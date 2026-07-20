@@ -1,0 +1,21 @@
+[package]
+name = "otlyra-platform"
+description = "OS window, GPU surface and input, with no winit type in the public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+otlyra-gfx.workspace = true
+pollster.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true
