@@ -8,7 +8,14 @@ use parley::{
 
 use crate::{FontStack, TEST_FAMILY, TEST_FONT};
 
-/// One run of glyphs: one font, one size, already positioned.
+/// The colour carried through shaping, as straight RGBA bytes.
+///
+/// parley calls this a brush and hands it back with each glyph run, which is what
+/// lets one paragraph contain differently coloured spans without shaping each of
+/// them separately and losing the line breaks between them.
+pub type Brush = [u8; 4];
+
+/// One run of glyphs: one font, one size, one colour, already positioned.
 ///
 /// The positions are absolute within the layout, in logical pixels, with the
 /// origin at the layout's top left. `PaintTarget::draw_glyphs` wants exactly this.
@@ -20,8 +27,42 @@ pub struct ShapedRun {
     pub font_size: f32,
     /// Variation axis coordinates, F2Dot14. Empty for a static font.
     pub normalized_coords: Vec<i16>,
+    /// The colour this run was requested in.
+    pub brush: Brush,
+    /// Which line of the paragraph the run belongs to.
+    pub line: usize,
     /// The glyphs, in visual order.
     pub glyphs: Vec<Glyph>,
+}
+
+/// One line of a shaped paragraph.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LineMetrics {
+    /// Distance from the paragraph top to this line's top.
+    pub top: f32,
+    /// Distance from the paragraph top to this line's baseline.
+    pub baseline: f32,
+    /// The line's height.
+    pub height: f32,
+    /// The line's advance width.
+    pub width: f32,
+}
+
+/// A span of text with one style, for shaping a paragraph made of several.
+#[derive(Clone, Debug)]
+pub struct TextSpan {
+    /// The text itself.
+    pub text: String,
+    /// The families to try, in order.
+    pub font_stack: FontStack,
+    /// Size in logical pixels.
+    pub font_size: f32,
+    /// CSS `font-weight`, 100–900.
+    pub font_weight: u16,
+    /// Colour, straight RGBA.
+    pub brush: Brush,
+    /// Line height in logical pixels, or `None` for the font's own.
+    pub line_height: Option<f32>,
 }
 
 /// Metrics of a whole shaped paragraph.
@@ -44,6 +85,8 @@ pub struct ShapedText {
     pub runs: Vec<ShapedRun>,
     /// Metrics for the paragraph as a whole.
     pub metrics: TextMetrics,
+    /// One entry per line, in order.
+    pub lines: Vec<LineMetrics>,
 }
 
 impl ShapedText {
@@ -103,6 +146,33 @@ impl TextEngine {
             source_cache: parley::fontique::SourceCache::default(),
         };
         register_test_font(&mut fonts);
+
+        // Point every generic family at the vendored font. Without this, an isolated
+        // engine cannot shape `sans-serif` — which is what every real document asks
+        // for — and a layout test would measure an empty line rather than a wrong
+        // one. The substitution is exactly what makes the numbers machine
+        // independent.
+        if let Some(id) = fonts.collection.family_id(TEST_FAMILY) {
+            for generic in [
+                parley::GenericFamily::Serif,
+                parley::GenericFamily::SansSerif,
+                parley::GenericFamily::Monospace,
+                parley::GenericFamily::Cursive,
+                parley::GenericFamily::Fantasy,
+                parley::GenericFamily::SystemUi,
+                parley::GenericFamily::UiSerif,
+                parley::GenericFamily::UiSansSerif,
+                parley::GenericFamily::UiMonospace,
+                parley::GenericFamily::UiRounded,
+                parley::GenericFamily::Emoji,
+                parley::GenericFamily::Math,
+            ] {
+                fonts
+                    .collection
+                    .set_generic_families(generic, std::iter::once(id));
+            }
+        }
+
         Self {
             fonts,
             layout: LayoutContext::new(),
@@ -132,50 +202,56 @@ impl TextEngine {
         let mut layout = builder.build(text);
         layout.break_all_lines(max_advance);
         layout.align(Alignment::Start, AlignmentOptions::default());
+        collect(&layout)
+    }
 
-        let mut runs = Vec::new();
-        let mut first_baseline = 0.0;
+    /// Shape several differently-styled spans as **one** paragraph.
+    ///
+    /// This is what an inline formatting context needs, and why it cannot simply
+    /// shape each span on its own: a line break may fall between two spans, and
+    /// `bold text` must break in the same place whether or not the `bold` is a
+    /// separate element. So the spans are concatenated, styled by range, and broken
+    /// together; each run comes back carrying the colour it was asked for.
+    pub fn shape_spans(&mut self, spans: &[TextSpan], max_advance: Option<f32>) -> ShapedText {
+        let mut text = String::new();
+        let mut ranges = Vec::with_capacity(spans.len());
+        for span in spans {
+            let start = text.len();
+            text.push_str(&span.text);
+            ranges.push(start..text.len());
+        }
 
-        for (index, line) in layout.lines().enumerate() {
-            if index == 0 {
-                first_baseline = line.metrics().baseline;
+        let mut builder = self
+            .layout
+            .ranged_builder(&mut self.fonts, &text, 1.0, true);
+        builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+
+        for (span, range) in spans.iter().zip(ranges) {
+            if range.is_empty() {
+                continue;
             }
-            for item in line.items() {
-                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                    continue;
-                };
-                let run = glyph_run.run();
-                let glyphs: Vec<Glyph> = glyph_run
-                    .positioned_glyphs()
-                    .map(|glyph| Glyph {
-                        id: glyph.id,
-                        x: glyph.x,
-                        y: glyph.y,
-                    })
-                    .collect();
-
-                if glyphs.is_empty() {
-                    continue;
-                }
-
-                runs.push(ShapedRun {
-                    font: run.font().clone(),
-                    font_size: run.font_size(),
-                    normalized_coords: run.normalized_coords().to_vec(),
-                    glyphs,
-                });
+            builder.push(
+                StyleProperty::FontFamily(span.font_stack.to_parley()),
+                range.clone(),
+            );
+            builder.push(StyleProperty::FontSize(span.font_size), range.clone());
+            builder.push(
+                StyleProperty::FontWeight(parley::FontWeight::new(f32::from(span.font_weight))),
+                range.clone(),
+            );
+            builder.push(StyleProperty::Brush(span.brush), range.clone());
+            if let Some(line_height) = span.line_height {
+                builder.push(
+                    StyleProperty::LineHeight(parley::LineHeight::Absolute(line_height)),
+                    range,
+                );
             }
         }
 
-        ShapedText {
-            metrics: TextMetrics {
-                width: layout.width(),
-                height: layout.height(),
-                first_baseline,
-                line_count: layout.len(),
-            },
-            runs,
-        }
+        let mut layout = builder.build(&text);
+        layout.break_all_lines(max_advance);
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        collect(&layout)
     }
 
     /// Measure without keeping the glyphs.
@@ -186,6 +262,66 @@ impl TextEngine {
     /// Whether a family name resolves to anything in the collection.
     pub fn has_family(&mut self, name: &str) -> bool {
         self.fonts.collection.family_by_name(name).is_some()
+    }
+}
+
+/// Pull runs, lines and metrics out of a broken parley layout.
+fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
+    let mut runs = Vec::new();
+    let mut lines = Vec::new();
+    let mut first_baseline = 0.0;
+
+    for (index, line) in layout.lines().enumerate() {
+        let metrics = line.metrics();
+        if index == 0 {
+            first_baseline = metrics.baseline;
+        }
+        lines.push(LineMetrics {
+            top: metrics.block_min_coord,
+            baseline: metrics.baseline,
+            height: metrics.line_height,
+            width: metrics.advance,
+        });
+
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+            let brush = glyph_run.style().brush;
+            let run = glyph_run.run();
+            let glyphs: Vec<Glyph> = glyph_run
+                .positioned_glyphs()
+                .map(|glyph| Glyph {
+                    id: glyph.id,
+                    x: glyph.x,
+                    y: glyph.y,
+                })
+                .collect();
+
+            if glyphs.is_empty() {
+                continue;
+            }
+
+            runs.push(ShapedRun {
+                font: run.font().clone(),
+                font_size: run.font_size(),
+                normalized_coords: run.normalized_coords().to_vec(),
+                brush,
+                line: index,
+                glyphs,
+            });
+        }
+    }
+
+    ShapedText {
+        metrics: TextMetrics {
+            width: layout.width(),
+            height: layout.height(),
+            first_baseline,
+            line_count: layout.len(),
+        },
+        runs,
+        lines,
     }
 }
 
@@ -317,6 +453,85 @@ mod tests {
                 "{text:?} should break into {expected_lines} lines"
             );
         }
+    }
+
+    fn span(text: &str, size: f32, brush: Brush) -> TextSpan {
+        TextSpan {
+            text: text.to_owned(),
+            font_stack: test_stack(),
+            font_size: size,
+            font_weight: 400,
+            brush,
+            line_height: None,
+        }
+    }
+
+    #[test]
+    fn spans_keep_the_colour_they_were_asked_for() {
+        let mut engine = engine();
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let shaped = engine.shape_spans(&[span("red ", 16.0, red), span("blue", 16.0, blue)], None);
+
+        let brushes: Vec<Brush> = shaped.runs.iter().map(|run| run.brush).collect();
+        assert_eq!(brushes, vec![red, blue]);
+    }
+
+    /// The reason spans are shaped together rather than one at a time: the break
+    /// belongs to the paragraph, not to whichever element the words came from.
+    #[test]
+    fn a_line_break_may_fall_between_two_spans() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let together = engine.shape_spans(
+            &[span("alpha ", 16.0, brush), span("beta", 16.0, brush)],
+            Some(48.0),
+        );
+        let one_string = engine.shape("alpha beta", &test_stack(), 16.0, Some(48.0));
+
+        assert_eq!(together.metrics.line_count, 2);
+        assert_eq!(
+            together.metrics.line_count, one_string.metrics.line_count,
+            "styling must not change where the text breaks"
+        );
+        assert!(
+            (together.metrics.height - one_string.metrics.height).abs() < 0.01,
+            "nor how tall it is"
+        );
+    }
+
+    #[test]
+    fn a_larger_span_makes_its_line_taller_and_shares_the_baseline() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let mixed = engine.shape_spans(
+            &[span("small ", 12.0, brush), span("BIG", 32.0, brush)],
+            None,
+        );
+
+        assert_eq!(mixed.lines.len(), 1);
+        let line = mixed.lines[0];
+        assert!(line.height >= 32.0, "line height was {}", line.height);
+        for run in &mixed.runs {
+            let baseline_y = run.glyphs[0].y;
+            assert!(
+                (baseline_y - line.baseline).abs() < 0.01,
+                "run at {baseline_y} should sit on the line's baseline {}",
+                line.baseline
+            );
+        }
+    }
+
+    #[test]
+    fn line_metrics_stack_top_to_bottom() {
+        let mut engine = engine();
+        let shaped = engine.shape("alpha beta gamma", &test_stack(), 16.0, Some(48.0));
+        assert_eq!(shaped.lines.len(), 3);
+        for pair in shaped.lines.windows(2) {
+            assert!(pair[1].top > pair[0].top);
+            assert!(pair[1].baseline > pair[0].baseline);
+        }
+        assert!(shaped.runs.iter().all(|run| run.line < 3));
     }
 
     #[test]

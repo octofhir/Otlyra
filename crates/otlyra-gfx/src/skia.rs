@@ -65,30 +65,77 @@ pub struct SkiaPainter {
 /// than re-parsed per run.
 #[derive(Default)]
 struct TypefaceCache {
-    entries: Vec<(usize, u32, sk::Typeface)>,
+    /// Keyed by the blob's address, the face index, and the variation
+    /// coordinates: a bold instance of a variable font is a different typeface to
+    /// Skia, and the whole point of caching is not to build it twice.
+    entries: Vec<(usize, u32, Vec<i16>, sk::Typeface)>,
     font_mgr: Option<sk::FontMgr>,
 }
 
 impl TypefaceCache {
-    fn get(&mut self, font: &FontData) -> Option<sk::Typeface> {
+    fn get(&mut self, font: &FontData, normalized_coords: &[i16]) -> Option<sk::Typeface> {
         // `Blob` is reference-counted and shared, so its data pointer is a stable
         // identity for as long as anyone holds the font.
         let key = font.data.as_ref().as_ptr() as usize;
         let index = font.index;
 
-        if let Some((_, _, typeface)) = self
-            .entries
-            .iter()
-            .find(|(cached_key, cached_index, _)| *cached_key == key && *cached_index == index)
-        {
+        if let Some((_, _, _, typeface)) = self.entries.iter().find(|(k, i, coords, _)| {
+            *k == key && *i == index && coords.as_slice() == normalized_coords
+        }) {
             return Some(typeface.clone());
         }
 
         let font_mgr = self.font_mgr.get_or_insert_with(sk::FontMgr::new);
-        let typeface = font_mgr.new_from_data(font.data.as_ref(), index as usize)?;
-        self.entries.push((key, index, typeface.clone()));
+        let base = font_mgr.new_from_data(font.data.as_ref(), index as usize)?;
+        let typeface = instantiate(&base, normalized_coords).unwrap_or(base);
+
+        self.entries
+            .push((key, index, normalized_coords.to_vec(), typeface.clone()));
         Some(typeface)
     }
+}
+
+/// Build the variable-font instance the shaper asked for.
+///
+/// The shaper reports the position it chose as **normalized** coordinates — the
+/// OpenType convention where each axis runs -1 to 1 around its default — while Skia
+/// wants design-space values. The mapping is linear on each side of the default,
+/// which is the same conversion the specification defines, minus `avar`: a font with
+/// an axis-variation table will land slightly off the requested weight. That is a
+/// visible-if-you-look difference, not a missing feature, and it costs no glyphs.
+///
+/// Without this, every variable font renders at its default instance — and on macOS
+/// the system UI font is variable, so `<b>` and every heading come out at regular
+/// weight. That is what this exists to fix.
+fn instantiate(typeface: &sk::Typeface, normalized_coords: &[i16]) -> Option<sk::Typeface> {
+    if normalized_coords.is_empty() {
+        return None;
+    }
+    let axes = typeface.variation_design_parameters()?;
+
+    let coordinates: Vec<sk::font_arguments::variation_position::Coordinate> = axes
+        .iter()
+        .zip(normalized_coords)
+        .map(|(axis, &normalized)| {
+            // F2Dot14: 1.0 is 16384.
+            let normalized = f32::from(normalized) / 16384.0;
+            let value = if normalized >= 0.0 {
+                axis.def + normalized * (axis.max - axis.def)
+            } else {
+                axis.def + normalized * (axis.def - axis.min)
+            };
+            sk::font_arguments::variation_position::Coordinate {
+                axis: axis.tag,
+                value,
+            }
+        })
+        .collect();
+
+    typeface.clone_with_arguments(&sk::FontArguments::new().set_variation_design_position(
+        sk::font_arguments::VariationPosition {
+            coordinates: &coordinates,
+        },
+    ))
 }
 
 impl std::fmt::Debug for SkiaPainter {
@@ -441,14 +488,7 @@ impl PaintTarget for SkiaPainter {
             return;
         }
 
-        if !normalized_coords.is_empty() {
-            tracing::warn!(
-                axes = normalized_coords.len(),
-                "variable font coordinates are ignored; the run will use the default instance"
-            );
-        }
-
-        let Some(typeface) = self.typefaces.get(font) else {
+        let Some(typeface) = self.typefaces.get(font, normalized_coords) else {
             tracing::error!("skia could not parse the font for a glyph run; dropping it");
             return;
         };

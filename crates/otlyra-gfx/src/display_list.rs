@@ -311,6 +311,26 @@ impl DisplayList {
         self.items.push(item);
     }
 
+    /// Apply `transform` to every item, ahead of the transform it already carries.
+    ///
+    /// This is how the device scale reaches the rasterizer: geometry is authored in
+    /// logical pixels all the way down, and one transform at the end turns it into
+    /// device pixels. Baking the scale into coordinates instead would make every
+    /// number in the list depend on which display it was built for.
+    pub fn transform(&mut self, transform: Affine) {
+        for item in &mut self.items {
+            match item {
+                DisplayItem::PushLayer { transform: t, .. }
+                | DisplayItem::Fill { transform: t, .. }
+                | DisplayItem::Stroke { transform: t, .. }
+                | DisplayItem::Glyphs { transform: t, .. }
+                | DisplayItem::Image { transform: t, .. }
+                | DisplayItem::HitTest { transform: t, .. } => *t = transform * *t,
+                DisplayItem::PopLayer => {}
+            }
+        }
+    }
+
     /// Append a glyph run, interning its font.
     #[allow(clippy::too_many_arguments)]
     pub fn push_glyphs(
