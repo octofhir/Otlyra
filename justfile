@@ -53,6 +53,30 @@ notice:
 install-tools:
     cargo install cargo-deny cargo-audit cargo-about
 
+# Build a macOS .app bundle. `cargo run` already sets the Dock icon at runtime;
+# this is for a bundle you can drag to /Applications, which also gets the Finder
+# icon, the real app name in the menu bar and file-type associations.
+bundle: release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    app="target/Otlyra.app"
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    cp target/release/otlyra "$app/Contents/MacOS/otlyra"
+    cp assets/macos/Info.plist "$app/Contents/Info.plist"
+
+    iconset="$(mktemp -d)/AppIcon.iconset"
+    mkdir -p "$iconset"
+    for size in 16 32 128 256 512; do
+      sips -z $size $size assets/logo/icon-512.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+      double=$((size * 2))
+      sips -z $double $double assets/logo/icon-512.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+
+    echo "built $app"
+    echo "run it with: open $app"
+
 doc:
     cargo doc --workspace --no-deps --open
 
