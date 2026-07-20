@@ -18,7 +18,7 @@ use otlyra_gfx::kurbo::{Affine, Rect, Shape};
 use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList, PaintTarget, render};
 use otlyra_platform::{Painter, PlatformEvent, Viewport};
-use otlyra_text::{FontStack, TextEngine};
+use otlyra_text::{FontStack, ShapedText, TextEngine};
 
 /// The initial containing block's background.
 const BACKGROUND: Color = Color::from_rgb8(0xff, 0xff, 0xff);
@@ -258,6 +258,15 @@ pub struct PageScene {
     text: TextEngine,
     stack: FontStack,
     blocks: Vec<Block>,
+    /// One shaped paragraph per block, kept until the wrap width changes.
+    ///
+    /// Without this, every frame reshapes every block, so scrolling a long page
+    /// costs a full shaping pass per wheel notch and the first frame of a page with
+    /// one enormous block can take a visible second. Shaping is the expensive part
+    /// of drawing text and it only depends on the text and the width.
+    shaped: Vec<Option<ShapedText>>,
+    /// The width `shaped` was produced at. A change invalidates all of it.
+    shaped_width: f64,
     /// How far down the page we are, in logical pixels. Never negative, and never
     /// past the end of the content.
     scroll: f64,
@@ -282,10 +291,13 @@ impl PageScene {
     /// Uses the system fonts rather than the vendored test family: a real page is
     /// in whatever script it is in, and the vendored font covers one of them.
     pub fn new(document: &Document) -> Self {
+        let blocks = blocks_of(document);
         Self {
             text: TextEngine::new(),
             stack: FontStack::parse_css("Helvetica Neue, system-ui, sans-serif"),
-            blocks: blocks_of(document),
+            shaped: vec![None; blocks.len()],
+            shaped_width: 0.0,
+            blocks,
             scroll: 0.0,
             content_height: 0.0,
             viewport_height: 0.0,
@@ -314,15 +326,26 @@ impl PageScene {
             shape: Rect::new(0.0, 0.0, width, height).to_path(PATH_TOLERANCE),
         });
 
+        // A width change is the only thing that invalidates shaping, and it
+        // invalidates all of it.
+        if self.shaped_width != width {
+            self.shaped.clear();
+            self.shaped.resize(self.blocks.len(), None);
+            self.shaped_width = width;
+        }
+
         let mut y = MARGIN;
-        for block in &self.blocks {
-            let available = (width - MARGIN * 2.0 - block.indent).max(1.0);
-            let shaped = self.text.shape(
-                &block.text,
-                &self.stack,
-                block.font_size,
-                Some(available as f32),
-            );
+        for (index, block) in self.blocks.iter().enumerate() {
+            if self.shaped[index].is_none() {
+                let available = (width - MARGIN * 2.0 - block.indent).max(1.0) as f32;
+                self.shaped[index] = Some(self.text.shape(
+                    &block.text,
+                    &self.stack,
+                    block.font_size,
+                    Some(available),
+                ));
+            }
+            let shaped = self.shaped[index].as_ref().expect("shaped just above");
 
             y += block.space_before;
             let top = y - self.scroll;

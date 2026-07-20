@@ -13,11 +13,14 @@ use winit::window::{Window, WindowId};
 use otlyra_gfx::{PaintTarget, SkiaPainter};
 
 use crate::menu::{NativeMenu, command_from_muda};
-use crate::present::Presenter;
+use crate::present::{Presented, Presenter};
 use crate::{MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
 
 /// Logical pixels one wheel notch scrolls.
 const LINE_SCROLL: f64 = 40.0;
+
+/// How many frames in a row the swapchain may refuse before we stop asking.
+const MAX_DROPPED_FRAMES: u32 = 8;
 
 /// Menu activations arrive on muda's own callback, off winit's event path, so they
 /// are forwarded through the event loop proxy. Without this the loop would sit in
@@ -94,6 +97,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         rasterizer: None,
         menu: None,
         frames: 0,
+        dropped_frames: 0,
         failure: None,
     };
 
@@ -116,6 +120,8 @@ struct WindowedApp<'p> {
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
     frames: u64,
+    /// Consecutive frames the swapchain refused, so retrying stays bounded.
+    dropped_frames: u32,
     /// First fatal error, so `run` can return it once the loop unwinds. An
     /// `ApplicationHandler` callback cannot return one, and panicking across the OS
     /// callback boundary is worse.
@@ -139,7 +145,7 @@ impl WindowedApp<'_> {
         event_loop.exit();
     }
 
-    fn redraw(&mut self) -> Result<(), PlatformError> {
+    fn redraw(&mut self) -> Result<Presented, PlatformError> {
         let viewport = self.viewport();
 
         let rasterizer = match self.rasterizer.as_mut() {
@@ -170,13 +176,17 @@ impl WindowedApp<'_> {
 
         let _present = tracing::info_span!("present", mode = "blit").entered();
         let pixels = rasterizer.read_rgba8().map_err(Box::new)?;
-        if let Some(presenter) = self.presenter.as_mut() {
-            presenter.resize(viewport);
-            presenter.present(&pixels, viewport.width, viewport.height)?;
+        let Some(presenter) = self.presenter.as_mut() else {
+            return Ok(Presented::Dropped);
+        };
+        presenter.resize(viewport);
+        let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
+
+        if outcome == Presented::Frame {
+            self.frames += 1;
+            tracing::debug!(frame = self.frames, "frame presented");
         }
-        self.frames += 1;
-        tracing::debug!(frame = self.frames, "frame presented");
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -268,6 +278,16 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
                     window.request_redraw();
                 }
             }
+            // The window became visible or came to the front. Both mean the last
+            // frame may never have reached the screen — a swapchain hands back an
+            // occluded texture and the paint goes nowhere — and in a loop that
+            // blocks in `Wait` nothing else will ask for another one.
+            WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
+                self.dropped_frames = 0;
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.viewport().scale_factor;
                 let (x, y) = match delta {
@@ -289,11 +309,26 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
                     window.request_redraw();
                 }
             }
-            WindowEvent::RedrawRequested => {
-                if let Err(error) = self.redraw() {
-                    self.fail(event_loop, error);
+            WindowEvent::RedrawRequested => match self.redraw() {
+                Err(error) => self.fail(event_loop, error),
+                Ok(Presented::Frame | Presented::Occluded) => self.dropped_frames = 0,
+                // Ask for the frame again. Bounded, because a swapchain that fails
+                // forever must not turn the blocking loop into a spinning one — that
+                // would trade a black window for a hot CPU.
+                Ok(Presented::Dropped) => {
+                    self.dropped_frames += 1;
+                    if self.dropped_frames <= MAX_DROPPED_FRAMES {
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                    } else {
+                        tracing::warn!(
+                            dropped = self.dropped_frames,
+                            "the swapchain keeps refusing frames; waiting for the next event"
+                        );
+                    }
                 }
-            }
+            },
             _ => {}
         }
     }

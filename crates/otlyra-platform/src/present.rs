@@ -242,7 +242,7 @@ impl Presenter {
         pixels: &[u8],
         width: u32,
         height: u32,
-    ) -> Result<(), PresentError> {
+    ) -> Result<Presented, PresentError> {
         let expected = width as usize * height as usize * 4;
         if pixels.len() != expected {
             return Err(PresentError::PixelBufferSize {
@@ -254,15 +254,23 @@ impl Presenter {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            // A lost or outdated swapchain is normal during a resize or a display
-            // change; reconfigure and drop this frame.
+            // A lost or outdated swapchain is normal while a window is being
+            // created, resized or moved between displays. Reconfigure and tell the
+            // caller the frame never happened, so it can ask for another one — the
+            // loop blocks in `Wait`, so a dropped frame nobody re-requests is a
+            // window that stays black until the user happens to poke it.
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                tracing::debug!("swapchain lost or outdated; frame dropped");
+                return Ok(Presented::Dropped);
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                tracing::debug!("swapchain timed out; frame dropped");
+                return Ok(Presented::Dropped);
             }
+            // The window is hidden. Asking again would spin against a window nobody
+            // can see; winit wakes us when it is visible.
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(Presented::Occluded),
             wgpu::CurrentSurfaceTexture::Validation => return Err(PresentError::SurfaceValidation),
         };
 
@@ -321,8 +329,19 @@ impl Presenter {
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
-        Ok(())
+        Ok(Presented::Frame)
     }
+}
+
+/// What became of a frame handed to [`Presenter::present`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Presented {
+    /// It reached the screen.
+    Frame,
+    /// The swapchain refused it. Painting it again should work.
+    Dropped,
+    /// The window is not visible. Painting it again would achieve nothing.
+    Occluded,
 }
 
 #[derive(Debug, thiserror::Error)]
