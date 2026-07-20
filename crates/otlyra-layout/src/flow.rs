@@ -140,10 +140,15 @@ impl<'a> Flow<'a> {
         let mut children = Vec::new();
         let content_height =
             self.layout_children(id, content_width, content_x, content_y, &mut children);
-        let content_height = style
-            .height
-            .resolve(containing_width)
-            .unwrap_or(content_height);
+        let content_height = clamp(
+            style
+                .height
+                .resolve(containing_width)
+                .unwrap_or(content_height),
+            style.min_height,
+            style.max_height,
+            containing_width,
+        );
 
         Fragment {
             box_id: Some(id),
@@ -491,7 +496,20 @@ fn resolve_horizontal(
     let mut margin = resolve_margin(style, containing);
     let extra = padding.left + padding.right + border.left + border.right;
 
-    let Some(width) = style.width.resolve(containing) else {
+    // `max-width` and `min-width` are applied to whatever `width` worked out to,
+    // and the box is then laid out again as if that were the width it asked for —
+    // which is what makes `max-width` centre a column that `margin: 0 auto` would
+    // otherwise leave full width.
+    let width = match style.width.resolve(containing) {
+        Some(width) => Some(clamp(width, style.min_width, style.max_width, containing)),
+        None => {
+            let available = (containing - margin.left - margin.right - extra).max(0.0);
+            let constrained = clamp(available, style.min_width, style.max_width, containing);
+            (constrained != available).then_some(constrained)
+        }
+    };
+
+    let Some(width) = width else {
         let content = (containing - margin.left - margin.right - extra).max(0.0);
         return (margin, content);
     };
@@ -509,6 +527,18 @@ fn resolve_horizontal(
         (false, false) => {}
     }
     (margin, width)
+}
+
+/// A size held between its minimum and its maximum.
+///
+/// The maximum is applied first and the minimum second, which is the order CSS
+/// gives them and the reason a `min-width` larger than a `max-width` wins.
+fn clamp(value: f32, min: Length, max: Option<Length>, containing: f32) -> f32 {
+    let capped = match max {
+        Some(max) => value.min(max.resolve(containing)),
+        None => value,
+    };
+    capped.max(min.resolve(containing))
 }
 
 /// The four border widths, which are already absolute lengths by this point.
@@ -725,6 +755,57 @@ mod tests {
             line.height + 30.0,
             "the border box is the content plus both borders and both paddings"
         );
+    }
+
+    /// The pattern nearly every readable page is built on: a column held to a
+    /// measure and centred, with no width of its own.
+    #[test]
+    fn max_width_and_auto_margins_centre_a_column() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             div { max-width: 300px; margin: 0 auto }</style><div>x</div>",
+            800.0,
+        );
+        let column = rect_of(&tree, &boxes, "div");
+        assert_eq!(column.width, 300.0);
+        assert_eq!(column.x, 250.0);
+    }
+
+    /// A maximum below the width asked for wins, and a minimum below the maximum
+    /// does not.
+    #[test]
+    fn min_and_max_hold_a_width_between_them() {
+        let capped = laid_out(
+            "<style>body { margin: 0 } div { width: 600px; max-width: 200px }</style><div>x</div>",
+            800.0,
+        );
+        assert_eq!(rect_of(&capped.0, &capped.1, "div").width, 200.0);
+
+        let floored = laid_out(
+            "<style>body { margin: 0 } div { width: 50px; min-width: 120px }</style><div>x</div>",
+            800.0,
+        );
+        assert_eq!(rect_of(&floored.0, &floored.1, "div").width, 120.0);
+
+        // A minimum larger than the maximum wins, because the minimum is applied
+        // last.
+        let both = laid_out(
+            "<style>body { margin: 0 } \
+             div { width: 400px; max-width: 100px; min-width: 300px }</style><div>x</div>",
+            800.0,
+        );
+        assert_eq!(rect_of(&both.0, &both.1, "div").width, 300.0);
+    }
+
+    /// `min-height` makes a box taller than its content, which is how a page's
+    /// footer stays at the bottom of a short page.
+    #[test]
+    fn min_height_makes_a_box_taller_than_its_content() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } div { min-height: 400px }</style><div>x</div>",
+            800.0,
+        );
+        assert_eq!(rect_of(&tree, &boxes, "div").height, 400.0);
     }
 
     /// `margin: 0 auto` on a box with a width is how a page is centred, and the

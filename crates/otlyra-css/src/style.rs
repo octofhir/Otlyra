@@ -255,6 +255,16 @@ pub struct ComputedStyle {
     pub width: LengthOrAuto,
     /// `height`.
     pub height: LengthOrAuto,
+    /// `min-width`, which floors whatever `width` resolves to.
+    pub min_width: Length,
+    /// `max-width`, or `None` for `none`. This is what holds a page's text column
+    /// to a readable measure, so it is the one of the four that shows on nearly
+    /// every real page.
+    pub max_width: Option<Length>,
+    /// `min-height`.
+    pub min_height: Length,
+    /// `max-height`, or `None` for `none`.
+    pub max_height: Option<Length>,
 }
 
 /// The initial values, as CSS defines them, with the UA's font defaults.
@@ -279,6 +289,10 @@ impl Default for ComputedStyle {
             text_align: TextAlign::Start,
             width: LengthOrAuto::Auto,
             height: LengthOrAuto::Auto,
+            min_width: Length::ZERO,
+            max_width: None,
+            min_height: Length::ZERO,
+            max_height: None,
         }
     }
 }

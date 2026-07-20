@@ -56,6 +56,10 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         text_align: text_align(values),
         width: size(&values.get_position().width),
         height: size(&values.get_position().height),
+        min_width: min_size(&values.get_position().min_width),
+        max_width: max_size(&values.get_position().max_width),
+        min_height: min_size(&values.get_position().min_height),
+        max_height: max_size(&values.get_position().max_height),
     }
 }
 
@@ -247,6 +251,32 @@ fn size(value: &style::values::computed::Size) -> LengthOrAuto {
         // `min-content`, `max-content` and `fit-content` need intrinsic sizing,
         // which layout does not do; auto is the value it can honour.
         _ => LengthOrAuto::Auto,
+    }
+}
+
+/// `min-width` and `min-height`. `auto` floors at nothing, which is what it means
+/// outside a flex or grid item.
+fn min_size(value: &style::values::computed::Size) -> Length {
+    match size(value) {
+        LengthOrAuto::Px(px) => Length::Px(px),
+        LengthOrAuto::Percent(fraction) => Length::Percent(fraction),
+        LengthOrAuto::Auto => Length::ZERO,
+    }
+}
+
+/// `max-width` and `max-height`, where `none` is no limit at all rather than a
+/// very large one.
+fn max_size(value: &style::values::computed::MaxSize) -> Option<Length> {
+    use style::values::generics::length::GenericMaxSize as Generic;
+
+    match value {
+        Generic::None => None,
+        Generic::LengthPercentage(value) => Some(match value.0.to_percentage() {
+            Some(percentage) => Length::Percent(percentage.0),
+            None => Length::Px(value.0.to_used_value(app_units::Au(0)).to_f32_px()),
+        }),
+        // The intrinsic keywords need intrinsic sizing, which layout does not do.
+        _ => None,
     }
 }
 
