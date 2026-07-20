@@ -52,6 +52,16 @@ pub fn normalize(input: &str) -> Result<Url, NetError> {
     Ok(parsed)
 }
 
+/// Resolve `href` against the document it appeared in.
+///
+/// A page's links are mostly relative, and a relative link is meaningless without
+/// the address it was found at — which is why this takes the base rather than
+/// guessing one. Anything that is already absolute passes through unchanged.
+pub fn resolve(base: &str, href: &str) -> Option<String> {
+    let base = Url::parse(base).ok()?;
+    base.join(href).ok().map(|url| url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +99,40 @@ mod tests {
             normalize("file:///etc/passwd"),
             Err(NetError::UnsupportedScheme { scheme }) if scheme == "file"
         ));
+    }
+
+    #[test]
+    fn a_relative_link_resolves_against_the_page_it_was_found_on() {
+        let base = "https://example.com/docs/guide.html";
+        assert_eq!(
+            resolve(base, "intro.html").as_deref(),
+            Some("https://example.com/docs/intro.html")
+        );
+        assert_eq!(
+            resolve(base, "/index.html").as_deref(),
+            Some("https://example.com/index.html")
+        );
+        assert_eq!(
+            resolve(base, "../other/page").as_deref(),
+            Some("https://example.com/other/page")
+        );
+        assert_eq!(
+            resolve(base, "#section").as_deref(),
+            Some("https://example.com/docs/guide.html#section")
+        );
+    }
+
+    #[test]
+    fn an_absolute_link_passes_through() {
+        assert_eq!(
+            resolve("https://example.com/", "https://other.example/x").as_deref(),
+            Some("https://other.example/x")
+        );
+    }
+
+    #[test]
+    fn a_link_on_a_page_with_no_address_resolves_to_nothing() {
+        assert_eq!(resolve("", "page.html"), None);
     }
 
     #[test]

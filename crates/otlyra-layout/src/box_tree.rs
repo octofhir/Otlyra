@@ -187,6 +187,23 @@ impl BoxTree {
     }
 }
 
+/// A [`BoxId`] as a plain number, and back.
+///
+/// The display list carries hit-test identifiers as `u64` because it is
+/// serializable and crosses process boundaries later; a slotmap key is exactly a
+/// number, and round-tripping it here keeps the conversion in one place with the
+/// type it belongs to.
+pub fn box_id_to_u64(id: BoxId) -> u64 {
+    use slotmap::Key as _;
+    id.data().as_ffi()
+}
+
+/// The inverse of [`box_id_to_u64`]. The id may be stale, which is what the
+/// generation in it is for: looking it up returns `None` rather than a stranger.
+pub fn box_id_from_u64(raw: u64) -> BoxId {
+    BoxId::from(slotmap::KeyData::from_ffi(raw))
+}
+
 /// The invariant that makes block and inline layout separable: a box's children are
 /// either all block-level or all inline-level, never both.
 ///

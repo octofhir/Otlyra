@@ -7,9 +7,9 @@ BOX at (0.0, 0.0) size 300.0x600.0
     BOX at (8.0, 8.0) size 284.0x159.3
       BOX at (8.0, 29.4) size 284.0x42.2
         LINE at (8.0, 29.4) size 53.4x42.2
-          TEXT 5 glyphs in 1 runs at (8.0, 29.4) size 53.4x42.2
+          TEXT 5 glyphs at (8.0, 29.4) size 53.4x42.2
       BOX at (8.0, 109.1) size 284.0x42.2
         LINE at (8.0, 109.1) size 284.3x21.0
-          TEXT 40 glyphs in 1 runs at (8.0, 109.1) size 284.3x21.0
+          TEXT 40 glyphs at (8.0, 109.1) size 284.3x21.0
         LINE at (8.0, 130.1) size 27.1x21.1
-          TEXT 3 glyphs in 1 runs at (8.0, 130.1) size 27.1x21.1
+          TEXT 3 glyphs at (8.0, 130.1) size 27.1x21.1

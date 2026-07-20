@@ -63,10 +63,7 @@ fn write_fragment(fragment: &crate::fragment::Fragment, depth: usize, out: &mut 
     let kind = match &fragment.kind {
         FragmentKind::Box => "BOX".to_owned(),
         FragmentKind::Line => "LINE".to_owned(),
-        FragmentKind::Text(runs) => {
-            let glyphs: usize = runs.iter().map(|run| run.glyphs.len()).sum();
-            format!("TEXT {glyphs} glyphs in {} runs", runs.len())
-        }
+        FragmentKind::Text(run) => format!("TEXT {} glyphs", run.glyphs.len()),
     };
     let _ = writeln!(
         out,

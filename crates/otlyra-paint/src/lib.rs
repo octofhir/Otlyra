@@ -23,7 +23,7 @@
 
 use otlyra_gfx::kurbo::{Affine, Rect as KurboRect, Shape};
 use otlyra_gfx::peniko::{Brush, Color, Fill};
-use otlyra_gfx::{DisplayItem, DisplayList};
+use otlyra_gfx::{DisplayItem, DisplayList, HitTestId};
 use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 
 /// Flattening tolerance for shapes entering the display list. Matches the recording
@@ -68,6 +68,24 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
     let rect = fragment.rect;
     let origin = Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)));
 
+    // Hit testing is a display list too, emitted into the same sequence as the
+    // painting it belongs to. Keeping them together is what stops a link from being
+    // clickable somewhere other than where it is drawn.
+    if let Some(box_id) = fragment.box_id
+        && !matches!(fragment.kind, FragmentKind::Line)
+    {
+        list.push(DisplayItem::HitTest {
+            rect: KurboRect::new(
+                f64::from(rect.x),
+                f64::from(rect.y - scroll_y),
+                f64::from(rect.right()),
+                f64::from(rect.bottom() - scroll_y),
+            ),
+            transform: Affine::IDENTITY,
+            id: HitTestId(otlyra_layout::box_id_to_u64(box_id)),
+        });
+    }
+
     match &fragment.kind {
         FragmentKind::Box => {
             let background = fragment.style.background_color;
@@ -91,21 +109,19 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
 
         FragmentKind::Line => {}
 
-        FragmentKind::Text(runs) => {
-            for run in runs {
-                if run.glyphs.is_empty() {
-                    continue;
-                }
-                list.push_glyphs(
-                    &run.font,
-                    run.font_size,
-                    run.normalized_coords.clone(),
-                    Brush::Solid(brush_to_color(run.brush)),
-                    origin,
-                    true,
-                    run.glyphs.clone(),
-                );
+        FragmentKind::Text(run) => {
+            if run.glyphs.is_empty() {
+                return;
             }
+            list.push_glyphs(
+                &run.font,
+                run.font_size,
+                run.normalized_coords.clone(),
+                Brush::Solid(brush_to_color(run.brush)),
+                origin,
+                true,
+                run.glyphs.clone(),
+            );
         }
     }
 }
@@ -198,6 +214,44 @@ mod tests {
     #[test]
     fn an_empty_document_still_paints_the_canvas() {
         let list = page("", 0.0);
-        assert_eq!(list.len(), 1);
+        let ops = ops(&list);
+        assert_eq!(ops.len(), 1, "one fill and nothing else to draw");
+        assert!(matches!(ops[0], PaintOp::Fill { .. }));
+
+        // The empty `<html>` and `<body>` are still hit-testable — a click on blank
+        // space lands on the document, not on nothing.
+        assert!(
+            list.items()
+                .iter()
+                .any(|item| matches!(item, DisplayItem::HitTest { .. }))
+        );
+    }
+
+    /// Every text run is its own target. A link that is clickable across the whole
+    /// line it happens to sit on is worse than no hit testing.
+    #[test]
+    fn each_text_run_gets_its_own_target() {
+        let list = page("<body><p>before <a href=\"/x\">link</a> after", 0.0);
+        let targets: Vec<_> = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::HitTest { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+
+        // html, body, p, and one per run.
+        assert!(targets.len() >= 6, "got {} targets", targets.len());
+        let runs: Vec<_> = targets.iter().filter(|rect| rect.width() < 700.0).collect();
+        assert!(runs.len() >= 3, "one target per run on the line");
+        for pair in runs.windows(2) {
+            assert!(
+                pair[1].x0 >= pair[0].x1 - 0.5,
+                "run targets must not overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

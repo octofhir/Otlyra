@@ -64,8 +64,13 @@ pub enum FragmentKind {
     Box,
     /// One line of an inline formatting context.
     Line,
-    /// Positioned glyphs. Positions are relative to the fragment's origin.
-    Text(Vec<ShapedRun>),
+    /// One shaped run of glyphs, positioned relative to the fragment's origin.
+    ///
+    /// One fragment per run rather than per line, so that the fragment's rectangle
+    /// is the run's own: that is what hit testing needs, and a link that is
+    /// clickable across the whole line it happens to sit on is worse than no hit
+    /// testing at all.
+    Text(ShapedRun),
 }
 
 /// One fragment.

@@ -141,9 +141,20 @@ impl Flow<'_> {
         out: &mut Vec<Fragment>,
     ) -> f32 {
         let mut spans = Vec::new();
-        self.collect_spans(parent, &mut spans);
+        let mut sources = Vec::new();
+        self.collect_spans(parent, &mut spans, &mut sources);
         if spans.is_empty() {
             return 0.0;
+        }
+
+        // Where each span landed in the concatenated text, computed the same way
+        // `shape_spans` concatenates it. This is what turns a shaped run back into
+        // the box it came from — and therefore into the element a click lands on.
+        let mut starts = Vec::with_capacity(spans.len());
+        let mut offset = 0usize;
+        for span in &spans {
+            starts.push(offset);
+            offset += span.text.len();
         }
 
         let shaped = self.text.shape_spans(&spans, Some(width));
@@ -155,21 +166,6 @@ impl Flow<'_> {
         let paragraph_top = shaped.lines.first().map_or(0.0, |line| line.top);
 
         for (index, line) in shaped.lines.iter().enumerate() {
-            // Glyph positions come back relative to the paragraph; a line fragment
-            // is a place on the page, so they are rebased onto it.
-            let runs: Vec<_> = shaped
-                .runs
-                .iter()
-                .filter(|run| run.line == index)
-                .map(|run| {
-                    let mut run = run.clone();
-                    for glyph in &mut run.glyphs {
-                        glyph.y -= line.top;
-                    }
-                    run
-                })
-                .collect();
-
             // Line boxes are contiguous: each one ends where the next begins. Taking
             // the height from the next line's top rather than from the font's line
             // height keeps them so, and avoids the fraction of a pixel of overlap
@@ -178,20 +174,40 @@ impl Flow<'_> {
                 .lines
                 .get(index + 1)
                 .map_or(line.height, |next| next.top - line.top);
-            let rect = Rect::new(x, y + line.top - paragraph_top, line.width, height);
-            let text = Fragment {
-                box_id: Some(parent),
-                rect,
-                kind: FragmentKind::Text(runs),
-                style: Arc::clone(&style),
-                children: Vec::new(),
-            };
+            let line_y = y + line.top - paragraph_top;
+
+            let runs: Vec<Fragment> = shaped
+                .runs
+                .iter()
+                .filter(|run| run.line == index)
+                .map(|run| {
+                    // Glyph positions come back relative to the paragraph; a
+                    // fragment is a place on the page, so they are rebased onto it.
+                    let mut run = run.clone();
+                    for glyph in &mut run.glyphs {
+                        glyph.x -= run.offset_x;
+                        glyph.y -= line.top;
+                    }
+
+                    let source = starts
+                        .partition_point(|&start| start <= run.text_range.start)
+                        .saturating_sub(1);
+                    Fragment {
+                        box_id: sources.get(source).copied(),
+                        rect: Rect::new(x + run.offset_x, line_y, run.advance, height),
+                        kind: FragmentKind::Text(run),
+                        style: Arc::clone(&style),
+                        children: Vec::new(),
+                    }
+                })
+                .collect();
+
             out.push(Fragment {
                 box_id: Some(parent),
-                rect,
+                rect: Rect::new(x, line_y, line.width, height),
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
-                children: vec![text],
+                children: runs,
             });
         }
 
@@ -199,11 +215,20 @@ impl Flow<'_> {
     }
 
     /// Walk an inline subtree in order, turning each text box into a styled span.
-    fn collect_spans(&self, id: BoxId, spans: &mut Vec<TextSpan>) {
+    ///
+    /// `sources` records which box each span came from, in step with `spans`: a
+    /// run of glyphs is no use to hit testing without knowing which element it
+    /// belongs to.
+    fn collect_spans(&self, id: BoxId, spans: &mut Vec<TextSpan>, sources: &mut Vec<BoxId>) {
         for &child in &self.tree.node(id).children {
             let node = self.tree.node(child);
             match &node.kind {
-                BoxKind::Text(text) => spans.push(span_for(text, &node.style)),
+                BoxKind::Text(text) => {
+                    spans.push(span_for(text, &node.style));
+                    // The text's own box is anonymous as far as the document is
+                    // concerned; what a click means is the element around it.
+                    sources.push(id);
+                }
                 BoxKind::Inline => {
                     // `<br>` is a forced break, and a newline is exactly how the
                     // shaper is told about one.
@@ -215,14 +240,15 @@ impl Flow<'_> {
                             text: "\n".to_owned(),
                             ..span_for("", &node.style)
                         });
+                        sources.push(child);
                     }
-                    self.collect_spans(child, spans);
+                    self.collect_spans(child, spans, sources);
                 }
                 BoxKind::Block => {
                     // A block inside an inline context. Real CSS splits the inline
                     // around it; we do not yet, so its text joins the paragraph
                     // rather than vanishing.
-                    self.collect_spans(child, spans);
+                    self.collect_spans(child, spans, sources);
                 }
             }
         }

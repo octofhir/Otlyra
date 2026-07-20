@@ -124,6 +124,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         menu: None,
         frames: 0,
         modifiers: crate::Modifiers::default(),
+        cursor: crate::Cursor::default(),
         dropped_frames: 0,
         failure: None,
     };
@@ -150,6 +151,8 @@ struct WindowedApp<'p> {
     /// Modifier state, tracked here because winit reports it as its own event and
     /// every key press needs it.
     modifiers: crate::Modifiers,
+    /// The cursor currently set, so it is only changed when it actually changes.
+    cursor: crate::Cursor,
     /// Consecutive frames the swapchain refused, so retrying stays bounded.
     dropped_frames: u32,
     /// First fatal error, so `run` can return it once the loop unwinds. An
@@ -182,6 +185,19 @@ impl WindowedApp<'_> {
     /// sees no result from.
     fn deliver(&mut self, event: PlatformEvent) {
         self.painter.on_event(event);
+
+        let cursor = self.painter.cursor();
+        if cursor != self.cursor
+            && let Some(window) = self.window.as_ref()
+        {
+            window.set_cursor(match cursor {
+                crate::Cursor::Default => winit::window::CursorIcon::Default,
+                crate::Cursor::Pointer => winit::window::CursorIcon::Pointer,
+                crate::Cursor::Text => winit::window::CursorIcon::Text,
+            });
+            self.cursor = cursor;
+        }
+
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }

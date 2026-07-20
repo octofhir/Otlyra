@@ -171,9 +171,15 @@ fn a_heading_is_taller_than_body_text() {
 fn one_line_holds_two_font_sizes_on_a_shared_baseline() {
     let tree = lay_out("<body><p>normal <small>smaller</small> normal", 800.0);
     let line = lines(&tree)[0];
-    let FragmentKind::Text(runs) = &line.children[0].kind else {
-        panic!("a line should contain text");
-    };
+
+    let runs: Vec<_> = line
+        .children
+        .iter()
+        .filter_map(|child| match &child.kind {
+            FragmentKind::Text(run) => Some(run),
+            _ => None,
+        })
+        .collect();
 
     assert!(runs.len() >= 2, "expected several runs on the line");
     let baselines: Vec<f32> = runs.iter().map(|run| run.glyphs[0].y).collect();
@@ -233,8 +239,8 @@ fn text_still_shapes_when_the_named_family_is_missing() {
     assert_eq!(stack.families().len(), 2);
 
     let tree = lay_out("<body><p>text", 800.0);
-    let FragmentKind::Text(runs) = &lines(&tree)[0].children[0].kind else {
+    let FragmentKind::Text(run) = &lines(&tree)[0].children[0].kind else {
         panic!("expected text");
     };
-    assert!(runs.iter().any(|run| !run.glyphs.is_empty()));
+    assert!(!run.glyphs.is_empty());
 }

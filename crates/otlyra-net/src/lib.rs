@@ -30,7 +30,7 @@ pub mod url;
 
 pub use limits::Limits;
 pub use loader::{LoadRequest, LoadedResource, Loader, NetError};
-pub use url::normalize;
+pub use url::{normalize, resolve};
 
 /// Install the process-wide rustls crypto provider.
 ///

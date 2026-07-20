@@ -10,14 +10,23 @@
 //! A resize invalidates layout, because layout is a function of the width.
 
 use otlyra_dom::{Document, NodeData, NodeId};
-use otlyra_gfx::DisplayList;
-use otlyra_layout::{BoxTree, FragmentTree, build_box_tree};
+use otlyra_gfx::{DisplayItem, DisplayList};
+use otlyra_layout::{BoxId, BoxTree, FragmentTree, build_box_tree};
 use otlyra_text::TextEngine;
 
 /// A parsed document, laid out and painted.
 #[derive(Debug)]
 pub struct PageScene {
+    /// The document itself, kept because a click resolves to a box, a box to a
+    /// node, and a node's attributes are what say where a link goes.
+    document: Document,
     boxes: BoxTree,
+    /// The last frame's hit-test targets, in paint order, in window coordinates.
+    ///
+    /// Extracted from the display list rather than kept as a second structure: the
+    /// list is what was drawn, so a target taken from it cannot describe a place
+    /// nothing was painted.
+    targets: Vec<(otlyra_gfx::kurbo::Rect, BoxId)>,
     /// The last layout, and the width it was made at.
     layout: Option<(f32, FragmentTree)>,
     /// How far down the page the reader is, in logical pixels.
@@ -29,13 +38,20 @@ pub struct PageScene {
 
 impl PageScene {
     /// A scene showing `document`.
-    pub fn new(document: &Document) -> Self {
+    pub fn new(document: Document) -> Self {
         Self {
-            boxes: build_box_tree(document),
+            boxes: build_box_tree(&document),
+            document,
+            targets: Vec::new(),
             layout: None,
             scroll: 0.0,
             viewport_height: 0.0,
         }
+    }
+
+    /// The document behind the page.
+    pub fn document(&self) -> &Document {
+        &self.document
     }
 
     /// The box tree behind the page.
@@ -76,7 +92,67 @@ impl PageScene {
         if top != 0.0 {
             list.transform(otlyra_gfx::kurbo::Affine::translate((0.0, f64::from(top))));
         }
+
+        self.targets = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::HitTest {
+                    rect,
+                    transform,
+                    id,
+                } => Some((
+                    transform.transform_rect_bbox(*rect),
+                    otlyra_layout::box_id_from_u64(id.0),
+                )),
+                _ => None,
+            })
+            .collect();
+
         list
+    }
+
+    /// The topmost box at `point`, in window logical coordinates.
+    ///
+    /// Reads the last frame's targets: a click lands on what the user was looking
+    /// at, which is the frame that was on screen, not the one that would be built
+    /// now.
+    pub fn box_at(&self, x: f64, y: f64) -> Option<BoxId> {
+        let point = otlyra_gfx::kurbo::Point::new(x, y);
+        self.targets
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|(_, id)| *id)
+    }
+
+    /// The `href` of the link at `point`, if there is one.
+    ///
+    /// Walks up the box tree, because the text inside `<a><b>text</b></a>` belongs
+    /// to the `<b>` and the link is two boxes above it.
+    pub fn link_at(&self, x: f64, y: f64) -> Option<String> {
+        let mut current = self.box_at(x, y);
+        while let Some(id) = current {
+            let node = self.boxes.get(id)?;
+            if node.tag.as_ref().is_some_and(|tag| tag.as_ref() == "a")
+                && let Some(href) = node.node.and_then(|node| self.attribute(node, "href"))
+            {
+                return Some(href);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// One attribute of an element node.
+    fn attribute(&self, node: NodeId, name: &str) -> Option<String> {
+        self.document
+            .get(node)?
+            .element()?
+            .attrs
+            .iter()
+            .find(|attr| attr.name.local.as_ref() == name)
+            .map(|attr| attr.value.to_string())
     }
 
     /// Scroll by `delta` logical pixels, clamped to the content.
@@ -124,7 +200,7 @@ mod tests {
 
     fn scene(html: &str) -> (PageScene, TextEngine) {
         let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-        (PageScene::new(&parsed.document), TextEngine::isolated())
+        (PageScene::new(parsed.document), TextEngine::isolated())
     }
 
     fn glyph_ys(list: &DisplayList) -> Vec<f64> {
@@ -195,6 +271,68 @@ mod tests {
 
         let _ = scene.build_display_list(&mut text, 400.0, 600.0, 0.0);
         assert_eq!(scene.layout.as_ref().expect("laid out").0, 400.0);
+    }
+
+    /// The assertion that keeps clicking honest: the link's target is the
+    /// rectangle its text was drawn in, and nothing else on the page is.
+    #[test]
+    fn a_point_on_a_link_resolves_to_its_href() {
+        let (mut scene, mut text) =
+            scene("<body><p>before <a href=\"/next\">the link</a> after</p>");
+        let list = scene.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        // Find where the link's own run was drawn, from the display list itself.
+        let mut painter = RecordingPainter::new();
+        render(&list, &mut painter);
+        let ops = painter.take();
+        let blue = ops
+            .iter()
+            .filter_map(|op| match op {
+                PaintOp::DrawGlyphs {
+                    brush, transform, ..
+                } if *brush
+                    == otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
+                        0, 0, 0xee,
+                    )) =>
+                {
+                    Some(transform.as_coeffs())
+                }
+                _ => None,
+            })
+            .next()
+            .expect("the link is painted in the UA blue");
+
+        let (x, y) = (blue[4] + 4.0, blue[5] + 6.0);
+        assert_eq!(scene.link_at(x, y).as_deref(), Some("/next"));
+        assert_eq!(scene.link_at(x, y + 400.0), None, "below the text");
+        assert_eq!(scene.link_at(2.0, y), None, "before the link starts");
+    }
+
+    #[test]
+    fn a_link_around_other_elements_is_still_a_link() {
+        let (mut scene, mut text) = scene("<body><p><a href=\"/x\"><b>bold link</b></a>");
+        let _ = scene.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        // The narrowest target is the text run itself; the wide ones are the
+        // blocks it sits inside.
+        let hit = scene
+            .targets
+            .iter()
+            .map(|(rect, _)| *rect)
+            .min_by(|a, b| a.width().total_cmp(&b.width()))
+            .expect("something was drawn");
+        assert_eq!(
+            scene.link_at(hit.x0 + 2.0, hit.y0 + 2.0).as_deref(),
+            Some("/x"),
+            "the text belongs to the <b>, and the link is above it"
+        );
+    }
+
+    #[test]
+    fn an_anchor_without_an_href_is_not_a_link() {
+        let (mut scene, mut text) = scene("<body><p><a>not a link</a>");
+        let _ = scene.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(scene.link_at(10.0, 20.0), None);
     }
 
     #[test]

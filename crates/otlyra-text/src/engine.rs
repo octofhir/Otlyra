@@ -31,6 +31,16 @@ pub struct ShapedRun {
     pub brush: Brush,
     /// Which line of the paragraph the run belongs to.
     pub line: usize,
+    /// Where the run starts along its line, in logical pixels.
+    pub offset_x: f32,
+    /// How far the run advances.
+    pub advance: f32,
+    /// The byte range of the shaped text this run covers.
+    ///
+    /// Opaque here — this crate has no idea what the text came from — and the one
+    /// thing a caller needs to map a run back to whatever produced it. Hit testing
+    /// a link is that mapping.
+    pub text_range: std::ops::Range<usize>,
     /// The glyphs, in visual order.
     pub glyphs: Vec<Glyph>,
 }
@@ -271,6 +281,14 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
     let mut lines = Vec::new();
     let mut first_baseline = 0.0;
 
+    // How many of each parley run's clusters have already been handed out. A run
+    // spans line breaks and style changes, so the glyph runs that come back are
+    // slices of it, in order — and the byte range of a slice is only recoverable by
+    // walking the clusters alongside them. parley reports a range for the whole run,
+    // which is not the same thing and is what a naive reading gets wrong: with one
+    // font and one size, a paragraph of differently coloured links is *one* run.
+    let mut consumed: Vec<usize> = Vec::new();
+
     for (index, line) in layout.lines().enumerate() {
         let metrics = line.metrics();
         if index == 0 {
@@ -289,6 +307,13 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
             };
             let brush = glyph_run.style().brush;
             let run = glyph_run.run();
+
+            let run_index = run.index();
+            if consumed.len() <= run_index {
+                consumed.resize(run_index + 1, 0);
+            }
+            let text_range = consume_clusters(run, &mut consumed[run_index], glyph_run.advance());
+
             let glyphs: Vec<Glyph> = glyph_run
                 .positioned_glyphs()
                 .map(|glyph| Glyph {
@@ -308,6 +333,9 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
                 normalized_coords: run.normalized_coords().to_vec(),
                 brush,
                 line: index,
+                offset_x: glyph_run.offset(),
+                advance: glyph_run.advance(),
+                text_range,
                 glyphs,
             });
         }
@@ -323,6 +351,38 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
         runs,
         lines,
     }
+}
+
+/// Take clusters from `run`, starting at `from`, until they add up to `advance`,
+/// and report the byte range they cover.
+///
+/// Advances are floats and a slice of them will not sum exactly, so the comparison
+/// carries a half-pixel of slack; overshooting by one cluster would attribute a
+/// character to the wrong element, which for a link means the wrong destination.
+fn consume_clusters(
+    run: &parley::Run<'_, Brush>,
+    from: &mut usize,
+    advance: f32,
+) -> std::ops::Range<usize> {
+    let mut taken = 0.0;
+    let mut start = None;
+    let mut end = *from;
+
+    for cluster in run.clusters().skip(*from) {
+        if taken > 0.0 && taken + cluster.advance() > advance + 0.5 {
+            break;
+        }
+        let range = cluster.text_range();
+        start.get_or_insert(range.start);
+        end = range.end;
+        taken += cluster.advance();
+        *from += 1;
+        if taken >= advance - 0.5 {
+            break;
+        }
+    }
+
+    start.unwrap_or(end)..end
 }
 
 /// Register the vendored font under [`TEST_FAMILY`], overriding whatever family

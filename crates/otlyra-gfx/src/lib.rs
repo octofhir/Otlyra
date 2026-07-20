@@ -33,12 +33,14 @@
 //!    a provided method over the seven, or it does not go in.
 
 mod display_list;
+mod hit_test;
 mod paint_target;
 mod recording;
 mod render;
 mod skia;
 
 pub use display_list::{DisplayItem, DisplayList, FontId, FontTable, HitTestId, ImageResource};
+pub use hit_test::{Hit, hit_test, hit_test_all};
 pub use paint_target::{Glyph, PaintShape, PaintTarget};
 pub use peniko::ImageBrushRef;
 pub use recording::{PaintOp, RecordingPainter};

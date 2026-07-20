@@ -198,11 +198,36 @@ impl Modifiers {
     }
 }
 
+/// What the pointer should look like.
+///
+/// Three, because three is what the browser can currently justify: a link, text,
+/// and everything else. Each one is a promise that the thing under the pointer
+/// behaves that way.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    /// The ordinary arrow.
+    #[default]
+    Default,
+    /// Over something that navigates when clicked.
+    Pointer,
+    /// Over text.
+    Text,
+}
+
 /// The embedder's side of the boundary: given a target and a viewport, draw.
 pub trait Painter {
     /// React to a platform event. Default: ignore it.
     fn on_event(&mut self, event: PlatformEvent) {
         let _ = event;
+    }
+
+    /// What the pointer should look like now.
+    ///
+    /// Polled after every event rather than pushed, because the answer is a
+    /// function of state the painter already keeps — where the pointer is and what
+    /// is under it — and a push would be a second copy of that.
+    fn cursor(&self) -> Cursor {
+        Cursor::Default
     }
 
     /// Paint one frame. `target` has already been reset for this frame.

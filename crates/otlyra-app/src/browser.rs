@@ -5,7 +5,7 @@
 //! type owns the two of them and the one thing they share, the font engine.
 
 use otlyra_gfx::{PaintTarget, render};
-use otlyra_platform::{Painter, PlatformEvent, Viewport};
+use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport};
 use otlyra_text::TextEngine;
 
 use crate::page::{PageScene, title_of};
@@ -68,6 +68,8 @@ pub struct Browser<L: Loader> {
     /// The mark shown on an empty tab. `None` if it failed to decode, which is a
     /// cosmetic problem and not a reason to refuse to draw a frame.
     mark: Option<otlyra_gfx::peniko::ImageData>,
+    /// Where the pointer is, in window logical pixels.
+    pointer: (f64, f64),
 }
 
 impl<L: Loader> Browser<L> {
@@ -83,6 +85,7 @@ impl<L: Loader> Browser<L> {
             mark: otlyra_gfx::decode_image(crate::MARK)
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
+            pointer: (0.0, 0.0),
         }
     }
 
@@ -121,7 +124,7 @@ impl<L: Loader> Browser<L> {
                 let tab = &mut self.tabs[self.active];
                 tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
                 tab.url = final_url.clone();
-                tab.page = Some(PageScene::new(&parsed.document));
+                tab.page = Some(PageScene::new(parsed.document));
                 self.ui.address.set_text(final_url);
             }
             Err(error) => {
@@ -182,6 +185,21 @@ impl<L: Loader> Browser<L> {
         }
     }
 
+    /// The link under the pointer, resolved against the tab's own address.
+    ///
+    /// Resolution happens here rather than at the click, because the cursor has to
+    /// know as well, and a link that changes the cursor but goes nowhere — or the
+    /// reverse — is worse than neither.
+    fn link_under_pointer(&self) -> Option<String> {
+        let (x, y) = self.pointer;
+        if y < UI_HEIGHT {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        let href = tab.page.as_ref()?.link_at(x, y)?;
+        Some(otlyra_net::resolve(&tab.url, &href).unwrap_or(href))
+    }
+
     fn labels(&self) -> Vec<TabLabel> {
         self.tabs
             .iter()
@@ -196,9 +214,18 @@ impl<L: Loader> Browser<L> {
 impl<L: Loader> Painter for Browser<L> {
     fn on_event(&mut self, event: PlatformEvent) {
         match event {
-            PlatformEvent::PointerMoved { x, y } => self.ui.pointer_moved(x, y),
+            PlatformEvent::PointerMoved { x, y } => {
+                self.pointer = (x, y);
+                self.ui.pointer_moved(x, y);
+            }
 
             PlatformEvent::PointerPressed => {
+                // A link takes the press before the interface sees it, because the
+                // interface has nothing in the page area to claim it.
+                if let Some(url) = self.link_under_pointer() {
+                    self.navigate(&url);
+                    return;
+                }
                 // Width is not carried on the event, so the interface is asked
                 // against the geometry of the last frame — which is the frame the
                 // user was looking at when they pressed.
@@ -227,6 +254,14 @@ impl<L: Loader> Painter for Browser<L> {
 
             PlatformEvent::CloseRequested => tracing::info!("close requested"),
             _ => {}
+        }
+    }
+
+    fn cursor(&self) -> Cursor {
+        if self.link_under_pointer().is_some() {
+            Cursor::Pointer
+        } else {
+            Cursor::Default
         }
     }
 
@@ -419,6 +454,94 @@ mod tests {
         browser.ui.pointer_moved(400.0, 10.0);
         browser.on_event(PlatformEvent::Scroll { x: 0.0, y: 100.0 });
         assert_eq!(browser.tabs[0].page.as_ref().expect("page").scroll(), 0.0);
+    }
+
+    /// Clicking a link navigates, and the address it navigates to is resolved
+    /// against the page the link was on — a relative href is meaningless otherwise.
+    #[test]
+    fn clicking_a_link_navigates_to_it() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        let (x, y) = link_position(&browser);
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        assert_eq!(
+            browser.cursor(),
+            Cursor::Pointer,
+            "the pointer says so first"
+        );
+
+        browser.on_event(PlatformEvent::PointerPressed);
+        assert_eq!(browser.tabs[0].url, "https://start.example/next");
+    }
+
+    #[test]
+    fn the_cursor_is_ordinary_away_from_a_link() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
+        assert_eq!(browser.cursor(), Cursor::Default);
+
+        // And over the interface, where the page's links cannot reach.
+        browser.on_event(PlatformEvent::PointerMoved { x: 100.0, y: 10.0 });
+        assert_eq!(browser.cursor(), Cursor::Default);
+    }
+
+    #[test]
+    fn a_press_on_the_page_that_is_not_a_link_navigates_nowhere() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
+        browser.on_event(PlatformEvent::PointerPressed);
+        assert_eq!(browser.tabs[0].url, "https://start.example/");
+    }
+
+    /// A loader whose pages contain one link, so the click path has something to
+    /// land on.
+    struct LinkLoader;
+
+    impl Loader for LinkLoader {
+        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            // Anything that is not already an address on this host is treated as
+            // its root, which is what typing a bare hostname means.
+            let path = match url.strip_prefix("https://start.example") {
+                Some("") | None => "/",
+                Some(path) => path,
+            };
+            Ok((
+                b"<title>Linked</title><body><p><a href=\"/next\">go on</a></p>".to_vec(),
+                Some("utf-8".to_owned()),
+                format!("https://start.example{path}"),
+            ))
+        }
+    }
+
+    /// Where the link's text was actually painted, taken from the page's own
+    /// targets rather than guessed.
+    fn link_position(browser: &Browser<LinkLoader>) -> (f64, f64) {
+        let page = browser.tabs[browser.active].page.as_ref().expect("page");
+        let mut x = 0.0;
+        let mut y = 0.0;
+        for offset in 0..2000 {
+            let candidate_x = 4.0 + f64::from(offset);
+            let candidate_y = UI_HEIGHT + 30.0;
+            if page.link_at(candidate_x, candidate_y).is_some() {
+                x = candidate_x;
+                y = candidate_y;
+                break;
+            }
+        }
+        assert!(x > 0.0, "the link should be somewhere on the first line");
+        (x, y)
     }
 
     #[test]
