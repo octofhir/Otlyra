@@ -1,0 +1,23 @@
+[package]
+name = "otlyra-layout"
+description = "The box tree: a styled DOM turned into the tree layout operates on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+otlyra-css.workspace = true
+otlyra-dom.workspace = true
+html5ever.workspace = true
+slotmap.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+otlyra-html.workspace = true
+insta.workspace = true
+
+[lints]
+workspace = true

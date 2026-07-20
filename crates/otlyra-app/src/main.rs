@@ -65,6 +65,13 @@ struct Cli {
     #[arg(long, value_name = "PATH", num_args = 0..=1)]
     dump_dom: Option<Option<PathBuf>>,
 
+    /// Print the box tree instead of opening a window, then exit.
+    ///
+    /// The box tree is what the DOM becomes once the user-agent stylesheet has had
+    /// its say: `display: none` gone, anonymous blocks inserted, one style per box.
+    #[arg(long)]
+    dump_boxes: bool,
+
     /// Print the document's source instead of opening a window, then exit.
     #[arg(long)]
     dump_source: bool,
@@ -113,8 +120,8 @@ fn main() -> ExitCode {
         };
     }
 
-    if cli.dump_dom.is_some() || cli.dump_source {
-        eprintln!("otlyra: --dump-dom and --dump-source need a --url or a --file");
+    if cli.dump_dom.is_some() || cli.dump_source || cli.dump_boxes {
+        eprintln!("otlyra: --dump-dom, --dump-boxes and --dump-source need a --url or a --file");
         return ExitCode::FAILURE;
     }
 
@@ -216,6 +223,13 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
 
     if cli.dump_dom.is_some() {
         print!("{}", otlyra_dom::dump::serialize(&parsed.document));
+        return Ok(());
+    }
+
+    if cli.dump_boxes {
+        let tree = otlyra_layout::build_box_tree(&parsed.document);
+        eprintln!("{} boxes", tree.len());
+        print!("{}", otlyra_layout::dump::serialize(&tree));
         return Ok(());
     }
 

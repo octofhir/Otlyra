@@ -1,0 +1,18 @@
+[package]
+name = "otlyra-css"
+description = "Computed style values and the user-agent stylesheet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The colour type only. `peniko` is the geometry-and-brush vocabulary every layer
+# already speaks, so using it here saves a conversion at each boundary and adds
+# nothing to the build graph. It is not a dependency on the renderer.
+peniko.workspace = true
+
+[lints]
+workspace = true

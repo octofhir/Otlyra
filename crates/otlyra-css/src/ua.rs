@@ -1,0 +1,213 @@
+//! The user-agent stylesheet, written in Rust.
+//!
+//! Every browser has one, and it is the reason an unstyled `<h1>` is large and bold
+//! and a `<p>` has space around it. Ours is a `match` on the tag name rather than a
+//! parsed stylesheet because parsing CSS is M8 and getting pixels out of HTML must
+//! not wait for it. It is deliberately shaped like the stylesheet it will become:
+//! one arm per selector, values in the same units CSS uses.
+//!
+//! Source for the values: the HTML standard's rendering section, which is what the
+//! real UA stylesheets implement.
+
+use std::sync::Arc;
+
+use peniko::Color;
+
+use crate::style::{ComputedStyle, Display, Length, LengthOrAuto, Sides};
+
+/// `1em` expressed against the parent font size.
+fn em(style: &ComputedStyle, multiple: f32) -> LengthOrAuto {
+    LengthOrAuto::Px(style.font_size * multiple)
+}
+
+/// The style of the root: the initial containing block's text and background.
+pub fn initial_style() -> ComputedStyle {
+    ComputedStyle {
+        display: Display::Block,
+        background_color: Color::from_rgb8(0xff, 0xff, 0xff),
+        ..ComputedStyle::default()
+    }
+}
+
+/// The UA style for `element`, inheriting from `parent`.
+///
+/// An element the table does not know becomes `inline`, which is what the HTML
+/// standard says an unknown element is, and is why a page using tags we have never
+/// heard of still shows its text.
+pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
+    let mut style = ComputedStyle::inheriting_from(parent);
+
+    match element {
+        // Not rendered at all.
+        "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "template"
+        | "noscript" => style.display = Display::None,
+
+        "html" | "body" | "div" | "section" | "article" | "aside" | "header" | "footer"
+        | "main" | "nav" | "figure" | "figcaption" | "address" | "form" | "fieldset" | "dl"
+        | "dd" | "dt" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
+            style.display = Display::Block;
+        }
+
+        "p" => {
+            style.display = Display::Block;
+            style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
+        }
+
+        "blockquote" => {
+            style.display = Display::Block;
+            style.margin = Sides {
+                top: em(parent, 1.0),
+                right: LengthOrAuto::Px(40.0),
+                bottom: em(parent, 1.0),
+                left: LengthOrAuto::Px(40.0),
+            };
+        }
+
+        "ul" | "ol" => {
+            style.display = Display::Block;
+            style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
+            style.padding = Sides {
+                left: Length::Px(40.0),
+                ..Sides::all(Length::ZERO)
+            };
+        }
+
+        "li" => style.display = Display::Block,
+
+        "pre" => {
+            style.display = Display::Block;
+            style.font_family = Arc::from("monospace");
+            style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
+        }
+
+        "hr" => {
+            style.display = Display::Block;
+            style.margin = Sides::axes(LengthOrAuto::Px(8.0), LengthOrAuto::Auto);
+        }
+
+        // Headings: the standard's own sizes, as multiples of the parent font size,
+        // and the margins that go with them.
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let (scale, margin) = match element {
+                "h1" => (2.00, 0.67),
+                "h2" => (1.50, 0.83),
+                "h3" => (1.17, 1.00),
+                "h4" => (1.00, 1.33),
+                "h5" => (0.83, 1.67),
+                _ => (0.67, 2.33),
+            };
+            style.display = Display::Block;
+            style.font_size = parent.font_size * scale;
+            style.font_weight = 700;
+            style.margin = Sides::axes(
+                LengthOrAuto::Px(style.font_size * margin),
+                LengthOrAuto::Px(0.0),
+            );
+        }
+
+        "b" | "strong" => style.font_weight = 700,
+
+        "a" => style.color = Color::from_rgb8(0x00, 0x00, 0xee),
+
+        "code" | "kbd" | "samp" | "tt" => style.font_family = Arc::from("monospace"),
+
+        "small" => style.font_size = parent.font_size * 0.83,
+
+        // Everything else, including elements invented since this was written.
+        _ => style.display = Display::Inline,
+    }
+
+    style
+}
+
+/// Whether an element's *children* are rendered at all.
+///
+/// Separate from `display: none` because the reason differs: a `<script>`'s text is
+/// program source, not content, and no styling can make it text on the page.
+pub fn has_renderable_children(element: &str) -> bool {
+    !matches!(
+        element,
+        "script" | "style" | "template" | "noscript" | "iframe" | "object"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> ComputedStyle {
+        initial_style()
+    }
+
+    #[test]
+    fn the_table_assigns_the_displays_the_standard_does() {
+        let parent = root();
+        assert_eq!(ua_style("div", &parent).display, Display::Block);
+        assert_eq!(ua_style("p", &parent).display, Display::Block);
+        assert_eq!(ua_style("span", &parent).display, Display::Inline);
+        assert_eq!(ua_style("a", &parent).display, Display::Inline);
+        assert_eq!(ua_style("head", &parent).display, Display::None);
+        assert_eq!(ua_style("script", &parent).display, Display::None);
+    }
+
+    #[test]
+    fn an_unknown_element_is_inline() {
+        let style = ua_style("some-web-component", &root());
+        assert_eq!(style.display, Display::Inline);
+    }
+
+    #[test]
+    fn headings_are_larger_and_bolder_than_their_parent() {
+        let parent = root();
+        let h1 = ua_style("h1", &parent);
+        let h6 = ua_style("h6", &parent);
+
+        assert_eq!(h1.font_size, 32.0);
+        assert_eq!(h1.font_weight, 700);
+        assert!(h6.font_size < parent.font_size);
+        assert_eq!(h6.font_weight, 700);
+    }
+
+    /// Heading sizes are relative, so a heading inside a larger context is larger.
+    #[test]
+    fn font_sizes_compose_through_inheritance() {
+        let parent = ComputedStyle {
+            font_size: 20.0,
+            ..root()
+        };
+        assert_eq!(ua_style("h1", &parent).font_size, 40.0);
+
+        let big = ua_style("h1", &parent);
+        assert_eq!(
+            ua_style("span", &big).font_size,
+            40.0,
+            "an inline inside a heading inherits its size"
+        );
+    }
+
+    #[test]
+    fn paragraph_margins_are_one_em_of_the_parent() {
+        let parent = ComputedStyle {
+            font_size: 16.0,
+            ..root()
+        };
+        let paragraph = ua_style("p", &parent);
+        assert_eq!(paragraph.margin.top, LengthOrAuto::Px(16.0));
+        assert_eq!(paragraph.margin.left, LengthOrAuto::Px(0.0));
+    }
+
+    #[test]
+    fn links_are_blue_and_bold_elements_are_bold() {
+        let parent = root();
+        assert_eq!(ua_style("a", &parent).color, Color::from_rgb8(0, 0, 0xee));
+        assert_eq!(ua_style("strong", &parent).font_weight, 700);
+        assert_eq!(ua_style("em", &parent).font_weight, 400);
+    }
+
+    #[test]
+    fn script_and_style_children_are_never_content() {
+        assert!(!has_renderable_children("script"));
+        assert!(!has_renderable_children("style"));
+        assert!(has_renderable_children("div"));
+    }
+}

@@ -2140,6 +2140,7 @@ dependencies = [
  "otlyra-dom",
  "otlyra-gfx",
  "otlyra-html",
+ "otlyra-layout",
  "otlyra-net",
  "otlyra-platform",
  "otlyra-text",
@@ -2148,6 +2149,13 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "otlyra-css"
+version = "0.0.0"
+dependencies = [
+ "peniko",
 ]
 
 [[package]]
@@ -2180,6 +2188,19 @@ dependencies = [
  "encoding_rs",
  "html5ever",
  "otlyra-dom",
+ "tracing",
+]
+
+[[package]]
+name = "otlyra-layout"
+version = "0.0.0"
+dependencies = [
+ "html5ever",
+ "insta",
+ "otlyra-css",
+ "otlyra-dom",
+ "otlyra-html",
+ "slotmap",
  "tracing",
 ]
 

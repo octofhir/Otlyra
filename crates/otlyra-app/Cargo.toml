@@ -21,6 +21,7 @@ path = "src/lib.rs"
 otlyra-dom.workspace = true
 otlyra-gfx.workspace = true
 otlyra-html.workspace = true
+otlyra-layout.workspace = true
 otlyra-net.workspace = true
 otlyra-platform.workspace = true
 otlyra-text.workspace = true

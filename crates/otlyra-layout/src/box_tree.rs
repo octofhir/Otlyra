@@ -1,0 +1,216 @@
+//! The box tree: what the DOM becomes once style has had its say.
+//!
+//! It is a separate tree, not an annotation on the DOM, because the two do not
+//! correspond. One element can generate no box (`display: none`), one box
+//! (the common case) or several; and boxes exist that no element generated at all
+//! (anonymous boxes, below). Painting from the DOM is the shortcut that makes CSS
+//! impossible later.
+
+use std::sync::Arc;
+
+use html5ever::LocalName;
+use html5ever::tendril::StrTendril;
+use otlyra_css::ComputedStyle;
+use otlyra_dom::NodeId;
+use slotmap::{SecondaryMap, SlotMap, new_key_type};
+
+new_key_type! {
+    /// A handle to a box in a [`BoxTree`].
+    pub struct BoxId;
+}
+
+/// What kind of box this is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoxKind {
+    /// A block-level box: it stacks vertically and establishes or joins a block
+    /// formatting context.
+    Block,
+    /// An inline-level box: it flows in a line.
+    Inline,
+    /// Text. A leaf, always inline-level.
+    Text(StrTendril),
+}
+
+/// One box.
+#[derive(Clone, Debug)]
+pub struct BoxNode {
+    /// What it is.
+    pub kind: BoxKind,
+    /// Its computed style. Shared, because siblings usually agree.
+    pub style: Arc<ComputedStyle>,
+    /// The element or text node that generated it, absent for anonymous boxes.
+    pub node: Option<NodeId>,
+    /// The tag it came from. An interned atom, kept here so that dumping a tree, or
+    /// asking whether a box is a `<br>`, does not need the document back.
+    pub tag: Option<LocalName>,
+    /// Whether this box was invented to keep the tree well-formed.
+    pub anonymous: bool,
+    /// Children, in order.
+    pub children: Vec<BoxId>,
+    /// The parent, absent for the root.
+    pub parent: Option<BoxId>,
+}
+
+impl BoxNode {
+    /// Whether this box is block-level.
+    pub fn is_block_level(&self) -> bool {
+        matches!(self.kind, BoxKind::Block)
+    }
+
+    /// Whether this box is inline-level.
+    pub fn is_inline_level(&self) -> bool {
+        matches!(self.kind, BoxKind::Inline | BoxKind::Text(_))
+    }
+}
+
+/// An arena of boxes with one root.
+#[derive(Debug)]
+pub struct BoxTree {
+    boxes: SlotMap<BoxId, BoxNode>,
+    root: BoxId,
+    /// Which box each DOM node generated. Sparse: most documents have nodes that
+    /// generate none.
+    by_node: SecondaryMap<NodeId, BoxId>,
+}
+
+impl BoxTree {
+    /// A tree with a single root box carrying `style`.
+    pub fn new(style: Arc<ComputedStyle>) -> Self {
+        let mut boxes = SlotMap::with_key();
+        let root = boxes.insert(BoxNode {
+            kind: BoxKind::Block,
+            style,
+            node: None,
+            tag: None,
+            anonymous: false,
+            children: Vec::new(),
+            parent: None,
+        });
+        Self {
+            boxes,
+            root,
+            by_node: SecondaryMap::new(),
+        }
+    }
+
+    /// The root box.
+    pub fn root(&self) -> BoxId {
+        self.root
+    }
+
+    /// The box behind a handle.
+    pub fn get(&self, id: BoxId) -> Option<&BoxNode> {
+        self.boxes.get(id)
+    }
+
+    /// The box behind a handle.
+    ///
+    /// # Panics
+    ///
+    /// If the handle is stale.
+    pub fn node(&self, id: BoxId) -> &BoxNode {
+        &self.boxes[id]
+    }
+
+    /// How many boxes the tree holds.
+    pub fn len(&self) -> usize {
+        self.boxes.len()
+    }
+
+    /// Whether the tree is nothing but its root.
+    pub fn is_empty(&self) -> bool {
+        self.boxes.len() <= 1
+    }
+
+    /// The box a DOM node generated, if it generated one.
+    pub fn box_for(&self, node: NodeId) -> Option<BoxId> {
+        self.by_node.get(node).copied()
+    }
+
+    /// Add a box under `parent`.
+    pub fn push(&mut self, parent: BoxId, node: BoxNode) -> BoxId {
+        let dom_node = node.node;
+        let id = self.boxes.insert(BoxNode {
+            parent: Some(parent),
+            ..node
+        });
+        self.boxes[parent].children.push(id);
+        if let Some(dom_node) = dom_node {
+            self.by_node.insert(dom_node, id);
+        }
+        id
+    }
+
+    /// Replace `parent`'s children wholesale. Used by the anonymous-box fixup,
+    /// which rewrites a child list rather than editing it in place.
+    pub(crate) fn set_children(&mut self, parent: BoxId, children: Vec<BoxId>) {
+        for &child in &children {
+            self.boxes[child].parent = Some(parent);
+        }
+        self.boxes[parent].children = children;
+    }
+
+    /// Create a detached anonymous box of `kind` carrying `style`.
+    pub(crate) fn create_anonymous(&mut self, kind: BoxKind, style: Arc<ComputedStyle>) -> BoxId {
+        self.boxes.insert(BoxNode {
+            kind,
+            style,
+            node: None,
+            tag: None,
+            anonymous: true,
+            children: Vec::new(),
+            parent: None,
+        })
+    }
+
+    /// Every box under `id`, depth first, `id` included.
+    pub fn descendants(&self, id: BoxId) -> Vec<BoxId> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            out.push(current);
+            let children = &self.boxes[current].children;
+            stack.extend(children.iter().rev().copied());
+        }
+        out
+    }
+}
+
+/// The invariant that makes block and inline layout separable: a box's children are
+/// either all block-level or all inline-level, never both.
+///
+/// Returns the first box that breaks it. This is a checker rather than an assertion
+/// inside the builder because it has to hold for trees the builder did not produce
+/// — including, later, trees a DOM mutation has edited.
+pub fn first_box_with_mixed_children(tree: &BoxTree) -> Option<BoxId> {
+    tree.descendants(tree.root()).into_iter().find(|&id| {
+        let children = &tree.node(id).children;
+        let blocks = children
+            .iter()
+            .filter(|&&child| tree.node(child).is_block_level())
+            .count();
+        blocks != 0 && blocks != children.len()
+    })
+}
+
+/// Why the box tree, or part of it, has to be rebuilt.
+///
+/// Named from the first day, and never merged into a bare boolean, because "why did
+/// we rebuild four hundred times" has to stay answerable. Servo and Ladybird both
+/// arrived at this and Ladybird spells its version out in an enum macro.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidationReason {
+    /// A document was parsed or replaced.
+    DocumentLoaded,
+    /// The viewport changed size.
+    ViewportResized,
+    /// A node was inserted into the DOM.
+    NodeInserted,
+    /// A node was removed from the DOM.
+    NodeRemoved,
+    /// A node's text changed.
+    TextChanged,
+    /// An attribute changed, so style may have.
+    AttributeChanged,
+}
