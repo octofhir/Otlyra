@@ -35,6 +35,8 @@
            color: #909; padding: 4px; }
   .centred { width: 300px; margin: 8px auto; background: #eee; }
   .pushed { width: 200px; margin-left: auto; background: #eee; }
+  .chip { border: 2px solid #c30; padding: 2px 8px; background: #fed; }
+  .tint { background: #cef; }
   .middle { text-align: center; }
   .right { text-align: right; }
 
@@ -54,7 +56,9 @@ origin, specificity and source order, with <code>!important</code>,
 inheritance, <code>calc()</code>, custom properties and media queries.</p>
 <p><strong>Boxes</strong>: colours, fonts, margins — including <code>auto</code>
 margins, which is how a box is centred — padding, borders per side, widths and
-heights, and <code>text-align</code>.</p>
+heights, and <code>text-align</code>. On an <strong>inline</strong> box too:
+its padding and borders take room in the line, and a box broken over two lines
+keeps the border on the edge each piece owns.</p>
 <p>Selector <strong>matching</strong>, over our own DOM:
 type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 <code>*=</code>), the four combinators, structural pseudo-classes, and
@@ -65,9 +69,9 @@ match" against a real document.</p>
 <h2>What does not work yet</h2>
 <p>A rule the cascade computes correctly can still change nothing, because
 layout reads a subset of what CSS defines: positioning, floats, flex and grid
-have no formatting context behind them, an unsupported <code>display</code> lays
-out as a block, and padding and borders on an <em>inline</em> box are ignored —
-which is why the controls above are framed tight against their text. Border
+have no formatting context behind them, and an unsupported <code>display</code>
+lays out as a block. An inline box is as tall as the line it sits on rather than
+as tall as its own text, and <code>vertical-align</code> does not exist. Border
 styles other than solid are drawn solid. External <code>&lt;link&gt;</code>
 stylesheets are not fetched, and a restyle recomputes the whole document rather
 than the part that changed.</p>
@@ -80,6 +84,11 @@ than the part that changed.</p>
 <div class="pushed">200px wide, pushed right by one auto margin.</div>
 <p class="middle">Centred text.</p>
 <p class="right">Right-aligned text.</p>
+<p>An inline box with a <span class="chip">border, padding</span> and a
+background of its own, and a <span class="tint">tinted one</span> the shaper
+gives no run of its own. A <span class="chip">longer one, written so that it
+runs past the edge of the line and has to be broken in two</span> is drawn as
+two pieces, open where the break is.</p>
 
 <h2>Elements the rules above are written against</h2>
 <section class="box" id="unique">
