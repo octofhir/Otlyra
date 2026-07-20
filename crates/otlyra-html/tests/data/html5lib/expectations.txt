@@ -1,0 +1,5 @@
+# Tree-construction cases we knowingly fail, one `file:index` per line with the
+# reason after it. Checked in both directions: an unlisted failure fails the
+# build, and so does a listed case that has started passing.
+#
+# Empty. Every case the runner executes currently passes.
