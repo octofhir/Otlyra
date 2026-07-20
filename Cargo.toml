@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = ["crates/otlyra-app", "crates/otlyra-gfx", "crates/otlyra-platform"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/octofhir/Otlyra"
+
+# Every version is pinned exactly. No wildcards, no unpinned git dependencies.
+[workspace.dependencies]
+otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
+otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
+
+# Windowing and GPU surface. Both are wrapped by otlyra-platform: neither may
+# appear in that crate's public API.
+#
+# `default-features = false` drops winit's X11 and Wayland backends. They are inert
+# on macOS but drag in the whole wayland-scanner/quick-xml and sctk-adwaita/ttf-parser
+# tree, which carries live advisories. Linux support re-enables them per target.
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+wgpu = "=30.0.0"
+raw-window-handle = "=0.6.2"
+
+# 2D rasterizer, behind the PaintTarget seam.
+skia-safe = "=0.99.0"
+
+# Geometry and brush vocabulary shared by every PaintTarget backend.
+kurbo = "=0.13.1"
+peniko = "=0.6.1"
+
+# Observability.
+tracing = { version = "=0.1.44", features = ["log"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+
+# Data structures.
+smallvec = { version = "=1.15.2", features = ["union"] }
+rustc-hash = "=2.1.3"
+slotmap = "=1.1.1"
+
+# CLI and error plumbing.
+clap = { version = "=4.6.2", features = ["derive"] }
+thiserror = "=2.0.19"
+pollster = "=1.0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = "debuginfo"
