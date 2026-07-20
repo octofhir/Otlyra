@@ -10,7 +10,7 @@
 //! drawn in one place and clicked in another is the classic interface bug, and it
 //! is only possible when two pieces of code each work the geometry out.
 
-use otlyra_gfx::kurbo::{Affine, RoundedRect, Shape};
+use otlyra_gfx::kurbo::{Affine, Arc, BezPath, Point, RoundedRect, Shape, Stroke};
 use otlyra_gfx::peniko::{Brush, Color, Fill, ImageData, ImageSampler};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_platform::{Key, Modifiers};
@@ -22,6 +22,9 @@ const TAB_STRIP_HEIGHT: f64 = 34.0;
 const ADDRESS_BAR_HEIGHT: f64 = 38.0;
 /// Total height the interface takes from the top of the window.
 pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + ADDRESS_BAR_HEIGHT;
+
+/// Width of the reload button, at the left end of the tab strip.
+const RELOAD_WIDTH: f64 = 30.0;
 
 const TAB_WIDTH: f64 = 200.0;
 const TAB_GAP: f64 = 2.0;
@@ -73,6 +76,8 @@ impl Rect {
 /// Where every part of the interface is, for one window width.
 #[derive(Clone, Debug)]
 pub struct UiLayout {
+    /// The reload button.
+    pub reload: Rect,
     /// One rectangle per tab, in order.
     pub tabs: Vec<Rect>,
     /// The close target inside each tab.
@@ -89,9 +94,12 @@ impl UiLayout {
         let mut tabs = Vec::with_capacity(tab_count);
         let mut closes = Vec::with_capacity(tab_count);
 
+        let reload = Rect::new(PADDING, 6.0, RELOAD_WIDTH - 6.0, TAB_STRIP_HEIGHT - 10.0);
+        let strip_start = reload.x + reload.width + TAB_GAP * 3.0;
+
         // Tabs shrink to fit rather than overflowing: a tab you cannot see is a tab
         // you cannot close.
-        let available = (width - NEW_TAB_WIDTH - PADDING * 2.0).max(0.0);
+        let available = (width - strip_start - NEW_TAB_WIDTH - PADDING).max(0.0);
         let each = if tab_count == 0 {
             TAB_WIDTH
         } else {
@@ -101,7 +109,7 @@ impl UiLayout {
         };
 
         for index in 0..tab_count {
-            let x = PADDING + index as f64 * (each + TAB_GAP);
+            let x = strip_start + index as f64 * (each + TAB_GAP);
             let rect = Rect::new(x, 4.0, each, TAB_STRIP_HEIGHT - 4.0);
             closes.push(Rect::new(
                 rect.x + rect.width - 22.0,
@@ -114,8 +122,9 @@ impl UiLayout {
 
         let new_tab_x = tabs
             .last()
-            .map_or(PADDING, |last| last.x + last.width + TAB_GAP);
+            .map_or(strip_start, |last| last.x + last.width + TAB_GAP);
         Self {
+            reload,
             new_tab: Rect::new(new_tab_x, 6.0, NEW_TAB_WIDTH - 6.0, TAB_STRIP_HEIGHT - 10.0),
             address: Rect::new(
                 PADDING,
@@ -300,6 +309,10 @@ impl BrowserUi {
 
         let layout = UiLayout::new(width, tab_count);
 
+        if layout.reload.contains(x, y) {
+            return UiAction::Reload;
+        }
+
         for (index, close) in layout.closes.iter().enumerate() {
             if close.contains(x, y) {
                 return UiAction::CloseTab(index);
@@ -412,6 +425,7 @@ impl BrowserUi {
         let stack = FontStack::parse_css("system-ui, sans-serif");
 
         fill(list, Rect::new(0.0, 0.0, width, UI_HEIGHT), BACKGROUND, 0.0);
+        draw_reload(list, layout.reload);
 
         for (index, (rect, label)) in layout.tabs.iter().zip(tabs).enumerate() {
             let active = index == active;
@@ -610,6 +624,56 @@ fn draw_centred_text(
     );
 }
 
+/// The reload button: a circular arrow, drawn rather than typed.
+///
+/// A glyph would be at the mercy of whichever font the system hands back, and a
+/// missing glyph is a hollow box where the button should be. A path is the same
+/// on every machine.
+fn draw_reload(list: &mut DisplayList, rect: Rect) {
+    fill(list, rect, TAB_INACTIVE, 6.0);
+
+    let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let radius = rect.width.min(rect.height) / 2.0 - 4.0;
+
+    // Five sixths of a circle, leaving a gap for the arrowhead to sit in.
+    let start = -0.9;
+    let sweep = 5.2;
+    list.push(DisplayItem::Stroke {
+        style: Stroke::new(1.6),
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(INK),
+        brush_transform: None,
+        shape: Arc::new(centre, (radius, radius), start, sweep, 0.0).to_path(0.05),
+    });
+
+    // The arrowhead sits on the arc's end, pointing along it — computed from the
+    // same angle the arc ends at, so the two cannot drift apart when either is
+    // adjusted.
+    let end = start + sweep;
+    let tip = Point::new(centre.x + radius * end.cos(), centre.y + radius * end.sin());
+    let along = Point::new(-end.sin(), end.cos());
+    let across = Point::new(end.cos(), end.sin());
+    let size = 4.0;
+    let mut head = BezPath::new();
+    head.move_to(Point::new(tip.x + along.x * size, tip.y + along.y * size));
+    head.line_to(Point::new(
+        tip.x - along.x * size * 0.4 + across.x * size,
+        tip.y - along.y * size * 0.4 + across.y * size,
+    ));
+    head.line_to(Point::new(
+        tip.x - along.x * size * 0.4 - across.x * size,
+        tip.y - along.y * size * 0.4 - across.y * size,
+    ));
+    head.close_path();
+    list.push(DisplayItem::Fill {
+        style: Fill::NonZero,
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(INK),
+        brush_transform: None,
+        shape: head,
+    });
+}
+
 /// A filled, optionally rounded rectangle.
 fn fill(list: &mut DisplayList, rect: Rect, color: Color, radius: f64) {
     let shape = if radius > 0.0 {
@@ -669,6 +733,24 @@ mod tests {
                 loading: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn pressing_the_reload_button_reloads() {
+        let mut ui = BrowserUi::new();
+        let layout = UiLayout::new(1000.0, 2);
+
+        ui.pointer_moved(layout.reload.x + 4.0, layout.reload.y + 4.0);
+        assert_eq!(ui.pointer_pressed(1000.0, 2), UiAction::Reload);
+    }
+
+    /// The button sits before the tabs and must not overlap the first of them —
+    /// the bug where reload closes a tab instead.
+    #[test]
+    fn the_reload_button_is_clear_of_the_first_tab() {
+        let layout = UiLayout::new(1000.0, 3);
+        assert!(layout.reload.x < layout.tabs[0].x);
+        assert!(layout.reload.x + layout.reload.width <= layout.tabs[0].x);
     }
 
     #[test]
