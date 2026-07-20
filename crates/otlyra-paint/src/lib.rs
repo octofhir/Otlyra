@@ -105,6 +105,8 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                     .to_path(PATH_TOLERANCE),
                 });
             }
+
+            paint_borders(list, fragment, rect, scroll_y);
         }
 
         FragmentKind::Line => {}
@@ -117,8 +119,13 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
             // An inline element's background. Inline boxes generate no box
             // fragment — only the runs their text landed in — so the background of
             // a `<mark>` or a `<button>` has to be painted here or nowhere.
+            //
+            // Only an inline one: a run inside a block carries the block's style,
+            // and painting from it would draw the block's background and border a
+            // second time, around the text rather than around the box.
+            let inline = fragment.style.display == otlyra_layout::Display::Inline;
             let background = fragment.style.background_color;
-            if background.components[3] > 0.0 {
+            if inline && background.components[3] > 0.0 {
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
                     transform: Affine::IDENTITY,
@@ -132,6 +139,18 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                     )
                     .to_path(PATH_TOLERANCE),
                 });
+            }
+
+            // And its borders, for the same reason. The rectangle is the run's,
+            // so an inline element broken across two lines gets a border round
+            // each piece rather than round the whole of it.
+            if inline {
+                paint_borders(
+                    list,
+                    fragment,
+                    otlyra_layout::Rect::new(rect.x, rect.y, run.advance, rect.height),
+                    scroll_y,
+                );
             }
 
             // Decorations first, so the glyphs sit on top of them: a line drawn
@@ -172,6 +191,56 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
 }
 
 /// The colour a shaped run carried, back as a paint colour.
+/// The four borders of a box, each as a filled rectangle on the inside edge of the
+/// border box.
+///
+/// Rectangles rather than a stroked outline, because each side has its own width
+/// and colour and a stroke has one of each. The corners are square: mitring them
+/// needs the four trapezia CSS specifies, and the difference only shows where two
+/// adjacent sides differ in colour and are thick enough to see.
+fn paint_borders(
+    list: &mut DisplayList,
+    fragment: &Fragment,
+    rect: otlyra_layout::Rect,
+    scroll_y: f32,
+) {
+    let border = fragment.style.border;
+    let (left, top) = (f64::from(rect.x), f64::from(rect.y - scroll_y));
+    let (right, bottom) = (f64::from(rect.right()), f64::from(rect.bottom() - scroll_y));
+
+    let sides = [
+        (
+            border.top,
+            [left, top, right, top + f64::from(border.top.width)],
+        ),
+        (
+            border.right,
+            [right - f64::from(border.right.width), top, right, bottom],
+        ),
+        (
+            border.bottom,
+            [left, bottom - f64::from(border.bottom.width), right, bottom],
+        ),
+        (
+            border.left,
+            [left, top, left + f64::from(border.left.width), bottom],
+        ),
+    ];
+
+    for (side, [x0, y0, x1, y1]) in sides {
+        if !side.is_visible() {
+            continue;
+        }
+        list.push(DisplayItem::Fill {
+            style: Fill::NonZero,
+            transform: Affine::IDENTITY,
+            brush: Brush::Solid(side.color),
+            brush_transform: None,
+            shape: KurboRect::new(x0, y0, x1, y1).to_path(PATH_TOLERANCE),
+        });
+    }
+}
+
 fn brush_to_color(brush: [u8; 4]) -> Color {
     Color::from_rgba8(brush[0], brush[1], brush[2], brush[3])
 }
@@ -298,5 +367,97 @@ mod tests {
                 pair[1]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod border_tests {
+    use otlyra_css::cascade::{Viewport as StyleViewport, style_document};
+    use otlyra_layout::{Viewport, build_styled_box_tree, layout};
+    use otlyra_text::TextEngine;
+
+    use super::*;
+
+    /// The display list for a styled document, at a fixed viewport.
+    fn list_for(html: &str) -> DisplayList {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styles = style_document(&document, StyleViewport::default());
+        let boxes = build_styled_box_tree(&document, &styles);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        build_display_list(&fragments, (800.0, 600.0), 0.0)
+    }
+
+    /// Every rectangle filled in `colour`, as (x0, y0, x1, y1).
+    ///
+    /// By colour, because a page always paints a canvas and a body background too,
+    /// and a test about borders should not count them.
+    fn rects(list: &DisplayList, colour: Color) -> Vec<[f64; 4]> {
+        list.items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Fill {
+                    shape,
+                    brush: Brush::Solid(fill),
+                    ..
+                } if *fill == colour => {
+                    let bounds = shape.bounding_box();
+                    Some([bounds.x0, bounds.y0, bounds.x1, bounds.y1])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const RED: Color = Color::from_rgb8(255, 0, 0);
+    const BLUE: Color = Color::from_rgb8(0, 0, 255);
+
+    /// Four sides, four rectangles, each the width it was asked for.
+    #[test]
+    fn each_border_side_is_painted_at_its_own_width() {
+        let list = list_for(
+            "<style>body { margin: 0 } div { border-top: 4px solid red; \
+             border-left: 10px solid blue }</style><div>text</div>",
+        );
+        let top = rects(&list, RED);
+        assert_eq!(top.len(), 1, "expected one red side, got {top:?}");
+        assert_eq!(top[0], [0.0, 0.0, 800.0, 4.0]);
+
+        let left = rects(&list, BLUE);
+        assert_eq!(left.len(), 1, "expected one blue side, got {left:?}");
+        assert_eq!(left[0][0], 0.0);
+        assert_eq!(left[0][2], 10.0);
+    }
+
+    /// A border whose style is `none` is zero wide however wide it was declared,
+    /// so nothing is drawn and nothing moves.
+    #[test]
+    fn a_border_with_no_style_paints_nothing() {
+        let list = list_for(
+            "<style>body { margin: 0 } div { border: 10px none red }</style><div>text</div>",
+        );
+        assert!(
+            rects(&list, RED).is_empty(),
+            "a border with no style was painted"
+        );
+    }
+
+    /// A run inside a block carries that block's style. Painting a border from it
+    /// would frame the text rather than the box — twice over, once per line.
+    #[test]
+    fn a_blocks_border_is_painted_once_and_not_around_its_text() {
+        let list = list_for(
+            "<style>body { margin: 0 } p { border: 2px solid red }</style>\
+             <p>a line of text long enough to be its own run</p>",
+        );
+        let sides = rects(&list, RED);
+        assert_eq!(sides.len(), 4, "expected four sides, got {sides:?}");
     }
 }
