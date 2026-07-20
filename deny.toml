@@ -1,0 +1,45 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+
+[licenses]
+version = 2
+# Every license we are prepared to ship. Adding one is a deliberate act: it changes
+# what obligations the binary carries.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "ISC",
+    "BSL-1.0",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# Skia itself is BSD-3-Clause; the bindings are MIT. Both are allowed above, but
+# the crate's own expression is unhelpful, so it is pinned explicitly.
+name = "skia-bindings"
+allow = ["MIT", "BSD-3-Clause"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
