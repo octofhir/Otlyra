@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
+use otlyra_app::browser::Browser;
 use otlyra_app::menu::menu_bar;
 use otlyra_app::scene::DemoScene;
 use otlyra_app::{observability, run_window, write_screenshot};
@@ -155,16 +156,13 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.screenshot.as_deref() {
+        // The golden image is the demo scene: it is the one frame whose every pixel
+        // is ours, with no system font and no network in it.
         Some(path) => write_screenshot(&mut scene, viewport, path),
-        None => run_window(
-            WindowConfig {
-                title: "Otlyra".to_owned(),
-                logical_size: (f64::from(cli.width), f64::from(cli.height)),
-                menu_bar: menu_bar(),
-                icon: Some(otlyra_app::ICON),
-            },
-            &mut scene,
-        ),
+        None => {
+            let mut browser = Browser::new(NetLoader::default());
+            run_window(window_config(&cli), &mut browser)
+        }
     };
 
     match result {
@@ -254,27 +252,64 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
 
-    let title = otlyra_app::page::title_of(&parsed.document);
-    let mut page = otlyra_app::page::PageScene::new(&parsed.document);
-    eprintln!("{} boxes", page.boxes().len());
+    // A document was named on the command line, and nothing asked for a dump: open
+    // the browser with it already loaded.
+    let mut browser = Browser::new(NetLoader::default());
+    browser.navigate(&match &source {
+        Source::Url(url) => url.clone(),
+        Source::File(path) => path.display().to_string(),
+    });
 
     match cli.screenshot.as_deref() {
-        Some(path) => write_screenshot(&mut page, cli.viewport(), path)?,
-        None => run_window(
-            WindowConfig {
-                title: match (&title, &source) {
-                    (Some(title), _) => format!("{title} — Otlyra"),
-                    (None, Source::Url(url)) => format!("{url} — Otlyra"),
-                    (None, Source::File(path)) => format!("{} — Otlyra", path.display()),
-                },
-                logical_size: (f64::from(cli.width), f64::from(cli.height)),
-                menu_bar: menu_bar(),
-                icon: Some(otlyra_app::ICON),
-            },
-            &mut page,
-        )?,
+        Some(path) => write_screenshot(&mut browser, cli.viewport(), path)?,
+        None => run_window(window_config(cli), &mut browser)?,
     }
     Ok(())
+}
+
+/// How the shell configures its window.
+fn window_config(cli: &Cli) -> WindowConfig {
+    WindowConfig {
+        title: "Otlyra".to_owned(),
+        logical_size: (f64::from(cli.width), f64::from(cli.height)),
+        menu_bar: menu_bar(),
+        icon: Some(otlyra_app::ICON),
+    }
+}
+
+/// The real loader: `otlyra-net` over HTTP, or the filesystem for a path.
+///
+/// A path is accepted because typing one into the address bar is how a local test
+/// page gets opened, and because `file://` as a URL scheme has rules of its own
+/// (§14) that are not written yet.
+#[derive(Default)]
+struct NetLoader {
+    loader: Option<otlyra_net::Loader>,
+}
+
+impl otlyra_app::browser::Loader for NetLoader {
+    fn load(&mut self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        let path = std::path::Path::new(input);
+        if path.exists() {
+            let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+            return Ok((bytes, None, input.to_owned()));
+        }
+
+        otlyra_net::install_crypto_provider();
+        let url = otlyra_net::normalize(input).map_err(|error| error.to_string())?;
+        let loader = match self.loader.as_ref() {
+            Some(loader) => loader,
+            None => self
+                .loader
+                .insert(otlyra_net::Loader::new().map_err(|error| error.to_string())?),
+        };
+
+        let resource = loader
+            .fetch_blocking(otlyra_net::LoadRequest::new(url))
+            .map_err(|error| error.to_string())?;
+        let charset = resource.charset();
+        Ok((resource.body, charset, resource.final_url))
+    }
 }
 
 /// Fetch one URL.

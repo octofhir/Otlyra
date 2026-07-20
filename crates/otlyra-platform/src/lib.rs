@@ -102,10 +102,100 @@ pub enum PlatformEvent {
         /// Vertical delta in logical pixels.
         y: f64,
     },
+    /// The pointer moved to this position, in logical pixels from the top left of
+    /// the drawable.
+    PointerMoved {
+        /// Horizontal position.
+        x: f64,
+        /// Vertical position.
+        y: f64,
+    },
+    /// The primary pointer button went down at the last reported position.
+    PointerPressed,
+    /// The primary pointer button came up.
+    PointerReleased,
+    /// A key went down.
+    KeyPressed {
+        /// Which key, in a vocabulary that does not depend on the keyboard layout.
+        key: Key,
+        /// Modifiers held at the time.
+        modifiers: Modifiers,
+    },
+    /// The user typed text. Separate from [`PlatformEvent::KeyPressed`] because
+    /// what a key *inserts* depends on layout, dead keys and the input method,
+    /// and the answer is the platform's to give.
+    TextInput(char),
     /// The user asked to close the window. The loop exits after this is delivered.
     CloseRequested,
     /// The user chose a menu item the embedder defined.
     MenuCommand(MenuId),
+}
+
+/// The keys the browser acts on by identity rather than by what they type.
+///
+/// Deliberately small. A key with no consumer is a translation this layer would
+/// have to keep honest for nothing; the rest arrive as
+/// [`PlatformEvent::TextInput`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Key {
+    /// Return or Enter.
+    Enter,
+    /// Backspace.
+    Backspace,
+    /// Delete forward.
+    Delete,
+    /// Escape.
+    Escape,
+    /// Tab.
+    Tab,
+    /// Left arrow.
+    Left,
+    /// Right arrow.
+    Right,
+    /// Up arrow.
+    Up,
+    /// Down arrow.
+    Down,
+    /// Home.
+    Home,
+    /// End.
+    End,
+    /// Page up.
+    PageUp,
+    /// Page down.
+    PageDown,
+    /// A printable character, identified by what an unmodified press would type.
+    /// Used for shortcuts: `Cmd+T` arrives as `Character('t')`.
+    Character(char),
+}
+
+/// Modifier keys held during an event.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Modifiers {
+    /// Shift.
+    pub shift: bool,
+    /// Control.
+    pub control: bool,
+    /// Alt, or Option.
+    pub alt: bool,
+    /// The platform's command key: Command on macOS, the Windows key elsewhere.
+    pub command: bool,
+}
+
+impl Modifiers {
+    /// Whether this is the platform's "do the menu action" modifier and nothing
+    /// else — Command on macOS, Control elsewhere.
+    pub fn is_accelerator(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.command && !self.control && !self.alt
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.control && !self.command && !self.alt
+        }
+    }
 }
 
 /// The embedder's side of the boundary: given a target and a viewport, draw.

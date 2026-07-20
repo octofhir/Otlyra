@@ -22,6 +22,32 @@ const LINE_SCROLL: f64 = 40.0;
 /// How many frames in a row the swapchain may refuse before we stop asking.
 const MAX_DROPPED_FRAMES: u32 = 8;
 
+/// Translate a winit key into our own vocabulary. `None` for keys nothing acts on.
+fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
+    use winit::keyboard::{Key as WinitKey, NamedKey};
+
+    Some(match key {
+        WinitKey::Named(named) => match named {
+            NamedKey::Enter => crate::Key::Enter,
+            NamedKey::Backspace => crate::Key::Backspace,
+            NamedKey::Delete => crate::Key::Delete,
+            NamedKey::Escape => crate::Key::Escape,
+            NamedKey::Tab => crate::Key::Tab,
+            NamedKey::ArrowLeft => crate::Key::Left,
+            NamedKey::ArrowRight => crate::Key::Right,
+            NamedKey::ArrowUp => crate::Key::Up,
+            NamedKey::ArrowDown => crate::Key::Down,
+            NamedKey::Home => crate::Key::Home,
+            NamedKey::End => crate::Key::End,
+            NamedKey::PageUp => crate::Key::PageUp,
+            NamedKey::PageDown => crate::Key::PageDown,
+            _ => return None,
+        },
+        WinitKey::Character(text) => crate::Key::Character(text.chars().next()?),
+        _ => return None,
+    })
+}
+
 /// Menu activations arrive on muda's own callback, off winit's event path, so they
 /// are forwarded through the event loop proxy. Without this the loop would sit in
 /// `Wait` and the menu would appear to do nothing until the next mouse move.
@@ -97,6 +123,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         rasterizer: None,
         menu: None,
         frames: 0,
+        modifiers: crate::Modifiers::default(),
         dropped_frames: 0,
         failure: None,
     };
@@ -120,6 +147,9 @@ struct WindowedApp<'p> {
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
     frames: u64,
+    /// Modifier state, tracked here because winit reports it as its own event and
+    /// every key press needs it.
+    modifiers: crate::Modifiers,
     /// Consecutive frames the swapchain refused, so retrying stays bounded.
     dropped_frames: u32,
     /// First fatal error, so `run` can return it once the loop unwinds. An
@@ -143,6 +173,18 @@ impl WindowedApp<'_> {
             self.failure = Some(error);
         }
         event_loop.exit();
+    }
+
+    /// Hand an event up and ask for a frame.
+    ///
+    /// Every input event may change what is on screen, and the loop blocks in
+    /// `Wait`: an event nobody follows with a redraw request is an event the user
+    /// sees no result from.
+    fn deliver(&mut self, event: PlatformEvent) {
+        self.painter.on_event(event);
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     fn redraw(&mut self) -> Result<Presented, PlatformError> {
@@ -288,6 +330,55 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                self.modifiers = crate::Modifiers {
+                    shift: state.shift_key(),
+                    control: state.control_key(),
+                    alt: state.alt_key(),
+                    command: state.super_key(),
+                };
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.viewport().scale_factor;
+                self.deliver(PlatformEvent::PointerMoved {
+                    x: position.x / scale,
+                    y: position.y / scale,
+                });
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == winit::event::MouseButton::Left {
+                    self.deliver(match state {
+                        winit::event::ElementState::Pressed => PlatformEvent::PointerPressed,
+                        winit::event::ElementState::Released => PlatformEvent::PointerReleased,
+                    });
+                }
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != winit::event::ElementState::Pressed {
+                    return;
+                }
+                if let Some(key) = translate_key(&event.logical_key) {
+                    self.deliver(PlatformEvent::KeyPressed {
+                        key,
+                        modifiers: self.modifiers,
+                    });
+                }
+                // Text is what the key produced *after* layout, dead keys and the
+                // input method had their say — which is why it is a separate event
+                // and not something this layer works out from the key.
+                if !self.modifiers.command && !self.modifiers.control {
+                    for character in event.text.iter().flat_map(|text| text.chars()) {
+                        if !character.is_control() {
+                            self.deliver(PlatformEvent::TextInput(character));
+                        }
+                    }
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.viewport().scale_factor;
                 let (x, y) = match delta {
