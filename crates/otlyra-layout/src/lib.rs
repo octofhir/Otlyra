@@ -36,7 +36,7 @@ pub use box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, InvalidationReason, box_id_from_u64, box_id_to_u64,
     first_box_with_mixed_children,
 };
-pub use builder::build_box_tree;
+pub use builder::{build_box_tree, build_styled_box_tree};
 pub use damage::Damage;
 pub use flow::{Viewport, layout};
 pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect};

@@ -2,20 +2,38 @@
 
 use std::sync::Arc;
 
+use otlyra_css::cascade::StyledDocument;
 use otlyra_css::{ComputedStyle, Display, has_renderable_children, initial_style, ua_style};
 use otlyra_dom::{Document, NodeData, NodeId};
 
 use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree};
 
-/// Build the box tree for `document`.
+/// Build the box tree for `document` from the built-in element styles alone.
+///
+/// No stylesheet is consulted, so `<style>` and `style=` change nothing. This is
+/// what the parts of the browser that ask only "what boxes does this markup make"
+/// want — dumps, tests — and it is the fallback when the cascade has not run.
 pub fn build_box_tree(document: &Document) -> BoxTree {
+    build(document, None)
+}
+
+/// Build the box tree for `document` using styles the cascade computed.
+pub fn build_styled_box_tree(document: &Document, styles: &StyledDocument) -> BoxTree {
+    build(document, Some(styles))
+}
+
+fn build(document: &Document, styles: Option<&StyledDocument>) -> BoxTree {
     let _span = tracing::info_span!("build_box_tree").entered();
 
     let root_style = Arc::new(initial_style());
     let tree = BoxTree::new(Arc::clone(&root_style));
     let root = tree.root();
 
-    let mut builder = Builder { document, tree };
+    let mut builder = Builder {
+        document,
+        styles,
+        tree,
+    };
     for child in document.children(document.root()) {
         builder.walk(child, root, &root_style);
     }
@@ -28,6 +46,7 @@ pub fn build_box_tree(document: &Document) -> BoxTree {
 
 struct Builder<'a> {
     document: &'a Document,
+    styles: Option<&'a StyledDocument>,
     tree: BoxTree,
 }
 
@@ -195,6 +214,15 @@ impl Builder<'_> {
         }
     }
 
+    /// The style of one element: the cascade's answer where there is one, and the
+    /// built-in element style where there is not.
+    fn style_for(&self, node: NodeId, name: &str, parent: &ComputedStyle) -> ComputedStyle {
+        match self.styles.and_then(|styles| styles.style_of(node)) {
+            Some(values) => otlyra_css::computed::to_layout_style(values),
+            None => ua_style(name, parent),
+        }
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -203,7 +231,7 @@ impl Builder<'_> {
         match &dom.data {
             NodeData::Element(element) => {
                 let name = element.name.local.as_ref();
-                let style = Arc::new(ua_style(name, parent_style));
+                let style = Arc::new(self.style_for(node, name, parent_style));
 
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
@@ -394,4 +422,72 @@ fn flush_run(
     let children = std::mem::take(run);
     tree.set_children(wrapper, children);
     rebuilt.push(wrapper);
+}
+
+#[cfg(test)]
+mod tests {
+    use otlyra_css::cascade::{Viewport, style_document};
+
+    use super::*;
+
+    /// The box tree markup produces once its own stylesheets have been applied.
+    fn styled(html: &str) -> BoxTree {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styles = style_document(&document, Viewport::default());
+        build_styled_box_tree(&document, &styles)
+    }
+
+    fn style_of(tree: &BoxTree, tag: &str) -> Arc<ComputedStyle> {
+        tree.descendants(tree.root())
+            .into_iter()
+            .find(|&id| {
+                tree.node(id)
+                    .tag
+                    .as_ref()
+                    .is_some_and(|name| name.as_ref() == tag)
+            })
+            .map(|id| Arc::clone(&tree.node(id).style))
+            .unwrap_or_else(|| panic!("no <{tag}> box"))
+    }
+
+    #[test]
+    fn an_author_rule_changes_the_boxes() {
+        let tree = styled("<style>p { color: #0f0; font-size: 30px }</style><p>text");
+        let style = style_of(&tree, "p");
+        assert_eq!(style.font_size, 30.0);
+        let rgba = style.color.to_rgba8();
+        assert_eq!([rgba.r, rgba.g, rgba.b], [0, 255, 0]);
+    }
+
+    /// An author rule can remove a box, which is the difference between "the
+    /// cascade ran" and "the cascade is only consulted for colours".
+    #[test]
+    fn display_none_from_a_stylesheet_generates_no_box() {
+        let tree = styled("<style>p { display: none }</style><p>text</p><div>kept</div>");
+        let dump = crate::dump::serialize(&tree);
+        assert!(!dump.contains("text"), "{dump}");
+        assert!(dump.contains("kept"), "{dump}");
+    }
+
+    #[test]
+    fn a_style_attribute_reaches_the_box_tree() {
+        let tree = styled("<p style=\"font-size: 21px\">text");
+        assert_eq!(style_of(&tree, "p").font_size, 21.0);
+    }
+
+    /// Without a stylesheet the built-in element styles still apply, so markup
+    /// alone renders the same as it did before the cascade existed.
+    #[test]
+    fn the_unstyled_path_keeps_the_built_in_element_styles() {
+        let document = otlyra_html::parse(b"<h1>title", Some("utf-8")).document;
+        let with_cascade = {
+            let styles = style_document(&document, Viewport::default());
+            build_styled_box_tree(&document, &styles)
+        };
+        let without = build_box_tree(&document);
+        assert_eq!(
+            style_of(&with_cascade, "h1").font_size,
+            style_of(&without, "h1").font_size
+        );
+    }
 }
