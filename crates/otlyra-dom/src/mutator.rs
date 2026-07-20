@@ -174,6 +174,38 @@ impl<'a> DocumentMutator<'a> {
         }
     }
 
+    /// Copy a subtree, returning the copy's root. The copy is detached.
+    ///
+    /// The DOM's `cloneNode(true)`, and the one place a node is duplicated rather
+    /// than moved. Iterative rather than recursive: a document is untrusted input,
+    /// and a clone that recurses inherits its nesting as stack depth.
+    pub fn deep_clone(&mut self, source: NodeId) -> Option<NodeId> {
+        let data = self.document.get(source)?.data.clone();
+        let root = self.create(data);
+
+        let mut pending = vec![(source, root)];
+        while let Some((from, to)) = pending.pop() {
+            let children: Vec<NodeId> = self.document.children(from).collect();
+            for child in children {
+                let Some(data) = self.document.get(child).map(|node| node.data.clone()) else {
+                    continue;
+                };
+                let copy = self.create(data);
+                if self.append(to, copy) {
+                    pending.push((child, copy));
+                }
+            }
+        }
+        Some(root)
+    }
+
+    /// Remove every child of `parent` from the tree.
+    pub fn remove_children(&mut self, parent: NodeId) {
+        while let Some(child) = self.document.node(parent).first_child() {
+            self.detach(child);
+        }
+    }
+
     /// Add each attribute that the element does not already have.
     pub fn add_attrs_if_missing(&mut self, target: NodeId, attrs: Vec<Attribute>) {
         let limit = self.document.limits().max_attrs_per_element;

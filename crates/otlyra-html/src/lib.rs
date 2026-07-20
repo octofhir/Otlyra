@@ -68,6 +68,29 @@ fn parse_with(bytes: &[u8], decision: EncodingDecision) -> Pass {
     }
 }
 
+/// Parse `html` as the contents of a `context` element, the way `innerHTML` does.
+///
+/// The result is a document whose root holds the fragment's nodes. What comes back
+/// depends on the context — the same markup inside a `<table>` and inside a `<div>`
+/// parse differently — which is why the context is required rather than assumed.
+pub fn parse_fragment(html: &str, context: &str) -> Document {
+    use html5ever::{LocalName, Namespace, QualName, ns};
+
+    // A context name may carry a namespace, spelled the way the conformance suite
+    // spells it: `svg path`, `math ms`.
+    let (namespace, local) = match context.split_once(' ') {
+        Some(("svg", local)) => (ns!(svg), local),
+        Some(("math", local)) => (Namespace::from("http://www.w3.org/1998/Math/MathML"), local),
+        Some((_, local)) => (ns!(html), local),
+        None => (ns!(html), context),
+    };
+    let name = QualName::new(None, namespace, LocalName::from(local));
+
+    let mut parser = HtmlParser::for_fragment(Document::new(), name, Vec::new());
+    parser.feed(html.into());
+    parser.finish()
+}
+
 /// Parse a complete byte stream into a document.
 ///
 /// `transport_charset` is the `charset` parameter of the response's `Content-Type`,
@@ -304,6 +327,20 @@ mod tests {
 |     <p>
 |       \"after\"
 "
+        );
+    }
+
+    /// The spec step that copies an option's contents into `<selectedcontent>`.
+    /// html5ever only calls it on an explicit `</option>`, which is why the four
+    /// html5lib cases without one stay in the expectations ledger.
+    #[test]
+    fn a_closed_option_is_cloned_into_selectedcontent() {
+        let tree = tree(
+            "<select><button><selectedcontent></selectedcontent></button><option>Chosen</option></select>",
+        );
+        assert!(
+            tree.contains("selectedcontent") && tree.matches("\"Chosen\"").count() == 2,
+            "the option's text should appear both in it and in the selectedcontent:\n{tree}"
         );
     }
 

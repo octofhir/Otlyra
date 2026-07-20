@@ -147,7 +147,7 @@ fn tree_construction() {
         let contents = std::fs::read_to_string(&path).expect("readable test data");
 
         for case in parse_dat(&file, &contents) {
-            if case.fragment_context.is_some() || case.script_off {
+            if case.script_off {
                 skipped += 1;
                 continue;
             }
@@ -158,8 +158,19 @@ fn tree_construction() {
                 name(&case)
             );
 
-            let parsed = otlyra_html::parse(case.data.as_bytes(), Some("utf-8"));
-            let actual = dump::serialize(&parsed.document);
+            // A fragment is parsed as if it were inside its context element, and
+            // the suite's expectation is the fragment's own nodes — not the
+            // scaffolding the parser puts them in.
+            let actual = match &case.fragment_context {
+                Some(context) => {
+                    let document = otlyra_html::parse_fragment(&case.data, context);
+                    dump::serialize_fragment(&document)
+                }
+                None => {
+                    let parsed = otlyra_html::parse(case.data.as_bytes(), Some("utf-8"));
+                    dump::serialize(&parsed.document)
+                }
+            };
             let id = name(&case);
 
             match (actual == case.expected, known_failures.contains(&id)) {

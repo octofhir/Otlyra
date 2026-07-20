@@ -2,4 +2,19 @@
 # reason after it. Checked in both directions: an unlisted failure fails the
 # build, and so does a listed case that has started passing.
 #
-# Empty. Every case the runner executes currently passes.
+# All five are html5ever's tree builder, not our sink and not our driver. Each is
+# upstream work; none is a shortcut taken here.
+
+# `<selectedcontent>` mirrors the selected option's contents. html5ever calls the
+# sink hook for it only on an explicit `</option>`, and these four cases have
+# none, so the clone never happens. Our half of the hook is implemented and is
+# covered by `a_closed_option_is_cloned_into_selectedcontent`.
+webkit02:44 html5ever: hook not called without an explicit </option>
+webkit02:45 html5ever: hook not called without an explicit </option>
+webkit02:46 html5ever: hook not called without an explicit </option>
+webkit02:47 html5ever: hook not called without an explicit </option>
+
+# `<input>` in the "in select" insertion mode is a parse error the spec says to
+# ignore when no select is in select scope — which is the case in a fragment whose
+# context *is* the select. html5ever inserts the element instead.
+tests_innerHTML_1:75 html5ever: <input> not ignored in a select fragment

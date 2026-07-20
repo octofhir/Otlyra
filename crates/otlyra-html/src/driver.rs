@@ -14,8 +14,8 @@
 use html5ever::interface::TreeSink;
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{Tokenizer, TokenizerOpts};
-use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts};
-use html5ever::{TokenizerResult, buffer_queue::BufferQueue};
+use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts, create_element};
+use html5ever::{Attribute, QualName, TokenizerResult, buffer_queue::BufferQueue};
 use otlyra_dom::{Document, DomSink, NodeId};
 
 /// A parser fed decoded text.
@@ -42,6 +42,33 @@ impl HtmlParser {
         let tree_builder = TreeBuilder::new(sink, TreeBuilderOpts::default());
         Self {
             tokenizer: Tokenizer::new(tree_builder, TokenizerOpts::default()),
+            network_input: BufferQueue::default(),
+            script_input: BufferQueue::default(),
+            scripts_seen: 0,
+            encoding_indicator: None,
+        }
+    }
+
+    /// A parser for a fragment, as `innerHTML` parses one.
+    ///
+    /// A fragment is parsed *as if* it were inside `context`, and that changes the
+    /// answer completely: the same bytes inside a `<table>` and inside a `<div>`
+    /// produce different trees, and inside a `<title>` they produce no elements at
+    /// all. The context also decides which tokenizer state to start in, which is
+    /// why this cannot be the document parser with a different root.
+    pub fn for_fragment(document: Document, context: QualName, attrs: Vec<Attribute>) -> Self {
+        let sink = DomSink::with_document(document);
+        let context_element = create_element(&sink, context, attrs);
+
+        let tree_builder =
+            TreeBuilder::new_for_fragment(sink, context_element, None, TreeBuilderOpts::default());
+        let tokenizer_opts = TokenizerOpts {
+            initial_state: Some(tree_builder.tokenizer_state_for_context_elem(false)),
+            ..TokenizerOpts::default()
+        };
+
+        Self {
+            tokenizer: Tokenizer::new(tree_builder, tokenizer_opts),
             network_input: BufferQueue::default(),
             script_input: BufferQueue::default(),
             scripts_seen: 0,

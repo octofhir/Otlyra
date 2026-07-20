@@ -67,6 +67,42 @@ impl DomSink {
         self.parse_errors.get()
     }
 
+    /// The `<selectedcontent>` that should mirror `option`, if there is one.
+    ///
+    /// Found by walking up to the enclosing `<select>` and then down through it,
+    /// which is what the spec's phrasing amounts to for a tree still being built.
+    fn selectedcontent_for(&self, option: NodeId) -> Option<NodeId> {
+        let document = self.document.borrow();
+
+        let mut select = document.get(option)?.parent;
+        while let Some(id) = select {
+            let node = document.get(id)?;
+            if node
+                .element()
+                .is_some_and(|element| element.name.local.as_ref() == "select")
+            {
+                break;
+            }
+            select = node.parent;
+        }
+        let select = select?;
+
+        let mut stack: Vec<NodeId> = document.children(select).collect();
+        while let Some(id) = stack.pop() {
+            let Some(node) = document.get(id) else {
+                continue;
+            };
+            if node
+                .element()
+                .is_some_and(|element| element.name.local.as_ref() == "selectedcontent")
+            {
+                return Some(id);
+            }
+            stack.extend(document.children(id));
+        }
+        None
+    }
+
     fn mutate<T>(&self, edit: impl FnOnce(&mut DocumentMutator<'_>) -> T) -> T {
         let mut document = self.document.borrow_mut();
         edit(&mut DocumentMutator::new(&mut document))
@@ -211,6 +247,30 @@ impl TreeSink for DomSink {
 
     fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
         self.mutate(|dom| dom.reparent_children(*node, *new_parent));
+    }
+
+    /// [Maybe clone an option into selectedcontent][spec].
+    ///
+    /// When an `<option>` closes inside a `<select>` whose button holds a
+    /// `<selectedcontent>`, that element shows a copy of the option's contents. It
+    /// is the only place tree construction *duplicates* nodes, which is why the
+    /// tree builder cannot do it alone and asks the sink.
+    ///
+    /// [spec]: https://html.spec.whatwg.org/#maybe-clone-an-option-into-selectedcontent
+    fn maybe_clone_an_option_into_selectedcontent(&self, option: &NodeId) {
+        let Some(target) = self.selectedcontent_for(*option) else {
+            return;
+        };
+
+        self.mutate(|dom| {
+            dom.remove_children(target);
+            let children: Vec<NodeId> = dom.document().children(*option).collect();
+            for child in children {
+                if let Some(copy) = dom.deep_clone(child) {
+                    dom.append(target, copy);
+                }
+            }
+        });
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, handle: &NodeId) -> bool {

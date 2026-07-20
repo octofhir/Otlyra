@@ -13,6 +13,23 @@ use html5ever::{QualName, ns};
 use crate::node::{NodeData, NodeId};
 use crate::tree::Document;
 
+/// Serialize a fragment: the children of the single element the parser built the
+/// fragment inside, rather than that element itself.
+///
+/// The conformance suite states a fragment's expectation as the nodes it produced,
+/// and the container is scaffolding — real `innerHTML` hands back those nodes too.
+pub fn serialize_fragment(document: &Document) -> String {
+    let mut out = String::new();
+    let container = document
+        .children(document.root())
+        .next()
+        .unwrap_or_else(|| document.root());
+    for child in document.children(container) {
+        serialize_node(document, child, 0, &mut out);
+    }
+    out
+}
+
 /// Serialize a whole document.
 pub fn serialize(document: &Document) -> String {
     let mut out = String::new();

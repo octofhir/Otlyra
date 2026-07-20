@@ -13,9 +13,9 @@ not a conformance suite.
 `expectations.txt` records cases we knowingly fail. It is checked in both
 directions — an unlisted failure and a listed pass both fail the build.
 
-Two categories are skipped rather than run, and the runner counts them:
+The whole `tree-construction/` directory is imported — 57 files, 1787 cases — not
+a subset. A conformance suite you have chosen the easy parts of measures nothing.
 
-- `#document-fragment` cases, until fragment parsing exists (it needs
-  `innerHTML`, which needs script).
-- `#script-off` cases. We parse with scripting enabled, which is what a browser
-  does; the same tests appear in their scripting-on form.
+One category is skipped rather than run, and the runner counts it: `#script-off`
+cases, because we parse with scripting enabled, which is what a browser does. The
+same documents appear in their scripting-on form.
