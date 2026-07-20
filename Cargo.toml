@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/otlyra-app",
     "crates/otlyra-gfx",
+    "crates/otlyra-net",
     "crates/otlyra-platform",
     "crates/otlyra-text",
 ]
@@ -18,6 +19,7 @@ repository = "https://github.com/octofhir/Otlyra"
 # Every version is pinned exactly. No wildcards, no unpinned git dependencies.
 [workspace.dependencies]
 otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
+otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
 otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
 otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
 
@@ -72,6 +74,41 @@ insta = "=1.48.0"
 
 # PNG decoding, for image-comparison tests only.
 png = "=0.18.1"
+
+# Network. The feature set is Otter's, plus `stream`, so the two share one HTTP and
+# TLS tree rather than resolving two of everything.
+#
+# `default-features = false` drops reqwest's `charset` (which is `mime` plus a second
+# copy of the charset logic we own) and `system-proxy`. `rustls` brings
+# `rustls-platform-verifier`, so certificates are checked against the OS trust store
+# and not a vendored Mozilla list that we could never revoke from.
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "rustls",
+    "http2",
+    "json",
+    "gzip",
+    "stream",
+] }
+tokio = { version = "=1.53.0", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+] }
+
+# Named directly, and only, so that the process can install one crypto provider
+# explicitly. With two providers reachable there is no implicit default and
+# `ClientConfig::builder()` panics; being explicit turns that into our decision.
+rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-rs"] }
+
+# WHATWG URL. Hand-rolling this is how CVE-2024-12224 happened.
+url = "=2.5.8"
+
+# WHATWG encodings. Gecko's decoder; the legacy tables are not writable by hand.
+encoding_rs = "=0.8.35"
 
 # CLI and error plumbing.
 clap = { version = "=4.6.2", features = ["derive"] }

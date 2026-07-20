@@ -1,0 +1,21 @@
+[package]
+name = "otlyra-net"
+description = "Otlyra's network layer: fetching bytes, and nothing that knows what they mean."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
