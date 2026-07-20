@@ -52,8 +52,8 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
 
         "html" | "div" | "center" | "section" | "article" | "aside" | "header" | "footer"
-        | "main" | "nav" | "figure" | "figcaption" | "form" | "fieldset" | "dl" | "dt"
-        | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
+        | "main" | "nav" | "figcaption" | "form" | "dl" | "dt" | "table" | "tbody" | "thead"
+        | "tfoot" | "tr" | "td" | "th" | "caption" => {
             style.display = Display::Block;
         }
 
@@ -139,11 +139,44 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
 
         "u" | "ins" => style.text_decoration = TextDecoration::UNDERLINE,
         "s" | "strike" | "del" => style.text_decoration = TextDecoration::LINE_THROUGH,
-        "textarea" => style.white_space = WhiteSpace::Pre,
 
         "code" | "kbd" | "samp" | "tt" => style.font_family = Arc::from("monospace"),
 
         "mark" => style.background_color = Color::from_rgb8(0xff, 0xff, 0x00),
+
+        // Form controls. A real browser draws these as native widgets with a
+        // border, a focus ring and a pressed state; we have none of that, so they
+        // are text on a tinted background — enough to see that a control is there
+        // and where it ends, and no claim to be more.
+        "button" | "select" => {
+            style.background_color = Color::from_rgb8(0xe6, 0xe6, 0xe8);
+            style.font_size = parent.font_size * 0.95;
+        }
+        // A checkbox or radio is a glyph, not a field: tinting it makes the
+        // marker harder to read rather than easier.
+        "label" => {}
+        "input" => {
+            style.background_color = Color::from_rgb8(0xf4, 0xf4, 0xf6);
+            style.font_size = parent.font_size * 0.95;
+            // A field keeps its spacing: an empty one is sized by the space it
+            // reserves, and collapsing that away leaves a field a pixel wide.
+            style.white_space = WhiteSpace::Pre;
+        }
+        "textarea" => {
+            style.display = Display::Block;
+            style.background_color = Color::from_rgb8(0xf4, 0xf4, 0xf6);
+            style.font_family = Arc::from("monospace");
+            style.white_space = WhiteSpace::Pre;
+        }
+        // Present in the standard's stylesheet and cheap to be right about.
+        "details" | "summary" | "dialog" | "figure" | "hgroup" | "search" => {
+            style.display = Display::Block;
+        }
+        "fieldset" => {
+            style.display = Display::Block;
+            style.padding = Sides::all(Length::Px(8.0));
+            style.margin = Sides::axes(LengthOrAuto::Px(0.0), LengthOrAuto::Px(2.0));
+        }
 
         // `dd` is indented; `dt` is not. The standard says 40px, and it is the one
         // indent people notice the absence of.

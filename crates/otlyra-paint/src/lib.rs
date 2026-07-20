@@ -114,6 +114,26 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                 return;
             }
 
+            // An inline element's background. Inline boxes generate no box
+            // fragment — only the runs their text landed in — so the background of
+            // a `<mark>` or a `<button>` has to be painted here or nowhere.
+            let background = fragment.style.background_color;
+            if background.components[3] > 0.0 {
+                list.push(DisplayItem::Fill {
+                    style: Fill::NonZero,
+                    transform: Affine::IDENTITY,
+                    brush: Brush::Solid(background),
+                    brush_transform: None,
+                    shape: KurboRect::new(
+                        f64::from(rect.x),
+                        f64::from(rect.y - scroll_y),
+                        f64::from(rect.x) + f64::from(run.advance),
+                        f64::from(rect.bottom() - scroll_y),
+                    )
+                    .to_path(PATH_TOLERANCE),
+                });
+            }
+
             // Decorations first, so the glyphs sit on top of them: a line drawn
             // over text is a strikethrough whatever it was meant to be. The offset
             // and thickness come from the font, by way of the shaper.

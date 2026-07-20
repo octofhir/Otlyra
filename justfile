@@ -27,7 +27,7 @@ defaults:
 # Render that page to a PNG instead of opening a window.
 defaults-shot path=(screenshot_dir / "defaults.png"):
     @mkdir -p "$(dirname {{path}})"
-    cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 2400 --scale-factor 2
+    cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 3000 --scale-factor 1
     @echo "wrote {{path}}"
 
 build:

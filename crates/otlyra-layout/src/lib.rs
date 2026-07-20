@@ -173,6 +173,83 @@ mod tests {
         assert_no_mixed_children(&tree);
     }
 
+    /// Text drawn from the box tree, in order — what the page actually says.
+    fn text_of(tree: &BoxTree) -> String {
+        tree.descendants(tree.root())
+            .into_iter()
+            .filter_map(|id| match &tree.node(id).kind {
+                BoxKind::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// An `<input>` is a void element: without generated content it lays out as
+    /// nothing at all, and a form becomes a page of labels with no fields.
+    #[test]
+    fn a_text_field_shows_its_value_then_its_placeholder() {
+        assert!(text_of(&tree_of("<input value=typed placeholder=hint>")).contains("typed"));
+        assert!(text_of(&tree_of("<input placeholder=hint>")).contains("hint"));
+        assert!(
+            text_of(&tree_of("<input>")).len() > 4,
+            "an empty field still reserves room to type in"
+        );
+    }
+
+    #[test]
+    fn a_checkbox_shows_whether_it_is_checked() {
+        assert!(text_of(&tree_of("<input type=checkbox checked>")).contains("[x]"));
+        assert!(text_of(&tree_of("<input type=checkbox>")).contains("[ ]"));
+        assert!(text_of(&tree_of("<input type=radio checked>")).contains("(o)"));
+    }
+
+    #[test]
+    fn a_button_input_is_labelled_by_its_value() {
+        assert!(text_of(&tree_of("<input type=submit value=Send>")).contains("Send"));
+        assert!(
+            text_of(&tree_of("<input type=submit>")).contains("Submit"),
+            "and by the default label when it has none"
+        );
+    }
+
+    #[test]
+    fn a_hidden_input_shows_nothing() {
+        assert_eq!(text_of(&tree_of("<input type=hidden value=secret>")), "");
+    }
+
+    /// A select shows one option. A page of dropdowns that showed all of them
+    /// would read as a wall of every choice in each.
+    #[test]
+    fn a_select_shows_only_the_option_it_displays() {
+        let text = text_of(&tree_of(
+            "<select><option>First<option selected>Second<option>Third</select>",
+        ));
+        assert!(text.contains("Second"), "{text}");
+        assert!(!text.contains("First") && !text.contains("Third"), "{text}");
+
+        let unselected = text_of(&tree_of("<select><option>First<option>Second</select>"));
+        assert!(
+            unselected.contains("First") && !unselected.contains("Second"),
+            "with nothing selected it is the first: {unselected}"
+        );
+    }
+
+    #[test]
+    fn an_image_stands_in_with_its_alt_text() {
+        assert!(text_of(&tree_of("<img src=x alt='a photo'>")).contains("a photo"));
+        assert_eq!(text_of(&tree_of("<img src=x alt=''>")), "");
+    }
+
+    #[test]
+    fn list_markers_are_bullets_and_numbers() {
+        assert!(text_of(&tree_of("<ul><li>one<li>two")).starts_with("• one• two"));
+
+        let ordered = text_of(&tree_of("<ol><li>one<li>two<li>three"));
+        assert!(ordered.contains("1. one"), "{ordered}");
+        assert!(ordered.contains("3. three"), "{ordered}");
+    }
+
     #[test]
     fn the_invariant_holds_on_a_deliberately_malformed_document() {
         for html in [

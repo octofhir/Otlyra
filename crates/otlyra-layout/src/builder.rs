@@ -68,6 +68,112 @@ impl Builder<'_> {
         Some(marker_text(ordered, index))
     }
 
+    /// The text a replaced or attribute-driven element shows.
+    ///
+    /// `None` for everything whose content is in the tree where it belongs.
+    fn generated_text(&self, name: &str, node: NodeId) -> Option<String> {
+        let attribute = |key: &str| {
+            self.document
+                .get(node)?
+                .element()?
+                .attrs
+                .iter()
+                .find(|attr| attr.name.local.as_ref() == key)
+                .map(|attr| attr.value.to_string())
+        };
+
+        match name {
+            "input" => {
+                let kind = attribute("type").unwrap_or_else(|| "text".to_owned());
+                match kind.to_ascii_lowercase().as_str() {
+                    // A button-shaped input carries its label in `value`.
+                    "button" | "submit" | "reset" => {
+                        // Padded with spaces because an inline box has no padding
+                        // here, and without them two buttons touch.
+                        let label = attribute("value").unwrap_or_else(|| match kind.as_str() {
+                            "submit" => "Submit".to_owned(),
+                            "reset" => "Reset".to_owned(),
+                            _ => " ".to_owned(),
+                        });
+                        Some(format!("  {label}  "))
+                    }
+                    // ASCII rather than the ballot-box and radio characters: those
+                    // are dingbats many system fonts have no glyph for, and a
+                    // missing glyph is a hollow box where the control should be.
+                    "checkbox" => Some(if attribute("checked").is_some() {
+                        "[x] ".to_owned()
+                    } else {
+                        "[ ] ".to_owned()
+                    }),
+                    "radio" => Some(if attribute("checked").is_some() {
+                        "(o) ".to_owned()
+                    } else {
+                        "( ) ".to_owned()
+                    }),
+                    "hidden" => None,
+                    // A text field shows its value, or its placeholder, or enough
+                    // space to look like a field rather than vanishing.
+                    _ => Some(
+                        attribute("value")
+                            .or_else(|| attribute("placeholder"))
+                            .unwrap_or_else(|| "          ".to_owned()),
+                    ),
+                }
+            }
+            "img" => attribute("alt").filter(|alt| !alt.is_empty()),
+            // The same padding a value-driven button gets, so that two buttons
+            // side by side do not read as one.
+            "button" => Some("  ".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// Whether an `<option>` is the one a closed `<select>` displays.
+    ///
+    /// A select shows one option, not all of them — which is why a page full of
+    /// dropdowns does not read as a wall of every choice in each.
+    fn is_displayed_option(&self, option: NodeId) -> bool {
+        let Some(parent) = self.document.get(option).and_then(|node| node.parent) else {
+            return true;
+        };
+        let is_select = self
+            .document
+            .get(parent)
+            .and_then(|node| node.element())
+            .is_some_and(|element| element.name.local.as_ref() == "select");
+        if !is_select {
+            return true;
+        }
+
+        let options: Vec<NodeId> = self
+            .document
+            .children(parent)
+            .filter(|&child| {
+                self.document
+                    .get(child)
+                    .and_then(|node| node.element())
+                    .is_some_and(|element| element.name.local.as_ref() == "option")
+            })
+            .collect();
+
+        let selected = options.iter().find(|&&child| {
+            self.document
+                .get(child)
+                .and_then(|node| node.element())
+                .is_some_and(|element| {
+                    element
+                        .attrs
+                        .iter()
+                        .any(|attr| attr.name.local.as_ref() == "selected")
+                })
+        });
+
+        match selected {
+            Some(&chosen) => chosen == option,
+            None => options.first() == Some(&option),
+        }
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -81,6 +187,12 @@ impl Builder<'_> {
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
                 // and not hit-testable.
+                // An option the select does not display generates no box, which is
+                // `display: none` arrived at by a different route.
+                if name == "option" && !self.is_displayed_option(node) {
+                    return;
+                }
+
                 let kind = match style.display {
                     Display::None => return,
                     Display::Block => BoxKind::Block,
@@ -99,6 +211,25 @@ impl Builder<'_> {
                         parent: None,
                     },
                 );
+
+                // A control's label is in an attribute, not in the tree: an
+                // `<input>` is a void element, so without this it lays out as
+                // nothing at all. Real browsers generate this content too — they
+                // just do it inside a widget we do not have.
+                if let Some(text) = self.generated_text(name, node) {
+                    self.tree.push(
+                        id,
+                        BoxNode {
+                            kind: BoxKind::Text(text.into()),
+                            style: Arc::clone(&style),
+                            node: None,
+                            tag: None,
+                            anonymous: true,
+                            children: Vec::new(),
+                            parent: None,
+                        },
+                    );
+                }
 
                 // A list item's marker. CSS generates it as a `::marker` box
                 // outside the item's content; putting it inside the content is

@@ -3,36 +3,47 @@
 <title>Default HTML rendering — Otlyra</title>
 
 <h1>Default HTML rendering</h1>
-<p>Everything on this page is unstyled. What you see is the user-agent
-stylesheet, which is the browser's own opinion about what HTML looks like
-before any author has said anything.</p>
+<p>Nothing on this page is styled. Everything you see is the user-agent
+stylesheet — the browser's own opinion about what HTML looks like before any
+author has said anything. The sections follow the HTML standard's rendering
+chapter, and where we do not implement something it says so on the page rather
+than leaving you to notice.</p>
 
-<h2>Headings</h2>
+<h2>1. Headings</h2>
 <h1>h1 — the page's title</h1>
 <h2>h2 — a section</h2>
 <h3>h3 — a subsection</h3>
-<h4>h4</h4>
-<h5>h5</h5>
-<h6>h6 — smaller than body text, and still bold</h6>
+<h4>h4 — smaller still</h4>
+<h5>h5 — smaller than body text</h5>
+<h6>h6 — the smallest, and still bold</h6>
 
-<h2>Paragraphs and inline elements</h2>
-<p>A paragraph of ordinary text, long enough to wrap at most window widths so
-that line breaking has something to do. It contains <b>bold</b> and
-<strong>strong</strong>, <i>italic</i> and <em>emphasis</em>, <u>underlined</u>
-and <s>struck through</s>, <small>small print</small>, <mark>a marked
-phrase</mark>, <code>inline_code()</code>, <kbd>Ctrl</kbd>+<kbd>C</kbd>, and
-<a href="https://example.com/">a link to example.com</a> that is blue,
-underlined, and clickable.</p>
-<p>A second paragraph, to show the margin between them.<br>
-A line after a <code>&lt;br&gt;</code>, which breaks without starting a new
-paragraph.</p>
+<h2>2. Paragraphs and line breaks</h2>
+<p>A paragraph of ordinary text, long enough that it wraps at most window widths
+and line breaking has something to do. Two paragraphs are separated by a margin
+of one em, above and below.</p>
+<p>A second paragraph.<br>A line after a <code>&lt;br&gt;</code>, which breaks
+the line without starting a new paragraph.</p>
 
-<h2>Lists</h2>
+<h2>3. Inline semantics</h2>
+<p><b>b</b>, <strong>strong</strong>, <i>i</i>, <em>em</em>, <u>u</u>,
+<s>s</s>, <del>del</del>, <ins>ins</ins>, <small>small</small>,
+<mark>mark</mark>, <code>code</code>, <kbd>kbd</kbd>, <samp>samp</samp>,
+<var>var</var>, <cite>cite</cite>, <dfn>dfn</dfn>, <abbr>abbr</abbr>,
+<q>q</q>, <time>time</time>, <data>data</data>, H<sub>2</sub>O, x<sup>2</sup>,
+<a href="https://example.com/">a link</a>.</p>
+<p><small>Known gaps here: <code>&lt;q&gt;</code> should generate quotation
+marks, and <code>&lt;sub&gt;</code>/<code>&lt;sup&gt;</code> should be lowered
+and raised — both need generated content and <code>vertical-align</code>, which
+are not implemented. They currently differ only in size.</small></p>
+
+<h2>4. Lists</h2>
 <ul>
   <li>An unordered item</li>
-  <li>Another one, longer, so that it wraps and you can see whether the second
-      line lines up with the first rather than with the marker</li>
-  <li>A third</li>
+  <li>A longer one, long enough to wrap, so you can see whether the second line
+      lines up with the first or with the marker</li>
+  <li>A third, with a nested list:
+    <ul><li>Nested one</li><li>Nested two</li></ul>
+  </li>
 </ul>
 <ol>
   <li>First</li>
@@ -41,37 +52,95 @@ paragraph.</p>
 </ol>
 <dl>
   <dt>A term</dt>
-  <dd>Its definition, indented.</dd>
+  <dd>Its definition, indented by 40 pixels.</dd>
   <dt>Another term</dt>
   <dd>Another definition.</dd>
 </dl>
 
-<h2>Quotations and preformatted text</h2>
-<blockquote>A block quotation is indented on both sides. It is one of the few
-elements whose default rendering people actually rely on.</blockquote>
+<h2>5. Quotations, preformatted text, rules</h2>
+<blockquote>A block quotation is indented on both sides — one of the few
+default renderings people actually rely on.</blockquote>
 <pre>fn main() {
-    // In &lt;pre&gt;, whitespace   is   preserved
-    // and lines    do not wrap however long they get.
+    // Inside &lt;pre&gt;, whitespace   is   preserved
+    // and long lines do not wrap however far they run.
     println!("hello");
 }</pre>
-
-<h2>A rule</h2>
 <p>Above the rule.</p>
 <hr>
 <p>Below it.</p>
 
-<h2>A table</h2>
-<table>
-  <tr><th>Element</th><th>Default</th></tr>
-  <tr><td>h1</td><td>2em, bold</td></tr>
-  <tr><td>p</td><td>1em margins</td></tr>
-</table>
-<p><small>Table layout is not implemented: cells stack as blocks rather than
-forming rows and columns. This is here to show what that looks like, not to
-claim it works.</small></p>
+<h2>6. Form controls</h2>
+<form>
+  <fieldset>
+    <p><label>A text field: <input type="text" value="typed text"></label></p>
+    <p><label>An empty one with a placeholder:
+       <input type="text" placeholder="Enter a URL"></label></p>
+    <p><input type="checkbox" checked> A checked checkbox,
+       <input type="checkbox"> and an unchecked one.</p>
+    <p><input type="radio" checked> A chosen radio,
+       <input type="radio"> and one not chosen.</p>
+    <p>A dropdown:
+      <select>
+        <option>First choice</option>
+        <option selected>The selected one</option>
+        <option>Third choice</option>
+      </select>
+    </p>
+    <p>A text area:</p>
+    <textarea>Text in a textarea,
+where newlines   and   spacing survive.</textarea>
+    <p>
+      <button>A button</button>
+      <input type="submit" value="A submit input">
+      <input type="reset">
+    </p>
+  </fieldset>
+</form>
+<p><small>These are text on a tinted background, not native widgets: there is no
+border, no focus ring, no pressed state, and nothing responds to being clicked.
+A field's contents come from its <code>value</code> or <code>placeholder</code>
+attribute, the way a real browser generates them too — it just puts them inside
+a widget we do not have. A <code>&lt;select&gt;</code> shows the selected option
+and hides the rest.</small></p>
 
-<h2>Not rendered</h2>
-<p>The following are <code>display: none</code> and should leave no trace:</p>
+<h2>7. Tables</h2>
+<table>
+  <caption>A table with a caption</caption>
+  <tr><th>Element</th><th>Default rendering</th></tr>
+  <tr><td>h1</td><td>2em, bold, 0.67em margins</td></tr>
+  <tr><td>p</td><td>1em margins, top and bottom</td></tr>
+  <tr><td>pre</td><td>monospace, whitespace preserved</td></tr>
+</table>
+<p><small>Not implemented: table layout. Cells stack as blocks instead of
+forming rows and columns, and there are no borders or cell spacing. This is what
+that looks like, and it is not a claim that tables work.</small></p>
+
+<h2>8. Images and embedded content</h2>
+<p>An image with alt text: <img src="nothing.png" alt="[alt text stands in for
+an image]"> — images are not loaded or decoded yet, so the alt text is all there
+is. An <code>&lt;iframe&gt;</code>, an <code>&lt;object&gt;</code> and an
+<code>&lt;svg&gt;</code> render nothing at all.</p>
+
+<h2>9. Sectioning and grouping</h2>
+<article>
+  <header><p>A header inside an article.</p></header>
+  <p>The article's own paragraph. Sectioning elements are blocks with no other
+  default styling, which is exactly what they look like here.</p>
+  <figure>
+    <p>A figure's contents.</p>
+    <figcaption>Its caption.</figcaption>
+  </figure>
+  <address>An address renders in italics.</address>
+  <footer><p>A footer.</p></footer>
+</article>
+<details><summary>A summary</summary><p>Details' contents — always visible here,
+because there is no open and closed state without script.</p></details>
+
+<h2>10. Not rendered at all</h2>
+<p>The following are <code>display: none</code> in the stylesheet and must leave
+no trace on the page:</p>
 <style>p { color: red }</style>
-<script>var x = 1;</script>
-<p>If the CSS or the script above appeared as text, something is wrong.</p>
+<script>var leaked = "this should not appear";</script>
+<template><p>Template contents.</p></template>
+<p>If the CSS, the script source or the template's paragraph appeared as text
+above this line, something is wrong.</p>
