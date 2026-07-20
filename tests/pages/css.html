@@ -29,6 +29,15 @@
   :where(.box) p { margin: 0; }
   section:not(.box) { opacity: 0.9; }
 
+  .framed { border: 3px solid #c30; padding: 6px; margin: 8px 0; }
+  .sides { border-top: 6px solid #06c; border-right: 2px solid #060;
+           border-bottom: 6px dashed #c30; border-left: 12px solid currentColor;
+           color: #909; padding: 4px; }
+  .centred { width: 300px; margin: 8px auto; background: #eee; }
+  .pushed { width: 200px; margin-left: auto; background: #eee; }
+  .middle { text-align: center; }
+  .right { text-align: right; }
+
   @media (min-width: 600px) { .wide { display: block; } }
   @supports (display: grid) { .grid { display: grid; } }
 </style>
@@ -43,6 +52,9 @@ what you see is what the cascade computed.</p>
 <code>&lt;style&gt;</code> and a <code>style=</code> attribute, resolved by
 origin, specificity and source order, with <code>!important</code>,
 inheritance, <code>calc()</code>, custom properties and media queries.</p>
+<p><strong>Boxes</strong>: colours, fonts, margins — including <code>auto</code>
+margins, which is how a box is centred — padding, borders per side, widths and
+heights, and <code>text-align</code>.</p>
 <p>Selector <strong>matching</strong>, over our own DOM:
 type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 <code>*=</code>), the four combinators, structural pseudo-classes, and
@@ -51,11 +63,23 @@ type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 match" against a real document.</p>
 
 <h2>What does not work yet</h2>
-<p>Layout reads twelve properties, so a rule the cascade computes correctly can
-still change nothing: borders, positioning, floats, flex and grid have no
-formatting context behind them yet. External <code>&lt;link&gt;</code>
+<p>A rule the cascade computes correctly can still change nothing, because
+layout reads a subset of what CSS defines: positioning, floats, flex and grid
+have no formatting context behind them, an unsupported <code>display</code> lays
+out as a block, and padding and borders on an <em>inline</em> box are ignored —
+which is why the controls above are framed tight against their text. Border
+styles other than solid are drawn solid. External <code>&lt;link&gt;</code>
 stylesheets are not fetched, and a restyle recomputes the whole document rather
 than the part that changed.</p>
+
+<h2>Boxes</h2>
+<div class="framed">A box with a border on all four sides and padding inside it.</div>
+<div class="sides">Four different borders. The left one is
+<code>currentColor</code>, so it takes this element's own colour.</div>
+<div class="centred">300px wide, centred by <code>margin: 0 auto</code>.</div>
+<div class="pushed">200px wide, pushed right by one auto margin.</div>
+<p class="middle">Centred text.</p>
+<p class="right">Right-aligned text.</p>
 
 <h2>Elements the rules above are written against</h2>
 <section class="box" id="unique">
