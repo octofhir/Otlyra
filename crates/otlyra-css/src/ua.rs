@@ -52,8 +52,8 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
 
         "html" | "div" | "center" | "section" | "article" | "aside" | "header" | "footer"
-        | "main" | "nav" | "figure" | "figcaption" | "form" | "fieldset" | "dl"
-        | "dt" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
+        | "main" | "nav" | "figure" | "figcaption" | "form" | "fieldset" | "dl" | "dt"
+        | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
             style.display = Display::Block;
         }
 
