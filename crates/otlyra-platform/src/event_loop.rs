@@ -16,6 +16,9 @@ use crate::menu::{NativeMenu, command_from_muda};
 use crate::present::Presenter;
 use crate::{MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
 
+/// Logical pixels one wheel notch scrolls.
+const LINE_SCROLL: f64 = 40.0;
+
 /// Menu activations arrive on muda's own callback, off winit's event path, so they
 /// are forwarded through the event loop proxy. Without this the loop would sit in
 /// `Wait` and the menu would appear to do nothing until the next mouse move.
@@ -261,6 +264,27 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 let viewport = self.viewport();
                 self.painter.on_event(PlatformEvent::Resized(viewport));
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scale = self.viewport().scale_factor;
+                let (x, y) = match delta {
+                    // A notch, not a distance. What it is worth in pixels is a
+                    // platform convention; 40 is the figure browsers settled on.
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        (f64::from(x) * LINE_SCROLL, f64::from(y) * LINE_SCROLL)
+                    }
+                    // Already a distance, in device pixels.
+                    winit::event::MouseScrollDelta::PixelDelta(position) => {
+                        (position.x / scale, position.y / scale)
+                    }
+                };
+                // Negated: winit reports which way the wheel turned, and the event
+                // says which way the content should move.
+                self.painter
+                    .on_event(PlatformEvent::Scroll { x: -x, y: -y });
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }

@@ -91,6 +91,17 @@ pub enum PlatformEvent {
     SurfaceReady(Viewport),
     /// The drawable changed size, the scale factor changed, or both.
     Resized(Viewport),
+    /// The user scrolled, by this many **logical** pixels. Positive `y` means the
+    /// content should move up, i.e. the reader is going down the page.
+    ///
+    /// Line-based wheels are converted here, because how many pixels a wheel notch
+    /// is worth is a platform fact and this crate is where platform facts live.
+    Scroll {
+        /// Horizontal delta in logical pixels.
+        x: f64,
+        /// Vertical delta in logical pixels.
+        y: f64,
+    },
     /// The user asked to close the window. The loop exits after this is delivered.
     CloseRequested,
     /// The user chose a menu item the embedder defined.

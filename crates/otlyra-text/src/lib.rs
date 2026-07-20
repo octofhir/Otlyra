@@ -35,7 +35,7 @@ mod engine;
 mod stack;
 
 pub use engine::{ShapedRun, TextEngine};
-pub use stack::{FontStack, GenericFamily};
+pub use stack::{Family, FontStack, GenericFamily};
 
 /// Re-exported so callers name the same font handle type the shaper does.
 pub use parley::FontData;

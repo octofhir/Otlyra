@@ -46,21 +46,39 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Renderer::Skia)]
     renderer: Renderer,
 
-    /// Fetch this URL, print the source it returns, then exit.
+    /// Fetch this URL and show the page in a window.
     ///
-    /// A bare host is assumed to be `https`. Nothing is rendered; this is the
-    /// network stack on its own. With `--dump-dom`, the fetched bytes are parsed
-    /// and the tree is printed instead of the source.
+    /// A bare host is assumed to be `https`. With `--dump-dom` or `--dump-source`
+    /// the page goes to the terminal instead and no window opens.
     #[arg(long, value_name = "URL")]
     url: Option<String>,
 
-    /// Parse HTML and print the resulting tree, then exit.
+    /// Open a local HTML file instead of fetching one.
+    #[arg(long, value_name = "PATH", conflicts_with = "url")]
+    file: Option<PathBuf>,
+
+    /// Print the parsed tree instead of opening a window, then exit.
     ///
-    /// Takes a file, or nothing at all when `--url` supplies the bytes. The output
-    /// is the html5lib-tests format, so what you read is exactly what the
+    /// Takes a file, or nothing at all when `--url` or `--file` supplies the bytes.
+    /// The output is the html5lib-tests format, so what you read is exactly what the
     /// conformance suite compares against.
     #[arg(long, value_name = "PATH", num_args = 0..=1)]
     dump_dom: Option<Option<PathBuf>>,
+
+    /// Print the document's source instead of opening a window, then exit.
+    #[arg(long)]
+    dump_source: bool,
+}
+
+impl Cli {
+    /// The viewport `--screenshot` and `--dump-display-list` render at.
+    fn viewport(&self) -> Viewport {
+        Viewport::new(
+            (f64::from(self.width) * self.scale_factor).round() as u32,
+            (f64::from(self.height) * self.scale_factor).round() as u32,
+            self.scale_factor,
+        )
+    }
 }
 
 /// The rasterizer backends the `PaintTarget` seam offers.
@@ -77,8 +95,16 @@ fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
 
-    if cli.url.is_some() || cli.dump_dom.is_some() {
-        return match load_document(cli.url.as_deref(), cli.dump_dom.clone()) {
+    // Was a document named? `--dump-dom PATH` names one too.
+    let document = cli
+        .url
+        .clone()
+        .map(Source::Url)
+        .or_else(|| cli.file.clone().map(Source::File))
+        .or_else(|| cli.dump_dom.clone().flatten().map(Source::File));
+
+    if let Some(source) = document {
+        return match open_document(source, &cli) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("otlyra: {error}");
@@ -87,18 +113,16 @@ fn main() -> ExitCode {
         };
     }
 
-    let mut scene = DemoScene::new();
+    if cli.dump_dom.is_some() || cli.dump_source {
+        eprintln!("otlyra: --dump-dom and --dump-source need a --url or a --file");
+        return ExitCode::FAILURE;
+    }
 
-    let viewport = || {
-        Viewport::new(
-            (f64::from(cli.width) * cli.scale_factor).round() as u32,
-            (f64::from(cli.height) * cli.scale_factor).round() as u32,
-            cli.scale_factor,
-        )
-    };
+    let mut scene = DemoScene::new();
+    let viewport = cli.viewport();
 
     if let Some(path) = cli.dump_display_list.as_deref() {
-        return match dump_display_list(&mut scene, viewport(), path) {
+        return match dump_display_list(&mut scene, viewport, path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("otlyra: {error}");
@@ -108,7 +132,7 @@ fn main() -> ExitCode {
     }
 
     if cli.renderer == Renderer::Record {
-        let list = scene.build_display_list(viewport());
+        let list = scene.build_display_list(viewport);
         let mut painter = otlyra_gfx::RecordingPainter::new();
         otlyra_gfx::render(&list, &mut painter);
         for op in painter.ops() {
@@ -118,7 +142,7 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.screenshot.as_deref() {
-        Some(path) => write_screenshot(&mut scene, viewport(), path),
+        Some(path) => write_screenshot(&mut scene, viewport, path),
         None => run_window(
             WindowConfig {
                 title: "Otlyra".to_owned(),
@@ -144,17 +168,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// Get a document's bytes — from the network or from a file — and print either its
-/// source or its parsed tree.
+/// Where a document's bytes come from.
+#[derive(Clone, Debug)]
+enum Source {
+    /// Over the network.
+    Url(String),
+    /// Off the disk.
+    File(PathBuf),
+}
+
+/// The whole pipeline we have, end to end: bytes, encoding, tree, and either a
+/// window or a dump of what we found on the way.
 ///
-/// This is the whole pipeline we have so far, end to end and in one place: bytes,
-/// encoding, tree. Navigation and rendering join it later.
-fn load_document(
-    url: Option<&str>,
-    dump_dom: Option<Option<PathBuf>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (bytes, transport_charset) = match url {
-        Some(input) => {
+/// The fetch blocks before the window opens. That is wrong and it is temporary —
+/// the event loop must never wait on the network — and it is why `fetch_blocking`
+/// is spelled the way it is. Navigation over a channel is M9.
+fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let (bytes, transport_charset) = match &source {
+        Source::Url(input) => {
             let resource = fetch(input)?;
             eprintln!(
                 "{} {} ({} bytes)",
@@ -165,30 +196,48 @@ fn load_document(
             let charset = resource.charset();
             (resource.body, charset)
         }
-        None => {
-            let path = dump_dom
-                .clone()
-                .flatten()
-                .ok_or("--dump-dom needs a file, or a --url to fetch")?;
-            (std::fs::read(path)?, None)
-        }
+        Source::File(path) => (std::fs::read(path)?, None),
     };
 
-    match dump_dom {
-        Some(_) => {
-            let parsed = otlyra_html::parse(&bytes, transport_charset.as_deref());
-            eprintln!(
-                "encoding {} ({:?})",
-                parsed.encoding.encoding.name(),
-                parsed.encoding.source
-            );
-            print!("{}", otlyra_dom::dump::serialize(&parsed.document));
-        }
-        None => {
-            let encoding = otlyra_html::determine(&bytes, transport_charset.as_deref());
-            let (text, _actual, _errors) = encoding.encoding.decode(&bytes);
-            print!("{text}");
-        }
+    if cli.dump_source {
+        let decision = otlyra_html::determine(&bytes, transport_charset.as_deref());
+        let (text, _actual, _errors) = decision.encoding.decode(&bytes);
+        print!("{text}");
+        return Ok(());
+    }
+
+    let parsed = otlyra_html::parse(&bytes, transport_charset.as_deref());
+    eprintln!(
+        "encoding {} ({:?}), {} nodes",
+        parsed.encoding.encoding.name(),
+        parsed.encoding.source,
+        parsed.document.len()
+    );
+
+    if cli.dump_dom.is_some() {
+        print!("{}", otlyra_dom::dump::serialize(&parsed.document));
+        return Ok(());
+    }
+
+    let title = otlyra_app::page::title_of(&parsed.document);
+    let mut page = otlyra_app::page::PageScene::new(&parsed.document);
+    eprintln!("{} blocks of text", page.blocks().len());
+
+    match cli.screenshot.as_deref() {
+        Some(path) => write_screenshot(&mut page, cli.viewport(), path)?,
+        None => run_window(
+            WindowConfig {
+                title: match (&title, &source) {
+                    (Some(title), _) => format!("{title} — Otlyra"),
+                    (None, Source::Url(url)) => format!("{url} — Otlyra"),
+                    (None, Source::File(path)) => format!("{} — Otlyra", path.display()),
+                },
+                logical_size: (f64::from(cli.width), f64::from(cli.height)),
+                menu_bar: menu_bar(),
+                icon: Some(otlyra_app::ICON),
+            },
+            &mut page,
+        )?,
     }
     Ok(())
 }

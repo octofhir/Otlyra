@@ -10,6 +10,7 @@
 //!
 //! - [`menu`] — the native menu bar and the commands it invokes.
 //! - [`observability`] — tracing setup and the fixed span vocabulary.
+//! - [`page`] — a fetched or opened document on screen, until layout exists.
 //! - [`scene`] — the placeholder scene, replaced once a display list exists.
 //! - [`run_window`] / [`write_screenshot`] — the two entry points.
 //!
@@ -30,6 +31,7 @@ pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
 
 pub mod menu;
 pub mod observability;
+pub mod page;
 pub mod scene;
 
 use std::path::Path;
