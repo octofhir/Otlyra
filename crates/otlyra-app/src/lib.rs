@@ -8,6 +8,7 @@
 //!
 //! ## Contents
 //!
+//! - [`menu`] — the native menu bar and the commands it invokes.
 //! - [`observability`] — tracing setup and the fixed span vocabulary.
 //! - [`scene`] — the placeholder scene, replaced once a display list exists.
 //! - [`run_window`] / [`write_screenshot`] — the two entry points.
@@ -21,6 +22,13 @@
 //! 3. **This crate holds no GPU or rasterizer handle.** It hands a `Painter` to
 //!    `otlyra-platform` and gets pixels or a PNG back.
 
+/// The application icon, shown in the Dock.
+///
+/// Carried as encoded bytes rather than a path because a `cargo run` binary has no
+/// bundle to load resources from.
+pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
+
+pub mod menu;
 pub mod observability;
 pub mod scene;
 

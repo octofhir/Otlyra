@@ -12,8 +12,15 @@ use winit::window::{Window, WindowId};
 
 use otlyra_gfx::{PaintTarget, SkiaPainter};
 
+use crate::menu::{NativeMenu, command_from_muda};
 use crate::present::Presenter;
-use crate::{Painter, PlatformEvent, Viewport, WindowConfig};
+use crate::{MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
+
+/// Menu activations arrive on muda's own callback, off winit's event path, so they
+/// are forwarded through the event loop proxy. Without this the loop would sit in
+/// `Wait` and the menu would appear to do nothing until the next mouse move.
+#[derive(Debug)]
+struct MenuActivated(MenuId);
 
 /// Anything that can go wrong opening or driving a window.
 ///
@@ -28,6 +35,9 @@ pub enum PlatformError {
     /// The window itself could not be created.
     #[error("window creation failed: {0}")]
     WindowCreation(String),
+    /// The menu bar could not be built.
+    #[error("menu bar failed: {0}")]
+    Menu(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The GPU presentation path failed.
     #[error("gpu presentation failed: {0}")]
     Gpu(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -42,6 +52,12 @@ impl From<Box<otlyra_gfx::SkiaError>> for PlatformError {
     }
 }
 
+impl From<crate::menu::MenuError> for PlatformError {
+    fn from(error: crate::menu::MenuError) -> Self {
+        Self::Menu(Box::new(error))
+    }
+}
+
 impl From<crate::present::PresentError> for PlatformError {
     fn from(error: crate::present::PresentError) -> Self {
         Self::Gpu(Box::new(error))
@@ -53,9 +69,19 @@ impl From<crate::present::PresentError> for PlatformError {
 /// The loop blocks in `ControlFlow::Wait`, so nothing here may request a redraw
 /// unconditionally.
 pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), PlatformError> {
-    let event_loop =
-        EventLoop::new().map_err(|error| PlatformError::EventLoop(error.to_string()))?;
+    let event_loop = EventLoop::<MenuActivated>::with_user_event()
+        .build()
+        .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
+
+    // muda dispatches on its own callback; hand activations to winit so the loop
+    // wakes and the app sees one ordered stream of events.
+    let proxy = event_loop.create_proxy();
+    muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+        if let Some(id) = command_from_muda(&event) {
+            let _ = proxy.send_event(MenuActivated(id));
+        }
+    }));
 
     let mut app = WindowedApp {
         config,
@@ -63,6 +89,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         window: None,
         presenter: None,
         rasterizer: None,
+        menu: None,
         frames: 0,
         failure: None,
     };
@@ -83,6 +110,8 @@ struct WindowedApp<'p> {
     window: Option<Arc<Window>>,
     presenter: Option<Presenter>,
     rasterizer: Option<SkiaPainter>,
+    /// Held for the application's lifetime: dropping it removes the menu bar.
+    menu: Option<NativeMenu>,
     frames: u64,
     /// First fatal error, so `run` can return it once the loop unwinds. An
     /// `ApplicationHandler` callback cannot return one, and panicking across the OS
@@ -148,12 +177,33 @@ impl WindowedApp<'_> {
     }
 }
 
-impl ApplicationHandler for WindowedApp<'_> {
+impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: MenuActivated) {
+        tracing::debug!(id = ?event.0, "menu command");
+        self.painter.on_event(PlatformEvent::MenuCommand(event.0));
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             // macOS can resume an already-running application; recreating the
             // window here would orphan the surface.
             return;
+        }
+
+        // Both before the window, so the icon and menu bar are in place the moment
+        // anything is on screen.
+        if let Some(icon) = self.config.icon {
+            crate::icon::set_dock_icon(icon);
+        }
+
+        if !self.config.menu_bar.menus.is_empty() {
+            match NativeMenu::install(&self.config.menu_bar) {
+                Ok(menu) => self.menu = Some(menu),
+                Err(error) => {
+                    self.fail(event_loop, error.into());
+                    return;
+                }
+            }
         }
 
         let attributes = Window::default_attributes()

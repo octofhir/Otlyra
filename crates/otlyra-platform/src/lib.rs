@@ -34,9 +34,12 @@
 //!    platform's.
 
 mod event_loop;
+mod icon;
+mod menu;
 mod present;
 
 pub use event_loop::{PlatformError, run};
+pub use menu::{Menu, MenuBar, MenuEntry, MenuError, MenuId, SystemItem};
 
 use otlyra_gfx::PaintTarget;
 
@@ -90,6 +93,8 @@ pub enum PlatformEvent {
     Resized(Viewport),
     /// The user asked to close the window. The loop exits after this is delivered.
     CloseRequested,
+    /// The user chose a menu item the embedder defined.
+    MenuCommand(MenuId),
 }
 
 /// The embedder's side of the boundary: given a target and a viewport, draw.
@@ -111,6 +116,13 @@ pub struct WindowConfig {
     /// Initial size in *logical* pixels — this is the one place logical units are
     /// the natural unit, because that is what the user and the OS agree on.
     pub logical_size: (f64, f64),
+    /// The application menu bar. Empty means no menu bar is installed.
+    pub menu_bar: MenuBar,
+    /// Encoded image (PNG) to show in the Dock or taskbar.
+    ///
+    /// Needed because an unbundled binary has no plist to read an icon from, which
+    /// is exactly the `cargo run` case.
+    pub icon: Option<&'static [u8]>,
 }
 
 impl Default for WindowConfig {
@@ -118,6 +130,8 @@ impl Default for WindowConfig {
         Self {
             title: "Otlyra".to_owned(),
             logical_size: (1024.0, 768.0),
+            menu_bar: MenuBar::new(),
+            icon: None,
         }
     }
 }
