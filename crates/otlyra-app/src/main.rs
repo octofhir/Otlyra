@@ -59,8 +59,8 @@ struct Cli {
     /// Takes a file, or nothing at all when `--url` supplies the bytes. The output
     /// is the html5lib-tests format, so what you read is exactly what the
     /// conformance suite compares against.
-    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
-    dump_dom: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", num_args = 0..=1)]
+    dump_dom: Option<Option<PathBuf>>,
 }
 
 /// The rasterizer backends the `PaintTarget` seam offers.
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.url.is_some() || cli.dump_dom.is_some() {
-        return match load_document(cli.url.as_deref(), cli.dump_dom.as_deref()) {
+        return match load_document(cli.url.as_deref(), cli.dump_dom.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("otlyra: {error}");
@@ -151,7 +151,7 @@ fn main() -> ExitCode {
 /// encoding, tree. Navigation and rendering join it later.
 fn load_document(
     url: Option<&str>,
-    dump_dom: Option<&std::path::Path>,
+    dump_dom: Option<Option<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (bytes, transport_charset) = match url {
         Some(input) => {
@@ -166,8 +166,10 @@ fn load_document(
             (resource.body, charset)
         }
         None => {
-            let path = dump_dom.filter(|path| !path.as_os_str().is_empty());
-            let path = path.ok_or("--dump-dom needs a file, or a --url to fetch")?;
+            let path = dump_dom
+                .clone()
+                .flatten()
+                .ok_or("--dump-dom needs a file, or a --url to fetch")?;
             (std::fs::read(path)?, None)
         }
     };
