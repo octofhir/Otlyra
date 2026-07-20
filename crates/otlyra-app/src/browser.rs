@@ -7,14 +7,54 @@
 use std::collections::HashMap;
 
 use otlyra_css::cascade::ExternalSheets;
-use otlyra_dom::Document;
+use otlyra_dom::NodeId;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_layout::Images;
-use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport};
+use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport, Waker};
 use otlyra_text::TextEngine;
 
+use crate::fetcher::{Fetched, Fetcher, Loader, ResourceKind};
 use crate::page::{PageScene, title_of};
 use crate::ui::{BrowserUi, TabLabel, UI_HEIGHT, UiAction};
+
+/// How long a caller with no event loop waits between checks for a finished fetch.
+const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A load in flight, and everything it is still waiting for.
+struct PendingLoad {
+    /// The request the document itself was asked for under.
+    document: u64,
+    /// Where the tab was before, which decides whether this is a new place.
+    previous_url: String,
+    /// Whether arriving should add a history entry. A reload and a step through
+    /// the history are the same place again, so they do not.
+    record: bool,
+    /// Where to put the reader once the page is built.
+    restore_scroll: f32,
+    sheets: ExternalSheets,
+    images: Images,
+    /// What each outstanding request will feed once it arrives.
+    outstanding: HashMap<u64, Vec<PendingResource>>,
+}
+
+/// What a subresource is for once it lands.
+enum PendingResource {
+    /// The `<link>` whose stylesheet this is.
+    Stylesheet(NodeId),
+    /// The `<img>` whose picture this is.
+    Image(NodeId),
+}
+
+/// Note in the log when a document asked for more than the limit allows.
+fn report_limit(asked: usize, limit: usize, what: &str) {
+    if asked > limit {
+        tracing::warn!(
+            asked,
+            fetched = limit,
+            "the document asks for more {what} than the limit"
+        );
+    }
+}
 
 /// One place a tab has been.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +76,8 @@ pub struct Tab {
     pub page: Option<PageScene>,
     /// What went wrong, if anything.
     pub error: Option<String>,
+    /// The load in flight, if one is.
+    pending: Option<PendingLoad>,
     /// Where this tab has been, oldest first.
     ///
     /// A list and a position rather than two stacks: going back and then somewhere
@@ -54,9 +96,15 @@ impl Tab {
             title: "New tab".to_owned(),
             page: None,
             error: None,
+            pending: None,
             history: Vec::new(),
             position: 0,
         }
+    }
+
+    /// Whether this tab is waiting for something.
+    pub fn loading(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Whether there is anywhere to go back to.
@@ -105,23 +153,15 @@ fn decode_css(bytes: &[u8], charset: Option<&str>) -> String {
     }
 }
 
-/// How a tab gets its bytes.
-///
-/// A trait rather than a direct call to `otlyra-net` for one reason: the browser's
-/// behaviour around navigation — which tab, what title, what happens on failure —
-/// is worth testing without a socket.
-pub trait Loader {
-    /// Fetch `url`, returning the bytes and the transport's charset.
-    fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String>;
-}
-
 /// The browser.
-pub struct Browser<L: Loader> {
+pub struct Browser {
     text: TextEngine,
     ui: BrowserUi,
     tabs: Vec<Tab>,
     active: usize,
-    loader: L,
+    fetcher: Fetcher,
+    /// When the current load started, so the spinner has something to turn by.
+    load_started: std::time::Instant,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
@@ -132,15 +172,16 @@ pub struct Browser<L: Loader> {
     pointer: (f64, f64),
 }
 
-impl<L: Loader> Browser<L> {
-    /// A browser with one blank tab.
-    pub fn new(loader: L) -> Self {
+impl Browser {
+    /// A browser with one blank tab, fetching through `loader`.
+    pub fn new<L: Loader>(loader: L) -> Self {
         Self {
             text: TextEngine::new(),
             ui: BrowserUi::new(),
             tabs: vec![Tab::blank()],
             active: 0,
-            loader,
+            fetcher: Fetcher::spawn(loader),
+            load_started: std::time::Instant::now(),
             last_width: 1024.0,
             mark: otlyra_gfx::decode_image(crate::MARK)
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
@@ -213,10 +254,7 @@ impl<L: Loader> Browser<L> {
         self.tabs[self.active].position = target;
         // The entry was reached once, so its scheme was allowed once; going back to
         // it is the reader's own request and not the page's.
-        self.load_into_tab(&entry.url, true);
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
-            page.set_scroll(entry.scroll);
-        }
+        self.start_load(&entry.url, true, false, entry.scroll);
     }
 
     /// Record where the reader is in the entry they are about to leave.
@@ -245,10 +283,7 @@ impl<L: Loader> Browser<L> {
         let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
         // Reload keeps the entry it is on: a page loaded twice is one place, and
         // going back from it must reach where you were before it, not itself.
-        self.load_into_tab(&url, false);
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
-            page.set_scroll(scroll);
-        }
+        self.start_load(&url, false, false, scroll);
     }
 
     /// Load `url` into the active tab.
@@ -258,15 +293,284 @@ impl<L: Loader> Browser<L> {
     /// all, and a page from the internet must never be able to claim it.
     fn navigate_from(&mut self, url: &str, user_initiated: bool) {
         self.remember_scroll();
-        let before = self.tabs[self.active].url.clone();
-        self.load_into_tab(url, user_initiated);
+        self.start_load(url, user_initiated, true, 0.0);
+    }
 
-        // A load that failed is still somewhere the tab has been — the address bar
-        // shows it and reload has to work — but it is not worth an entry of its own
-        // if it did not move: reloading a broken page would otherwise fill the
-        // history with it.
+    /// Ask for `url` and leave the tab waiting for it.
+    ///
+    /// Nothing here waits: the request goes to the fetch thread and the answer
+    /// arrives as an event like any other. `record` says whether reaching it should
+    /// become a history entry, and `restore_scroll` where the reader should be put
+    /// once it has.
+    fn start_load(&mut self, url: &str, user_initiated: bool, record: bool, restore_scroll: f32) {
+        let _span = tracing::info_span!("navigation", url).entered();
+
+        if !user_initiated && let Ok(target) = otlyra_net::normalize(url) {
+            let from = self.tabs[self.active].url.clone();
+            if !otlyra_net::may_navigate(Some(&from), &target) {
+                tracing::warn!(%url, %from, "navigation refused by scheme policy");
+                let tab = &mut self.tabs[self.active];
+                tab.error = Some(format!("Refused to open {url} from {from}"));
+                tab.page = None;
+                tab.pending = None;
+                return;
+            }
+        }
+
+        let previous_url = self.tabs[self.active].url.clone();
+        let id = self.fetcher.request(url, ResourceKind::Document);
+        self.load_started = std::time::Instant::now();
+
         let tab = &mut self.tabs[self.active];
-        if tab.url == before && !tab.history.is_empty() {
+        tab.url = url.to_owned();
+        tab.error = None;
+        tab.title = url.to_owned();
+        tab.pending = Some(PendingLoad {
+            document: id,
+            previous_url,
+            record,
+            restore_scroll,
+            sheets: ExternalSheets::default(),
+            images: Images::default(),
+            outstanding: HashMap::new(),
+        });
+        self.ui.address.set_text(url);
+    }
+
+    /// How far round the spinner is, or `None` when nothing is loading.
+    ///
+    /// A function of how long the load has been going rather than of a counter
+    /// somewhere: a frame that arrives late then draws where the spinner should be
+    /// now, not where the last frame left it.
+    fn spinner_phase(&self) -> Option<f32> {
+        self.tabs[self.active]
+            .loading()
+            .then(|| self.load_started.elapsed().as_secs_f32() * 4.0)
+    }
+
+    /// Take in everything the fetch thread has finished.
+    ///
+    /// Called when the loop says it was woken, and by anything with no loop to be
+    /// woken by. Returns whether a tab changed, which is whether a frame is worth
+    /// drawing.
+    pub fn pump(&mut self) -> bool {
+        let finished = self.fetcher.poll();
+        let mut changed = false;
+        for fetched in finished {
+            changed |= self.receive(fetched);
+        }
+        changed
+    }
+
+    /// Wait for the tab to finish loading, for callers with no event loop.
+    ///
+    /// The window never calls this — it is woken instead. A screenshot and a test
+    /// have nowhere to be woken from, and waiting is what they mean by "load".
+    pub fn wait_for_load(&mut self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.tabs.iter().any(|tab| tab.loading()) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("gave up waiting for a load");
+                return;
+            }
+            for fetched in self.fetcher.wait(remaining.min(FETCH_POLL)) {
+                self.receive(fetched);
+            }
+        }
+    }
+
+    /// One finished fetch. Returns whether it changed anything on screen.
+    fn receive(&mut self, fetched: Fetched) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| {
+            tab.pending.as_ref().is_some_and(|pending| {
+                pending.document == fetched.id || pending.outstanding.contains_key(&fetched.id)
+            })
+        }) else {
+            // A load nobody is waiting for any more: the tab moved on, or closed.
+            return false;
+        };
+
+        match fetched.kind {
+            ResourceKind::Document => self.receive_document(index, fetched),
+            ResourceKind::Stylesheet | ResourceKind::Image => {
+                self.receive_subresource(index, fetched);
+                true
+            }
+        }
+    }
+
+    /// The page itself arrived.
+    ///
+    /// The document is shown straight away, before its stylesheets and pictures
+    /// have been asked for: a page that is readable now and styled a moment later
+    /// beats a blank window for the length of the slowest thing it links to.
+    fn receive_document(&mut self, index: usize, fetched: Fetched) -> bool {
+        let loaded = match fetched.result {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(%error, "navigation failed");
+                let tab = &mut self.tabs[index];
+                tab.title = "Failed".to_owned();
+                tab.page = None;
+                tab.error = Some(error);
+                tab.pending = None;
+                return true;
+            }
+        };
+
+        let parsed = otlyra_html::parse(&loaded.bytes, loaded.charset.as_deref());
+        let final_url = loaded.final_url;
+
+        // What the page asks for, decided here and fetched on the other thread.
+        let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
+        let links = otlyra_css::cascade::stylesheet_links(&parsed.document);
+        self.request_subresources(
+            &mut outstanding,
+            &final_url,
+            links.iter().take(STYLESHEET_LIMIT).map(|link| {
+                (
+                    link.href.clone(),
+                    PendingResource::Stylesheet(link.node),
+                    ResourceKind::Stylesheet,
+                )
+            }),
+        );
+        let pictures = otlyra_layout::image_sources(&parsed.document);
+        self.request_subresources(
+            &mut outstanding,
+            &final_url,
+            pictures.iter().take(IMAGE_LIMIT).map(|source| {
+                (
+                    source.src.clone(),
+                    PendingResource::Image(source.node),
+                    ResourceKind::Image,
+                )
+            }),
+        );
+        report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
+        report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
+
+        let tab = &mut self.tabs[index];
+        tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
+        tab.url = final_url.clone();
+        tab.page = Some(PageScene::new(parsed.document));
+        if index == self.active {
+            self.ui.address.set_text(&final_url);
+        }
+
+        let Some(pending) = self.tabs[index].pending.as_mut() else {
+            return true;
+        };
+        pending.outstanding = outstanding;
+        let record = pending.record;
+        let previous = pending.previous_url.clone();
+
+        if record {
+            self.record_history(index, &previous);
+        }
+        if self.tabs[index]
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.outstanding.is_empty())
+        {
+            self.finish_load(index);
+        }
+        true
+    }
+
+    /// Ask for a page's subresources, recording which nodes each answer feeds.
+    fn request_subresources(
+        &mut self,
+        outstanding: &mut HashMap<u64, Vec<PendingResource>>,
+        base: &str,
+        wanted: impl Iterator<Item = (String, PendingResource, ResourceKind)>,
+    ) {
+        // One request per address: a page that names the same picture in ten places
+        // is asking for it once.
+        let mut asked: HashMap<String, u64> = HashMap::new();
+        for (href, resource, kind) in wanted {
+            let Some(url) = Self::subresource_url(base, &href) else {
+                continue;
+            };
+            let id = *asked
+                .entry(url.clone())
+                .or_insert_with(|| self.fetcher.request(&url, kind));
+            outstanding.entry(id).or_default().push(resource);
+        }
+    }
+
+    /// A stylesheet or a picture arrived.
+    fn receive_subresource(&mut self, index: usize, fetched: Fetched) {
+        let Some(pending) = self.tabs[index].pending.as_mut() else {
+            return;
+        };
+        let Some(wanted) = pending.outstanding.remove(&fetched.id) else {
+            return;
+        };
+
+        match fetched.result {
+            Ok(loaded) => {
+                for resource in wanted {
+                    match resource {
+                        PendingResource::Stylesheet(node) => {
+                            let source = decode_css(&loaded.bytes, loaded.charset.as_deref());
+                            pending.sheets.insert(node, source);
+                        }
+                        PendingResource::Image(node) => {
+                            match otlyra_gfx::decode_image(&loaded.bytes) {
+                                Ok(image) => {
+                                    pending.images.insert(node, image);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(url = %fetched.url, %error, "image failed to decode");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(url = %fetched.url, %error, "subresource failed to load");
+            }
+        }
+
+        if pending.outstanding.is_empty() {
+            self.finish_load(index);
+        }
+    }
+
+    /// Everything the page asked for has arrived or failed: build it for real.
+    fn finish_load(&mut self, index: usize) {
+        let Some(pending) = self.tabs[index].pending.take() else {
+            return;
+        };
+        let scroll = pending.restore_scroll;
+        let tab = &mut self.tabs[index];
+
+        // The document is already on screen, unstyled; rebuilding it with what
+        // arrived is what turns it into the page the author wrote.
+        if (!pending.sheets.is_empty() || !pending.images.is_empty())
+            && let Some(page) = tab.page.take()
+        {
+            tab.page = Some(PageScene::with_resources(
+                page.into_document(),
+                pending.sheets,
+                pending.images,
+            ));
+        }
+        if let Some(page) = tab.page.as_mut() {
+            page.set_scroll(scroll);
+        }
+    }
+
+    /// Add the entry this load earned, if it earned one.
+    fn record_history(&mut self, index: usize, previous_url: &str) {
+        let tab = &mut self.tabs[index];
+
+        // A load that did not move is not a second place: reloading a page, or
+        // typing the address it is already on, adds nothing.
+        if tab.url == previous_url && !tab.history.is_empty() {
             return;
         }
 
@@ -283,148 +587,22 @@ impl<L: Loader> Browser<L> {
         tab.position = tab.history.len() - 1;
     }
 
-    /// Load `url` into the active tab, without touching its history.
-    fn load_into_tab(&mut self, url: &str, user_initiated: bool) {
-        let _span = tracing::info_span!("navigation", url).entered();
-
-        if !user_initiated && let Ok(target) = otlyra_net::normalize(url) {
-            let from = self.tabs[self.active].url.clone();
-            if !otlyra_net::may_navigate(Some(&from), &target) {
-                tracing::warn!(%url, %from, "navigation refused by scheme policy");
-                let tab = &mut self.tabs[self.active];
-                tab.error = Some(format!("Refused to open {url} from {from}"));
-                tab.page = None;
-                return;
-            }
-        }
-
-        let tab = &mut self.tabs[self.active];
-        tab.url = url.to_owned();
-        tab.error = None;
-        tab.title = url.to_owned();
-        self.ui.address.set_text(url);
-
-        match self.loader.load(url) {
-            Ok((bytes, charset, final_url)) => {
-                let parsed = otlyra_html::parse(&bytes, charset.as_deref());
-                let sheets = self.fetch_stylesheets(&parsed.document, &final_url);
-                let images = self.fetch_images(&parsed.document, &final_url);
-                let tab = &mut self.tabs[self.active];
-                tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
-                tab.url = final_url.clone();
-                tab.page = Some(PageScene::with_resources(parsed.document, sheets, images));
-                self.ui.address.set_text(final_url);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "navigation failed");
-                let tab = &mut self.tabs[self.active];
-                tab.title = "Failed".to_owned();
-                tab.page = None;
-                tab.error = Some(error);
-            }
-        }
-    }
-
-    /// Fetch every stylesheet `document` links to, resolved against `base`.
-    ///
-    /// Synchronous, like the navigation it is part of, and for the same reason:
-    /// the page cannot be styled before its sheets have arrived, and the real fix
-    /// is a load that does not block the event loop rather than a style step that
-    /// waits for one.
-    ///
-    /// A document fetched over the network may not reach a `file:` URL, the same
-    /// rule that governs where it may navigate: a stylesheet is a request the page
-    /// chose to make, and a page from the internet reading the disk is the failure
-    /// that rule exists to prevent.
-    fn fetch_stylesheets(&mut self, document: &Document, base: &str) -> ExternalSheets {
-        let links = otlyra_css::cascade::stylesheet_links(document);
-        let mut sheets = ExternalSheets::default();
-        let mut fetched: HashMap<String, Option<String>> = HashMap::new();
-
-        for link in links.iter().take(STYLESHEET_LIMIT) {
-            let Some(url) = Self::subresource_url(base, &link.href, "stylesheet") else {
-                continue;
-            };
-
-            // One fetch per address: a page that links the same sheet from two
-            // places is asking for it once.
-            let source = fetched.entry(url.clone()).or_insert_with(|| {
-                let (bytes, charset) = Self::fetch(&mut self.loader, &url, "stylesheet")?;
-                Some(decode_css(&bytes, charset.as_deref()))
-            });
-
-            if let Some(source) = source {
-                sheets.insert(link.node, source.clone());
-            }
-        }
-
-        if links.len() > STYLESHEET_LIMIT {
-            tracing::warn!(
-                asked = links.len(),
-                fetched = STYLESHEET_LIMIT,
-                "the document links more stylesheets than the limit"
-            );
-        }
-
-        sheets
-    }
-
-    /// Fetch and decode every picture `document` asks for.
-    fn fetch_images(&mut self, document: &Document, base: &str) -> Images {
-        let sources = otlyra_layout::image_sources(document);
-        let mut images = Images::default();
-        let mut fetched: HashMap<String, Option<otlyra_gfx::peniko::ImageData>> = HashMap::new();
-
-        for source in sources.iter().take(IMAGE_LIMIT) {
-            let Some(url) = Self::subresource_url(base, &source.src, "image") else {
-                continue;
-            };
-
-            let image = fetched.entry(url.clone()).or_insert_with(|| {
-                let (bytes, _) = Self::fetch(&mut self.loader, &url, "image")?;
-                otlyra_gfx::decode_image(&bytes)
-                    .inspect_err(|error| tracing::warn!(%url, %error, "image failed to decode"))
-                    .ok()
-            });
-
-            if let Some(image) = image {
-                images.insert(source.node, image.clone());
-            }
-        }
-
-        if sources.len() > IMAGE_LIMIT {
-            tracing::warn!(
-                asked = sources.len(),
-                fetched = IMAGE_LIMIT,
-                "the document asks for more pictures than the limit"
-            );
-        }
-
-        images
-    }
-
     /// The address a subresource is actually fetched from, or `None` if the page
     /// may not reach it.
-    fn subresource_url(base: &str, href: &str, kind: &str) -> Option<String> {
+    ///
+    /// A document fetched over the network may not reach a `file:` URL, the same
+    /// rule that governs where it may navigate: a subresource is a request the page
+    /// chose to make, and a page from the internet reading the disk is the failure
+    /// that rule exists to prevent.
+    fn subresource_url(base: &str, href: &str) -> Option<String> {
         let url = otlyra_net::resolve(base, href)?;
         if let Ok(target) = otlyra_net::normalize(&url)
             && !otlyra_net::may_navigate(Some(base), &target)
         {
-            tracing::warn!(%url, %base, %kind, "subresource refused by scheme policy");
+            tracing::warn!(%url, %base, "subresource refused by scheme policy");
             return None;
         }
         Some(url)
-    }
-
-    /// One subresource's bytes, or `None` with a note about why not.
-    fn fetch(loader: &mut L, url: &str, kind: &str) -> Option<(Vec<u8>, Option<String>)> {
-        match loader.load(url) {
-            Ok((bytes, charset, _)) => Some((bytes, charset)),
-            Err(error) => {
-                tracing::warn!(%url, %error, %kind, "subresource failed to load");
-                None
-            }
-        }
     }
 
     /// Open a tab and make it active.
@@ -498,15 +676,31 @@ impl<L: Loader> Browser<L> {
             .iter()
             .map(|tab| TabLabel {
                 title: tab.title.clone(),
-                loading: false,
+                loading: tab.loading(),
             })
             .collect()
     }
 }
 
-impl<L: Loader> Painter for Browser<L> {
+impl Painter for Browser {
+    fn set_waker(&mut self, waker: Waker) {
+        self.fetcher.set_waker(waker);
+    }
+
+    /// A frame at the display's pace while something is loading, so the spinner
+    /// turns; nothing at all when the browser is idle.
+    fn animating(&self) -> bool {
+        self.tabs.iter().any(Tab::loading)
+    }
+
     fn on_event(&mut self, event: PlatformEvent) {
         match event {
+            // Something finished on the fetch thread. What it was is the browser's
+            // business; the loop only knows it should ask.
+            PlatformEvent::Woken => {
+                self.pump();
+            }
+
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
                 self.ui.pointer_moved(x, y);
@@ -627,6 +821,7 @@ impl<L: Loader> Painter for Browser<L> {
                 self.tabs[self.active].can_go_back(),
                 self.tabs[self.active].can_go_forward(),
             ),
+            self.spinner_phase(),
             &mut self.text,
             &mut list,
         );
@@ -641,16 +836,23 @@ mod tests {
 
     use super::*;
 
+    /// What a fake loader was asked for, shared because the loader itself lives on
+    /// the fetch thread and a test cannot reach into it.
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
     /// A loader that serves canned pages, so navigation can be tested without a
     /// socket — including the failure path, which a real server makes awkward.
     #[derive(Default)]
     struct FakeLoader {
-        requested: Vec<String>,
+        requested: Requests,
     }
 
     impl Loader for FakeLoader {
         fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
-            self.requested.push(url.to_owned());
+            self.requested
+                .lock()
+                .expect("no panic on the fetch thread")
+                .push(url.to_owned());
             match url {
                 "broken.example" => Err("could not fetch broken.example".to_owned()),
                 // A `file:` URL loads as itself; anything else becomes an https
@@ -679,11 +881,41 @@ mod tests {
         }
     }
 
-    fn browser() -> Browser<FakeLoader> {
-        Browser::new(FakeLoader::default())
+    fn browser() -> Browser {
+        browser_with_log().0
     }
 
-    fn type_url(browser: &mut Browser<FakeLoader>, url: &str) {
+    /// A browser and the list of what its loader was asked for.
+    fn browser_with_log() -> (Browser, Requests) {
+        let requested = Requests::default();
+        let loader = FakeLoader {
+            requested: std::sync::Arc::clone(&requested),
+        };
+        (Browser::new(loader), requested)
+    }
+
+    /// Wait for whatever was asked for to arrive.
+    ///
+    /// Loading happens on another thread and the window is woken when it finishes;
+    /// a test has no window, so it waits instead.
+    fn settle(browser: &mut Browser) {
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+    }
+
+    /// Navigate and wait, which is what every test means by "load this".
+    fn go(browser: &mut Browser, url: &str) {
+        browser.navigate(url);
+        settle(browser);
+    }
+
+    fn asked_for(requests: &Requests) -> Vec<String> {
+        requests
+            .lock()
+            .expect("no panic on the fetch thread")
+            .clone()
+    }
+
+    fn type_url(browser: &mut Browser, url: &str) {
         browser.ui.address_focused = true;
         for character in url.chars() {
             browser.on_event(PlatformEvent::TextInput(character));
@@ -692,14 +924,15 @@ mod tests {
             key: Key::Enter,
             modifiers: Modifiers::default(),
         });
+        settle(browser);
     }
 
     #[test]
     fn typing_an_address_and_pressing_enter_loads_it() {
-        let mut browser = browser();
+        let (mut browser, requested) = browser_with_log();
         type_url(&mut browser, "example.com");
 
-        assert_eq!(browser.loader.requested, ["example.com"]);
+        assert_eq!(asked_for(&requested), ["example.com"]);
         assert_eq!(browser.tabs[0].title, "Title of example.com");
         assert!(browser.tabs[0].page.is_some());
     }
@@ -806,6 +1039,7 @@ mod tests {
     fn clicking_a_link_navigates_to_it() {
         let mut browser = Browser::new(LinkLoader);
         browser.navigate("start.example");
+        settle(&mut browser);
 
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
@@ -826,6 +1060,7 @@ mod tests {
     fn the_cursor_is_ordinary_away_from_a_link() {
         let mut browser = Browser::new(LinkLoader);
         browser.navigate("start.example");
+        settle(&mut browser);
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
@@ -841,6 +1076,7 @@ mod tests {
     fn a_press_on_the_page_that_is_not_a_link_navigates_nowhere() {
         let mut browser = Browser::new(LinkLoader);
         browser.navigate("start.example");
+        settle(&mut browser);
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
@@ -877,28 +1113,37 @@ mod tests {
         assert!(!browser.can_go_back() && !browser.can_go_forward());
 
         browser.navigate("one.example");
+        settle(&mut browser);
         assert!(!browser.can_go_back(), "one entry is nowhere to go back to");
         browser.navigate("two.example");
+        settle(&mut browser);
         browser.navigate("three.example");
+        settle(&mut browser);
 
         assert!(browser.can_go_back() && !browser.can_go_forward());
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://two.example/");
         assert!(browser.can_go_forward());
 
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://one.example/");
         assert!(!browser.can_go_back());
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(
             browser.tabs[0].url, "https://one.example/",
             "and no further"
         );
 
         browser.go_forward();
+        settle(&mut browser);
         browser.go_forward();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://three.example/");
         browser.go_forward();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://three.example/", "nor further");
     }
 
@@ -908,12 +1153,17 @@ mod tests {
     fn navigating_after_going_back_drops_the_forward_entries() {
         let mut browser = browser();
         browser.navigate("one.example");
+        settle(&mut browser);
         browser.navigate("two.example");
+        settle(&mut browser);
         browser.go_back();
+        settle(&mut browser);
         browser.navigate("three.example");
+        settle(&mut browser);
 
         assert!(!browser.can_go_forward());
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://one.example/");
     }
 
@@ -922,11 +1172,15 @@ mod tests {
     fn a_reload_adds_no_history_entry() {
         let mut browser = browser();
         browser.navigate("one.example");
+        settle(&mut browser);
         browser.navigate("two.example");
+        settle(&mut browser);
         browser.reload();
+        settle(&mut browser);
 
         assert!(!browser.can_go_forward());
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(browser.tabs[0].url, "https://one.example/");
     }
 
@@ -936,6 +1190,7 @@ mod tests {
     fn going_back_restores_where_the_reader_was() {
         let mut browser = Browser::new(LongLoader);
         browser.navigate("long.example");
+        settle(&mut browser);
         browser.tabs[0]
             .page
             .as_mut()
@@ -943,7 +1198,9 @@ mod tests {
             .set_scroll(120.0);
 
         browser.navigate("long.example/second");
+        settle(&mut browser);
         browser.go_back();
+        settle(&mut browser);
         assert_eq!(
             browser.tabs[0].page.as_ref().expect("a page").scroll(),
             120.0
@@ -953,12 +1210,15 @@ mod tests {
     /// A site whose CSS lives in a file next to the page.
     #[derive(Default)]
     struct SiteLoader {
-        requested: Vec<String>,
+        requested: Requests,
     }
 
     impl Loader for SiteLoader {
         fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
-            self.requested.push(url.to_owned());
+            self.requested
+                .lock()
+                .expect("no panic on the fetch thread")
+                .push(url.to_owned());
             match url {
                 "https://site.example/site.css" => Ok((
                     b"p { color: rgb(0, 128, 0) }".to_vec(),
@@ -983,11 +1243,14 @@ mod tests {
     /// links that are stylesheets are fetched at all.
     #[test]
     fn navigation_fetches_the_stylesheets_the_page_links() {
-        let mut browser = Browser::new(SiteLoader::default());
-        browser.navigate("site.example");
+        let requested = Requests::default();
+        let mut browser = Browser::new(SiteLoader {
+            requested: std::sync::Arc::clone(&requested),
+        });
+        go(&mut browser, "site.example");
 
         assert_eq!(
-            browser.loader.requested,
+            asked_for(&requested),
             vec![
                 "site.example".to_owned(),
                 "https://site.example/site.css".to_owned(),
@@ -1031,12 +1294,13 @@ mod tests {
 
         let mut browser = Browser::new(DiskLoader);
         browser.navigate("site.example");
+        settle(&mut browser);
         assert!(browser.tabs[browser.active].page.is_some());
     }
 
     /// Where the link's text was actually painted, taken from the page's own
     /// targets rather than guessed.
-    fn link_position(browser: &Browser<LinkLoader>) -> (f64, f64) {
+    fn link_position(browser: &Browser) -> (f64, f64) {
         let page = browser.tabs[browser.active].page.as_ref().expect("page");
         let mut x = 0.0;
         let mut y = 0.0;
@@ -1055,12 +1319,13 @@ mod tests {
 
     #[test]
     fn reloading_fetches_the_same_address_again() {
-        let mut browser = browser();
+        let (mut browser, requested) = browser_with_log();
         type_url(&mut browser, "example.com");
         browser.reload();
+        settle(&mut browser);
 
         assert_eq!(
-            browser.loader.requested,
+            asked_for(&requested),
             ["example.com", "https://example.com/"],
             "the reload asks for where the first load ended up"
         );
@@ -1072,6 +1337,7 @@ mod tests {
     fn reloading_keeps_the_scroll_position() {
         let mut browser = Browser::new(LongLoader);
         browser.navigate("long.example");
+        settle(&mut browser);
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
@@ -1081,6 +1347,7 @@ mod tests {
         assert!(scrolled > 0.0);
 
         browser.reload();
+        settle(&mut browser);
         assert_eq!(
             browser.tabs[0].page.as_ref().expect("page").scroll(),
             scrolled
@@ -1089,17 +1356,19 @@ mod tests {
 
     #[test]
     fn reloading_a_blank_tab_does_nothing() {
-        let mut browser = browser();
+        let (mut browser, requested) = browser_with_log();
         browser.reload();
-        assert!(browser.loader.requested.is_empty());
+        settle(&mut browser);
+        assert!(asked_for(&requested).is_empty());
     }
 
     /// §14's rule: a page from the internet must never be able to open a file.
     #[test]
     fn a_web_page_may_not_navigate_to_a_file_url() {
-        let mut browser = browser();
+        let (mut browser, requested) = browser_with_log();
         type_url(&mut browser, "example.com");
         browser.navigate_from("file:///etc/passwd", false);
+        settle(&mut browser);
 
         assert_eq!(browser.tabs[0].url, "https://example.com/");
         assert!(
@@ -1109,7 +1378,7 @@ mod tests {
                 .is_some_and(|error| error.contains("Refused"))
         );
         assert_eq!(
-            browser.loader.requested,
+            asked_for(&requested),
             ["example.com"],
             "the loader is never even asked"
         );
@@ -1117,13 +1386,14 @@ mod tests {
 
     #[test]
     fn the_user_may_open_a_file_url_and_so_may_a_local_page() {
-        let mut browser = browser();
+        let (mut browser, requested) = browser_with_log();
         type_url(&mut browser, "file:///tmp/one.html");
-        assert_eq!(browser.loader.requested.len(), 1);
+        assert_eq!(asked_for(&requested).len(), 1);
 
         browser.navigate_from("file:///tmp/two.html", false);
+        settle(&mut browser);
         assert_eq!(
-            browser.loader.requested.len(),
+            asked_for(&requested).len(),
             2,
             "a local page's own link is allowed"
         );

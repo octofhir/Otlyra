@@ -288,11 +288,19 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     });
 
     match cli.screenshot.as_deref() {
-        Some(path) => write_screenshot(&mut browser, cli.viewport(), path)?,
+        Some(path) => {
+            // A screenshot has one frame to get right and no event loop to be woken
+            // by, so this is the one place that waits for a load.
+            browser.wait_for_load(LOAD_TIMEOUT);
+            write_screenshot(&mut browser, cli.viewport(), path)?;
+        }
         None => run_window(window_config(cli), &mut browser)?,
     }
     Ok(())
 }
+
+/// How long `--screenshot` waits for the page it was given.
+const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How the shell configures its window.
 fn window_config(cli: &Cli) -> WindowConfig {
@@ -348,7 +356,7 @@ fn file_url(input: &str) -> Option<url::Url> {
     url::Url::from_file_path(absolute).ok()
 }
 
-impl otlyra_app::browser::Loader for NetLoader {
+impl otlyra_app::fetcher::Loader for NetLoader {
     fn load(&mut self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
         // A path typed into the address bar becomes the `file:` URL it names, so
         // that what the bar shows is an address and not a filename — and so that a

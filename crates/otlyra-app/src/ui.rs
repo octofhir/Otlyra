@@ -452,6 +452,7 @@ impl BrowserUi {
         tabs: &[TabLabel],
         active: usize,
         history: (bool, bool),
+        spinner: Option<f32>,
         text: &mut TextEngine,
         list: &mut DisplayList,
     ) {
@@ -462,7 +463,7 @@ impl BrowserUi {
         fill(list, Rect::new(0.0, 0.0, width, UI_HEIGHT), BACKGROUND, 0.0);
         draw_chevron(list, layout.back, Direction::Back, can_go_back);
         draw_chevron(list, layout.forward, Direction::Forward, can_go_forward);
-        draw_reload(list, layout.reload);
+        draw_reload(list, layout.reload, spinner);
 
         for (index, (rect, label)) in layout.tabs.iter().zip(tabs).enumerate() {
             let active = index == active;
@@ -699,15 +700,19 @@ fn draw_chevron(list: &mut DisplayList, rect: Rect, direction: Direction, enable
 /// A glyph would be at the mercy of whichever font the system hands back, and a
 /// missing glyph is a hollow box where the button should be. A path is the same
 /// on every machine.
-fn draw_reload(list: &mut DisplayList, rect: Rect) {
+fn draw_reload(list: &mut DisplayList, rect: Rect, spinner: Option<f32>) {
     fill(list, rect, TAB_INACTIVE, 6.0);
 
     let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
     let radius = rect.width.min(rect.height) / 2.0 - 4.0;
 
-    // Five sixths of a circle, leaving a gap for the arrowhead to sit in.
-    let start = -0.9;
-    let sweep = 5.2;
+    // The same arrow either way: while a page is loading it turns, and the turn is
+    // the only thing that says the browser is busy rather than stuck. A shorter
+    // sweep then, so the gap reads as motion.
+    let (start, sweep) = match spinner {
+        Some(phase) => (f64::from(phase), 4.2),
+        None => (-0.9, 5.2),
+    };
     list.push(DisplayItem::Stroke {
         style: Stroke::new(1.6),
         transform: Affine::IDENTITY,
@@ -1046,7 +1051,15 @@ mod tests {
         let ui = BrowserUi::new();
         let mut engine = TextEngine::isolated();
         let mut list = DisplayList::new();
-        ui.build_display_list(1000.0, &labels(3), 0, (true, false), &mut engine, &mut list);
+        ui.build_display_list(
+            1000.0,
+            &labels(3),
+            0,
+            (true, false),
+            None,
+            &mut engine,
+            &mut list,
+        );
 
         let glyph_runs = list
             .items()

@@ -84,6 +84,13 @@ impl PageScene {
         &self.document
     }
 
+    /// Take the document back out, to build the page again with more of what it
+    /// asked for — a stylesheet that has since arrived, a picture that has decoded.
+    /// Parsing it twice would be the alternative, and the bytes are gone by then.
+    pub fn into_document(self) -> Document {
+        self.document
+    }
+
     /// The box tree behind the page.
     pub fn boxes(&self) -> &BoxTree {
         &self.boxes
