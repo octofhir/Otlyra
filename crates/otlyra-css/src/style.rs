@@ -99,6 +99,44 @@ impl<T: Copy> Sides<T> {
     }
 }
 
+/// One border: how wide it is drawn and what colour.
+///
+/// `border-style` is not a field. A border is either drawn or it is not, and the
+/// styles that are not `solid` — dashed, dotted, ridge — are a painting difference
+/// this renderer does not make yet. What it must not get wrong is the arithmetic:
+/// a `none` or `hidden` border is zero wide, and that changes where content sits.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Border {
+    /// The used width in CSS pixels — zero when the style makes the border absent.
+    pub width: f32,
+    /// `border-*-color`, which defaults to the element's own `color`.
+    pub color: Color,
+}
+
+impl Border {
+    /// No border.
+    pub const NONE: Self = Self {
+        width: 0.0,
+        color: Color::TRANSPARENT,
+    };
+
+    /// Whether this border puts anything on the screen.
+    pub fn is_visible(self) -> bool {
+        self.width > 0.0 && self.color.components[3] > 0.0
+    }
+}
+
+/// `text-align`, in the values a block formatting context can honour.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TextAlign {
+    /// The start edge — left, in the writing direction we support.
+    Start,
+    /// Centred in the content box.
+    Center,
+    /// The end edge.
+    End,
+}
+
 /// `white-space`, in the two values that matter before CSS parsing exists.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WhiteSpace {
@@ -200,6 +238,10 @@ pub struct ComputedStyle {
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
     pub padding: Sides<Length>,
+    /// `border-*-width` and `border-*-color`, resolved together.
+    pub border: Sides<Border>,
+    /// `text-align`. Inherited.
+    pub text_align: TextAlign,
     /// `white-space`. Inherited.
     pub white_space: WhiteSpace,
     /// `text-decoration-line`.
@@ -233,6 +275,8 @@ impl Default for ComputedStyle {
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
             padding: Sides::all(Length::ZERO),
+            border: Sides::all(Border::NONE),
+            text_align: TextAlign::Start,
             width: LengthOrAuto::Auto,
             height: LengthOrAuto::Auto,
         }
@@ -256,6 +300,7 @@ impl ComputedStyle {
             line_height: parent.line_height,
             white_space: parent.white_space,
             text_decoration: parent.text_decoration,
+            text_align: parent.text_align,
             ..Self::default()
         }
     }

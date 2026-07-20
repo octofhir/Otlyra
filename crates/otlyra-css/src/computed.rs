@@ -12,8 +12,8 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, LineHeight, Sides, TextDecoration,
-    WhiteSpace,
+    Border, ComputedStyle, Display, FontStyle, Length, LengthOrAuto, LineHeight, Sides, TextAlign,
+    TextDecoration, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -52,6 +52,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             bottom: length(&values.get_padding().padding_bottom.0),
             left: length(&values.get_padding().padding_left.0),
         },
+        border: border(values),
+        text_align: text_align(values),
         width: size(&values.get_position().width),
         height: size(&values.get_position().height),
     }
@@ -86,6 +88,11 @@ fn colour(value: style::color::AbsoluteColor) -> Color {
         srgb.components.2,
         srgb.alpha,
     ])
+}
+
+/// A colour that may be `currentColor`, resolved against the element's own colour.
+fn resolve_colour(value: &style::values::computed::Color, current: Color) -> Color {
+    value.as_absolute().map_or(current, |value| colour(*value))
 }
 
 /// The font stack, as the CSS source list the text layer parses.
@@ -137,6 +144,63 @@ fn white_space(values: &ComputedValues) -> WhiteSpace {
         // Preserve, PreserveBreaks, PreserveSpaces and BreakSpaces all keep more
         // than `normal` does; layout has one bit for that today.
         _ => WhiteSpace::Pre,
+    }
+}
+
+/// The four borders, each as the width that is actually used and its colour.
+///
+/// A border whose style is `none` or `hidden` has a used width of zero however
+/// wide it was declared, which is the rule that keeps `border-style` out of the
+/// computed style this crate hands to layout.
+fn border(values: &ComputedValues) -> Sides<Border> {
+    use style::values::computed::BorderStyle;
+
+    let border = values.get_border();
+    let text = colour(values.clone_color());
+    let side =
+        |width: &style::values::computed::BorderSideWidth, style: BorderStyle, colour_value| {
+            if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
+                return Border::NONE;
+            }
+            Border {
+                width: width.0.to_f32_px(),
+                color: resolve_colour(colour_value, text),
+            }
+        };
+
+    Sides {
+        top: side(
+            &border.border_top_width,
+            border.border_top_style,
+            &border.border_top_color,
+        ),
+        right: side(
+            &border.border_right_width,
+            border.border_right_style,
+            &border.border_right_color,
+        ),
+        bottom: side(
+            &border.border_bottom_width,
+            border.border_bottom_style,
+            &border.border_bottom_color,
+        ),
+        left: side(
+            &border.border_left_width,
+            border.border_left_style,
+            &border.border_left_color,
+        ),
+    }
+}
+
+fn text_align(values: &ComputedValues) -> TextAlign {
+    use style::values::computed::TextAlign as Computed;
+
+    match values.clone_text_align() {
+        Computed::Center | Computed::MozCenter => TextAlign::Center,
+        Computed::Right | Computed::End | Computed::MozRight => TextAlign::End,
+        // `justify` spaces a line out, which inline layout does not do; its start
+        // edge is where a start-aligned line begins, so that is what it gets.
+        _ => TextAlign::Start,
     }
 }
 
@@ -276,6 +340,46 @@ mod tests {
             layout_style("<style>p { display: grid }</style><p>x", "p").display,
             Display::Block
         );
+    }
+
+    /// `border-style` decides whether a declared width is used at all, which is
+    /// why layout is handed a width rather than a style to interpret.
+    #[test]
+    fn a_border_width_counts_only_when_the_style_draws_something() {
+        let drawn = layout_style("<style>p { border: 4px solid #00f }</style><p>x", "p");
+        assert_eq!(drawn.border.top.width, 4.0);
+        assert_eq!(drawn.border.left.color, Color::from_rgb8(0, 0, 255));
+
+        let absent = layout_style("<style>p { border: 4px none #00f }</style><p>x", "p");
+        assert_eq!(absent.border.top.width, 0.0);
+        assert!(!absent.border.top.is_visible());
+    }
+
+    /// A border with no colour of its own takes the element's, which is what makes
+    /// `border: 1px solid` follow the text it frames.
+    #[test]
+    fn a_border_defaults_to_the_elements_own_colour() {
+        let style = layout_style(
+            "<style>p { color: #0a0; border: 1px solid }</style><p>x",
+            "p",
+        );
+        assert_eq!(style.border.top.color, Color::from_rgb8(0, 170, 0));
+    }
+
+    #[test]
+    fn text_align_narrows_to_the_three_a_line_box_can_honour() {
+        let align = |css: &str| {
+            layout_style(
+                &format!("<style>p {{ text-align: {css} }}</style><p>x"),
+                "p",
+            )
+            .text_align
+        };
+        assert_eq!(align("center"), TextAlign::Center);
+        assert_eq!(align("right"), TextAlign::End);
+        assert_eq!(align("left"), TextAlign::Start);
+        // Justification spaces a line out, which inline layout does not do.
+        assert_eq!(align("justify"), TextAlign::Start);
     }
 
     #[test]
