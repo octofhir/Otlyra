@@ -207,6 +207,20 @@ enum Source {
 /// the event loop must never wait on the network — and it is why `fetch_blocking`
 /// is spelled the way it is. Navigation over a channel is M9.
 fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // One of the browser's own pages fetches nothing and parses nothing, so
+    // every step below it — the encoding decision, the tree, the dumps — has
+    // no input to work on. It goes straight to a window.
+    if let Source::Url(input) = &source
+        && let Some(page) = otlyra_app::ui::SystemPage::from_url(input)
+    {
+        let mut browser = Browser::new(NetLoader::default());
+        browser.open_system(page);
+        return match cli.screenshot.as_deref() {
+            Some(path) => Ok(write_screenshot(&mut browser, cli.viewport(), path)?),
+            None => Ok(run_window(window_config(cli), &mut browser)?),
+        };
+    }
+
     let (bytes, transport_charset) = match &source {
         Source::Url(input) => {
             let resource = fetch(input)?;

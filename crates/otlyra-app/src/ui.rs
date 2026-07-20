@@ -1,159 +1,54 @@
-//! The browser's own interface: the tab strip and the address bar.
+//! The browser's own interface: the tab strip and the toolbar.
 //!
-//! Drawn with the same `otlyra-gfx` stack the page is drawn with, and for the same
-//! reason the plan gives: by the time an interface is needed we already own text
-//! layout, hit testing, input routing and painting, and a second toolkit would
-//! duplicate all four and bring a second event model with it.
+//! Drawn with the same `otlyra-gfx` stack the page is drawn with, and for the
+//! same reason the plan gives: by the time an interface is needed we already own
+//! text layout, hit testing, input routing and painting, and a second toolkit
+//! would duplicate all four and bring a second event model with it.
 //!
-//! One rule holds this file together: **geometry is computed once**, by
-//! [`UiLayout::new`], and both painting and hit testing read it. A widget that is
-//! drawn in one place and clicked in another is the classic interface bug, and it
-//! is only possible when two pieces of code each work the geometry out.
+//! The interface is a [`crate::widget`] tree, rebuilt from this struct's state
+//! every frame and thrown away after. That sounds wasteful and is not: a toolbar
+//! is a dozen boxes, and building from state means there is no second copy of
+//! anything to fall out of step — no widget holding a stale title, no hover flag
+//! left set when the pointer moved somewhere else, no identity to match between
+//! frames. What survives a frame is the *geometry*: the tree is kept so that the
+//! next press can be tested against exactly the rectangles that were drawn,
+//! which is the one thing that must not be recomputed.
+//!
+//! Two rows. The tab strip on top, on the recessed grey; the toolbar under it,
+//! on white, with the active tab merging into it — so the tab and the page it
+//! belongs to read as one surface, and the inactive ones read as behind it.
 
-use otlyra_gfx::kurbo::{Affine, Arc, BezPath, Point, RoundedRect, Shape, Stroke};
-use otlyra_gfx::peniko::{Brush, Color, Fill, ImageData, ImageSampler};
+use otlyra_gfx::kurbo::Affine;
+use otlyra_gfx::peniko::{Color, ImageData, ImageSampler};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_platform::{Key, Modifiers};
-use otlyra_text::{FontStack, TextEngine};
+use otlyra_text::TextEngine;
+
+pub use crate::widget::Rect;
+
+use crate::widget::controls::{self, Elide, FieldView, TextInput};
+use crate::widget::icon;
+use crate::widget::theme::Theme;
+use crate::widget::{
+    Align, Background, Button, Child, Cx, Event, Fixed, Insets, Label, Padding, Painted, Size,
+    Stack, Widget, fill_rounded,
+};
 
 /// Height of the tab strip, in logical pixels.
-const TAB_STRIP_HEIGHT: f64 = 34.0;
-/// Height of the address bar.
-const ADDRESS_BAR_HEIGHT: f64 = 38.0;
+const TAB_STRIP_HEIGHT: f64 = 36.0;
+/// Height of the toolbar under it.
+const TOOLBAR_HEIGHT: f64 = 42.0;
 /// Total height the interface takes from the top of the window.
-pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + ADDRESS_BAR_HEIGHT;
+pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT;
 
-/// Width of each of the three buttons at the left end of the tab strip.
-const BUTTON_WIDTH: f64 = 30.0;
-
-const TAB_WIDTH: f64 = 200.0;
+/// The widest a tab is allowed to be, however few there are.
+const TAB_MAX_WIDTH: f64 = 220.0;
+/// The narrowest a tab may shrink to before the strip overflows instead.
+const TAB_MIN_WIDTH: f64 = 92.0;
+/// The gap between one tab and the next.
 const TAB_GAP: f64 = 2.0;
-const NEW_TAB_WIDTH: f64 = 34.0;
-const PADDING: f64 = 8.0;
-const FONT_SIZE: f32 = 13.0;
-
-const BACKGROUND: Color = Color::from_rgb8(0xe8, 0xe8, 0xea);
-const TAB_ACTIVE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-const TAB_INACTIVE: Color = Color::from_rgb8(0xd4, 0xd4, 0xd8);
-const FIELD: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-const FIELD_FOCUSED: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-const FIELD_BORDER: Color = Color::from_rgb8(0x45, 0x7b, 0x9d);
-const INK: Color = Color::from_rgb8(0x1d, 0x1d, 0x1f);
-const INK_DIM: Color = Color::from_rgb8(0x6b, 0x6b, 0x70);
-const DISABLED: Color = Color::from_rgb8(0xb0, 0xb0, 0xb6);
-
-/// A rectangle in logical pixels.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Rect {
-    /// Left edge.
-    pub x: f64,
-    /// Top edge.
-    pub y: f64,
-    /// Width.
-    pub width: f64,
-    /// Height.
-    pub height: f64,
-}
-
-impl Rect {
-    fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
-    }
-
-    fn to_kurbo(self) -> otlyra_gfx::kurbo::Rect {
-        otlyra_gfx::kurbo::Rect::new(self.x, self.y, self.x + self.width, self.y + self.height)
-    }
-}
-
-/// Where every part of the interface is, for one window width.
-#[derive(Clone, Debug)]
-pub struct UiLayout {
-    /// The back button.
-    pub back: Rect,
-    /// The forward button.
-    pub forward: Rect,
-    /// The reload button.
-    pub reload: Rect,
-    /// One rectangle per tab, in order.
-    pub tabs: Vec<Rect>,
-    /// The close target inside each tab.
-    pub closes: Vec<Rect>,
-    /// The new-tab button.
-    pub new_tab: Rect,
-    /// The address field.
-    pub address: Rect,
-}
-
-impl UiLayout {
-    /// Work out the geometry for `tab_count` tabs across `width` logical pixels.
-    pub fn new(width: f64, tab_count: usize) -> Self {
-        let mut tabs = Vec::with_capacity(tab_count);
-        let mut closes = Vec::with_capacity(tab_count);
-
-        let button = |index: f64| {
-            Rect::new(
-                PADDING + index * BUTTON_WIDTH,
-                6.0,
-                BUTTON_WIDTH - 6.0,
-                TAB_STRIP_HEIGHT - 10.0,
-            )
-        };
-        let back = button(0.0);
-        let forward = button(1.0);
-        let reload = button(2.0);
-        let strip_start = reload.x + reload.width + TAB_GAP * 3.0;
-
-        // Tabs shrink to fit rather than overflowing: a tab you cannot see is a tab
-        // you cannot close.
-        let available = (width - strip_start - NEW_TAB_WIDTH - PADDING).max(0.0);
-        let each = if tab_count == 0 {
-            TAB_WIDTH
-        } else {
-            TAB_WIDTH
-                .min((available / tab_count as f64) - TAB_GAP)
-                .max(60.0)
-        };
-
-        for index in 0..tab_count {
-            let x = strip_start + index as f64 * (each + TAB_GAP);
-            let rect = Rect::new(x, 4.0, each, TAB_STRIP_HEIGHT - 4.0);
-            closes.push(Rect::new(
-                rect.x + rect.width - 22.0,
-                rect.y + 5.0,
-                18.0,
-                18.0,
-            ));
-            tabs.push(rect);
-        }
-
-        let new_tab_x = tabs
-            .last()
-            .map_or(strip_start, |last| last.x + last.width + TAB_GAP);
-        Self {
-            back,
-            forward,
-            reload,
-            new_tab: Rect::new(new_tab_x, 6.0, NEW_TAB_WIDTH - 6.0, TAB_STRIP_HEIGHT - 10.0),
-            address: Rect::new(
-                PADDING,
-                TAB_STRIP_HEIGHT + 4.0,
-                (width - PADDING * 2.0).max(0.0),
-                ADDRESS_BAR_HEIGHT - 10.0,
-            ),
-            tabs,
-            closes,
-        }
-    }
-}
+/// The side of the button that opens a tab.
+const NEW_TAB_SIZE: f64 = 28.0;
 
 /// An editable single-line text field.
 ///
@@ -191,8 +86,7 @@ impl TextField {
         self.caret = self.text.len();
     }
 
-    /// Select everything, which for a field with no selection model means putting
-    /// the caret at the end and remembering nothing.
+    /// Insert a character at the caret and step over it.
     pub fn insert(&mut self, character: char) {
         self.text.insert(self.caret, character);
         self.caret += character.len_utf8();
@@ -279,6 +173,103 @@ pub enum UiAction {
     Back,
     /// Go forward one entry.
     Forward,
+    /// Open one of the browser's own pages.
+    OpenPage(SystemPage),
+    /// Show the menu behind the cogwheel, or put it away.
+    ///
+    /// Never reaches the browser: the menu is the interface's own state, like
+    /// the caret in the address field.
+    ToggleMenu,
+    /// Put the menu away without doing anything else — what a press anywhere
+    /// off the panel means.
+    CloseMenu,
+    /// Put the caret in the address field.
+    ///
+    /// Never reaches the browser: [`BrowserUi::pointer_pressed`] applies it to
+    /// its own state and reports [`UiAction::None`]. It is an action rather than
+    /// a rectangle test in the press handler because that is what keeps the
+    /// field's position known in exactly one place — the widget tree that drew
+    /// it.
+    FocusAddress,
+}
+
+/// A page the browser serves about itself.
+///
+/// Not URLs yet. When there is an `about:` scheme these become addresses and
+/// the menu navigates to them like anything else; until then they name a
+/// surface the browser draws instead of a document.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SystemPage {
+    /// The preferences.
+    Settings,
+    /// Where the reader has been.
+    History,
+    /// What the reader kept.
+    Bookmarks,
+    /// What was fetched to disk.
+    Downloads,
+    /// What this program is.
+    About,
+}
+
+impl SystemPage {
+    /// Whether this one has been built yet.
+    ///
+    /// The menu lists all of them and dims the rest, rather than growing an
+    /// entry per milestone: what a browser cannot do *yet* is worth saying.
+    pub fn available(self) -> bool {
+        matches!(self, Self::Settings | Self::About)
+    }
+
+    /// The address that names this page.
+    ///
+    /// `about:` rather than a scheme of our own. Both `chrome://settings` and
+    /// `firefox://…` are a vendor putting its name in the URL bar of a page
+    /// that is not on the web; `about:` is the one spelling every browser
+    /// already answers to, it is registered for exactly this, and it does not
+    /// have to be renamed if this program is.
+    pub fn url(self) -> &'static str {
+        match self {
+            Self::Settings => "about:settings",
+            Self::History => "about:history",
+            Self::Bookmarks => "about:bookmarks",
+            Self::Downloads => "about:downloads",
+            Self::About => "about:otlyra",
+        }
+    }
+
+    /// The page `url` names, if it names one.
+    ///
+    /// Case-insensitive on the scheme, because a URL bar is typed into by
+    /// hand: `About:Settings` is the same request.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let rest = url
+            .strip_prefix("about:")
+            .or_else(|| url.strip_prefix("About:"))
+            .or_else(|| url.strip_prefix("ABOUT:"))?;
+        let rest = rest.trim_end_matches('/').to_ascii_lowercase();
+        Some(match rest.as_str() {
+            "settings" | "preferences" | "config" => Self::Settings,
+            "history" => Self::History,
+            "bookmarks" => Self::Bookmarks,
+            "downloads" => Self::Downloads,
+            // `about:` on its own is the browser talking about itself, which is
+            // what every other browser does with it too.
+            "otlyra" | "about" | "version" | "" => Self::About,
+            _ => return None,
+        })
+    }
+
+    /// What it is called in the menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "Settings",
+            Self::History => "History",
+            Self::Bookmarks => "Bookmarks",
+            Self::Downloads => "Downloads",
+            Self::About => "About Otlyra",
+        }
+    }
 }
 
 /// What one tab shows in the strip.
@@ -291,19 +282,50 @@ pub struct TabLabel {
 }
 
 /// The interface's own state: what is focused, where the pointer is, what is typed.
-#[derive(Clone, Debug, Default)]
 pub struct BrowserUi {
     /// The address field.
     pub address: TextField,
     /// Whether the address field has keyboard focus.
     pub address_focused: bool,
+    /// Whether the menu behind the cogwheel is open.
+    pub menu_open: bool,
+    /// Every colour and measurement the interface is drawn from.
+    pub theme: Theme,
     pointer: (f64, f64),
+    pointer_down: bool,
+    /// Last frame's tree, kept only so a press lands on what was drawn.
+    root: Option<Child<UiAction>>,
+}
+
+impl Default for BrowserUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for BrowserUi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserUi")
+            .field("address", &self.address)
+            .field("address_focused", &self.address_focused)
+            .field("pointer", &self.pointer)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BrowserUi {
     /// A new interface with an empty address field.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            address: TextField::default(),
+            address_focused: false,
+            menu_open: false,
+            theme: Theme::light(),
+            pointer: (-1.0, -1.0),
+            pointer_down: false,
+            root: None,
+        }
     }
 
     /// Note where the pointer is. Kept so a press can be tested against the same
@@ -313,63 +335,85 @@ impl BrowserUi {
     }
 
     /// Whether the pointer is over the interface rather than the page.
+    ///
+    /// An open menu counts as the interface wherever it reaches, which is how a
+    /// press on the panel stops being a press on the document under it.
     pub fn owns_pointer(&self) -> bool {
-        self.pointer.1 < UI_HEIGHT
+        self.pointer.1 < UI_HEIGHT || self.menu_open
     }
 
     /// Handle a press at the last reported pointer position.
-    pub fn pointer_pressed(&mut self, width: f64, tab_count: usize) -> UiAction {
-        let (x, y) = self.pointer;
-        if y >= UI_HEIGHT {
+    ///
+    /// The press is offered to the tree the last frame drew. Nothing is measured
+    /// again and no rectangle is worked out a second time, so a control cannot
+    /// be drawn in one place and clicked in another.
+    pub fn pointer_pressed(&mut self, text: &mut TextEngine) -> UiAction {
+        self.pointer_down = true;
+        if self.pointer.1 >= UI_HEIGHT && !self.menu_open {
             // The press belongs to the page, and it takes focus away from the
-            // address bar — which is what every browser does and what makes typing
-            // after clicking a page do nothing surprising.
+            // address field — which is what every browser does, and what makes
+            // typing after clicking a page do nothing surprising.
             self.address_focused = false;
             return UiAction::None;
         }
 
-        let layout = UiLayout::new(width, tab_count);
+        let mut cx = self.cx(text);
+        let action = self
+            .root
+            .as_mut()
+            .and_then(|root| root.event(&Event::PointerPressed, &mut cx));
 
-        if layout.back.contains(x, y) {
-            return UiAction::Back;
-        }
-        if layout.forward.contains(x, y) {
-            return UiAction::Forward;
-        }
-        if layout.reload.contains(x, y) {
-            return UiAction::Reload;
-        }
-
-        for (index, close) in layout.closes.iter().enumerate() {
-            if close.contains(x, y) {
-                return UiAction::CloseTab(index);
+        match action {
+            Some(UiAction::FocusAddress) => {
+                self.address_focused = true;
+                self.menu_open = false;
+                UiAction::None
             }
-        }
-        for (index, tab) in layout.tabs.iter().enumerate() {
-            if tab.contains(x, y) {
+            Some(UiAction::ToggleMenu) => {
+                self.menu_open = !self.menu_open;
                 self.address_focused = false;
-                return UiAction::SelectTab(index);
+                UiAction::None
+            }
+            Some(UiAction::CloseMenu) => {
+                self.menu_open = false;
+                UiAction::None
+            }
+            // Choosing something from the menu closes it. A menu that stayed
+            // open over the page it just opened would have to be dismissed by
+            // hand every time.
+            Some(UiAction::OpenPage(page)) => {
+                self.menu_open = false;
+                UiAction::OpenPage(page)
+            }
+            Some(action) => {
+                if !matches!(
+                    action,
+                    UiAction::Reload | UiAction::Back | UiAction::Forward
+                ) {
+                    self.address_focused = false;
+                }
+                action
+            }
+            None => {
+                self.address_focused = false;
+                self.menu_open = false;
+                UiAction::None
             }
         }
-        if layout.new_tab.contains(x, y) {
-            return UiAction::NewTab;
-        }
-        if layout.address.contains(x, y) {
-            self.address_focused = true;
-            return UiAction::None;
-        }
-
-        self.address_focused = false;
-        UiAction::None
     }
 
     /// Handle a key press. Returns what the browser should do about it.
     pub fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> UiAction {
         // Accelerators work whether or not the field has focus.
-        // F5 reloads whatever has focus, including the address bar: it is not a
-        // character, so it cannot be something the user meant to type.
+        // F5 reloads whatever has focus, including the address field: it is not
+        // a character, so it cannot be something the user meant to type.
         if key == Key::F5 {
             return UiAction::Reload;
+        }
+
+        if key == Key::Escape && self.menu_open {
+            self.menu_open = false;
+            return UiAction::None;
         }
 
         if modifiers.is_accelerator() {
@@ -447,8 +491,9 @@ impl BrowserUi {
     /// Paint the interface across `width` logical pixels.
     #[allow(clippy::too_many_arguments)]
     pub fn build_display_list(
-        &self,
+        &mut self,
         width: f64,
+        height: f64,
         tabs: &[TabLabel],
         active: usize,
         history: (bool, bool),
@@ -456,148 +501,364 @@ impl BrowserUi {
         text: &mut TextEngine,
         list: &mut DisplayList,
     ) {
-        let layout = UiLayout::new(width, tabs.len());
-        let stack = FontStack::parse_css("system-ui, sans-serif");
+        let theme = self.theme.clone();
 
-        let (can_go_back, can_go_forward) = history;
-        fill(list, Rect::new(0.0, 0.0, width, UI_HEIGHT), BACKGROUND, 0.0);
-        draw_chevron(list, layout.back, Direction::Back, can_go_back);
-        draw_chevron(list, layout.forward, Direction::Forward, can_go_forward);
-        draw_reload(list, layout.reload, spinner);
-
-        for (index, (rect, label)) in layout.tabs.iter().zip(tabs).enumerate() {
-            let active = index == active;
-            fill(
-                list,
-                *rect,
-                if active { TAB_ACTIVE } else { TAB_INACTIVE },
-                6.0,
-            );
-
-            let title = if label.loading {
-                format!("… {}", label.title)
-            } else {
-                label.title.clone()
-            };
-            draw_text(
-                list,
-                text,
-                &stack,
-                &title,
-                rect.x + 10.0,
-                rect.y + 6.0,
-                (rect.width - 34.0).max(0.0),
-                if active { INK } else { INK_DIM },
-            );
-
-            // The close target is drawn as the glyph it is, so what is clicked and
-            // what is seen are the same rectangle.
-            if let Some(close) = layout.closes.get(index) {
-                draw_text(
-                    list,
-                    text,
-                    &stack,
-                    // Multiplication sign, not the heavier "✕": the latter is a
-                    // dingbat that many system fonts have no glyph for, and a
-                    // missing glyph is a hollow box where the close button should
-                    // be.
-                    "×",
-                    close.x + 4.0,
-                    close.y + 1.0,
-                    close.width,
-                    INK_DIM,
-                );
-            }
-        }
-
-        fill(list, layout.new_tab, TAB_INACTIVE, 6.0);
-        draw_text(
+        // The two surfaces, painted before the tree so that everything the tree
+        // draws lands on top of them. The strip is recessed and the toolbar is
+        // raised, which is what lets the active tab merge downward into it.
+        fill_rounded(
             list,
-            text,
-            &stack,
-            "+",
-            layout.new_tab.x + 9.0,
-            layout.new_tab.y + 3.0,
-            layout.new_tab.width,
-            INK,
+            Rect::new(0.0, 0.0, width, TAB_STRIP_HEIGHT),
+            theme.surface,
+            0.0,
+        );
+        fill_rounded(
+            list,
+            Rect::new(0.0, TAB_STRIP_HEIGHT, width, TOOLBAR_HEIGHT),
+            theme.raised,
+            0.0,
         );
 
-        let field = layout.address;
-        if self.address_focused {
-            // The focus ring is a slightly larger rounded rect behind the field:
-            // one fill, no stroke, and it cannot be mistaken for a border colour.
-            fill(
-                list,
-                Rect::new(
-                    field.x - 2.0,
-                    field.y - 2.0,
-                    field.width + 4.0,
-                    field.height + 4.0,
-                ),
-                FIELD_BORDER,
-                8.0,
-            );
-        }
-        fill(
+        // The tree covers the whole window rather than the interface's own
+        // band: an open menu hangs below the toolbar, and both drawing and hit
+        // testing have to reach it there.
+        let surface = Size::new(width, height.max(UI_HEIGHT));
+        let mut root = self.build(width, tabs, active, history, spinner, text);
+        let mut cx = self.cx(text);
+        root.measure(surface, &mut cx);
+        root.place(Rect::new(0.0, 0.0, surface.width, surface.height), &mut cx);
+        root.draw(&mut cx, list);
+
+        // The line the page starts under. Drawn last so nothing overlaps it, and
+        // it is what tells the eye where the browser stops and the document
+        // begins — without it a white toolbar and a white page are one surface.
+        controls::hairline(
+            &theme,
             list,
-            field,
-            if self.address_focused {
-                FIELD_FOCUSED
-            } else {
-                FIELD
-            },
-            6.0,
-        );
-
-        let content = self.address.text();
-        let placeholder = content.is_empty() && !self.address_focused;
-        let inner = field.width - 20.0;
-
-        // An address longer than the field has to lose something. Which end is the
-        // question: while it is being typed the interesting part is where the caret
-        // is, which is the end; while it is only being read the interesting part is
-        // the scheme and the host, which is the start.
-        let shown = if placeholder {
-            "Enter a URL".to_owned()
-        } else if self.address_focused {
-            elide(text, &stack, content, inner, Elide::Start)
-        } else {
-            elide(text, &stack, content, inner, Elide::End)
-        };
-
-        draw_text(
-            list,
-            text,
-            &stack,
-            &shown,
-            field.x + 10.0,
-            field.y + 5.0,
-            inner,
-            if placeholder { INK_DIM } else { INK },
-        );
-
-        if self.address_focused {
-            // The caret sits after the text up to the caret offset, measured with
-            // the same engine that drew it — anything else drifts by a pixel per
-            // glyph and lands in the wrong place on a long address. What is drawn
-            // may have lost its front, so the caret is measured against that.
-            let caret = self.address.caret().min(content.len());
-            let visible = shown.trim_start_matches(ELLIPSIS);
-            let before = match content[..caret].len().checked_sub(visible.len()) {
-                // The front was elided: the caret is inside what is left.
-                Some(dropped) if dropped > 0 => &shown[..shown.len() - visible.len()],
-                _ => &content[..caret],
-            };
-            let advance = text.measure(before, &stack, FONT_SIZE).width;
-            let caret_x = field.x + 10.0 + f64::from(advance);
-            fill(
-                list,
-                Rect::new(caret_x, field.y + 5.0, 1.5, f64::from(FONT_SIZE) * 1.3),
-                INK,
+            Rect::new(
                 0.0,
-            );
+                UI_HEIGHT - theme.hairline_width,
+                width,
+                theme.hairline_width,
+            ),
+        );
+
+        self.root = Some(root);
+    }
+
+    /// A drawing context over `text`, carrying this interface's pointer and theme.
+    fn cx<'a>(&self, text: &'a mut TextEngine) -> Cx<'a> {
+        let mut cx = Cx::new(text);
+        cx.pointer = self.pointer;
+        cx.pointer_down = self.pointer_down;
+        cx.theme = self.theme.clone();
+        cx
+    }
+
+    /// Build this frame's tree from this frame's state.
+    fn build(
+        &self,
+        width: f64,
+        tabs: &[TabLabel],
+        active: usize,
+        history: (bool, bool),
+        spinner: Option<f32>,
+        text: &mut TextEngine,
+    ) -> Child<UiAction> {
+        let theme = self.theme.clone();
+        let mut cx = self.cx(text);
+        // A column with an empty flexible tail rather than an aligner: an
+        // aligner would shrink the interface to what it measured, and what the
+        // toolbar measures is its buttons — not the window it has to span.
+        let rows: Child<UiAction> = Box::new(Stack::column(
+            0.0,
+            vec![
+                Box::new(Fixed::height(
+                    UI_HEIGHT,
+                    Box::new(Stack::column(
+                        0.0,
+                        vec![
+                            Box::new(Fixed::height(
+                                TAB_STRIP_HEIGHT,
+                                tab_strip(&theme, &mut cx, width, tabs, active, spinner),
+                            )),
+                            Box::new(Fixed::height(
+                                TOOLBAR_HEIGHT,
+                                toolbar(&theme, self, history, spinner),
+                            )),
+                        ],
+                    )),
+                )),
+                Box::new(crate::widget::Flex::new(
+                    1.0,
+                    Box::new(crate::widget::Gap::new(0.0, 0.0)),
+                )),
+            ],
+        ));
+
+        if !self.menu_open {
+            return rows;
+        }
+
+        // Panel first in the list so it is drawn last and answers first; the
+        // sheet under it catches every press that misses, which is what makes
+        // clicking anywhere else dismiss the menu without also doing whatever
+        // was under the pointer.
+        Box::new(crate::widget::Overlay::new(vec![
+            rows,
+            controls::scrim(UiAction::CloseMenu),
+            Box::new(crate::widget::Anchored::from_right(
+                theme.inset,
+                UI_HEIGHT - 2.0,
+                menu(&theme),
+            )),
+        ]))
+    }
+}
+
+/// The strip of tabs, and the button that opens another.
+fn tab_strip(
+    theme: &Theme,
+    cx: &mut Cx,
+    width: f64,
+    tabs: &[TabLabel],
+    active: usize,
+    spinner: Option<f32>,
+) -> Child<UiAction> {
+    let inset = theme.inset * 0.75;
+    // Tabs shrink to share the strip rather than overflowing it: a tab you
+    // cannot see is a tab you cannot close. Past the floor they do overflow,
+    // which is a stated gap rather than a surprise.
+    let available = (width - inset * 2.0 - NEW_TAB_SIZE - theme.gap).max(0.0);
+    let each = if tabs.is_empty() {
+        TAB_MAX_WIDTH
+    } else {
+        TAB_MAX_WIDTH
+            .min(available / tabs.len() as f64 - TAB_GAP)
+            .max(TAB_MIN_WIDTH)
+    };
+
+    let mut children: Vec<Child<UiAction>> = Vec::with_capacity(tabs.len() * 2 + 2);
+    for (index, label) in tabs.iter().enumerate() {
+        children.push(tab(theme, cx, label, index, index == active, each, spinner));
+        // A hairline between two tabs that are both in the background, so a run
+        // of them reads as several rather than as one wide empty area. Beside
+        // the active tab there is nothing to separate: its own edge does that.
+        let next_is_active = index + 1 == active;
+        if index + 1 < tabs.len() && index != active && !next_is_active {
+            children.push(separator(theme));
         }
     }
+
+    children.push(controls::icon_button(
+        theme,
+        UiAction::NewTab,
+        true,
+        icon::plus,
+    ));
+    // Everything is pushed to the left; whatever is left over is empty strip.
+    children.push(Box::new(crate::widget::Flex::new(
+        1.0,
+        Box::new(crate::widget::Gap::new(0.0, 0.0)),
+    )));
+
+    Box::new(Padding::new(
+        Insets {
+            left: inset,
+            top: 4.0,
+            right: inset,
+            bottom: 0.0,
+        },
+        Box::new(Stack::row(TAB_GAP, children)),
+    ))
+}
+
+/// The menu behind the cogwheel: everything the browser is, as opposed to
+/// everything a page is.
+fn menu(theme: &Theme) -> Child<UiAction> {
+    use SystemPage::{About, Bookmarks, Downloads, History, Settings};
+
+    let row = |page: SystemPage,
+               mark: fn(&mut DisplayList, Rect, otlyra_gfx::peniko::Color),
+               shortcut: Option<&str>| {
+        controls::menu_item(
+            theme,
+            UiAction::OpenPage(page),
+            page.available(),
+            mark,
+            page.label(),
+            shortcut,
+        )
+    };
+
+    controls::menu_panel(
+        theme,
+        248.0,
+        vec![
+            controls::menu_heading(theme, "Otlyra"),
+            row(Settings, icon::gear, Some("⌘,")),
+            row(History, icon::clock, Some("⌘Y")),
+            row(Bookmarks, icon::star, None),
+            row(Downloads, icon::download, Some("⌘⇧J")),
+            controls::divider(theme),
+            row(About, icon::info, None),
+        ],
+    )
+}
+
+/// The hairline between two background tabs.
+fn separator(theme: &Theme) -> Child<UiAction> {
+    let color = theme.hairline;
+    Box::new(Fixed::width(
+        1.0,
+        Box::new(Painted::new(1.0, 16.0, move |rect, _cx, list| {
+            let height = 16.0;
+            fill_rounded(
+                list,
+                Rect::new(
+                    rect.x,
+                    rect.y + (rect.height - height) / 2.0,
+                    1.0,
+                    height.min(rect.height),
+                ),
+                color,
+                0.0,
+            );
+        })),
+    ))
+}
+
+/// One tab: a mark, a title, and a cross.
+fn tab(
+    theme: &Theme,
+    cx: &mut Cx,
+    label: &TabLabel,
+    index: usize,
+    active: bool,
+    width: f64,
+    spinner: Option<f32>,
+) -> Child<UiAction> {
+    let face = if active { theme.raised } else { Theme::CLEAR };
+    let ink = if active { theme.ink } else { theme.ink_dim };
+
+    // A loading tab turns where a still one has a dot, so the strip says which
+    // of several tabs is the one still working.
+    let phase = spinner.filter(|_| label.loading);
+    let mark_ink = if label.loading { theme.accent } else { ink };
+    let mark = Box::new(Align::centre(Box::new(Painted::new(
+        14.0,
+        14.0,
+        move |rect, _cx, list| match phase {
+            Some(phase) => icon::reload(list, rect, Some(phase), mark_ink),
+            None => icon::dot(list, rect, mark_ink),
+        },
+    ))));
+
+    // The title is cut to what the tab can show before it is handed over, with
+    // the same engine that will draw it — a title that overflowed would be
+    // clipped mid-word with no sign that anything was lost.
+    let room = width - 14.0 - 18.0 - theme.gap * 3.0 - theme.inset;
+    let title = controls::elide(cx, &label.title, room, Elide::End);
+
+    let close = controls::icon_button(theme, UiAction::CloseTab(index), true, icon::cross);
+    let close = Box::new(Fixed::new(18.0, 18.0, Box::new(Align::centre(close))));
+
+    let row = Stack::row(
+        theme.gap,
+        vec![
+            mark,
+            Box::new(crate::widget::Flex::new(
+                1.0,
+                Box::new(Align::new(
+                    0.0,
+                    0.5,
+                    Box::new(Label::new(title, theme.font_size, ink)),
+                )),
+            )),
+            close,
+        ],
+    );
+
+    let mut background = Background::rounded(
+        face,
+        // The two bottom corners are square so the active tab runs into the
+        // toolbar beneath it rather than sitting on it.
+        (theme.radius_tab, theme.radius_tab, 0.0, 0.0),
+        Box::new(Padding::new(
+            Insets::symmetric(theme.gap * 1.5, 0.0),
+            Box::new(row),
+        )),
+    );
+    if !active {
+        background = background.on_hover(theme.hover);
+    }
+
+    Box::new(Fixed::width(
+        width,
+        Box::new(Button::new(
+            UiAction::SelectTab(index),
+            Box::new(background),
+        )),
+    ))
+}
+
+/// The row under the tabs: where you have been, and where you are.
+fn toolbar(
+    theme: &Theme,
+    ui: &BrowserUi,
+    history: (bool, bool),
+    spinner: Option<f32>,
+) -> Child<UiAction> {
+    let (can_go_back, can_go_forward) = history;
+
+    let back = controls::icon_button(theme, UiAction::Back, can_go_back, |list, rect, color| {
+        icon::chevron(list, rect, icon::Direction::Left, color);
+    });
+    let forward = controls::icon_button(
+        theme,
+        UiAction::Forward,
+        can_go_forward,
+        |list, rect, color| icon::chevron(list, rect, icon::Direction::Right, color),
+    );
+    let reload = controls::icon_button(theme, UiAction::Reload, true, move |list, rect, color| {
+        icon::reload(list, rect, spinner, color);
+    });
+
+    // The scheme decides the mark, and only a transport that was authenticated
+    // gets the padlock. Everything else gets a page, which claims nothing.
+    let secure = ui.address.text().starts_with("https://");
+    let field = TextInput::new(FieldView {
+        text: ui.address.text().to_owned(),
+        caret: ui.address_focused.then(|| ui.address.caret()),
+        placeholder: "Search or enter address".to_owned(),
+    })
+    .leading(move |list, rect, color| {
+        if secure {
+            icon::lock(list, rect, color);
+        } else {
+            icon::page(list, rect, color);
+        }
+    })
+    .face(theme.surface)
+    .into_widget(theme);
+
+    let field = Box::new(Button::new(UiAction::FocusAddress, field));
+
+    Box::new(Padding::new(
+        Insets::symmetric(theme.inset, (TOOLBAR_HEIGHT - theme.control_height) / 2.0),
+        Box::new(Stack::row(
+            theme.gap * 0.5,
+            vec![
+                back,
+                forward,
+                reload,
+                controls::gap(theme.gap * 0.5),
+                field,
+                controls::gap(theme.gap * 0.5),
+                controls::icon_button(theme, UiAction::ToggleMenu, true, icon::gear),
+            ],
+        )),
+    ))
 }
 
 /// Size the mark is drawn at on an empty tab, in logical pixels.
@@ -615,14 +876,10 @@ pub fn paint_blank_page(
     mark: Option<&ImageData>,
     text: &mut TextEngine,
 ) {
-    fill(
-        list,
-        Rect::new(0.0, 0.0, width, height),
-        Color::from_rgb8(0xff, 0xff, 0xff),
-        0.0,
-    );
+    let theme = Theme::light();
+    fill_rounded(list, Rect::new(0.0, 0.0, width, height), theme.raised, 0.0);
 
-    let stack = FontStack::parse_css("system-ui, sans-serif");
+    let mut cx = Cx::new(text);
     let content_top = UI_HEIGHT;
     let content_height = (height - content_top).max(0.0);
     let centre_y = content_top + content_height / 2.0;
@@ -631,7 +888,7 @@ pub fn paint_blank_page(
     // sitting under it, because a logo above a failure reads as decoration on bad
     // news.
     if let Some(error) = error {
-        draw_centred_text(list, text, &stack, error, width, centre_y, INK);
+        centred_text(&mut cx, list, error, width, centre_y, theme.ink);
         return;
     }
 
@@ -649,241 +906,32 @@ pub fn paint_blank_page(
         caption_y = y + BLANK_MARK_SIZE + 20.0;
     }
 
-    draw_centred_text(
+    centred_text(
+        &mut cx,
         list,
-        text,
-        &stack,
         "Type a URL above",
         width,
         caption_y,
-        INK_DIM,
+        theme.ink_dim,
     );
 }
 
 /// One line of interface text, centred horizontally, with `y` as its top.
-fn draw_centred_text(
+fn centred_text(
+    cx: &mut Cx,
     list: &mut DisplayList,
-    engine: &mut TextEngine,
-    stack: &FontStack,
     content: &str,
     width: f64,
     y: f64,
     color: Color,
 ) {
-    let measured = f64::from(engine.measure(content, stack, FONT_SIZE).width);
-    draw_text(
-        list,
-        engine,
-        stack,
-        content,
-        ((width - measured) / 2.0).max(0.0),
-        y,
-        width,
-        color,
-    );
-}
-
-/// Which way a chevron points.
-#[derive(Copy, Clone, PartialEq)]
-enum Direction {
-    Back,
-    Forward,
-}
-
-/// A back or forward button: a chevron, drawn rather than typed, and dimmed when
-/// there is nowhere to go — a button that does nothing should look like one.
-fn draw_chevron(list: &mut DisplayList, rect: Rect, direction: Direction, enabled: bool) {
-    fill(list, rect, TAB_INACTIVE, 6.0);
-
-    let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-    let reach = rect.height.min(rect.width) / 4.0;
-    let tip = if direction == Direction::Back {
-        -reach
-    } else {
-        reach
-    };
-
-    let mut path = BezPath::new();
-    path.move_to(Point::new(centre.x - tip, centre.y - reach));
-    path.line_to(Point::new(centre.x + tip, centre.y));
-    path.line_to(Point::new(centre.x - tip, centre.y + reach));
-    list.push(DisplayItem::Stroke {
-        style: Stroke::new(1.8),
-        transform: Affine::IDENTITY,
-        brush: Brush::Solid(if enabled { INK } else { DISABLED }),
-        brush_transform: None,
-        shape: path,
-    });
-}
-
-/// The reload button: a circular arrow, drawn rather than typed.
-///
-/// A glyph would be at the mercy of whichever font the system hands back, and a
-/// missing glyph is a hollow box where the button should be. A path is the same
-/// on every machine.
-fn draw_reload(list: &mut DisplayList, rect: Rect, spinner: Option<f32>) {
-    fill(list, rect, TAB_INACTIVE, 6.0);
-
-    let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-    let radius = rect.width.min(rect.height) / 2.0 - 4.0;
-
-    // The same arrow either way: while a page is loading it turns, and the turn is
-    // the only thing that says the browser is busy rather than stuck. A shorter
-    // sweep then, so the gap reads as motion.
-    let (start, sweep) = match spinner {
-        Some(phase) => (f64::from(phase), 4.2),
-        None => (-0.9, 5.2),
-    };
-    list.push(DisplayItem::Stroke {
-        style: Stroke::new(1.6),
-        transform: Affine::IDENTITY,
-        brush: Brush::Solid(INK),
-        brush_transform: None,
-        shape: Arc::new(centre, (radius, radius), start, sweep, 0.0).to_path(0.05),
-    });
-
-    // The arrowhead sits on the arc's end, pointing along it — computed from the
-    // same angle the arc ends at, so the two cannot drift apart when either is
-    // adjusted.
-    let end = start + sweep;
-    let tip = Point::new(centre.x + radius * end.cos(), centre.y + radius * end.sin());
-    let along = Point::new(-end.sin(), end.cos());
-    let across = Point::new(end.cos(), end.sin());
-    let size = 4.0;
-    let mut head = BezPath::new();
-    head.move_to(Point::new(tip.x + along.x * size, tip.y + along.y * size));
-    head.line_to(Point::new(
-        tip.x - along.x * size * 0.4 + across.x * size,
-        tip.y - along.y * size * 0.4 + across.y * size,
-    ));
-    head.line_to(Point::new(
-        tip.x - along.x * size * 0.4 - across.x * size,
-        tip.y - along.y * size * 0.4 - across.y * size,
-    ));
-    head.close_path();
-    list.push(DisplayItem::Fill {
-        style: Fill::NonZero,
-        transform: Affine::IDENTITY,
-        brush: Brush::Solid(INK),
-        brush_transform: None,
-        shape: head,
-    });
-}
-
-/// A filled, optionally rounded rectangle.
-fn fill(list: &mut DisplayList, rect: Rect, color: Color, radius: f64) {
-    let shape = if radius > 0.0 {
-        RoundedRect::from_rect(rect.to_kurbo(), radius).to_path(0.1)
-    } else {
-        rect.to_kurbo().to_path(0.1)
-    };
-    list.push(DisplayItem::Fill {
-        style: Fill::NonZero,
-        transform: Affine::IDENTITY,
-        brush: Brush::Solid(color),
-        brush_transform: None,
-        shape,
-    });
-}
-
-/// One line of interface text, clipped by shaping it to `max_width`.
-/// Which end of a string to drop when it does not fit.
-#[derive(Copy, Clone, PartialEq)]
-enum Elide {
-    /// Keep the end, drop the beginning.
-    Start,
-    /// Keep the beginning, drop the end.
-    End,
-}
-
-/// The character that stands in for what was dropped.
-const ELLIPSIS: char = '\u{2026}';
-
-/// `content`, shortened to fit `max_width` with an ellipsis where it was cut.
-///
-/// The alternative — shaping to a maximum width and drawing the first line — cuts
-/// mid-word and says nothing about having cut, so an address that is one character
-/// too long reads as a different address.
-fn elide(
-    engine: &mut TextEngine,
-    stack: &FontStack,
-    content: &str,
-    max_width: f64,
-    end: Elide,
-) -> String {
-    let fits = |engine: &mut TextEngine, text: &str| {
-        f64::from(engine.measure(text, stack, FONT_SIZE).width) <= max_width
-    };
-    if content.is_empty() || fits(engine, content) {
-        return content.to_owned();
-    }
-
-    // Character boundaries, so the search cannot land inside a code point.
-    let boundaries: Vec<usize> = content
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(content.len()))
-        .collect();
-
-    // Binary search over how much to keep: everything shorter than a fitting length
-    // fits too, so the predicate is monotonic and this is a handful of shapes
-    // rather than one per character.
-    let mut low = 0;
-    let mut high = boundaries.len() - 1;
-    while low < high {
-        let middle = low.midpoint(high + 1);
-        let candidate = match end {
-            Elide::End => format!("{}{ELLIPSIS}", &content[..boundaries[middle]]),
-            Elide::Start => format!(
-                "{ELLIPSIS}{}",
-                &content[boundaries[boundaries.len() - 1 - middle]..]
-            ),
-        };
-        if fits(engine, &candidate) {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-
-    match end {
-        Elide::End => format!("{}{ELLIPSIS}", &content[..boundaries[low]]),
-        Elide::Start => format!(
-            "{ELLIPSIS}{}",
-            &content[boundaries[boundaries.len() - 1 - low]..]
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
-    list: &mut DisplayList,
-    engine: &mut TextEngine,
-    stack: &FontStack,
-    content: &str,
-    x: f64,
-    y: f64,
-    max_width: f64,
-    color: Color,
-) {
-    if content.is_empty() || max_width <= 0.0 {
-        return;
-    }
-    let shaped = engine.shape(content, stack, FONT_SIZE, Some(max_width as f32));
-
-    // One line only: a tab title that wrapped would push the address bar down the
-    // window.
-    for run in shaped.runs.iter().filter(|run| run.line == 0) {
-        list.push_glyphs(
-            &run.font,
-            run.font_size,
-            run.normalized_coords.clone(),
-            Brush::Solid(color),
-            Affine::translate((x, y)),
-            true,
-            run.glyphs.clone(),
-        );
-    }
+    let size = cx.theme.font_size;
+    let measured = cx.measure_text(content, size);
+    let mut label = Label::new(content, size, color);
+    let height = cx.line_height(size);
+    let rect = Rect::new(((width - measured) / 2.0).max(0.0), y, width, height);
+    Widget::<UiAction>::place(&mut label, rect, cx);
+    Widget::<UiAction>::draw(&mut label, cx, list);
 }
 
 #[cfg(test)]
@@ -899,60 +947,117 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn pressing_the_reload_button_reloads() {
-        let mut ui = BrowserUi::new();
-        let layout = UiLayout::new(1000.0, 2);
-
-        ui.pointer_moved(layout.reload.x + 4.0, layout.reload.y + 4.0);
-        assert_eq!(ui.pointer_pressed(1000.0, 2), UiAction::Reload);
+    /// Draw one frame, which is what gives the interface the geometry every
+    /// press is then tested against.
+    fn frame(ui: &mut BrowserUi, text: &mut TextEngine, width: f64, tabs: usize) {
+        let mut list = DisplayList::default();
+        ui.build_display_list(
+            width,
+            600.0,
+            &labels(tabs),
+            0,
+            (true, true),
+            None,
+            text,
+            &mut list,
+        );
     }
 
-    /// The button sits before the tabs and must not overlap the first of them —
-    /// the bug where reload closes a tab instead.
+    /// The rectangle the widget tree placed something at, found by pressing.
+    fn press(ui: &mut BrowserUi, text: &mut TextEngine, x: f64, y: f64) -> UiAction {
+        ui.pointer_moved(x, y);
+        ui.pointer_pressed(text)
+    }
+
     #[test]
-    fn the_reload_button_is_clear_of_the_first_tab() {
-        let layout = UiLayout::new(1000.0, 3);
-        assert!(layout.reload.x < layout.tabs[0].x);
-        assert!(layout.reload.x + layout.reload.width <= layout.tabs[0].x);
+    fn the_toolbar_buttons_sit_in_the_order_they_are_drawn() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 2);
+
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+        assert_eq!(press(&mut ui, &mut text, 20.0, middle), UiAction::Back);
+        assert_eq!(press(&mut ui, &mut text, 50.0, middle), UiAction::Forward);
+        assert_eq!(press(&mut ui, &mut text, 80.0, middle), UiAction::Reload);
     }
 
     #[test]
     fn a_press_selects_the_tab_it_is_drawn_over() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        let layout = UiLayout::new(1000.0, 3);
-        let second = layout.tabs[1];
+        frame(&mut ui, &mut text, 1000.0, 3);
 
-        ui.pointer_moved(second.x + 5.0, second.y + 5.0);
-        assert_eq!(ui.pointer_pressed(1000.0, 3), UiAction::SelectTab(1));
-    }
-
-    #[test]
-    fn the_close_target_is_inside_the_tab_and_wins_over_it() {
-        let mut ui = BrowserUi::new();
-        let layout = UiLayout::new(1000.0, 2);
-        let close = layout.closes[1];
-
-        assert!(
-            layout.tabs[1].contains(close.x + 1.0, close.y + 1.0),
-            "the close target must sit inside its tab"
+        // Well inside the second tab, and away from its cross.
+        let x = 6.0 + TAB_MAX_WIDTH + TAB_GAP + 30.0;
+        assert_eq!(
+            press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::SelectTab(1)
         );
-        ui.pointer_moved(close.x + 2.0, close.y + 2.0);
-        assert_eq!(ui.pointer_pressed(1000.0, 2), UiAction::CloseTab(1));
     }
 
     #[test]
-    fn pressing_the_address_bar_focuses_it_and_pressing_the_page_does_not() {
+    fn the_cross_inside_a_tab_wins_over_the_tab_it_sits_in() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        let layout = UiLayout::new(1000.0, 1);
+        frame(&mut ui, &mut text, 1000.0, 2);
 
-        ui.pointer_moved(layout.address.x + 20.0, layout.address.y + 5.0);
-        ui.pointer_pressed(1000.0, 1);
-        assert!(ui.address_focused);
+        // The cross is at the tab's right end, inside its padding.
+        let x = 6.0 + TAB_MAX_WIDTH - 16.0;
+        assert_eq!(
+            press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::CloseTab(0)
+        );
+    }
 
-        ui.pointer_moved(400.0, UI_HEIGHT + 100.0);
-        ui.pointer_pressed(1000.0, 1);
+    #[test]
+    fn the_button_that_opens_a_tab_sits_after_the_last_of_them() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 2);
+
+        let x = 6.0 + (TAB_MAX_WIDTH + TAB_GAP) * 2.0 + NEW_TAB_SIZE / 2.0;
+        assert_eq!(
+            press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::NewTab
+        );
+    }
+
+    #[test]
+    fn pressing_the_address_field_focuses_it_and_pressing_the_page_does_not() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+        assert_eq!(press(&mut ui, &mut text, 500.0, middle), UiAction::None);
+        assert!(ui.address_focused, "a press in the field focuses it");
+
+        assert_eq!(
+            press(&mut ui, &mut text, 400.0, UI_HEIGHT + 100.0),
+            UiAction::None
+        );
         assert!(!ui.address_focused, "clicking the page takes focus away");
+    }
+
+    #[test]
+    fn a_press_on_empty_strip_focuses_nothing_and_does_nothing() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.address_focused = true;
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        assert_eq!(
+            press(&mut ui, &mut text, 900.0, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::None
+        );
+        assert!(!ui.address_focused);
+    }
+
+    #[test]
+    fn a_press_before_the_first_frame_reports_nothing_rather_than_guessing() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        assert_eq!(press(&mut ui, &mut text, 20.0, 20.0), UiAction::None);
     }
 
     #[test]
@@ -1041,120 +1146,32 @@ mod tests {
     }
 
     /// Tabs shrink to share the width, down to a floor. Past the floor they run
-    /// off the edge, which is a stated gap: a scrolling or collapsing tab strip is
-    /// interface work this milestone does not do.
+    /// off the edge, which is a stated gap: a scrolling or collapsing tab strip
+    /// is interface work this milestone does not do.
     #[test]
-    fn f5_and_the_accelerator_both_reload() {
+    fn many_tabs_shrink_to_share_the_strip_and_stop_at_a_floor() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 20);
+
+        // Twenty tabs across a 1000px strip would be 47px each if they kept
+        // dividing, and a 47px tab holds no title. They stop at the floor
+        // instead, so the right end of the strip is the tenth of them and the
+        // rest have run off the edge — visible in that the press lands on a tab
+        // in the middle of the run rather than on the last of them.
+        let strip_end = press(&mut ui, &mut text, 990.0, TAB_STRIP_HEIGHT / 2.0);
+        assert_eq!(strip_end, UiAction::SelectTab(10));
+
+        // And the floor is the floor: the tab before that one starts a full
+        // tab-width earlier.
         assert_eq!(
-            ui.key_pressed(Key::F5, Modifiers::default()),
-            UiAction::Reload
+            press(
+                &mut ui,
+                &mut text,
+                990.0 - TAB_MIN_WIDTH - TAB_GAP,
+                TAB_STRIP_HEIGHT / 2.0
+            ),
+            UiAction::SelectTab(9)
         );
-
-        let accelerator = Modifiers {
-            command: cfg!(target_os = "macos"),
-            control: !cfg!(target_os = "macos"),
-            ..Modifiers::default()
-        };
-        assert_eq!(
-            ui.key_pressed(Key::Character('r'), accelerator),
-            UiAction::Reload
-        );
-    }
-
-    /// F5 while typing an address is still a reload — it types nothing, so there
-    /// is nothing for it to mean instead.
-    #[test]
-    fn f5_reloads_even_with_the_address_bar_focused() {
-        let mut ui = BrowserUi::new();
-        ui.address_focused = true;
-        assert_eq!(
-            ui.key_pressed(Key::F5, Modifiers::default()),
-            UiAction::Reload
-        );
-    }
-
-    #[test]
-    fn tabs_share_the_width_down_to_a_readable_minimum() {
-        let few = UiLayout::new(1000.0, 2);
-        let many = UiLayout::new(1000.0, 8);
-        assert!(
-            many.tabs[0].width < few.tabs[0].width,
-            "more tabs must mean narrower tabs"
-        );
-        assert!(
-            many.tabs.last().expect("tabs").x + many.tabs.last().expect("tabs").width <= 1000.0,
-            "eight tabs still fit in a thousand pixels"
-        );
-
-        let crowded = UiLayout::new(400.0, 8);
-        assert_eq!(crowded.tabs[0].width, 60.0, "the floor holds");
-    }
-
-    #[test]
-    fn an_empty_tab_shows_the_mark_and_a_hint() {
-        let mut engine = TextEngine::isolated();
-        let mark = otlyra_gfx::decode_image(crate::MARK).expect("the mark decodes");
-        let mut list = DisplayList::new();
-        paint_blank_page(&mut list, 1000.0, 700.0, None, Some(&mark), &mut engine);
-
-        let images = list
-            .items()
-            .iter()
-            .filter(|item| matches!(item, DisplayItem::Image { .. }))
-            .count();
-        assert_eq!(images, 1, "the mark");
-        assert!(
-            list.items()
-                .iter()
-                .any(|item| matches!(item, DisplayItem::Glyphs { .. })),
-            "and the hint under it"
-        );
-    }
-
-    /// A logo over a failure reads as decoration on bad news.
-    #[test]
-    fn a_failed_tab_shows_the_error_instead_of_the_mark() {
-        let mut engine = TextEngine::isolated();
-        let mark = otlyra_gfx::decode_image(crate::MARK).expect("the mark decodes");
-        let mut list = DisplayList::new();
-        paint_blank_page(
-            &mut list,
-            1000.0,
-            700.0,
-            Some("could not fetch"),
-            Some(&mark),
-            &mut engine,
-        );
-
-        assert!(
-            !list
-                .items()
-                .iter()
-                .any(|item| matches!(item, DisplayItem::Image { .. }))
-        );
-    }
-
-    #[test]
-    fn the_interface_paints_something_for_every_tab() {
-        let ui = BrowserUi::new();
-        let mut engine = TextEngine::isolated();
-        let mut list = DisplayList::new();
-        ui.build_display_list(
-            1000.0,
-            &labels(3),
-            0,
-            (true, false),
-            None,
-            &mut engine,
-            &mut list,
-        );
-
-        let glyph_runs = list
-            .items()
-            .iter()
-            .filter(|item| matches!(item, DisplayItem::Glyphs { .. }))
-            .count();
-        assert!(glyph_runs >= 4, "three titles and the new-tab button");
     }
 }

@@ -39,13 +39,16 @@ pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
 pub const MARK: &[u8] = include_bytes!("../../../assets/logo/mark-256.png");
 
 pub mod a11y;
+pub mod about;
 pub mod browser;
 pub mod fetcher;
 pub mod menu;
 pub mod observability;
 pub mod page;
 pub mod scene;
+pub mod settings;
 pub mod ui;
+pub mod widget;
 
 use std::path::Path;
 

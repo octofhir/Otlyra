@@ -466,8 +466,16 @@ impl PaintTarget for SkiaPainter {
 
         let canvas = self.canvas();
         canvas.save();
+        // The transform positions the *clip*, and nothing else. Every item in
+        // this list carries its own absolute transform — a fill inside a layer
+        // is not expressed relative to it — so the matrix is reset once the clip
+        // has been taken, or the layer's transform is applied a second time to
+        // everything inside it. That is invisible while layers are only ever
+        // pushed with the identity, and doubles a scrolling panel the moment the
+        // whole list is scaled for a HiDPI screen.
         canvas.concat(&matrix);
         canvas.clip_path(&path, sk::ClipOp::Intersect, true);
+        canvas.reset_matrix();
         canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
         self.layer_depth += 1;
     }
@@ -766,6 +774,41 @@ mod tests {
             [0xff, 0xff, 0xff, 0xff],
             "origin is now empty"
         );
+    }
+
+    /// A layer positions its own clip and nothing else.
+    ///
+    /// Every item in a display list carries an absolute transform, so if the
+    /// layer's matrix stayed on the canvas it would be applied a second time to
+    /// everything inside it. Invisible while layers are pushed with the identity
+    /// — and it doubles the size and the offset of a scrolling panel the moment
+    /// the whole list is scaled for a HiDPI screen, which is exactly what a
+    /// display list scaled by the device factor does.
+    #[test]
+    fn what_is_inside_a_transformed_layer_is_not_transformed_twice() {
+        let mut painter = SkiaPainter::new_raster(32, 32).expect("32x32 raster surface");
+        painter.clear(Color::WHITE);
+        let brush = peniko::Brush::Solid(Color::BLACK);
+        let scale = Affine::scale(2.0);
+
+        // The clip covers the whole surface once scaled; the fill lands at 8..16
+        // in device pixels because its own transform already carries the scale.
+        painter.push_clip_rect(scale, Rect::new(0.0, 0.0, 16.0, 16.0));
+        painter.fill_rect(scale, (&brush).into(), Rect::new(4.0, 4.0, 8.0, 8.0));
+        painter.pop_layer();
+
+        let pixels = painter.read_rgba8().expect("read back");
+        assert_eq!(
+            pixel_at(&pixels, 32, 12, 12),
+            [0x00, 0x00, 0x00, 0xff],
+            "the fill is where its own transform puts it"
+        );
+        assert_eq!(
+            pixel_at(&pixels, 32, 20, 20),
+            [0xff, 0xff, 0xff, 0xff],
+            "and not at twice that, which is where the layer's matrix would put it"
+        );
+        assert_eq!(painter.layer_depth, 0);
     }
 
     #[test]

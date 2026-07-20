@@ -13,9 +13,11 @@ use otlyra_layout::Images;
 use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport, Waker};
 use otlyra_text::TextEngine;
 
+use crate::about::{self, AboutSurface};
 use crate::fetcher::{Fetched, Fetcher, Loader, ResourceKind};
 use crate::page::{PageScene, title_of};
-use crate::ui::{BrowserUi, TabLabel, UI_HEIGHT, UiAction};
+use crate::settings::{self, SettingsSurface};
+use crate::ui::{BrowserUi, SystemPage, TabLabel, UI_HEIGHT, UiAction};
 
 /// How long a caller with no event loop waits between checks for a finished fetch.
 const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -170,6 +172,20 @@ pub struct Browser {
     mark: Option<otlyra_gfx::peniko::ImageData>,
     /// Where the pointer is, in window logical pixels.
     pointer: (f64, f64),
+    /// The preferences.
+    ///
+    /// One surface for the whole browser rather than one per tab: a preference
+    /// is the browser's, and two tabs showing two copies of it could disagree
+    /// about what it currently says.
+    settings: SettingsSurface,
+    /// What this program is.
+    about: AboutSurface,
+    /// Which of the browser's own pages the active tab is showing, if any.
+    ///
+    /// Per tab would be better and is what a real `about:` scheme gives; this
+    /// is the smaller version of that, and the thing that replaces it is the
+    /// navigation path rather than another field.
+    system: Option<SystemPage>,
 }
 
 impl Browser {
@@ -187,6 +203,9 @@ impl Browser {
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
             pointer: (0.0, 0.0),
+            settings: SettingsSurface::new(),
+            about: AboutSurface::new(),
+            system: None,
         }
     }
 
@@ -212,7 +231,36 @@ impl Browser {
     /// why M9 replaces this body with a channel and a pending state rather than
     /// replacing the caller.
     pub fn navigate(&mut self, url: &str) {
+        // A browser's own page is not fetched, not parsed and not laid out: it
+        // is a surface this program draws. Catching it here rather than in the
+        // fetcher means every way of asking for one — the menu, the address
+        // bar, a keyboard shortcut — arrives at the same place.
+        if let Some(page) = SystemPage::from_url(url) {
+            self.open_system(page);
+            return;
+        }
+        self.system = None;
         self.navigate_from(url, true);
+    }
+
+    /// Show one of the browser's own pages in the active tab.
+    pub fn open_system(&mut self, page: SystemPage) {
+        if !page.available() {
+            self.tabs[self.active].error = Some(format!("{} is not built yet.", page.label()));
+            tracing::info!(?page, "system page requested before it exists");
+            return;
+        }
+        self.system = Some(page);
+        let tab = &mut self.tabs[self.active];
+        tab.url = page.url().to_owned();
+        tab.title = page.label().to_owned();
+        tab.error = None;
+        self.ui.address.set_text(page.url());
+    }
+
+    /// Which of the browser's own pages is showing, if any.
+    pub fn system_page(&self) -> Option<SystemPage> {
+        self.system
     }
 
     /// Go back one entry in the active tab's history.
@@ -643,9 +691,32 @@ impl Browser {
         self.ui.address.set_text(url);
     }
 
+    /// Leave the settings when the surface says it is done with them.
+    ///
+    /// Back to a blank tab rather than to the document that was there: there is
+    /// no document — the settings replaced the tab's contents, and restoring it
+    /// is what a real history entry will do once `about:` is a navigation.
+    fn close_settings_if(&mut self, action: &settings::Action) {
+        if *action == settings::Action::Close {
+            self.system = None;
+            let tab = &mut self.tabs[self.active];
+            tab.url = String::new();
+            tab.title = "New tab".to_owned();
+            self.ui.address.clear();
+        }
+    }
+
     fn apply(&mut self, action: UiAction) {
         match action {
             UiAction::None => {}
+            // Focus and the menu belong to the interface and are settled there:
+            // the press handler applies them and reports `None`, so these arms
+            // are only here to keep the match honest about the whole enum.
+            UiAction::FocusAddress | UiAction::ToggleMenu | UiAction::CloseMenu => {}
+            // One way in for all of them: the menu, the address bar and the
+            // command line all end up in `open_system`, which is also the only
+            // place that knows which of these pages exists yet.
+            UiAction::OpenPage(page) => self.open_system(page),
             UiAction::Navigate(url) => self.navigate(&url),
             UiAction::Back => self.go_back(),
             UiAction::Forward => self.go_forward(),
@@ -708,37 +779,86 @@ impl Painter for Browser {
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
                 self.ui.pointer_moved(x, y);
+                match self.system {
+                    // Moves matter to a surface that has a slider on it: that is
+                    // what a drag is made of.
+                    Some(SystemPage::Settings) => {
+                        let action = self.settings.pointer_moved(x, y);
+                        self.close_settings_if(&action);
+                    }
+                    Some(SystemPage::About) => self.about.pointer_moved(x, y),
+                    _ => {}
+                }
             }
 
             PlatformEvent::PointerPressed => {
+                // The settings surface owns everything below the toolbar while it
+                // is showing, so a press there never reaches the document behind
+                // it — there is no document behind it.
+                if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
+                    match self.system {
+                        Some(SystemPage::Settings) => {
+                            let action = self.settings.pointer_pressed();
+                            self.close_settings_if(&action);
+                            return;
+                        }
+                        Some(SystemPage::About) => {
+                            if self.about.pointer_pressed(&mut self.text)
+                                == about::Action::OpenSettings
+                            {
+                                self.open_system(SystemPage::Settings);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // A link takes the press before the interface sees it, because the
                 // interface has nothing in the page area to claim it.
                 if let Some(url) = self.link_under_pointer() {
                     self.navigate_from(&url, false);
                     return;
                 }
-                // Width is not carried on the event, so the interface is asked
-                // against the geometry of the last frame — which is the frame the
-                // user was looking at when they pressed.
-                let action = self.ui.pointer_pressed(self.last_width, self.tabs.len());
+                // The press is tested against the geometry of the last frame —
+                // which is the frame the user was looking at when they pressed.
+                let action = self.ui.pointer_pressed(&mut self.text);
                 self.apply(action);
             }
 
+            PlatformEvent::PointerReleased => {
+                self.settings.pointer_released();
+            }
+
             PlatformEvent::KeyPressed { key, modifiers } => {
+                if self.system == Some(SystemPage::Settings) {
+                    let action = self.settings.settings.key_pressed(key, modifiers);
+                    self.close_settings_if(&action);
+                    if action != settings::Action::None {
+                        return;
+                    }
+                }
                 let action = self.ui.key_pressed(key, modifiers);
                 self.apply(action);
             }
 
             PlatformEvent::TextInput(character) => {
+                if self.system == Some(SystemPage::Settings)
+                    && self.settings.settings.text_input(character)
+                {
+                    return;
+                }
                 self.ui.text_input(character);
             }
 
             // Scrolling belongs to the page unless the pointer is over the
             // interface, where there is nothing to scroll.
             PlatformEvent::Scroll { y, .. } => {
-                if !self.ui.owns_pointer()
-                    && let Some(page) = self.tabs[self.active].page.as_mut()
-                {
+                if self.ui.owns_pointer() {
+                    return;
+                }
+                if self.system == Some(SystemPage::Settings) {
+                    self.settings.scroll_by(-y);
+                } else if let Some(page) = self.tabs[self.active].page.as_mut() {
                     page.scroll_by(y as f32);
                 }
             }
@@ -797,7 +917,24 @@ impl Painter for Browser {
         // interface's height and culled to what is visible, so it cannot paint
         // underneath it — but painting in this order means a future translucent
         // toolbar composites correctly rather than needing a clip.
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(system) = self.system {
+            // A browser page takes the whole content area: it is not a document
+            // in a tab, it is the browser looked at from the front.
+            let content =
+                crate::ui::Rect::new(0.0, UI_HEIGHT, width, (height - UI_HEIGHT).max(0.0));
+            let mut list = otlyra_gfx::DisplayList::new();
+            match system {
+                SystemPage::Settings => {
+                    self.settings
+                        .build_display_list(content, &mut self.text, &mut list);
+                }
+                _ => self
+                    .about
+                    .build_display_list(content, &mut self.text, &mut list),
+            }
+            list.transform(scale);
+            render(&list, target);
+        } else if let Some(page) = self.tabs[self.active].page.as_mut() {
             let mut list = page.build_display_list(
                 &mut self.text,
                 width as f32,
@@ -824,6 +961,7 @@ impl Painter for Browser {
         let labels = self.labels();
         self.ui.build_display_list(
             width,
+            height,
             &labels,
             self.active,
             (
@@ -836,6 +974,139 @@ impl Painter for Browser {
         );
         list.transform(scale);
         render(&list, target);
+    }
+}
+
+#[cfg(test)]
+mod system_page_tests {
+    use super::*;
+    use crate::ui::SystemPage;
+
+    /// A loader that fails everything, so a test that reaches the network is a
+    /// test that was wrong to.
+    struct NoNetwork;
+
+    impl Loader for NoNetwork {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            Err(format!("nothing may be fetched in this test: {url}"))
+        }
+    }
+
+    /// Press where the interface drew something, going through the whole path
+    /// a person's click takes: the platform event, the interface's geometry,
+    /// and whatever the browser makes of what comes back.
+    fn press(browser: &mut Browser, x: f64, y: f64) {
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed);
+    }
+
+    /// Draw one frame at `width` by `height`, which is what gives the interface
+    /// the geometry the next press is tested against.
+    fn frame(browser: &mut Browser, width: f64, height: f64) {
+        let viewport = Viewport {
+            width: width as u32,
+            height: height as u32,
+            scale_factor: 1.0,
+        };
+        let mut target = otlyra_gfx::RecordingPainter::default();
+        browser.paint(&mut target, viewport);
+    }
+
+    #[test]
+    fn the_menu_opens_the_pages_that_exist_and_closes_over_the_ones_that_do_not() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 1000.0, 700.0);
+
+        // The cogwheel is the last control on the toolbar, at its right end.
+        press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        assert!(browser.ui().menu_open, "the cogwheel opens the menu");
+
+        // The panel hangs below the toolbar at the right-hand edge; its rows are
+        // 30 tall under a heading, so this is the first of them.
+        frame(&mut browser, 1000.0, 700.0);
+        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 34.0);
+
+        assert!(
+            !browser.ui().menu_open,
+            "choosing something closes the menu"
+        );
+        assert_eq!(
+            browser.system_page(),
+            Some(SystemPage::Settings),
+            "the first row is the settings, and it opens them"
+        );
+    }
+
+    #[test]
+    fn a_row_for_a_page_that_does_not_exist_yet_only_closes_the_menu() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 1000.0, 700.0);
+        press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        frame(&mut browser, 1000.0, 700.0);
+
+        // The second row is History, which is dimmed: the press falls through it
+        // to the sheet behind the panel, which dismisses the menu and does
+        // nothing else. That is the whole of what a disabled row does.
+        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 65.0);
+        assert!(!browser.ui().menu_open);
+        assert_eq!(browser.system_page(), None);
+    }
+
+    #[test]
+    fn typing_a_browser_address_opens_a_surface_rather_than_fetching() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:settings");
+
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+        assert_eq!(browser.tabs()[0].url, "about:settings");
+        assert_eq!(browser.ui().address.text(), "about:settings");
+        assert!(
+            browser.tabs()[0].error.is_none(),
+            "nothing was fetched, so nothing failed"
+        );
+    }
+
+    #[test]
+    fn the_spellings_a_person_might_type_all_arrive_at_the_same_page() {
+        for spelling in ["about:settings", "About:Settings", "about:preferences/"] {
+            let mut browser = Browser::new(NoNetwork);
+            browser.navigate(spelling);
+            assert_eq!(
+                browser.system_page(),
+                Some(SystemPage::Settings),
+                "{spelling} should open the settings"
+            );
+        }
+
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:otlyra");
+        assert_eq!(browser.system_page(), Some(SystemPage::About));
+    }
+
+    #[test]
+    fn a_page_that_does_not_exist_yet_says_so_instead_of_showing_nothing() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:downloads");
+
+        assert_eq!(browser.system_page(), None);
+        assert!(
+            browser.tabs()[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Downloads")),
+            "the tab says which page is missing"
+        );
+    }
+
+    #[test]
+    fn leaving_the_settings_leaves_the_tab_blank_rather_than_still_on_them() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:settings");
+        browser.close_settings_if(&crate::settings::Action::Close);
+
+        assert_eq!(browser.system_page(), None);
+        assert_eq!(browser.ui().address.text(), "");
+        assert_eq!(browser.tabs()[0].title, "New tab");
     }
 }
 
