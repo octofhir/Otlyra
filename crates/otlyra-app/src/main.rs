@@ -45,6 +45,13 @@ struct Cli {
     /// Which rasterizer to use.
     #[arg(long, value_enum, default_value_t = Renderer::Skia)]
     renderer: Renderer,
+
+    /// Fetch this URL, print the source it returns, then exit.
+    ///
+    /// A bare host is assumed to be `https`. Nothing is parsed or rendered yet;
+    /// this is the network stack on its own.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
 }
 
 /// The rasterizer backends the `PaintTarget` seam offers.
@@ -60,6 +67,16 @@ enum Renderer {
 fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
+
+    if let Some(url) = cli.url.as_deref() {
+        return match print_source(url) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("otlyra: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let mut scene = DemoScene::new();
 
@@ -116,6 +133,29 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Fetch `input` and print what the server sent, decoded to text.
+///
+/// The crypto provider is installed here, in `main`, and nowhere else: rustls picks
+/// one implicitly only while exactly one is reachable, and a dependency that drags
+/// in a second turns that into a panic at the first HTTPS request. Naming ours makes
+/// the choice ours.
+fn print_source(input: &str) -> Result<(), otlyra_net::NetError> {
+    otlyra_net::install_crypto_provider();
+
+    let url = otlyra_net::normalize(input)?;
+    let loader = otlyra_net::Loader::new()?;
+    let resource = loader.fetch_blocking(otlyra_net::LoadRequest::new(url))?;
+
+    eprintln!(
+        "{} {} ({} bytes)",
+        resource.status,
+        resource.final_url,
+        resource.body.len()
+    );
+    print!("{}", resource.decode_text());
+    Ok(())
 }
 
 /// Serialize the frame's display list to `path`.

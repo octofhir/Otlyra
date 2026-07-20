@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 otlyra-gfx.workspace = true
+otlyra-net.workspace = true
 otlyra-platform.workspace = true
 otlyra-text.workspace = true
 clap.workspace = true
