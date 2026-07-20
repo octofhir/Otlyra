@@ -31,6 +31,12 @@
 /// bundle to load resources from.
 pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
 
+/// The mark, drawn on an empty tab.
+///
+/// Encoded bytes for the same reason the icon is: a `cargo run` binary has no
+/// bundle to load resources from.
+pub const MARK: &[u8] = include_bytes!("../../../assets/logo/mark-256.png");
+
 pub mod browser;
 pub mod menu;
 pub mod observability;

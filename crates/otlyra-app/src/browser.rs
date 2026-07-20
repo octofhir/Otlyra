@@ -65,6 +65,9 @@ pub struct Browser<L: Loader> {
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
+    /// The mark shown on an empty tab. `None` if it failed to decode, which is a
+    /// cosmetic problem and not a reason to refuse to draw a frame.
+    mark: Option<otlyra_gfx::peniko::ImageData>,
 }
 
 impl<L: Loader> Browser<L> {
@@ -77,6 +80,9 @@ impl<L: Loader> Browser<L> {
             active: 0,
             loader,
             last_width: 1024.0,
+            mark: otlyra_gfx::decode_image(crate::MARK)
+                .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
+                .ok(),
         }
     }
 
@@ -251,6 +257,7 @@ impl<L: Loader> Painter for Browser<L> {
                 width,
                 height,
                 self.tabs[self.active].error.as_deref(),
+                self.mark.as_ref(),
                 &mut self.text,
             );
             list.transform(scale);

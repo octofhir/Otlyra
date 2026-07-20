@@ -11,7 +11,7 @@
 //! is only possible when two pieces of code each work the geometry out.
 
 use otlyra_gfx::kurbo::{Affine, RoundedRect, Shape};
-use otlyra_gfx::peniko::{Brush, Color, Fill};
+use otlyra_gfx::peniko::{Brush, Color, Fill, ImageData, ImageSampler};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_platform::{Key, Modifiers};
 use otlyra_text::{FontStack, TextEngine};
@@ -518,12 +518,19 @@ impl BrowserUi {
     }
 }
 
+/// Size the mark is drawn at on an empty tab, in logical pixels.
+const BLANK_MARK_SIZE: f64 = 96.0;
+
 /// Paint a tab that has no document: the empty state, or why the load failed.
+///
+/// The mark is centred in the content area rather than in the window, so it does
+/// not creep upward as the interface grows a toolbar.
 pub fn paint_blank_page(
     list: &mut DisplayList,
     width: f64,
     height: f64,
     error: Option<&str>,
+    mark: Option<&ImageData>,
     text: &mut TextEngine,
 ) {
     fill(
@@ -534,19 +541,63 @@ pub fn paint_blank_page(
     );
 
     let stack = FontStack::parse_css("system-ui, sans-serif");
-    let message = match error {
-        Some(error) => error.to_owned(),
-        None => "Type a URL above.".to_owned(),
-    };
-    draw_text(
+    let content_top = UI_HEIGHT;
+    let content_height = (height - content_top).max(0.0);
+    let centre_y = content_top + content_height / 2.0;
+
+    // An error is a message, not a greeting: it replaces the mark rather than
+    // sitting under it, because a logo above a failure reads as decoration on bad
+    // news.
+    if let Some(error) = error {
+        draw_centred_text(list, text, &stack, error, width, centre_y, INK);
+        return;
+    }
+
+    let mut caption_y = centre_y;
+    if let Some(mark) = mark {
+        let scale = BLANK_MARK_SIZE / f64::from(mark.width);
+        let x = (width - BLANK_MARK_SIZE) / 2.0;
+        let y = centre_y - BLANK_MARK_SIZE * 0.75;
+        list.push(DisplayItem::Image {
+            image: mark.clone().into(),
+            sampler: ImageSampler::default(),
+            transform: Affine::translate((x, y)) * Affine::scale(scale),
+            clip_rect: None,
+        });
+        caption_y = y + BLANK_MARK_SIZE + 20.0;
+    }
+
+    draw_centred_text(
         list,
         text,
         &stack,
-        &message,
-        40.0,
-        UI_HEIGHT + 40.0,
-        (width - 80.0).max(0.0),
-        if error.is_some() { INK } else { INK_DIM },
+        "Type a URL above",
+        width,
+        caption_y,
+        INK_DIM,
+    );
+}
+
+/// One line of interface text, centred horizontally, with `y` as its top.
+fn draw_centred_text(
+    list: &mut DisplayList,
+    engine: &mut TextEngine,
+    stack: &FontStack,
+    content: &str,
+    width: f64,
+    y: f64,
+    color: Color,
+) {
+    let measured = f64::from(engine.measure(content, stack, FONT_SIZE).width);
+    draw_text(
+        list,
+        engine,
+        stack,
+        content,
+        ((width - measured) / 2.0).max(0.0),
+        y,
+        width,
+        color,
     );
 }
 
@@ -752,6 +803,50 @@ mod tests {
 
         let crowded = UiLayout::new(400.0, 8);
         assert_eq!(crowded.tabs[0].width, 60.0, "the floor holds");
+    }
+
+    #[test]
+    fn an_empty_tab_shows_the_mark_and_a_hint() {
+        let mut engine = TextEngine::isolated();
+        let mark = otlyra_gfx::decode_image(crate::MARK).expect("the mark decodes");
+        let mut list = DisplayList::new();
+        paint_blank_page(&mut list, 1000.0, 700.0, None, Some(&mark), &mut engine);
+
+        let images = list
+            .items()
+            .iter()
+            .filter(|item| matches!(item, DisplayItem::Image { .. }))
+            .count();
+        assert_eq!(images, 1, "the mark");
+        assert!(
+            list.items()
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Glyphs { .. })),
+            "and the hint under it"
+        );
+    }
+
+    /// A logo over a failure reads as decoration on bad news.
+    #[test]
+    fn a_failed_tab_shows_the_error_instead_of_the_mark() {
+        let mut engine = TextEngine::isolated();
+        let mark = otlyra_gfx::decode_image(crate::MARK).expect("the mark decodes");
+        let mut list = DisplayList::new();
+        paint_blank_page(
+            &mut list,
+            1000.0,
+            700.0,
+            Some("could not fetch"),
+            Some(&mark),
+            &mut engine,
+        );
+
+        assert!(
+            !list
+                .items()
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Image { .. }))
+        );
     }
 
     #[test]
