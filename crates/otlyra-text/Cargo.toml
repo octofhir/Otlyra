@@ -1,0 +1,17 @@
+[package]
+name = "otlyra-text"
+description = "Font stack, shaping, line breaking and measurement over parley."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+otlyra-gfx.workspace = true
+parley.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
