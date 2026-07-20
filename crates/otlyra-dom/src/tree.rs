@@ -90,6 +90,50 @@ impl Document {
         self.refused
     }
 
+    /// The element sibling before `id`, skipping text and comments.
+    ///
+    /// Selector matching walks siblings by element, because `p + p` means the
+    /// paragraph before this one and not the whitespace between them.
+    pub fn prev_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.get(id)?.prev_sibling();
+        while let Some(candidate) = current {
+            if self.get(candidate)?.element().is_some() {
+                return Some(candidate);
+            }
+            current = self.get(candidate)?.prev_sibling();
+        }
+        None
+    }
+
+    /// The element sibling after `id`.
+    pub fn next_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.get(id)?.next_sibling();
+        while let Some(candidate) = current {
+            if self.get(candidate)?.element().is_some() {
+                return Some(candidate);
+            }
+            current = self.get(candidate)?.next_sibling();
+        }
+        None
+    }
+
+    /// The first element child of `id`.
+    pub fn first_element_child(&self, id: NodeId) -> Option<NodeId> {
+        self.children(id)
+            .find(|&child| self.get(child).is_some_and(|node| node.element().is_some()))
+    }
+
+    /// Whether `id` has no children that count as content — no elements, and no
+    /// text that is not whitespace. This is `:empty`.
+    pub fn is_empty_element(&self, id: NodeId) -> bool {
+        self.children(id)
+            .all(|child| match self.get(child).map(|node| &node.data) {
+                Some(NodeData::Element(_)) => false,
+                Some(NodeData::Text(text)) => text.is_empty(),
+                _ => true,
+            })
+    }
+
     /// The children of `id`, in tree order.
     pub fn children(&self, id: NodeId) -> Children<'_> {
         Children {

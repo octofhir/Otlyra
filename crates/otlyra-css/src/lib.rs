@@ -22,6 +22,7 @@
 //!    DOM's business and what they mean geometrically is layout's.
 
 pub mod style;
+pub mod stylo_dom;
 pub mod ua;
 
 pub use style::{

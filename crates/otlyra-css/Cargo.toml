@@ -13,6 +13,20 @@ repository.workspace = true
 # already speaks, so using it here saves a conversion at each boundary and adds
 # nothing to the build graph. It is not a dependency on the renderer.
 peniko.workspace = true
+stylo.workspace = true
+stylo_traits.workspace = true
+stylo_atoms.workspace = true
+stylo_dom.workspace = true
+stylo_static_prefs.workspace = true
+selectors.workspace = true
+cssparser.workspace = true
+servo_arc.workspace = true
+otlyra-dom.workspace = true
+html5ever.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+otlyra-html.workspace = true
 
 [lints]
 workspace = true

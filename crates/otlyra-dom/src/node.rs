@@ -71,6 +71,42 @@ pub struct Node {
     pub(crate) next_sibling: Option<NodeId>,
 }
 
+impl ElementData {
+    /// One attribute's value, by local name, in no namespace.
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|attr| attr.name.ns == html5ever::ns!() && attr.name.local.as_ref() == name)
+            .map(|attr| attr.value.as_ref())
+    }
+
+    /// The element's `id`, if it has one.
+    pub fn id(&self) -> Option<&str> {
+        self.attr("id")
+    }
+
+    /// The element's classes, in source order.
+    ///
+    /// Split on ASCII whitespace, which is what `class` is: a set written as a
+    /// space-separated list, not a single name.
+    pub fn classes(&self) -> impl Iterator<Item = &str> {
+        self.attr("class")
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+    }
+
+    /// Whether the element carries `class`.
+    pub fn has_class(&self, class: &str, case_sensitive: bool) -> bool {
+        self.classes().any(|candidate| {
+            if case_sensitive {
+                candidate == class
+            } else {
+                candidate.eq_ignore_ascii_case(class)
+            }
+        })
+    }
+}
+
 impl Node {
     pub(crate) fn new(data: NodeData) -> Self {
         Self {
