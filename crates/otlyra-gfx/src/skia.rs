@@ -54,6 +54,38 @@ pub struct SkiaPainter {
     /// Number of `save`/`save_layer` pairs currently open, so that an unbalanced
     /// [`PaintTarget::pop_layer`] cannot restore past our own baseline.
     layer_depth: usize,
+    typefaces: TypefaceCache,
+}
+
+/// Parsing a font file is expensive and every glyph run asks for the same handful
+/// of fonts, so typefaces are cached by the identity of their backing blob rather
+/// than re-parsed per run.
+#[derive(Default)]
+struct TypefaceCache {
+    entries: Vec<(usize, u32, sk::Typeface)>,
+    font_mgr: Option<sk::FontMgr>,
+}
+
+impl TypefaceCache {
+    fn get(&mut self, font: &FontData) -> Option<sk::Typeface> {
+        // `Blob` is reference-counted and shared, so its data pointer is a stable
+        // identity for as long as anyone holds the font.
+        let key = font.data.as_ref().as_ptr() as usize;
+        let index = font.index;
+
+        if let Some((_, _, typeface)) = self
+            .entries
+            .iter()
+            .find(|(cached_key, cached_index, _)| *cached_key == key && *cached_index == index)
+        {
+            return Some(typeface.clone());
+        }
+
+        let font_mgr = self.font_mgr.get_or_insert_with(sk::FontMgr::new);
+        let typeface = font_mgr.new_from_data(font.data.as_ref(), index as usize)?;
+        self.entries.push((key, index, typeface.clone()));
+        Some(typeface)
+    }
 }
 
 impl std::fmt::Debug for SkiaPainter {
@@ -82,6 +114,7 @@ impl SkiaPainter {
             width,
             height,
             layer_depth: 0,
+            typefaces: TypefaceCache::default(),
         })
     }
 
@@ -96,7 +129,11 @@ impl SkiaPainter {
         if (width, height) == (self.width, self.height) {
             return Ok(false);
         }
+        // Keep the typeface cache across a resize: the fonts have not changed, and
+        // re-parsing every font on every window drag is pure waste.
+        let typefaces = std::mem::take(&mut self.typefaces);
         *self = Self::new_raster(width, height)?;
+        self.typefaces = typefaces;
         Ok(true)
     }
 
@@ -383,18 +420,61 @@ impl PaintTarget for SkiaPainter {
 
     fn draw_glyphs(
         &mut self,
-        _font: &FontData,
-        _font_size: f32,
-        _normalized_coords: &[i16],
-        _brush: BrushRef<'_>,
-        _transform: Affine,
-        _hint: bool,
+        font: &FontData,
+        font_size: f32,
+        normalized_coords: &[i16],
+        brush: BrushRef<'_>,
+        transform: Affine,
+        hint: bool,
         glyphs: &mut dyn Iterator<Item = Glyph>,
     ) {
-        // Drain the iterator regardless: the caller's contract is that it is
-        // consumed exactly once.
-        let count = glyphs.count();
-        tracing::warn!(count, "SkiaPainter::draw_glyphs is not implemented yet");
+        // Drain the iterator before any early return: the caller's contract is that
+        // it is consumed exactly once.
+        let (ids, positions): (Vec<sk::GlyphId>, Vec<sk::Point>) = glyphs
+            .map(|glyph| (glyph.id as sk::GlyphId, sk::Point::new(glyph.x, glyph.y)))
+            .unzip();
+
+        if ids.is_empty() {
+            return;
+        }
+
+        if !normalized_coords.is_empty() {
+            tracing::warn!(
+                axes = normalized_coords.len(),
+                "variable font coordinates are ignored; the run will use the default instance"
+            );
+        }
+
+        let Some(typeface) = self.typefaces.get(font) else {
+            tracing::error!("skia could not parse the font for a glyph run; dropping it");
+            return;
+        };
+
+        let mut sk_font = sk::Font::from_typeface(typeface, font_size);
+        // Grid fitting must be off for transformed or animating text, which is
+        // exactly what `hint` reports.
+        sk_font.set_subpixel(!hint);
+        sk_font.set_hinting(if hint {
+            sk::FontHinting::Slight
+        } else {
+            sk::FontHinting::None
+        });
+        sk_font.set_edging(sk::font::Edging::AntiAlias);
+
+        let mut paint = to_skia_paint(brush, None);
+        paint.set_style(sk::paint::Style::Fill);
+
+        let canvas = self.canvas();
+        canvas.save();
+        canvas.concat(&to_skia_matrix(transform));
+        canvas.draw_glyphs_at(
+            &ids,
+            positions.as_slice(),
+            sk::Point::new(0.0, 0.0),
+            &sk_font,
+            &paint,
+        );
+        canvas.restore();
     }
 
     fn draw_image(
