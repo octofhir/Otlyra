@@ -116,6 +116,19 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
         fix_anonymous_boxes(tree, child);
     }
 
+    // An inline box containing a block becomes a block. CSS resolves this by
+    // splitting the inline around the block and keeping both halves inline;
+    // blockifying is coarser, and it is the difference between a page laying out and
+    // a page collapsing into one enormous paragraph — `<center><table>` is on the
+    // front page of Hacker News, and `<a>` wrapped around a `<div>` is legal HTML5
+    // and everywhere.
+    if children
+        .iter()
+        .any(|&child| tree.node(child).is_block_level())
+    {
+        tree.blockify(id);
+    }
+
     let has_block = children
         .iter()
         .any(|&child| tree.node(child).is_block_level());

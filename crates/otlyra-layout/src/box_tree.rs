@@ -150,6 +150,17 @@ impl BoxTree {
         self.boxes[parent].children = children;
     }
 
+    /// Turn an inline-level box into a block-level one.
+    ///
+    /// See [`crate::builder`] for when and why: an inline box that contains a block
+    /// is a shape CSS resolves by splitting the inline, and blockifying is the
+    /// approximation we take until it does.
+    pub(crate) fn blockify(&mut self, id: BoxId) {
+        if matches!(self.boxes[id].kind, BoxKind::Inline) {
+            self.boxes[id].kind = BoxKind::Block;
+        }
+    }
+
     /// Create a detached anonymous box of `kind` carrying `style`.
     pub(crate) fn create_anonymous(&mut self, kind: BoxKind, style: Arc<ComputedStyle>) -> BoxId {
         self.boxes.insert(BoxNode {
