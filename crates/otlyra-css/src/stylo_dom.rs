@@ -33,67 +33,151 @@ type BorrowedNamespace = <StyleSelectorImpl as selectors::SelectorImpl>::Borrowe
 type LocalNameIdent = style::values::GenericAtomIdent<html5ever::LocalNameStaticSet>;
 type NamespaceIdent = style::values::GenericAtomIdent<html5ever::NamespaceStaticSet>;
 
-/// A borrowed handle to one node: the document, and which node in it.
+/// A document together with its style state.
 ///
-/// `Copy`, because Stylo's traits require it — the style system passes these
-/// around by value everywhere. That forces the handle to be an index rather than
-/// an owned node, which our arena already is.
-#[derive(Clone, Copy)]
-pub struct NodeRef<'a> {
-    /// The document the node lives in.
+/// The pair exists so that a node handle can be *two* words: one pointer here and
+/// one node id. The style engine's sharing cache asserts the size of the handle it
+/// was compiled for, and it is right to — the cache is an array of them, and a
+/// handle that carries a third word makes every entry pay for it.
+pub struct Tree<'a> {
+    /// The document.
     pub document: &'a Document,
     /// The style engine's per-element state, beside the document rather than in
     /// it: the engine borrows it mutably while holding only a shared reference to
     /// the tree, which is a shape the DOM should not have to take.
     ///
-    /// Absent for a handle used only to match selectors, which needs no state.
+    /// Absent for a tree used only to match selectors, which needs no state.
     pub style_data: Option<&'a StyleData>,
-    /// Which node.
-    pub id: NodeId,
 }
 
-impl<'a> NodeRef<'a> {
-    /// A handle to `id` in `document`, with no style state — enough for matching.
-    pub fn new(document: &'a Document, id: NodeId) -> Self {
+impl<'a> Tree<'a> {
+    /// A tree that can only be matched against.
+    pub fn new(document: &'a Document) -> Self {
         Self {
             document,
             style_data: None,
-            id,
         }
     }
 
-    /// A handle that can also carry style.
-    pub fn styled(document: &'a Document, style_data: &'a StyleData, id: NodeId) -> Self {
+    /// A tree that can be styled.
+    pub fn styled(document: &'a Document, style_data: &'a StyleData) -> Self {
         Self {
             document,
             style_data: Some(style_data),
-            id,
         }
+    }
+
+    /// A handle to one node in it.
+    ///
+    /// Only meaningful inside a [`TreeScope`] for this tree, which is what the
+    /// handle's lifetime is tied to.
+    pub fn node(&'a self, id: NodeId) -> NodeRef<'a> {
+        NodeRef {
+            id,
+            tree: std::marker::PhantomData,
+        }
+    }
+}
+
+thread_local! {
+    /// The tree the current restyle is walking.
+    ///
+    /// A node handle has to be **one word**: the style engine's sharing cache is an
+    /// array of entries compiled for an element of pointer size, and it asserts
+    /// that size at construction. Our nodes live in an arena, so a self-contained
+    /// handle would be two — the arena and the index. The arena therefore moves out
+    /// of the handle and into the scope, which is exactly as wide as one restyle.
+    static CURRENT_TREE: std::cell::Cell<*const Tree<'static>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Makes a tree current for as long as it is held.
+///
+/// Restores the previous tree on drop rather than clearing, so that a nested scope
+/// — a document styled while another is being styled — leaves the outer one intact.
+pub struct TreeScope {
+    previous: *const Tree<'static>,
+}
+
+impl TreeScope {
+    /// Enter `tree`.
+    ///
+    /// The lifetime is erased on the way in and restored on the way out by the
+    /// scope: nothing can observe a handle outside the scope, because every handle
+    /// borrows from it.
+    pub fn enter(tree: &Tree<'_>) -> Self {
+        // SAFETY: the pointer is only read while this scope is alive, and the scope
+        // borrows the tree for its whole lifetime. The erased lifetime is never
+        // handed back out: `NodeRef::tree` reborrows for the caller's lifetime,
+        // which cannot outlive the scope that produced the handle.
+        let erased = unsafe {
+            std::mem::transmute::<*const Tree<'_>, *const Tree<'static>>(std::ptr::from_ref(tree))
+        };
+        let previous = CURRENT_TREE.with(|current| current.replace(erased));
+        Self { previous }
+    }
+}
+
+impl Drop for TreeScope {
+    fn drop(&mut self) {
+        CURRENT_TREE.with(|current| current.set(self.previous));
+    }
+}
+
+/// A borrowed handle to one node.
+///
+/// `Copy` and one word wide, both because the style engine requires it. The tree it
+/// belongs to is the one currently in scope; see [`TreeScope`] for why it cannot be
+/// carried here.
+#[derive(Clone, Copy)]
+pub struct NodeRef<'a> {
+    /// Which node.
+    pub id: NodeId,
+    /// Ties the handle to the scope that produced it.
+    tree: std::marker::PhantomData<&'a Tree<'a>>,
+}
+
+impl<'a> NodeRef<'a> {
+    /// The tree this handle belongs to.
+    fn tree(&self) -> &'a Tree<'a> {
+        let pointer = CURRENT_TREE.with(std::cell::Cell::get);
+        assert!(
+            !pointer.is_null(),
+            "a node handle used outside a tree scope"
+        );
+        // SAFETY: the handle's lifetime is tied to the scope that produced it, and
+        // the scope keeps the tree borrowed and the pointer current for exactly as
+        // long as it lives.
+        unsafe { &*pointer }
+    }
+
+    /// The document this node lives in.
+    pub fn document(&self) -> &'a Document {
+        self.tree().document
     }
 
     /// This element's slot in the style state, if it has one.
     fn slot(&self) -> Option<&'a ElementSlot> {
-        self.style_data?.slots.get(&self.id)
+        self.tree().style_data?.slots.get(&self.id)
     }
 
     /// The element data, if this node is an element.
     pub fn element(&self) -> Option<&'a ElementData> {
-        self.document.get(self.id)?.element()
+        self.tree().document.get(self.id)?.element()
     }
 
     /// The same handle, pointed at another node.
     fn at(&self, id: NodeId) -> Self {
         Self {
-            document: self.document,
-            style_data: self.style_data,
             id,
+            tree: std::marker::PhantomData,
         }
     }
 
     /// The nearest ancestor that is an element.
     fn parent_element_id(&self) -> Option<NodeId> {
-        let parent = self.document.get(self.id)?.parent?;
-        self.document.get(parent)?.element().map(|_| parent)
+        let parent = self.tree().document.get(self.id)?.parent?;
+        self.tree().document.get(parent)?.element().map(|_| parent)
     }
 }
 
@@ -111,7 +195,7 @@ impl PartialEq for NodeRef<'_> {
         // Identity is the node, not the handle: two handles into the same document
         // and the same node are the same element, which is what selector matching
         // means by equality.
-        self.id == other.id && std::ptr::eq(self.document, other.document)
+        self.id == other.id
     }
 }
 
@@ -142,7 +226,7 @@ impl SelectorsElement for NodeRef<'_> {
         // An identity the matcher can compare and hash without knowing what it is.
         // Derived from the node's own key rather than a pointer: our nodes live in
         // a slotmap and do not have stable addresses.
-        OpaqueElement::new(&self.document.node(self.id).data)
+        OpaqueElement::new(&self.tree().document.node(self.id).data)
     }
 
     fn parent_element(&self) -> Option<Self> {
@@ -162,19 +246,22 @@ impl SelectorsElement for NodeRef<'_> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .prev_element_sibling(self.id)
             .map(|id| self.at(id))
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .next_element_sibling(self.id)
             .map(|id| self.at(id))
     }
 
     fn first_element_child(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .first_element_child(self.id)
             .map(|id| self.at(id))
     }
@@ -303,17 +390,18 @@ impl SelectorsElement for NodeRef<'_> {
     }
 
     fn is_empty(&self) -> bool {
-        self.document.is_empty_element(self.id)
+        self.tree().document.is_empty_element(self.id)
     }
 
     fn is_root(&self) -> bool {
         // The root element, not the document node: `:root` is `<html>`.
         self.parent_element_id().is_none()
             && self
+                .tree()
                 .document
                 .get(self.id)
                 .and_then(|node| node.parent)
-                .is_some_and(|parent| parent == self.document.root())
+                .is_some_and(|parent| parent == self.tree().document.root())
     }
 
     fn add_element_unique_hashes(&self, filter: &mut BloomFilter) -> bool {
@@ -385,6 +473,8 @@ pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String
         MatchingForInvalidation::No,
     );
 
+    let tree = Tree::new(document);
+    let _scope = TreeScope::enter(&tree);
     let mut matched = Vec::new();
     let mut stack = vec![document.root()];
     let mut order = Vec::new();
@@ -395,7 +485,7 @@ pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String
     }
 
     for id in order {
-        let node = NodeRef::new(document, id);
+        let node = tree.node(id);
         if node.element().is_none() {
             continue;
         }
@@ -565,15 +655,62 @@ impl Default for StyleData {
 }
 
 impl StyleData {
-    /// Make a slot for every element in `document`.
+    /// Make a slot for every element in `document`, and fill it.
+    ///
+    /// The matcher asks for an element's id, classes and attribute names through
+    /// the style engine's own atom table, which is not the one the HTML parser
+    /// interned them into — the two compare by identity within themselves and not
+    /// with each other. Interning once here is what makes matching a pointer
+    /// comparison rather than a string one, thousands of times per page.
     pub fn prepare(&mut self, document: &Document) {
+        let url = crate::cascade::base_url();
+        let quirks_mode = match document.quirks_mode() {
+            html5ever::interface::QuirksMode::Quirks => style::context::QuirksMode::Quirks,
+            html5ever::interface::QuirksMode::LimitedQuirks => {
+                style::context::QuirksMode::LimitedQuirks
+            }
+            html5ever::interface::QuirksMode::NoQuirks => style::context::QuirksMode::NoQuirks,
+        };
+
         let mut stack = vec![document.root()];
         while let Some(id) = stack.pop() {
-            if document.get(id).and_then(|node| node.element()).is_some() {
-                self.slots.entry(id).or_default();
+            if let Some(element) = document.get(id).and_then(|node| node.element()) {
+                let style_attribute = element.attr("style").and_then(|source| {
+                    if source.trim().is_empty() {
+                        return None;
+                    }
+                    let block = style::properties::parse_style_attribute(
+                        source,
+                        &url,
+                        None,
+                        quirks_mode,
+                        style::stylesheets::CssRuleType::Style,
+                    );
+                    Some(servo_arc::Arc::new(self.lock.wrap(block)))
+                });
+
+                self.slots.insert(
+                    id,
+                    ElementSlot {
+                        id: element.id().map(style::Atom::from),
+                        classes: element.classes().map(AtomIdent::from).collect(),
+                        attr_names: element
+                            .attrs
+                            .iter()
+                            .map(|attr| style::LocalName::from(attr.name.local.as_ref()))
+                            .collect(),
+                        style_attribute,
+                        ..ElementSlot::default()
+                    },
+                );
             }
             stack.extend(document.children(id));
         }
+    }
+
+    /// The lock every stylesheet and declaration block in this document shares.
+    pub fn lock(&self) -> &style::shared_lock::SharedRwLock {
+        &self.lock
     }
 
     /// Forget everything, as a new document does.
@@ -589,7 +726,7 @@ impl style::dom::NodeInfo for NodeRef<'_> {
 
     fn is_text_node(&self) -> bool {
         matches!(
-            self.document.get(self.id).map(|node| &node.data),
+            self.tree().document.get(self.id).map(|node| &node.data),
             Some(otlyra_dom::NodeData::Text(_))
         )
     }
@@ -613,7 +750,7 @@ impl<'a> style::dom::TDocument for DocumentRef<'a> {
     }
 
     fn quirks_mode(&self) -> style::context::QuirksMode {
-        match self.node.document.quirks_mode() {
+        match self.node.document().quirks_mode() {
             html5ever::interface::QuirksMode::NoQuirks => style::context::QuirksMode::NoQuirks,
             html5ever::interface::QuirksMode::LimitedQuirks => {
                 style::context::QuirksMode::LimitedQuirks
@@ -623,11 +760,11 @@ impl<'a> style::dom::TDocument for DocumentRef<'a> {
     }
 
     fn shared_lock(&self) -> &style::shared_lock::SharedRwLock {
-        &self
-            .node
+        self.node
+            .tree()
             .style_data
             .expect("a document handle always carries style state")
-            .lock
+            .lock()
     }
 }
 
@@ -676,32 +813,40 @@ impl<'a> style::dom::TNode for NodeRef<'a> {
     type ConcreteShadowRoot = NoShadowRoot<'a>;
 
     fn parent_node(&self) -> Option<Self> {
-        self.document.get(self.id)?.parent.map(|id| self.at(id))
+        self.tree()
+            .document
+            .get(self.id)?
+            .parent
+            .map(|id| self.at(id))
     }
 
     fn first_child(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .get(self.id)?
             .first_child()
             .map(|id| self.at(id))
     }
 
     fn last_child(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .get(self.id)?
             .last_child()
             .map(|id| self.at(id))
     }
 
     fn prev_sibling(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .get(self.id)?
             .prev_sibling()
             .map(|id| self.at(id))
     }
 
     fn next_sibling(&self) -> Option<Self> {
-        self.document
+        self.tree()
+            .document
             .get(self.id)?
             .next_sibling()
             .map(|id| self.at(id))
@@ -712,7 +857,7 @@ impl<'a> style::dom::TNode for NodeRef<'a> {
     }
 
     fn is_in_document(&self) -> bool {
-        self.document.get(self.id).is_some()
+        self.tree().document.get(self.id).is_some()
     }
 
     fn traversal_parent(&self) -> Option<Self> {
@@ -750,6 +895,7 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
 
     fn traversal_children(&self) -> style::dom::LayoutIterator<Self::TraversalChildrenIterator> {
         let children: Vec<Self> = self
+            .tree()
             .document
             .children(self.id)
             .map(|id| self.at(id))

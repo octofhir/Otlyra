@@ -24,6 +24,7 @@ servo_arc.workspace = true
 atomic_refcell.workspace = true
 euclid.workspace = true
 app_units.workspace = true
+tracing.workspace = true
 otlyra-dom.workspace = true
 html5ever.workspace = true
 url.workspace = true

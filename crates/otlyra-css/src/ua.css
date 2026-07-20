@@ -1,0 +1,46 @@
+/* The user-agent stylesheet, as CSS.
+ *
+ * This is the same set of decisions the hardcoded table made, written in the
+ * language they belong to: one rule per selector, values in CSS units, and the
+ * cascade — not a `match` arm — deciding what wins. The source for the values is
+ * the HTML standard's rendering chapter.
+ */
+
+html, body, div, center, section, article, aside, header, footer, main, nav,
+figcaption, form, dl, dt, table, tbody, thead, tfoot, tr, td, th, caption,
+li, details, summary, dialog, figure, hgroup, search, address, hr, p, pre,
+blockquote, ul, ol, fieldset, textarea { display: block; }
+
+head, title, meta, link, style, script, base, template, noscript { display: none; }
+
+html { color: black; background-color: white; font-family: system-ui, sans-serif;
+       font-size: 16px; }
+body { margin: 8px; }
+
+h1 { display: block; font-size: 2em;    font-weight: bold; margin: 0.67em 0; }
+h2 { display: block; font-size: 1.5em;  font-weight: bold; margin: 0.83em 0; }
+h3 { display: block; font-size: 1.17em; font-weight: bold; margin: 1em 0; }
+h4 { display: block; font-size: 1em;    font-weight: bold; margin: 1.33em 0; }
+h5 { display: block; font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
+h6 { display: block; font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
+
+p { margin: 1em 0; }
+blockquote { margin: 1em 40px; }
+ul, ol { margin: 1em 0; padding-left: 40px; }
+dd { margin-left: 40px; }
+pre { font-family: monospace; white-space: pre; margin: 1em 0; }
+hr { height: 1px; background-color: #c0c0c0; margin: 8px 0; }
+
+b, strong { font-weight: bold; }
+i, em, cite, var, dfn, address { font-style: italic; }
+code, kbd, samp, tt { font-family: monospace; }
+small, sub, sup { font-size: 0.83em; }
+mark { background-color: yellow; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+a { color: #0000ee; text-decoration: underline; }
+
+button, select { background-color: #e6e6e8; font-size: 0.95em; }
+input { background-color: #f4f4f6; font-size: 0.95em; white-space: pre; }
+textarea { background-color: #f4f4f6; font-family: monospace; white-space: pre; }
+fieldset { padding: 8px; margin: 0 2px; }

@@ -1,0 +1,537 @@
+//! The cascade: stylesheets in, one computed style per element out.
+//!
+//! What this owns is the *arrangement* — which sheets exist, in which origin, what
+//! the device is, and the order elements are visited in. The resolution itself is
+//! the style engine's, driven one element at a time from the root down, because a
+//! child's style is a function of its parent's and nothing else may run in
+//! between.
+//!
+//! Sequential on purpose. Parallel restyle is a real speed-up on a large document
+//! and it is also a way to have two documents restyle at once through one global
+//! pool; the plan defers it, and this is where that decision lives.
+
+use std::collections::HashMap;
+
+use otlyra_dom::{Document, NodeData, NodeId};
+use servo_arc::Arc;
+use style::context::{QuirksMode, SharedStyleContext, StyleContext, ThreadLocalStyleContext};
+use style::device::Device;
+use style::media_queries::{MediaList, MediaType};
+use style::properties::ComputedValues;
+use style::selector_parser::SnapshotMap;
+use style::shared_lock::{SharedRwLock, StylesheetGuards};
+use style::stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet, UrlExtraData};
+use style::stylist::Stylist;
+use style::traversal_flags::TraversalFlags;
+
+use crate::stylo_dom::{NodeRef, StyleData, Tree, TreeScope};
+
+/// Our user-agent stylesheet, in the language it belongs to.
+pub const UA_STYLESHEET: &str = include_str!("ua.css");
+
+/// A computed style per element, and the sheets that produced them.
+pub struct StyledDocument {
+    /// The engine's per-element state, which owns the computed values.
+    pub style_data: StyleData,
+    /// The computed style of each element, by node.
+    styles: HashMap<NodeId, Arc<ComputedValues>>,
+}
+
+impl StyledDocument {
+    /// The computed style of one element, if it has one.
+    pub fn style_of(&self, node: NodeId) -> Option<&Arc<ComputedValues>> {
+        self.styles.get(&node)
+    }
+
+    /// How many elements got a style.
+    pub fn len(&self) -> usize {
+        self.styles.len()
+    }
+
+    /// Whether nothing was styled.
+    pub fn is_empty(&self) -> bool {
+        self.styles.is_empty()
+    }
+}
+
+/// The viewport a document is styled against.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Viewport {
+    /// Width in CSS pixels.
+    pub width: f32,
+    /// Height in CSS pixels.
+    pub height: f32,
+    /// Device pixels per CSS pixel.
+    pub scale: f32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            width: 1024.0,
+            height: 768.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// Style every element in `document` against `viewport`.
+///
+/// Author sheets come from the document's own `<style>` elements; the user-agent
+/// sheet is ours. Both go into the same stylist, in their own origins, and the
+/// cascade decides between them — which is the whole point of using a real cascade
+/// rather than a table of defaults that author rules have to be merged into by
+/// hand.
+pub fn style_document(document: &Document, viewport: Viewport) -> StyledDocument {
+    let _span = tracing::info_span!("recalc_style").entered();
+
+    let mut style_data = StyleData::default();
+    style_data.prepare(document);
+
+    let lock = style_data.lock().clone();
+    let url = base_url();
+
+    let quirks_mode = match document.quirks_mode() {
+        html5ever::interface::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
+        html5ever::interface::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
+        html5ever::interface::QuirksMode::Quirks => QuirksMode::Quirks,
+    };
+
+    let size = euclid::Size2D::new(viewport.width, viewport.height);
+    let device = Device::new(
+        MediaType::screen(),
+        quirks_mode,
+        size,
+        euclid::Size2D::new(
+            viewport.width * viewport.scale,
+            viewport.height * viewport.scale,
+        ),
+        euclid::Scale::new(viewport.scale),
+        Box::new(NoFontMetrics),
+        // The initial values every cascade starts from, with the default font
+        // taken from those same initial values: there is no platform font
+        // preference to consult yet.
+        ComputedValues::initial_values_with_font_override(
+            style::properties::style_structs::Font::initial_values(),
+        ),
+        style::queries::values::PrefersColorScheme::Light,
+        style::servo::media_features::PointerCapabilities::FINE,
+        style::servo::media_features::PointerCapabilities::FINE,
+    );
+
+    let mut stylist = Stylist::new(device, quirks_mode);
+    stylist.append_stylesheet(
+        DocumentStyleSheet(Arc::new(parse_sheet(
+            UA_STYLESHEET,
+            Origin::UserAgent,
+            &lock,
+            &url,
+            quirks_mode,
+        ))),
+        &lock.read(),
+    );
+
+    for source in author_stylesheets(document) {
+        stylist.append_stylesheet(
+            DocumentStyleSheet(Arc::new(parse_sheet(
+                &source,
+                Origin::Author,
+                &lock,
+                &url,
+                quirks_mode,
+            ))),
+            &lock.read(),
+        );
+    }
+
+    let guard = lock.read();
+    stylist.flush(&StylesheetGuards::same(&guard));
+
+    let snapshots = SnapshotMap::new();
+    let shared = SharedStyleContext {
+        stylist: &stylist,
+        visited_styles_enabled: false,
+        options: Default::default(),
+        guards: StylesheetGuards::same(&guard),
+        current_time_for_animations: 0.0,
+        traversal_flags: TraversalFlags::empty(),
+        snapshot_map: &snapshots,
+        animations: Default::default(),
+        registered_speculative_painters: &NoPainters,
+    };
+
+    let tree = Tree::styled(document, &style_data);
+    let _scope = TreeScope::enter(&tree);
+    let mut styles = HashMap::new();
+    {
+        // The engine's assertions check that a restyle happens on a thread that has
+        // declared itself the layout thread — including in the destructors of the
+        // context, which is why this is a guard and not two bare calls. The
+        // assertion is not a formality: element data is behind interior mutability
+        // that only one thread at a time may touch.
+        let _layout = LayoutThread::enter();
+
+        let mut thread_local = ThreadLocalStyleContext::new();
+        let mut context = StyleContext {
+            shared: &shared,
+            thread_local: &mut thread_local,
+        };
+
+        let root = document.root();
+        for child in document.children(root).collect::<Vec<_>>() {
+            resolve(&tree, child, None, 0, &mut context, &mut styles);
+        }
+    }
+
+    tracing::debug!(elements = styles.len(), "styled");
+    StyledDocument { style_data, styles }
+}
+
+/// Declares this thread the layout thread for as long as it is held.
+struct LayoutThread;
+
+impl LayoutThread {
+    fn enter() -> Self {
+        style::thread_state::enter(style::thread_state::ThreadState::LAYOUT);
+        Self
+    }
+}
+
+impl Drop for LayoutThread {
+    fn drop(&mut self) {
+        style::thread_state::exit(style::thread_state::ThreadState::LAYOUT);
+    }
+}
+
+/// Resolve `node`'s style, then its children's, depth first.
+///
+/// Depth first and parent first, because inheritance means a child cannot be
+/// resolved before its parent — which is also why this is one function and not a
+/// worklist.
+fn resolve<'a>(
+    tree: &'a Tree<'a>,
+    node: NodeId,
+    parent: Option<&Arc<ComputedValues>>,
+    depth: usize,
+    context: &mut StyleContext<'_, NodeRef<'a>>,
+    styles: &mut HashMap<NodeId, Arc<ComputedValues>>,
+) {
+    let document = tree.document;
+    let is_element = document
+        .get(node)
+        .is_some_and(|node| matches!(node.data, NodeData::Element(_)));
+
+    let own_style = if is_element {
+        let element = tree.node(node);
+        // The ancestor filter must hold this element's ancestors — and only those —
+        // when it is matched, or every selector with a combinator is fast-rejected
+        // and quietly does not apply. It is a cache that changes the answer when it
+        // is wrong, so the traversal keeps it in step with the walk.
+        context
+            .thread_local
+            .bloom_filter
+            .insert_parents_recovering(element, depth);
+        let resolved = style::style_resolver::StyleResolverForElement::new(
+            element,
+            context,
+            style::stylist::RuleInclusion::All,
+            style::style_resolver::PseudoElementResolution::IfApplicable,
+        )
+        .resolve_primary_style(parent.map(|style| &**style), parent.map(|style| &**style));
+
+        let style = resolved.style.0;
+        styles.insert(node, style.clone());
+        Some(style)
+    } else {
+        None
+    };
+
+    let inherited = own_style.as_ref().or(parent);
+    let child_depth = if is_element { depth + 1 } else { depth };
+    for child in document.children(node).collect::<Vec<_>>() {
+        resolve(tree, child, inherited, child_depth, context, styles);
+    }
+}
+
+/// Every author stylesheet in the document, in tree order.
+///
+/// `<style>` elements only. `<link rel=stylesheet>` needs a fetch, and a fetch
+/// during styling is the thing the whole architecture is arranged to avoid; it
+/// arrives with navigation.
+fn author_stylesheets(document: &Document) -> Vec<String> {
+    let mut sheets = Vec::new();
+    let mut stack = vec![document.root()];
+
+    while let Some(id) = stack.pop() {
+        if let Some(element) = document.get(id).and_then(|node| node.element())
+            && element.name.local.as_ref() == "style"
+        {
+            let mut source = String::new();
+            for child in document.children(id) {
+                if let Some(NodeData::Text(text)) = document.get(child).map(|node| &node.data) {
+                    source.push_str(text);
+                }
+            }
+            if !source.trim().is_empty() {
+                sheets.push(source);
+            }
+        }
+        stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
+    }
+
+    sheets
+}
+
+/// Parse one stylesheet.
+fn parse_sheet(
+    source: &str,
+    origin: Origin,
+    lock: &SharedRwLock,
+    url: &UrlExtraData,
+    quirks_mode: QuirksMode,
+) -> Stylesheet {
+    Stylesheet::from_str(
+        source,
+        url.clone(),
+        origin,
+        Arc::new(lock.wrap(MediaList::empty())),
+        lock.clone(),
+        None,
+        None,
+        quirks_mode,
+        AllowImportRules::No,
+    )
+}
+
+/// The base every sheet is parsed against.
+///
+/// Relative `url()` in a stylesheet resolves against the document it came from,
+/// and we do not thread that through yet — so this is a base that cannot resolve
+/// to anything rather than one that resolves to the wrong thing.
+pub(crate) fn base_url() -> UrlExtraData {
+    UrlExtraData(Arc::new(
+        url::Url::parse("about:blank").expect("about:blank parses"),
+    ))
+}
+
+/// No paint worklets, which is a web feature nothing here implements.
+struct NoPainters;
+
+impl style::context::RegisteredSpeculativePainters for NoPainters {
+    fn get(
+        &self,
+        _name: &style::Atom,
+    ) -> Option<&dyn style::context::RegisteredSpeculativePainter> {
+        None
+    }
+}
+
+/// Font metrics for the queries that need them — `ex`, `ch`, `ic` units and the
+/// `font-size` keywords' relationship to the actual face.
+///
+/// Reporting none makes the engine fall back to ratios of the font size, which is
+/// what it does when a platform cannot answer. Real metrics live in the text
+/// crate, and threading them here is worth doing once anything depends on them.
+#[derive(Debug)]
+struct NoFontMetrics;
+
+impl style::device::servo::FontMetricsProvider for NoFontMetrics {
+    fn query_font_metrics(
+        &self,
+        _vertical: bool,
+        _font: &style::properties::style_structs::Font,
+        _base_size: style::values::computed::CSSPixelLength,
+        _flags: style::values::specified::font::QueryFontMetricsFlags,
+    ) -> style::font_metrics::FontMetrics {
+        Default::default()
+    }
+
+    fn base_size_for_generic(
+        &self,
+        _generic: style::values::computed::font::GenericFontFamily,
+    ) -> style::values::computed::Length {
+        style::values::computed::Length::new(16.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Style a document and hand back the computed values of the first element
+    /// matching `selector`.
+    fn computed(html: &str, selector: &str) -> Arc<ComputedValues> {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styled = style_document(&document, Viewport::default());
+        let node = crate::stylo_dom::select(&document, selector)
+            .expect("the selector should parse")
+            .into_iter()
+            .next()
+            .expect("something should match");
+        styled.style_of(node).expect("a styled element").clone()
+    }
+
+    fn colour(style: &ComputedValues) -> (u8, u8, u8) {
+        let colour = style
+            .clone_color()
+            .to_color_space(style::color::ColorSpace::Srgb);
+        (
+            (colour.components.0 * 255.0).round() as u8,
+            (colour.components.1 * 255.0).round() as u8,
+            (colour.components.2 * 255.0).round() as u8,
+        )
+    }
+
+    #[test]
+    fn the_user_agent_sheet_applies_without_any_author_css() {
+        let heading = computed("<body><h1>title", "h1");
+        assert_eq!(heading.clone_font_size().used_size().px(), 32.0);
+        assert_eq!(
+            heading.clone_display(),
+            style::values::computed::Display::Block
+        );
+    }
+
+    /// The point of the whole exercise: a rule in the document changes the page.
+    #[test]
+    fn an_author_rule_beats_the_user_agent_sheet() {
+        let styled = computed(
+            "<style>p { color: rgb(255, 0, 0); font-size: 20px }</style><body><p>text",
+            "p",
+        );
+        assert_eq!(colour(&styled), (255, 0, 0));
+        assert_eq!(styled.clone_font_size().used_size().px(), 20.0);
+    }
+
+    #[test]
+    fn specificity_decides_between_author_rules() {
+        let styled = computed(
+            "<style>p { color: rgb(0,0,255) } .note { color: rgb(0,128,0) } \
+             p.note { color: rgb(255,0,0) }</style><body><p class=note>x",
+            "p",
+        );
+        assert_eq!(colour(&styled), (255, 0, 0), "p.note is the most specific");
+    }
+
+    #[test]
+    fn a_later_rule_of_equal_specificity_wins() {
+        let styled = computed(
+            "<style>p { color: rgb(0,0,255) } p { color: rgb(0,128,0) }</style><body><p>x",
+            "p",
+        );
+        assert_eq!(colour(&styled), (0, 128, 0));
+    }
+
+    #[test]
+    fn important_beats_specificity() {
+        let styled = computed(
+            "<style>p { color: rgb(0,128,0) !important } p#x { color: rgb(0,0,255) }\
+             </style><body><p id=x>text",
+            "p",
+        );
+        assert_eq!(colour(&styled), (0, 128, 0));
+    }
+
+    #[test]
+    fn colour_inherits_and_display_does_not() {
+        let styled = computed(
+            "<style>div { color: rgb(0,128,0); display: block }</style>\
+             <body><div><span>text</span></div>",
+            "span",
+        );
+        assert_eq!(colour(&styled), (0, 128, 0), "colour inherits");
+        assert_eq!(
+            styled.clone_display(),
+            style::values::computed::Display::Inline,
+            "display does not"
+        );
+    }
+
+    /// `em` resolves against the parent's font size, which is the thing a table of
+    /// defaults cannot do and a cascade does for free.
+    #[test]
+    fn relative_units_resolve_against_the_parent() {
+        let styled = computed(
+            "<style>div { font-size: 20px } div p { font-size: 1.5em }</style>\
+             <body><div><p>text",
+            "p",
+        );
+        assert_eq!(styled.clone_font_size().used_size().px(), 30.0);
+    }
+
+    #[test]
+    fn a_style_attribute_beats_every_rule() {
+        let styled = computed(
+            "<style>p { color: rgb(0,0,255) !important }</style>\
+             <body><p style='color: rgb(255,0,0)'>text",
+            "p",
+        );
+        // The author's `!important` still wins over an ordinary inline
+        // declaration, which is what the cascade order says.
+        assert_eq!(colour(&styled), (0, 0, 255));
+    }
+
+    #[test]
+    fn an_invalid_declaration_is_dropped_and_the_rest_survives() {
+        let styled = computed(
+            "<style>p { color: nonsense; font-size: 22px }</style><body><p>x",
+            "p",
+        );
+        assert_eq!(styled.clone_font_size().used_size().px(), 22.0);
+        assert_eq!(colour(&styled), (0, 0, 0), "the bad colour was ignored");
+    }
+
+    #[test]
+    fn custom_properties_and_calc_work() {
+        let styled = computed(
+            "<style>:root { --size: 12px } p { font-size: calc(var(--size) * 2) }\
+             </style><body><p>x",
+            "p",
+        );
+        assert_eq!(styled.clone_font_size().used_size().px(), 24.0);
+    }
+
+    #[test]
+    fn a_media_query_is_evaluated_against_the_viewport() {
+        let document = otlyra_html::parse(
+            b"<style>@media (min-width: 800px) { p { font-size: 30px } }</style><body><p>x",
+            Some("utf-8"),
+        )
+        .document;
+
+        let wide = style_document(
+            &document,
+            Viewport {
+                width: 1000.0,
+                ..Viewport::default()
+            },
+        );
+        let narrow = style_document(
+            &document,
+            Viewport {
+                width: 500.0,
+                ..Viewport::default()
+            },
+        );
+
+        let paragraph = crate::stylo_dom::select(&document, "p").expect("selector")[0];
+        assert_eq!(
+            wide.style_of(paragraph)
+                .expect("styled")
+                .clone_font_size()
+                .used_size()
+                .px(),
+            30.0
+        );
+        assert_eq!(
+            narrow
+                .style_of(paragraph)
+                .expect("styled")
+                .clone_font_size()
+                .used_size()
+                .px(),
+            16.0,
+            "the rule does not apply below its breakpoint"
+        );
+    }
+}

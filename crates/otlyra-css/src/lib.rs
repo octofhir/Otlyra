@@ -9,7 +9,8 @@
 //! ## Contents
 //!
 //! - [`style`] — [`ComputedStyle`] and the value types it is made of.
-//! - [`ua`] — the user-agent stylesheet, as a `match` on the tag name.
+//! - [`ua`] — the user-agent stylesheet, both as CSS and as the table it replaces.
+//! - [`cascade`] — parsing stylesheets and computing a style per element.
 //!
 //! ## Invariants
 //!
@@ -21,6 +22,8 @@
 //! 3. **No DOM, no layout, no painting.** This crate is values; who has them is the
 //!    DOM's business and what they mean geometrically is layout's.
 
+pub mod cascade;
+pub mod computed;
 pub mod style;
 pub mod stylo_dom;
 pub mod ua;
