@@ -120,6 +120,13 @@ stylo_static_prefs = "=0.19.0"
 selectors = "=0.39.0"
 cssparser = "=0.37.0"
 servo_arc = "=0.4.3"
+# The interior mutability the style engine's element data is stored behind. Its
+# own API hands these out, so the version has to be the one it uses.
+atomic_refcell = "=0.1.13"
+# Geometry and length types the style engine's own API hands back, so the versions
+# have to be the ones it uses.
+euclid = "=0.22.11"
+app_units = "=0.7.8"
 
 # Display-list serialization, for snapshots today and IPC later.
 serde = { version = "=1.0.229", features = ["derive"] }

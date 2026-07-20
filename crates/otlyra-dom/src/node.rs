@@ -71,6 +71,21 @@ pub struct Node {
     pub(crate) next_sibling: Option<NodeId>,
 }
 
+/// A [`NodeId`] as a plain number, and back.
+///
+/// Some of what a browser hands to other machinery — hit-test identifiers, the
+/// style engine's opaque node ids — is a number, and a generational key already is
+/// one. Round-tripping it here keeps the conversion beside the type.
+pub fn node_id_to_u64(id: NodeId) -> u64 {
+    use slotmap::Key as _;
+    id.data().as_ffi()
+}
+
+/// The inverse of [`node_id_to_u64`].
+pub fn node_id_from_u64(raw: u64) -> NodeId {
+    NodeId::from(slotmap::KeyData::from_ffi(raw))
+}
+
 impl ElementData {
     /// One attribute's value, by local name, in no namespace.
     pub fn attr(&self, name: &str) -> Option<&str> {

@@ -36,7 +36,7 @@ pub mod tree;
 
 pub use limits::DomLimits;
 pub use mutator::DocumentMutator;
-pub use node::{ElementData, Node, NodeData, NodeId};
+pub use node::{ElementData, Node, NodeData, NodeId, node_id_from_u64, node_id_to_u64};
 pub use sink::DomSink;
 pub use tree::Document;
 

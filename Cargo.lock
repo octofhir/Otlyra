@@ -227,9 +227,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atomic_refcell"
-version = "0.1.14"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
+checksum = "41e67cd8309bbd06cd603a9e693a784ac2e5d1e955f11286e355089fcab3047c"
 
 [[package]]
 name = "autocfg"
@@ -876,9 +876,9 @@ dependencies = [
 
 [[package]]
 name = "euclid"
-version = "0.22.14"
+version = "0.22.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
+checksum = "ad9cdb4b747e485a12abb0e6566612956c7a1bafa3bdb8d682c5b6d403589e48"
 dependencies = [
  "num-traits",
  "serde",
@@ -2441,7 +2441,10 @@ dependencies = [
 name = "otlyra-css"
 version = "0.0.0"
 dependencies = [
+ "app_units",
+ "atomic_refcell",
  "cssparser",
+ "euclid",
  "html5ever",
  "otlyra-dom",
  "otlyra-html",
