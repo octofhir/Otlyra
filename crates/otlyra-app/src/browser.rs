@@ -4,6 +4,10 @@
 //! its scroll position; the interface owns what is typed and what is focused; this
 //! type owns the two of them and the one thing they share, the font engine.
 
+use std::collections::HashMap;
+
+use otlyra_css::cascade::ExternalSheets;
+use otlyra_dom::Document;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport};
 use otlyra_text::TextEngine;
@@ -42,6 +46,28 @@ impl std::fmt::Debug for Tab {
             .field("title", &self.title)
             .field("loaded", &self.page.is_some())
             .finish()
+    }
+}
+
+/// How many stylesheets one document may pull in.
+///
+/// A limit rather than none: every one of these is a synchronous fetch on the way
+/// to the first frame, and a document that asks for hundreds is either generated
+/// or hostile.
+const STYLESHEET_LIMIT: usize = 32;
+
+/// Decode a fetched stylesheet.
+///
+/// A BOM or a charset from the transport decides; anything else is UTF-8, which
+/// is CSS's own default and not HTML's — an unlabelled *document* is assumed to be
+/// windows-1252, an unlabelled *stylesheet* is not.
+fn decode_css(bytes: &[u8], charset: Option<&str>) -> String {
+    let decision = otlyra_html::determine(bytes, charset);
+    match decision.source {
+        otlyra_html::EncodingSource::Bom | otlyra_html::EncodingSource::TransportCharset => {
+            decision.encoding.decode(bytes).0.into_owned()
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -163,10 +189,11 @@ impl<L: Loader> Browser<L> {
         match self.loader.load(url) {
             Ok((bytes, charset, final_url)) => {
                 let parsed = otlyra_html::parse(&bytes, charset.as_deref());
+                let sheets = self.fetch_stylesheets(&parsed.document, &final_url);
                 let tab = &mut self.tabs[self.active];
                 tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
                 tab.url = final_url.clone();
-                tab.page = Some(PageScene::new(parsed.document));
+                tab.page = Some(PageScene::with_stylesheets(parsed.document, sheets));
                 self.ui.address.set_text(final_url);
             }
             Err(error) => {
@@ -177,6 +204,62 @@ impl<L: Loader> Browser<L> {
                 tab.error = Some(error);
             }
         }
+    }
+
+    /// Fetch every stylesheet `document` links to, resolved against `base`.
+    ///
+    /// Synchronous, like the navigation it is part of, and for the same reason:
+    /// the page cannot be styled before its sheets have arrived, and the real fix
+    /// is a load that does not block the event loop rather than a style step that
+    /// waits for one.
+    ///
+    /// A document fetched over the network may not reach a `file:` URL, the same
+    /// rule that governs where it may navigate: a stylesheet is a request the page
+    /// chose to make, and a page from the internet reading the disk is the failure
+    /// that rule exists to prevent.
+    fn fetch_stylesheets(&mut self, document: &Document, base: &str) -> ExternalSheets {
+        let links = otlyra_css::cascade::stylesheet_links(document);
+        let mut sheets = ExternalSheets::default();
+        let mut fetched: HashMap<String, Option<String>> = HashMap::new();
+
+        for link in links.iter().take(STYLESHEET_LIMIT) {
+            let Some(url) = otlyra_net::resolve(base, &link.href) else {
+                continue;
+            };
+            if let Ok(target) = otlyra_net::normalize(&url)
+                && !otlyra_net::may_navigate(Some(base), &target)
+            {
+                tracing::warn!(%url, %base, "stylesheet refused by scheme policy");
+                continue;
+            }
+
+            // One fetch per address: a page that links the same sheet from two
+            // places is asking for it once.
+            let source =
+                fetched
+                    .entry(url.clone())
+                    .or_insert_with(|| match self.loader.load(&url) {
+                        Ok((bytes, charset, _)) => Some(decode_css(&bytes, charset.as_deref())),
+                        Err(error) => {
+                            tracing::warn!(%url, %error, "stylesheet failed to load");
+                            None
+                        }
+                    });
+
+            if let Some(source) = source {
+                sheets.insert(link.node, source.clone());
+            }
+        }
+
+        if links.len() > STYLESHEET_LIMIT {
+            tracing::warn!(
+                asked = links.len(),
+                fetched = STYLESHEET_LIMIT,
+                "the document links more stylesheets than the limit"
+            );
+        }
+
+        sheets
     }
 
     /// Open a tab and make it active.
@@ -596,6 +679,90 @@ mod tests {
                 format!("https://start.example{path}"),
             ))
         }
+    }
+
+    /// A site whose CSS lives in a file next to the page.
+    #[derive(Default)]
+    struct SiteLoader {
+        requested: Vec<String>,
+    }
+
+    impl Loader for SiteLoader {
+        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            self.requested.push(url.to_owned());
+            match url {
+                "https://site.example/site.css" => Ok((
+                    b"p { color: rgb(0, 128, 0) }".to_vec(),
+                    Some("utf-8".to_owned()),
+                    url.to_owned(),
+                )),
+                "https://site.example/missing.css" => Err("404".to_owned()),
+                _ => Ok((
+                    b"<link rel=stylesheet href=site.css>\
+                      <link rel=stylesheet href=missing.css>\
+                      <link rel=icon href=favicon.ico>\
+                      <body><p>text"
+                        .to_vec(),
+                    Some("utf-8".to_owned()),
+                    "https://site.example/".to_owned(),
+                )),
+            }
+        }
+    }
+
+    /// A linked stylesheet is fetched against the page's own address, and only the
+    /// links that are stylesheets are fetched at all.
+    #[test]
+    fn navigation_fetches_the_stylesheets_the_page_links() {
+        let mut browser = Browser::new(SiteLoader::default());
+        browser.navigate("site.example");
+
+        assert_eq!(
+            browser.loader.requested,
+            vec![
+                "site.example".to_owned(),
+                "https://site.example/site.css".to_owned(),
+                "https://site.example/missing.css".to_owned(),
+            ],
+            "the icon is not a stylesheet and is not fetched"
+        );
+
+        let active = browser.active;
+        let page = browser.tabs[active].page.as_mut().expect("a page");
+        // The cascade runs on the way to a frame, so ask for one.
+        page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
+
+        let boxes = page.boxes();
+        let coloured = boxes.descendants(boxes.root()).into_iter().any(|id| {
+            boxes.node(id).style.color == otlyra_gfx::peniko::Color::from_rgb8(0, 128, 0)
+        });
+        assert!(coloured, "the fetched sheet reached the box tree");
+    }
+
+    /// A page from the network asking for a stylesheet on disk is the rule that
+    /// keeps a web page out of the filesystem, and it holds for subresources and
+    /// not only for navigation.
+    #[test]
+    fn a_web_page_may_not_link_a_stylesheet_on_disk() {
+        struct DiskLoader;
+
+        impl Loader for DiskLoader {
+            fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+                assert!(
+                    !url.starts_with("file:"),
+                    "the loader must never be asked for {url}"
+                );
+                Ok((
+                    b"<link rel=stylesheet href=\"file:///etc/theme.css\"><body><p>x".to_vec(),
+                    Some("utf-8".to_owned()),
+                    "https://site.example/".to_owned(),
+                ))
+            }
+        }
+
+        let mut browser = Browser::new(DiskLoader);
+        browser.navigate("site.example");
+        assert!(browser.tabs[browser.active].page.is_some());
     }
 
     /// Where the link's text was actually painted, taken from the page's own

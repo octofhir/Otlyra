@@ -9,6 +9,7 @@
 //! the display list, which is a walk over the fragments that are actually visible.
 //! A resize invalidates layout, because layout is a function of the width.
 
+use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, build_box_tree, build_styled_box_tree};
@@ -17,6 +18,10 @@ use otlyra_text::TextEngine;
 /// A parsed document, laid out and painted.
 #[derive(Debug)]
 pub struct PageScene {
+    /// The stylesheets the document's `<link>` elements asked for, already
+    /// fetched. Kept because a restyle needs them again and a restyle must not
+    /// wait on a network.
+    sheets: ExternalSheets,
     /// The document itself, kept because a click resolves to a box, a box to a
     /// node, and a node's attributes are what say where a link goes.
     document: Document,
@@ -44,9 +49,15 @@ pub struct PageScene {
 }
 
 impl PageScene {
-    /// A scene showing `document`.
+    /// A scene showing `document`, with no external stylesheets.
     pub fn new(document: Document) -> Self {
+        Self::with_stylesheets(document, ExternalSheets::default())
+    }
+
+    /// A scene showing `document`, styled with `sheets` as well as its own CSS.
+    pub fn with_stylesheets(document: Document, sheets: ExternalSheets) -> Self {
         Self {
+            sheets,
             boxes: build_box_tree(&document),
             document,
             targets: Vec::new(),
@@ -99,13 +110,14 @@ impl PageScene {
 
     /// Run the cascade for a viewport of `width` by `height`, and rebuild the boxes.
     fn restyle(&mut self, width: f32, height: f32) {
-        let styles = otlyra_css::cascade::style_document(
+        let styles = otlyra_css::cascade::style_document_with(
             &self.document,
             otlyra_css::cascade::Viewport {
                 width,
                 height,
                 scale: 1.0,
             },
+            &self.sheets,
         );
         self.boxes = build_styled_box_tree(&self.document, &styles);
         self.styled_at = Some((width, height));
