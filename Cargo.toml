@@ -8,6 +8,7 @@ members = [
     "crates/otlyra-html",
     "crates/otlyra-layout",
     "crates/otlyra-net",
+    "crates/otlyra-paint",
     "crates/otlyra-platform",
     "crates/otlyra-text",
 ]
@@ -28,6 +29,7 @@ otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
 otlyra-html = { path = "crates/otlyra-html", version = "0.0.0" }
 otlyra-layout = { path = "crates/otlyra-layout", version = "0.0.0" }
 otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
+otlyra-paint = { path = "crates/otlyra-paint", version = "0.0.0" }
 otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
 otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
 

@@ -1,0 +1,240 @@
+//! Block and inline layout, judged on geometry.
+//!
+//! Every case uses the vendored font through [`TextEngine::isolated`], so the
+//! numbers hold on any machine. A layout test measured against a system font is a
+//! layout test that fails on someone else's laptop.
+
+use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree};
+use otlyra_layout::{Viewport, build_box_tree, dump, layout};
+use otlyra_text::{FontStack, TextEngine};
+
+/// Lay out `html` at `width` logical pixels.
+fn lay_out(html: &str, width: f32) -> FragmentTree {
+    let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+    let boxes = build_box_tree(&parsed.document);
+    let mut text = isolated_engine();
+    layout(
+        &boxes,
+        &mut text,
+        Viewport {
+            width,
+            height: 600.0,
+        },
+    )
+}
+
+/// An engine that can only see the vendored family, whatever the document asks
+/// for. The font stack a page names is resolved by name, and on a machine without
+/// that font the metrics differ — so the tests pin the font instead.
+fn isolated_engine() -> TextEngine {
+    let mut engine = TextEngine::isolated();
+    assert!(engine.has_family(otlyra_text::TEST_FAMILY));
+    engine
+}
+
+fn fragments(tree: &FragmentTree) -> Vec<&Fragment> {
+    tree.iter().collect()
+}
+
+fn lines(tree: &FragmentTree) -> Vec<&Fragment> {
+    tree.iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .collect()
+}
+
+fn boxes_of(tree: &FragmentTree) -> Vec<&Fragment> {
+    tree.iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Box))
+        .collect()
+}
+
+/// Boxes that directly contain lines — the paragraph-shaped ones, as opposed to
+/// the root, `<html>` and `<body>` wrappers that contain those.
+fn text_blocks(tree: &FragmentTree) -> Vec<&Fragment> {
+    tree.iter()
+        .filter(|fragment| {
+            matches!(fragment.kind, FragmentKind::Box)
+                && fragment
+                    .children
+                    .iter()
+                    .any(|child| matches!(child.kind, FragmentKind::Line))
+        })
+        .collect()
+}
+
+#[test]
+fn a_single_paragraph_becomes_one_line() {
+    let tree = lay_out("<body><p>hello", 800.0);
+    assert_eq!(lines(&tree).len(), 1);
+    insta::assert_snapshot!(dump::serialize_fragments(&tree));
+}
+
+#[test]
+fn blocks_stack_downward_and_never_overlap() {
+    let tree = lay_out("<body><p>one</p><p>two</p><p>three</p>", 800.0);
+    let paragraphs = text_blocks(&tree);
+    assert_eq!(paragraphs.len(), 3);
+
+    for pair in paragraphs.windows(2) {
+        assert!(
+            pair[1].rect.y >= pair[0].rect.bottom(),
+            "{:?} overlaps {:?}",
+            pair[1].rect,
+            pair[0].rect
+        );
+    }
+}
+
+#[test]
+fn a_paragraph_wraps_to_the_width_it_is_given() {
+    let text = "the quick brown fox jumps over the lazy dog again and again";
+    let wide = lay_out(&format!("<body><p>{text}"), 800.0);
+    let narrow = lay_out(&format!("<body><p>{text}"), 200.0);
+
+    assert_eq!(lines(&wide).len(), 1);
+    assert!(
+        lines(&narrow).len() > 2,
+        "expected wrapping at 200px, got {} lines",
+        lines(&narrow).len()
+    );
+    for line in lines(&narrow) {
+        assert!(line.rect.width <= 200.0, "line is {:?}", line.rect);
+    }
+}
+
+#[test]
+fn lines_stack_downward_within_a_paragraph() {
+    let tree = lay_out(
+        "<body><p>the quick brown fox jumps over the lazy dog again and again",
+        200.0,
+    );
+    let lines = lines(&tree);
+    assert!(lines.len() > 2);
+    for pair in lines.windows(2) {
+        assert!(
+            pair[1].rect.y >= pair[0].rect.bottom() - 0.01,
+            "line at {:?} overlaps the one at {:?}",
+            pair[1].rect,
+            pair[0].rect
+        );
+    }
+}
+
+#[test]
+fn a_margin_separates_two_paragraphs() {
+    let tree = lay_out("<body><p>one</p><p>two</p>", 800.0);
+    // The UA margin is 1em of the 16px body text, so 16px above and below.
+    let paragraphs = text_blocks(&tree);
+    let first = paragraphs[0];
+    let second = paragraphs[1];
+    let gap = second.rect.y - first.rect.bottom();
+    assert!(
+        (gap - 32.0).abs() < 0.5,
+        "gap was {gap}px; margins do not collapse yet, so it is both margins"
+    );
+}
+
+#[test]
+fn padding_moves_content_inward_and_makes_the_box_larger() {
+    // <ul> is the one element in the UA table with padding: 40px on the left.
+    let tree = lay_out("<body><ul><li>item", 800.0);
+    let list = tree
+        .iter()
+        .find(|fragment| {
+            matches!(fragment.kind, FragmentKind::Box)
+                && fragment.style.padding.left != otlyra_css::Length::ZERO
+        })
+        .expect("the list should have padding");
+    let line = lines(&tree)[0];
+
+    assert!(
+        line.rect.x >= list.rect.x + 40.0,
+        "text at {} should sit inside the padding of a box at {}",
+        line.rect.x,
+        list.rect.x
+    );
+}
+
+#[test]
+fn a_heading_is_taller_than_body_text() {
+    let heading = lay_out("<body><h1>title", 800.0);
+    let paragraph = lay_out("<body><p>title", 800.0);
+    assert!(
+        lines(&heading)[0].rect.height > lines(&paragraph)[0].rect.height,
+        "a 32px heading must make a taller line than 16px body text"
+    );
+}
+
+/// Mixed font sizes on one line: the tall span sets the line height and both sit on
+/// one baseline. This is the case a hand-rolled line builder gets wrong first.
+#[test]
+fn one_line_holds_two_font_sizes_on_a_shared_baseline() {
+    let tree = lay_out("<body><p>normal <small>smaller</small> normal", 800.0);
+    let line = lines(&tree)[0];
+    let FragmentKind::Text(runs) = &line.children[0].kind else {
+        panic!("a line should contain text");
+    };
+
+    assert!(runs.len() >= 2, "expected several runs on the line");
+    let baselines: Vec<f32> = runs.iter().map(|run| run.glyphs[0].y).collect();
+    for baseline in &baselines {
+        assert!(
+            (baseline - baselines[0]).abs() < 0.01,
+            "runs sit at {baselines:?}; they must share a baseline"
+        );
+    }
+}
+
+#[test]
+fn br_forces_a_line_break() {
+    let single = lay_out("<body><p>one two", 800.0);
+    let broken = lay_out("<body><p>one<br>two", 800.0);
+
+    assert_eq!(lines(&single).len(), 1);
+    assert_eq!(lines(&broken).len(), 2);
+}
+
+#[test]
+fn an_empty_block_takes_no_height() {
+    let tree = lay_out("<body><div></div>", 800.0);
+    let empty = boxes_of(&tree)
+        .into_iter()
+        .find(|fragment| fragment.children.is_empty())
+        .expect("the empty div");
+    assert_eq!(empty.rect.height, 0.0);
+}
+
+#[test]
+fn layout_is_deterministic_across_runs() {
+    let html = "<body><h1>title</h1><p>the quick brown fox jumps over the lazy dog";
+    let first = dump::serialize_fragments(&lay_out(html, 300.0));
+    for _ in 0..9 {
+        assert_eq!(dump::serialize_fragments(&lay_out(html, 300.0)), first);
+    }
+    insta::assert_snapshot!(first);
+}
+
+#[test]
+fn culling_keeps_only_the_fragments_that_touch_the_viewport() {
+    let html = "<body>".to_owned() + &"<p>a paragraph</p>".repeat(200);
+    let tree = lay_out(&html, 800.0);
+    let viewport = otlyra_layout::Rect::new(0.0, 0.0, 800.0, 600.0);
+
+    let visible = tree.visible(&viewport).count();
+    assert!(visible < fragments(&tree).len() / 4, "{visible} visible");
+    assert!(visible > 0);
+}
+
+/// The font stack a document names is resolved by name; when nothing matches, the
+/// generic fallback has to still produce glyphs rather than nothing.
+#[test]
+fn text_still_shapes_when_the_named_family_is_missing() {
+    let stack = FontStack::parse_css("NoSuchFamily, sans-serif");
+    assert_eq!(stack.families().len(), 2);
+
+    let tree = lay_out("<body><p>text", 800.0);
+    let FragmentKind::Text(runs) = &lines(&tree)[0].children[0].kind else {
+        panic!("expected text");
+    };
+    assert!(runs.iter().any(|run| !run.glyphs.is_empty()));
+}

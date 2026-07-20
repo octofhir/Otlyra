@@ -2142,6 +2142,7 @@ dependencies = [
  "otlyra-html",
  "otlyra-layout",
  "otlyra-net",
+ "otlyra-paint",
  "otlyra-platform",
  "otlyra-text",
  "png",
@@ -2200,6 +2201,7 @@ dependencies = [
  "otlyra-css",
  "otlyra-dom",
  "otlyra-html",
+ "otlyra-text",
  "slotmap",
  "tracing",
 ]
@@ -2215,6 +2217,17 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "otlyra-paint"
+version = "0.0.0"
+dependencies = [
+ "otlyra-gfx",
+ "otlyra-html",
+ "otlyra-layout",
+ "otlyra-text",
+ "tracing",
 ]
 
 [[package]]

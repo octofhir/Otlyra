@@ -46,3 +46,35 @@ fn write_box(tree: &BoxTree, id: BoxId, depth: usize, out: &mut String) {
         write_box(tree, child, depth + 1, out);
     }
 }
+
+/// Serialize a fragment tree: geometry first, because geometry is what layout is
+/// judged on.
+pub fn serialize_fragments(tree: &crate::fragment::FragmentTree) -> String {
+    let mut out = String::new();
+    write_fragment(&tree.root, 0, &mut out);
+    out
+}
+
+fn write_fragment(fragment: &crate::fragment::Fragment, depth: usize, out: &mut String) {
+    use crate::fragment::FragmentKind;
+
+    let indent = "  ".repeat(depth);
+    let rect = fragment.rect;
+    let kind = match &fragment.kind {
+        FragmentKind::Box => "BOX".to_owned(),
+        FragmentKind::Line => "LINE".to_owned(),
+        FragmentKind::Text(runs) => {
+            let glyphs: usize = runs.iter().map(|run| run.glyphs.len()).sum();
+            format!("TEXT {glyphs} glyphs in {} runs", runs.len())
+        }
+    };
+    let _ = writeln!(
+        out,
+        "{indent}{kind} at ({:.1}, {:.1}) size {:.1}x{:.1}",
+        rect.x, rect.y, rect.width, rect.height
+    );
+
+    for child in &fragment.children {
+        write_fragment(child, depth + 1, out);
+    }
+}

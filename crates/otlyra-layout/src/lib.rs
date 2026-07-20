@@ -11,7 +11,9 @@
 //!
 //! - [`box_tree`] — [`BoxTree`], [`BoxNode`], and the invariant checker.
 //! - [`builder`] — [`build_box_tree`]: DOM plus UA style becomes boxes.
-//! - [`dump`] — the text form, for `--dump-boxes` and for snapshots.
+//! - [`flow`] — [`layout`]: block and inline formatting contexts.
+//! - [`fragment`] — [`FragmentTree`]: boxes once they have a position and a size.
+//! - [`dump`] — the text forms, for `--dump-boxes`, `--dump-fragments` and snapshots.
 //!
 //! ## Invariants
 //!
@@ -25,11 +27,15 @@
 pub mod box_tree;
 pub mod builder;
 pub mod dump;
+pub mod flow;
+pub mod fragment;
 
 pub use box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, InvalidationReason, first_box_with_mixed_children,
 };
 pub use builder::build_box_tree;
+pub use flow::{Viewport, layout};
+pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 
 #[cfg(test)]
 mod tests {

@@ -72,6 +72,12 @@ struct Cli {
     #[arg(long)]
     dump_boxes: bool,
 
+    /// Print the laid-out fragment tree instead of opening a window, then exit.
+    ///
+    /// Geometry, in logical pixels, at `--width` by `--height`.
+    #[arg(long)]
+    dump_fragments: bool,
+
     /// Print the document's source instead of opening a window, then exit.
     #[arg(long)]
     dump_source: bool,
@@ -120,7 +126,7 @@ fn main() -> ExitCode {
         };
     }
 
-    if cli.dump_dom.is_some() || cli.dump_source || cli.dump_boxes {
+    if cli.dump_dom.is_some() || cli.dump_source || cli.dump_boxes || cli.dump_fragments {
         eprintln!("otlyra: --dump-dom, --dump-boxes and --dump-source need a --url or a --file");
         return ExitCode::FAILURE;
     }
@@ -233,9 +239,24 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
 
+    if cli.dump_fragments {
+        let boxes = otlyra_layout::build_box_tree(&parsed.document);
+        let mut text = otlyra_text::TextEngine::new();
+        let fragments = otlyra_layout::layout(
+            &boxes,
+            &mut text,
+            otlyra_layout::Viewport {
+                width: cli.width as f32,
+                height: cli.height as f32,
+            },
+        );
+        print!("{}", otlyra_layout::dump::serialize_fragments(&fragments));
+        return Ok(());
+    }
+
     let title = otlyra_app::page::title_of(&parsed.document);
     let mut page = otlyra_app::page::PageScene::new(&parsed.document);
-    eprintln!("{} blocks of text", page.blocks().len());
+    eprintln!("{} boxes", page.boxes().len());
 
     match cli.screenshot.as_deref() {
         Some(path) => write_screenshot(&mut page, cli.viewport(), path)?,

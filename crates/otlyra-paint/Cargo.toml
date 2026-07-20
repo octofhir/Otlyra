@@ -1,6 +1,6 @@
 [package]
-name = "otlyra-layout"
-description = "The box tree: a styled DOM turned into the tree layout operates on."
+name = "otlyra-paint"
+description = "Fragments to a display list: the last step before pixels, and a pure function."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +9,13 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-otlyra-css.workspace = true
-otlyra-dom.workspace = true
-otlyra-text.workspace = true
-html5ever.workspace = true
-slotmap.workspace = true
+otlyra-gfx.workspace = true
+otlyra-layout.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 otlyra-html.workspace = true
-insta.workspace = true
+otlyra-text.workspace = true
 
 [lints]
 workspace = true

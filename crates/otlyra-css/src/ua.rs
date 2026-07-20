@@ -42,9 +42,16 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "template"
         | "noscript" => style.display = Display::None,
 
-        "html" | "body" | "div" | "section" | "article" | "aside" | "header" | "footer"
-        | "main" | "nav" | "figure" | "figcaption" | "address" | "form" | "fieldset" | "dl"
-        | "dd" | "dt" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
+        // The standard's `body { margin: 8px }`, which is why text does not touch
+        // the window edge in any browser.
+        "body" => {
+            style.display = Display::Block;
+            style.margin = Sides::all(LengthOrAuto::Px(8.0));
+        }
+
+        "html" | "div" | "section" | "article" | "aside" | "header" | "footer" | "main" | "nav"
+        | "figure" | "figcaption" | "address" | "form" | "fieldset" | "dl" | "dd" | "dt"
+        | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
             style.display = Display::Block;
         }
 
