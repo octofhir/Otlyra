@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/otlyra-app",
+    "crates/otlyra-dom",
     "crates/otlyra-gfx",
     "crates/otlyra-net",
     "crates/otlyra-platform",
@@ -18,6 +19,7 @@ repository = "https://github.com/octofhir/Otlyra"
 
 # Every version is pinned exactly. No wildcards, no unpinned git dependencies.
 [workspace.dependencies]
+otlyra-dom = { path = "crates/otlyra-dom", version = "0.0.0" }
 otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
 otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
 otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
@@ -64,6 +66,19 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 smallvec = { version = "=1.15.2", features = ["union"] }
 rustc-hash = "=2.1.3"
 slotmap = "=1.1.1"
+
+# HTML tokenizer and tree construction. Hand-writing one to html5lib-green is
+# 8-11 kLOC and months; the parts we do write ourselves are the ones html5ever
+# leaves out, in otlyra-html.
+#
+# Pinned exactly and deliberately: html5ever's minors break, and its version is
+# further constrained by Stylo — `markup5ever` must agree with Stylo's `web_atoms`
+# when the cascade lands at M8.
+html5ever = "=0.39.0"
+
+# Zero-copy text slices off the parse buffer. `subtendril` is O(1) where `String`
+# is a copy, and the tokenizer produces a great many small slices.
+tendril = { version = "=0.5.1", features = ["encoding_rs"] }
 
 # Display-list serialization, for snapshots today and IPC later.
 serde = { version = "=1.0.229", features = ["derive"] }
