@@ -42,6 +42,7 @@ fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
             NamedKey::End => crate::Key::End,
             NamedKey::PageUp => crate::Key::PageUp,
             NamedKey::PageDown => crate::Key::PageDown,
+            NamedKey::F5 => crate::Key::F5,
             _ => return None,
         },
         WinitKey::Character(text) => crate::Key::Character(text.chars().next()?),

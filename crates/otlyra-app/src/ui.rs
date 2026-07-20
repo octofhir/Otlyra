@@ -247,6 +247,8 @@ pub enum UiAction {
     CloseTab(usize),
     /// Make a tab active.
     SelectTab(usize),
+    /// Load the active tab's address again.
+    Reload,
 }
 
 /// What one tab shows in the strip.
@@ -324,8 +326,15 @@ impl BrowserUi {
     /// Handle a key press. Returns what the browser should do about it.
     pub fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> UiAction {
         // Accelerators work whether or not the field has focus.
+        // F5 reloads whatever has focus, including the address bar: it is not a
+        // character, so it cannot be something the user meant to type.
+        if key == Key::F5 {
+            return UiAction::Reload;
+        }
+
         if modifiers.is_accelerator() {
             return match key {
+                Key::Character('r') => UiAction::Reload,
                 Key::Character('t') => UiAction::NewTab,
                 Key::Character('l') => {
                     self.address_focused = true;
@@ -788,6 +797,37 @@ mod tests {
     /// Tabs shrink to share the width, down to a floor. Past the floor they run
     /// off the edge, which is a stated gap: a scrolling or collapsing tab strip is
     /// interface work this milestone does not do.
+    #[test]
+    fn f5_and_the_accelerator_both_reload() {
+        let mut ui = BrowserUi::new();
+        assert_eq!(
+            ui.key_pressed(Key::F5, Modifiers::default()),
+            UiAction::Reload
+        );
+
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            ui.key_pressed(Key::Character('r'), accelerator),
+            UiAction::Reload
+        );
+    }
+
+    /// F5 while typing an address is still a reload — it types nothing, so there
+    /// is nothing for it to mean instead.
+    #[test]
+    fn f5_reloads_even_with_the_address_bar_focused() {
+        let mut ui = BrowserUi::new();
+        ui.address_focused = true;
+        assert_eq!(
+            ui.key_pressed(Key::F5, Modifiers::default()),
+            UiAction::Reload
+        );
+    }
+
     #[test]
     fn tabs_share_the_width_down_to_a_readable_minimum() {
         let few = UiLayout::new(1000.0, 2);

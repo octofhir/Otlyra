@@ -191,6 +191,16 @@ impl PageScene {
             .map(|attr| attr.value.to_string())
     }
 
+    /// Put the reader back where they were, as a reload does.
+    ///
+    /// Not clamped here: the new document may be shorter or taller, and the clamp
+    /// happens on the next scroll or the next frame, once there is a layout to
+    /// clamp against.
+    pub fn set_scroll(&mut self, scroll: f32) {
+        self.scroll = scroll.max(0.0);
+        self.damage.add(Damage::PAINT);
+    }
+
     /// Scroll by `delta` logical pixels, clamped to the content.
     ///
     /// Damages paint and no more: where the content is has not changed, only which

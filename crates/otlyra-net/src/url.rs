@@ -4,7 +4,14 @@ use url::Url;
 
 use crate::loader::NetError;
 
-/// Schemes this crate will fetch.
+/// Schemes a browser will navigate to.
+///
+/// `file` is here and not in [`FETCHABLE`]: it is a scheme the browser can show
+/// and the network stack cannot fetch, and keeping the two lists apart is what
+/// stops one from being mistaken for the other.
+const NAVIGABLE: [&str; 3] = ["http", "https", "file"];
+
+/// Schemes this crate will fetch over the network.
 const FETCHABLE: [&str; 2] = ["http", "https"];
 
 /// Resolve user input to an absolute URL.
@@ -33,23 +40,51 @@ pub fn normalize(input: &str) -> Result<Url, NetError> {
         parse(input)?
     } else {
         match Url::parse(input) {
-            Ok(url) if FETCHABLE.contains(&url.scheme()) => url,
+            Ok(url) if NAVIGABLE.contains(&url.scheme()) => url,
             _ => parse(&format!("https://{input}"))?,
         }
     };
 
-    if !FETCHABLE.contains(&parsed.scheme()) {
+    if !NAVIGABLE.contains(&parsed.scheme()) {
         return Err(NetError::UnsupportedScheme {
             scheme: parsed.scheme().to_owned(),
         });
     }
-    if parsed.host().is_none() {
+    // A `file:` URL has no host, and that is not the same as a missing one.
+    if parsed.scheme() != "file" && parsed.host().is_none() {
         return Err(NetError::MissingHost {
             url: parsed.to_string(),
         });
     }
 
     Ok(parsed)
+}
+
+/// Whether this crate can fetch `url` over the network.
+///
+/// A `file:` URL is navigable and not fetchable: the browser can show one, and
+/// the thing that reads it is the filesystem, not an HTTP client. Asking the
+/// client anyway would get a confusing transport error instead of a clear refusal.
+pub fn is_fetchable(url: &Url) -> bool {
+    FETCHABLE.contains(&url.scheme())
+}
+
+/// Whether a document at `from` may navigate to `to`.
+///
+/// The rule this enforces is §14's: `file:` is reachable from the address bar and
+/// from a `file:` document's own relative links, and **never** from a document
+/// fetched over the network. A page from the internet that can open
+/// `file:///etc/passwd` — or, worse, follow a redirect into one — is the oldest
+/// browser vulnerability there is.
+pub fn may_navigate(from: Option<&str>, to: &Url) -> bool {
+    if to.scheme() != "file" {
+        return true;
+    }
+    match from {
+        // Typed, or opened from the command line. The user is allowed to ask.
+        None | Some("") => true,
+        Some(from) => Url::parse(from).is_ok_and(|url| url.scheme() == "file"),
+    }
 }
 
 /// Resolve `href` against the document it appeared in.
@@ -95,10 +130,48 @@ mod tests {
             normalize("ftp://example.com/x"),
             Err(NetError::UnsupportedScheme { scheme }) if scheme == "ftp"
         ));
+        // `data:` has no `//`, so it is refused as unparseable rather than as an
+        // unsupported scheme. Either way it does not become a navigation.
+        assert!(normalize("data:text/html,x").is_err());
         assert!(matches!(
-            normalize("file:///etc/passwd"),
-            Err(NetError::UnsupportedScheme { scheme }) if scheme == "file"
+            normalize("javascript://alert(1)"),
+            Err(NetError::UnsupportedScheme { scheme }) if scheme == "javascript"
         ));
+    }
+
+    #[test]
+    fn a_file_url_is_navigable_and_keeps_its_path() {
+        let url = normalize("file:///tmp/page.html").expect("a file url");
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.path(), "/tmp/page.html");
+    }
+
+    /// The rule that keeps the web out of the filesystem.
+    #[test]
+    fn only_the_user_and_a_local_page_may_reach_a_file_url() {
+        let target = normalize("file:///tmp/page.html").expect("a file url");
+
+        assert!(may_navigate(None, &target), "typed into the address bar");
+        assert!(
+            may_navigate(Some("file:///tmp/index.html"), &target),
+            "a local page's own link"
+        );
+        assert!(
+            !may_navigate(Some("https://example.com/"), &target),
+            "a page from the internet must never reach the filesystem"
+        );
+        assert!(
+            !may_navigate(Some("http://example.com/"), &target),
+            "nor over plain http"
+        );
+    }
+
+    #[test]
+    fn navigating_to_the_web_is_never_restricted() {
+        let target = normalize("https://example.com/").expect("a url");
+        assert!(may_navigate(Some("file:///tmp/page.html"), &target));
+        assert!(may_navigate(Some("https://other.example/"), &target));
+        assert!(may_navigate(None, &target));
     }
 
     #[test]

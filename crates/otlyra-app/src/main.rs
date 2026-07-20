@@ -277,22 +277,45 @@ fn window_config(cli: &Cli) -> WindowConfig {
     }
 }
 
-/// The real loader: `otlyra-net` over HTTP, or the filesystem for a path.
-///
-/// A path is accepted because typing one into the address bar is how a local test
-/// page gets opened, and because `file://` as a URL scheme has rules of its own
-/// (§14) that are not written yet.
+/// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.
 #[derive(Default)]
 struct NetLoader {
     loader: Option<otlyra_net::Loader>,
 }
 
+/// The `file:` URL an input names, if it names one.
+///
+/// Accepts both a `file://` URL and a plain path, because both are things people
+/// type; a path is resolved against the working directory, as a shell would.
+fn file_url(input: &str) -> Option<url::Url> {
+    if let Ok(url) = url::Url::parse(input)
+        && url.scheme() == "file"
+    {
+        return Some(url);
+    }
+
+    let path = std::path::Path::new(input);
+    if !path.exists() {
+        return None;
+    }
+    let absolute = path
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
+    url::Url::from_file_path(absolute).ok()
+}
+
 impl otlyra_app::browser::Loader for NetLoader {
     fn load(&mut self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
-        let path = std::path::Path::new(input);
-        if path.exists() {
-            let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-            return Ok((bytes, None, input.to_owned()));
+        // A path typed into the address bar becomes the `file:` URL it names, so
+        // that what the bar shows is an address and not a filename — and so that a
+        // relative link on the page has something to resolve against.
+        if let Some(url) = file_url(input) {
+            let path = url
+                .to_file_path()
+                .map_err(|()| format!("not a path: {input}"))?;
+            let bytes =
+                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            return Ok((bytes, None, url.to_string()));
         }
 
         otlyra_net::install_crypto_provider();

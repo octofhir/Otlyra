@@ -174,6 +174,8 @@ pub enum Key {
     PageUp,
     /// Page down.
     PageDown,
+    /// F5, which reloads on every platform that has the key.
+    F5,
     /// A printable character, identified by what an unmodified press would type.
     /// Used for shortcuts: `Cmd+T` arrives as `Character('t')`.
     Character(char),

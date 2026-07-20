@@ -221,6 +221,12 @@ impl Loader {
     }
 
     async fn fetch(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
+        if !crate::is_fetchable(&request.url) {
+            return Err(NetError::UnsupportedScheme {
+                scheme: request.url.scheme().to_owned(),
+            });
+        }
+
         let url = request.url.to_string();
         let limit = self.limits.max_body_bytes;
 

@@ -111,7 +111,49 @@ impl<L: Loader> Browser<L> {
     /// why M9 replaces this body with a channel and a pending state rather than
     /// replacing the caller.
     pub fn navigate(&mut self, url: &str) {
+        self.navigate_from(url, true);
+    }
+
+    /// Load the active tab's address again, keeping where the reader had got to.
+    ///
+    /// Browsers restore the scroll position on reload, and for a page you are
+    /// editing that is the whole value of the key: the alternative is finding your
+    /// place again after every change.
+    pub fn reload(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.url.is_empty() {
+            return;
+        }
+
+        let url = tab.url.clone();
+        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        self.navigate_from(&url, false);
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.set_scroll(scroll);
+        }
+    }
+
+    /// Load `url` into the active tab.
+    ///
+    /// `user_initiated` says whether the address came from the person rather than
+    /// from the page: it is what decides whether a `file:` URL may be reached at
+    /// all, and a page from the internet must never be able to claim it.
+    fn navigate_from(&mut self, url: &str, user_initiated: bool) {
         let _span = tracing::info_span!("navigation", url).entered();
+
+        if !user_initiated && let Ok(target) = otlyra_net::normalize(url) {
+            let from = self.tabs[self.active].url.clone();
+            if !otlyra_net::may_navigate(Some(&from), &target) {
+                tracing::warn!(%url, %from, "navigation refused by scheme policy");
+                let tab = &mut self.tabs[self.active];
+                tab.error = Some(format!("Refused to open {url} from {from}"));
+                tab.page = None;
+                return;
+            }
+        }
+
         let tab = &mut self.tabs[self.active];
         tab.url = url.to_owned();
         tab.error = None;
@@ -182,6 +224,7 @@ impl<L: Loader> Browser<L> {
             UiAction::NewTab => self.new_tab(),
             UiAction::CloseTab(index) => self.close_tab(index),
             UiAction::SelectTab(index) => self.select_tab(index),
+            UiAction::Reload => self.reload(),
         }
     }
 
@@ -223,7 +266,7 @@ impl<L: Loader> Painter for Browser<L> {
                 // A link takes the press before the interface sees it, because the
                 // interface has nothing in the page area to claim it.
                 if let Some(url) = self.link_under_pointer() {
-                    self.navigate(&url);
+                    self.navigate_from(&url, false);
                     return;
                 }
                 // Width is not carried on the event, so the interface is asked
@@ -251,6 +294,18 @@ impl<L: Loader> Painter for Browser<L> {
                     page.scroll_by(y as f32);
                 }
             }
+
+            // The menu and the keyboard reach the same commands: one definition of
+            // what each means, invoked from wherever the user found it.
+            PlatformEvent::MenuCommand(id) => match crate::menu::Command::from_id(id) {
+                Some(crate::menu::Command::Reload | crate::menu::Command::ReloadIgnoringCache) => {
+                    self.reload();
+                }
+                Some(crate::menu::Command::NewTab) => self.new_tab(),
+                Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
+                Some(command) => tracing::info!(?command, "command not implemented yet"),
+                None => tracing::warn!(?id, "menu reported an id no command claims"),
+            },
 
             PlatformEvent::CloseRequested => tracing::info!("close requested"),
             _ => {}
@@ -337,6 +392,13 @@ mod tests {
             self.requested.push(url.to_owned());
             match url {
                 "broken.example" => Err("could not fetch broken.example".to_owned()),
+                // A `file:` URL loads as itself; anything else becomes an https
+                // address, the way a bare hostname does.
+                _ if url.starts_with("file://") => Ok((
+                    format!("<title>Local</title><body><p>Body of {url}").into_bytes(),
+                    Some("utf-8".to_owned()),
+                    url.to_owned(),
+                )),
                 _ => Ok((
                     format!("<title>Title of {url}</title><body><p>Body of {url}").into_bytes(),
                     Some("utf-8".to_owned()),
@@ -553,6 +615,96 @@ mod tests {
         }
         assert!(x > 0.0, "the link should be somewhere on the first line");
         (x, y)
+    }
+
+    #[test]
+    fn reloading_fetches_the_same_address_again() {
+        let mut browser = browser();
+        type_url(&mut browser, "example.com");
+        browser.reload();
+
+        assert_eq!(
+            browser.loader.requested,
+            ["example.com", "https://example.com/"],
+            "the reload asks for where the first load ended up"
+        );
+    }
+
+    /// A reload keeps your place. For a page you are editing that is the whole
+    /// value of the key.
+    #[test]
+    fn reloading_keeps_the_scroll_position() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.ui.pointer_moved(400.0, 400.0);
+        browser.on_event(PlatformEvent::Scroll { x: 0.0, y: 200.0 });
+        let scrolled = browser.tabs[0].page.as_ref().expect("page").scroll();
+        assert!(scrolled > 0.0);
+
+        browser.reload();
+        assert_eq!(
+            browser.tabs[0].page.as_ref().expect("page").scroll(),
+            scrolled
+        );
+    }
+
+    #[test]
+    fn reloading_a_blank_tab_does_nothing() {
+        let mut browser = browser();
+        browser.reload();
+        assert!(browser.loader.requested.is_empty());
+    }
+
+    /// §14's rule: a page from the internet must never be able to open a file.
+    #[test]
+    fn a_web_page_may_not_navigate_to_a_file_url() {
+        let mut browser = browser();
+        type_url(&mut browser, "example.com");
+        browser.navigate_from("file:///etc/passwd", false);
+
+        assert_eq!(browser.tabs[0].url, "https://example.com/");
+        assert!(
+            browser.tabs[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Refused"))
+        );
+        assert_eq!(
+            browser.loader.requested,
+            ["example.com"],
+            "the loader is never even asked"
+        );
+    }
+
+    #[test]
+    fn the_user_may_open_a_file_url_and_so_may_a_local_page() {
+        let mut browser = browser();
+        type_url(&mut browser, "file:///tmp/one.html");
+        assert_eq!(browser.loader.requested.len(), 1);
+
+        browser.navigate_from("file:///tmp/two.html", false);
+        assert_eq!(
+            browser.loader.requested.len(),
+            2,
+            "a local page's own link is allowed"
+        );
+    }
+
+    /// A page long enough to scroll.
+    struct LongLoader;
+
+    impl Loader for LongLoader {
+        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            let body = "<title>Long</title><body>".to_owned() + &"<p>a paragraph</p>".repeat(200);
+            Ok((
+                body.into_bytes(),
+                Some("utf-8".to_owned()),
+                format!("https://{url}/"),
+            ))
+        }
     }
 
     #[test]
