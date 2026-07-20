@@ -79,6 +79,13 @@ struct Cli {
     #[arg(long)]
     dump_fragments: bool,
 
+    /// Print which elements a selector matches, then exit.
+    ///
+    /// Answers the question the cascade will ask of every rule, one selector at a
+    /// time: `--dump-selectors 'ul > li:first-child'`.
+    #[arg(long, value_name = "SELECTOR")]
+    dump_selectors: Option<String>,
+
     /// Print the document's source instead of opening a window, then exit.
     #[arg(long)]
     dump_source: bool,
@@ -127,7 +134,12 @@ fn main() -> ExitCode {
         };
     }
 
-    if cli.dump_dom.is_some() || cli.dump_source || cli.dump_boxes || cli.dump_fragments {
+    if cli.dump_dom.is_some()
+        || cli.dump_source
+        || cli.dump_boxes
+        || cli.dump_fragments
+        || cli.dump_selectors.is_some()
+    {
         eprintln!("otlyra: --dump-dom, --dump-boxes and --dump-source need a --url or a --file");
         return ExitCode::FAILURE;
     }
@@ -227,6 +239,21 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
 
     if cli.dump_dom.is_some() {
         print!("{}", otlyra_dom::dump::serialize(&parsed.document));
+        return Ok(());
+    }
+
+    if let Some(selector) = cli.dump_selectors.as_deref() {
+        let matched = otlyra_css::stylo_dom::select(&parsed.document, selector)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        eprintln!("{} elements match {selector:?}", matched.len());
+        for id in matched {
+            let element = parsed.document.node(id).element().expect("an element");
+            print!("<{}", element.name.local);
+            for attr in &element.attrs {
+                print!(" {}=\"{}\"", attr.name.local, attr.value);
+            }
+            println!(">");
+        }
         return Ok(());
     }
 

@@ -59,6 +59,10 @@ pub fn init() -> bool {
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        // Every span in `spans` is a stage of the pipeline, and the question asked
+        // of them is always "how long did it take" — so closing a span reports it.
+        // Without this the span names are labels on nothing.
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_target(true)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)

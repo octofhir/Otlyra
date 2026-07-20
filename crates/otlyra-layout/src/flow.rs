@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides, WhiteSpace};
+use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides};
 use otlyra_text::{FontStack, TextEngine, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind, BoxTree};
@@ -30,7 +30,11 @@ pub struct Viewport {
 pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> FragmentTree {
     let _span = tracing::info_span!("layout", width = viewport.width).entered();
 
-    let mut engine = Flow { tree, text };
+    let mut engine = Flow {
+        tree,
+        text,
+        font_stacks: std::collections::HashMap::new(),
+    };
     let root = tree.root();
     let mut children = Vec::new();
     let height = engine.layout_children(root, viewport.width, 0.0, 0.0, &mut children);
@@ -52,9 +56,16 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
 struct Flow<'a> {
     tree: &'a BoxTree,
     text: &'a mut TextEngine,
+    /// Font stacks, keyed by the identity of the `font-family` string they were
+    /// parsed from.
+    ///
+    /// Inheritance clones the `Arc<str>`, so every element that did not name its
+    /// own family shares one pointer — which makes this a handful of entries for a
+    /// whole document instead of one parse per run per layout.
+    font_stacks: std::collections::HashMap<usize, FontStack>,
 }
 
-impl Flow<'_> {
+impl<'a> Flow<'a> {
     /// Lay out the children of `parent` into a content box starting at
     /// (`x`, `y`) and `width` wide. Returns the height they used.
     fn layout_children(
@@ -223,17 +234,31 @@ impl Flow<'_> {
         shaped.metrics.height
     }
 
+    /// The parsed font stack for a style, from the cache.
+    fn font_stack(&mut self, style: &Arc<ComputedStyle>) -> FontStack {
+        let key = Arc::as_ptr(&style.font_family) as *const u8 as usize;
+        self.font_stacks
+            .entry(key)
+            .or_insert_with(|| FontStack::parse_css(&style.font_family))
+            .clone()
+    }
+
     /// Walk an inline subtree in order, turning each text box into a styled span.
     ///
     /// `sources` records which box each span came from, in step with `spans`: a
     /// run of glyphs is no use to hit testing without knowing which element it
     /// belongs to.
-    fn collect_spans(&self, id: BoxId, spans: &mut Vec<TextSpan>, sources: &mut Vec<BoxId>) {
+    fn collect_spans(
+        &mut self,
+        id: BoxId,
+        spans: &mut Vec<TextSpan<'a>>,
+        sources: &mut Vec<BoxId>,
+    ) {
         for &child in &self.tree.node(id).children {
             let node = self.tree.node(child);
             match &node.kind {
                 BoxKind::Text(text) => {
-                    spans.push(span_for(text, &node.style));
+                    spans.push(span_for(text, &node.style, self.font_stack(&node.style)));
                     // The text's own box is anonymous as far as the document is
                     // concerned; what a click means is the element around it.
                     sources.push(id);
@@ -246,8 +271,8 @@ impl Flow<'_> {
                         // the newline into a space, which is exactly the difference
                         // between a `<br>` and a line ending in the source.
                         spans.push(TextSpan {
-                            text: "\n".to_owned(),
-                            ..span_for("", &node.style)
+                            text: "\n",
+                            ..span_for("", &node.style, self.font_stack(&node.style))
                         });
                         sources.push(child);
                     }
@@ -265,16 +290,14 @@ impl Flow<'_> {
 }
 
 /// The span one text box contributes.
-fn span_for(text: &str, style: &ComputedStyle) -> TextSpan {
+///
+/// The text is already collapsed — the box tree did it at load time — so this
+/// borrows rather than copies.
+fn span_for<'a>(text: &'a str, style: &ComputedStyle, font_stack: FontStack) -> TextSpan<'a> {
     let color = style.color.to_rgba8();
     TextSpan {
-        text: match style.white_space {
-            WhiteSpace::Normal => collapse_whitespace(text),
-            // `pre` keeps every space and every newline, which is the whole point
-            // of it: code and poetry are the two things HTML cannot re-wrap.
-            WhiteSpace::Pre => text.to_owned(),
-        },
-        font_stack: FontStack::parse_css(&style.font_family),
+        text,
+        font_stack,
         font_size: style.font_size,
         font_weight: style.font_weight,
         italic: style.font_style == otlyra_css::FontStyle::Italic,
@@ -286,27 +309,6 @@ fn span_for(text: &str, style: &ComputedStyle) -> TextSpan {
             other => Some(other.resolve(style.font_size, style.font_size * 1.2)),
         },
     }
-}
-
-/// CSS `white-space: normal` collapsing.
-///
-/// A run of whitespace becomes one space, and a newline in the source is just more
-/// whitespace — `<br>` is what makes a line break, not a line ending in the markup.
-fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_space = false;
-    for character in text.chars() {
-        if character.is_whitespace() {
-            if !in_space {
-                out.push(' ');
-                in_space = true;
-            }
-        } else {
-            out.push(character);
-            in_space = false;
-        }
-    }
-    out
 }
 
 fn resolve_margin(style: &ComputedStyle, containing: f32) -> Sides<f32> {

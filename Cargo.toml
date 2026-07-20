@@ -57,6 +57,10 @@ objc2-foundation = "=0.3.2"
 raw-window-handle = "=0.6.2"
 
 # 2D rasterizer, behind the PaintTarget seam.
+# Defaults kept deliberately. Dropping `embed-icudtl` would shed ~10 MB and a
+# one-off ~79 ms on the first glyph — but rust-skia publishes prebuilt binaries per
+# feature permutation, and that one is not among them, so the saving costs a
+# from-source Skia build on every machine. Revisit if the permutation appears.
 skia-safe = "=0.99.0"
 
 # Font enumeration, CSS family matching, shaping and line breaking.

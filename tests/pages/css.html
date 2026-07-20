@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CSS support — Otlyra</title>
+
+<style>
+  /* Nothing on this page is applied yet: the cascade lands at M8. What works
+     today is *matching* — Servo's selector engine over our DOM — so the page is
+     written to make it obvious which rules should have applied once it does. */
+  body { font-family: system-ui, sans-serif; }
+
+  .box { background: #eef; color: #113; padding: 8px; margin: 8px 0; }
+  #unique { background: #ffe; }
+
+  h2 { color: #333; border-bottom: 1px solid #ccc; }
+  p em { color: #a00; }
+  ul > li { color: #060; }
+  li + li { font-weight: bold; }
+  li ~ li { font-style: italic; }
+
+  a[href^="https://"] { color: #06c; }
+  input[type="checkbox"] { outline: 1px solid #999; }
+
+  li:first-child { text-decoration: underline; }
+  li:nth-child(2) { background: #efe; }
+  li:last-child { text-transform: uppercase; }
+  p:empty { display: none; }
+  :root { --accent: #c30; }
+
+  :is(h3, h4) { letter-spacing: 0.02em; }
+  :where(.box) p { margin: 0; }
+  section:not(.box) { opacity: 0.9; }
+
+  @media (min-width: 600px) { .wide { display: block; } }
+  @supports (display: grid) { .grid { display: grid; } }
+</style>
+
+<h1>CSS</h1>
+<p>This page is the CSS counterpart to <code>defaults.html</code>. It states what
+each rule above <em>should</em> do, so that the difference between "matched" and
+"applied" stays visible while the cascade is being built.</p>
+
+<h2>What works today</h2>
+<p>Selector <strong>matching</strong>, through Servo's own engine over our DOM:
+type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
+<code>*=</code>), the four combinators, structural pseudo-classes, and
+<code>:is()</code>, <code>:where()</code> and <code>:not()</code>. The
+<code>--dump-selectors</code> flag answers "which elements does this selector
+match" against a real document.</p>
+
+<h2>What does not work yet</h2>
+<p>The cascade: nothing in the <code>&lt;style&gt;</code> block above changes
+this page, and neither would a <code>style=</code> attribute. Specificity,
+inheritance, <code>!important</code>, <code>calc()</code>, custom properties and
+media queries all arrive with it.</p>
+
+<h2>Elements the rules above are written against</h2>
+<section class="box" id="unique">
+  <p>A paragraph inside <code>.box#unique</code>.</p>
+  <p>Another one, so that <code>:where(.box) p</code> has two to match.</p>
+</section>
+<section>
+  <p>A paragraph with <em>emphasis</em> that <code>p em</code> selects.</p>
+  <p></p>
+</section>
+
+<ul>
+  <li>First item</li>
+  <li>Second item</li>
+  <li>Third item</li>
+</ul>
+
+<p>
+  <a href="https://example.com/">An https link</a>,
+  <a href="/relative">a relative one</a>,
+  <input type="checkbox" checked>
+  <input type="text" value="a field">
+</p>
+
+<h3>An h3</h3>
+<h4>An h4</h4>
+<div class="wide">A block behind a media query.</div>
+<div class="grid">A block behind an @supports rule.</div>

@@ -76,10 +76,14 @@ pub struct LineMetrics {
 }
 
 /// A span of text with one style, for shaping a paragraph made of several.
+///
+/// The text is borrowed. Layout runs on every resize and a page has thousands of
+/// spans; owning each one would be thousands of copies per frame of text that is
+/// already sitting in the box tree.
 #[derive(Clone, Debug)]
-pub struct TextSpan {
+pub struct TextSpan<'a> {
     /// The text itself.
-    pub text: String,
+    pub text: &'a str,
     /// The families to try, in order.
     pub font_stack: FontStack,
     /// Size in logical pixels.
@@ -245,12 +249,12 @@ impl TextEngine {
     /// `bold text` must break in the same place whether or not the `bold` is a
     /// separate element. So the spans are concatenated, styled by range, and broken
     /// together; each run comes back carrying the colour it was asked for.
-    pub fn shape_spans(&mut self, spans: &[TextSpan], max_advance: Option<f32>) -> ShapedText {
+    pub fn shape_spans(&mut self, spans: &[TextSpan<'_>], max_advance: Option<f32>) -> ShapedText {
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(spans.len());
         for span in spans {
             let start = text.len();
-            text.push_str(&span.text);
+            text.push_str(span.text);
             ranges.push(start..text.len());
         }
 
@@ -567,9 +571,9 @@ mod tests {
         }
     }
 
-    fn span(text: &str, size: f32, brush: Brush) -> TextSpan {
+    fn span(text: &str, size: f32, brush: Brush) -> TextSpan<'_> {
         TextSpan {
-            text: text.to_owned(),
+            text,
             font_stack: test_stack(),
             font_size: size,
             font_weight: 400,

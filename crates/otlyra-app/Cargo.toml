@@ -18,6 +18,7 @@ name = "otlyra_app"
 path = "src/lib.rs"
 
 [dependencies]
+otlyra-css.workspace = true
 otlyra-dom.workspace = true
 otlyra-gfx.workspace = true
 otlyra-html.workspace = true

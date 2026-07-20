@@ -69,10 +69,54 @@ struct TypefaceCache {
     /// coordinates: a bold instance of a variable font is a different typeface to
     /// Skia, and the whole point of caching is not to build it twice.
     entries: Vec<(usize, u32, Vec<i16>, sk::Typeface)>,
+    /// Configured fonts, keyed by typeface, size and hinting.
+    ///
+    /// An `SkFont` is not a handle to a typeface; it is the key to a *strike* — the
+    /// rasterized glyphs at one size with one set of flags. Building a new one per
+    /// glyph run makes Skia rasterize the same glyphs again for every run on the
+    /// page, which costs the same whatever the window size, and on a text-heavy
+    /// page it is the single largest cost in the frame.
+    fonts: Vec<(usize, u32, u32, bool, sk::Font)>,
     font_mgr: Option<sk::FontMgr>,
 }
 
 impl TypefaceCache {
+    /// A configured font for this typeface at this size, from the cache.
+    fn font(
+        &mut self,
+        font: &FontData,
+        normalized_coords: &[i16],
+        size: f32,
+        hint: bool,
+    ) -> Option<sk::Font> {
+        let key = font.data.as_ref().as_ptr() as usize;
+        // Size is compared by bits: it comes from a layout that produced the same
+        // number for every run at that size, so exact equality is what is wanted.
+        let bits = size.to_bits();
+
+        if let Some((_, _, _, _, cached)) = self.fonts.iter().find(|(k, index, s, h, _)| {
+            *k == key && *index == font.index && *s == bits && *h == hint
+        }) {
+            return Some(cached.clone());
+        }
+
+        let typeface = self.get(font, normalized_coords)?;
+        let mut configured = sk::Font::from_typeface(typeface, size);
+        // Grid fitting must be off for transformed or animating text, which is
+        // exactly what `hint` reports.
+        configured.set_subpixel(!hint);
+        configured.set_hinting(if hint {
+            sk::FontHinting::Slight
+        } else {
+            sk::FontHinting::None
+        });
+        configured.set_edging(sk::font::Edging::AntiAlias);
+
+        self.fonts
+            .push((key, font.index, bits, hint, configured.clone()));
+        Some(configured)
+    }
+
     fn get(&mut self, font: &FontData, normalized_coords: &[i16]) -> Option<sk::Typeface> {
         // `Blob` is reference-counted and shared, so its data pointer is a stable
         // identity for as long as anyone holds the font.
@@ -488,21 +532,13 @@ impl PaintTarget for SkiaPainter {
             return;
         }
 
-        let Some(typeface) = self.typefaces.get(font, normalized_coords) else {
+        let Some(sk_font) = self
+            .typefaces
+            .font(font, normalized_coords, font_size, hint)
+        else {
             tracing::error!("skia could not parse the font for a glyph run; dropping it");
             return;
         };
-
-        let mut sk_font = sk::Font::from_typeface(typeface, font_size);
-        // Grid fitting must be off for transformed or animating text, which is
-        // exactly what `hint` reports.
-        sk_font.set_subpixel(!hint);
-        sk_font.set_hinting(if hint {
-            sk::FontHinting::Slight
-        } else {
-            sk::FontHinting::None
-        });
-        sk_font.set_edging(sk::font::Edging::AntiAlias);
 
         let mut paint = to_skia_paint(brush, None);
         paint.set_style(sk::paint::Style::Fill);

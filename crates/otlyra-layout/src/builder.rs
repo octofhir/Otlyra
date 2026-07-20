@@ -31,6 +31,27 @@ struct Builder<'a> {
     tree: BoxTree,
 }
 
+/// CSS `white-space: normal` collapsing.
+///
+/// A run of whitespace becomes one space, and a newline in the source is just more
+/// whitespace — `<br>` is what makes a line break, not a line ending in the markup.
+pub(crate) fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_space = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(character);
+            in_space = false;
+        }
+    }
+    out
+}
+
 /// The marker text for a list item, given the list it is in.
 fn marker_text(ordered: bool, index: usize) -> String {
     if ordered {
@@ -266,10 +287,19 @@ impl Builder<'_> {
                 if text.trim().is_empty() {
                     return;
                 }
+
+                // Collapsed here, once per load, rather than in layout, which runs
+                // again on every resize. The result cannot change between them: it
+                // is a function of the text and of `white-space`, and neither is.
+                let text = match parent_style.white_space {
+                    otlyra_css::WhiteSpace::Pre => text.clone(),
+                    otlyra_css::WhiteSpace::Normal => collapse_whitespace(text).into(),
+                };
+
                 self.tree.push(
                     parent_box,
                     BoxNode {
-                        kind: BoxKind::Text(text.clone()),
+                        kind: BoxKind::Text(text),
                         style: Arc::clone(parent_style),
                         node: Some(node),
                         tag: None,

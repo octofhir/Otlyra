@@ -30,6 +30,11 @@ defaults-shot path=(screenshot_dir / "defaults.png"):
     cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 3000 --scale-factor 1
     @echo "wrote {{path}}"
 
+# Open the CSS test page: which selectors match, and what the cascade will do
+# with them once it exists.
+css:
+    cargo run -- --file tests/pages/css.html
+
 build:
     cargo build --workspace
 
