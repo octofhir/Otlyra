@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides};
-use otlyra_text::{FontStack, TextEngine, TextSpan};
+use otlyra_text::{FontStack, PlacedSpacer, Spacer, TextEngine, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind, BoxTree};
 use crate::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
@@ -63,6 +63,35 @@ struct Flow<'a> {
     /// own family shares one pointer — which makes this a handful of entries for a
     /// whole document instead of one parse per run per layout.
     font_stacks: std::collections::HashMap<usize, FontStack>,
+}
+
+/// An inline element that has a box of its own to draw: a background, a border, or
+/// padding that moves the text around it.
+///
+/// It is not a box fragment yet, because where it starts and ends is only known
+/// once the paragraph has been broken into lines.
+struct InlineBox {
+    id: BoxId,
+    style: Arc<ComputedStyle>,
+    border: Sides<f32>,
+    padding: Sides<f32>,
+    /// The span its content starts at, and the one it ends before.
+    first_span: usize,
+    last_span: usize,
+}
+
+/// The spacer identifiers for the two edges of the `index`th inline box.
+fn leading_spacer(index: usize) -> u64 {
+    index as u64 * 2
+}
+
+fn trailing_spacer(index: usize) -> u64 {
+    index as u64 * 2 + 1
+}
+
+/// Whether any of the four sides is non-zero.
+fn any_side(sides: Sides<f32>) -> bool {
+    sides.top > 0.0 || sides.right > 0.0 || sides.bottom > 0.0 || sides.left > 0.0
 }
 
 impl<'a> Flow<'a> {
@@ -148,7 +177,8 @@ impl<'a> Flow<'a> {
     ) -> f32 {
         let mut spans = Vec::new();
         let mut sources = Vec::new();
-        self.collect_spans(parent, &mut spans, &mut sources);
+        let mut inlines = Vec::new();
+        self.collect_spans(parent, width, &mut spans, &mut sources, &mut inlines);
         if spans.is_empty() {
             return 0.0;
         }
@@ -163,13 +193,43 @@ impl<'a> Flow<'a> {
             offset += span.text.len();
         }
 
-        let shaped = self.text.shape_spans(&spans, &[], Some(width));
+        // Each inline box asks for two spacers: one at each edge, carrying the
+        // border and padding on that side. They reserve the room the text has to
+        // move over by, and where they land is where the box starts and ends —
+        // which the shaper is the only thing that knows, since it decided the
+        // lines.
+        let spacers: Vec<Spacer> = inlines
+            .iter()
+            .enumerate()
+            .flat_map(|(index, inline)| {
+                [
+                    Spacer {
+                        id: leading_spacer(index),
+                        at: inline.first_span,
+                        width: inline.border.left + inline.padding.left,
+                    },
+                    Spacer {
+                        id: trailing_spacer(index),
+                        at: inline.last_span,
+                        width: inline.border.right + inline.padding.right,
+                    },
+                ]
+            })
+            .collect();
+
+        let shaped = self.text.shape_spans(&spans, &spacers, Some(width));
         let style = Arc::clone(&self.tree.node(parent).style);
 
         // parley measures line tops from the text origin, and the first line's top
         // can sit above it by the half-leading. The paragraph's box starts where its
         // first line starts, so everything is rebased onto that.
         let paragraph_top = shaped.lines.first().map_or(0.0, |line| line.top);
+
+        let placed: std::collections::HashMap<u64, PlacedSpacer> = shaped
+            .spacers
+            .iter()
+            .map(|spacer| (spacer.id, *spacer))
+            .collect();
 
         for (index, line) in shaped.lines.iter().enumerate() {
             // Line boxes are contiguous: each one ends where the next begins. Taking
@@ -189,6 +249,66 @@ impl<'a> Flow<'a> {
                 otlyra_css::TextAlign::Center => ((width - line.width) / 2.0).max(0.0),
                 otlyra_css::TextAlign::End => (width - line.width).max(0.0),
             };
+
+            // The inline boxes that reach this line, before the text, so their
+            // backgrounds and borders sit under the glyphs they belong to. A box
+            // that spans two lines gets one fragment per line, each ending where
+            // the line does — which is what CSS draws.
+            let mut children: Vec<Fragment> = inlines
+                .iter()
+                .enumerate()
+                .filter_map(|(number, inline)| {
+                    let start = placed.get(&leading_spacer(number))?;
+                    let end = placed.get(&trailing_spacer(number))?;
+                    if index < start.line || index > end.line {
+                        return None;
+                    }
+                    let left = if index == start.line { start.x } else { 0.0 };
+                    let right = if index == end.line {
+                        end.x + end.width
+                    } else {
+                        line.width
+                    };
+
+                    // A box broken over two lines is drawn as CSS says: the border
+                    // on the start edge belongs to the piece that starts it and the
+                    // one on the end edge to the piece that ends it, so the middle
+                    // of a wrapped element is open at both ends rather than boxed
+                    // twice.
+                    let style = if index == start.line && index == end.line {
+                        Arc::clone(&inline.style)
+                    } else {
+                        let mut broken = (*inline.style).clone();
+                        if index != start.line {
+                            broken.border.left = otlyra_css::Border::NONE;
+                        }
+                        if index != end.line {
+                            broken.border.right = otlyra_css::Border::NONE;
+                        }
+                        Arc::new(broken)
+                    };
+
+                    Some(Fragment {
+                        box_id: Some(inline.id),
+                        // Vertical padding and a horizontal border spill outside
+                        // the line box without making it taller: an inline box does
+                        // not push its neighbours apart vertically.
+                        rect: Rect::new(
+                            line_x + left,
+                            line_y - inline.border.top - inline.padding.top,
+                            (right - left).max(0.0),
+                            height
+                                + inline.border.top
+                                + inline.padding.top
+                                + inline.border.bottom
+                                + inline.padding.bottom,
+                        ),
+                        kind: FragmentKind::Box,
+                        style,
+                        children: Vec::new(),
+                    })
+                })
+                .collect();
 
             let runs: Vec<Fragment> = shaped
                 .runs
@@ -224,13 +344,14 @@ impl<'a> Flow<'a> {
                     }
                 })
                 .collect();
+            children.extend(runs);
 
             out.push(Fragment {
                 box_id: Some(parent),
                 rect: Rect::new(line_x, line_y, line.width, height),
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
-                children: runs,
+                children,
             });
         }
 
@@ -254,8 +375,10 @@ impl<'a> Flow<'a> {
     fn collect_spans(
         &mut self,
         id: BoxId,
+        containing_width: f32,
         spans: &mut Vec<TextSpan<'a>>,
         sources: &mut Vec<BoxId>,
+        inlines: &mut Vec<InlineBox>,
     ) {
         for &child in &self.tree.node(id).children {
             let node = self.tree.node(child);
@@ -279,13 +402,39 @@ impl<'a> Flow<'a> {
                         });
                         sources.push(child);
                     }
-                    self.collect_spans(child, spans, sources);
+
+                    // An inline box only becomes a fragment if it has something to
+                    // draw or something to reserve; the rest of them — a `<span>`
+                    // that only changes the colour — stay what they are, which is
+                    // the style on a run of text.
+                    let border = resolve_border(&node.style);
+                    let padding = resolve_padding(&node.style, containing_width);
+                    let paints = node.style.background_color.components[3] > 0.0
+                        || any_side(border)
+                        || any_side(padding);
+                    let slot = paints.then(|| {
+                        inlines.push(InlineBox {
+                            id: child,
+                            style: Arc::clone(&node.style),
+                            border,
+                            padding,
+                            first_span: spans.len(),
+                            last_span: spans.len(),
+                        });
+                        inlines.len() - 1
+                    });
+
+                    self.collect_spans(child, containing_width, spans, sources, inlines);
+
+                    if let Some(slot) = slot {
+                        inlines[slot].last_span = spans.len();
+                    }
                 }
                 BoxKind::Block => {
                     // A block inside an inline context. Real CSS splits the inline
                     // around it; we do not yet, so its text joins the paragraph
                     // rather than vanishing.
-                    self.collect_spans(child, spans, sources);
+                    self.collect_spans(child, containing_width, spans, sources, inlines);
                 }
             }
         }
@@ -455,6 +604,103 @@ mod tests {
             fragment.children.iter().find_map(walk)
         }
         walk(&tree.root).expect("a line box")
+    }
+
+    /// Every box fragment generated by the element `tag`, in order.
+    fn boxes_of(tree: &FragmentTree, boxes: &BoxTree, tag: &str) -> Vec<Fragment> {
+        tree.iter()
+            .filter(|fragment| {
+                matches!(fragment.kind, FragmentKind::Box)
+                    && fragment
+                        .box_id
+                        .and_then(|id| boxes.get(id))
+                        .and_then(|node| node.tag.as_ref())
+                        .is_some_and(|name| name.as_ref() == tag)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The text runs of a laid-out document, left to right within each line.
+    fn runs(tree: &FragmentTree) -> Vec<Rect> {
+        tree.iter()
+            .filter(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
+            .map(|fragment| fragment.rect)
+            .collect()
+    }
+
+    /// An inline element with a background but nothing else different about it is
+    /// the case the shaper merges into its neighbours' run: its box has to come
+    /// from the boundaries it was shaped with, not from a run of its own.
+    #[test]
+    fn an_inline_box_covers_its_own_text_inside_a_merged_run() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } span { background: #ff0 }</style>\
+             <p>before <span>middle</span> after</p>",
+            400.0,
+        );
+
+        let pieces = boxes_of(&tree, &boxes, "span");
+        let [span] = &pieces[..] else {
+            panic!("one box fragment for the span");
+        };
+        let line = first_line(&tree);
+        assert!(span.rect.x > line.x, "it starts after the text before it");
+        assert!(span.rect.right() < line.right(), "and ends before the rest");
+        assert!(span.rect.width > 0.0);
+    }
+
+    /// Padding and a border on an inline element take room in the line: the text
+    /// after them moves over by exactly as much.
+    #[test]
+    fn padding_and_borders_on_an_inline_box_move_the_text_along() {
+        let bare = laid_out(
+            "<style>body { margin: 0 }</style><p>a<span>b</span>c</p>",
+            400.0,
+        )
+        .0;
+        let padded = laid_out(
+            "<style>body { margin: 0 } \
+             span { padding: 0 6px; border: 2px solid black }</style>\
+             <p>a<span>b</span>c</p>",
+            400.0,
+        )
+        .0;
+
+        let widths = |tree: &FragmentTree| first_line(tree).width;
+        assert!(
+            (widths(&padded) - widths(&bare) - 16.0).abs() < 0.01,
+            "two paddings and two borders wider"
+        );
+
+        let last = |tree: &FragmentTree| *runs(tree).last().expect("a run");
+        assert!(
+            last(&padded).x - last(&bare).x >= 15.0,
+            "and the text after the span starts that much further along"
+        );
+    }
+
+    /// An inline box broken over two lines is drawn as two pieces, each ending
+    /// where its line does, and the border on an edge belongs to the piece that
+    /// edge is on.
+    #[test]
+    fn a_wrapped_inline_box_is_open_where_the_line_broke() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } span { border: 2px solid black }</style>\
+             <p><span>alpha beta gamma delta</span></p>",
+            80.0,
+        );
+
+        let pieces = boxes_of(&tree, &boxes, "span");
+        assert!(pieces.len() > 1, "the span wrapped");
+        let first = pieces.first().expect("a first piece");
+        let last = pieces.last().expect("a last piece");
+
+        assert_eq!(first.style.border.left.width, 2.0);
+        assert_eq!(first.style.border.right.width, 0.0);
+        assert_eq!(last.style.border.left.width, 0.0);
+        assert_eq!(last.style.border.right.width, 2.0);
+        assert!(last.rect.y > first.rect.y, "on different lines");
     }
 
     /// The box a border is drawn on includes the border, and the content sits

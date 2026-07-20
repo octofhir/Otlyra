@@ -116,43 +116,6 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                 return;
             }
 
-            // An inline element's background. Inline boxes generate no box
-            // fragment — only the runs their text landed in — so the background of
-            // a `<mark>` or a `<button>` has to be painted here or nowhere.
-            //
-            // Only an inline one: a run inside a block carries the block's style,
-            // and painting from it would draw the block's background and border a
-            // second time, around the text rather than around the box.
-            let inline = fragment.style.display == otlyra_layout::Display::Inline;
-            let background = fragment.style.background_color;
-            if inline && background.components[3] > 0.0 {
-                list.push(DisplayItem::Fill {
-                    style: Fill::NonZero,
-                    transform: Affine::IDENTITY,
-                    brush: Brush::Solid(background),
-                    brush_transform: None,
-                    shape: KurboRect::new(
-                        f64::from(rect.x),
-                        f64::from(rect.y - scroll_y),
-                        f64::from(rect.x) + f64::from(run.advance),
-                        f64::from(rect.bottom() - scroll_y),
-                    )
-                    .to_path(PATH_TOLERANCE),
-                });
-            }
-
-            // And its borders, for the same reason. The rectangle is the run's,
-            // so an inline element broken across two lines gets a border round
-            // each piece rather than round the whole of it.
-            if inline {
-                paint_borders(
-                    list,
-                    fragment,
-                    otlyra_layout::Rect::new(rect.x, rect.y, run.advance, rect.height),
-                    scroll_y,
-                );
-            }
-
             // Decorations first, so the glyphs sit on top of them: a line drawn
             // over text is a strikethrough whatever it was meant to be. The offset
             // and thickness come from the font, by way of the shaper.
