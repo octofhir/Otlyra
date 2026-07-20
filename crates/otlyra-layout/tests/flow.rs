@@ -220,6 +220,32 @@ fn layout_is_deterministic_across_runs() {
     insta::assert_snapshot!(first);
 }
 
+/// A resize is a reflow, not a rebuild: the same boxes land in different places.
+#[test]
+fn the_same_document_reflows_at_three_widths() {
+    let html = "<body><h1>A heading that is long enough to wrap</h1><p>the quick brown fox jumps over the lazy dog";
+
+    let mut previous_lines = 0;
+    for width in [900.0, 500.0, 260.0] {
+        let tree = lay_out(html, width);
+        let lines = lines(&tree);
+
+        for line in &lines {
+            assert!(
+                line.rect.right() <= width + 0.5,
+                "a line at {:?} runs past a {width}px viewport",
+                line.rect
+            );
+        }
+        assert!(
+            lines.len() > previous_lines,
+            "narrower must mean more lines: {} at {width}px after {previous_lines}",
+            lines.len()
+        );
+        previous_lines = lines.len();
+    }
+}
+
 #[test]
 fn culling_keeps_only_the_fragments_that_touch_the_viewport() {
     let html = "<body>".to_owned() + &"<p>a paragraph</p>".repeat(200);

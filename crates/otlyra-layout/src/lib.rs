@@ -11,6 +11,7 @@
 //!
 //! - [`box_tree`] — [`BoxTree`], [`BoxNode`], and the invariant checker.
 //! - [`builder`] — [`build_box_tree`]: DOM plus UA style becomes boxes.
+//! - [`damage`] — [`Damage`]: how much of the pipeline a change invalidates.
 //! - [`flow`] — [`layout`]: block and inline formatting contexts.
 //! - [`fragment`] — [`FragmentTree`]: boxes once they have a position and a size.
 //! - [`dump`] — the text forms, for `--dump-boxes`, `--dump-fragments` and snapshots.
@@ -26,6 +27,7 @@
 
 pub mod box_tree;
 pub mod builder;
+pub mod damage;
 pub mod dump;
 pub mod flow;
 pub mod fragment;
@@ -35,6 +37,7 @@ pub use box_tree::{
     first_box_with_mixed_children,
 };
 pub use builder::build_box_tree;
+pub use damage::Damage;
 pub use flow::{Viewport, layout};
 pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 

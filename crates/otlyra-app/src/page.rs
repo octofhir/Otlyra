@@ -11,7 +11,7 @@
 
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_layout::{BoxId, BoxTree, FragmentTree, build_box_tree};
+use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, build_box_tree};
 use otlyra_text::TextEngine;
 
 /// A parsed document, laid out and painted.
@@ -34,6 +34,8 @@ pub struct PageScene {
     /// The last frame's content height, so a scroll can be clamped without waiting
     /// for the next one.
     viewport_height: f32,
+    /// What the next frame has to redo.
+    damage: Damage,
 }
 
 impl PageScene {
@@ -46,7 +48,13 @@ impl PageScene {
             layout: None,
             scroll: 0.0,
             viewport_height: 0.0,
+            damage: Damage::STYLE,
         }
+    }
+
+    /// What the next frame has to redo.
+    pub fn damage(&self) -> Damage {
+        self.damage
     }
 
     /// The document behind the page.
@@ -69,6 +77,9 @@ impl PageScene {
     fn fragments(&mut self, text: &mut TextEngine, width: f32, height: f32) -> &FragmentTree {
         let stale = !matches!(&self.layout, Some((last, _)) if *last == width);
         if stale {
+            self.damage.add(Damage::of(
+                otlyra_layout::InvalidationReason::ViewportResized,
+            ));
             let tree =
                 otlyra_layout::layout(&self.boxes, text, otlyra_layout::Viewport { width, height });
             self.layout = Some((width, tree));
@@ -86,6 +97,7 @@ impl PageScene {
         top: f32,
     ) -> DisplayList {
         self.viewport_height = height;
+        self.damage.take();
         let scroll = self.scroll;
         let fragments = self.fragments(text, width, height);
         let mut list = otlyra_paint::build_display_list(fragments, (width, height), scroll);
@@ -156,7 +168,11 @@ impl PageScene {
     }
 
     /// Scroll by `delta` logical pixels, clamped to the content.
+    ///
+    /// Damages paint and no more: where the content is has not changed, only which
+    /// part of it is on screen.
     pub fn scroll_by(&mut self, delta: f32) {
+        self.damage.add(Damage::PAINT);
         let content = self
             .layout
             .as_ref()
