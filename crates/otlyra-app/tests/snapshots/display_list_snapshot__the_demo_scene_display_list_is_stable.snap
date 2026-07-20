@@ -1,0 +1,502 @@
+---
+source: crates/otlyra-app/tests/display_list_snapshot.rs
+expression: list
+---
+DisplayList {
+    items: [
+        Fill {
+            style: NonZero,
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        1.0,
+                        1.0,
+                        1.0,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (0.0, 0.0),
+                    ),
+                    LineTo(
+                        (400.0, 0.0),
+                    ),
+                    LineTo(
+                        (400.0, 300.0),
+                    ),
+                    LineTo(
+                        (0.0, 300.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+        Image {
+            image: ImageResource {
+                width: 256,
+                height: 256,
+                format: Rgba8,
+                alpha_type: AlphaPremultiplied,
+                bytes: 262144,
+            },
+            sampler: ImageSampler {
+                x_extend: Pad,
+                y_extend: Pad,
+                quality: Medium,
+                alpha: 1.0,
+            },
+            transform: Affine(
+                [
+                    0.375,
+                    0.0,
+                    0.0,
+                    0.375,
+                    96.0,
+                    90.203125,
+                ],
+            ),
+            clip_rect: None,
+        },
+        Glyphs {
+            font: FontId(
+                0,
+            ),
+            font_size: 32.0,
+            normalized_coords: [],
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.1137255,
+                        0.20784315,
+                        0.34117648,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    224.0,
+                    96.0,
+                ],
+            ),
+            hint: true,
+            glyphs: [
+                Glyph {
+                    id: 52,
+                    x: 0.0,
+                    y: 33.0,
+                },
+                Glyph {
+                    id: 89,
+                    x: 22.0,
+                    y: 33.0,
+                },
+                Glyph {
+                    id: 81,
+                    x: 32.453125,
+                    y: 33.0,
+                },
+                Glyph {
+                    id: 94,
+                    x: 40.21875,
+                    y: 33.0,
+                },
+                Glyph {
+                    id: 87,
+                    x: 55.359375,
+                    y: 33.0,
+                },
+                Glyph {
+                    id: 70,
+                    x: 65.5625,
+                    y: 33.0,
+                },
+            ],
+        },
+        Fill {
+            style: NonZero,
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.90196085,
+                        0.22352943,
+                        0.27450982,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (48.0, 118.203125),
+                    ),
+                    CurveTo(
+                        (48.0, 111.57570800203048),
+                        (53.372583002030474, 106.203125),
+                        (60.0, 106.203125),
+                    ),
+                    LineTo(
+                        (100.0, 106.203125),
+                    ),
+                    CurveTo(
+                        (106.62741699796952, 106.203125),
+                        (112.0, 111.57570800203048),
+                        (112.0, 118.203125),
+                    ),
+                    LineTo(
+                        (112.0, 240.0),
+                    ),
+                    CurveTo(
+                        (112.0, 246.62741699796953),
+                        (106.62741699796952, 252.0),
+                        (100.0, 252.0),
+                    ),
+                    LineTo(
+                        (60.0, 252.0),
+                    ),
+                    CurveTo(
+                        (53.37258300203048, 252.0),
+                        (48.0, 246.62741699796953),
+                        (48.0, 240.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+        HitTest {
+            rect: Rect { origin: (48.0, 106.203125), size: 64.0W×145.796875H },
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            id: HitTestId(
+                0,
+            ),
+        },
+        Fill {
+            style: NonZero,
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.9450981,
+                        0.9803922,
+                        0.9333334,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (128.0, 118.203125),
+                    ),
+                    CurveTo(
+                        (128.0, 111.57570800203048),
+                        (133.37258300203047, 106.203125),
+                        (140.0, 106.203125),
+                    ),
+                    LineTo(
+                        (180.0, 106.203125),
+                    ),
+                    CurveTo(
+                        (186.62741699796953, 106.203125),
+                        (192.0, 111.57570800203048),
+                        (192.0, 118.203125),
+                    ),
+                    LineTo(
+                        (192.0, 240.0),
+                    ),
+                    CurveTo(
+                        (192.0, 246.62741699796953),
+                        (186.62741699796953, 252.0),
+                        (180.0, 252.0),
+                    ),
+                    LineTo(
+                        (140.0, 252.0),
+                    ),
+                    CurveTo(
+                        (133.37258300203047, 252.0),
+                        (128.0, 246.62741699796953),
+                        (128.0, 240.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+        HitTest {
+            rect: Rect { origin: (128.0, 106.203125), size: 64.0W×145.796875H },
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            id: HitTestId(
+                1,
+            ),
+        },
+        Fill {
+            style: NonZero,
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.27058825,
+                        0.48235297,
+                        0.6156863,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (208.0, 118.203125),
+                    ),
+                    CurveTo(
+                        (208.0, 111.57570800203048),
+                        (213.37258300203047, 106.203125),
+                        (220.0, 106.203125),
+                    ),
+                    LineTo(
+                        (260.0, 106.203125),
+                    ),
+                    CurveTo(
+                        (266.62741699796953, 106.203125),
+                        (272.0, 111.57570800203048),
+                        (272.0, 118.203125),
+                    ),
+                    LineTo(
+                        (272.0, 240.0),
+                    ),
+                    CurveTo(
+                        (272.0, 246.62741699796953),
+                        (266.62741699796953, 252.0),
+                        (260.0, 252.0),
+                    ),
+                    LineTo(
+                        (220.0, 252.0),
+                    ),
+                    CurveTo(
+                        (213.37258300203047, 252.0),
+                        (208.0, 246.62741699796953),
+                        (208.0, 240.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+        HitTest {
+            rect: Rect { origin: (208.0, 106.203125), size: 64.0W×145.796875H },
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            id: HitTestId(
+                2,
+            ),
+        },
+        Fill {
+            style: NonZero,
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.1137255,
+                        0.20784315,
+                        0.34117648,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (288.0, 118.203125),
+                    ),
+                    CurveTo(
+                        (288.0, 111.57570800203048),
+                        (293.37258300203047, 106.203125),
+                        (300.0, 106.203125),
+                    ),
+                    LineTo(
+                        (340.0, 106.203125),
+                    ),
+                    CurveTo(
+                        (346.62741699796953, 106.203125),
+                        (352.0, 111.57570800203048),
+                        (352.0, 118.203125),
+                    ),
+                    LineTo(
+                        (352.0, 240.0),
+                    ),
+                    CurveTo(
+                        (352.0, 246.62741699796953),
+                        (346.62741699796953, 252.0),
+                        (340.0, 252.0),
+                    ),
+                    LineTo(
+                        (300.0, 252.0),
+                    ),
+                    CurveTo(
+                        (293.37258300203047, 252.0),
+                        (288.0, 246.62741699796953),
+                        (288.0, 240.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+        HitTest {
+            rect: Rect { origin: (288.0, 106.203125), size: 64.0W×145.796875H },
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            id: HitTestId(
+                3,
+            ),
+        },
+        Stroke {
+            style: Stroke {
+                width: 2.0,
+                join: Round,
+                miter_limit: 4.0,
+                start_cap: Round,
+                end_cap: Round,
+                dash_pattern: [],
+                dash_offset: 0.0,
+            },
+            transform: Affine(
+                [
+                    2.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            brush: Solid(
+                AlphaColor {
+                    components: [
+                        0.1137255,
+                        0.20784315,
+                        0.34117648,
+                        1.0,
+                    ],
+                    cs: PhantomData<color::colorspace::Srgb>,
+                },
+            ),
+            brush_transform: None,
+            shape: BezPath(
+                [
+                    MoveTo(
+                        (40.0, 98.203125),
+                    ),
+                    LineTo(
+                        (360.0, 98.203125),
+                    ),
+                    LineTo(
+                        (360.0, 260.0),
+                    ),
+                    LineTo(
+                        (40.0, 260.0),
+                    ),
+                    ClosePath,
+                ],
+            ),
+        },
+    ],
+    fonts: [
+        FontId(0): 515100 bytes, face 0,
+    ],
+}

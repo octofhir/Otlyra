@@ -22,11 +22,13 @@ otlyra-gfx.workspace = true
 otlyra-platform.workspace = true
 otlyra-text.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
 png.workspace = true
 
 [lints]
