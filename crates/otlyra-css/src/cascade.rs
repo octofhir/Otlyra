@@ -83,6 +83,21 @@ impl Default for Viewport {
 /// rather than a table of defaults that author rules have to be merged into by
 /// hand.
 pub fn style_document(document: &Document, viewport: Viewport) -> StyledDocument {
+    style_document_with(document, viewport, &ExternalSheets::default())
+}
+
+/// Style every element in `document`, with the stylesheets its `<link>` elements
+/// asked for already fetched.
+///
+/// The fetch is the caller's: styling is synchronous and must not wait on a
+/// network, so what arrives here is text that has already been got. A link with
+/// nothing fetched for it simply contributes nothing, which is what a browser does
+/// with a stylesheet that failed to load.
+pub fn style_document_with(
+    document: &Document,
+    viewport: Viewport,
+    external: &ExternalSheets,
+) -> StyledDocument {
     let _span = tracing::info_span!("recalc_style").entered();
 
     let mut style_data = StyleData::default();
@@ -131,7 +146,7 @@ pub fn style_document(document: &Document, viewport: Viewport) -> StyledDocument
         &lock.read(),
     );
 
-    for source in author_stylesheets(document) {
+    for source in author_stylesheets(document, external) {
         stylist.append_stylesheet(
             DocumentStyleSheet(Arc::new(parse_sheet(
                 &source,
@@ -255,31 +270,108 @@ fn resolve<'a>(
 
 /// Every author stylesheet in the document, in tree order.
 ///
-/// `<style>` elements only. `<link rel=stylesheet>` needs a fetch, and a fetch
-/// during styling is the thing the whole architecture is arranged to avoid; it
-/// arrives with navigation.
-fn author_stylesheets(document: &Document) -> Vec<String> {
+/// Tree order is not decoration: two rules of equal specificity are decided by
+/// which sheet came last, so a `<style>` after a `<link>` has to be appended after
+/// it — which means both kinds are collected by one walk rather than one list
+/// after another.
+fn author_stylesheets(document: &Document, external: &ExternalSheets) -> Vec<String> {
     let mut sheets = Vec::new();
     let mut stack = vec![document.root()];
 
     while let Some(id) = stack.pop() {
-        if let Some(element) = document.get(id).and_then(|node| node.element())
-            && element.name.local.as_ref() == "style"
-        {
-            let mut source = String::new();
-            for child in document.children(id) {
-                if let Some(NodeData::Text(text)) = document.get(child).map(|node| &node.data) {
-                    source.push_str(text);
+        if let Some(element) = document.get(id).and_then(|node| node.element()) {
+            match element.name.local.as_ref() {
+                "style" => {
+                    let mut source = String::new();
+                    for child in document.children(id) {
+                        if let Some(NodeData::Text(text)) =
+                            document.get(child).map(|node| &node.data)
+                        {
+                            source.push_str(text);
+                        }
+                    }
+                    if !source.trim().is_empty() {
+                        sheets.push(source);
+                    }
                 }
-            }
-            if !source.trim().is_empty() {
-                sheets.push(source);
+                "link" => {
+                    if let Some(source) = external.get(&id) {
+                        // A `media` attribute applies to the whole sheet, and
+                        // wrapping it is exactly what that means — the queries
+                        // inside are then evaluated against the same device as
+                        // every other one.
+                        match attribute(document, id, "media").filter(|q| !q.trim().is_empty()) {
+                            Some(query) => sheets.push(format!("@media {query} {{\n{source}\n}}")),
+                            None => sheets.push(source.clone()),
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
     }
 
     sheets
+}
+
+/// The stylesheets fetched for a document, by the `<link>` element that asked for
+/// each one.
+pub type ExternalSheets = HashMap<NodeId, String>;
+
+/// A stylesheet a document asks for but does not contain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StylesheetLink {
+    /// The `<link>` element, which is how the fetched text finds its way back to
+    /// the place in the document that decides where it cascades.
+    pub node: NodeId,
+    /// The address, exactly as the attribute spells it — resolving it against the
+    /// document's own needs the document's address, which this crate does not know.
+    pub href: String,
+}
+
+/// Every `<link rel=stylesheet>` in the document, in tree order.
+///
+/// `rel` is a space-separated list of keywords, and only the ones that make the
+/// link a stylesheet count. `alternate` is skipped: an alternate sheet is one the
+/// reader chooses, and applying it alongside the main one would style the page
+/// twice over.
+pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
+    let mut links = Vec::new();
+    let mut stack = vec![document.root()];
+
+    while let Some(id) = stack.pop() {
+        if let Some(element) = document.get(id).and_then(|node| node.element())
+            && element.name.local.as_ref() == "link"
+        {
+            let rel = attribute(document, id, "rel").unwrap_or_default();
+            let mut keywords = rel.split_ascii_whitespace().map(str::to_ascii_lowercase);
+            let is_sheet = keywords.clone().any(|word| word == "stylesheet");
+            let alternate = keywords.any(|word| word == "alternate");
+
+            if is_sheet
+                && !alternate
+                && let Some(href) = attribute(document, id, "href")
+                && !href.trim().is_empty()
+            {
+                links.push(StylesheetLink { node: id, href });
+            }
+        }
+        stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
+    }
+
+    links
+}
+
+/// One attribute of an element, by local name.
+fn attribute(document: &Document, node: NodeId, name: &str) -> Option<String> {
+    document
+        .get(node)
+        .and_then(|node| node.element())?
+        .attrs
+        .iter()
+        .find(|attribute| attribute.name.local.as_ref() == name)
+        .map(|attribute| attribute.value.to_string())
 }
 
 /// Parse one stylesheet.
@@ -380,6 +472,119 @@ mod tests {
             (colour.components.1 * 255.0).round() as u8,
             (colour.components.2 * 255.0).round() as u8,
         )
+    }
+
+    /// Style a document with one fetched sheet per `<link>`, in the order the
+    /// links appear, and read one element's computed style back.
+    fn computed_with_links(html: &str, sources: &[&str], selector: &str) -> Arc<ComputedValues> {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let links = stylesheet_links(&document);
+        assert_eq!(links.len(), sources.len(), "one source per link");
+        let external: ExternalSheets = links
+            .iter()
+            .zip(sources)
+            .map(|(link, source)| (link.node, (*source).to_owned()))
+            .collect();
+
+        let styled = style_document_with(&document, Viewport::default(), &external);
+        let node = crate::stylo_dom::select(&document, selector)
+            .expect("the selector should parse")
+            .into_iter()
+            .next()
+            .expect("something should match");
+        styled.style_of(node).expect("a styled element").clone()
+    }
+
+    /// A page that keeps its CSS in a file is the common case, and the sheet has
+    /// to reach the cascade as an author sheet like any other.
+    #[test]
+    fn a_linked_stylesheet_styles_the_document() {
+        let styled = computed_with_links(
+            "<link rel=stylesheet href=site.css><body><p>text",
+            &["p { color: rgb(0, 128, 0) }"],
+            "p",
+        );
+        assert_eq!(colour(&styled), (0, 128, 0));
+    }
+
+    /// Equal specificity is decided by source order, and a link is at the place in
+    /// the document where it is written — not before every `<style>` or after them.
+    #[test]
+    fn a_link_cascades_where_it_appears_in_the_document() {
+        let link_last = computed_with_links(
+            "<style>p { color: rgb(255, 0, 0) }</style>\
+             <link rel=stylesheet href=a.css><body><p>x",
+            &["p { color: rgb(0, 0, 255) }"],
+            "p",
+        );
+        assert_eq!(colour(&link_last), (0, 0, 255));
+
+        let style_last = computed_with_links(
+            "<link rel=stylesheet href=a.css>\
+             <style>p { color: rgb(255, 0, 0) }</style><body><p>x",
+            &["p { color: rgb(0, 0, 255) }"],
+            "p",
+        );
+        assert_eq!(colour(&style_last), (255, 0, 0));
+    }
+
+    /// Which links are stylesheets at all: `rel` is a list of keywords, an
+    /// alternate sheet is one the reader has to choose, and a link with no `href`
+    /// asks for nothing.
+    #[test]
+    fn only_the_links_that_are_stylesheets_are_collected() {
+        let document = otlyra_html::parse(
+            b"<link rel=icon href=favicon.ico>\
+              <link rel=\"STYLESHEET\" href=one.css>\
+              <link rel=\"alternate stylesheet\" href=dark.css>\
+              <link rel=stylesheet>\
+              <link rel=\"preload stylesheet\" href=two.css>",
+            Some("utf-8"),
+        )
+        .document;
+
+        let hrefs: Vec<String> = stylesheet_links(&document)
+            .into_iter()
+            .map(|link| link.href)
+            .collect();
+        assert_eq!(hrefs, vec!["one.css".to_owned(), "two.css".to_owned()]);
+    }
+
+    /// A `media` attribute applies to the whole sheet, so a sheet for print does
+    /// nothing on screen.
+    #[test]
+    fn a_media_attribute_gates_the_whole_sheet() {
+        let screen = computed_with_links(
+            "<link rel=stylesheet href=a.css media=screen><body><p>x",
+            &["p { color: rgb(0, 128, 0) }"],
+            "p",
+        );
+        assert_eq!(colour(&screen), (0, 128, 0));
+
+        let print = computed_with_links(
+            "<link rel=stylesheet href=a.css media=print><body><p>x",
+            &["p { color: rgb(0, 128, 0) }"],
+            "p",
+        );
+        assert_ne!(colour(&print), (0, 128, 0));
+    }
+
+    /// A sheet that failed to load contributes nothing, and the rest of the page
+    /// is styled anyway.
+    #[test]
+    fn a_link_with_nothing_fetched_for_it_is_ignored() {
+        let document = otlyra_html::parse(
+            b"<link rel=stylesheet href=missing.css><body><p>x",
+            Some("utf-8"),
+        )
+        .document;
+        let styled = style_document_with(&document, Viewport::default(), &ExternalSheets::new());
+        let node = crate::stylo_dom::select(&document, "p")
+            .expect("the selector should parse")
+            .into_iter()
+            .next()
+            .expect("a paragraph");
+        assert!(styled.style_of(node).is_some());
     }
 
     #[test]
