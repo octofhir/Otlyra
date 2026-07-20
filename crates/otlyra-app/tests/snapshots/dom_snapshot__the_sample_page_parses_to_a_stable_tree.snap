@@ -1,0 +1,60 @@
+---
+source: crates/otlyra-app/tests/dom_snapshot.rs
+expression: "otlyra_dom::dump::serialize(&parsed.document)"
+---
+| <!DOCTYPE html>
+| <html>
+|   lang="en"
+|   <head>
+|     "
+    "
+|     <meta>
+|       charset="utf-8"
+|     "
+    "
+|     <title>
+|       "Otlyra"
+|     "
+  "
+|   "
+  "
+|   <body>
+|     "
+    "
+|     <h1>
+|       "An experimental browser"
+|     "
+    "
+|     <p>
+|       "This page exists to be parsed, not to be pretty. It is deliberately a
+      little malformed: the paragraph below never closes, the emphasis is
+      misnested, and there is a stray end tag.
+    "
+|     <p>
+|       "Second paragraph, "
+|       <b>
+|         "bold "
+|         <i>
+|           "and italic"
+|       <i>
+|         " still italic"
+|       "."
+|     "
+    
+    
+      stray text that belongs outside the table
+      "
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "cell"
+|         "
+    "
+|     "
+    "
+|     <!--  a comment  -->
+|     "
+  
+
+"

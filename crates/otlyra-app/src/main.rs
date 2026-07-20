@@ -48,10 +48,19 @@ struct Cli {
 
     /// Fetch this URL, print the source it returns, then exit.
     ///
-    /// A bare host is assumed to be `https`. Nothing is parsed or rendered yet;
-    /// this is the network stack on its own.
+    /// A bare host is assumed to be `https`. Nothing is rendered; this is the
+    /// network stack on its own. With `--dump-dom`, the fetched bytes are parsed
+    /// and the tree is printed instead of the source.
     #[arg(long, value_name = "URL")]
     url: Option<String>,
+
+    /// Parse HTML and print the resulting tree, then exit.
+    ///
+    /// Takes a file, or nothing at all when `--url` supplies the bytes. The output
+    /// is the html5lib-tests format, so what you read is exactly what the
+    /// conformance suite compares against.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    dump_dom: Option<PathBuf>,
 }
 
 /// The rasterizer backends the `PaintTarget` seam offers.
@@ -68,8 +77,8 @@ fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
 
-    if let Some(url) = cli.url.as_deref() {
-        return match print_source(url) {
+    if cli.url.is_some() || cli.dump_dom.is_some() {
+        return match load_document(cli.url.as_deref(), cli.dump_dom.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("otlyra: {error}");
@@ -135,27 +144,65 @@ fn main() -> ExitCode {
     }
 }
 
-/// Fetch `input` and print what the server sent, decoded to text.
+/// Get a document's bytes — from the network or from a file — and print either its
+/// source or its parsed tree.
+///
+/// This is the whole pipeline we have so far, end to end and in one place: bytes,
+/// encoding, tree. Navigation and rendering join it later.
+fn load_document(
+    url: Option<&str>,
+    dump_dom: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (bytes, transport_charset) = match url {
+        Some(input) => {
+            let resource = fetch(input)?;
+            eprintln!(
+                "{} {} ({} bytes)",
+                resource.status,
+                resource.final_url,
+                resource.body.len()
+            );
+            let charset = resource.charset();
+            (resource.body, charset)
+        }
+        None => {
+            let path = dump_dom.filter(|path| !path.as_os_str().is_empty());
+            let path = path.ok_or("--dump-dom needs a file, or a --url to fetch")?;
+            (std::fs::read(path)?, None)
+        }
+    };
+
+    match dump_dom {
+        Some(_) => {
+            let parsed = otlyra_html::parse(&bytes, transport_charset.as_deref());
+            eprintln!(
+                "encoding {} ({:?})",
+                parsed.encoding.encoding.name(),
+                parsed.encoding.source
+            );
+            print!("{}", otlyra_dom::dump::serialize(&parsed.document));
+        }
+        None => {
+            let encoding = otlyra_html::determine(&bytes, transport_charset.as_deref());
+            let (text, _actual, _errors) = encoding.encoding.decode(&bytes);
+            print!("{text}");
+        }
+    }
+    Ok(())
+}
+
+/// Fetch one URL.
 ///
 /// The crypto provider is installed here, in `main`, and nowhere else: rustls picks
 /// one implicitly only while exactly one is reachable, and a dependency that drags
 /// in a second turns that into a panic at the first HTTPS request. Naming ours makes
 /// the choice ours.
-fn print_source(input: &str) -> Result<(), otlyra_net::NetError> {
+fn fetch(input: &str) -> Result<otlyra_net::LoadedResource, otlyra_net::NetError> {
     otlyra_net::install_crypto_provider();
 
     let url = otlyra_net::normalize(input)?;
     let loader = otlyra_net::Loader::new()?;
-    let resource = loader.fetch_blocking(otlyra_net::LoadRequest::new(url))?;
-
-    eprintln!(
-        "{} {} ({} bytes)",
-        resource.status,
-        resource.final_url,
-        resource.body.len()
-    );
-    print!("{}", resource.decode_text());
-    Ok(())
+    loader.fetch_blocking(otlyra_net::LoadRequest::new(url))
 }
 
 /// Serialize the frame's display list to `path`.

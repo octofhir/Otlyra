@@ -2137,7 +2137,9 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "insta",
+ "otlyra-dom",
  "otlyra-gfx",
+ "otlyra-html",
  "otlyra-net",
  "otlyra-platform",
  "otlyra-text",
