@@ -38,8 +38,11 @@ pub use box_tree::{
 };
 pub use builder::{build_box_tree, build_styled_box_tree};
 pub use damage::Damage;
+// Re-exported because a fragment carries a style and anything reading one needs
+// the vocabulary that style is written in.
 pub use flow::{Viewport, layout};
 pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect};
+pub use otlyra_css::{ComputedStyle, Display};
 
 #[cfg(test)]
 mod tests {

@@ -95,25 +95,18 @@ impl<'a> Flow<'a> {
         cursor - y
     }
 
-    /// One block-level box: margins, padding, a width, and whatever it contains.
+    /// One block-level box: margins, borders, padding, a width, and whatever it
+    /// contains.
     fn layout_block(&mut self, id: BoxId, containing_width: f32, x: f32, y: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
-        let margin = resolve_margin(&style, containing_width);
         let padding = resolve_padding(&style, containing_width);
+        let border = resolve_border(&style);
+        let (margin, content_width) = resolve_horizontal(&style, containing_width, padding, border);
 
-        // `width: auto` fills the containing block minus its own margins and
-        // padding. That is the whole of block width resolution for now: no
-        // min/max-width, no `box-sizing`, no over-constrained-margin rule.
         let border_x = x + margin.left;
         let border_y = y + margin.top;
-        let available = (containing_width - margin.left - margin.right).max(0.0);
-        let content_width = match style.width.resolve(containing_width) {
-            Some(explicit) => explicit,
-            None => (available - padding.left - padding.right).max(0.0),
-        };
-
-        let content_x = border_x + padding.left;
-        let content_y = border_y + padding.top;
+        let content_x = border_x + border.left + padding.left;
+        let content_y = border_y + border.top + padding.top;
 
         let mut children = Vec::new();
         let content_height =
@@ -125,11 +118,13 @@ impl<'a> Flow<'a> {
 
         Fragment {
             box_id: Some(id),
+            // The border box: the rectangle a background paints and a border is
+            // drawn on the inside edge of.
             rect: Rect::new(
                 border_x,
                 border_y,
-                content_width + padding.left + padding.right,
-                content_height + padding.top + padding.bottom,
+                content_width + padding.left + padding.right + border.left + border.right,
+                content_height + padding.top + padding.bottom + border.top + border.bottom,
             ),
             kind: FragmentKind::Box,
             style,
@@ -186,6 +181,14 @@ impl<'a> Flow<'a> {
                 .get(index + 1)
                 .map_or(line.height, |next| next.top - line.top);
             let line_y = y + line.top - paragraph_top;
+            // Alignment moves the whole line, glyphs and all: the shaper laid it
+            // out from the start edge, and where that edge is is the block's
+            // decision, not the paragraph's.
+            let line_x = x + match style.text_align {
+                otlyra_css::TextAlign::Start => 0.0,
+                otlyra_css::TextAlign::Center => ((width - line.width) / 2.0).max(0.0),
+                otlyra_css::TextAlign::End => (width - line.width).max(0.0),
+            };
 
             let runs: Vec<Fragment> = shaped
                 .runs
@@ -207,7 +210,7 @@ impl<'a> Flow<'a> {
 
                     Fragment {
                         box_id,
-                        rect: Rect::new(x + run.offset_x, line_y, run.advance, height),
+                        rect: Rect::new(line_x + run.offset_x, line_y, run.advance, height),
                         kind: FragmentKind::Text(run),
                         // The run's own style, not the paragraph's: the underline
                         // on a link belongs to the link, and painting from the
@@ -224,7 +227,7 @@ impl<'a> Flow<'a> {
 
             out.push(Fragment {
                 box_id: Some(parent),
-                rect: Rect::new(x, line_y, line.width, height),
+                rect: Rect::new(line_x, line_y, line.width, height),
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
                 children: runs,
@@ -312,14 +315,60 @@ fn span_for<'a>(text: &'a str, style: &ComputedStyle, font_stack: FontStack) -> 
 }
 
 fn resolve_margin(style: &ComputedStyle, containing: f32) -> Sides<f32> {
-    // `auto` margins resolve to zero here. Centring with `margin: 0 auto` needs the
-    // over-constrained rules, which are not in this milestone.
+    // `auto` starts as zero; `resolve_horizontal` is what shares out the leftover
+    // when there is one to share.
     let resolve = |value: LengthOrAuto| value.resolve(containing).unwrap_or(0.0);
     Sides {
         top: resolve(style.margin.top),
         right: resolve(style.margin.right),
         bottom: resolve(style.margin.bottom),
         left: resolve(style.margin.left),
+    }
+}
+
+/// The used horizontal margins and content width.
+///
+/// This is where `margin: 0 auto` centres. With an explicit width, whatever is
+/// left over after the borders, padding and the margins that are not `auto` is
+/// shared out between the ones that are — both of them for centring, one of them
+/// for pushing a box to an edge. With `width: auto` there is nothing left over by
+/// definition, and CSS makes an `auto` margin zero.
+fn resolve_horizontal(
+    style: &ComputedStyle,
+    containing: f32,
+    padding: Sides<f32>,
+    border: Sides<f32>,
+) -> (Sides<f32>, f32) {
+    let mut margin = resolve_margin(style, containing);
+    let extra = padding.left + padding.right + border.left + border.right;
+
+    let Some(width) = style.width.resolve(containing) else {
+        let content = (containing - margin.left - margin.right - extra).max(0.0);
+        return (margin, content);
+    };
+
+    let leftover = containing - width - extra;
+    let left_auto = style.margin.left == LengthOrAuto::Auto;
+    let right_auto = style.margin.right == LengthOrAuto::Auto;
+    match (left_auto, right_auto) {
+        (true, true) => {
+            margin.left = (leftover / 2.0).max(0.0);
+            margin.right = margin.left;
+        }
+        (true, false) => margin.left = (leftover - margin.right).max(0.0),
+        (false, true) => margin.right = (leftover - margin.left).max(0.0),
+        (false, false) => {}
+    }
+    (margin, width)
+}
+
+/// The four border widths, which are already absolute lengths by this point.
+fn resolve_border(style: &ComputedStyle) -> Sides<f32> {
+    Sides {
+        top: style.border.top.width,
+        right: style.border.right.width,
+        bottom: style.border.bottom.width,
+        left: style.border.left.width,
     }
 }
 
@@ -340,4 +389,142 @@ fn resolve_padding(style: &ComputedStyle, containing: f32) -> Sides<f32> {
 /// far apart as they should until margin collapsing lands.
 fn bottom_margin(style: &ComputedStyle, containing: f32) -> f32 {
     style.margin.bottom.resolve(containing).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use otlyra_css::cascade::{Viewport as StyleViewport, style_document};
+
+    use super::*;
+    use crate::{BoxTree, FragmentKind, FragmentTree, build_styled_box_tree};
+
+    /// Lay a document out at `width`, with its own stylesheets applied, and keep
+    /// the boxes: a fragment says where something is, and only the box says what.
+    fn laid_out(html: &str, width: f32) -> (FragmentTree, BoxTree) {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styles = style_document(
+            &document,
+            StyleViewport {
+                width,
+                height: 600.0,
+                scale: 1.0,
+            },
+        );
+        let boxes = build_styled_box_tree(&document, &styles);
+        let mut text = otlyra_text::TextEngine::isolated();
+        let tree = crate::layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width,
+                height: 600.0,
+            },
+        );
+        (tree, boxes)
+    }
+
+    /// The first box fragment whose element is `tag`.
+    fn rect_of(tree: &FragmentTree, boxes: &BoxTree, tag: &str) -> Rect {
+        fn walk<'a>(fragment: &'a Fragment, out: &mut Vec<&'a Fragment>) {
+            out.push(fragment);
+            for child in &fragment.children {
+                walk(child, out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(&tree.root, &mut all);
+        all.into_iter()
+            .find(|fragment| {
+                matches!(fragment.kind, FragmentKind::Box)
+                    && fragment
+                        .box_id
+                        .and_then(|id| boxes.get(id))
+                        .and_then(|node| node.tag.as_ref())
+                        .is_some_and(|name| name.as_ref() == tag)
+            })
+            .map(|fragment| fragment.rect)
+            .unwrap_or_else(|| panic!("no <{tag}> box fragment"))
+    }
+
+    /// The first line box, which is where alignment shows.
+    fn first_line(tree: &FragmentTree) -> Rect {
+        fn walk(fragment: &Fragment) -> Option<Rect> {
+            if matches!(fragment.kind, FragmentKind::Line) {
+                return Some(fragment.rect);
+            }
+            fragment.children.iter().find_map(walk)
+        }
+        walk(&tree.root).expect("a line box")
+    }
+
+    /// The box a border is drawn on includes the border, and the content sits
+    /// inside it. Getting this wrong puts text on top of its own frame.
+    #[test]
+    fn a_border_makes_the_box_bigger_and_moves_the_content_in() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             div { border: 5px solid black; padding: 10px }</style><div>text</div>",
+            400.0,
+        );
+
+        let div = rect_of(&tree, &boxes, "div");
+        assert_eq!(div.x, 0.0);
+        assert_eq!(div.width, 400.0);
+
+        let line = first_line(&tree);
+        assert_eq!(line.x, 15.0, "border plus padding on the left");
+        assert_eq!(line.y, 15.0, "border plus padding on the top");
+        assert_eq!(
+            div.height,
+            line.height + 30.0,
+            "the border box is the content plus both borders and both paddings"
+        );
+    }
+
+    /// `margin: 0 auto` on a box with a width is how a page is centred, and the
+    /// one place two `auto` values mean "share out what is left over".
+    #[test]
+    fn two_auto_margins_centre_a_box_with_a_width() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } div { width: 200px; margin: 0 auto }</style><div>x</div>",
+            400.0,
+        );
+        let div = rect_of(&tree, &boxes, "div");
+        assert_eq!(div.x, 100.0);
+        assert_eq!(div.width, 200.0);
+    }
+
+    /// One `auto` margin takes the whole of the leftover, which pushes a box to an
+    /// edge without anything having to know how wide the page is.
+    #[test]
+    fn one_auto_margin_pushes_the_box_to_the_other_edge() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } div { width: 200px; margin-left: auto }</style><div>x</div>",
+            400.0,
+        );
+        assert_eq!(rect_of(&tree, &boxes, "div").x, 200.0);
+    }
+
+    #[test]
+    fn text_align_moves_the_line_within_the_block() {
+        let start = laid_out("<style>body{margin:0}</style><p>x</p>", 400.0).0;
+        let centre = laid_out(
+            "<style>body{margin:0} p{text-align:center}</style><p>x</p>",
+            400.0,
+        )
+        .0;
+        let end = laid_out(
+            "<style>body{margin:0} p{text-align:right}</style><p>x</p>",
+            400.0,
+        )
+        .0;
+
+        assert_eq!(first_line(&start).x, 0.0);
+        assert!(first_line(&centre).x > first_line(&start).x);
+        assert!(first_line(&centre).x < first_line(&end).x);
+        assert!(
+            first_line(&end).x > 380.0,
+            "a right-aligned line ends at the edge"
+        );
+    }
 }
