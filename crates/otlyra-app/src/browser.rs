@@ -685,6 +685,10 @@ impl Browser {
 impl Painter for Browser {
     fn set_waker(&mut self, waker: Waker) {
         self.fetcher.set_waker(waker);
+        // Anything that finished before the loop had a waker to be woken by is
+        // sitting in the channel: a page asked for on the command line usually
+        // arrives before the window exists.
+        self.pump();
     }
 
     /// A frame at the display's pace while something is loading, so the spinner
@@ -778,6 +782,11 @@ impl Painter for Browser {
     }
 
     fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        // Every frame takes in whatever has arrived. A wake is what *asks* for a
+        // frame; this is what makes a frame that happened for any other reason —
+        // a resize, an animation tick — show what has landed since the last one.
+        self.pump();
+
         let width = viewport.logical_width();
         let height = viewport.logical_height();
         self.last_width = width;
@@ -848,7 +857,7 @@ mod tests {
     }
 
     impl Loader for FakeLoader {
-        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
             self.requested
                 .lock()
                 .expect("no panic on the fetch thread")
@@ -1090,7 +1099,7 @@ mod tests {
     struct LinkLoader;
 
     impl Loader for LinkLoader {
-        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
             // Anything that is not already an address on this host is treated as
             // its root, which is what typing a bare hostname means.
             let path = match url.strip_prefix("https://start.example") {
@@ -1103,6 +1112,29 @@ mod tests {
                 format!("https://start.example{path}"),
             ))
         }
+    }
+
+    /// A frame takes in whatever has arrived, even when nothing woke the loop.
+    ///
+    /// The regression this pins: a page asked for before the window exists finishes
+    /// before there is a waker to be woken by, so that wake is lost. If a frame did
+    /// not take results in as well, the tab would stay loading — and the spinner
+    /// would turn for a page that had already arrived.
+    #[test]
+    fn a_frame_takes_in_a_load_that_nothing_woke_the_loop_for() {
+        let mut browser = browser();
+        browser.navigate("example.com");
+
+        // Nothing here pumps but painting, which is the whole point.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while browser.tabs[0].loading() && std::time::Instant::now() < deadline {
+            browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!browser.tabs[0].loading(), "the tab is still loading");
+        assert!(browser.tabs[0].page.is_some());
     }
 
     /// Back and forward walk the addresses the tab has been to, and a new tab has
@@ -1214,7 +1246,7 @@ mod tests {
     }
 
     impl Loader for SiteLoader {
-        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
             self.requested
                 .lock()
                 .expect("no panic on the fetch thread")
@@ -1249,12 +1281,16 @@ mod tests {
         });
         go(&mut browser, "site.example");
 
+        // Sorted, because the fetch pool serves several at once and the order two
+        // stylesheets come back in is not the browser's to promise.
+        let mut asked = asked_for(&requested);
+        asked.sort();
         assert_eq!(
-            asked_for(&requested),
+            asked,
             vec![
-                "site.example".to_owned(),
-                "https://site.example/site.css".to_owned(),
                 "https://site.example/missing.css".to_owned(),
+                "https://site.example/site.css".to_owned(),
+                "site.example".to_owned(),
             ],
             "the icon is not a stylesheet and is not fetched"
         );
@@ -1279,7 +1315,7 @@ mod tests {
         struct DiskLoader;
 
         impl Loader for DiskLoader {
-            fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
                 assert!(
                     !url.starts_with("file:"),
                     "the loader must never be asked for {url}"
@@ -1403,7 +1439,7 @@ mod tests {
     struct LongLoader;
 
     impl Loader for LongLoader {
-        fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
             let body = "<title>Long</title><body>".to_owned() + &"<p>a paragraph</p>".repeat(200);
             Ok((
                 body.into_bytes(),

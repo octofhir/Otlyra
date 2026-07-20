@@ -30,6 +30,16 @@ defaults-shot path=(screenshot_dir / "defaults.png"):
     cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 3000 --scale-factor 1
     @echo "wrote {{path}}"
 
+# Open the image test page: intrinsic sizes, ratios, and pictures in a line.
+images:
+    cargo run -- --file tests/pages/images.html
+
+# Render that page to a PNG instead of opening a window.
+images-shot path=(screenshot_dir / "images.png"):
+    @mkdir -p "$(dirname {{path}})"
+    cargo run --quiet -- --file tests/pages/images.html --screenshot {{path}} --width 820 --height 2000 --scale-factor 1
+    @echo "wrote {{path}}"
+
 # Open the CSS test page: which selectors match, and what the cascade will do
 # with them once it exists.
 css:

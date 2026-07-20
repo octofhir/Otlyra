@@ -313,9 +313,13 @@ fn window_config(cli: &Cli) -> WindowConfig {
 }
 
 /// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.
+///
+/// One client behind a `OnceLock`, shared by every fetch thread: the client owns
+/// the connection pool, so one per thread would be several pools and several
+/// runtimes for no gain.
 #[derive(Default)]
 struct NetLoader {
-    loader: Option<otlyra_net::Loader>,
+    loader: std::sync::OnceLock<otlyra_net::Loader>,
 }
 
 /// The `file:` URL an input names, if it names one.
@@ -357,7 +361,7 @@ fn file_url(input: &str) -> Option<url::Url> {
 }
 
 impl otlyra_app::fetcher::Loader for NetLoader {
-    fn load(&mut self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+    fn load(&self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
         // A path typed into the address bar becomes the `file:` URL it names, so
         // that what the bar shows is an address and not a filename — and so that a
         // relative link on the page has something to resolve against.
@@ -372,12 +376,13 @@ impl otlyra_app::fetcher::Loader for NetLoader {
 
         otlyra_net::install_crypto_provider();
         let url = otlyra_net::normalize(input).map_err(|error| error.to_string())?;
-        let loader = match self.loader.as_ref() {
-            Some(loader) => loader,
-            None => self
-                .loader
-                .insert(otlyra_net::Loader::new().map_err(|error| error.to_string())?),
-        };
+        // Built once, on whichever thread asks first; the rest wait for it and then
+        // share it.
+        if self.loader.get().is_none() {
+            let built = otlyra_net::Loader::new().map_err(|error| error.to_string())?;
+            let _ = self.loader.set(built);
+        }
+        let loader = self.loader.get().expect("the loader was just built");
 
         let resource = loader
             .fetch_blocking(otlyra_net::LoadRequest::new(url))

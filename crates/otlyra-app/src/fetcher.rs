@@ -58,12 +58,25 @@ pub struct Fetched {
 ///
 /// A trait rather than a direct call to `otlyra-net` for one reason: the browser's
 /// behaviour around navigation — which tab, what title, what happens on failure —
-/// is worth testing without a socket. `Send` because this runs on the fetch thread.
-pub trait Loader: Send + 'static {
+/// is worth testing without a socket.
+///
+/// `Send + Sync` and `&self`, because the pool shares one of these across every
+/// fetch thread: a loader holds a client and a connection pool, and one per thread
+/// would be several of both.
+pub trait Loader: Send + Sync + 'static {
     /// Fetch `url`, returning the bytes, the transport's charset, and the address
     /// the bytes actually came from.
-    fn load(&mut self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String>;
+    fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String>;
 }
+
+/// How many fetches may be in flight at once.
+///
+/// Six, which is the number browsers settled on per host over HTTP/1.1: enough that
+/// a page of pictures does not arrive one at a time, few enough that a page can
+/// point only so many connections at a server. Ours is a total rather than a
+/// per-host count, which is stricter and simpler; per-host queues belong with a
+/// real connection pool underneath.
+pub const FETCH_CONCURRENCY: usize = 6;
 
 /// The handle the browser keeps on the fetch thread.
 pub struct Fetcher {
@@ -89,45 +102,63 @@ impl std::fmt::Debug for Fetcher {
 }
 
 impl Fetcher {
-    /// Start a fetch thread over `loader`.
+    /// Start a pool of fetch threads over `loader`.
     ///
-    /// One thread, so requests are served in the order they were made and a page
-    /// cannot open fifty sockets by listing fifty pictures. Parallel fetching is a
-    /// pool on this side of the channel and changes nothing above it.
-    pub fn spawn<L: Loader>(mut loader: L) -> Self {
+    /// [`FETCH_CONCURRENCY`] threads take from one queue, so a page's pictures are
+    /// fetched several at a time and a slow one does not hold up the rest. Results
+    /// therefore arrive in whatever order they finish, which is why every reply
+    /// carries the number it was asked under.
+    pub fn spawn<L: Loader>(loader: L) -> Self {
         let (request_sender, request_receiver) = channel::<Request>();
         let (result_sender, result_receiver) = channel::<Fetched>();
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 
-        let thread_waker = Arc::clone(&waker);
-        std::thread::Builder::new()
-            .name("otlyra-fetch".to_owned())
-            .spawn(move || {
-                // Ends when the browser drops its sender, which is when the window
-                // has gone and there is nothing left to load for.
-                while let Ok(request) = request_receiver.recv() {
-                    let result = loader
-                        .load(&request.url)
-                        .map(|(bytes, charset, final_url)| Loaded {
-                            bytes,
-                            charset,
-                            final_url,
-                        });
-                    let fetched = Fetched {
-                        id: request.id,
-                        kind: request.kind,
-                        url: request.url,
-                        result,
-                    };
-                    if result_sender.send(fetched).is_err() {
-                        break;
+        let loader: Arc<dyn Loader> = Arc::new(loader);
+        // One queue, several takers: the mutex is held only long enough to take the
+        // next request, never across a fetch.
+        let queue = Arc::new(Mutex::new(request_receiver));
+
+        for worker in 0..FETCH_CONCURRENCY {
+            let queue = Arc::clone(&queue);
+            let loader = Arc::clone(&loader);
+            let results = result_sender.clone();
+            let thread_waker = Arc::clone(&waker);
+
+            std::thread::Builder::new()
+                .name(format!("otlyra-fetch-{worker}"))
+                .spawn(move || {
+                    // Ends when the browser drops its sender, which is when the
+                    // window has gone and there is nothing left to load for.
+                    while let Ok(request) = {
+                        let queue = queue.lock().expect("no panic while taking a request");
+                        queue.recv()
+                    } {
+                        let result =
+                            loader
+                                .load(&request.url)
+                                .map(|(bytes, charset, final_url)| Loaded {
+                                    bytes,
+                                    charset,
+                                    final_url,
+                                });
+                        let fetched = Fetched {
+                            id: request.id,
+                            kind: request.kind,
+                            url: request.url,
+                            result,
+                        };
+                        if results.send(fetched).is_err() {
+                            break;
+                        }
+                        if let Some(waker) =
+                            thread_waker.lock().ok().and_then(|waker| waker.clone())
+                        {
+                            waker.wake();
+                        }
                     }
-                    if let Some(waker) = thread_waker.lock().ok().and_then(|waker| waker.clone()) {
-                        waker.wake();
-                    }
-                }
-            })
-            .expect("the fetch thread must start");
+                })
+                .expect("a fetch thread must start");
+        }
 
         Self {
             requests: request_sender,
@@ -178,5 +209,90 @@ impl Fetcher {
             }
             Err(_) => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A loader that takes its time and records how many fetches overlapped.
+    struct SlowLoader {
+        in_flight: Arc<AtomicUsize>,
+        highest: Arc<AtomicUsize>,
+    }
+
+    impl Loader for SlowLoader {
+        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.highest.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok((Vec::new(), None, url.to_owned()))
+        }
+    }
+
+    /// The point of the pool: a page that asks for several things gets them at
+    /// once rather than one after another.
+    #[test]
+    fn several_fetches_are_in_flight_at_once() {
+        let highest = Arc::new(AtomicUsize::new(0));
+        let mut fetcher = Fetcher::spawn(SlowLoader {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            highest: Arc::clone(&highest),
+        });
+
+        for index in 0..FETCH_CONCURRENCY {
+            fetcher.request(
+                &format!("https://example.test/{index}"),
+                ResourceKind::Image,
+            );
+        }
+
+        let mut finished = 0;
+        while finished < FETCH_CONCURRENCY {
+            let batch = fetcher.wait(std::time::Duration::from_secs(5));
+            if batch.is_empty() {
+                panic!("the pool never finished; {finished} of {FETCH_CONCURRENCY} arrived");
+            }
+            finished += batch.len();
+        }
+
+        assert!(
+            highest.load(Ordering::SeqCst) > 1,
+            "only one fetch ever ran at a time"
+        );
+    }
+
+    /// Every reply carries the number it was asked under, which is what makes an
+    /// out-of-order pool usable at all.
+    #[test]
+    fn a_reply_carries_the_number_it_was_asked_under() {
+        let mut fetcher = Fetcher::spawn(SlowLoader {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            highest: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let first = fetcher.request("https://example.test/one", ResourceKind::Document);
+        let second = fetcher.request("https://example.test/two", ResourceKind::Image);
+        assert_ne!(first, second);
+
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let batch = fetcher.wait(std::time::Duration::from_secs(5));
+            assert!(!batch.is_empty(), "the pool never finished");
+            seen.extend(batch.into_iter().map(|fetched| (fetched.id, fetched.url)));
+        }
+        seen.sort();
+
+        assert_eq!(
+            seen,
+            vec![
+                (first, "https://example.test/one".to_owned()),
+                (second, "https://example.test/two".to_owned()),
+            ]
+        );
     }
 }

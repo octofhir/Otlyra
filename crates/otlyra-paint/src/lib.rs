@@ -254,6 +254,85 @@ mod tests {
         build_display_list(&fragments, (800.0, 600.0), scroll_y)
     }
 
+    /// A page with one picture in it, at `width` by `height` logical pixels.
+    fn page_with_image(style: &str, pixels: (u32, u32)) -> DisplayList {
+        let html = format!("<style>body {{ margin: 0 }} {style}</style><img src=a.png>");
+        let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+        let image = otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![
+                0u8;
+                pixels.0 as usize
+                    * pixels.1 as usize
+                    * 4
+            ])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: pixels.0,
+            height: pixels.1,
+        };
+        let styles = otlyra_css::cascade::style_document(
+            &parsed.document,
+            otlyra_css::cascade::Viewport {
+                width: 800.0,
+                height: 600.0,
+                scale: 1.0,
+            },
+        );
+        let images: otlyra_layout::Images = otlyra_layout::image_sources(&parsed.document)
+            .into_iter()
+            .map(|source| (source.node, image.clone()))
+            .collect();
+        let boxes =
+            otlyra_layout::build_box_tree_with_images(&parsed.document, Some(&styles), &images);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        build_display_list(&fragments, (800.0, 600.0), 0.0)
+    }
+
+    /// Where a picture actually lands: the transform is what decides its size, so
+    /// this maps the image's own corners through it and checks the rectangle.
+    fn image_rect(list: &DisplayList) -> (f64, f64, f64, f64) {
+        let item = list
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image {
+                    image, transform, ..
+                } => Some((image.width, image.height, *transform)),
+                _ => None,
+            })
+            .expect("an image item");
+        let (width, height, transform) = item;
+        let origin = transform * otlyra_gfx::kurbo::Point::new(0.0, 0.0);
+        let far = transform * otlyra_gfx::kurbo::Point::new(f64::from(width), f64::from(height));
+        (origin.x, origin.y, far.x - origin.x, far.y - origin.y)
+    }
+
+    /// A picture asked for at a size is drawn at that size, whatever size its file
+    /// is: the scale in the transform is the only thing that decides it.
+    #[test]
+    fn a_picture_is_drawn_at_the_size_the_page_asked_for() {
+        let (x, _, width, height) = image_rect(&page_with_image(
+            "img { width: 200px; height: 100px }",
+            (64, 64),
+        ));
+        assert_eq!(x, 0.0);
+        assert_eq!((width, height), (200.0, 100.0));
+
+        let (_, _, width, height) = image_rect(&page_with_image("img { width: 320px }", (160, 80)));
+        assert_eq!((width, height), (320.0, 160.0), "the ratio is kept");
+
+        let (_, _, width, height) = image_rect(&page_with_image("", (48, 24)));
+        assert_eq!((width, height), (48.0, 24.0), "and its own size otherwise");
+    }
+
     fn ops(list: &DisplayList) -> Vec<PaintOp> {
         let mut painter = RecordingPainter::new();
         render(list, &mut painter);

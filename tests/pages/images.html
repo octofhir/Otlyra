@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Images — Otlyra</title>
+
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; }
+  h2 { border-bottom: 1px solid #ccc; margin-top: 32px; }
+  .half { width: 160px; }
+  .wide { width: 100%; }
+  .tall { height: 120px; }
+  .both { width: 200px; height: 60px; }
+  .framed { border: 3px solid #c30; padding: 6px; background: #fed; }
+  .block { display: block; }
+  figure { margin: 16px 0; }
+  figcaption { color: #555; font-size: 14px; }
+  .row img { margin-right: 8px; }
+</style>
+
+<h1>Images</h1>
+<p>Every picture on this page is the same three files, drawn at whatever size the
+rules ask for. The three are 320×240, 200×200 as a JPEG, and 64×64.</p>
+
+<h2>Intrinsic size</h2>
+<p>With nothing said about its size, a picture is drawn at the size it is:
+<img src="images/small.png"> — 64 pixels square, sitting in this line of text.</p>
+<img src="images/wide.png">
+
+<h2>One dimension given</h2>
+<p>The other comes from the picture's own ratio, so nothing is squashed.</p>
+<figure>
+  <img class="half" src="images/wide.png">
+  <figcaption><code>width: 160px</code> on a 4:3 picture, so it is 120 tall.</figcaption>
+</figure>
+<figure>
+  <img class="tall" src="images/wide.png">
+  <figcaption><code>height: 120px</code> on the same one, so it is 160 wide.</figcaption>
+</figure>
+
+<h2>Both given</h2>
+<p>Then the ratio is not kept, because the page asked for something else.</p>
+<img class="both" src="images/wide.png">
+
+<h2>Attributes rather than CSS</h2>
+<p>A <code>width</code> and <code>height</code> attribute stand in for the
+picture's own size, so a rule can still override them:
+<img src="images/square.jpg" width="48" height="48"> is a 200-pixel JPEG asked
+for at 48.</p>
+
+<h2>Filling the column</h2>
+<p><code>width: 100%</code> against the column this page is held to.</p>
+<img class="wide" src="images/wide.png">
+
+<h2>In a line, and around one</h2>
+<p>Pictures sit on the baseline like text does:
+<img src="images/small.png" width="24" height="24"> small,
+<img src="images/small.png" width="40" height="40"> larger,
+<img src="images/small.png" width="56" height="56"> larger again — and the line
+grows to hold the tallest of them.</p>
+<p class="row">
+  <img class="framed" src="images/small.png" width="60" height="60">
+  A framed one: the border and padding are the inline box model's, not the
+  picture's.
+</p>
+
+<h2>Block-level</h2>
+<p>A picture with <code>display: block</code> is on a line of its own.</p>
+<img class="block" src="images/square.jpg" width="120" height="120">
+<img class="block" src="images/small.png">
+
+<h2>Several at once</h2>
+<p>Six requests, fetched by a pool rather than one after another.</p>
+<p class="row">
+  <img src="images/small.png" width="48" height="48">
+  <img src="images/square.jpg" width="48" height="48">
+  <img src="images/wide.png" width="64" height="48">
+  <img src="images/small.png" width="48" height="48">
+  <img src="images/square.jpg" width="48" height="48">
+  <img src="images/wide.png" width="64" height="48">
+</p>
+
+<h2>What is missing</h2>
+<p>A picture that does not load shows its <code>alt</code> text instead:
+<img src="images/nothing-here.png" alt="[no such picture]"> — and one with no
+<code>alt</code> shows nothing at all: <img src="images/nothing-here.png">.</p>
+<p>Not implemented, and visible here: <code>srcset</code> and
+<code>sizes</code> are ignored, so the same file is used at every size;
+<code>object-fit</code> is not read, so a picture given both dimensions is
+stretched rather than fitted; there is no <code>vertical-align</code>, so a
+picture always sits on the baseline; animated formats show their first frame;
+and nothing is decoded lazily — every picture on the page is fetched before the
+page is finished.</p>

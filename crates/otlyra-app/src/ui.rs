@@ -551,22 +551,43 @@ impl BrowserUi {
 
         let content = self.address.text();
         let placeholder = content.is_empty() && !self.address_focused;
+        let inner = field.width - 20.0;
+
+        // An address longer than the field has to lose something. Which end is the
+        // question: while it is being typed the interesting part is where the caret
+        // is, which is the end; while it is only being read the interesting part is
+        // the scheme and the host, which is the start.
+        let shown = if placeholder {
+            "Enter a URL".to_owned()
+        } else if self.address_focused {
+            elide(text, &stack, content, inner, Elide::Start)
+        } else {
+            elide(text, &stack, content, inner, Elide::End)
+        };
+
         draw_text(
             list,
             text,
             &stack,
-            if placeholder { "Enter a URL" } else { content },
+            &shown,
             field.x + 10.0,
             field.y + 5.0,
-            field.width - 20.0,
+            inner,
             if placeholder { INK_DIM } else { INK },
         );
 
         if self.address_focused {
             // The caret sits after the text up to the caret offset, measured with
             // the same engine that drew it — anything else drifts by a pixel per
-            // glyph and lands in the wrong place on a long address.
-            let before = &content[..self.address.caret().min(content.len())];
+            // glyph and lands in the wrong place on a long address. What is drawn
+            // may have lost its front, so the caret is measured against that.
+            let caret = self.address.caret().min(content.len());
+            let visible = shown.trim_start_matches(ELLIPSIS);
+            let before = match content[..caret].len().checked_sub(visible.len()) {
+                // The front was elided: the caret is inside what is left.
+                Some(dropped) if dropped > 0 => &shown[..shown.len() - visible.len()],
+                _ => &content[..caret],
+            };
             let advance = text.measure(before, &stack, FONT_SIZE).width;
             let caret_x = field.x + 10.0 + f64::from(advance);
             fill(
@@ -766,6 +787,74 @@ fn fill(list: &mut DisplayList, rect: Rect, color: Color, radius: f64) {
 }
 
 /// One line of interface text, clipped by shaping it to `max_width`.
+/// Which end of a string to drop when it does not fit.
+#[derive(Copy, Clone, PartialEq)]
+enum Elide {
+    /// Keep the end, drop the beginning.
+    Start,
+    /// Keep the beginning, drop the end.
+    End,
+}
+
+/// The character that stands in for what was dropped.
+const ELLIPSIS: char = '\u{2026}';
+
+/// `content`, shortened to fit `max_width` with an ellipsis where it was cut.
+///
+/// The alternative — shaping to a maximum width and drawing the first line — cuts
+/// mid-word and says nothing about having cut, so an address that is one character
+/// too long reads as a different address.
+fn elide(
+    engine: &mut TextEngine,
+    stack: &FontStack,
+    content: &str,
+    max_width: f64,
+    end: Elide,
+) -> String {
+    let fits = |engine: &mut TextEngine, text: &str| {
+        f64::from(engine.measure(text, stack, FONT_SIZE).width) <= max_width
+    };
+    if content.is_empty() || fits(engine, content) {
+        return content.to_owned();
+    }
+
+    // Character boundaries, so the search cannot land inside a code point.
+    let boundaries: Vec<usize> = content
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(content.len()))
+        .collect();
+
+    // Binary search over how much to keep: everything shorter than a fitting length
+    // fits too, so the predicate is monotonic and this is a handful of shapes
+    // rather than one per character.
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let middle = low.midpoint(high + 1);
+        let candidate = match end {
+            Elide::End => format!("{}{ELLIPSIS}", &content[..boundaries[middle]]),
+            Elide::Start => format!(
+                "{ELLIPSIS}{}",
+                &content[boundaries[boundaries.len() - 1 - middle]..]
+            ),
+        };
+        if fits(engine, &candidate) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+
+    match end {
+        Elide::End => format!("{}{ELLIPSIS}", &content[..boundaries[low]]),
+        Elide::Start => format!(
+            "{ELLIPSIS}{}",
+            &content[boundaries[boundaries.len() - 1 - low]..]
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     list: &mut DisplayList,
