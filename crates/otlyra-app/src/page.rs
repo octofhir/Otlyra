@@ -11,7 +11,7 @@
 
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, build_box_tree};
+use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, build_box_tree, build_styled_box_tree};
 use otlyra_text::TextEngine;
 
 /// A parsed document, laid out and painted.
@@ -29,6 +29,11 @@ pub struct PageScene {
     targets: Vec<(otlyra_gfx::kurbo::Rect, BoxId)>,
     /// The last layout, and the width it was made at.
     layout: Option<(f32, FragmentTree)>,
+    /// The viewport the cascade last ran against.
+    ///
+    /// Style depends on the viewport — `vw`, `vh` and media queries all read it —
+    /// so a resize is a restyle, not only a relayout.
+    styled_at: Option<(f32, f32)>,
     /// How far down the page the reader is, in logical pixels.
     scroll: f32,
     /// The last frame's content height, so a scroll can be clamped without waiting
@@ -46,6 +51,7 @@ impl PageScene {
             document,
             targets: Vec::new(),
             layout: None,
+            styled_at: None,
             scroll: 0.0,
             viewport_height: 0.0,
             damage: Damage::STYLE,
@@ -75,6 +81,10 @@ impl PageScene {
     /// Lay the page out for `width`, reusing the last layout if the width has not
     /// changed.
     fn fragments(&mut self, text: &mut TextEngine, width: f32, height: f32) -> &FragmentTree {
+        if self.styled_at != Some((width, height)) {
+            self.restyle(width, height);
+        }
+
         let stale = !matches!(&self.layout, Some((last, _)) if *last == width);
         if stale {
             self.damage.add(Damage::of(
@@ -85,6 +95,24 @@ impl PageScene {
             self.layout = Some((width, tree));
         }
         &self.layout.as_ref().expect("just laid out").1
+    }
+
+    /// Run the cascade for a viewport of `width` by `height`, and rebuild the boxes.
+    fn restyle(&mut self, width: f32, height: f32) {
+        let styles = otlyra_css::cascade::style_document(
+            &self.document,
+            otlyra_css::cascade::Viewport {
+                width,
+                height,
+                scale: 1.0,
+            },
+        );
+        self.boxes = build_styled_box_tree(&self.document, &styles);
+        self.styled_at = Some((width, height));
+        self.layout = None;
+        self.damage.add(Damage::of(
+            otlyra_layout::InvalidationReason::DocumentLoaded,
+        ));
     }
 
     /// Build the display list for a content area `width` by `height` logical pixels
@@ -395,3 +423,4 @@ mod tests {
         ));
     }
 }
+

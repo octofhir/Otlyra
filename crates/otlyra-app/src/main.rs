@@ -258,14 +258,14 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     }
 
     if cli.dump_boxes {
-        let tree = otlyra_layout::build_box_tree(&parsed.document);
+        let tree = styled_boxes(&parsed.document, cli.width, cli.height);
         eprintln!("{} boxes", tree.len());
         print!("{}", otlyra_layout::dump::serialize(&tree));
         return Ok(());
     }
 
     if cli.dump_fragments {
-        let boxes = otlyra_layout::build_box_tree(&parsed.document);
+        let boxes = styled_boxes(&parsed.document, cli.width, cli.height);
         let mut text = otlyra_text::TextEngine::new();
         let fragments = otlyra_layout::layout(
             &boxes,
@@ -314,6 +314,23 @@ struct NetLoader {
 ///
 /// Accepts both a `file://` URL and a plain path, because both are things people
 /// type; a path is resolved against the working directory, as a shell would.
+/// The box tree a dump should show: the one the window would draw, cascade and all.
+fn styled_boxes(
+    document: &otlyra_dom::Document,
+    width: u32,
+    height: u32,
+) -> otlyra_layout::BoxTree {
+    let styles = otlyra_css::cascade::style_document(
+        document,
+        otlyra_css::cascade::Viewport {
+            width: width as f32,
+            height: height as f32,
+            scale: 1.0,
+        },
+    );
+    otlyra_layout::build_styled_box_tree(document, &styles)
+}
+
 fn file_url(input: &str) -> Option<url::Url> {
     if let Ok(url) = url::Url::parse(input)
         && url.scheme() == "file"
