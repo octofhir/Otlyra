@@ -3,9 +3,8 @@
 <title>CSS support — Otlyra</title>
 
 <style>
-  /* Nothing on this page is applied yet: the cascade lands at M8. What works
-     today is *matching* — the selector engine over our DOM — so the page is
-     written to make it obvious which rules should have applied once it does. */
+  /* One rule per selector feature, written so that whether it applied is
+     visible on the page rather than only in a dump. */
   body { font-family: system-ui, sans-serif; }
 
   .box { background: #eef; color: #113; padding: 8px; margin: 8px 0; }
@@ -35,11 +34,15 @@
 </style>
 
 <h1>CSS</h1>
-<p>This page is the CSS counterpart to <code>defaults.html</code>. It states what
-each rule above <em>should</em> do, so that the difference between "matched" and
-"applied" stays visible while the cascade is being built.</p>
+<p>This page is the CSS counterpart to <code>defaults.html</code>. Everything the
+<code>&lt;style&gt;</code> block above says is applied to the elements below, so
+what you see is what the cascade computed.</p>
 
 <h2>What works today</h2>
+<p>The <strong>cascade</strong>: the user-agent stylesheet, author rules from
+<code>&lt;style&gt;</code> and a <code>style=</code> attribute, resolved by
+origin, specificity and source order, with <code>!important</code>,
+inheritance, <code>calc()</code>, custom properties and media queries.</p>
 <p>Selector <strong>matching</strong>, over our own DOM:
 type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 <code>*=</code>), the four combinators, structural pseudo-classes, and
@@ -48,10 +51,11 @@ type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 match" against a real document.</p>
 
 <h2>What does not work yet</h2>
-<p>The cascade: nothing in the <code>&lt;style&gt;</code> block above changes
-this page, and neither would a <code>style=</code> attribute. Specificity,
-inheritance, <code>!important</code>, <code>calc()</code>, custom properties and
-media queries all arrive with it.</p>
+<p>Layout reads twelve properties, so a rule the cascade computes correctly can
+still change nothing: borders, positioning, floats, flex and grid have no
+formatting context behind them yet. External <code>&lt;link&gt;</code>
+stylesheets are not fetched, and a restyle recomputes the whole document rather
+than the part that changed.</p>
 
 <h2>Elements the rules above are written against</h2>
 <section class="box" id="unique">

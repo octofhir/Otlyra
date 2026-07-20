@@ -139,7 +139,7 @@ because there is no open and closed state without script.</p></details>
 <h2>10. Not rendered at all</h2>
 <p>The following are <code>display: none</code> in the stylesheet and must leave
 no trace on the page:</p>
-<style>p { color: red }</style>
+<style>.never-matched { color: red }</style>
 <script>var leaked = "this should not appear";</script>
 <template><p>Template contents.</p></template>
 <p>If the CSS, the script source or the template's paragraph appeared as text
