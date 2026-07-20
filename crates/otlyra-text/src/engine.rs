@@ -122,8 +122,9 @@ impl TextEngine {
     ) -> ShapedText {
         let mut builder = self.layout.ranged_builder(&mut self.fonts, text, 1.0, true);
 
-        // Applied to every layout, without exception: UAX#14 alone disagrees with
-        // what browsers do at several ASCII pairs.
+        // Applied to every layout, without exception. This is a table of ASCII
+        // break-pair rules, not a dependency on any other engine: bare UAX#14
+        // disagrees with what the web actually does at several pairs.
         builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
         builder.push_default(StyleProperty::FontFamily(stack.to_parley()));
         builder.push_default(StyleProperty::FontSize(font_size));
@@ -295,8 +296,8 @@ mod tests {
         assert!(broken.metrics.height > unbroken.metrics.height);
     }
 
-    /// Break opportunities over a fixed corpus. Chromium's override table is what
-    /// makes these match a browser rather than plain UAX#14.
+    /// Break opportunities over a fixed corpus. The override table is what makes
+    /// these match web behaviour rather than plain UAX#14.
     #[test]
     fn break_opportunities_match_a_fixed_table() {
         let mut engine = engine();

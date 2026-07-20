@@ -18,10 +18,11 @@
 //!
 //! ## Invariants
 //!
-//! 1. **Line breaking matches Chromium.** `CHROMIUM_LINE_BREAK_OVERRIDE` is applied
-//!    to every layout, without exception. UAX#14 alone disagrees with what browsers
-//!    actually do at several ASCII pairs, and a break table that differs from the
-//!    web's is a compatibility bug, not a preference.
+//! 1. **Line breaking follows web behaviour, not bare UAX#14.** parley's
+//!    web-compatible override table is applied to every layout, without exception.
+//!    UAX#14 alone disagrees with what shipping browsers do at several ASCII pairs,
+//!    and breaking a line where the web would not is a compatibility bug that shows
+//!    up as visibly wrong text wrapping.
 //! 2. **Measurement tests use the vendored font, never a system font.** System
 //!    fonts differ per machine and per OS version, so a golden number measured
 //!    against one is a golden number that fails on someone else's laptop.
