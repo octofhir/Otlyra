@@ -86,11 +86,19 @@ impl Command {
 
     /// Whether the command is implemented yet.
     ///
-    /// Everything here is currently unimplemented, so the menu shows the shape of
-    /// the browser with its entries greyed out. That is more honest than an empty
-    /// menu bar and more discoverable than hiding them.
+    /// The ones that are not are shown greyed out rather than hidden: the menu is
+    /// then the shape of the browser, which is more honest than an empty menu bar
+    /// and more discoverable than nothing at all.
     pub fn is_available(self) -> bool {
-        false
+        matches!(
+            self,
+            Self::NewTab
+                | Self::CloseTab
+                | Self::Reload
+                | Self::ReloadIgnoringCache
+                | Self::Back
+                | Self::Forward
+        )
     }
 }
 

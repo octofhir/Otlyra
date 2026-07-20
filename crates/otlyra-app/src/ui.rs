@@ -23,8 +23,8 @@ const ADDRESS_BAR_HEIGHT: f64 = 38.0;
 /// Total height the interface takes from the top of the window.
 pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + ADDRESS_BAR_HEIGHT;
 
-/// Width of the reload button, at the left end of the tab strip.
-const RELOAD_WIDTH: f64 = 30.0;
+/// Width of each of the three buttons at the left end of the tab strip.
+const BUTTON_WIDTH: f64 = 30.0;
 
 const TAB_WIDTH: f64 = 200.0;
 const TAB_GAP: f64 = 2.0;
@@ -40,6 +40,7 @@ const FIELD_FOCUSED: Color = Color::from_rgb8(0xff, 0xff, 0xff);
 const FIELD_BORDER: Color = Color::from_rgb8(0x45, 0x7b, 0x9d);
 const INK: Color = Color::from_rgb8(0x1d, 0x1d, 0x1f);
 const INK_DIM: Color = Color::from_rgb8(0x6b, 0x6b, 0x70);
+const DISABLED: Color = Color::from_rgb8(0xb0, 0xb0, 0xb6);
 
 /// A rectangle in logical pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -76,6 +77,10 @@ impl Rect {
 /// Where every part of the interface is, for one window width.
 #[derive(Clone, Debug)]
 pub struct UiLayout {
+    /// The back button.
+    pub back: Rect,
+    /// The forward button.
+    pub forward: Rect,
     /// The reload button.
     pub reload: Rect,
     /// One rectangle per tab, in order.
@@ -94,7 +99,17 @@ impl UiLayout {
         let mut tabs = Vec::with_capacity(tab_count);
         let mut closes = Vec::with_capacity(tab_count);
 
-        let reload = Rect::new(PADDING, 6.0, RELOAD_WIDTH - 6.0, TAB_STRIP_HEIGHT - 10.0);
+        let button = |index: f64| {
+            Rect::new(
+                PADDING + index * BUTTON_WIDTH,
+                6.0,
+                BUTTON_WIDTH - 6.0,
+                TAB_STRIP_HEIGHT - 10.0,
+            )
+        };
+        let back = button(0.0);
+        let forward = button(1.0);
+        let reload = button(2.0);
         let strip_start = reload.x + reload.width + TAB_GAP * 3.0;
 
         // Tabs shrink to fit rather than overflowing: a tab you cannot see is a tab
@@ -124,6 +139,8 @@ impl UiLayout {
             .last()
             .map_or(strip_start, |last| last.x + last.width + TAB_GAP);
         Self {
+            back,
+            forward,
             reload,
             new_tab: Rect::new(new_tab_x, 6.0, NEW_TAB_WIDTH - 6.0, TAB_STRIP_HEIGHT - 10.0),
             address: Rect::new(
@@ -258,6 +275,10 @@ pub enum UiAction {
     SelectTab(usize),
     /// Load the active tab's address again.
     Reload,
+    /// Go back one entry in the active tab's history.
+    Back,
+    /// Go forward one entry.
+    Forward,
 }
 
 /// What one tab shows in the strip.
@@ -309,6 +330,12 @@ impl BrowserUi {
 
         let layout = UiLayout::new(width, tab_count);
 
+        if layout.back.contains(x, y) {
+            return UiAction::Back;
+        }
+        if layout.forward.contains(x, y) {
+            return UiAction::Forward;
+        }
         if layout.reload.contains(x, y) {
             return UiAction::Reload;
         }
@@ -348,6 +375,11 @@ impl BrowserUi {
         if modifiers.is_accelerator() {
             return match key {
                 Key::Character('r') => UiAction::Reload,
+                // The bracket keys are what this platform's browsers use, and the
+                // arrows are what the rest of them use; both are here because a
+                // person's fingers know one of the two.
+                Key::Character('[') | Key::Left => UiAction::Back,
+                Key::Character(']') | Key::Right => UiAction::Forward,
                 Key::Character('t') => UiAction::NewTab,
                 Key::Character('l') => {
                     self.address_focused = true;
@@ -413,18 +445,23 @@ impl BrowserUi {
     }
 
     /// Paint the interface across `width` logical pixels.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_display_list(
         &self,
         width: f64,
         tabs: &[TabLabel],
         active: usize,
+        history: (bool, bool),
         text: &mut TextEngine,
         list: &mut DisplayList,
     ) {
         let layout = UiLayout::new(width, tabs.len());
         let stack = FontStack::parse_css("system-ui, sans-serif");
 
+        let (can_go_back, can_go_forward) = history;
         fill(list, Rect::new(0.0, 0.0, width, UI_HEIGHT), BACKGROUND, 0.0);
+        draw_chevron(list, layout.back, Direction::Back, can_go_back);
+        draw_chevron(list, layout.forward, Direction::Forward, can_go_forward);
         draw_reload(list, layout.reload);
 
         for (index, (rect, label)) in layout.tabs.iter().zip(tabs).enumerate() {
@@ -622,6 +659,39 @@ fn draw_centred_text(
         width,
         color,
     );
+}
+
+/// Which way a chevron points.
+#[derive(Copy, Clone, PartialEq)]
+enum Direction {
+    Back,
+    Forward,
+}
+
+/// A back or forward button: a chevron, drawn rather than typed, and dimmed when
+/// there is nowhere to go — a button that does nothing should look like one.
+fn draw_chevron(list: &mut DisplayList, rect: Rect, direction: Direction, enabled: bool) {
+    fill(list, rect, TAB_INACTIVE, 6.0);
+
+    let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let reach = rect.height.min(rect.width) / 4.0;
+    let tip = if direction == Direction::Back {
+        -reach
+    } else {
+        reach
+    };
+
+    let mut path = BezPath::new();
+    path.move_to(Point::new(centre.x - tip, centre.y - reach));
+    path.line_to(Point::new(centre.x + tip, centre.y));
+    path.line_to(Point::new(centre.x - tip, centre.y + reach));
+    list.push(DisplayItem::Stroke {
+        style: Stroke::new(1.8),
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(if enabled { INK } else { DISABLED }),
+        brush_transform: None,
+        shape: path,
+    });
 }
 
 /// The reload button: a circular arrow, drawn rather than typed.
@@ -976,7 +1046,7 @@ mod tests {
         let ui = BrowserUi::new();
         let mut engine = TextEngine::isolated();
         let mut list = DisplayList::new();
-        ui.build_display_list(1000.0, &labels(3), 0, &mut engine, &mut list);
+        ui.build_display_list(1000.0, &labels(3), 0, (true, false), &mut engine, &mut list);
 
         let glyph_runs = list
             .items()

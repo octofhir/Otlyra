@@ -15,6 +15,16 @@ use otlyra_text::TextEngine;
 use crate::page::{PageScene, title_of};
 use crate::ui::{BrowserUi, TabLabel, UI_HEIGHT, UiAction};
 
+/// One place a tab has been.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEntry {
+    /// The address that was loaded, after redirects.
+    pub url: String,
+    /// How far down the reader had got when they left it. Restored on the way
+    /// back, which is the difference between going back and starting over.
+    pub scroll: f32,
+}
+
 /// One tab.
 pub struct Tab {
     /// What the address bar shows for it.
@@ -25,6 +35,14 @@ pub struct Tab {
     pub page: Option<PageScene>,
     /// What went wrong, if anything.
     pub error: Option<String>,
+    /// Where this tab has been, oldest first.
+    ///
+    /// A list and a position rather than two stacks: going back and then somewhere
+    /// new drops the forward entries, and that rule is one truncation on a list
+    /// instead of a second stack to keep in step.
+    history: Vec<HistoryEntry>,
+    /// Which entry is showing. Meaningless while the history is empty.
+    position: usize,
 }
 
 impl Tab {
@@ -35,7 +53,19 @@ impl Tab {
             title: "New tab".to_owned(),
             page: None,
             error: None,
+            history: Vec::new(),
+            position: 0,
         }
+    }
+
+    /// Whether there is anywhere to go back to.
+    pub fn can_go_back(&self) -> bool {
+        self.position > 0
+    }
+
+    /// Whether there is anywhere to go forward to.
+    pub fn can_go_forward(&self) -> bool {
+        self.position + 1 < self.history.len()
     }
 }
 
@@ -140,6 +170,60 @@ impl<L: Loader> Browser<L> {
         self.navigate_from(url, true);
     }
 
+    /// Go back one entry in the active tab's history.
+    ///
+    /// The page is loaded again rather than kept: a document costs what it costs
+    /// to hold, and a back button that works is worth more than one that is
+    /// instant. Where the reader had got to is restored, which is the part they
+    /// actually notice.
+    pub fn go_back(&mut self) {
+        self.travel(-1);
+    }
+
+    /// Go forward one entry.
+    pub fn go_forward(&mut self) {
+        self.travel(1);
+    }
+
+    /// Whether the active tab can go back.
+    pub fn can_go_back(&self) -> bool {
+        self.tabs[self.active].can_go_back()
+    }
+
+    /// Whether the active tab can go forward.
+    pub fn can_go_forward(&self) -> bool {
+        self.tabs[self.active].can_go_forward()
+    }
+
+    /// Move `offset` entries through the active tab's history.
+    fn travel(&mut self, offset: isize) {
+        let tab = &mut self.tabs[self.active];
+        let Some(target) = tab.position.checked_add_signed(offset) else {
+            return;
+        };
+        let Some(entry) = tab.history.get(target).cloned() else {
+            return;
+        };
+
+        self.remember_scroll();
+        self.tabs[self.active].position = target;
+        // The entry was reached once, so its scheme was allowed once; going back to
+        // it is the reader's own request and not the page's.
+        self.load_into_tab(&entry.url, true);
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.set_scroll(entry.scroll);
+        }
+    }
+
+    /// Record where the reader is in the entry they are about to leave.
+    fn remember_scroll(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        if let Some(entry) = tab.history.get_mut(tab.position) {
+            entry.scroll = scroll;
+        }
+    }
+
     /// Load the active tab's address again, keeping where the reader had got to.
     ///
     /// Browsers restore the scroll position on reload, and for a page you are
@@ -155,7 +239,9 @@ impl<L: Loader> Browser<L> {
 
         let url = tab.url.clone();
         let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
-        self.navigate_from(&url, false);
+        // Reload keeps the entry it is on: a page loaded twice is one place, and
+        // going back from it must reach where you were before it, not itself.
+        self.load_into_tab(&url, false);
         if let Some(page) = self.tabs[self.active].page.as_mut() {
             page.set_scroll(scroll);
         }
@@ -167,6 +253,34 @@ impl<L: Loader> Browser<L> {
     /// from the page: it is what decides whether a `file:` URL may be reached at
     /// all, and a page from the internet must never be able to claim it.
     fn navigate_from(&mut self, url: &str, user_initiated: bool) {
+        self.remember_scroll();
+        let before = self.tabs[self.active].url.clone();
+        self.load_into_tab(url, user_initiated);
+
+        // A load that failed is still somewhere the tab has been — the address bar
+        // shows it and reload has to work — but it is not worth an entry of its own
+        // if it did not move: reloading a broken page would otherwise fill the
+        // history with it.
+        let tab = &mut self.tabs[self.active];
+        if tab.url == before && !tab.history.is_empty() {
+            return;
+        }
+
+        // Going somewhere new after going back drops what was ahead: the forward
+        // entries describe a future that did not happen.
+        if !tab.history.is_empty() {
+            tab.position += 1;
+            tab.history.truncate(tab.position);
+        }
+        tab.history.push(HistoryEntry {
+            url: tab.url.clone(),
+            scroll: 0.0,
+        });
+        tab.position = tab.history.len() - 1;
+    }
+
+    /// Load `url` into the active tab, without touching its history.
+    fn load_into_tab(&mut self, url: &str, user_initiated: bool) {
         let _span = tracing::info_span!("navigation", url).entered();
 
         if !user_initiated && let Ok(target) = otlyra_net::normalize(url) {
@@ -304,6 +418,8 @@ impl<L: Loader> Browser<L> {
         match action {
             UiAction::None => {}
             UiAction::Navigate(url) => self.navigate(&url),
+            UiAction::Back => self.go_back(),
+            UiAction::Forward => self.go_forward(),
             UiAction::NewTab => self.new_tab(),
             UiAction::CloseTab(index) => self.close_tab(index),
             UiAction::SelectTab(index) => self.select_tab(index),
@@ -384,6 +500,8 @@ impl<L: Loader> Painter for Browser<L> {
                 Some(crate::menu::Command::Reload | crate::menu::Command::ReloadIgnoringCache) => {
                     self.reload();
                 }
+                Some(crate::menu::Command::Back) => self.go_back(),
+                Some(crate::menu::Command::Forward) => self.go_forward(),
                 Some(crate::menu::Command::NewTab) => self.new_tab(),
                 Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
                 Some(command) => tracing::info!(?command, "command not implemented yet"),
@@ -450,8 +568,17 @@ impl<L: Loader> Painter for Browser<L> {
 
         let mut list = otlyra_gfx::DisplayList::new();
         let labels = self.labels();
-        self.ui
-            .build_display_list(width, &labels, self.active, &mut self.text, &mut list);
+        self.ui.build_display_list(
+            width,
+            &labels,
+            self.active,
+            (
+                self.tabs[self.active].can_go_back(),
+                self.tabs[self.active].can_go_forward(),
+            ),
+            &mut self.text,
+            &mut list,
+        );
         list.transform(scale);
         render(&list, target);
     }
@@ -482,11 +609,21 @@ mod tests {
                     Some("utf-8".to_owned()),
                     url.to_owned(),
                 )),
-                _ => Ok((
-                    format!("<title>Title of {url}</title><body><p>Body of {url}").into_bytes(),
-                    Some("utf-8".to_owned()),
-                    format!("https://{url}/"),
-                )),
+                // A bare hostname becomes an https address, the way the real
+                // loader normalizes one; an address that already is one is left
+                // alone, or going back to it would grow a second scheme each time.
+                _ => {
+                    let final_url = if url.contains("://") {
+                        url.to_owned()
+                    } else {
+                        format!("https://{url}/")
+                    };
+                    Ok((
+                        format!("<title>Title of {url}</title><body><p>Body of {url}").into_bytes(),
+                        Some("utf-8".to_owned()),
+                        final_url,
+                    ))
+                }
             }
         }
     }
@@ -679,6 +816,87 @@ mod tests {
                 format!("https://start.example{path}"),
             ))
         }
+    }
+
+    /// Back and forward walk the addresses the tab has been to, and a new tab has
+    /// nowhere to go in either direction.
+    #[test]
+    fn back_and_forward_walk_the_history() {
+        let mut browser = browser();
+        assert!(!browser.can_go_back() && !browser.can_go_forward());
+
+        browser.navigate("one.example");
+        assert!(!browser.can_go_back(), "one entry is nowhere to go back to");
+        browser.navigate("two.example");
+        browser.navigate("three.example");
+
+        assert!(browser.can_go_back() && !browser.can_go_forward());
+        browser.go_back();
+        assert_eq!(browser.tabs[0].url, "https://two.example/");
+        assert!(browser.can_go_forward());
+
+        browser.go_back();
+        assert_eq!(browser.tabs[0].url, "https://one.example/");
+        assert!(!browser.can_go_back());
+        browser.go_back();
+        assert_eq!(
+            browser.tabs[0].url, "https://one.example/",
+            "and no further"
+        );
+
+        browser.go_forward();
+        browser.go_forward();
+        assert_eq!(browser.tabs[0].url, "https://three.example/");
+        browser.go_forward();
+        assert_eq!(browser.tabs[0].url, "https://three.example/", "nor further");
+    }
+
+    /// Going somewhere new after going back drops what was ahead: those entries
+    /// describe a future that did not happen.
+    #[test]
+    fn navigating_after_going_back_drops_the_forward_entries() {
+        let mut browser = browser();
+        browser.navigate("one.example");
+        browser.navigate("two.example");
+        browser.go_back();
+        browser.navigate("three.example");
+
+        assert!(!browser.can_go_forward());
+        browser.go_back();
+        assert_eq!(browser.tabs[0].url, "https://one.example/");
+    }
+
+    /// A reload is the same place twice, not two places.
+    #[test]
+    fn a_reload_adds_no_history_entry() {
+        let mut browser = browser();
+        browser.navigate("one.example");
+        browser.navigate("two.example");
+        browser.reload();
+
+        assert!(!browser.can_go_forward());
+        browser.go_back();
+        assert_eq!(browser.tabs[0].url, "https://one.example/");
+    }
+
+    /// Where the reader had got to comes back with the page, which is the part of
+    /// a back button people actually notice.
+    #[test]
+    fn going_back_restores_where_the_reader_was() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        browser.tabs[0]
+            .page
+            .as_mut()
+            .expect("a page")
+            .set_scroll(120.0);
+
+        browser.navigate("long.example/second");
+        browser.go_back();
+        assert_eq!(
+            browser.tabs[0].page.as_ref().expect("a page").scroll(),
+            120.0
+        );
     }
 
     /// A site whose CSS lives in a file next to the page.
