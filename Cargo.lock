@@ -2172,6 +2172,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "otlyra-html"
+version = "0.0.0"
+dependencies = [
+ "encoding_rs",
+ "html5ever",
+ "otlyra-dom",
+ "tracing",
+]
+
+[[package]]
 name = "otlyra-net"
 version = "0.0.0"
 dependencies = [

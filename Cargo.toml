@@ -4,6 +4,7 @@ members = [
     "crates/otlyra-app",
     "crates/otlyra-dom",
     "crates/otlyra-gfx",
+    "crates/otlyra-html",
     "crates/otlyra-net",
     "crates/otlyra-platform",
     "crates/otlyra-text",
@@ -21,6 +22,7 @@ repository = "https://github.com/octofhir/Otlyra"
 [workspace.dependencies]
 otlyra-dom = { path = "crates/otlyra-dom", version = "0.0.0" }
 otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
+otlyra-html = { path = "crates/otlyra-html", version = "0.0.0" }
 otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
 otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
 otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
