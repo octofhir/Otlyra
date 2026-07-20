@@ -29,7 +29,9 @@ blockquote { margin: 1em 40px; }
 ul, ol { margin: 1em 0; padding-left: 40px; }
 dd { margin-left: 40px; }
 pre { font-family: monospace; white-space: pre; margin: 1em 0; }
-hr { height: 1px; background-color: #c0c0c0; margin: 8px 0; }
+/* A rule is a border, not a filled strip: `border-style: inset` renders as one
+   flat grey line here, which is what an inset one-pixel border looks like. */
+hr { height: 0; border-top: 1px solid #c0c0c0; margin: 8px 0; }
 
 b, strong { font-weight: bold; }
 i, em, cite, var, dfn, address { font-style: italic; }
@@ -40,7 +42,13 @@ u, ins { text-decoration: underline; }
 s, strike, del { text-decoration: line-through; }
 a { color: #0000ee; text-decoration: underline; }
 
-button, select { background-color: #e6e6e8; font-size: 0.95em; }
-input { background-color: #f4f4f6; font-size: 0.95em; white-space: pre; }
-textarea { background-color: #f4f4f6; font-family: monospace; white-space: pre; }
-fieldset { padding: 8px; margin: 0 2px; }
+button, select { background-color: #e6e6e8; font-size: 0.95em;
+                 border: 1px solid #8f8f9d; padding: 1px 6px; }
+input { background-color: #f4f4f6; font-size: 0.95em; white-space: pre;
+        border: 1px solid #8f8f9d; padding: 1px 2px; }
+textarea { background-color: #f4f4f6; font-family: monospace; white-space: pre;
+           border: 1px solid #8f8f9d; padding: 2px; }
+fieldset { padding: 8px; margin: 0 2px; border: 2px groove #c0c0c0; }
+
+center, caption { text-align: center; }
+th { font-weight: bold; text-align: center; }
