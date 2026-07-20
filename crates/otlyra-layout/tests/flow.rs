@@ -129,8 +129,8 @@ fn a_margin_separates_two_paragraphs() {
     let second = paragraphs[1];
     let gap = second.rect.y - first.rect.bottom();
     assert!(
-        (gap - 32.0).abs() < 0.5,
-        "gap was {gap}px; margins do not collapse yet, so it is both margins"
+        (gap - 16.0).abs() < 0.5,
+        "gap was {gap}px; the two margins collapse into the larger of them"
     );
 }
 

@@ -115,13 +115,103 @@ impl<'a> Flow<'a> {
             return self.layout_inline(parent, width, x, y, out);
         }
 
+        // Vertical margins between siblings collapse: two blocks that each ask for
+        // a margin are separated by the larger of the two and not by their sum,
+        // which is why a page of paragraphs is spaced the way its author expected.
+        // `pending` is the run of margins that has met and not yet been spent.
+        //
+        // A margin also escapes through an edge with no border and no padding on
+        // it, so the first child's top margin is the *parent's* to spend, and was
+        // spent before this call. The same at the bottom.
+        let (top_open, bottom_open) = self.open_edges(parent, width);
         let mut cursor = y;
-        for &child in &children.clone() {
-            let fragment = self.layout_block(child, width, x, cursor);
-            cursor = fragment.rect.bottom() + bottom_margin(&fragment.style, width);
+        let mut pending = 0.0;
+        let last = children.len() - 1;
+
+        for (index, &child) in children.clone().iter().enumerate() {
+            if index == 0 && top_open {
+                pending = 0.0;
+            } else {
+                pending = collapse(pending, self.collapsed_top(child, width));
+            }
+
+            let fragment = self.layout_block(child, width, x, cursor + pending);
+            let bottom = if index == last && bottom_open {
+                0.0
+            } else {
+                self.collapsed_bottom(child, width)
+            };
+
+            // A box with no height and nothing to separate its own two margins
+            // collapses through: its top and bottom join the same run rather than
+            // opening a gap on each side of nothing.
+            if fragment.rect.height == 0.0 {
+                pending = collapse(pending, bottom);
+            } else {
+                cursor = fragment.rect.bottom();
+                pending = bottom;
+            }
             out.push(fragment);
         }
-        cursor - y
+
+        cursor + pending - y
+    }
+
+    /// Whether margins pass through the top and bottom edges of `id`.
+    ///
+    /// An edge is open when nothing sits on it: no border, no padding, and no line
+    /// of text, since a line box is content and content is what a margin cannot
+    /// pass through. The root is closed at both ends however empty it is — a
+    /// document's own margins stay inside it.
+    fn open_edges(&self, id: BoxId, containing_width: f32) -> (bool, bool) {
+        if id == self.tree.root() {
+            return (false, false);
+        }
+        let node = self.tree.node(id);
+        if node
+            .children
+            .first()
+            .is_some_and(|&child| self.tree.node(child).is_inline_level())
+        {
+            return (false, false);
+        }
+
+        let style = &node.style;
+        let border = resolve_border(style);
+        let padding = resolve_padding(style, containing_width);
+        // A height of its own stops a margin at the bottom edge: the box ends where
+        // it says it does, not where its last child does.
+        let sized = style.height != LengthOrAuto::Auto;
+
+        (
+            border.top == 0.0 && padding.top == 0.0,
+            border.bottom == 0.0 && padding.bottom == 0.0 && !sized,
+        )
+    }
+
+    /// The margin `id` presents to whatever is above it, including any that
+    /// escaped from its own first children.
+    fn collapsed_top(&self, id: BoxId, containing_width: f32) -> f32 {
+        let node = self.tree.node(id);
+        let mut margin = vertical_margin(node.style.margin.top, containing_width);
+        if self.open_edges(id, containing_width).0
+            && let Some(&first) = node.children.first()
+        {
+            margin = collapse(margin, self.collapsed_top(first, containing_width));
+        }
+        margin
+    }
+
+    /// The margin `id` presents to whatever is below it.
+    fn collapsed_bottom(&self, id: BoxId, containing_width: f32) -> f32 {
+        let node = self.tree.node(id);
+        let mut margin = vertical_margin(node.style.margin.bottom, containing_width);
+        if self.open_edges(id, containing_width).1
+            && let Some(&last) = node.children.last()
+        {
+            margin = collapse(margin, self.collapsed_bottom(last, containing_width));
+        }
+        margin
     }
 
     /// One block-level box: margins, borders, padding, a width, and whatever it
@@ -133,7 +223,7 @@ impl<'a> Flow<'a> {
         let (margin, content_width) = resolve_horizontal(&style, containing_width, padding, border);
 
         let border_x = x + margin.left;
-        let border_y = y + margin.top;
+        let border_y = y;
         let content_x = border_x + border.left + padding.left;
         let content_y = border_y + border.top + padding.top;
 
@@ -561,13 +651,24 @@ fn resolve_padding(style: &ComputedStyle, containing: f32) -> Sides<f32> {
     }
 }
 
-/// The bottom margin of a laid-out block.
+/// A vertical margin, which `auto` makes zero.
+fn vertical_margin(margin: LengthOrAuto, containing: f32) -> f32 {
+    margin.resolve(containing).unwrap_or(0.0)
+}
+
+/// Two margins that have met.
 ///
-/// Adjacent margins do **not** collapse yet. That is a real difference from CSS and
-/// it is stated here rather than silently approximated: two paragraphs sit twice as
-/// far apart as they should until margin collapsing lands.
-fn bottom_margin(style: &ComputedStyle, containing: f32) -> f32 {
-    style.margin.bottom.resolve(containing).unwrap_or(0.0)
+/// Both positive: the larger wins. Both negative: the more negative wins. One of
+/// each: they add, so a negative margin pulls a box back over its neighbour by
+/// exactly as much as it asks for.
+fn collapse(a: f32, b: f32) -> f32 {
+    if a >= 0.0 && b >= 0.0 {
+        a.max(b)
+    } else if a < 0.0 && b < 0.0 {
+        a.min(b)
+    } else {
+        a + b
+    }
 }
 
 #[cfg(test)]
@@ -755,6 +856,60 @@ mod tests {
             line.height + 30.0,
             "the border box is the content plus both borders and both paddings"
         );
+    }
+
+    /// Two margins that meet make one gap, the larger of them.
+    #[test]
+    fn margins_between_siblings_collapse() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .a { margin-bottom: 30px } .b { margin-top: 10px }</style>\
+             <div class=a>one</div><div class=b>two</div>",
+            400.0,
+        );
+        let divs = boxes_of(&tree, &boxes, "div");
+        let gap = divs[1].rect.y - divs[0].rect.bottom();
+        assert!((gap - 30.0).abs() < 0.01, "gap was {gap}");
+    }
+
+    /// A margin passes through an edge with nothing on it, and is stopped by a
+    /// border or a padding.
+    #[test]
+    fn a_margin_escapes_an_open_edge_and_not_a_closed_one() {
+        let open = laid_out(
+            "<style>body { margin: 0 } section { margin: 0 } \
+             p { margin: 40px 0 }</style><section><p>x</p></section>",
+            400.0,
+        );
+        let section = rect_of(&open.0, &open.1, "section");
+        let paragraph = rect_of(&open.0, &open.1, "p");
+        assert_eq!(section.y, 40.0, "the child's margin moved the parent");
+        assert_eq!(paragraph.y, section.y, "and they start together");
+
+        let closed = laid_out(
+            "<style>body { margin: 0 } section { margin: 0; border-top: 1px solid black } \
+             p { margin: 40px 0 }</style><section><p>x</p></section>",
+            400.0,
+        );
+        let section = rect_of(&closed.0, &closed.1, "section");
+        let paragraph = rect_of(&closed.0, &closed.1, "p");
+        assert_eq!(section.y, 0.0, "a border keeps the margin inside");
+        assert_eq!(paragraph.y, 41.0, "below the border, by its own margin");
+    }
+
+    /// A negative margin pulls a box back over what is above it, which is what
+    /// makes the two rules — larger of two positives, sum across signs — worth
+    /// stating apart.
+    #[test]
+    fn a_negative_margin_pulls_the_next_box_up() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .a { margin-bottom: 20px } \
+             .b { margin-top: -8px }</style><div class=a>one</div><div class=b>two</div>",
+            400.0,
+        );
+        let divs = boxes_of(&tree, &boxes, "div");
+        let gap = divs[1].rect.y - divs[0].rect.bottom();
+        assert!((gap - 12.0).abs() < 0.01, "gap was {gap}");
     }
 
     /// The pattern nearly every readable page is built on: a column held to a

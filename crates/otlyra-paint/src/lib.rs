@@ -281,8 +281,10 @@ mod tests {
     fn off_screen_content_produces_no_items() {
         let html = "<body>".to_owned() + &"<p>a paragraph</p>".repeat(400);
         let all = page(&html, 0.0);
+        // A screenful is some tens of items; four hundred paragraphs would be an
+        // order of magnitude more.
         assert!(
-            all.len() < 40,
+            all.len() < 100,
             "only the visible paragraphs should be painted, got {} items",
             all.len()
         );
