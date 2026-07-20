@@ -1,32 +1,22 @@
 //! The placeholder scene.
 //!
 //! Until there is a DOM, a cascade and a layout engine, something has to prove the
-//! pipeline end to end. This paints through the real [`PaintTarget`] seam, so what
-//! appears on screen comes out of the code path a real page will use. It goes away
-//! once a display list replaces it.
+//! pipeline end to end. This paints through the real [`PaintTarget`] seam and shapes
+//! its text through the real font stack, so what appears on screen comes out of the
+//! code path a real page will use. It goes away once a display list replaces it.
 
 use otlyra_gfx::PaintTarget;
 use otlyra_gfx::kurbo::{Affine, Rect, RoundedRect, Stroke};
-use otlyra_gfx::peniko::{Brush, Color};
+use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_platform::{Painter, PlatformEvent, Viewport};
-
-/// Paints a fixed test scene: a background and a row of coloured rectangles.
-#[derive(Debug, Default)]
-pub struct DemoScene {
-    /// Last viewport we were told about, for logging only.
-    last_viewport: Option<Viewport>,
-}
-
-impl DemoScene {
-    /// A new scene.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
+use otlyra_text::{FontStack, TEST_FAMILY, TextEngine};
 
 /// Background of the viewport. White, because that is the initial containing
 /// block's used background in every browser.
 const BACKGROUND: Color = Color::from_rgb8(0xff, 0xff, 0xff);
+
+/// Ink colour for the label and the outline.
+const INK: Color = Color::from_rgb8(0x1d, 0x35, 0x57);
 
 /// The swatches, in painting order.
 const SWATCHES: [Color; 4] = [
@@ -36,16 +26,41 @@ const SWATCHES: [Color; 4] = [
     Color::from_rgb8(0x1d, 0x35, 0x57),
 ];
 
+const LABEL: &str = "Otlyra";
+const LABEL_SIZE: f32 = 32.0;
+
+/// Paints a fixed test scene: a label, a background and a row of rectangles.
+#[derive(Debug)]
+pub struct DemoScene {
+    text: TextEngine,
+    stack: FontStack,
+}
+
+impl Default for DemoScene {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DemoScene {
+    /// A new scene.
+    ///
+    /// The engine is deliberately isolated from system fonts. The only text here is
+    /// our own label, and an isolated engine makes the rendered frame identical on
+    /// every machine, which is what lets the image test be a merge gate. Real pages
+    /// will want system fonts; they arrive with the DOM.
+    pub fn new() -> Self {
+        Self {
+            text: TextEngine::isolated(),
+            stack: FontStack::named(TEST_FAMILY),
+        }
+    }
+}
+
 impl Painter for DemoScene {
     fn on_event(&mut self, event: PlatformEvent) {
-        match event {
-            PlatformEvent::SurfaceReady(viewport) | PlatformEvent::Resized(viewport) => {
-                self.last_viewport = Some(viewport);
-            }
-            PlatformEvent::CloseRequested => {
-                tracing::info!("close requested");
-            }
-            _ => {}
+        if let PlatformEvent::CloseRequested = event {
+            tracing::info!("close requested");
         }
     }
 
@@ -65,9 +80,34 @@ impl Painter for DemoScene {
 
         let margin = 48.0_f64;
         let gap = 16.0_f64;
+
+        let shaped = {
+            let _span = tracing::info_span!("layout", text = LABEL).entered();
+            self.text.shape(LABEL, &self.stack, LABEL_SIZE, None)
+        };
+
+        // Glyph positions are already absolute within the layout, baseline
+        // included, so the transform carries the layout origin and nothing else.
+        let ink = Brush::Solid(INK);
+        for run in &shaped.runs {
+            target.draw_glyphs(
+                &run.font,
+                run.font_size,
+                &run.normalized_coords,
+                (&ink).into(),
+                scale * Affine::translate((margin, margin)),
+                true,
+                &mut run.glyphs.iter().copied(),
+            );
+        }
+
+        // Derived from what the text actually measured, not from a magic band
+        // height: a constant here is a constant that silently collides the first
+        // time the label or its size changes.
+        let swatch_top = margin + f64::from(shaped.metrics.height) + gap;
         let count = SWATCHES.len() as f64;
         let swatch_width = ((width - margin * 2.0) - gap * (count - 1.0)) / count;
-        let swatch_height = (height - margin * 2.0).min(240.0);
+        let swatch_height = (height - swatch_top - margin).min(240.0);
 
         if swatch_width <= 0.0 || swatch_height <= 0.0 {
             // Smaller than the margins. Painting nothing is correct.
@@ -76,10 +116,10 @@ impl Painter for DemoScene {
 
         for (index, color) in SWATCHES.iter().enumerate() {
             let x = margin + index as f64 * (swatch_width + gap);
-            let rect = Rect::new(x, margin, x + swatch_width, margin + swatch_height);
+            let rect = Rect::new(x, swatch_top, x + swatch_width, swatch_top + swatch_height);
             let brush = Brush::Solid(*color);
             target.fill(
-                otlyra_gfx::peniko::Fill::NonZero,
+                Fill::NonZero,
                 scale,
                 (&brush).into(),
                 None,
@@ -89,17 +129,16 @@ impl Painter for DemoScene {
 
         // One stroked outline, so the stroke path is exercised by the image tests
         // too and not only by unit tests.
-        let outline = Brush::Solid(Color::from_rgb8(0x1d, 0x35, 0x57));
         target.stroke(
             &Stroke::new(2.0),
             scale,
-            (&outline).into(),
+            (&ink).into(),
             None,
             &Rect::new(
                 margin - 8.0,
-                margin - 8.0,
+                swatch_top - 8.0,
                 width - margin + 8.0,
-                margin + swatch_height + 8.0,
+                swatch_top + swatch_height + 8.0,
             ),
         );
     }
@@ -119,25 +158,48 @@ mod tests {
     }
 
     #[test]
-    fn paints_a_background_then_one_fill_per_swatch_then_an_outline() {
+    fn paints_background_then_text_then_swatches_then_an_outline() {
         let ops = record(Viewport::new(1024, 768, 1.0));
 
-        assert_eq!(
-            ops.len(),
-            1 + SWATCHES.len() + 1,
-            "background + swatches + outline"
-        );
         assert!(
             matches!(ops[0], PaintOp::Fill { .. }),
             "background is a fill"
         );
-        for op in &ops[1..=SWATCHES.len()] {
+        assert!(
+            matches!(ops[1], PaintOp::DrawGlyphs { .. }),
+            "then the label"
+        );
+        for op in &ops[2..2 + SWATCHES.len()] {
             assert!(matches!(op, PaintOp::Fill { .. }), "swatches are fills");
         }
         assert!(
-            matches!(ops[SWATCHES.len() + 1], PaintOp::Stroke { .. }),
+            matches!(ops[2 + SWATCHES.len()], PaintOp::Stroke { .. }),
             "outline is a stroke"
         );
+        assert_eq!(ops.len(), 3 + SWATCHES.len());
+    }
+
+    /// The label must reach the seam as one run of six glyphs at the size we asked
+    /// for. This is the assertion that catches text silently vanishing.
+    #[test]
+    fn the_label_reaches_the_seam_as_a_shaped_glyph_run() {
+        let ops = record(Viewport::new(1024, 768, 1.0));
+        let PaintOp::DrawGlyphs {
+            font_size,
+            glyphs,
+            hint,
+            ..
+        } = &ops[1]
+        else {
+            panic!("expected a glyph run, got {:?}", ops[1]);
+        };
+
+        assert_eq!(*font_size, LABEL_SIZE);
+        assert_eq!(glyphs.len(), LABEL.len(), "one glyph per ASCII character");
+        assert!(*hint, "static text should be grid fitted");
+        for pair in glyphs.windows(2) {
+            assert!(pair[1].x > pair[0].x, "glyphs advance left to right");
+        }
     }
 
     #[test]
@@ -177,9 +239,24 @@ mod tests {
         assert_eq!(*tb, Affine::scale(2.0));
     }
 
+    /// Glyph geometry is authored in logical pixels too: the run's transform
+    /// carries the scale, the glyph offsets do not.
     #[test]
-    fn a_viewport_smaller_than_the_margins_paints_only_the_background() {
+    fn glyph_positions_are_logical_and_the_transform_carries_the_scale() {
+        let one_x = record(Viewport::new(800, 600, 1.0));
+        let two_x = record(Viewport::new(1600, 1200, 2.0));
+
+        let (PaintOp::DrawGlyphs { glyphs: a, .. }, PaintOp::DrawGlyphs { glyphs: b, .. }) =
+            (&one_x[1], &two_x[1])
+        else {
+            panic!("expected glyph runs")
+        };
+        assert_eq!(a, b, "glyph offsets must not depend on the device scale");
+    }
+
+    #[test]
+    fn a_viewport_smaller_than_the_margins_paints_only_the_background_and_label() {
         let ops = record(Viewport::new(16, 16, 1.0));
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
     }
 }

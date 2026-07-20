@@ -20,10 +20,14 @@ path = "src/lib.rs"
 [dependencies]
 otlyra-gfx.workspace = true
 otlyra-platform.workspace = true
+otlyra-text.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+png.workspace = true
 
 [lints]
 workspace = true
