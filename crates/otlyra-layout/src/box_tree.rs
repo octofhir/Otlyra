@@ -12,6 +12,7 @@ use html5ever::LocalName;
 use html5ever::tendril::StrTendril;
 use otlyra_css::ComputedStyle;
 use otlyra_dom::NodeId;
+use otlyra_gfx::peniko::ImageData;
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
 
 new_key_type! {
@@ -29,6 +30,20 @@ pub enum BoxKind {
     Inline,
     /// Text. A leaf, always inline-level.
     Text(StrTendril),
+    /// A replaced box: its content comes from somewhere other than the document,
+    /// and its size can come from the content itself.
+    Replaced(Replaced),
+}
+
+/// What a replaced box shows, and how big it is when nothing says otherwise.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Replaced {
+    /// The decoded picture, absent while it is missing or failed to decode — in
+    /// which case the box is still generated, at whatever size was asked for, the
+    /// way a browser leaves room for a picture it has not got.
+    pub image: Option<ImageData>,
+    /// The size the content itself has, if it has one.
+    pub intrinsic: Option<(f32, f32)>,
 }
 
 /// One box.
@@ -59,7 +74,13 @@ impl BoxNode {
 
     /// Whether this box is inline-level.
     pub fn is_inline_level(&self) -> bool {
-        matches!(self.kind, BoxKind::Inline | BoxKind::Text(_))
+        match &self.kind {
+            BoxKind::Inline | BoxKind::Text(_) => true,
+            // A replaced box takes the level its style gives it: an image is
+            // inline by default and a block when a rule says so.
+            BoxKind::Replaced(_) => self.style.display != otlyra_css::Display::Block,
+            BoxKind::Block => false,
+        }
     }
 }
 

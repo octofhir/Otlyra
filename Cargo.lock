@@ -2501,6 +2501,7 @@ dependencies = [
  "insta",
  "otlyra-css",
  "otlyra-dom",
+ "otlyra-gfx",
  "otlyra-html",
  "otlyra-text",
  "slotmap",

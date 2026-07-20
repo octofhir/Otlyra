@@ -111,6 +111,29 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
 
         FragmentKind::Line => {}
 
+        FragmentKind::Image(image) => {
+            if rect.width <= 0.0 || rect.height <= 0.0 || image.width == 0 || image.height == 0 {
+                return;
+            }
+            // The image carries its own pixel size, so the transform is what makes
+            // it the size the page asked for: a scale to the fragment, then a move
+            // to where the fragment is.
+            let scale = Affine::scale_non_uniform(
+                f64::from(rect.width) / f64::from(image.width),
+                f64::from(rect.height) / f64::from(image.height),
+            );
+            list.push(DisplayItem::Image {
+                image: otlyra_gfx::ImageResource::from(image.clone()),
+                sampler: otlyra_gfx::peniko::ImageSampler::default(),
+                transform: origin * scale,
+                // No clip: the transform already lands the picture exactly on the
+                // fragment, and the rectangle a clip takes is in the transformed
+                // space rather than the page's, so a page-space rectangle here
+                // would cut the picture down by whatever it was scaled by.
+                clip_rect: None,
+            });
+        }
+
         FragmentKind::Text(run) => {
             if run.glyphs.is_empty() {
                 return;

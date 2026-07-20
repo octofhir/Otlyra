@@ -121,6 +121,10 @@ pub struct Spacer {
     pub at: usize,
     /// Width to reserve, in logical pixels. May be zero.
     pub width: f32,
+    /// Height to reserve. A spacer with a height makes the line at least that
+    /// tall, which is what an image sitting in a paragraph does; zero leaves the
+    /// line the height of its text, which is what a border and a padding do.
+    pub height: f32,
 }
 
 /// A spacer once the paragraph has been broken into lines.
@@ -135,6 +139,10 @@ pub struct PlacedSpacer {
     pub x: f32,
     /// The width it reserved.
     pub width: f32,
+    /// Where its top sits, measured from the paragraph top like a line's own top.
+    pub y: f32,
+    /// The height it reserved.
+    pub height: f32,
 }
 
 /// Metrics of a whole shaped paragraph.
@@ -320,10 +328,7 @@ impl TextEngine {
                 kind: parley::InlineBoxKind::InFlow,
                 index,
                 width: spacer.width,
-                // Zero, deliberately: vertical padding and borders on an inline box
-                // paint outside the line without making the line taller, which is
-                // what CSS says and what a height here would undo.
-                height: 0.0,
+                height: spacer.height,
             });
         }
 
@@ -415,6 +420,8 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
                         line: index,
                         x: placed.x,
                         width: placed.width,
+                        y: placed.y,
+                        height: placed.height,
                     });
                     continue;
                 }
@@ -690,11 +697,13 @@ mod tests {
                     id: 1,
                     at: 1,
                     width: 0.0,
+                    height: 0.0,
                 },
                 Spacer {
                     id: 2,
                     at: 2,
                     width: 0.0,
+                    height: 0.0,
                 },
             ],
             None,
@@ -728,6 +737,7 @@ mod tests {
                 id: 1,
                 at: 1,
                 width: 20.0,
+                height: 0.0,
             }],
             None,
         );

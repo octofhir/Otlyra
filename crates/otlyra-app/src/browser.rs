@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::Document;
 use otlyra_gfx::{PaintTarget, render};
+use otlyra_layout::Images;
 use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport};
 use otlyra_text::TextEngine;
 
@@ -85,6 +86,9 @@ impl std::fmt::Debug for Tab {
 /// to the first frame, and a document that asks for hundreds is either generated
 /// or hostile.
 const STYLESHEET_LIMIT: usize = 32;
+
+/// How many pictures one document may pull in, for the same reason.
+const IMAGE_LIMIT: usize = 64;
 
 /// Decode a fetched stylesheet.
 ///
@@ -304,10 +308,11 @@ impl<L: Loader> Browser<L> {
             Ok((bytes, charset, final_url)) => {
                 let parsed = otlyra_html::parse(&bytes, charset.as_deref());
                 let sheets = self.fetch_stylesheets(&parsed.document, &final_url);
+                let images = self.fetch_images(&parsed.document, &final_url);
                 let tab = &mut self.tabs[self.active];
                 tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
                 tab.url = final_url.clone();
-                tab.page = Some(PageScene::with_stylesheets(parsed.document, sheets));
+                tab.page = Some(PageScene::with_resources(parsed.document, sheets, images));
                 self.ui.address.set_text(final_url);
             }
             Err(error) => {
@@ -337,28 +342,16 @@ impl<L: Loader> Browser<L> {
         let mut fetched: HashMap<String, Option<String>> = HashMap::new();
 
         for link in links.iter().take(STYLESHEET_LIMIT) {
-            let Some(url) = otlyra_net::resolve(base, &link.href) else {
+            let Some(url) = Self::subresource_url(base, &link.href, "stylesheet") else {
                 continue;
             };
-            if let Ok(target) = otlyra_net::normalize(&url)
-                && !otlyra_net::may_navigate(Some(base), &target)
-            {
-                tracing::warn!(%url, %base, "stylesheet refused by scheme policy");
-                continue;
-            }
 
             // One fetch per address: a page that links the same sheet from two
             // places is asking for it once.
-            let source =
-                fetched
-                    .entry(url.clone())
-                    .or_insert_with(|| match self.loader.load(&url) {
-                        Ok((bytes, charset, _)) => Some(decode_css(&bytes, charset.as_deref())),
-                        Err(error) => {
-                            tracing::warn!(%url, %error, "stylesheet failed to load");
-                            None
-                        }
-                    });
+            let source = fetched.entry(url.clone()).or_insert_with(|| {
+                let (bytes, charset) = Self::fetch(&mut self.loader, &url, "stylesheet")?;
+                Some(decode_css(&bytes, charset.as_deref()))
+            });
 
             if let Some(source) = source {
                 sheets.insert(link.node, source.clone());
@@ -374,6 +367,64 @@ impl<L: Loader> Browser<L> {
         }
 
         sheets
+    }
+
+    /// Fetch and decode every picture `document` asks for.
+    fn fetch_images(&mut self, document: &Document, base: &str) -> Images {
+        let sources = otlyra_layout::image_sources(document);
+        let mut images = Images::default();
+        let mut fetched: HashMap<String, Option<otlyra_gfx::peniko::ImageData>> = HashMap::new();
+
+        for source in sources.iter().take(IMAGE_LIMIT) {
+            let Some(url) = Self::subresource_url(base, &source.src, "image") else {
+                continue;
+            };
+
+            let image = fetched.entry(url.clone()).or_insert_with(|| {
+                let (bytes, _) = Self::fetch(&mut self.loader, &url, "image")?;
+                otlyra_gfx::decode_image(&bytes)
+                    .inspect_err(|error| tracing::warn!(%url, %error, "image failed to decode"))
+                    .ok()
+            });
+
+            if let Some(image) = image {
+                images.insert(source.node, image.clone());
+            }
+        }
+
+        if sources.len() > IMAGE_LIMIT {
+            tracing::warn!(
+                asked = sources.len(),
+                fetched = IMAGE_LIMIT,
+                "the document asks for more pictures than the limit"
+            );
+        }
+
+        images
+    }
+
+    /// The address a subresource is actually fetched from, or `None` if the page
+    /// may not reach it.
+    fn subresource_url(base: &str, href: &str, kind: &str) -> Option<String> {
+        let url = otlyra_net::resolve(base, href)?;
+        if let Ok(target) = otlyra_net::normalize(&url)
+            && !otlyra_net::may_navigate(Some(base), &target)
+        {
+            tracing::warn!(%url, %base, %kind, "subresource refused by scheme policy");
+            return None;
+        }
+        Some(url)
+    }
+
+    /// One subresource's bytes, or `None` with a note about why not.
+    fn fetch(loader: &mut L, url: &str, kind: &str) -> Option<(Vec<u8>, Option<String>)> {
+        match loader.load(url) {
+            Ok((bytes, charset, _)) => Some((bytes, charset)),
+            Err(error) => {
+                tracing::warn!(%url, %error, %kind, "subresource failed to load");
+                None
+            }
+        }
     }
 
     /// Open a tab and make it active.

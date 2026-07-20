@@ -64,6 +64,8 @@ pub enum FragmentKind {
     Box,
     /// One line of an inline formatting context.
     Line,
+    /// A replaced box's content: a picture, drawn to fill the fragment.
+    Image(otlyra_gfx::peniko::ImageData),
     /// One shaped run of glyphs, positioned relative to the fragment's origin.
     ///
     /// One fragment per run rather than per line, so that the fragment's rectangle

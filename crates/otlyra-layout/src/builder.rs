@@ -16,15 +16,65 @@ use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree};
 /// what the parts of the browser that ask only "what boxes does this markup make"
 /// want — dumps, tests — and it is the fallback when the cascade has not run.
 pub fn build_box_tree(document: &Document) -> BoxTree {
-    build(document, None)
+    build(document, None, &Images::default())
 }
 
 /// Build the box tree for `document` using styles the cascade computed.
 pub fn build_styled_box_tree(document: &Document, styles: &StyledDocument) -> BoxTree {
-    build(document, Some(styles))
+    build(document, Some(styles), &Images::default())
 }
 
-fn build(document: &Document, styles: Option<&StyledDocument>) -> BoxTree {
+/// Build the box tree with the pictures the document's `<img>` elements asked for
+/// already decoded.
+///
+/// One that has not arrived generates no replaced box, so the element falls back to
+/// its `alt` text — which is what a browser shows while a picture is missing.
+pub fn build_box_tree_with_images(
+    document: &Document,
+    styles: Option<&StyledDocument>,
+    images: &Images,
+) -> BoxTree {
+    build(document, styles, images)
+}
+
+/// The decoded pictures of a document, by the element that asked for each.
+pub type Images = std::collections::HashMap<NodeId, otlyra_gfx::peniko::ImageData>;
+
+/// A picture a document asks for but does not contain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageSource {
+    /// The `<img>` element, which is how the decoded picture finds its way back to
+    /// the box it belongs to.
+    pub node: NodeId,
+    /// The address, exactly as the attribute spells it: resolving it needs the
+    /// document's own address, which this crate does not know.
+    pub src: String,
+}
+
+/// Every `<img src>` in the document, in tree order.
+pub fn image_sources(document: &Document) -> Vec<ImageSource> {
+    let mut sources = Vec::new();
+    let mut stack = vec![document.root()];
+
+    while let Some(id) = stack.pop() {
+        if let Some(element) = document.get(id).and_then(|node| node.element())
+            && element.name.local.as_ref() == "img"
+            && let Some(src) = element
+                .attrs
+                .iter()
+                .find(|attr| attr.name.local.as_ref() == "src")
+                .map(|attr| attr.value.trim().to_owned())
+            && !src.is_empty()
+        {
+            sources.push(ImageSource { node: id, src });
+        }
+        stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
+    }
+
+    sources
+}
+
+fn build(document: &Document, styles: Option<&StyledDocument>, images: &Images) -> BoxTree {
     let _span = tracing::info_span!("build_box_tree").entered();
 
     let root_style = Arc::new(initial_style());
@@ -34,6 +84,7 @@ fn build(document: &Document, styles: Option<&StyledDocument>) -> BoxTree {
     let mut builder = Builder {
         document,
         styles,
+        images,
         tree,
     };
     for child in document.children(document.root()) {
@@ -49,6 +100,7 @@ fn build(document: &Document, styles: Option<&StyledDocument>) -> BoxTree {
 struct Builder<'a> {
     document: &'a Document,
     styles: Option<&'a StyledDocument>,
+    images: &'a Images,
     tree: BoxTree,
 }
 
@@ -199,6 +251,43 @@ impl Builder<'_> {
         }
     }
 
+    /// The replaced content an element shows, if it has any.
+    ///
+    /// Only `<img>`, and only when its picture has arrived: an element with no
+    /// picture keeps its `alt` text, which is the whole point of having one.
+    fn replaced_content(&self, name: &str, node: NodeId) -> Option<crate::box_tree::Replaced> {
+        if name != "img" {
+            return None;
+        }
+        let image = self.images.get(&node)?.clone();
+
+        // A `width` or `height` attribute is the size the document asked for before
+        // any CSS is written, so it stands in for the picture's own size rather
+        // than overriding what a rule says.
+        let attribute = |key: &str| -> Option<f32> {
+            self.document
+                .get(node)?
+                .element()?
+                .attrs
+                .iter()
+                .find(|attr| attr.name.local.as_ref() == key)?
+                .value
+                .trim()
+                .parse()
+                .ok()
+        };
+
+        let intrinsic = (
+            attribute("width").unwrap_or(image.width as f32),
+            attribute("height").unwrap_or(image.height as f32),
+        );
+
+        Some(crate::box_tree::Replaced {
+            image: Some(image),
+            intrinsic: Some(intrinsic),
+        })
+    }
+
     /// Whether an `<option>` is the one a closed `<select>` displays.
     ///
     /// A select shows one option, not all of them — which is why a page full of
@@ -273,10 +362,17 @@ impl Builder<'_> {
                     return;
                 }
 
-                let kind = match style.display {
-                    Display::None => return,
-                    Display::Block => BoxKind::Block,
-                    Display::Inline => BoxKind::Inline,
+                if style.display == Display::None {
+                    return;
+                }
+
+                let kind = match self.replaced_content(name, node) {
+                    Some(content) => BoxKind::Replaced(content),
+                    None => match style.display {
+                        Display::None => return,
+                        Display::Block => BoxKind::Block,
+                        Display::Inline => BoxKind::Inline,
+                    },
                 };
 
                 let id = self.tree.push(
@@ -296,7 +392,12 @@ impl Builder<'_> {
                 // `<input>` is a void element, so without this it lays out as
                 // nothing at all. Real browsers generate this content too — they
                 // just do it inside a widget we do not have.
-                if let Some(text) = self.generated_text(name, node) {
+                // A replaced box shows its content, not its stand-in: the `alt`
+                // text is what is shown *instead* of a picture, not beside it.
+                let generated = (!matches!(self.tree.node(id).kind, BoxKind::Replaced(_)))
+                    .then(|| self.generated_text(name, node))
+                    .flatten();
+                if let Some(text) = generated {
                     self.tree.push(
                         id,
                         BoxNode {

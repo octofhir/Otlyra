@@ -80,6 +80,18 @@ struct InlineBox {
     last_span: usize,
 }
 
+/// A replaced box in an inline formatting context, waiting for the shaper to say
+/// where in the line it landed.
+struct ReplacedBox {
+    id: BoxId,
+    style: Arc<ComputedStyle>,
+    image: Option<otlyra_gfx::peniko::ImageData>,
+    /// The span it sits before.
+    at: usize,
+    width: f32,
+    height: f32,
+}
+
 /// The spacer identifiers for the two edges of the `index`th inline box.
 fn leading_spacer(index: usize) -> u64 {
     index as u64 * 2
@@ -87,6 +99,41 @@ fn leading_spacer(index: usize) -> u64 {
 
 fn trailing_spacer(index: usize) -> u64 {
     index as u64 * 2 + 1
+}
+
+/// The spacer identifier for the `index`th replaced box, in a range of its own so
+/// that it cannot collide with an inline box's two edges.
+fn replaced_spacer(index: usize) -> u64 {
+    (1 << 62) | index as u64
+}
+
+/// The size a replaced box is drawn at.
+///
+/// CSS first, then whatever the content itself says, and a single given dimension
+/// takes the other from the intrinsic ratio — which is what makes `width: 100%` on
+/// a photograph keep its shape instead of squashing it.
+fn replaced_size(
+    style: &ComputedStyle,
+    content: &crate::box_tree::Replaced,
+    containing: f32,
+) -> (f32, f32) {
+    let intrinsic = content.intrinsic;
+    let ratio = intrinsic.and_then(|(width, height)| (height > 0.0).then(|| width / height));
+
+    let width = style.width.resolve(containing);
+    let height = style.height.resolve(containing);
+
+    let (width, height) = match (width, height) {
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) => (width, ratio.map_or(0.0, |ratio| width / ratio)),
+        (None, Some(height)) => (ratio.map_or(0.0, |ratio| height * ratio), height),
+        (None, None) => intrinsic.unwrap_or((0.0, 0.0)),
+    };
+
+    (
+        clamp(width, style.min_width, style.max_width, containing),
+        clamp(height, style.min_height, style.max_height, containing),
+    )
 }
 
 /// Whether any of the four sides is non-zero.
@@ -218,6 +265,21 @@ impl<'a> Flow<'a> {
     /// contains.
     fn layout_block(&mut self, id: BoxId, containing_width: f32, x: f32, y: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
+        // A block-level picture is its own size and has no children to lay out;
+        // everything else about it — margins, borders — is an ordinary block's.
+        if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
+            let (width, height) = replaced_size(&style, content, containing_width);
+            let image = content.image.clone();
+            let margin = resolve_margin(&style, containing_width);
+            return Fragment {
+                box_id: Some(id),
+                rect: Rect::new(x + margin.left, y, width, height),
+                kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
+                style,
+                children: Vec::new(),
+            };
+        }
+
         let padding = resolve_padding(&style, containing_width);
         let border = resolve_border(&style);
         let (margin, content_width) = resolve_horizontal(&style, containing_width, padding, border);
@@ -273,8 +335,16 @@ impl<'a> Flow<'a> {
         let mut spans = Vec::new();
         let mut sources = Vec::new();
         let mut inlines = Vec::new();
-        self.collect_spans(parent, width, &mut spans, &mut sources, &mut inlines);
-        if spans.is_empty() {
+        let mut replaced = Vec::new();
+        self.collect_spans(
+            parent,
+            width,
+            &mut spans,
+            &mut sources,
+            &mut inlines,
+            &mut replaced,
+        );
+        if spans.is_empty() && replaced.is_empty() {
             return 0.0;
         }
 
@@ -302,14 +372,22 @@ impl<'a> Flow<'a> {
                         id: leading_spacer(index),
                         at: inline.first_span,
                         width: inline.border.left + inline.padding.left,
+                        height: 0.0,
                     },
                     Spacer {
                         id: trailing_spacer(index),
                         at: inline.last_span,
                         width: inline.border.right + inline.padding.right,
+                        height: 0.0,
                     },
                 ]
             })
+            .chain(replaced.iter().enumerate().map(|(index, box_)| Spacer {
+                id: replaced_spacer(index),
+                at: box_.at,
+                width: box_.width,
+                height: box_.height,
+            }))
             .collect();
 
         let shaped = self.text.shape_spans(&spans, &spacers, Some(width));
@@ -441,6 +519,27 @@ impl<'a> Flow<'a> {
                 .collect();
             children.extend(runs);
 
+            // The pictures that landed on this line, where the shaper put them.
+            children.extend(replaced.iter().enumerate().filter_map(|(number, box_)| {
+                let spacer = placed.get(&replaced_spacer(number))?;
+                if spacer.line != index {
+                    return None;
+                }
+                let image = box_.image.clone()?;
+                Some(Fragment {
+                    box_id: Some(box_.id),
+                    rect: Rect::new(
+                        line_x + spacer.x,
+                        y + spacer.y - paragraph_top,
+                        spacer.width,
+                        spacer.height,
+                    ),
+                    kind: FragmentKind::Image(image),
+                    style: Arc::clone(&box_.style),
+                    children: Vec::new(),
+                })
+            }));
+
             out.push(Fragment {
                 box_id: Some(parent),
                 rect: Rect::new(line_x, line_y, line.width, height),
@@ -474,10 +573,25 @@ impl<'a> Flow<'a> {
         spans: &mut Vec<TextSpan<'a>>,
         sources: &mut Vec<BoxId>,
         inlines: &mut Vec<InlineBox>,
+        replaced: &mut Vec<ReplacedBox>,
     ) {
         for &child in &self.tree.node(id).children {
             let node = self.tree.node(child);
             match &node.kind {
+                BoxKind::Replaced(content) => {
+                    // A picture in a line is a box the shaper has to make room for,
+                    // horizontally and vertically both: the line it sits in is at
+                    // least as tall as it is.
+                    let (width, height) = replaced_size(&node.style, content, containing_width);
+                    replaced.push(ReplacedBox {
+                        id: child,
+                        style: Arc::clone(&node.style),
+                        image: content.image.clone(),
+                        at: spans.len(),
+                        width,
+                        height,
+                    });
+                }
                 BoxKind::Text(text) => {
                     spans.push(span_for(text, &node.style, self.font_stack(&node.style)));
                     // The text's own box is anonymous as far as the document is
@@ -519,7 +633,7 @@ impl<'a> Flow<'a> {
                         inlines.len() - 1
                     });
 
-                    self.collect_spans(child, containing_width, spans, sources, inlines);
+                    self.collect_spans(child, containing_width, spans, sources, inlines, replaced);
 
                     if let Some(slot) = slot {
                         inlines[slot].last_span = spans.len();
@@ -529,7 +643,7 @@ impl<'a> Flow<'a> {
                     // A block inside an inline context. Real CSS splits the inline
                     // around it; we do not yet, so its text joins the paragraph
                     // rather than vanishing.
-                    self.collect_spans(child, containing_width, spans, sources, inlines);
+                    self.collect_spans(child, containing_width, spans, sources, inlines, replaced);
                 }
             }
         }
@@ -856,6 +970,124 @@ mod tests {
             line.height + 30.0,
             "the border box is the content plus both borders and both paddings"
         );
+    }
+
+    /// A picture of `width` by `height`, with no file behind it: layout reads its
+    /// dimensions and never its pixels.
+    fn picture(width: u32, height: u32) -> otlyra_gfx::peniko::ImageData {
+        otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![
+                0u8;
+                width as usize
+                    * height as usize
+                    * 4
+            ])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width,
+            height,
+        }
+    }
+
+    /// Lay out a document whose every `<img>` shows the same picture.
+    fn laid_out_with_image(
+        html: &str,
+        width: f32,
+        image: otlyra_gfx::peniko::ImageData,
+    ) -> (FragmentTree, BoxTree) {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styles = style_document(
+            &document,
+            StyleViewport {
+                width,
+                height: 600.0,
+                scale: 1.0,
+            },
+        );
+        let images: crate::Images = crate::image_sources(&document)
+            .into_iter()
+            .map(|source| (source.node, image.clone()))
+            .collect();
+        let boxes = crate::build_box_tree_with_images(&document, Some(&styles), &images);
+        let mut text = otlyra_text::TextEngine::isolated();
+        let tree = crate::layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width,
+                height: 600.0,
+            },
+        );
+        (tree, boxes)
+    }
+
+    /// The first image fragment, which is what a picture is drawn from.
+    fn image_rect(tree: &FragmentTree) -> Rect {
+        tree.iter()
+            .find(|fragment| matches!(fragment.kind, FragmentKind::Image(_)))
+            .map(|fragment| fragment.rect)
+            .expect("an image fragment")
+    }
+
+    /// A picture with no size of its own in the CSS is drawn at the size it is.
+    #[test]
+    fn an_image_takes_its_own_size() {
+        let (tree, _) = laid_out_with_image(
+            "<style>body { margin: 0 }</style><p><img src=a.png></p>",
+            400.0,
+            picture(64, 32),
+        );
+        let rect = image_rect(&tree);
+        assert_eq!((rect.width, rect.height), (64.0, 32.0));
+    }
+
+    /// One dimension given takes the other from the picture's own ratio, which is
+    /// what keeps a photograph from being squashed by `width: 100%`.
+    #[test]
+    fn one_given_dimension_keeps_the_ratio() {
+        let (tree, _) = laid_out_with_image(
+            "<style>body { margin: 0 } img { width: 200px }</style><p><img src=a.png></p>",
+            400.0,
+            picture(100, 50),
+        );
+        let rect = image_rect(&tree);
+        assert_eq!((rect.width, rect.height), (200.0, 100.0));
+    }
+
+    /// An image in a line takes room in it: the text after it starts further along
+    /// and the line is at least as tall as the picture.
+    #[test]
+    fn an_image_takes_room_in_the_line_it_sits_in() {
+        let (with, _) = laid_out_with_image(
+            "<style>body { margin: 0 }</style><p>before <img src=a.png> after</p>",
+            400.0,
+            picture(80, 60),
+        );
+        let (without, _) = laid_out_with_image(
+            "<style>body { margin: 0 }</style><p>before after</p>",
+            400.0,
+            picture(80, 60),
+        );
+
+        let line = first_line(&with);
+        assert!(line.width > first_line(&without).width + 79.0);
+        assert!(line.height >= 60.0, "line height was {}", line.height);
+    }
+
+    /// A picture that never arrived generates no image fragment, and the element
+    /// keeps its `alt` text instead.
+    #[test]
+    fn a_missing_picture_leaves_the_alt_text() {
+        let (tree, _) = laid_out(
+            "<style>body { margin: 0 }</style><p><img src=a.png alt=\"a description\"></p>",
+            400.0,
+        );
+        assert!(
+            !tree
+                .iter()
+                .any(|fragment| matches!(fragment.kind, FragmentKind::Image(_)))
+        );
+        assert!(first_line(&tree).width > 0.0, "the alt text was laid out");
     }
 
     /// Two margins that meet make one gap, the larger of them.

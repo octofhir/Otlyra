@@ -25,6 +25,7 @@ fn write_box(tree: &BoxTree, id: BoxId, depth: usize, out: &mut String) {
             let name = match kind {
                 BoxKind::Block => "BLOCK",
                 BoxKind::Inline => "INLINE",
+                BoxKind::Replaced(_) => "REPLACED",
                 BoxKind::Text(_) => unreachable!("handled above"),
             };
             let tag = match (&node.tag, node.parent) {
@@ -63,6 +64,7 @@ fn write_fragment(fragment: &crate::fragment::Fragment, depth: usize, out: &mut 
     let kind = match &fragment.kind {
         FragmentKind::Box => "BOX".to_owned(),
         FragmentKind::Line => "LINE".to_owned(),
+        FragmentKind::Image(image) => format!("IMAGE {}x{}", image.width, image.height),
         FragmentKind::Text(run) => format!("TEXT {} glyphs", run.glyphs.len()),
     };
     let _ = writeln!(

@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 otlyra-css.workspace = true
 otlyra-dom.workspace = true
+otlyra-gfx.workspace = true
 otlyra-text.workspace = true
 html5ever.workspace = true
 slotmap.workspace = true

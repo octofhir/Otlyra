@@ -12,7 +12,7 @@
 use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, build_box_tree, build_styled_box_tree};
+use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images, build_box_tree};
 use otlyra_text::TextEngine;
 
 /// A parsed document, laid out and painted.
@@ -22,6 +22,10 @@ pub struct PageScene {
     /// fetched. Kept because a restyle needs them again and a restyle must not
     /// wait on a network.
     sheets: ExternalSheets,
+    /// The pictures its `<img>` elements asked for, already decoded. Kept for the
+    /// same reason as the sheets: rebuilding the box tree must not wait on a
+    /// network either.
+    images: Images,
     /// The document itself, kept because a click resolves to a box, a box to a
     /// node, and a node's attributes are what say where a link goes.
     document: Document,
@@ -49,15 +53,16 @@ pub struct PageScene {
 }
 
 impl PageScene {
-    /// A scene showing `document`, with no external stylesheets.
+    /// A scene showing `document`, with nothing fetched for it.
     pub fn new(document: Document) -> Self {
-        Self::with_stylesheets(document, ExternalSheets::default())
+        Self::with_resources(document, ExternalSheets::default(), Images::default())
     }
 
-    /// A scene showing `document`, styled with `sheets` as well as its own CSS.
-    pub fn with_stylesheets(document: Document, sheets: ExternalSheets) -> Self {
+    /// A scene showing `document` with the stylesheets and pictures it asked for.
+    pub fn with_resources(document: Document, sheets: ExternalSheets, images: Images) -> Self {
         Self {
             sheets,
+            images,
             boxes: build_box_tree(&document),
             document,
             targets: Vec::new(),
@@ -119,7 +124,8 @@ impl PageScene {
             },
             &self.sheets,
         );
-        self.boxes = build_styled_box_tree(&self.document, &styles);
+        self.boxes =
+            otlyra_layout::build_box_tree_with_images(&self.document, Some(&styles), &self.images);
         self.styled_at = Some((width, height));
         self.layout = None;
         self.damage.add(Damage::of(
