@@ -1,0 +1,69 @@
+//! # otlyra-app — the browser shell
+//!
+//! ## Purpose
+//!
+//! The top of the stack. It owns the event loop, and will own navigation, the
+//! document lifecycle and the session. Every other crate is a library it drives;
+//! nothing depends on this one.
+//!
+//! ## Contents
+//!
+//! - [`observability`] — tracing setup and the fixed span vocabulary.
+//! - [`scene`] — the placeholder scene, replaced once a display list exists.
+//! - [`run_window`] / [`write_screenshot`] — the two entry points.
+//!
+//! ## Invariants
+//!
+//! 1. **Span names are fixed** in [`observability::spans`] and never renamed; every
+//!    performance target is stated in terms of them.
+//! 2. **Windowed and screenshot rendering share one [`otlyra_platform::Painter`].**
+//!    A screenshot that can drift from what the window shows is worthless as a test.
+//! 3. **This crate holds no GPU or rasterizer handle.** It hands a `Painter` to
+//!    `otlyra-platform` and gets pixels or a PNG back.
+
+pub mod observability;
+pub mod scene;
+
+use std::path::Path;
+
+use otlyra_platform::{Painter, Viewport, WindowConfig};
+
+/// Failures that reach `main`.
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    /// The platform layer failed.
+    #[error(transparent)]
+    Platform(#[from] otlyra_platform::PlatformError),
+    /// Writing the screenshot failed.
+    #[error("failed to write screenshot to {path}: {source}")]
+    ScreenshotWrite {
+        /// The path we tried to write.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Open a window and run until it closes.
+pub fn run_window(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), AppError> {
+    Ok(otlyra_platform::run(config, painter)?)
+}
+
+/// Render exactly one frame at `viewport` and write it to `path` as a PNG.
+///
+/// Touches neither winit nor wgpu, so it runs on a CI machine with no display
+/// server. That is what lets the image tests be a merge gate.
+pub fn write_screenshot(
+    painter: &mut dyn Painter,
+    viewport: Viewport,
+    path: &Path,
+) -> Result<(), AppError> {
+    let png = otlyra_platform::render_offscreen(painter, viewport)?;
+    std::fs::write(path, &png).map_err(|source| AppError::ScreenshotWrite {
+        path: path.display().to_string(),
+        source,
+    })?;
+    tracing::info!(path = %path.display(), bytes = png.len(), "screenshot written");
+    Ok(())
+}
