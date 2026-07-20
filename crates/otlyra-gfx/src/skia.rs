@@ -36,6 +36,9 @@ pub enum SkiaError {
     /// PNG encoding failed.
     #[error("skia failed to encode the surface as PNG")]
     PngEncode,
+    /// An encoded image could not be decoded.
+    #[error("skia could not decode the image")]
+    ImageDecode,
     /// A zero-area surface was requested. Callers must clamp before asking.
     #[error("surface dimensions must be non-zero, got {width}x{height}")]
     ZeroSize {
@@ -477,18 +480,120 @@ impl PaintTarget for SkiaPainter {
         canvas.restore();
     }
 
-    fn draw_image(
-        &mut self,
-        image: ImageBrushRef<'_>,
-        _transform: Affine,
-        _clip_rect: Option<Rect>,
-    ) {
-        tracing::warn!(
-            width = image.image.width,
-            height = image.image.height,
-            "SkiaPainter::draw_image is not implemented yet"
+    fn draw_image(&mut self, image: ImageBrushRef<'_>, transform: Affine, clip_rect: Option<Rect>) {
+        let data = image.image;
+        let Some(expected) = data.format.size_in_bytes(data.width, data.height) else {
+            tracing::error!(
+                width = data.width,
+                height = data.height,
+                "image dimensions overflow"
+            );
+            return;
+        };
+        if data.data.as_ref().len() < expected {
+            tracing::error!(
+                got = data.data.as_ref().len(),
+                expected,
+                "image buffer is smaller than its dimensions claim"
+            );
+            return;
+        }
+
+        let color_type = match data.format {
+            peniko::ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
+            peniko::ImageFormat::Bgra8 => sk::ColorType::BGRA8888,
+            // `ImageFormat` is non-exhaustive; an unknown format is better dropped
+            // loudly than guessed at.
+            other => {
+                tracing::error!(?other, "unsupported image format");
+                return;
+            }
+        };
+        let alpha_type = match data.alpha_type {
+            peniko::ImageAlphaType::Alpha => sk::AlphaType::Unpremul,
+            peniko::ImageAlphaType::AlphaPremultiplied => sk::AlphaType::Premul,
+        };
+
+        let info = sk::ImageInfo::new(
+            (data.width as i32, data.height as i32),
+            color_type,
+            alpha_type,
+            None,
         );
+        let row_bytes = data.width as usize * 4;
+        let pixels = sk::Data::new_copy(&data.data.as_ref()[..expected]);
+        let Some(sk_image) = sk::images::raster_from_data(&info, pixels, row_bytes) else {
+            tracing::error!("skia rejected the image data");
+            return;
+        };
+
+        let mut paint = sk::Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_alpha_f(image.sampler.alpha);
+
+        let sampling = match image.sampler.quality {
+            peniko::ImageQuality::Low => {
+                sk::SamplingOptions::new(sk::FilterMode::Nearest, sk::MipmapMode::None)
+            }
+            _ => sk::SamplingOptions::new(sk::FilterMode::Linear, sk::MipmapMode::Linear),
+        };
+
+        let canvas = self.canvas();
+        canvas.save();
+        canvas.concat(&to_skia_matrix(transform));
+        if let Some(clip) = clip_rect {
+            canvas.clip_rect(
+                sk::Rect::new(
+                    clip.x0 as f32,
+                    clip.y0 as f32,
+                    clip.x1 as f32,
+                    clip.y1 as f32,
+                ),
+                sk::ClipOp::Intersect,
+                true,
+            );
+        }
+        canvas.draw_image_with_sampling_options(&sk_image, (0.0, 0.0), sampling, Some(&paint));
+        canvas.restore();
     }
+}
+
+/// Decode an encoded image (PNG, JPEG, …) into pixels the display list can carry.
+///
+/// Skia is already a dependency and already contains decoders, so this costs no new
+/// crate. When resource loading exists this moves out of the renderer.
+pub fn decode_image(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
+    let data = sk::Data::new_copy(bytes);
+    let image = sk::Image::from_encoded(data).ok_or(SkiaError::ImageDecode)?;
+
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let info = sk::ImageInfo::new(
+        (image.width(), image.height()),
+        sk::ColorType::RGBA8888,
+        sk::AlphaType::Premul,
+        None,
+    );
+
+    let row_bytes = width as usize * 4;
+    let mut pixels = vec![0u8; row_bytes * height as usize];
+    if !image.read_pixels(
+        &info,
+        &mut pixels,
+        row_bytes,
+        (0, 0),
+        sk::image::CachingHint::Allow,
+    ) {
+        return Err(SkiaError::ImageDecode);
+    }
+
+    Ok(peniko::ImageData {
+        data: peniko::Blob::new(std::sync::Arc::new(pixels)),
+        format: peniko::ImageFormat::Rgba8,
+        alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+        width,
+        height,
+    })
 }
 
 #[cfg(test)]
