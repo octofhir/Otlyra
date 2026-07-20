@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use otlyra_css::cascade::StyledDocument;
-use otlyra_css::{ComputedStyle, Display, has_renderable_children, initial_style, ua_style};
+use otlyra_css::{
+    ComputedStyle, Display, WhiteSpace, has_renderable_children, initial_style, ua_style,
+};
 use otlyra_dom::{Document, NodeData, NodeId};
 
 use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree};
@@ -54,6 +56,41 @@ struct Builder<'a> {
 ///
 /// A run of whitespace becomes one space, and a newline in the source is just more
 /// whitespace — `<br>` is what makes a line break, not a line ending in the markup.
+/// Remove the whitespace-only boxes that sit between block-level boxes.
+///
+/// The space in `</div> <div>` is not a word gap and generating a line box for it
+/// would put a blank line between every pair of blocks. The space in
+/// `</button> <button>` is the gap between two controls, and dropping it runs them
+/// together — which is why this is decided here, where both neighbours are known,
+/// rather than while walking the DOM.
+fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
+    let children = tree.node(id).children.clone();
+    let is_space = |tree: &BoxTree, child: BoxId| {
+        let node = tree.node(child);
+        node.node.is_some() && matches!(&node.kind, BoxKind::Text(text) if text.trim().is_empty())
+    };
+    let inline_neighbour = |tree: &BoxTree, child: Option<&BoxId>| {
+        child.is_some_and(|&child| tree.node(child).is_inline_level() && !is_space(tree, child))
+    };
+
+    let kept: Vec<BoxId> = children
+        .iter()
+        .enumerate()
+        .filter(|&(index, &child)| {
+            if !is_space(tree, child) {
+                return true;
+            }
+            inline_neighbour(tree, children.get(index.wrapping_sub(1)))
+                || inline_neighbour(tree, children.get(index + 1))
+        })
+        .map(|(_, &child)| child)
+        .collect();
+
+    if kept.len() != children.len() {
+        tree.set_children(id, kept);
+    }
+}
+
 pub(crate) fn collapse_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_space = false;
@@ -128,14 +165,11 @@ impl Builder<'_> {
                 match kind.to_ascii_lowercase().as_str() {
                     // A button-shaped input carries its label in `value`.
                     "button" | "submit" | "reset" => {
-                        // Padded with spaces because an inline box has no padding
-                        // here, and without them two buttons touch.
-                        let label = attribute("value").unwrap_or_else(|| match kind.as_str() {
+                        Some(attribute("value").unwrap_or_else(|| match kind.as_str() {
                             "submit" => "Submit".to_owned(),
                             "reset" => "Reset".to_owned(),
                             _ => " ".to_owned(),
-                        });
-                        Some(format!("  {label}  "))
+                        }))
                     }
                     // ASCII rather than the ballot-box and radio characters: those
                     // are dingbats many system fonts have no glyph for, and a
@@ -161,9 +195,6 @@ impl Builder<'_> {
                 }
             }
             "img" => attribute("alt").filter(|alt| !alt.is_empty()),
-            // The same padding a value-driven button gets, so that two buttons
-            // side by side do not read as one.
-            "button" => Some("  ".to_owned()),
             _ => None,
         }
     }
@@ -309,10 +340,26 @@ impl Builder<'_> {
             }
 
             NodeData::Text(text) => {
-                // Whitespace between two blocks generates no box. The full rule is
-                // subtler — it depends on `white-space` and on what sits either side
-                // — and it arrives with inline layout.
-                if text.trim().is_empty() {
+                // Whitespace-only text is kept here and removed later, once the
+                // boxes either side of it are known: the space between two blocks
+                // generates nothing, and the space between `<button>` and
+                // `<button>` is the gap between two controls.
+                if text.trim().is_empty() && parent_style.white_space != WhiteSpace::Pre {
+                    self.tree.push(
+                        parent_box,
+                        BoxNode {
+                            kind: BoxKind::Text(" ".into()),
+                            style: Arc::clone(parent_style),
+                            // The text node it came from, which is what tells the
+                            // fixup pass this space is markup rather than content a
+                            // control generated for itself.
+                            node: Some(node),
+                            tag: None,
+                            anonymous: true,
+                            children: Vec::new(),
+                            parent: None,
+                        },
+                    );
                     return;
                 }
 
@@ -357,6 +404,8 @@ impl Builder<'_> {
 /// it is in. `<div>text<p>para</p></div>` has one paragraph and one loose text node;
 /// the text gets an anonymous block of its own.
 pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
+    drop_whitespace_between_blocks(tree, id);
+
     let children = tree.node(id).children.clone();
     for &child in &children {
         fix_anonymous_boxes(tree, child);
@@ -473,6 +522,23 @@ mod tests {
     fn a_style_attribute_reaches_the_box_tree() {
         let tree = styled("<p style=\"font-size: 21px\">text");
         assert_eq!(style_of(&tree, "p").font_size, 21.0);
+    }
+
+    /// The space between two blocks is not a word gap; the space between two
+    /// controls is the only thing keeping them apart.
+    #[test]
+    fn whitespace_survives_between_inline_boxes_and_not_between_blocks() {
+        let inline = crate::dump::serialize(&styled("<p><button>a</button> <button>b</button>"));
+        assert!(
+            inline.contains("TEXT \" \""),
+            "the gap between two controls is gone:\n{inline}"
+        );
+
+        let blocks = crate::dump::serialize(&styled("<div>a</div>\n<div>b</div>"));
+        assert!(
+            !blocks.contains("TEXT \" \""),
+            "a newline between two blocks became a line box:\n{blocks}"
+        );
     }
 
     /// Without a stylesheet the built-in element styles still apply, so markup
