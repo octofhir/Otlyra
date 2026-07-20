@@ -224,8 +224,8 @@ pub fn first_box_with_mixed_children(tree: &BoxTree) -> Option<BoxId> {
 /// Why the box tree, or part of it, has to be rebuilt.
 ///
 /// Named from the first day, and never merged into a bare boolean, because "why did
-/// we rebuild four hundred times" has to stay answerable. Servo and Ladybird both
-/// arrived at this and Ladybird spells its version out in an enum macro.
+/// we rebuild four hundred times" has to stay answerable, and a boolean cannot
+/// answer it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvalidationReason {

@@ -1,14 +1,14 @@
 //! Our DOM, seen through Stylo's eyes.
 //!
-//! Stylo does not own a DOM; it operates over one through traits, which is what
-//! lets Servo, Gecko-derived code and now this browser share a cascade. The price
-//! is this file: a handle type that is `Copy`, and the trait implementations that
-//! answer every question the style system asks about a node.
+//! The style engine does not own a DOM; it operates over one through traits, and
+//! this file is our side of that boundary: a handle type that is `Copy`, and the
+//! trait implementations that answer every question the style system asks about a
+//! node.
 //!
 //! This is the first half — [`selectors::Element`], which is what matching needs.
 //! It is useful on its own: `div.note > p:first-child` can be matched against a
-//! parsed document with Servo's own engine before any cascade exists. The rest of
-//! `TElement` — element data, restyle damage, the traversal — follows it.
+//! parsed document before any cascade exists. The rest of `TElement` — element
+//! data, restyle damage, the traversal — follows it.
 
 use std::fmt;
 
@@ -18,7 +18,7 @@ use selectors::bloom::BloomFilter;
 use selectors::matching::{ElementSelectorFlags, MatchingContext};
 use selectors::{Element as SelectorsElement, OpaqueElement};
 use style::selector_parser::{
-    AttrValue, NonTSPseudoClass, PseudoElement, SelectorImpl as ServoSelectorImpl,
+    AttrValue, NonTSPseudoClass, PseudoElement, SelectorImpl as StyleSelectorImpl,
 };
 use style::values::AtomIdent;
 
@@ -28,8 +28,8 @@ use style::values::AtomIdent;
 /// names arrive inside Stylo's `GenericAtomIdent` newtype around the same atom.
 /// The two spellings are not interchangeable to the compiler, which is why both
 /// are named here rather than guessed at each call site.
-type BorrowedLocalName = <ServoSelectorImpl as selectors::SelectorImpl>::BorrowedLocalName;
-type BorrowedNamespace = <ServoSelectorImpl as selectors::SelectorImpl>::BorrowedNamespaceUrl;
+type BorrowedLocalName = <StyleSelectorImpl as selectors::SelectorImpl>::BorrowedLocalName;
+type BorrowedNamespace = <StyleSelectorImpl as selectors::SelectorImpl>::BorrowedNamespaceUrl;
 type LocalNameIdent = style::values::GenericAtomIdent<html5ever::LocalNameStaticSet>;
 type NamespaceIdent = style::values::GenericAtomIdent<html5ever::NamespaceStaticSet>;
 
@@ -93,7 +93,7 @@ impl PartialEq for NodeRef<'_> {
 impl Eq for NodeRef<'_> {}
 
 impl SelectorsElement for NodeRef<'_> {
-    type Impl = ServoSelectorImpl;
+    type Impl = StyleSelectorImpl;
 
     fn opaque(&self) -> OpaqueElement {
         // An identity the matcher can compare and hash without knowing what it is.
@@ -312,9 +312,9 @@ fn fxhash(value: &str) -> u32 {
 
 /// Match `selector` against every element in `document`, in tree order.
 ///
-/// Servo's own matching engine over our tree — the thing the cascade will use for
-/// every rule, exercised here on its own so that "does this selector match this
-/// element" is answerable and testable before any cascade exists.
+/// The matching engine over our tree — the thing the cascade will use for every
+/// rule, exercised here on its own so that "does this selector match this element"
+/// is answerable and testable before any cascade exists.
 pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String> {
     use selectors::matching::{
         MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
@@ -448,7 +448,8 @@ mod tests {
     }
 
     /// `:is()`, `:where()` and `:not()` — the ones a browser written in 2020 has
-    /// and one written in 2005 does not. They come free with Servo's parser.
+    /// and one written in 2005 does not. They come with the selector parser we
+    /// depend on rather than being ours to write.
     #[test]
     fn logical_combinations_are_supported() {
         let html = "<body><h1>a</h1><h2>b</h2><p>c</p>";

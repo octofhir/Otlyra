@@ -3,7 +3,6 @@
 //! Hit testing reads the display list rather than a tree of its own, because a
 //! second structure is a second thing to keep in step — and the failure mode when
 //! it drifts is a link that is clickable somewhere other than where it is drawn.
-//! Ladybird arrived at the same answer and calls its version a `HitTestDisplayList`.
 
 use kurbo::Point;
 

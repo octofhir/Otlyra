@@ -4,7 +4,7 @@
 
 <style>
   /* Nothing on this page is applied yet: the cascade lands at M8. What works
-     today is *matching* — Servo's selector engine over our DOM — so the page is
+     today is *matching* — the selector engine over our DOM — so the page is
      written to make it obvious which rules should have applied once it does. */
   body { font-family: system-ui, sans-serif; }
 
@@ -40,7 +40,7 @@ each rule above <em>should</em> do, so that the difference between "matched" and
 "applied" stays visible while the cascade is being built.</p>
 
 <h2>What works today</h2>
-<p>Selector <strong>matching</strong>, through Servo's own engine over our DOM:
+<p>Selector <strong>matching</strong>, over our own DOM:
 type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 <code>*=</code>), the four combinators, structural pseudo-classes, and
 <code>:is()</code>, <code>:where()</code> and <code>:not()</code>. The

@@ -106,10 +106,9 @@ html5ever = "=0.39.0"
 # is a copy, and the tokenizer produces a great many small slices.
 tendril = { version = "=0.5.1", features = ["encoding_rs"] }
 
-# The CSS engine: Servo's, rebased from mozilla-central. Seven version-locked
-# crates, MPL-2.0, and the reason is §4.7 — exactly two Rust crates model typed CSS
-# property values, and the other one has no cascade, no inheritance and no computed
-# values, which is the hard part of the job.
+# The CSS engine. Seven version-locked crates, MPL-2.0, and the reason is §4.7 —
+# exactly two Rust crates model typed CSS property values, and the other one has no
+# cascade, no inheritance and no computed values, which is the hard part of the job.
 #
 # Pinned exactly and upgraded deliberately: stylo has no API stability and ships
 # semver-breaking releases roughly monthly.
@@ -164,7 +163,7 @@ rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-r
 # WHATWG URL. Hand-rolling this is how CVE-2024-12224 happened.
 url = "=2.5.8"
 
-# WHATWG encodings. Gecko's decoder; the legacy tables are not writable by hand.
+# WHATWG encodings. The legacy index tables are not writable by hand.
 encoding_rs = "=0.8.35"
 
 # CLI and error plumbing.

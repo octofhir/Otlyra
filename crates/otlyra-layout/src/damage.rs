@@ -2,9 +2,8 @@
 //!
 //! Four dirty booleans is the obvious design and the wrong one: every consumer ends
 //! up asking "is style dirty *or* layout dirty *or*…", and each such question is a
-//! place to forget a term. Servo's answer, which this copies, is to make the levels
-//! a strict inclusion chain expressed as bitmasks, so that "does this need layout"
-//! is one AND and cannot be got subtly wrong.
+//! place to forget a term. Making the levels a strict inclusion chain, expressed as
+//! bitmasks, turns the question into one AND that cannot be got subtly wrong.
 //!
 //! The order is fixed by what each step depends on: restyling implies relayout,
 //! relayout implies repainting, repainting implies compositing. Nothing needs the

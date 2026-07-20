@@ -5,9 +5,9 @@
 //! inline-level, in which case they flow into lines. The box tree's anonymous-box
 //! fixup is what makes that true, so neither algorithm ever has to ask.
 //!
-//! Layout is a synchronous, non-reentrant call. Servo deleted its layout thread for
-//! this reason: with layout on the stack, "no script runs during layout" is a fact
-//! about the call stack rather than a protocol anyone has to maintain.
+//! Layout is a synchronous, non-reentrant call, and deliberately not a thread of
+//! its own: with layout on the stack, "no script runs during layout" is a fact about
+//! the call stack rather than a protocol anyone has to maintain.
 
 use std::sync::Arc;
 
