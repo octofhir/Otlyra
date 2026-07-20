@@ -99,6 +99,57 @@ impl<T: Copy> Sides<T> {
     }
 }
 
+/// `white-space`, in the two values that matter before CSS parsing exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WhiteSpace {
+    /// Runs of whitespace collapse to one space and lines wrap.
+    Normal,
+    /// Whitespace and newlines are kept exactly, and lines do not wrap.
+    Pre,
+}
+
+/// `text-decoration-line`, as the flags it is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct TextDecoration {
+    /// A line below the text.
+    pub underline: bool,
+    /// A line through it.
+    pub line_through: bool,
+}
+
+impl TextDecoration {
+    /// No decoration at all — the initial value.
+    pub const NONE: Self = Self {
+        underline: false,
+        line_through: false,
+    };
+    /// `underline`.
+    pub const UNDERLINE: Self = Self {
+        underline: true,
+        line_through: false,
+    };
+    /// `line-through`.
+    pub const LINE_THROUGH: Self = Self {
+        underline: false,
+        line_through: true,
+    };
+
+    /// Whether anything is drawn.
+    pub fn is_none(self) -> bool {
+        !self.underline && !self.line_through
+    }
+}
+
+/// `font-style`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum FontStyle {
+    /// Upright.
+    #[default]
+    Normal,
+    /// Italic, or oblique where the family has no italic face.
+    Italic,
+}
+
 /// `line-height`.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum LineHeight {
@@ -141,12 +192,23 @@ pub struct ComputedStyle {
     pub font_size: f32,
     /// `font-weight`, 100–900. Inherited.
     pub font_weight: u16,
+    /// `font-style`. Inherited.
+    pub font_style: FontStyle,
     /// `line-height`. Inherited.
     pub line_height: LineHeight,
     /// `margin`.
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
     pub padding: Sides<Length>,
+    /// `white-space`. Inherited.
+    pub white_space: WhiteSpace,
+    /// `text-decoration-line`.
+    ///
+    /// Not inherited in CSS — it *propagates*, which is a different thing: a
+    /// descendant cannot turn its ancestor's underline off. Propagating it as
+    /// inheritance is the approximation here, and it differs only for a case we
+    /// cannot express yet (`text-decoration: none` on a child).
+    pub text_decoration: TextDecoration,
     /// `width`.
     pub width: LengthOrAuto,
     /// `height`.
@@ -165,7 +227,10 @@ impl Default for ComputedStyle {
             font_family: Arc::from("system-ui, sans-serif"),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
+            font_style: FontStyle::Normal,
             line_height: LineHeight::Normal,
+            white_space: WhiteSpace::Normal,
+            text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
             padding: Sides::all(Length::ZERO),
             width: LengthOrAuto::Auto,
@@ -187,7 +252,10 @@ impl ComputedStyle {
             font_family: Arc::clone(&parent.font_family),
             font_size: parent.font_size,
             font_weight: parent.font_weight,
+            font_style: parent.font_style,
             line_height: parent.line_height,
+            white_space: parent.white_space,
+            text_decoration: parent.text_decoration,
             ..Self::default()
         }
     }

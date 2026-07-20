@@ -31,7 +31,43 @@ struct Builder<'a> {
     tree: BoxTree,
 }
 
+/// The marker text for a list item, given the list it is in.
+fn marker_text(ordered: bool, index: usize) -> String {
+    if ordered {
+        format!("{}. ", index + 1)
+    } else {
+        "• ".to_owned()
+    }
+}
+
 impl Builder<'_> {
+    /// The marker a list item should show, or `None` if it is not in a list we
+    /// recognise.
+    fn marker_for(&self, item: NodeId) -> Option<String> {
+        let parent = self.document.get(item)?.parent?;
+        let list = self.document.get(parent)?.element()?;
+        let ordered = match list.name.local.as_ref() {
+            "ol" => true,
+            "ul" | "menu" => false,
+            _ => return None,
+        };
+
+        // Counted over the items, not over every child: whitespace between them is
+        // still text, and a numbered list that counts it numbers nothing.
+        let index = self
+            .document
+            .children(parent)
+            .filter(|&child| {
+                self.document
+                    .get(child)
+                    .and_then(|node| node.element())
+                    .is_some_and(|element| element.name.local.as_ref() == "li")
+            })
+            .position(|child| child == item)?;
+
+        Some(marker_text(ordered, index))
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -63,6 +99,27 @@ impl Builder<'_> {
                         parent: None,
                     },
                 );
+
+                // A list item's marker. CSS generates it as a `::marker` box
+                // outside the item's content; putting it inside the content is
+                // coarser and visible in one place — a marker cannot sit in the
+                // margin — but it is what makes a list look like a list.
+                if name == "li"
+                    && let Some(marker) = self.marker_for(node)
+                {
+                    self.tree.push(
+                        id,
+                        BoxNode {
+                            kind: BoxKind::Text(marker.into()),
+                            style: Arc::clone(&style),
+                            node: None,
+                            tag: None,
+                            anonymous: true,
+                            children: Vec::new(),
+                            parent: None,
+                        },
+                    );
+                }
 
                 if has_renderable_children(name) {
                     for child in self.document.children(node) {

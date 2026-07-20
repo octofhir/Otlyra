@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Default HTML rendering — Otlyra</title>
+
+<h1>Default HTML rendering</h1>
+<p>Everything on this page is unstyled. What you see is the user-agent
+stylesheet, which is the browser's own opinion about what HTML looks like
+before any author has said anything.</p>
+
+<h2>Headings</h2>
+<h1>h1 — the page's title</h1>
+<h2>h2 — a section</h2>
+<h3>h3 — a subsection</h3>
+<h4>h4</h4>
+<h5>h5</h5>
+<h6>h6 — smaller than body text, and still bold</h6>
+
+<h2>Paragraphs and inline elements</h2>
+<p>A paragraph of ordinary text, long enough to wrap at most window widths so
+that line breaking has something to do. It contains <b>bold</b> and
+<strong>strong</strong>, <i>italic</i> and <em>emphasis</em>, <u>underlined</u>
+and <s>struck through</s>, <small>small print</small>, <mark>a marked
+phrase</mark>, <code>inline_code()</code>, <kbd>Ctrl</kbd>+<kbd>C</kbd>, and
+<a href="https://example.com/">a link to example.com</a> that is blue,
+underlined, and clickable.</p>
+<p>A second paragraph, to show the margin between them.<br>
+A line after a <code>&lt;br&gt;</code>, which breaks without starting a new
+paragraph.</p>
+
+<h2>Lists</h2>
+<ul>
+  <li>An unordered item</li>
+  <li>Another one, longer, so that it wraps and you can see whether the second
+      line lines up with the first rather than with the marker</li>
+  <li>A third</li>
+</ul>
+<ol>
+  <li>First</li>
+  <li>Second</li>
+  <li>Third</li>
+</ol>
+<dl>
+  <dt>A term</dt>
+  <dd>Its definition, indented.</dd>
+  <dt>Another term</dt>
+  <dd>Another definition.</dd>
+</dl>
+
+<h2>Quotations and preformatted text</h2>
+<blockquote>A block quotation is indented on both sides. It is one of the few
+elements whose default rendering people actually rely on.</blockquote>
+<pre>fn main() {
+    // In &lt;pre&gt;, whitespace   is   preserved
+    // and lines    do not wrap however long they get.
+    println!("hello");
+}</pre>
+
+<h2>A rule</h2>
+<p>Above the rule.</p>
+<hr>
+<p>Below it.</p>
+
+<h2>A table</h2>
+<table>
+  <tr><th>Element</th><th>Default</th></tr>
+  <tr><td>h1</td><td>2em, bold</td></tr>
+  <tr><td>p</td><td>1em margins</td></tr>
+</table>
+<p><small>Table layout is not implemented: cells stack as blocks rather than
+forming rows and columns. This is here to show what that looks like, not to
+claim it works.</small></p>
+
+<h2>Not rendered</h2>
+<p>The following are <code>display: none</code> and should leave no trace:</p>
+<style>p { color: red }</style>
+<script>var x = 1;</script>
+<p>If the CSS or the script above appeared as text, something is wrong.</p>

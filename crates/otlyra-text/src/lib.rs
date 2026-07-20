@@ -34,7 +34,9 @@
 mod engine;
 mod stack;
 
-pub use engine::{Brush, LineMetrics, ShapedRun, ShapedText, TextEngine, TextMetrics, TextSpan};
+pub use engine::{
+    Brush, Decoration, LineMetrics, ShapedRun, ShapedText, TextEngine, TextMetrics, TextSpan,
+};
 pub use stack::{Family, FontStack, GenericFamily};
 
 /// Re-exported so callers name the same font handle type the shaper does.

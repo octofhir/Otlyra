@@ -19,6 +19,17 @@ screenshot path=(screenshot_dir / "otlyra.png") width="1024" height="768" scale=
     cargo run --quiet -- --screenshot {{path}} --width {{width}} --height {{height}} --scale-factor {{scale}}
     @echo "wrote {{path}}"
 
+# Open the default-rendering test page: every element the UA stylesheet has an
+# opinion about, unstyled.
+defaults:
+    cargo run -- --file tests/pages/defaults.html
+
+# Render that page to a PNG instead of opening a window.
+defaults-shot path=(screenshot_dir / "defaults.png"):
+    @mkdir -p "$(dirname {{path}})"
+    cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 2400 --scale-factor 2
+    @echo "wrote {{path}}"
+
 build:
     cargo build --workspace
 

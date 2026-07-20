@@ -24,5 +24,8 @@
 pub mod style;
 pub mod ua;
 
-pub use style::{ComputedStyle, Display, Length, LengthOrAuto, LineHeight, Sides};
+pub use style::{
+    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, LineHeight, Sides, TextDecoration,
+    WhiteSpace,
+};
 pub use ua::{has_renderable_children, initial_style, ua_style};

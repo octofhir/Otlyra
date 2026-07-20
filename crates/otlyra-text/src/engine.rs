@@ -29,6 +29,10 @@ pub struct ShapedRun {
     pub normalized_coords: Vec<i16>,
     /// The colour this run was requested in.
     pub brush: Brush,
+    /// An underline, if the run asked for one.
+    pub underline: Option<Decoration>,
+    /// A strikethrough, if the run asked for one.
+    pub strikethrough: Option<Decoration>,
     /// Which line of the paragraph the run belongs to.
     pub line: usize,
     /// Where the run starts along its line, in logical pixels.
@@ -43,6 +47,19 @@ pub struct ShapedRun {
     pub text_range: std::ops::Range<usize>,
     /// The glyphs, in visual order.
     pub glyphs: Vec<Glyph>,
+}
+
+/// A decoration line under or through a run, with the metrics the font gives it.
+///
+/// Taken from the font rather than guessed from the size: where an underline sits
+/// and how thick it is are design decisions the typeface already made, and a
+/// constant fraction of the em looks wrong in exactly the faces people notice.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Decoration {
+    /// Distance from the baseline, positive upward.
+    pub offset: f32,
+    /// Thickness in logical pixels.
+    pub thickness: f32,
 }
 
 /// One line of a shaped paragraph.
@@ -69,6 +86,12 @@ pub struct TextSpan {
     pub font_size: f32,
     /// CSS `font-weight`, 100–900.
     pub font_weight: u16,
+    /// Whether the run is italic.
+    pub italic: bool,
+    /// Whether to draw a line under the run.
+    pub underline: bool,
+    /// Whether to draw a line through it.
+    pub strikethrough: bool,
     /// Colour, straight RGBA.
     pub brush: Brush,
     /// Line height in logical pixels, or `None` for the font's own.
@@ -249,6 +272,19 @@ impl TextEngine {
                 StyleProperty::FontWeight(parley::FontWeight::new(f32::from(span.font_weight))),
                 range.clone(),
             );
+            builder.push(
+                StyleProperty::FontStyle(if span.italic {
+                    parley::FontStyle::Italic
+                } else {
+                    parley::FontStyle::Normal
+                }),
+                range.clone(),
+            );
+            builder.push(StyleProperty::Underline(span.underline), range.clone());
+            builder.push(
+                StyleProperty::Strikethrough(span.strikethrough),
+                range.clone(),
+            );
             builder.push(StyleProperty::Brush(span.brush), range.clone());
             if let Some(line_height) = span.line_height {
                 builder.push(
@@ -305,8 +341,22 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
             };
-            let brush = glyph_run.style().brush;
+            let style = glyph_run.style();
+            let brush = style.brush;
             let run = glyph_run.run();
+            let metrics = run.metrics();
+
+            let underline = style.underline.as_ref().map(|decoration| Decoration {
+                offset: decoration.offset.unwrap_or(metrics.underline_offset),
+                thickness: decoration.size.unwrap_or(metrics.underline_size).max(1.0),
+            });
+            let strikethrough = style.strikethrough.as_ref().map(|decoration| Decoration {
+                offset: decoration.offset.unwrap_or(metrics.strikethrough_offset),
+                thickness: decoration
+                    .size
+                    .unwrap_or(metrics.strikethrough_size)
+                    .max(1.0),
+            });
 
             let run_index = run.index();
             if consumed.len() <= run_index {
@@ -332,6 +382,8 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
                 font_size: run.font_size(),
                 normalized_coords: run.normalized_coords().to_vec(),
                 brush,
+                underline,
+                strikethrough,
                 line: index,
                 offset_x: glyph_run.offset(),
                 advance: glyph_run.advance(),
@@ -521,6 +573,9 @@ mod tests {
             font_stack: test_stack(),
             font_size: size,
             font_weight: 400,
+            italic: false,
+            underline: false,
+            strikethrough: false,
             brush,
             line_height: None,
         }

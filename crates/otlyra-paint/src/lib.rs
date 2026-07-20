@@ -113,6 +113,31 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
             if run.glyphs.is_empty() {
                 return;
             }
+
+            // Decorations first, so the glyphs sit on top of them: a line drawn
+            // over text is a strikethrough whatever it was meant to be. The offset
+            // and thickness come from the font, by way of the shaper.
+            for decoration in [run.underline.as_ref(), run.strikethrough.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let baseline = f64::from(run.glyphs[0].y);
+                let top = f64::from(rect.y - scroll_y) + baseline - f64::from(decoration.offset);
+                list.push(DisplayItem::Fill {
+                    style: Fill::NonZero,
+                    transform: Affine::IDENTITY,
+                    brush: Brush::Solid(brush_to_color(run.brush)),
+                    brush_transform: None,
+                    shape: KurboRect::new(
+                        f64::from(rect.x),
+                        top,
+                        f64::from(rect.x) + f64::from(run.advance),
+                        top + f64::from(decoration.thickness),
+                    )
+                    .to_path(PATH_TOLERANCE),
+                });
+            }
+
             list.push_glyphs(
                 &run.font,
                 run.font_size,

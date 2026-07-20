@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use peniko::Color;
 
-use crate::style::{ComputedStyle, Display, Length, LengthOrAuto, Sides};
+use crate::style::{
+    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, Sides, TextDecoration, WhiteSpace,
+};
 
 /// `1em` expressed against the parent font size.
 fn em(style: &ComputedStyle, multiple: f32) -> LengthOrAuto {
@@ -50,8 +52,8 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
 
         "html" | "div" | "center" | "section" | "article" | "aside" | "header" | "footer"
-        | "main" | "nav" | "figure" | "figcaption" | "address" | "form" | "fieldset" | "dl"
-        | "dd" | "dt" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
+        | "main" | "nav" | "figure" | "figcaption" | "form" | "fieldset" | "dl"
+        | "dt" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" => {
             style.display = Display::Block;
         }
 
@@ -84,12 +86,8 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         "pre" => {
             style.display = Display::Block;
             style.font_family = Arc::from("monospace");
+            style.white_space = WhiteSpace::Pre;
             style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
-        }
-
-        "hr" => {
-            style.display = Display::Block;
-            style.margin = Sides::axes(LengthOrAuto::Px(8.0), LengthOrAuto::Auto);
         }
 
         // Headings: the standard's own sizes, as multiples of the parent font size,
@@ -113,10 +111,54 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
 
         "b" | "strong" => style.font_weight = 700,
+        "i" | "em" | "cite" | "var" | "dfn" => style.font_style = FontStyle::Italic,
 
-        "a" => style.color = Color::from_rgb8(0x00, 0x00, 0xee),
+        // Block *and* italic, which is why it cannot live in either list above.
+        "address" => {
+            style.display = Display::Block;
+            style.font_style = FontStyle::Italic;
+        }
+
+        // The standard renders a horizontal rule as a bordered block. Borders are
+        // not implemented, so this stands in for one: the same line, drawn as a
+        // background on a one-pixel-tall box. What it is is right; how it gets
+        // there is not, and the difference shows the day `border` exists.
+        "hr" => {
+            style.display = Display::Block;
+            style.height = LengthOrAuto::Px(1.0);
+            style.background_color = Color::from_rgb8(0xc0, 0xc0, 0xc0);
+            style.margin = Sides::axes(LengthOrAuto::Px(8.0), LengthOrAuto::Px(0.0));
+        }
+
+        // Blue and underlined, which between them are how a link says it is one
+        // without relying on colour alone.
+        "a" => {
+            style.color = Color::from_rgb8(0x00, 0x00, 0xee);
+            style.text_decoration = TextDecoration::UNDERLINE;
+        }
+
+        "u" | "ins" => style.text_decoration = TextDecoration::UNDERLINE,
+        "s" | "strike" | "del" => style.text_decoration = TextDecoration::LINE_THROUGH,
+        "textarea" => style.white_space = WhiteSpace::Pre,
 
         "code" | "kbd" | "samp" | "tt" => style.font_family = Arc::from("monospace"),
+
+        "mark" => style.background_color = Color::from_rgb8(0xff, 0xff, 0x00),
+
+        // `dd` is indented; `dt` is not. The standard says 40px, and it is the one
+        // indent people notice the absence of.
+        "dd" => {
+            style.display = Display::Block;
+            style.margin = Sides {
+                left: LengthOrAuto::Px(40.0),
+                ..Sides::all(LengthOrAuto::Px(0.0))
+            };
+        }
+
+        // Smaller, and raised or lowered. The shift is not implemented — there is
+        // no vertical-align — so for now these differ only in size, which is
+        // wrong in a way that is visible and recorded rather than hidden.
+        "sub" | "sup" => style.font_size = parent.font_size * 0.83,
 
         "small" => style.font_size = parent.font_size * 0.83,
 

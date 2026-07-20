@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides};
+use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides, WhiteSpace};
 use otlyra_text::{FontStack, TextEngine, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind, BoxTree};
@@ -192,11 +192,20 @@ impl Flow<'_> {
                     let source = starts
                         .partition_point(|&start| start <= run.text_range.start)
                         .saturating_sub(1);
+                    let box_id = sources.get(source).copied();
+
                     Fragment {
-                        box_id: sources.get(source).copied(),
+                        box_id,
                         rect: Rect::new(x + run.offset_x, line_y, run.advance, height),
                         kind: FragmentKind::Text(run),
-                        style: Arc::clone(&style),
+                        // The run's own style, not the paragraph's: the underline
+                        // on a link belongs to the link, and painting from the
+                        // block's style would underline the whole paragraph or
+                        // none of it.
+                        style: box_id.map_or_else(
+                            || Arc::clone(&style),
+                            |id| Arc::clone(&self.tree.node(id).style),
+                        ),
                         children: Vec::new(),
                     }
                 })
@@ -259,10 +268,18 @@ impl Flow<'_> {
 fn span_for(text: &str, style: &ComputedStyle) -> TextSpan {
     let color = style.color.to_rgba8();
     TextSpan {
-        text: collapse_whitespace(text),
+        text: match style.white_space {
+            WhiteSpace::Normal => collapse_whitespace(text),
+            // `pre` keeps every space and every newline, which is the whole point
+            // of it: code and poetry are the two things HTML cannot re-wrap.
+            WhiteSpace::Pre => text.to_owned(),
+        },
         font_stack: FontStack::parse_css(&style.font_family),
         font_size: style.font_size,
         font_weight: style.font_weight,
+        italic: style.font_style == otlyra_css::FontStyle::Italic,
+        underline: style.text_decoration.underline,
+        strikethrough: style.text_decoration.line_through,
         brush: [color.r, color.g, color.b, color.a],
         line_height: match style.line_height {
             otlyra_css::LineHeight::Normal => None,
