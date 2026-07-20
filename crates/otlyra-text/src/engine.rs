@@ -102,6 +102,41 @@ pub struct TextSpan<'a> {
     pub line_height: Option<f32>,
 }
 
+/// A gap reserved between two spans, and a marker of where their boundary landed.
+///
+/// Shaping a paragraph is the only thing that knows where a span boundary ends up
+/// once lines have been broken, so a caller that needs to reserve horizontal space
+/// at one — the space a border and a padding take on the edge of an inline element —
+/// has to ask for it here rather than adding it afterwards.
+///
+/// A zero-width spacer reserves nothing and still comes back positioned, which is
+/// how a caller finds a span's extent inside a run that the shaper merged with its
+/// neighbours.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Spacer {
+    /// The caller's own identifier, handed back untouched.
+    pub id: u64,
+    /// Where the spacer goes: before `spans[at]`, or after the last span when `at`
+    /// is the number of spans.
+    pub at: usize,
+    /// Width to reserve, in logical pixels. May be zero.
+    pub width: f32,
+}
+
+/// A spacer once the paragraph has been broken into lines.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PlacedSpacer {
+    /// The identifier the caller gave the [`Spacer`].
+    pub id: u64,
+    /// Which line it landed on.
+    pub line: usize,
+    /// Where it starts along the paragraph, in the same coordinates as
+    /// [`ShapedRun::offset_x`].
+    pub x: f32,
+    /// The width it reserved.
+    pub width: f32,
+}
+
 /// Metrics of a whole shaped paragraph.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TextMetrics {
@@ -124,6 +159,9 @@ pub struct ShapedText {
     pub metrics: TextMetrics,
     /// One entry per line, in order.
     pub lines: Vec<LineMetrics>,
+    /// The spacers the caller asked for, positioned. Empty when none were asked
+    /// for, which is every paragraph without a bordered inline element in it.
+    pub spacers: Vec<PlacedSpacer>,
 }
 
 impl ShapedText {
@@ -249,19 +287,45 @@ impl TextEngine {
     /// `bold text` must break in the same place whether or not the `bold` is a
     /// separate element. So the spans are concatenated, styled by range, and broken
     /// together; each run comes back carrying the colour it was asked for.
-    pub fn shape_spans(&mut self, spans: &[TextSpan<'_>], max_advance: Option<f32>) -> ShapedText {
+    /// `spacers` reserve horizontal space at span boundaries and come back
+    /// positioned; see [`Spacer`].
+    pub fn shape_spans(
+        &mut self,
+        spans: &[TextSpan<'_>],
+        spacers: &[Spacer],
+        max_advance: Option<f32>,
+    ) -> ShapedText {
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(spans.len());
+        let mut boundaries = Vec::with_capacity(spans.len() + 1);
         for span in spans {
             let start = text.len();
+            boundaries.push(start);
             text.push_str(span.text);
             ranges.push(start..text.len());
         }
+        boundaries.push(text.len());
 
         let mut builder = self
             .layout
             .ranged_builder(&mut self.fonts, &text, 1.0, true);
         builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+
+        for spacer in spacers {
+            let Some(&index) = boundaries.get(spacer.at) else {
+                continue;
+            };
+            builder.push_inline_box(parley::InlineBox {
+                id: spacer.id,
+                kind: parley::InlineBoxKind::InFlow,
+                index,
+                width: spacer.width,
+                // Zero, deliberately: vertical padding and borders on an inline box
+                // paint outside the line without making the line taller, which is
+                // what CSS says and what a height here would undo.
+                height: 0.0,
+            });
+        }
 
         for (span, range) in spans.iter().zip(ranges) {
             if range.is_empty() {
@@ -319,6 +383,7 @@ impl TextEngine {
 fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
     let mut runs = Vec::new();
     let mut lines = Vec::new();
+    let mut spacers = Vec::new();
     let mut first_baseline = 0.0;
 
     // How many of each parley run's clusters have already been handed out. A run
@@ -342,8 +407,17 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
         });
 
         for item in line.items() {
-            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
+            let glyph_run = match item {
+                PositionedLayoutItem::GlyphRun(glyph_run) => glyph_run,
+                PositionedLayoutItem::InlineBox(placed) => {
+                    spacers.push(PlacedSpacer {
+                        id: placed.id,
+                        line: index,
+                        x: placed.x,
+                        width: placed.width,
+                    });
+                    continue;
+                }
             };
             let style = glyph_run.style();
             let brush = style.brush;
@@ -406,6 +480,7 @@ fn collect(layout: &parley::Layout<Brush>) -> ShapedText {
         },
         runs,
         lines,
+        spacers,
     }
 }
 
@@ -590,10 +665,74 @@ mod tests {
         let mut engine = engine();
         let red = [255, 0, 0, 255];
         let blue = [0, 0, 255, 255];
-        let shaped = engine.shape_spans(&[span("red ", 16.0, red), span("blue", 16.0, blue)], None);
+        let shaped = engine.shape_spans(
+            &[span("red ", 16.0, red), span("blue", 16.0, blue)],
+            &[],
+            None,
+        );
 
         let brushes: Vec<Brush> = shaped.runs.iter().map(|run| run.brush).collect();
         assert_eq!(brushes, vec![red, blue]);
+    }
+
+    /// A zero-width spacer measures a span boundary without moving anything, which
+    /// is what finds a span inside a run the shaper merged with its neighbours.
+    #[test]
+    fn zero_width_spacers_mark_a_span_boundary_without_moving_it() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("one", 16.0, brush), span("two", 16.0, brush)];
+        let plain = engine.shape_spans(&spans, &[], None);
+        let marked = engine.shape_spans(
+            &spans,
+            &[
+                Spacer {
+                    id: 1,
+                    at: 1,
+                    width: 0.0,
+                },
+                Spacer {
+                    id: 2,
+                    at: 2,
+                    width: 0.0,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(marked.metrics.width, plain.metrics.width);
+        let placed: Vec<(u64, f32)> = marked
+            .spacers
+            .iter()
+            .map(|spacer| (spacer.id, spacer.x))
+            .collect();
+        assert_eq!(placed.len(), 2);
+        assert!(placed[0].1 > 0.0, "the boundary is past the first span");
+        assert_eq!(
+            placed[1].1, marked.metrics.width,
+            "and the end of the text is the end of the line"
+        );
+    }
+
+    /// A spacer with a width is how an inline element's border and padding take
+    /// room: the text after it moves over by exactly that much.
+    #[test]
+    fn a_spacer_reserves_room_in_the_line() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("one", 16.0, brush), span("two", 16.0, brush)];
+        let plain = engine.shape_spans(&spans, &[], None);
+        let spaced = engine.shape_spans(
+            &spans,
+            &[Spacer {
+                id: 1,
+                at: 1,
+                width: 20.0,
+            }],
+            None,
+        );
+
+        assert!((spaced.metrics.width - plain.metrics.width - 20.0).abs() < 0.01);
     }
 
     /// The reason spans are shaped together rather than one at a time: the break
@@ -604,6 +743,7 @@ mod tests {
         let brush = [0, 0, 0, 255];
         let together = engine.shape_spans(
             &[span("alpha ", 16.0, brush), span("beta", 16.0, brush)],
+            &[],
             Some(48.0),
         );
         let one_string = engine.shape("alpha beta", &test_stack(), 16.0, Some(48.0));
@@ -625,6 +765,7 @@ mod tests {
         let brush = [0, 0, 0, 255];
         let mixed = engine.shape_spans(
             &[span("small ", 12.0, brush), span("BIG", 32.0, brush)],
+            &[],
             None,
         );
 

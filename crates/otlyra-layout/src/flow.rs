@@ -163,7 +163,7 @@ impl<'a> Flow<'a> {
             offset += span.text.len();
         }
 
-        let shaped = self.text.shape_spans(&spans, Some(width));
+        let shaped = self.text.shape_spans(&spans, &[], Some(width));
         let style = Arc::clone(&self.tree.node(parent).style);
 
         // parley measures line tops from the text origin, and the first line's top

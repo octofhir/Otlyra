@@ -35,7 +35,8 @@ mod engine;
 mod stack;
 
 pub use engine::{
-    Brush, Decoration, LineMetrics, ShapedRun, ShapedText, TextEngine, TextMetrics, TextSpan,
+    Brush, Decoration, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, TextEngine,
+    TextMetrics, TextSpan,
 };
 pub use stack::{Family, FontStack, GenericFamily};
 
