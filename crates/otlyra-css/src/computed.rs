@@ -12,8 +12,9 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    Border, ComputedStyle, Display, FontStyle, Length, LengthOrAuto, LineHeight, Sides, TextAlign,
-    TextDecoration, WhiteSpace,
+    AlignItems, Border, Clear, ComputedStyle, Display, FlexDirection, FlexWrap, Float, FontStyle,
+    JustifyContent, Length, LengthOrAuto, LineHeight, Position, Sides, TextAlign, TextDecoration,
+    WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -60,6 +61,27 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         max_width: max_size(&values.get_position().max_width),
         min_height: min_size(&values.get_position().min_height),
         max_height: max_size(&values.get_position().max_height),
+        float: float_of(values),
+        clear: clear_of(values),
+        position: position_of(values),
+        inset: Sides {
+            top: inset(&values.get_position().top),
+            right: inset(&values.get_position().right),
+            bottom: inset(&values.get_position().bottom),
+            left: inset(&values.get_position().left),
+        },
+        flex_direction: flex_direction(values),
+        flex_wrap: flex_wrap(values),
+        justify_content: justify_content(values),
+        align_items: align_items(values),
+        align_self: align_self(values),
+        flex_grow: values.clone_flex_grow().0,
+        flex_shrink: values.clone_flex_shrink().0,
+        flex_basis: flex_basis(values),
+        gap: (
+            gap(&values.get_position().row_gap),
+            gap(&values.get_position().column_gap),
+        ),
     }
 }
 
@@ -71,12 +93,19 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
 /// `display: none` is not approximated at all.
 fn display_of(values: &ComputedValues) -> Display {
     use style::values::computed::Display as Computed;
+    use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
     let display = values.clone_display();
     if display == Computed::None {
         return Display::None;
     }
-    if display.outside() == style::values::specified::box_::DisplayOutside::Inline {
+    // A flex container is a flex container whichever way round it sits in its
+    // parent; `inline-flex` differs in how it is placed, which is a difference
+    // layout cannot express yet.
+    if display.inside() == DisplayInside::Flex {
+        return Display::Flex;
+    }
+    if display.outside() == DisplayOutside::Inline {
         Display::Inline
     } else {
         Display::Block
@@ -205,6 +234,140 @@ fn text_align(values: &ComputedValues) -> TextAlign {
         // `justify` spaces a line out, which inline layout does not do; its start
         // edge is where a start-aligned line begins, so that is what it gets.
         _ => TextAlign::Start,
+    }
+}
+
+fn position_of(values: &ComputedValues) -> Position {
+    use style::computed_values::position::T as Computed;
+
+    match values.clone_position() {
+        Computed::Relative => Position::Relative,
+        Computed::Absolute => Position::Absolute,
+        Computed::Fixed => Position::Fixed,
+        Computed::Sticky => Position::Sticky,
+        _ => Position::Static,
+    }
+}
+
+/// One of `top`, `right`, `bottom`, `left`.
+fn inset(value: &style::values::computed::Inset) -> LengthOrAuto {
+    use style::values::generics::position::GenericInset as Generic;
+
+    match value {
+        Generic::LengthPercentage(value) => match value.to_percentage() {
+            Some(percentage) => LengthOrAuto::Percent(percentage.0),
+            None => LengthOrAuto::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
+        },
+        // `auto`, and the anchor functions, which need an anchor element to
+        // measure against and are `auto` until there is one.
+        _ => LengthOrAuto::Auto,
+    }
+}
+
+fn flex_direction(values: &ComputedValues) -> FlexDirection {
+    use style::computed_values::flex_direction::T as Computed;
+
+    match values.clone_flex_direction() {
+        Computed::Row => FlexDirection::Row,
+        Computed::RowReverse => FlexDirection::RowReverse,
+        Computed::Column => FlexDirection::Column,
+        Computed::ColumnReverse => FlexDirection::ColumnReverse,
+    }
+}
+
+fn flex_wrap(values: &ComputedValues) -> FlexWrap {
+    use style::computed_values::flex_wrap::T as Computed;
+
+    match values.clone_flex_wrap() {
+        Computed::Nowrap => FlexWrap::NoWrap,
+        Computed::Wrap => FlexWrap::Wrap,
+        Computed::WrapReverse => FlexWrap::WrapReverse,
+    }
+}
+
+fn justify_content(values: &ComputedValues) -> JustifyContent {
+    use style::values::specified::align::AlignFlags;
+
+    match values.clone_justify_content().primary().value() {
+        AlignFlags::SPACE_BETWEEN => JustifyContent::SpaceBetween,
+        AlignFlags::SPACE_AROUND => JustifyContent::SpaceAround,
+        AlignFlags::SPACE_EVENLY => JustifyContent::SpaceEvenly,
+        AlignFlags::CENTER => JustifyContent::Center,
+        AlignFlags::END | AlignFlags::FLEX_END | AlignFlags::RIGHT => JustifyContent::End,
+        _ => JustifyContent::Start,
+    }
+}
+
+/// One `align-items`-shaped keyword, whatever property it came from.
+fn align_keyword(value: style::values::specified::align::AlignFlags) -> Option<AlignItems> {
+    use style::values::specified::align::AlignFlags;
+
+    match value.value() {
+        AlignFlags::CENTER => Some(AlignItems::Center),
+        AlignFlags::START | AlignFlags::SELF_START | AlignFlags::FLEX_START => {
+            Some(AlignItems::Start)
+        }
+        AlignFlags::END | AlignFlags::SELF_END | AlignFlags::FLEX_END => Some(AlignItems::End),
+        AlignFlags::STRETCH | AlignFlags::NORMAL => Some(AlignItems::Stretch),
+        AlignFlags::BASELINE | AlignFlags::LAST_BASELINE => Some(AlignItems::Baseline),
+        _ => None,
+    }
+}
+
+fn align_items(values: &ComputedValues) -> AlignItems {
+    align_keyword(values.clone_align_items().0).unwrap_or(AlignItems::Stretch)
+}
+
+fn align_self(values: &ComputedValues) -> Option<AlignItems> {
+    use style::values::specified::align::AlignFlags;
+
+    let value = values.clone_align_self().0;
+    if value.value() == AlignFlags::AUTO {
+        return None;
+    }
+    align_keyword(value)
+}
+
+/// A `row-gap` or `column-gap`. `normal` is no gap outside a multi-column layout.
+fn gap(value: &style::values::computed::length::NonNegativeLengthPercentageOrNormal) -> Length {
+    use style::values::generics::length::GenericLengthPercentageOrNormal as Generic;
+
+    match value {
+        Generic::Normal => Length::ZERO,
+        Generic::LengthPercentage(length_percentage) => length(&length_percentage.0),
+    }
+}
+
+fn flex_basis(values: &ComputedValues) -> Option<LengthOrAuto> {
+    use style::values::generics::flex::FlexBasis as Generic;
+
+    match values.clone_flex_basis() {
+        Generic::Content => None,
+        Generic::Size(value) => match size(&value) {
+            LengthOrAuto::Auto => None,
+            other => Some(other),
+        },
+    }
+}
+
+fn float_of(values: &ComputedValues) -> Float {
+    use style::computed_values::float::T as Computed;
+
+    match values.clone_float() {
+        Computed::Left => Float::Left,
+        Computed::Right => Float::Right,
+        _ => Float::None,
+    }
+}
+
+fn clear_of(values: &ComputedValues) -> Clear {
+    use style::computed_values::clear::T as Computed;
+
+    match values.clone_clear() {
+        Computed::Left => Clear::Left,
+        Computed::Right => Clear::Right,
+        Computed::Both => Clear::Both,
+        _ => Clear::None,
     }
 }
 

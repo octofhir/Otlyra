@@ -303,6 +303,27 @@ impl TextEngine {
         spacers: &[Spacer],
         max_advance: Option<f32>,
     ) -> ShapedText {
+        self.shape_spans_wrapping(spans, spacers, |_, _| max_advance)
+    }
+
+    /// Shape several spans as one paragraph, with the width decided line by line.
+    ///
+    /// `line_width` is asked for each line in turn, given its index and where its
+    /// top has landed, and answers how wide that line may be. This is what lets
+    /// text flow around something beside it: a float shortens the lines it sits
+    /// next to and no others, and only the shaper knows where one line ends and the
+    /// next begins.
+    ///
+    /// The width is asked for before the line is broken, so what it is given is the
+    /// top of the line and not its height. A float that starts partway down a line
+    /// therefore takes effect from the next one, which is the same approximation
+    /// every engine makes somewhere and is invisible at ordinary line heights.
+    pub fn shape_spans_wrapping(
+        &mut self,
+        spans: &[TextSpan<'_>],
+        spacers: &[Spacer],
+        line_width: impl FnMut(usize, f32) -> Option<f32>,
+    ) -> ShapedText {
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(spans.len());
         let mut boundaries = Vec::with_capacity(spans.len() + 1);
@@ -368,7 +389,7 @@ impl TextEngine {
         }
 
         let mut layout = builder.build(&text);
-        layout.break_all_lines(max_advance);
+        break_lines(&mut layout, line_width);
         layout.align(Alignment::Start, AlignmentOptions::default());
         collect(&layout)
     }
@@ -381,6 +402,38 @@ impl TextEngine {
     /// Whether a family name resolves to anything in the collection.
     pub fn has_family(&mut self, name: &str) -> bool {
         self.fonts.collection.family_by_name(name).is_some()
+    }
+}
+
+/// Break `layout` into lines, asking `line_width` how wide each one may be.
+///
+/// One line at a time rather than all at once, because the answer for a line
+/// depends on where the line landed.
+fn break_lines(
+    layout: &mut parley::Layout<Brush>,
+    mut line_width: impl FnMut(usize, f32) -> Option<f32>,
+) {
+    let mut breaker = layout.break_lines();
+    let mut index = 0usize;
+    let mut top = 0.0f32;
+
+    loop {
+        // parley asserts the two are the same, and they are two names for one
+        // thing until a line can be narrower than the paragraph it is in.
+        let width = line_width(index, top).unwrap_or(f32::INFINITY);
+        breaker.state_mut().set_layout_max_advance(width);
+        breaker.state_mut().set_line_max_advance(width);
+
+        match breaker.break_next() {
+            Some(parley::YieldData::LineBreak(line)) => {
+                top = line.line_y_end as f32;
+                index += 1;
+            }
+            // The other yields are for callers that place their own boxes or cap
+            // the height; neither is asked for here.
+            Some(_) => {}
+            None => break,
+        }
     }
 }
 
@@ -743,6 +796,29 @@ mod tests {
         );
 
         assert!((spaced.metrics.width - plain.metrics.width - 20.0).abs() < 0.01);
+    }
+
+    /// A narrower line breaks earlier than a wide one in the same paragraph, which
+    /// is the whole mechanism behind text flowing around something beside it.
+    #[test]
+    fn a_line_may_be_narrower_than_the_paragraph() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("alpha beta gamma delta epsilon", 16.0, brush)];
+
+        let even = engine.shape_spans(&spans, &[], Some(200.0));
+        // The first two lines are half as wide, as a float beside them would make
+        // them; the rest of the paragraph gets the full width back.
+        let stepped = engine.shape_spans_wrapping(&spans, &[], |index, _| {
+            Some(if index < 2 { 100.0 } else { 200.0 })
+        });
+
+        assert!(stepped.lines.len() > even.lines.len());
+        assert!(stepped.lines[0].width <= 100.0);
+        assert!(
+            stepped.lines.last().expect("a last line").width > 0.0,
+            "the paragraph still finishes"
+        );
     }
 
     /// The reason spans are shaped together rather than one at a time: the break

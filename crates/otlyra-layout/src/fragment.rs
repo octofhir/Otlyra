@@ -86,6 +86,12 @@ pub struct Fragment {
     pub kind: FragmentKind,
     /// The style to paint it with.
     pub style: Arc<ComputedStyle>,
+    /// Whether scrolling the page moves it.
+    ///
+    /// A fixed box is placed against the viewport, and so is everything inside it;
+    /// its coordinates are already the ones it is drawn at, whatever the reader has
+    /// scrolled past.
+    pub fixed: bool,
     /// Children, in paint order.
     pub children: Vec<Fragment>,
 }
@@ -114,12 +120,22 @@ impl FragmentTree {
         })
     }
 
-    /// Fragments that touch `viewport`, in paint order.
+    /// Fragments that touch the visible area, in paint order.
     ///
     /// Culling, not clipping: a fragment outside the viewport is not painted at all
     /// rather than painted and discarded, and on a long page that is most of them.
-    pub fn visible<'a>(&'a self, viewport: &'a Rect) -> impl Iterator<Item = &'a Fragment> {
-        self.iter()
-            .filter(move |fragment| fragment.rect.intersects(viewport))
+    ///
+    /// Two rectangles because there are two coordinate spaces: `scrolled` is the
+    /// part of the page on screen, and `screen` is the screen itself, which is what
+    /// a fixed fragment is already placed in.
+    pub fn visible<'a>(
+        &'a self,
+        scrolled: &'a Rect,
+        screen: &'a Rect,
+    ) -> impl Iterator<Item = &'a Fragment> {
+        self.iter().filter(move |fragment| {
+            let against = if fragment.fixed { screen } else { scrolled };
+            fragment.rect.intersects(against)
+        })
     }
 }

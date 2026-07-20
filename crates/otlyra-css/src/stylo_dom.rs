@@ -655,6 +655,17 @@ impl Default for StyleData {
 }
 
 impl StyleData {
+    /// Per-element state sharing an existing lock.
+    ///
+    /// The lock has to be the one the stylesheets were parsed under: a declaration
+    /// block read through a different lock is a panic, not a wrong answer.
+    pub fn with_lock(lock: style::shared_lock::SharedRwLock) -> Self {
+        Self {
+            slots: std::collections::HashMap::new(),
+            lock,
+        }
+    }
+
     /// Make a slot for every element in `document`, and fill it.
     ///
     /// The matcher asks for an element's id, classes and attribute names through

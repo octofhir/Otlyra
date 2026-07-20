@@ -38,11 +38,14 @@ pub struct PageScene {
     targets: Vec<(otlyra_gfx::kurbo::Rect, BoxId)>,
     /// The last layout, and the width it was made at.
     layout: Option<(f32, FragmentTree)>,
-    /// The viewport the cascade last ran against.
+    /// The parsed stylesheets and the cascade machinery over them.
     ///
-    /// Style depends on the viewport — `vw`, `vh` and media queries all read it —
-    /// so a resize is a restyle, not only a relayout.
-    styled_at: Option<(f32, f32)>,
+    /// Kept rather than rebuilt, so a resize does not re-parse a page's CSS. Absent
+    /// until the first frame, because parsing is not worth doing for a page nobody
+    /// has looked at.
+    styler: Option<otlyra_css::cascade::Styler>,
+    /// Whether the styles the box tree was built from still hold.
+    styled: bool,
     /// How far down the page the reader is, in logical pixels.
     scroll: f32,
     /// The last frame's content height, so a scroll can be clamped without waiting
@@ -67,7 +70,8 @@ impl PageScene {
             document,
             targets: Vec::new(),
             layout: None,
-            styled_at: None,
+            styler: None,
+            styled: false,
             scroll: 0.0,
             viewport_height: 0.0,
             damage: Damage::STYLE,
@@ -104,9 +108,7 @@ impl PageScene {
     /// Lay the page out for `width`, reusing the last layout if the width has not
     /// changed.
     fn fragments(&mut self, text: &mut TextEngine, width: f32, height: f32) -> &FragmentTree {
-        if self.styled_at != Some((width, height)) {
-            self.restyle(width, height);
-        }
+        self.restyle_if_needed(width, height);
 
         let stale = !matches!(&self.layout, Some((last, _)) if *last == width);
         if stale {
@@ -120,20 +122,44 @@ impl PageScene {
         &self.layout.as_ref().expect("just laid out").1
     }
 
-    /// Run the cascade for a viewport of `width` by `height`, and rebuild the boxes.
-    fn restyle(&mut self, width: f32, height: f32) {
-        let styles = otlyra_css::cascade::style_document_with(
-            &self.document,
-            otlyra_css::cascade::Viewport {
-                width,
-                height,
-                scale: 1.0,
-            },
-            &self.sheets,
-        );
+    /// Run the cascade for a viewport of `width` by `height` if this viewport can
+    /// change what it computed.
+    ///
+    /// Most resizes cannot: without a media query or a viewport unit, every element
+    /// keeps the style it had, and the width a box is laid out at is layout's
+    /// business rather than the cascade's. Asking is what turns a resize from a
+    /// re-parse and a re-cascade of the whole document into a relayout.
+    fn restyle_if_needed(&mut self, width: f32, height: f32) {
+        let viewport = otlyra_css::cascade::Viewport {
+            width,
+            height,
+            scale: 1.0,
+        };
+
+        let stale = match self.styler.as_mut() {
+            Some(styler) => styler.resize(viewport),
+            None => {
+                self.styler = Some(otlyra_css::cascade::Styler::new(
+                    &self.document,
+                    viewport,
+                    &self.sheets,
+                ));
+                true
+            }
+        };
+
+        if !stale && self.styled {
+            return;
+        }
+
+        let styles = self
+            .styler
+            .as_mut()
+            .expect("a styler was just made if there was none")
+            .style(&self.document);
         self.boxes =
             otlyra_layout::build_box_tree_with_images(&self.document, Some(&styles), &self.images);
-        self.styled_at = Some((width, height));
+        self.styled = true;
         self.layout = None;
         self.damage.add(Damage::of(
             otlyra_layout::InvalidationReason::DocumentLoaded,
@@ -317,6 +343,62 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The colour of the first paragraph, which is what a media query in these
+    /// tests changes.
+    fn paragraph_colour(page: &PageScene) -> otlyra_gfx::peniko::Color {
+        let boxes = page.boxes();
+        boxes
+            .descendants(boxes.root())
+            .into_iter()
+            .find(|&id| {
+                boxes
+                    .node(id)
+                    .tag
+                    .as_ref()
+                    .is_some_and(|tag| tag.as_ref() == "p")
+            })
+            .map(|id| boxes.node(id).style.color)
+            .expect("a paragraph")
+    }
+
+    /// A resize relays out; it re-cascades only when the viewport is something a
+    /// rule reads.
+    #[test]
+    fn a_resize_restyles_only_when_a_rule_reads_the_viewport() {
+        let (mut page, mut text) = scene(
+            "<style>@media (min-width: 700px) { p { color: rgb(255, 0, 0) } }</style><p>text",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(
+            paragraph_colour(&page),
+            otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0)
+        );
+
+        page.build_display_list(&mut text, 500.0, 600.0, 0.0);
+        assert_ne!(
+            paragraph_colour(&page),
+            otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0),
+            "the query stopped matching and nothing noticed"
+        );
+    }
+
+    /// A resize with nothing to restyle keeps the styles it had, and lays out
+    /// again at the new width — which is the whole point of asking first.
+    #[test]
+    fn a_resize_nothing_reads_still_relays_out() {
+        let (mut page, mut text) = scene("<style>p { color: rgb(0, 128, 0) }</style><p>text</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let colour = paragraph_colour(&page);
+
+        page.build_display_list(&mut text, 300.0, 600.0, 0.0);
+        assert_eq!(paragraph_colour(&page), colour);
+        assert_eq!(
+            page.layout.as_ref().expect("a layout").0,
+            300.0,
+            "laid out at the new width"
+        );
     }
 
     #[test]

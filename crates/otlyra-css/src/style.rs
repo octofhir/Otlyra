@@ -17,6 +17,77 @@ pub enum Display {
     Block,
     /// Inline-level: flows in a line box.
     Inline,
+    /// A flex container: block-level outside, and its children are flex items
+    /// rather than a block or inline formatting context.
+    Flex,
+}
+
+/// `flex-direction`, narrowed to the axis and whether it is reversed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlexDirection {
+    /// Along the inline axis.
+    Row,
+    /// Along the inline axis, from the end.
+    RowReverse,
+    /// Down the block axis.
+    Column,
+    /// Up the block axis.
+    ColumnReverse,
+}
+
+impl FlexDirection {
+    /// Whether the main axis is horizontal.
+    pub fn is_row(self) -> bool {
+        matches!(self, Self::Row | Self::RowReverse)
+    }
+
+    /// Whether items are placed from the far end of the main axis.
+    pub fn is_reverse(self) -> bool {
+        matches!(self, Self::RowReverse | Self::ColumnReverse)
+    }
+}
+
+/// How the leftover main-axis space is shared out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JustifyContent {
+    /// All of it after the items.
+    Start,
+    /// All of it before them.
+    End,
+    /// Half before, half after.
+    Center,
+    /// Between them, none at the ends.
+    SpaceBetween,
+    /// Between them and half as much at each end.
+    SpaceAround,
+    /// Equally between them and at the ends.
+    SpaceEvenly,
+}
+
+/// How items are placed across the cross axis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AlignItems {
+    /// At the start edge.
+    Start,
+    /// At the end edge.
+    End,
+    /// Centred.
+    Center,
+    /// Filling the line, which is what makes columns of equal height.
+    Stretch,
+    /// On their first baselines. Not implemented, and laid out as `start`.
+    Baseline,
+}
+
+/// `flex-wrap`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlexWrap {
+    /// One line, however much it overflows.
+    NoWrap,
+    /// As many lines as the items need.
+    Wrap,
+    /// As many lines, stacked the other way.
+    WrapReverse,
 }
 
 /// A length, or `auto`.
@@ -135,6 +206,58 @@ pub enum TextAlign {
     Center,
     /// The end edge.
     End,
+}
+
+/// `position`, which decides what a box's coordinates mean.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Position {
+    /// In the flow, at the place the flow puts it.
+    Static,
+    /// In the flow, and then moved by its insets without moving anything else.
+    Relative,
+    /// Out of the flow, placed against the nearest positioned ancestor.
+    Absolute,
+    /// Out of the flow, placed against the viewport and not scrolled with the page.
+    Fixed,
+    /// In the flow until the page scrolls it to its inset, and then held there.
+    Sticky,
+}
+
+impl Position {
+    /// Whether a box with this `position` is taken out of the flow.
+    pub fn is_out_of_flow(self) -> bool {
+        matches!(self, Self::Absolute | Self::Fixed)
+    }
+
+    /// Whether a box with this `position` is a containing block for the absolutely
+    /// positioned boxes inside it.
+    pub fn is_containing_block(self) -> bool {
+        !matches!(self, Self::Static)
+    }
+}
+
+/// `float`, which takes a box out of the flow and puts it against an edge.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Float {
+    /// In the flow, like everything else.
+    None,
+    /// Against the start edge, with the lines beside it shortened.
+    Left,
+    /// Against the end edge.
+    Right,
+}
+
+/// `clear`, which pushes a box past the floats it names.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Clear {
+    /// Nothing to clear.
+    None,
+    /// Past the bottom of every left float.
+    Left,
+    /// Past every right float.
+    Right,
+    /// Past both.
+    Both,
 }
 
 /// `white-space`, in the two values that matter before CSS parsing exists.
@@ -265,6 +388,33 @@ pub struct ComputedStyle {
     pub min_height: Length,
     /// `max-height`, or `None` for `none`.
     pub max_height: Option<Length>,
+    /// `float`.
+    pub float: Float,
+    /// `clear`.
+    pub clear: Clear,
+    /// `position`.
+    pub position: Position,
+    /// `top`, `right`, `bottom` and `left`, which only a positioned box reads.
+    pub inset: Sides<LengthOrAuto>,
+    /// `flex-direction`, read by a flex container.
+    pub flex_direction: FlexDirection,
+    /// `flex-wrap`.
+    pub flex_wrap: FlexWrap,
+    /// `justify-content`, along the main axis.
+    pub justify_content: JustifyContent,
+    /// `align-items`, across it.
+    pub align_items: AlignItems,
+    /// `align-self`, which overrides the container's `align-items` for one item.
+    /// `None` is `auto`: take the container's.
+    pub align_self: Option<AlignItems>,
+    /// `flex-grow`, read by a flex item.
+    pub flex_grow: f32,
+    /// `flex-shrink`.
+    pub flex_shrink: f32,
+    /// `flex-basis`, or `None` for `auto` — take the item's own size.
+    pub flex_basis: Option<LengthOrAuto>,
+    /// `row-gap` and `column-gap`, which a flex container puts between its items.
+    pub gap: (Length, Length),
 }
 
 /// The initial values, as CSS defines them, with the UA's font defaults.
@@ -293,6 +443,19 @@ impl Default for ComputedStyle {
             max_width: None,
             min_height: Length::ZERO,
             max_height: None,
+            float: Float::None,
+            clear: Clear::None,
+            position: Position::Static,
+            inset: Sides::all(LengthOrAuto::Auto),
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
+            justify_content: JustifyContent::Start,
+            align_items: AlignItems::Stretch,
+            align_self: None,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
+            gap: (Length::ZERO, Length::ZERO),
         }
     }
 }

@@ -98,108 +98,193 @@ pub fn style_document_with(
     viewport: Viewport,
     external: &ExternalSheets,
 ) -> StyledDocument {
-    let _span = tracing::info_span!("recalc_style").entered();
+    Styler::new(document, viewport, external).style(document)
+}
 
-    let mut style_data = StyleData::default();
-    style_data.prepare(document);
+/// The parsed stylesheets and the machinery that cascades them, kept between
+/// restyles.
+///
+/// Parsing a page's CSS again on every resize is the cost this exists to remove:
+/// the sheets have not changed, and neither has which rule beats which. What a new
+/// viewport can change is which media queries match and what `vw` resolves to, and
+/// the engine can answer whether either actually did — so most resizes turn out to
+/// need no cascade at all.
+pub struct Styler {
+    lock: SharedRwLock,
+    stylist: Stylist,
+    quirks_mode: QuirksMode,
+    viewport: Viewport,
+}
 
-    let lock = style_data.lock().clone();
-    let url = base_url();
+impl std::fmt::Debug for Styler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Styler")
+            .field("viewport", &self.viewport)
+            .finish_non_exhaustive()
+    }
+}
 
-    let quirks_mode = match document.quirks_mode() {
-        html5ever::interface::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
-        html5ever::interface::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
-        html5ever::interface::QuirksMode::Quirks => QuirksMode::Quirks,
-    };
+impl Styler {
+    /// Parse the user-agent sheet and the document's own, once.
+    pub fn new(document: &Document, viewport: Viewport, external: &ExternalSheets) -> Self {
+        let _span = tracing::info_span!("parse_stylesheets").entered();
 
-    let size = euclid::Size2D::new(viewport.width, viewport.height);
-    let device = Device::new(
-        MediaType::screen(),
-        quirks_mode,
-        size,
-        euclid::Size2D::new(
-            viewport.width * viewport.scale,
-            viewport.height * viewport.scale,
-        ),
-        euclid::Scale::new(viewport.scale),
-        Box::new(NoFontMetrics),
-        // The initial values every cascade starts from, with the default font
-        // taken from those same initial values: there is no platform font
-        // preference to consult yet.
-        ComputedValues::initial_values_with_font_override(
-            style::properties::style_structs::Font::initial_values(),
-        ),
-        style::queries::values::PrefersColorScheme::Light,
-        style::servo::media_features::PointerCapabilities::FINE,
-        style::servo::media_features::PointerCapabilities::FINE,
-    );
+        let lock = SharedRwLock::new();
+        let url = base_url();
+        let quirks_mode = match document.quirks_mode() {
+            html5ever::interface::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
+            html5ever::interface::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
+            html5ever::interface::QuirksMode::Quirks => QuirksMode::Quirks,
+        };
 
-    let mut stylist = Stylist::new(device, quirks_mode);
-    stylist.append_stylesheet(
-        DocumentStyleSheet(Arc::new(parse_sheet(
-            UA_STYLESHEET,
-            Origin::UserAgent,
-            &lock,
-            &url,
-            quirks_mode,
-        ))),
-        &lock.read(),
-    );
-
-    for source in author_stylesheets(document, external) {
+        let mut stylist = Stylist::new(device_for(viewport, quirks_mode), quirks_mode);
         stylist.append_stylesheet(
             DocumentStyleSheet(Arc::new(parse_sheet(
-                &source,
-                Origin::Author,
+                UA_STYLESHEET,
+                Origin::UserAgent,
                 &lock,
                 &url,
                 quirks_mode,
             ))),
             &lock.read(),
         );
-    }
 
-    let guard = lock.read();
-    stylist.flush(&StylesheetGuards::same(&guard));
+        for source in author_stylesheets(document, external) {
+            stylist.append_stylesheet(
+                DocumentStyleSheet(Arc::new(parse_sheet(
+                    &source,
+                    Origin::Author,
+                    &lock,
+                    &url,
+                    quirks_mode,
+                ))),
+                &lock.read(),
+            );
+        }
 
-    let snapshots = SnapshotMap::new();
-    let shared = SharedStyleContext {
-        stylist: &stylist,
-        visited_styles_enabled: false,
-        options: Default::default(),
-        guards: StylesheetGuards::same(&guard),
-        current_time_for_animations: 0.0,
-        traversal_flags: TraversalFlags::empty(),
-        snapshot_map: &snapshots,
-        animations: Default::default(),
-        registered_speculative_painters: &NoPainters,
-    };
-
-    let tree = Tree::styled(document, &style_data);
-    let _scope = TreeScope::enter(&tree);
-    let mut styles = HashMap::new();
-    {
-        // The engine's assertions check that a restyle happens on a thread that has
-        // declared itself the layout thread — including in the destructors of the
-        // context, which is why this is a guard and not two bare calls. The
-        // assertion is not a formality: element data is behind interior mutability
-        // that only one thread at a time may touch.
-        let _layout = LayoutThread::enter();
-
-        let mut thread_local = ThreadLocalStyleContext::new();
-        let mut context = StyleContext {
-            shared: &shared,
-            thread_local: &mut thread_local,
-        };
-
-        let root = document.root();
-        for child in document.children(root).collect::<Vec<_>>() {
-            resolve(&tree, child, None, 0, &mut context, &mut styles);
+        Self {
+            lock,
+            stylist,
+            quirks_mode,
+            viewport,
         }
     }
 
-    tracing::debug!(elements = styles.len(), "styled");
-    StyledDocument { style_data, styles }
+    /// The viewport the last cascade ran against.
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    /// Point the sheets at a new viewport, and say whether that changes anything.
+    ///
+    /// `false` means the same rules apply to the same elements with the same
+    /// values, so the styles already computed still hold and the caller can go
+    /// straight to layout. That is the common case: a window resized on a page
+    /// with no media queries and no viewport units restyles nothing.
+    ///
+    /// Before the first cascade the answer is always `true`, because there is
+    /// nothing yet for a resize to preserve.
+    pub fn resize(&mut self, viewport: Viewport) -> bool {
+        if self.viewport == viewport {
+            return false;
+        }
+
+        // Asked before the device is replaced: the flag is set while cascading,
+        // on the device that did the cascading.
+        let used_viewport_units = self.stylist.device().used_viewport_size();
+        self.viewport = viewport;
+
+        let device = device_for(viewport, self.quirks_mode);
+        let guard = self.lock.read();
+        let changed = self
+            .stylist
+            .set_device(device, &StylesheetGuards::same(&guard));
+        drop(guard);
+
+        if !changed.is_empty() {
+            // A media query that evaluates differently changes which rules are in
+            // the cascade, which is a rebuild of that origin's data rather than a
+            // fact about any one element.
+            self.stylist.force_stylesheet_origins_dirty(changed);
+            return true;
+        }
+        used_viewport_units
+    }
+
+    /// Compute a style for every element.
+    pub fn style(&mut self, document: &Document) -> StyledDocument {
+        let _span = tracing::info_span!("recalc_style").entered();
+
+        let mut style_data = StyleData::with_lock(self.lock.clone());
+        style_data.prepare(document);
+
+        let guard = self.lock.read();
+        self.stylist.flush(&StylesheetGuards::same(&guard));
+
+        let snapshots = SnapshotMap::new();
+        let shared = SharedStyleContext {
+            stylist: &self.stylist,
+            visited_styles_enabled: false,
+            options: Default::default(),
+            guards: StylesheetGuards::same(&guard),
+            current_time_for_animations: 0.0,
+            traversal_flags: TraversalFlags::empty(),
+            snapshot_map: &snapshots,
+            animations: Default::default(),
+            registered_speculative_painters: &NoPainters,
+        };
+
+        let tree = Tree::styled(document, &style_data);
+        let _scope = TreeScope::enter(&tree);
+        let mut styles = HashMap::new();
+        {
+            // The engine's assertions check that a restyle happens on a thread that
+            // has declared itself the layout thread — including in the destructors
+            // of the context, which is why this is a guard and not two bare calls.
+            // The assertion is not a formality: element data is behind interior
+            // mutability that only one thread at a time may touch.
+            let _layout = LayoutThread::enter();
+
+            let mut thread_local = ThreadLocalStyleContext::new();
+            let mut context = StyleContext {
+                shared: &shared,
+                thread_local: &mut thread_local,
+            };
+
+            let root = document.root();
+            for child in document.children(root).collect::<Vec<_>>() {
+                resolve(&tree, child, None, 0, &mut context, &mut styles);
+            }
+        }
+
+        tracing::debug!(elements = styles.len(), "styled");
+        StyledDocument { style_data, styles }
+    }
+}
+
+/// The device a viewport describes: what a media query is evaluated against and
+/// what `vw` and `vh` resolve to.
+fn device_for(viewport: Viewport, quirks_mode: QuirksMode) -> Device {
+    Device::new(
+        MediaType::screen(),
+        quirks_mode,
+        euclid::Size2D::new(viewport.width, viewport.height),
+        euclid::Size2D::new(
+            viewport.width * viewport.scale,
+            viewport.height * viewport.scale,
+        ),
+        euclid::Scale::new(viewport.scale),
+        Box::new(NoFontMetrics),
+        // The initial values every cascade starts from, with the default font taken
+        // from those same initial values: there is no platform font preference to
+        // consult yet.
+        ComputedValues::initial_values_with_font_override(
+            style::properties::style_structs::Font::initial_values(),
+        ),
+        style::queries::values::PrefersColorScheme::Light,
+        style::servo::media_features::PointerCapabilities::FINE,
+        style::servo::media_features::PointerCapabilities::FINE,
+    )
 }
 
 /// Declares this thread the layout thread for as long as it is held.
@@ -493,6 +578,55 @@ mod tests {
             .next()
             .expect("something should match");
         styled.style_of(node).expect("a styled element").clone()
+    }
+
+    /// A resize that no rule reads changes nothing, and the caller is told so:
+    /// this is what turns a window drag into a relayout rather than a re-cascade of
+    /// the whole document.
+    #[test]
+    fn a_resize_only_restyles_when_a_rule_reads_the_viewport() {
+        let plain =
+            otlyra_html::parse(b"<style>p { color: red }</style><p>x", Some("utf-8")).document;
+        let mut styler = Styler::new(&plain, Viewport::default(), &ExternalSheets::new());
+        styler.style(&plain);
+        assert!(
+            !styler.resize(Viewport {
+                width: 500.0,
+                ..Viewport::default()
+            }),
+            "nothing in this document reads the viewport"
+        );
+        assert!(!styler.resize(Viewport::default()), "nor going back");
+
+        let queried = otlyra_html::parse(
+            b"<style>@media (min-width: 800px) { p { color: red } }</style><p>x",
+            Some("utf-8"),
+        )
+        .document;
+        let mut styler = Styler::new(&queried, Viewport::default(), &ExternalSheets::new());
+        styler.style(&queried);
+        assert!(
+            styler.resize(Viewport {
+                width: 400.0,
+                ..Viewport::default()
+            }),
+            "the query stopped matching"
+        );
+    }
+
+    /// A viewport unit is read while cascading rather than while matching, so the
+    /// engine only knows it was used once it has been.
+    #[test]
+    fn a_viewport_unit_makes_every_resize_a_restyle() {
+        let document =
+            otlyra_html::parse(b"<style>p { width: 50vw }</style><p>x", Some("utf-8")).document;
+        let mut styler = Styler::new(&document, Viewport::default(), &ExternalSheets::new());
+        styler.style(&document);
+
+        assert!(styler.resize(Viewport {
+            width: 500.0,
+            ..Viewport::default()
+        }));
     }
 
     /// A page that keeps its CSS in a file is the common case, and the sheet has

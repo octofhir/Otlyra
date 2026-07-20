@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{ComputedStyle, Length, LengthOrAuto, Sides};
+use otlyra_css::{
+    AlignItems, Clear, ComputedStyle, FlexWrap, Float, JustifyContent, Length, LengthOrAuto, Sides,
+};
 use otlyra_text::{FontStack, PlacedSpacer, Spacer, TextEngine, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind, BoxTree};
@@ -30,10 +32,14 @@ pub struct Viewport {
 pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> FragmentTree {
     let _span = tracing::info_span!("layout", width = viewport.width).entered();
 
+    let initial = Rect::new(0.0, 0.0, viewport.width, viewport.height);
     let mut engine = Flow {
         tree,
         text,
         font_stacks: std::collections::HashMap::new(),
+        floats: Vec::new(),
+        containing_blocks: vec![initial],
+        viewport: initial,
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -44,6 +50,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         rect: Rect::new(0.0, 0.0, viewport.width, height.max(viewport.height)),
         kind: FragmentKind::Box,
         style: Arc::clone(&tree.node(root).style),
+        fixed: false,
         children,
     };
 
@@ -63,6 +70,27 @@ struct Flow<'a> {
     /// own family shares one pointer — which makes this a handful of entries for a
     /// whole document instead of one parse per run per layout.
     font_stacks: std::collections::HashMap<usize, FontStack>,
+    /// The floats placed so far, in page coordinates.
+    ///
+    /// One list for the document rather than one per formatting context: a float
+    /// affects the lines it sits beside, and until block formatting contexts are
+    /// told apart, "beside" is a question about the page.
+    floats: Vec<FloatBox>,
+    /// The padding box of the nearest positioned ancestor, which is what an
+    /// absolutely positioned box measures its insets against. The first entry is
+    /// the initial containing block, so the stack is never empty.
+    containing_blocks: Vec<Rect>,
+    /// The viewport, which is what a fixed box measures against.
+    viewport: Rect,
+}
+
+/// A box taken out of the flow and put against an edge.
+#[derive(Copy, Clone, Debug)]
+struct FloatBox {
+    /// Which edge it went to.
+    side: Float,
+    /// Its margin box, which is what lines and other floats keep clear of.
+    rect: Rect,
 }
 
 /// An inline element that has a box of its own to draw: a background, a border, or
@@ -78,6 +106,65 @@ struct InlineBox {
     /// The span its content starts at, and the one it ends before.
     first_span: usize,
     last_span: usize,
+}
+
+/// How far a laid-out flex line reached, on each axis.
+#[derive(Copy, Clone)]
+struct PlacedLine {
+    cross: f32,
+    main: f32,
+}
+
+/// Where one flex line sits and how much room it has.
+#[derive(Copy, Clone)]
+struct FlexLine {
+    /// Whether the main axis is horizontal.
+    row: bool,
+    /// Between two items on the line.
+    gap: f32,
+    /// The main-axis size the items are fitted into, or infinite when there is
+    /// nothing to fit them into.
+    inner: f32,
+    /// Where the line starts across the container.
+    cross_start: f32,
+    /// A cross size the line is at least as big as, which is how a lone line fills
+    /// a container that has a height of its own.
+    cross_floor: Option<f32>,
+}
+
+/// One child of a flex container, with the sizes the container needs to place it.
+struct FlexItem {
+    id: BoxId,
+    style: Arc<ComputedStyle>,
+    /// Its size along the main axis before growing or shrinking.
+    base: f32,
+    /// Its size along the main axis after.
+    main: f32,
+    /// Its size across.
+    cross: f32,
+    grow: f32,
+    shrink: f32,
+    margin: Sides<f32>,
+}
+
+impl FlexItem {
+    /// The margins that take room along the main axis.
+    fn margin_main(&self, row: bool) -> f32 {
+        if row {
+            self.margin.left + self.margin.right
+        } else {
+            self.margin.top + self.margin.bottom
+        }
+    }
+
+    /// The margins that take room across it.
+    fn margin_cross(&self, row: bool) -> f32 {
+        if row {
+            self.margin.top + self.margin.bottom
+        } else {
+            self.margin.left + self.margin.right
+        }
+    }
 }
 
 /// A replaced box in an inline formatting context, waiting for the shaper to say
@@ -136,6 +223,73 @@ fn replaced_size(
     )
 }
 
+/// The horizontal space `floats` leave free between `left` and `right`, for a band
+/// from `top` down `height` pixels.
+///
+/// A free function rather than a method, because a line asks this while the shaper
+/// holds the engine.
+fn band_of(floats: &[FloatBox], top: f32, height: f32, left: f32, right: f32) -> (f32, f32) {
+    let bottom = top + height;
+    let mut from = left;
+    let mut to = right;
+
+    for float in floats {
+        if float.rect.bottom() <= top || float.rect.y >= bottom {
+            continue;
+        }
+        match float.side {
+            Float::Left => from = from.max(float.rect.right()),
+            Float::Right => to = to.min(float.rect.x),
+            Float::None => {}
+        }
+    }
+    (from, to.max(from))
+}
+
+/// How far `relative` moves a box from where the flow put it.
+///
+/// `left` wins over `right` and `top` over `bottom`, which is what CSS says for a
+/// box that names both and cannot honour the two of them.
+fn relative_offset(style: &ComputedStyle, containing: f32) -> (f32, f32) {
+    let x = match (
+        style.inset.left.resolve(containing),
+        style.inset.right.resolve(containing),
+    ) {
+        (Some(left), _) => left,
+        (None, Some(right)) => -right,
+        (None, None) => 0.0,
+    };
+    let y = match (
+        style.inset.top.resolve(containing),
+        style.inset.bottom.resolve(containing),
+    ) {
+        (Some(top), _) => top,
+        (None, Some(bottom)) => -bottom,
+        (None, None) => 0.0,
+    };
+    (x, y)
+}
+
+/// Mark a fragment and everything inside it as not moving with the page.
+fn mark_fixed(fragment: &mut Fragment) {
+    fragment.fixed = true;
+    for child in &mut fragment.children {
+        mark_fixed(child);
+    }
+}
+
+/// Move a fragment and everything inside it.
+///
+/// A float is laid out where it would have gone in the flow and then moved to its
+/// edge; its descendants were positioned in page coordinates, so they move with it.
+fn offset(fragment: &mut Fragment, x: f32, y: f32) {
+    fragment.rect.x += x;
+    fragment.rect.y += y;
+    for child in &mut fragment.children {
+        offset(child, x, y);
+    }
+}
+
 /// Whether any of the four sides is non-zero.
 fn any_side(sides: Sides<f32>) -> bool {
     sides.top > 0.0 || sides.right > 0.0 || sides.bottom > 0.0 || sides.left > 0.0
@@ -157,6 +311,10 @@ impl<'a> Flow<'a> {
             return 0.0;
         }
 
+        if self.tree.node(parent).style.display == otlyra_css::Display::Flex {
+            return self.layout_flex(parent, width, x, y, out);
+        }
+
         // The invariant from the box tree: all block-level, or all inline-level.
         if self.tree.node(children[0]).is_inline_level() {
             return self.layout_inline(parent, width, x, y, out);
@@ -176,13 +334,54 @@ impl<'a> Flow<'a> {
         let last = children.len() - 1;
 
         for (index, &child) in children.clone().iter().enumerate() {
+            let style = Arc::clone(&self.tree.node(child).style);
+
+            // An absolutely positioned box is out of the flow entirely: it takes no
+            // room and its siblings stack as though it did not exist. It is placed
+            // against a containing block rather than against the cursor.
+            if style.position.is_out_of_flow() {
+                let fragment = self.layout_positioned(child, cursor + pending);
+                out.push(fragment);
+                continue;
+            }
+
+            // A float is out of the flow: it does not move the cursor, and the
+            // boxes after it stack as though it were not there. What it does do is
+            // shorten the lines it sits beside, which is the inline layout's
+            // business and is why it is recorded rather than returned.
+            if style.float != Float::None {
+                let fragment = self.layout_float(child, width, x, cursor + pending);
+                out.push(fragment);
+                continue;
+            }
+
             if index == 0 && top_open {
                 pending = 0.0;
             } else {
                 pending = collapse(pending, self.collapsed_top(child, width));
             }
 
-            let fragment = self.layout_block(child, width, x, cursor + pending);
+            // `clear` puts a box below the floats it names rather than beside them.
+            if style.clear != Clear::None {
+                let cleared = self.clearance(style.clear, cursor + pending);
+                if cleared > cursor + pending {
+                    cursor = cleared;
+                    pending = 0.0;
+                }
+            }
+
+            let mut fragment = self.layout_block(child, width, x, cursor + pending);
+
+            // `relative` moves a box after the flow has placed it, and moves
+            // nothing else: the gap it left stays where it was, which is what makes
+            // it a nudge rather than a layout. So the flow is advanced by where the
+            // box was, not by where it went.
+            let flowed = fragment.rect;
+            if style.position == otlyra_css::Position::Relative {
+                let (dx, dy) = relative_offset(&style, width);
+                offset(&mut fragment, dx, dy);
+            }
+
             let bottom = if index == last && bottom_open {
                 0.0
             } else {
@@ -192,16 +391,237 @@ impl<'a> Flow<'a> {
             // A box with no height and nothing to separate its own two margins
             // collapses through: its top and bottom join the same run rather than
             // opening a gap on each side of nothing.
-            if fragment.rect.height == 0.0 {
+            if flowed.height == 0.0 {
                 pending = collapse(pending, bottom);
             } else {
-                cursor = fragment.rect.bottom();
+                cursor = flowed.bottom();
                 pending = bottom;
             }
             out.push(fragment);
         }
 
         cursor + pending - y
+    }
+
+    /// Lay out a box's children, making it the containing block for the absolutely
+    /// positioned ones if its `position` says so.
+    ///
+    /// The height it offers is the height it was given, or the rest of the page
+    /// when it has none of its own: what a percentage inset resolves against is the
+    /// padding box, and a box whose height is its content's is not measured until
+    /// its content — including these very children — has been laid out.
+    fn layout_inside(
+        &mut self,
+        id: BoxId,
+        content_width: f32,
+        content_x: f32,
+        content_y: f32,
+        out: &mut Vec<Fragment>,
+    ) -> f32 {
+        let style = Arc::clone(&self.tree.node(id).style);
+        if !style.position.is_containing_block() {
+            return self.layout_children(id, content_width, content_x, content_y, out);
+        }
+
+        let padding = resolve_padding(&style, content_width);
+        let height = style
+            .height
+            .resolve(content_width)
+            .unwrap_or_else(|| (self.viewport.bottom() - content_y).max(0.0));
+        self.containing_blocks.push(Rect::new(
+            content_x - padding.left,
+            content_y - padding.top,
+            content_width + padding.left + padding.right,
+            height + padding.top + padding.bottom,
+        ));
+
+        let used = self.layout_children(id, content_width, content_x, content_y, out);
+        self.containing_blocks.pop();
+        used
+    }
+
+    /// Place an absolutely or fixed positioned box against its containing block.
+    ///
+    /// `static_y` is where the box would have been in the flow, which is what an
+    /// `auto` inset resolves to — a positioned box with no insets stays where it
+    /// was and only leaves the flow.
+    fn layout_positioned(&mut self, id: BoxId, static_y: f32) -> Fragment {
+        let style = Arc::clone(&self.tree.node(id).style);
+        let area = if style.position == otlyra_css::Position::Fixed {
+            self.viewport
+        } else {
+            *self
+                .containing_blocks
+                .last()
+                .expect("the initial containing block is always there")
+        };
+
+        let inset = |value: LengthOrAuto, against: f32| value.resolve(against);
+        let left = inset(style.inset.left, area.width);
+        let right = inset(style.inset.right, area.width);
+        let top = inset(style.inset.top, area.height);
+        let bottom = inset(style.inset.bottom, area.height);
+
+        // The width: what it asks for, what its two insets leave between them, or
+        // what its content wants.
+        let width = match (style.width.resolve(area.width), left, right) {
+            (Some(width), _, _) => width,
+            (None, Some(left), Some(right)) => (area.width - left - right).max(0.0),
+            _ => self
+                .max_content_width(id, area.width)
+                .min(area.width)
+                .max(0.0),
+        };
+
+        // A float outside does not reach into a positioned box, and one inside does
+        // not reach out.
+        let outer_floats = std::mem::take(&mut self.floats);
+        let mut fragment = self.layout_sized(id, area.x, area.y, width);
+        self.floats = outer_floats;
+
+        let x = match (left, right) {
+            (Some(left), _) => area.x + left,
+            (None, Some(right)) => area.x + area.width - right - fragment.rect.width,
+            (None, None) => area.x,
+        };
+        let y = match (top, bottom) {
+            (Some(top), _) => area.y + top,
+            (None, Some(bottom)) => area.y + area.height - bottom - fragment.rect.height,
+            // No inset at all: where the flow would have put it.
+            (None, None) => static_y,
+        };
+
+        let (delta_x, delta_y) = (x - fragment.rect.x, y - fragment.rect.y);
+        offset(&mut fragment, delta_x, delta_y);
+        if style.position == otlyra_css::Position::Fixed {
+            mark_fixed(&mut fragment);
+        }
+        fragment
+    }
+
+    /// A block laid out at a width the caller decided, rather than one worked out
+    /// from its containing block.
+    fn layout_sized(&mut self, id: BoxId, x: f32, y: f32, width: f32) -> Fragment {
+        let style = Arc::clone(&self.tree.node(id).style);
+        let padding = resolve_padding(&style, width);
+        let border = resolve_border(&style);
+        let content_width =
+            (width - padding.left - padding.right - border.left - border.right).max(0.0);
+
+        let content_x = x + border.left + padding.left;
+        let content_y = y + border.top + padding.top;
+        let mut children = Vec::new();
+        let content_height =
+            self.layout_inside(id, content_width, content_x, content_y, &mut children);
+        let content_height = clamp(
+            style.height.resolve(width).unwrap_or(content_height),
+            style.min_height,
+            style.max_height,
+            width,
+        );
+
+        Fragment {
+            box_id: Some(id),
+            rect: Rect::new(
+                x,
+                y,
+                width,
+                content_height + padding.top + padding.bottom + border.top + border.bottom,
+            ),
+            kind: FragmentKind::Box,
+            style,
+            fixed: false,
+            children,
+        }
+    }
+
+    /// Place a floated box against its edge, at or below `y`.
+    ///
+    /// It is laid out like any other block and then moved: to the near edge if it
+    /// fits beside what is already there, and down past the floats in the way if it
+    /// does not.
+    fn layout_float(&mut self, id: BoxId, containing_width: f32, x: f32, y: f32) -> Fragment {
+        let style = Arc::clone(&self.tree.node(id).style);
+
+        // A float establishes a formatting context of its own: the floats outside
+        // it do not shorten the lines inside it, and the ones inside it do not
+        // reach out. Hiding the list for the duration is the whole of that rule.
+        let outer_floats = std::mem::take(&mut self.floats);
+        let mut fragment = self.layout_block(id, containing_width, x, y);
+        self.floats = outer_floats;
+
+        let margin = resolve_margin(&style, containing_width);
+        let outer = fragment.rect.width + margin.left + margin.right;
+
+        // Down until there is room. A float never overlaps another one, so the
+        // first band with space enough is where it goes.
+        let mut top = self.clearance(
+            match style.clear {
+                Clear::None => Clear::None,
+                other => other,
+            },
+            y,
+        );
+        let height = fragment.rect.height.max(1.0);
+        let left_edge = x;
+        let right_edge = x + containing_width;
+
+        loop {
+            let (from, to) = self.band(top, height, left_edge, right_edge);
+            if to - from >= outer || !self.floats.iter().any(|float| float.rect.height > 0.0) {
+                let placed_x = match style.float {
+                    Float::Right => to - outer + margin.left,
+                    _ => from + margin.left,
+                };
+                let delta_x = placed_x - fragment.rect.x;
+                let delta_y = top - fragment.rect.y;
+                offset(&mut fragment, delta_x, delta_y);
+                break;
+            }
+
+            // The next band starts at the bottom of the nearest float in the way.
+            let Some(next) = self
+                .floats
+                .iter()
+                .map(|float| float.rect.bottom())
+                .filter(|bottom| *bottom > top)
+                .min_by(f32::total_cmp)
+            else {
+                break;
+            };
+            top = next;
+        }
+
+        self.floats.push(FloatBox {
+            side: style.float,
+            rect: Rect::new(
+                fragment.rect.x - margin.left,
+                fragment.rect.y,
+                outer,
+                fragment.rect.height + margin.top + margin.bottom,
+            ),
+        });
+        fragment
+    }
+
+    /// The horizontal space free of floats between `left` and `right`, for a band
+    /// from `top` down `height` pixels.
+    fn band(&self, top: f32, height: f32, left: f32, right: f32) -> (f32, f32) {
+        band_of(&self.floats, top, height, left, right)
+    }
+
+    /// The lowest `y` a box with this `clear` may start at.
+    fn clearance(&self, clear: Clear, y: f32) -> f32 {
+        self.floats
+            .iter()
+            .filter(|float| match clear {
+                Clear::Both => true,
+                Clear::Left => float.side == Float::Left,
+                Clear::Right => float.side == Float::Right,
+                Clear::None => false,
+            })
+            .map(|float| float.rect.bottom())
+            .fold(y, f32::max)
     }
 
     /// Whether margins pass through the top and bottom edges of `id`.
@@ -276,6 +696,7 @@ impl<'a> Flow<'a> {
                 rect: Rect::new(x + margin.left, y, width, height),
                 kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
                 style,
+                fixed: false,
                 children: Vec::new(),
             };
         }
@@ -291,7 +712,7 @@ impl<'a> Flow<'a> {
 
         let mut children = Vec::new();
         let content_height =
-            self.layout_children(id, content_width, content_x, content_y, &mut children);
+            self.layout_inside(id, content_width, content_x, content_y, &mut children);
         let content_height = clamp(
             style
                 .height
@@ -314,6 +735,391 @@ impl<'a> Flow<'a> {
             ),
             kind: FragmentKind::Box,
             style,
+            fixed: false,
+            children,
+        }
+    }
+
+    /// A flex formatting context: the children are items along one axis.
+    ///
+    /// One pass in each direction. Along the main axis every item is measured at
+    /// its base size, and what is left over — or missing — is shared out by
+    /// `flex-grow` and `flex-shrink`; across the cross axis each item is placed by
+    /// `align-items`, stretching to the line by default, which is what makes
+    /// columns of equal height without anyone saying how tall.
+    fn layout_flex(
+        &mut self,
+        parent: BoxId,
+        width: f32,
+        x: f32,
+        y: f32,
+        out: &mut Vec<Fragment>,
+    ) -> f32 {
+        let style = Arc::clone(&self.tree.node(parent).style);
+        let children = self.tree.node(parent).children.clone();
+        let row = style.flex_direction.is_row();
+        let gap = if row {
+            style.gap.1.resolve(width)
+        } else {
+            style.gap.0.resolve(width)
+        };
+
+        // A float outside the container does not reach into it: a flex container
+        // establishes a formatting context of its own.
+        let outer_floats = std::mem::take(&mut self.floats);
+
+        // The base size every item starts at, measured by laying it out on its own.
+        let mut items: Vec<FlexItem> = Vec::with_capacity(children.len());
+        for &child in &children {
+            let item_style = Arc::clone(&self.tree.node(child).style);
+            let fragment = self.layout_block(child, width, x, y);
+            let margin = resolve_margin(&item_style, width);
+
+            // The base size: `flex-basis` if it says, then the item's own size, and
+            // for an auto width along a row the size its content wants — a flex
+            // item is not a block, and does not fill the line it is on.
+            let basis = match item_style.flex_basis.and_then(|basis| basis.resolve(width)) {
+                Some(basis) => basis,
+                None if row => match item_style.width.resolve(width) {
+                    Some(_) => fragment.rect.width,
+                    None => {
+                        let content = self.max_content_width(child, width);
+                        clamp(
+                            content.min(width),
+                            item_style.min_width,
+                            item_style.max_width,
+                            width,
+                        )
+                    }
+                },
+                None => fragment.rect.height,
+            };
+
+            items.push(FlexItem {
+                id: child,
+                base: basis,
+                main: basis,
+                cross: if row {
+                    fragment.rect.height
+                } else {
+                    fragment.rect.width
+                },
+                grow: item_style.flex_grow,
+                shrink: item_style.flex_shrink,
+                margin,
+                style: item_style,
+            });
+        }
+
+        if items.is_empty() {
+            self.floats = outer_floats;
+            return 0.0;
+        }
+
+        // A container with a height of its own has a definite cross size when it
+        // is a row and a definite main size when it is a column: either way it is
+        // the size the items are fitted into rather than one they add up to.
+        let definite_height = style
+            .height
+            .resolve(width)
+            .map(|height| clamp(height, style.min_height, style.max_height, width));
+        let inner = if row {
+            width
+        } else {
+            definite_height.unwrap_or(f32::INFINITY)
+        };
+
+        // Lines: one, unless wrapping is allowed and the items do not fit on it.
+        let lines: Vec<std::ops::Range<usize>> =
+            if style.flex_wrap == FlexWrap::NoWrap || !inner.is_finite() {
+                std::iter::once(0..items.len()).collect()
+            } else {
+                let mut lines = Vec::new();
+                let mut start = 0;
+                let mut used = 0.0;
+                for (index, item) in items.iter().enumerate() {
+                    let outer = item.base + item.margin_main(row);
+                    let with_gap = if index == start { outer } else { outer + gap };
+                    if index > start && used + with_gap > inner {
+                        lines.push(start..index);
+                        start = index;
+                        used = outer;
+                    } else {
+                        used += with_gap;
+                    }
+                }
+                lines.push(start..items.len());
+                lines
+            };
+
+        // A single line fills a container that has a cross size of its own — which
+        // is what makes `align-items: center` centre against the container rather
+        // than against the tallest item. Several lines share the container out by
+        // taking what they need, which is `align-content: flex-start`.
+        let line_cross_floor = match (row, definite_height, lines.len()) {
+            (true, Some(height), 1) => Some(height),
+            _ => None,
+        };
+
+        let mut cross_cursor = 0.0f32;
+        let mut main_extent = 0.0f32;
+        let line_count = lines.len();
+        for (number, line) in lines.into_iter().enumerate() {
+            let placed = self.layout_flex_line(
+                &mut items,
+                line,
+                &style,
+                FlexLine {
+                    row,
+                    gap,
+                    inner,
+                    cross_start: cross_cursor,
+                    cross_floor: line_cross_floor,
+                },
+                (x, y),
+                out,
+            );
+            cross_cursor += placed.cross;
+            main_extent = main_extent.max(placed.main);
+            if number + 1 < line_count {
+                cross_cursor += if row { style.gap.0.resolve(width) } else { gap };
+            }
+        }
+
+        self.floats = outer_floats;
+
+        // The height a flex container takes: across the lines when it is a row,
+        // along the longest of them when it is a column.
+        if row { cross_cursor } else { main_extent }
+    }
+
+    /// One line of a flex container: the main axis shared out, the cross axis
+    /// aligned, and every item placed.
+    ///
+    /// Returns how much room the line took across the container.
+    fn layout_flex_line(
+        &mut self,
+        items: &mut [FlexItem],
+        line: std::ops::Range<usize>,
+        style: &Arc<ComputedStyle>,
+        geometry: FlexLine,
+        origin: (f32, f32),
+        out: &mut Vec<Fragment>,
+    ) -> PlacedLine {
+        let (x, y) = origin;
+        let FlexLine {
+            row,
+            gap,
+            inner,
+            cross_start,
+            cross_floor,
+        } = geometry;
+        let count = line.len();
+        if count == 0 {
+            return PlacedLine {
+                cross: 0.0,
+                main: 0.0,
+            };
+        }
+        let gaps = gap * (count - 1) as f32;
+
+        // The main axis: share out what is left over, or take back what is missing.
+        let used: f32 = items[line.clone()]
+            .iter()
+            .map(|item| item.base + item.margin_main(row))
+            .sum();
+        let free = inner - used - gaps;
+
+        for item in &mut items[line.clone()] {
+            item.main = item.base;
+        }
+        if free.is_finite() && free != 0.0 {
+            let factors: f32 = items[line.clone()]
+                .iter()
+                .map(|item| if free > 0.0 { item.grow } else { item.shrink })
+                .sum();
+            if factors > 0.0 {
+                for item in &mut items[line.clone()] {
+                    let factor = if free > 0.0 { item.grow } else { item.shrink };
+                    item.main = (item.base + free * factor / factors).max(0.0);
+                }
+            }
+        }
+
+        // The cross axis: the line is as big as its largest item, and `stretch`
+        // makes the rest of them match it.
+        let line_cross = items[line.clone()]
+            .iter()
+            .map(|item| item.cross + item.margin_cross(row))
+            .fold(cross_floor.unwrap_or(0.0), f32::max);
+
+        let content_main: f32 = items[line.clone()]
+            .iter()
+            .map(|item| item.main + item.margin_main(row))
+            .sum::<f32>()
+            + gaps;
+        let leftover = if inner.is_finite() {
+            (inner - content_main).max(0.0)
+        } else {
+            0.0
+        };
+        let count = count as f32;
+        let (leading, between) = match style.justify_content {
+            JustifyContent::Start => (0.0, 0.0),
+            JustifyContent::End => (leftover, 0.0),
+            JustifyContent::Center => (leftover / 2.0, 0.0),
+            JustifyContent::SpaceBetween if count > 1.0 => (0.0, leftover / (count - 1.0)),
+            JustifyContent::SpaceBetween => (0.0, 0.0),
+            JustifyContent::SpaceAround => (leftover / count / 2.0, leftover / count),
+            JustifyContent::SpaceEvenly => (leftover / (count + 1.0), leftover / (count + 1.0)),
+        };
+
+        let order: Vec<usize> = if style.flex_direction.is_reverse() {
+            line.clone().rev().collect()
+        } else {
+            line.clone().collect()
+        };
+
+        let mut cursor = leading;
+        for index in order {
+            let item = &items[index];
+            let align = item.style.align_self.unwrap_or(style.align_items);
+            let cross_size = match align {
+                AlignItems::Stretch => (line_cross - item.margin_cross(row)).max(item.cross),
+                _ => item.cross,
+            };
+            let cross_offset = cross_start
+                + match align {
+                    AlignItems::End => line_cross - cross_size - item.margin_cross(row),
+                    AlignItems::Center => (line_cross - cross_size - item.margin_cross(row)) / 2.0,
+                    // `baseline` needs a baseline to align on, which a box does not
+                    // carry yet; it lays out as `start`, which is where it would be
+                    // for a single line of text anyway.
+                    _ => 0.0,
+                };
+
+            let (item_x, item_y, item_width, item_height) = if row {
+                (
+                    x + cursor + item.margin.left,
+                    y + cross_offset + item.margin.top,
+                    item.main,
+                    cross_size,
+                )
+            } else {
+                (
+                    x + cross_offset + item.margin.left,
+                    y + cursor + item.margin.top,
+                    cross_size,
+                    item.main,
+                )
+            };
+
+            let id = item.id;
+            let advance = item.main + item.margin_main(row);
+            let fragment = self.layout_item(id, item_x, item_y, item_width, item_height);
+            out.push(fragment);
+            cursor += advance + gap + between;
+        }
+
+        PlacedLine {
+            cross: line_cross,
+            // What the line actually reached along the main axis: the last gap is
+            // spent moving the cursor past an item that is not there.
+            main: (cursor - gap - between).max(0.0),
+        }
+    }
+
+    /// The widest a box would be if nothing made it wrap.
+    ///
+    /// CSS calls this the max-content size, and a flex item with no width of its
+    /// own starts from it: `display: flex` on three words puts three words on a
+    /// line, not three equal columns. Measured by asking the shaper for the
+    /// paragraph's own width and by walking blocks for the widest of them.
+    fn max_content_width(&mut self, id: BoxId, containing_width: f32) -> f32 {
+        let node = self.tree.node(id);
+        let style = Arc::clone(&node.style);
+        let padding = resolve_padding(&style, containing_width);
+        let border = resolve_border(&style);
+        let extra = padding.left + padding.right + border.left + border.right;
+
+        // A width of its own is the answer, whatever it holds.
+        if let Some(width) = style.width.resolve(containing_width) {
+            return width + extra;
+        }
+
+        let inner = match &node.kind {
+            BoxKind::Replaced(content) => replaced_size(&style, content, containing_width).0,
+            _ if node.children.is_empty() => 0.0,
+            _ if self.tree.node(node.children[0]).is_inline_level() => {
+                // One line, however long: the shaper is asked for the paragraph
+                // with nothing to break it.
+                let mut spans = Vec::new();
+                let mut sources = Vec::new();
+                let mut inlines = Vec::new();
+                let mut replaced = Vec::new();
+                self.collect_spans(
+                    id,
+                    containing_width,
+                    &mut spans,
+                    &mut sources,
+                    &mut inlines,
+                    &mut replaced,
+                );
+                let text = if spans.is_empty() {
+                    0.0
+                } else {
+                    self.text.shape_spans(&spans, &[], None).metrics.width
+                };
+                let pictures: f32 = replaced.iter().map(|box_| box_.width).sum();
+                text + pictures
+            }
+            _ => {
+                let children = node.children.clone();
+                children
+                    .into_iter()
+                    .map(|child| {
+                        let child_style = &self.tree.node(child).style;
+                        let margin = resolve_margin(child_style, containing_width);
+                        self.max_content_width(child, containing_width) + margin.left + margin.right
+                    })
+                    .fold(0.0, f32::max)
+            }
+        };
+
+        inner + extra
+    }
+
+    /// One flex item, laid out at the size the container decided for it.
+    fn layout_item(&mut self, id: BoxId, x: f32, y: f32, width: f32, height: f32) -> Fragment {
+        let style = Arc::clone(&self.tree.node(id).style);
+        let padding = resolve_padding(&style, width);
+        let border = resolve_border(&style);
+
+        let content_width =
+            (width - padding.left - padding.right - border.left - border.right).max(0.0);
+        let content_x = x + border.left + padding.left;
+        let content_y = y + border.top + padding.top;
+
+        let mut children = Vec::new();
+        let content_height =
+            self.layout_inside(id, content_width, content_x, content_y, &mut children);
+
+        // A height of its own is the height it gets, whatever it holds — an item
+        // that overflows the size it asked for is what CSS says happens. Without
+        // one, the container's figure is a floor rather than the answer: it is
+        // where `stretch` put it, and content taller than that still fits.
+        let outer_height = match style.height.resolve(width) {
+            Some(_) => height,
+            None => height
+                .max(content_height + padding.top + padding.bottom + border.top + border.bottom),
+        };
+
+        Fragment {
+            box_id: Some(id),
+            rect: Rect::new(x, y, width, outer_height),
+            kind: FragmentKind::Box,
+            style,
+            fixed: false,
             children,
         }
     }
@@ -390,7 +1196,24 @@ impl<'a> Flow<'a> {
             }))
             .collect();
 
-        let shaped = self.text.shape_spans(&spans, &spacers, Some(width));
+        // Each line asks how much room the floats have left it at the height it
+        // landed at, and where that room starts; the width goes to the shaper and
+        // the offset is kept for placing the line.
+        let mut bands: Vec<(f32, f32)> = Vec::new();
+        let shaped = {
+            let floats = &self.floats;
+            let mut collect_band = |index: usize, top: f32| {
+                let (from, to) = band_of(floats, y + top, 1.0, x, x + width);
+                let available = (to - from).max(0.0);
+                if bands.len() <= index {
+                    bands.resize(index + 1, (0.0, width));
+                }
+                bands[index] = (from - x, available);
+                Some(available)
+            };
+            self.text
+                .shape_spans_wrapping(&spans, &spacers, &mut collect_band)
+        };
         let style = Arc::clone(&self.tree.node(parent).style);
 
         // parley measures line tops from the text origin, and the first line's top
@@ -417,11 +1240,16 @@ impl<'a> Flow<'a> {
             // Alignment moves the whole line, glyphs and all: the shaper laid it
             // out from the start edge, and where that edge is is the block's
             // decision, not the paragraph's.
-            let line_x = x + match style.text_align {
-                otlyra_css::TextAlign::Start => 0.0,
-                otlyra_css::TextAlign::Center => ((width - line.width) / 2.0).max(0.0),
-                otlyra_css::TextAlign::End => (width - line.width).max(0.0),
-            };
+            // Alignment is against what the line actually had to fill, which is
+            // narrower than the block wherever a float sits beside it.
+            let (indent, available) = bands.get(index).copied().unwrap_or((0.0, width));
+            let line_x = x
+                + indent
+                + match style.text_align {
+                    otlyra_css::TextAlign::Start => 0.0,
+                    otlyra_css::TextAlign::Center => ((available - line.width) / 2.0).max(0.0),
+                    otlyra_css::TextAlign::End => (available - line.width).max(0.0),
+                };
 
             // The inline boxes that reach this line, before the text, so their
             // backgrounds and borders sit under the glyphs they belong to. A box
@@ -478,6 +1306,7 @@ impl<'a> Flow<'a> {
                         ),
                         kind: FragmentKind::Box,
                         style,
+                        fixed: false,
                         children: Vec::new(),
                     })
                 })
@@ -504,6 +1333,7 @@ impl<'a> Flow<'a> {
                     Fragment {
                         box_id,
                         rect: Rect::new(line_x + run.offset_x, line_y, run.advance, height),
+                        fixed: false,
                         kind: FragmentKind::Text(run),
                         // The run's own style, not the paragraph's: the underline
                         // on a link belongs to the link, and painting from the
@@ -536,6 +1366,7 @@ impl<'a> Flow<'a> {
                     ),
                     kind: FragmentKind::Image(image),
                     style: Arc::clone(&box_.style),
+                    fixed: false,
                     children: Vec::new(),
                 })
             }));
@@ -545,6 +1376,7 @@ impl<'a> Flow<'a> {
                 rect: Rect::new(line_x, line_y, line.width, height),
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
+                fixed: false,
                 children,
             });
         }
@@ -1088,6 +1920,290 @@ mod tests {
                 .any(|fragment| matches!(fragment.kind, FragmentKind::Image(_)))
         );
         assert!(first_line(&tree).width > 0.0, "the alt text was laid out");
+    }
+
+    /// A float goes to its edge and the boxes after it stack as though it were not
+    /// there, because it is not: it is out of the flow.
+    #[test]
+    fn a_float_goes_to_its_edge_and_leaves_the_flow() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 }              .f { float: right; width: 100px; height: 40px }              p { margin: 0 }</style>             <div class=f>f</div><p>text</p>",
+            400.0,
+        );
+
+        let float = rect_of(&tree, &boxes, "div");
+        assert_eq!(float.x, 300.0, "against the right edge");
+        assert_eq!(float.y, 0.0);
+        assert_eq!(
+            rect_of(&tree, &boxes, "p").y,
+            0.0,
+            "the paragraph starts level with it"
+        );
+    }
+
+    /// The lines beside a float are shortened, and the ones below it are not.
+    #[test]
+    fn lines_beside_a_float_are_shorter_than_the_ones_below_it() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 }              .f { float: left; width: 200px; height: 30px }              p { margin: 0 }</style>             <div class=f>f</div>             <p>alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu              nu xi omicron pi rho sigma tau upsilon phi chi psi omega</p>",
+            400.0,
+        );
+
+        // The paragraph's own lines: the float has one too, and it starts at the
+        // float's edge rather than beside it.
+        let paragraph = boxes_of(&tree, &boxes, "p");
+        let lines: Vec<Rect> = paragraph[0]
+            .children
+            .iter()
+            .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+            .map(|fragment| fragment.rect)
+            .collect();
+        assert!(lines.len() > 2, "the paragraph wrapped");
+
+        let first = lines.first().expect("a first line");
+        let last = lines.last().expect("a last line");
+        assert!(first.x >= 200.0, "the first line starts beside the float");
+        assert!(last.x < 200.0, "and a line below it starts at the edge");
+        assert!(last.width > first.width);
+    }
+
+    /// `clear` puts a box below the floats it names.
+    #[test]
+    fn clear_puts_a_box_below_the_float() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 }              .f { float: left; width: 100px; height: 80px }              p { margin: 0 } .c { clear: left }</style>             <div class=f>f</div><p class=c>text</p>",
+            400.0,
+        );
+        assert_eq!(rect_of(&tree, &boxes, "p").y, 80.0);
+    }
+
+    /// Two floats on the same side sit beside each other while there is room, and
+    /// the one that does not fit goes below.
+    #[test]
+    fn floats_stack_along_the_edge_and_then_down() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 }              div { float: left; width: 150px; height: 20px }</style>             <div>one</div><div>two</div><div>three</div>",
+            400.0,
+        );
+        let floats = boxes_of(&tree, &boxes, "div");
+        assert_eq!((floats[0].rect.x, floats[0].rect.y), (0.0, 0.0));
+        assert_eq!((floats[1].rect.x, floats[1].rect.y), (150.0, 0.0));
+        assert_eq!(
+            (floats[2].rect.x, floats[2].rect.y),
+            (0.0, 20.0),
+            "the third has nowhere beside them to go"
+        );
+    }
+
+    /// A float is a formatting context of its own: the floats outside it do not
+    /// shorten the lines inside it.
+    #[test]
+    fn a_float_is_not_flowed_around_by_its_own_contents() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 }              .a { float: left; width: 200px; height: 50px }              .b { float: right; width: 100px; height: 50px }</style>             <div class=a>a</div><div class=b>b</div>",
+            400.0,
+        );
+        let floats = boxes_of(&tree, &boxes, "div");
+        let inner = floats[1]
+            .children
+            .iter()
+            .find(|child| matches!(child.kind, FragmentKind::Line))
+            .expect("the right float's own line");
+        assert_eq!(
+            inner.rect.x, floats[1].rect.x,
+            "its text starts at its own left edge"
+        );
+    }
+
+    /// A row of flex items sits along one line, in order, at the sizes the
+    /// container gave them.
+    #[test]
+    fn flex_items_lie_along_the_main_axis() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .flex { display: flex } \
+             .a { width: 100px; height: 20px } .b { width: 60px; height: 40px }</style>\
+             <div class=flex><div class=a>a</div><div class=b>b</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        // The container first, then its two items.
+        assert_eq!(items[1].rect.x, 0.0);
+        assert_eq!(items[1].rect.width, 100.0);
+        assert_eq!(items[2].rect.x, 100.0);
+        assert_eq!(items[2].rect.width, 60.0);
+        assert_eq!(items[1].rect.y, items[2].rect.y, "they share a line");
+    }
+
+    /// `flex-grow` shares out what is left over; `flex-shrink` takes back what is
+    /// missing.
+    #[test]
+    fn grow_and_shrink_share_out_the_main_axis() {
+        let (grown, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: flex } \
+             .a { width: 100px; flex-grow: 1 } .b { width: 100px; flex-grow: 3 }</style>\
+             <div class=flex><div class=a>a</div><div class=b>b</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&grown, &boxes, "div");
+        assert_eq!(items[1].rect.width, 150.0, "one quarter of the 200 spare");
+        assert_eq!(items[2].rect.width, 250.0);
+
+        let (shrunk, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: flex } \
+             .a { width: 300px } .b { width: 300px }</style>\
+             <div class=flex><div class=a>a</div><div class=b>b</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&shrunk, &boxes, "div");
+        assert_eq!(items[1].rect.width, 200.0, "the overflow is shared equally");
+        assert_eq!(items[2].rect.width, 200.0);
+    }
+
+    /// `justify-content` decides where the leftover goes, and `align-items`
+    /// what happens across the line.
+    #[test]
+    fn justify_and_align_place_the_items() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .flex { display: flex; justify-content: center; align-items: center; height: 100px } \
+             .a { width: 100px; height: 20px }</style>\
+             <div class=flex><div class=a>a</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(items[1].rect.x, 150.0, "centred along the row");
+        assert!(items[1].rect.y > 0.0, "and centred across it");
+        assert_eq!(items[1].rect.height, 20.0, "not stretched");
+    }
+
+    /// The default is `stretch`, which is what makes columns of equal height
+    /// without anyone saying how tall.
+    #[test]
+    fn items_stretch_to_the_tallest_of_them_by_default() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: flex } \
+             .a { width: 50px; height: 80px } .b { width: 50px }</style>\
+             <div class=flex><div class=a>a</div><div class=b>b</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(items[2].rect.height, 80.0);
+    }
+
+    /// `flex-direction: column` puts the main axis down the page, and a gap goes
+    /// between the items on whichever axis that is.
+    #[test]
+    fn a_column_stacks_its_items_with_the_gap_between_them() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .flex { display: flex; flex-direction: column; gap: 10px } \
+             .a { height: 30px } .b { height: 20px }</style>\
+             <div class=flex><div class=a>a</div><div class=b>b</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(items[1].rect.y, 0.0);
+        assert_eq!(items[2].rect.y, 40.0, "30 tall plus the 10px gap");
+    }
+
+    /// `flex-wrap: wrap` puts the items that do not fit on a line of their own,
+    /// below the one before it.
+    #[test]
+    fn items_that_do_not_fit_wrap_onto_the_next_line() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .flex { display: flex; flex-wrap: wrap } \
+             .a { width: 120px; height: 20px }</style>\
+             <div class=flex><div class=a>1</div><div class=a>2</div>\
+             <div class=a>3</div><div class=a>4</div></div>",
+            300.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        // Two fit on a 300px line, the other two go below.
+        assert_eq!(items[1].rect.y, items[2].rect.y);
+        assert_eq!(items[3].rect.x, 0.0, "the third starts a line");
+        assert!(items[3].rect.y >= items[1].rect.bottom());
+        assert_eq!(items[3].rect.y, items[4].rect.y);
+    }
+
+    /// `relative` moves a box and nothing else: the space it left stays where it
+    /// was, so its neighbours do not shift.
+    #[test]
+    fn relative_moves_the_box_and_not_its_neighbours() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } p { margin: 0 } \
+             .moved { position: relative; left: 20px; top: 10px }</style>\
+             <p class=moved>one</p><p>two</p>",
+            400.0,
+        );
+        let paragraphs = boxes_of(&tree, &boxes, "p");
+        assert_eq!(paragraphs[0].rect.x, 20.0);
+        assert_eq!(paragraphs[0].rect.y, 10.0);
+        assert_eq!(
+            paragraphs[1].rect.y, paragraphs[0].rect.height,
+            "the second is where it always was"
+        );
+        assert_eq!(paragraphs[1].rect.x, 0.0);
+    }
+
+    /// An absolutely positioned box leaves the flow: the boxes after it stack as
+    /// though it were not there, and it is placed against its containing block.
+    #[test]
+    fn absolute_leaves_the_flow_and_measures_from_its_ancestor() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } p { margin: 0 } \
+             .frame { position: relative; height: 200px } \
+             .pinned { position: absolute; right: 10px; bottom: 20px; width: 50px; height: 30px }</style>\
+             <div class=frame><p>text</p><div class=pinned>x</div></div>",
+            400.0,
+        );
+
+        let pinned = boxes_of(&tree, &boxes, "div")
+            .into_iter()
+            .find(|fragment| fragment.rect.width == 50.0)
+            .expect("the pinned box");
+        assert_eq!(pinned.rect.x, 340.0, "ten from the right edge");
+        assert_eq!(pinned.rect.y, 150.0, "twenty up from a 200px frame");
+
+        let paragraph = rect_of(&tree, &boxes, "p");
+        assert_eq!(paragraph.y, 0.0, "the flow did not notice it");
+    }
+
+    /// Both insets given is a width: the box stretches between them.
+    #[test]
+    fn two_insets_stretch_an_absolute_box_between_them() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .frame { position: relative } \
+             .wide { position: absolute; left: 30px; right: 30px }</style>\
+             <div class=frame><div class=wide>x</div></div>",
+            400.0,
+        );
+        let wide = boxes_of(&tree, &boxes, "div")
+            .into_iter()
+            .find(|fragment| fragment.rect.x == 30.0)
+            .expect("the stretched box");
+        assert_eq!(wide.rect.width, 340.0);
+    }
+
+    /// A fixed box is placed against the viewport and marked as not scrolling with
+    /// the page, which is what paint reads to leave it where it is.
+    #[test]
+    fn fixed_measures_against_the_viewport_and_does_not_scroll() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .bar { position: fixed; left: 0; bottom: 0; height: 40px; width: 100px }</style>\
+             <div class=bar>bar</div>",
+            400.0,
+        );
+        let bar = boxes_of(&tree, &boxes, "div");
+        assert_eq!(bar[0].rect.y, 560.0, "forty up from a 600px viewport");
+        assert!(bar[0].fixed);
+        assert!(
+            bar[0].children.iter().all(|child| child.fixed),
+            "what is inside it does not scroll either"
+        );
     }
 
     /// Two margins that meet make one gap, the larger of them.

@@ -29,7 +29,8 @@ pub mod stylo_dom;
 pub mod ua;
 
 pub use style::{
-    Border, ComputedStyle, Display, FontStyle, Length, LengthOrAuto, LineHeight, Sides, TextAlign,
-    TextDecoration, WhiteSpace,
+    AlignItems, Border, Clear, ComputedStyle, Display, FlexDirection, FlexWrap, Float, FontStyle,
+    JustifyContent, Length, LengthOrAuto, LineHeight, Position, Sides, TextAlign, TextDecoration,
+    WhiteSpace,
 };
 pub use ua::{has_renderable_children, initial_style, ua_style};

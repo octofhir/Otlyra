@@ -37,6 +37,20 @@
   .pushed { width: 200px; margin-left: auto; background: #eee; }
   .chip { border: 2px solid #c30; padding: 2px 8px; background: #fed; }
   .tint { background: #cef; }
+  .float-left { float: left; width: 140px; height: 60px; background: #cef; margin: 0 12px 8px 0; }
+  .float-right { float: right; width: 120px; height: 44px; background: #fed; margin: 0 0 8px 12px; }
+  .cleared { clear: both; background: #efe; }
+  .frame { position: relative; height: 120px; background: #eef; margin: 8px 0; }
+  .pinned { position: absolute; right: 8px; bottom: 8px; background: #fc9; padding: 4px; }
+  .corner { position: absolute; left: 8px; top: 8px; background: #cfc; padding: 4px; }
+  .nudged { position: relative; left: 30px; background: #fdd; }
+  .flex { display: flex; gap: 8px; background: #f2f2f6; margin: 8px 0; }
+  .flex > div { background: #cde; padding: 4px 8px; }
+  .flex-grow > div:first-child { flex-grow: 1; }
+  .flex-between { justify-content: space-between; }
+  .flex-tall { height: 60px; align-items: center; }
+  .flex-wrap { flex-wrap: wrap; }
+  .flex-wrap > div { width: 30%; }
   .middle { text-align: center; }
   .right { text-align: right; }
 
@@ -59,6 +73,19 @@ margins, which is how a box is centred — padding, borders per side, widths and
 heights, and <code>text-align</code>. On an <strong>inline</strong> box too:
 its padding and borders take room in the line, and a box broken over two lines
 keeps the border on the edge each piece owns.</p>
+<p><strong>Position</strong>: <code>relative</code> moves a box without moving
+its neighbours, <code>absolute</code> takes it out of the flow and places it
+against the nearest positioned ancestor, and <code>fixed</code> places it against
+the viewport and leaves it there while the page scrolls.</p>
+<p><strong>Flex</strong>: <code>display: flex</code> with a direction, a gap,
+<code>flex-grow</code> and <code>flex-shrink</code>, <code>justify-content</code>,
+<code>align-items</code> and <code>align-self</code>, and wrapping onto as many
+lines as the items need. An item with no width of its own is as wide as its
+content wants to be.</p>
+<p><strong>Floats</strong>: <code>float</code> and <code>clear</code>, with the
+lines beside a float shortened one at a time. Stylesheets from
+<code>&lt;link&gt;</code> are fetched, and so are the pictures an
+<code>&lt;img&gt;</code> asks for.</p>
 <p>Selector <strong>matching</strong>, over our own DOM:
 type, class, id, attribute (including <code>^=</code>, <code>$=</code>,
 <code>*=</code>), the four combinators, structural pseudo-classes, and
@@ -68,13 +95,20 @@ match" against a real document.</p>
 
 <h2>What does not work yet</h2>
 <p>A rule the cascade computes correctly can still change nothing, because
-layout reads a subset of what CSS defines: positioning, floats, flex and grid
-have no formatting context behind them, and an unsupported <code>display</code>
-lays out as a block. An inline box is as tall as the line it sits on rather than
-as tall as its own text, and <code>vertical-align</code> does not exist. Border
-styles other than solid are drawn solid. External <code>&lt;link&gt;</code>
-stylesheets are not fetched, and a restyle recomputes the whole document rather
-than the part that changed.</p>
+layout reads a subset of what CSS defines: grid has no formatting context behind
+it, an unsupported <code>display</code> lays out as a block,
+<code>position: sticky</code> lays out as <code>static</code>, and
+<code>z-index</code> is not read — a positioned box paints in document order like
+everything else. In a flex container, <code>order</code>, <code>align-content</code>
+and baseline alignment are not read, an item may shrink below its content, and
+<code>inline-flex</code> is placed as a block. A float with no width of its own takes the whole column rather than
+shrinking to its contents, and only a float establishes a formatting context of
+its own, so <code>overflow</code> does not yet stop one.</p>
+<p>An inline box is as tall as the line it sits on rather than as tall as its own
+text, and <code>vertical-align</code> does not exist. Border styles other than
+solid are drawn solid. A resize that no rule reads costs nothing — the sheets are
+parsed once and the cascade is skipped — but a resize that does change something
+recomputes every element rather than the part that changed.</p>
 
 <h2>Boxes</h2>
 <div class="framed">A box with a border on all four sides and padding inside it.</div>
@@ -89,6 +123,32 @@ background of its own, and a <span class="tint">tinted one</span> the shaper
 gives no run of its own. A <span class="chip">longer one, written so that it
 runs past the edge of the line and has to be broken in two</span> is drawn as
 two pieces, open where the break is.</p>
+
+<h2>Position</h2>
+<div class="frame">
+  <div class="corner">absolute, against the frame's top left</div>
+  <div class="pinned">absolute, bottom right</div>
+</div>
+<p class="nudged"><code>position: relative</code> moves this line 30px right and
+moves nothing else.</p>
+<p>Which is why this one is where it always was.</p>
+
+<h2>Flex</h2>
+<div class="flex"><div>one</div><div>two</div><div>three</div></div>
+<div class="flex flex-grow"><div>this one grows</div><div>this one does not</div></div>
+<div class="flex flex-between"><div>space</div><div>between</div><div>them</div></div>
+<div class="flex flex-tall"><div>centred across a 60px row</div><div>by <code>align-items</code></div></div>
+<div class="flex flex-wrap"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div></div>
+
+<h2>Floats</h2>
+<div class="float-left">float: left</div>
+<div class="float-right">float: right</div>
+<p>Text beside a float is shortened line by line and gets the full width back
+below it, which is what makes a picture with words beside it work. This
+paragraph is written long enough to run past both of the boxes above, so the
+first of its lines are narrow and the last ones are not.</p>
+<p class="cleared"><code>clear: both</code>, so this starts below whichever of
+them reaches further down.</p>
 
 <h2>Elements the rules above are written against</h2>
 <section class="box" id="unique">

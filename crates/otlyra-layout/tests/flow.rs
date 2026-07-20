@@ -252,7 +252,7 @@ fn culling_keeps_only_the_fragments_that_touch_the_viewport() {
     let tree = lay_out(&html, 800.0);
     let viewport = otlyra_layout::Rect::new(0.0, 0.0, 800.0, 600.0);
 
-    let visible = tree.visible(&viewport).count();
+    let visible = tree.visible(&viewport, &viewport).count();
     assert!(visible < fragments(&tree).len() / 4, "{visible} visible");
     assert!(visible > 0);
 }

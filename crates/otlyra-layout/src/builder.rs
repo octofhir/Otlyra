@@ -370,7 +370,10 @@ impl Builder<'_> {
                     Some(content) => BoxKind::Replaced(content),
                     None => match style.display {
                         Display::None => return,
-                        Display::Block => BoxKind::Block,
+                        // A flex container is a block-level box; what makes it a
+                        // flex container is its style, which layout reads when it
+                        // gets to its children.
+                        Display::Block | Display::Flex => BoxKind::Block,
                         Display::Inline => BoxKind::Inline,
                     },
                 };
@@ -525,13 +528,17 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
         tree.blockify(id);
     }
 
+    // Every child of a flex container is a flex item, and a run of inline content
+    // between two of them is one item of its own — so a container with any inline
+    // child needs the same wrapping a mixed block does.
+    let flex = tree.node(id).style.display == Display::Flex;
     let has_block = children
         .iter()
         .any(|&child| tree.node(child).is_block_level());
     let has_inline = children
         .iter()
         .any(|&child| tree.node(child).is_inline_level());
-    if !(has_block && has_inline) {
+    if !has_inline || !(has_block || flex) {
         return;
     }
 

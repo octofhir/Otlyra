@@ -48,8 +48,9 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
             .to_path(PATH_TOLERANCE),
     });
 
-    let visible = Rect::new(0.0, scroll_y, width, height);
-    for fragment in tree.visible(&visible) {
+    let scrolled = Rect::new(0.0, scroll_y, width, height);
+    let screen = Rect::new(0.0, 0.0, width, height);
+    for fragment in tree.visible(&scrolled, &screen) {
         // The initial containing block was painted as the canvas above; painting it
         // again would put a second full-viewport fill in every frame.
         if std::ptr::eq(fragment, &tree.root) {
@@ -66,6 +67,9 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
 /// never recurses — a fragment whose parent was culled may still be visible.
 fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
     let rect = fragment.rect;
+    // A fixed fragment is already in screen coordinates: it stays where it is
+    // however far the page has been scrolled.
+    let scroll_y = if fragment.fixed { 0.0 } else { scroll_y };
     let origin = Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)));
 
     // Hit testing is a display list too, emitted into the same sequence as the
@@ -294,6 +298,58 @@ mod tests {
             },
         );
         build_display_list(&fragments, (800.0, 600.0), 0.0)
+    }
+
+    /// A page laid out with its own stylesheet, scrolled to `scroll_y`.
+    fn styled_page(html: &str, scroll_y: f32) -> DisplayList {
+        let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+        let styles = otlyra_css::cascade::style_document(
+            &parsed.document,
+            otlyra_css::cascade::Viewport {
+                width: 800.0,
+                height: 600.0,
+                scale: 1.0,
+            },
+        );
+        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        build_display_list(&fragments, (800.0, 600.0), scroll_y)
+    }
+
+    /// A fixed box stays on screen while the page moves under it — which is the
+    /// whole of what `position: fixed` is for.
+    #[test]
+    fn a_fixed_box_does_not_move_when_the_page_scrolls() {
+        let html = "<style>body { margin: 0 }                     .bar { position: fixed; top: 10px; left: 0; width: 100px; height: 20px;                     background: rgb(255, 0, 0) }                     p { height: 400px }</style>                    <div class=bar>bar</div><p>tall</p><p>tall</p>";
+
+        let top_of = |list: &DisplayList| {
+            list.items()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Fill { brush, shape, .. }
+                        if *brush == Brush::Solid(Color::from_rgb8(255, 0, 0)) =>
+                    {
+                        Some(shape.bounding_box().y0)
+                    }
+                    _ => None,
+                })
+                .expect("the fixed bar")
+        };
+
+        assert_eq!(top_of(&styled_page(html, 0.0)), 10.0);
+        assert_eq!(
+            top_of(&styled_page(html, 300.0)),
+            10.0,
+            "it moved with the page"
+        );
     }
 
     /// Where a picture actually lands: the transform is what decides its size, so
