@@ -54,7 +54,12 @@ fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
 /// are forwarded through the event loop proxy. Without this the loop would sit in
 /// `Wait` and the menu would appear to do nothing until the next mouse move.
 #[derive(Debug)]
-struct MenuActivated(MenuId);
+enum UserEvent {
+    /// A menu item was chosen.
+    Menu(MenuId),
+    /// Something off the loop's thread asked for a frame.
+    Woken,
+}
 
 /// Anything that can go wrong opening or driving a window.
 ///
@@ -98,12 +103,16 @@ impl From<crate::present::PresentError> for PlatformError {
     }
 }
 
+/// How long the loop waits before an animated frame. Sixty a second, which is
+/// enough for a spinner and cheap enough that nothing else has to opt out.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Open one window, paint it with `painter`, and return when it closes.
 ///
 /// The loop blocks in `ControlFlow::Wait`, so nothing here may request a redraw
 /// unconditionally.
 pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), PlatformError> {
-    let event_loop = EventLoop::<MenuActivated>::with_user_event()
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -113,9 +122,23 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
     let proxy = event_loop.create_proxy();
     muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
         if let Some(id) = command_from_muda(&event) {
-            let _ = proxy.send_event(MenuActivated(id));
+            let _ = proxy.send_event(UserEvent::Menu(id));
         }
     }));
+
+    // A wake is a message on a channel rather than a proxy handed out directly:
+    // the proxy is winit's type and no crate above this one may name it.
+    let (wake_sender, wake_receiver) = std::sync::mpsc::channel();
+    let wake_proxy = event_loop.create_proxy();
+    std::thread::spawn(move || {
+        // Ends when the last waker is dropped, which is when the browser goes.
+        while wake_receiver.recv().is_ok() {
+            if wake_proxy.send_event(UserEvent::Woken).is_err() {
+                break;
+            }
+        }
+    });
+    painter.set_waker(crate::Waker::new(wake_sender));
 
     let mut app = WindowedApp {
         config,
@@ -262,10 +285,24 @@ impl WindowedApp<'_> {
     }
 }
 
-impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: MenuActivated) {
-        tracing::debug!(id = ?event.0, "menu command");
-        self.painter.on_event(PlatformEvent::MenuCommand(event.0));
+impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
+    /// The loop woke because an animated frame is due; ask for it.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.painter.animating()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Menu(id) => {
+                tracing::debug!(id = ?id, "menu command");
+                self.deliver(PlatformEvent::MenuCommand(id));
+            }
+            UserEvent::Woken => self.deliver(PlatformEvent::Woken),
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -442,7 +479,19 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
             }
             WindowEvent::RedrawRequested => match self.redraw() {
                 Err(error) => self.fail(event_loop, error),
-                Ok(Presented::Frame | Presented::Occluded) => self.dropped_frames = 0,
+                Ok(Presented::Frame | Presented::Occluded) => {
+                    self.dropped_frames = 0;
+                    // A painter that says it is animating gets the next frame at
+                    // the display's pace; one that does not gets none, and the
+                    // loop goes back to blocking.
+                    if self.painter.animating() {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(
+                            std::time::Instant::now() + FRAME_INTERVAL,
+                        ));
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                    }
+                }
                 // Ask for the frame again. Bounded, because a swapchain that fails
                 // forever must not turn the blocking loop into a spinning one — that
                 // would trade a black window for a hot CPU.

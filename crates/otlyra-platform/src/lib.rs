@@ -138,6 +138,32 @@ pub enum PlatformEvent {
     CloseRequested,
     /// The user chose a menu item the embedder defined.
     MenuCommand(MenuId),
+    /// Something outside the loop asked for attention: a [`Waker`] was woken, or
+    /// the painter said it was animating and this is the next tick. What that means
+    /// is the painter's business; the loop only knows a frame is wanted.
+    Woken,
+}
+
+/// A handle that wakes the event loop from another thread.
+///
+/// The one thing a worker thread may do to the interface: say that something has
+/// finished. Everything else — what finished, what it means — stays on the thread
+/// the loop runs on, because that is where the state it changes lives.
+#[derive(Clone, Debug)]
+pub struct Waker(std::sync::mpsc::Sender<()>);
+
+impl Waker {
+    /// Build a waker over a channel the loop drains. Used by the loop itself; an
+    /// embedder is given one rather than making it.
+    pub fn new(sender: std::sync::mpsc::Sender<()>) -> Self {
+        Self(sender)
+    }
+
+    /// Ask the loop for a frame. Cheap, and safe to call from any thread; a wake
+    /// after the loop has gone is silently dropped.
+    pub fn wake(&self) {
+        let _ = self.0.send(());
+    }
 }
 
 /// The keys the browser acts on by identity rather than by what they type.
@@ -227,6 +253,24 @@ pub enum Cursor {
 
 /// The embedder's side of the boundary: given a target and a viewport, draw.
 pub trait Painter {
+    /// Take the handle that wakes the loop. Called once, before the first frame.
+    ///
+    /// A painter that never works off the loop's own thread can ignore it, which is
+    /// why it has a default.
+    fn set_waker(&mut self, waker: Waker) {
+        let _ = waker;
+    }
+
+    /// Whether the painter wants a frame at the display's pace rather than only
+    /// when something happens.
+    ///
+    /// The loop otherwise blocks, so an animation that nobody asks for does not
+    /// run: this is how a spinner spins without the browser burning a core when
+    /// nothing is moving.
+    fn animating(&self) -> bool {
+        false
+    }
+
     /// React to a platform event. Default: ignore it.
     fn on_event(&mut self, event: PlatformEvent) {
         let _ = event;
