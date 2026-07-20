@@ -32,13 +32,18 @@
 //! 4. **Adding a required method is a four-backend cost.** New capability goes in as
 //!    a provided method over the seven, or it does not go in.
 
+mod display_list;
 mod paint_target;
 mod recording;
+mod render;
 mod skia;
 
+pub use display_list::{DisplayItem, DisplayList, FontId, FontTable, HitTestId, ImageResource};
 pub use paint_target::{Glyph, PaintShape, PaintTarget};
+pub use peniko::ImageBrushRef;
 pub use recording::{PaintOp, RecordingPainter};
-pub use skia::{SkiaError, SkiaPainter};
+pub use render::render;
+pub use skia::{SkiaError, SkiaPainter, decode_image};
 
 /// Re-exported so downstream crates speak exactly the geometry types the seam does.
 pub use kurbo;

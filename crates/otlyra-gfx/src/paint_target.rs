@@ -7,7 +7,7 @@ use kurbo::{Affine, PathEl, Rect, Stroke};
 use peniko::{BlendMode, BrushRef, Fill, FontData, ImageBrushRef};
 
 /// A glyph positioned in the run's local space, as emitted by parley.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Glyph {
     /// Glyph index within the font — *not* a Unicode code point.
     pub id: u32,
