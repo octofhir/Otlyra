@@ -9,6 +9,8 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+accesskit.workspace = true
+accesskit_winit.workspace = true
 otlyra-gfx.workspace = true
 pollster.workspace = true
 raw-window-handle.workspace = true

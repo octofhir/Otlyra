@@ -12,6 +12,7 @@ use winit::window::{Window, WindowId};
 
 use otlyra_gfx::{PaintTarget, SkiaPainter};
 
+use crate::a11y::Accessibility;
 use crate::menu::{NativeMenu, command_from_muda};
 use crate::present::{Presented, Presenter};
 use crate::{MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
@@ -122,6 +123,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         presenter: None,
         rasterizer: None,
         menu: None,
+        a11y: None,
         frames: 0,
         modifiers: crate::Modifiers::default(),
         cursor: crate::Cursor::default(),
@@ -147,6 +149,9 @@ struct WindowedApp<'p> {
     rasterizer: Option<SkiaPainter>,
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
+    /// The accessibility adapter. Absent if it could not be created, which is a
+    /// degraded browser and not a broken one.
+    a11y: Option<Accessibility>,
     frames: u64,
     /// Modifier state, tracked here because winit reports it as its own event and
     /// every key press needs it.
@@ -244,6 +249,14 @@ impl WindowedApp<'_> {
             self.frames += 1;
             tracing::debug!(frame = self.frames, "frame presented");
         }
+
+        // After the frame, because the tree describes what is now on screen.
+        if let Some(update) = self.painter.accessibility()
+            && let Some(a11y) = self.a11y.as_mut()
+        {
+            a11y.update(update);
+        }
+
         Ok(outcome)
     }
 }
@@ -277,8 +290,11 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
             }
         }
 
+        // Created hidden: the accessibility adapter must exist before the window is
+        // shown for the first time, and it says so by panicking otherwise.
         let attributes = Window::default_attributes()
             .with_title(self.config.title.clone())
+            .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.config.logical_size.0,
                 self.config.logical_size.1,
@@ -305,6 +321,9 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
             }
         }
 
+        self.a11y = Some(Accessibility::new(event_loop, &window));
+        window.set_visible(true);
+
         window.request_redraw();
         self.window = Some(window);
         self.painter.on_event(PlatformEvent::SurfaceReady(viewport));
@@ -322,6 +341,10 @@ impl ApplicationHandler<MenuActivated> for WindowedApp<'_> {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let (Some(a11y), Some(window)) = (self.a11y.as_mut(), self.window.as_ref()) {
+            a11y.process_event(window, &event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 self.painter.on_event(PlatformEvent::CloseRequested);

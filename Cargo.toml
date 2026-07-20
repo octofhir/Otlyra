@@ -66,6 +66,20 @@ parley = "=0.11.0"
 kurbo = "=0.13.1"
 peniko = "=0.6.1"
 
+# Accessibility. winit has none of its own (#1878, open since 2021), and a browser
+# has to build this tree out of the DOM whatever toolkit it uses — which is why the
+# plan puts it here rather than later: retrofitting it is the expensive path.
+#
+# `accesskit_winit` 0.33 rather than the 0.32 the plan named: both target the winit
+# 0.30 line and the same accesskit, and the newer one is where the fixes are.
+accesskit = "=0.24.1"
+#
+# `default-features = false` for the same reason winit and muda take it: the
+# defaults turn on the X11 and Wayland backends, which are inert on macOS and drag
+# in `wayland-scanner` and its `quick-xml`, currently carrying two high-severity
+# advisories. Linux re-enables `accesskit_unix` per target.
+accesskit_winit = { version = "=0.33.2", default-features = false, features = ["rwh_06"] }
+
 # Observability.
 tracing = { version = "=0.1.44", features = ["log"] }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }

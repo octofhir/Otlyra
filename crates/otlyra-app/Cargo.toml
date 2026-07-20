@@ -33,6 +33,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+otlyra-text.workspace = true
 insta.workspace = true
 png.workspace = true
 

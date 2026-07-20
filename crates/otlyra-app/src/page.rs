@@ -156,6 +156,30 @@ impl PageScene {
         None
     }
 
+    /// Where a box was drawn on the last frame, if it was.
+    pub fn rect_of(&self, id: BoxId) -> Option<otlyra_layout::Rect> {
+        self.targets
+            .iter()
+            .find(|(_, target)| *target == id)
+            .map(|(rect, _)| {
+                otlyra_layout::Rect::new(
+                    rect.x0 as f32,
+                    rect.y0 as f32,
+                    rect.width() as f32,
+                    rect.height() as f32,
+                )
+            })
+    }
+
+    /// The `href` of a box, if it is a link with one.
+    pub fn href_of(&self, id: BoxId) -> Option<String> {
+        let node = self.boxes.get(id)?;
+        if node.tag.as_ref().is_none_or(|tag| tag.as_ref() != "a") {
+            return None;
+        }
+        self.attribute(node.node?, "href")
+    }
+
     /// One attribute of an element node.
     fn attribute(&self, node: NodeId, name: &str) -> Option<String> {
         self.document

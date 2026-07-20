@@ -257,6 +257,17 @@ impl<L: Loader> Painter for Browser<L> {
         }
     }
 
+    fn accessibility(&mut self) -> Option<otlyra_platform::accesskit::TreeUpdate> {
+        // Rebuilt whenever the frame it describes changed. The tree is a function
+        // of the document and the last layout, so anything cheaper would be a
+        // second copy of that state to keep honest.
+        let tab = self.tabs.get(self.active)?;
+        Some(match tab.page.as_ref() {
+            Some(page) => crate::a11y::tree_for(page, &tab.title),
+            None => crate::a11y::empty_tree(&tab.title),
+        })
+    }
+
     fn cursor(&self) -> Cursor {
         if self.link_under_pointer().is_some() {
             Cursor::Pointer

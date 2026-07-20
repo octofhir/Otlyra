@@ -33,6 +33,7 @@
 //!    reported alongside. Logical pixels are the engine's business, not the
 //!    platform's.
 
+mod a11y;
 mod event_loop;
 mod icon;
 mod menu;
@@ -42,6 +43,14 @@ pub use event_loop::{PlatformError, run};
 pub use menu::{Menu, MenuBar, MenuEntry, MenuError, MenuId, SystemItem};
 
 use otlyra_gfx::PaintTarget;
+
+/// The accessibility vocabulary, re-exported so the browser names the same types
+/// the platform hands on.
+///
+/// Not a `winit` type and not a `wgpu` one: `accesskit` is a vocabulary crate the
+/// way `kurbo` and `peniko` are, and translating it into a second tree of our own
+/// would be a hundred lines that can only ever fall behind it.
+pub use accesskit;
 
 /// The drawable area, in device pixels, plus the factor that produced it.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -219,6 +228,15 @@ pub trait Painter {
     /// React to a platform event. Default: ignore it.
     fn on_event(&mut self, event: PlatformEvent) {
         let _ = event;
+    }
+
+    /// The accessibility tree, if it has changed since the last frame.
+    ///
+    /// A browser has to build this out of the DOM whatever toolkit it uses, so it
+    /// is asked for here rather than derived from anything this crate knows.
+    /// `None` means "unchanged", not "nothing to expose".
+    fn accessibility(&mut self) -> Option<accesskit::TreeUpdate> {
+        None
     }
 
     /// What the pointer should look like now.

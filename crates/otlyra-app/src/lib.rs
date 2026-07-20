@@ -10,6 +10,7 @@
 //!
 //! - [`menu`] — the native menu bar and the commands it invokes.
 //! - [`observability`] — tracing setup and the fixed span vocabulary.
+//! - [`a11y`] — the accessibility tree, built from the document.
 //! - [`browser`] — tabs, navigation, and the loop's `Painter`.
 //! - [`page`] — one document: box tree, layout, scroll position.
 //! - [`ui`] — the tab strip and address bar, drawn with our own stack.
@@ -37,6 +38,7 @@ pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
 /// bundle to load resources from.
 pub const MARK: &[u8] = include_bytes!("../../../assets/logo/mark-256.png");
 
+pub mod a11y;
 pub mod browser;
 pub mod menu;
 pub mod observability;
