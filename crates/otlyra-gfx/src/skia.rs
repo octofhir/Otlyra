@@ -69,14 +69,19 @@ struct TypefaceCache {
     /// coordinates: a bold instance of a variable font is a different typeface to
     /// Skia, and the whole point of caching is not to build it twice.
     entries: Vec<(usize, u32, Vec<i16>, sk::Typeface)>,
-    /// Configured fonts, keyed by typeface, size and hinting.
+    /// Configured fonts, keyed by typeface — blob, index *and* variation
+    /// coordinates — size and hinting.
+    ///
+    /// The coordinates belong in the key for the same reason they belong in the
+    /// typeface key: bold and regular of a variable font share a blob, so leaving
+    /// them out hands the bold run whichever weight was configured first.
     ///
     /// An `SkFont` is not a handle to a typeface; it is the key to a *strike* — the
     /// rasterized glyphs at one size with one set of flags. Building a new one per
     /// glyph run makes Skia rasterize the same glyphs again for every run on the
     /// page, which costs the same whatever the window size, and on a text-heavy
     /// page it is the single largest cost in the frame.
-    fonts: Vec<(usize, u32, u32, bool, sk::Font)>,
+    fonts: Vec<(usize, u32, Vec<i16>, u32, bool, sk::Font)>,
     font_mgr: Option<sk::FontMgr>,
 }
 
@@ -94,9 +99,15 @@ impl TypefaceCache {
         // number for every run at that size, so exact equality is what is wanted.
         let bits = size.to_bits();
 
-        if let Some((_, _, _, _, cached)) = self.fonts.iter().find(|(k, index, s, h, _)| {
-            *k == key && *index == font.index && *s == bits && *h == hint
-        }) {
+        if let Some((_, _, _, _, _, cached)) =
+            self.fonts.iter().find(|(k, index, coords, s, h, _)| {
+                *k == key
+                    && *index == font.index
+                    && coords.as_slice() == normalized_coords
+                    && *s == bits
+                    && *h == hint
+            })
+        {
             return Some(cached.clone());
         }
 
@@ -112,8 +123,14 @@ impl TypefaceCache {
         });
         configured.set_edging(sk::font::Edging::AntiAlias);
 
-        self.fonts
-            .push((key, font.index, bits, hint, configured.clone()));
+        self.fonts.push((
+            key,
+            font.index,
+            normalized_coords.to_vec(),
+            bits,
+            hint,
+            configured.clone(),
+        ));
         Some(configured)
     }
 
