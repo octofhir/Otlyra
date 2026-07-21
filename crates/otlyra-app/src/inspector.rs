@@ -798,6 +798,7 @@ impl Inspector {
             &self.focus,
             Action::TogglePicker,
             true,
+            "Pick an element",
             crate::widget::icon::picker,
         )));
         // Armed, it is lit, because a mode with no sign that it is on is a mode
@@ -837,6 +838,7 @@ impl Inspector {
                                 &self.focus,
                                 Action::Close,
                                 true,
+                                "Close the inspector",
                                 crate::widget::icon::cross,
                             ))),
                         ],

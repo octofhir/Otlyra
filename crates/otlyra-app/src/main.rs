@@ -165,7 +165,7 @@ fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::io::Write::flush(&mut std::io::stdout())?;
     tracing::info!(address = %server.address(), "answering WebDriver BiDi");
 
-    let browser = Browser::new(NetLoader::default());
+    let browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
     let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
     loop {
         server.serve_one(&mut session)?;
@@ -182,7 +182,8 @@ fn main() -> ExitCode {
     // Nothing was named on the command line, so what happens is what the
     // preferences say happens.
     if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
-        let mut browser = Browser::new(NetLoader::default());
+        let mut browser =
+            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
         let start = browser.settings_on_start();
         if start == otlyra_app::settings::OnStart::Home {
             browser.go_home();
@@ -211,7 +212,7 @@ fn main() -> ExitCode {
     if cli.mcp {
         // stdout is the wire from here on. Everything this program says about
         // itself already goes to stderr, which is what makes that safe.
-        let browser = Browser::new(NetLoader::default());
+        let browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
         let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
         let input = std::io::BufReader::new(std::io::stdin().lock());
         return match otlyra_app::mcp::serve(&mut session, input, std::io::stdout().lock()) {
@@ -289,7 +290,8 @@ fn main() -> ExitCode {
         // is ours, with no system font and no network in it.
         Some(path) => write_screenshot(&mut scene, viewport, path),
         None => {
-            let mut browser = Browser::new(NetLoader::default());
+            let mut browser =
+                Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
             run_window(window_config(&cli), &mut browser)
         }
     };
@@ -330,7 +332,8 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     if let Source::Url(input) = &source
         && let Some(page) = otlyra_app::ui::SystemPage::from_url(input)
     {
-        let mut browser = Browser::new(NetLoader::default());
+        let mut browser =
+            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
             Some(path) => Ok(write_screenshot(&mut browser, cli.viewport(), path)?),
@@ -347,7 +350,8 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         || cli.dump_fragments
         || cli.dump_selectors.is_some();
     if !wants_bytes {
-        let mut browser = Browser::new(NetLoader::default());
+        let mut browser =
+            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
         if cli.no_interface {
             browser.hide_interface();
         }
@@ -438,7 +442,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
 
     // A document was named on the command line, and nothing asked for a dump: open
     // the browser with it already loaded.
-    let mut browser = Browser::new(NetLoader::default());
+    let mut browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
     browser.navigate(&match &source {
         Source::Url(url) => url.clone(),
         Source::File(path) => path.display().to_string(),

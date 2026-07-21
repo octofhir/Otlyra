@@ -167,6 +167,15 @@ pub enum PlatformEvent {
     CloseRequested,
     /// The user chose a menu item the embedder defined.
     MenuCommand(MenuId),
+    /// Assistive technology asked to press something, naming it by the identifier
+    /// the embedder gave it in the accessibility tree.
+    ///
+    /// Only *press*: the other actions a reader can ask for either need a
+    /// vocabulary this layer does not have — scroll a named node into view — or
+    /// are already the platform's job. What arrives here is the same intent a
+    /// click and the activation key carry, so it joins them rather than opening a
+    /// third way into the same code.
+    AccessibilityActivate(accesskit::NodeId),
     /// Something outside the loop asked for attention: a [`Waker`] was woken, or
     /// the painter said it was animating and this is the next tick. What that means
     /// is the painter's business; the loop only knows a frame is wanted.

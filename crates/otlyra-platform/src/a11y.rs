@@ -34,21 +34,43 @@ impl ActivationHandler for SharedTree {
     }
 }
 
-/// Actions a screen reader can ask for — clicking, focusing, scrolling.
+/// Actions a screen reader asks for.
 ///
-/// Accepted and ignored for now: routing them needs the same input path a real
-/// pointer takes, and that lands with keyboard focus in the page. Refusing to
-/// create the adapter over it would be worse, because the tree itself is already
-/// useful for reading.
-struct IgnoreActions;
+/// The adapter calls this from whichever thread the assistive technology is on,
+/// so the request is queued rather than acted on: everything that changes the
+/// browser happens on the loop's thread, which is the same rule a `Waker`
+/// follows. The loop drains this after each batch of window events and delivers
+/// what it found as an ordinary [`PlatformEvent`].
+#[derive(Clone, Default)]
+pub(crate) struct Actions(Arc<Mutex<Vec<accesskit::NodeId>>>);
 
-impl ActionHandler for IgnoreActions {
-    fn do_action(&mut self, request: ActionRequest) {
-        tracing::debug!(action = ?request.action, "accessibility action ignored");
+impl Actions {
+    /// Take everything asked for since the last time this was called.
+    pub(crate) fn take(&self) -> Vec<accesskit::NodeId> {
+        match self.0.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
-impl DeactivationHandler for IgnoreActions {
+impl ActionHandler for Actions {
+    fn do_action(&mut self, request: ActionRequest) {
+        // Only *click*. `Focus` is the platform telling us where it thinks focus
+        // went, which our own traversal already decides; the rest name things
+        // this browser has no node for yet. Logging the ones we drop is what
+        // makes a missing one findable rather than mysterious.
+        if request.action == accesskit::Action::Click {
+            if let Ok(mut queue) = self.0.lock() {
+                queue.push(request.target_node);
+            }
+        } else {
+            tracing::debug!(action = ?request.action, "accessibility action ignored");
+        }
+    }
+}
+
+impl DeactivationHandler for Actions {
     fn deactivate_accessibility(&mut self) {}
 }
 
@@ -56,22 +78,30 @@ impl DeactivationHandler for IgnoreActions {
 pub(crate) struct Accessibility {
     adapter: accesskit_winit::Adapter,
     tree: SharedTree,
+    actions: Actions,
 }
 
 impl Accessibility {
     /// Start the adapter for `window`, which must not yet be visible.
     pub(crate) fn new(event_loop: &winit::event_loop::ActiveEventLoop, window: &Window) -> Self {
         let tree = SharedTree::default();
+        let actions = Actions::default();
         Self {
             adapter: accesskit_winit::Adapter::with_direct_handlers(
                 event_loop,
                 window,
                 tree.clone(),
-                IgnoreActions,
-                IgnoreActions,
+                actions.clone(),
+                actions.clone(),
             ),
             tree,
+            actions,
         }
+    }
+
+    /// Everything a reader has asked to press since this was last called.
+    pub(crate) fn take_actions(&self) -> Vec<accesskit::NodeId> {
+        self.actions.take()
     }
 
     /// Let the adapter see a window event. Focus changes in particular are how it

@@ -28,6 +28,19 @@ const FILE: &str = "preferences.toml";
 
 /// Where the preferences live, if the platform will say.
 pub fn path() -> Option<PathBuf> {
+    // An escape hatch, and the reason it exists is worth stating: without it a
+    // test that saves a preference writes the *developer's* preferences, and the
+    // next test that starts a browser reads them back. That is a test suite whose
+    // result depends on what the last run happened to click, which is how a
+    // machine ends up being the only one where anything passes.
+    if let Some(directory) = std::env::var_os("OTLYRA_CONFIG_DIR") {
+        return Some(PathBuf::from(directory).join(FILE));
+    }
+    platform_path()
+}
+
+/// Where the platform keeps a program's configuration, ignoring the override.
+fn platform_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let directory = if cfg!(target_os = "macos") {
         home?.join("Library").join("Application Support")
@@ -230,7 +243,10 @@ mod tests {
 
     #[test]
     fn the_file_goes_where_the_platform_keeps_such_things() {
-        let path = path().expect("a home directory in a test environment");
+        // `platform_path` rather than `path`, deliberately: `path` answers the
+        // override when one is set, and another test in this binary sets it. A
+        // test that read `path` would pass or fail on the order they ran in.
+        let path = platform_path().expect("a home directory in a test environment");
         assert!(
             path.ends_with(std::path::Path::new(FOLDER).join(FILE)),
             "{path:?}"

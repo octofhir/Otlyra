@@ -523,10 +523,74 @@ pub struct Described {
     pub label: String,
     /// What it currently says or holds, when that is not its name.
     pub value: Option<String>,
-    /// Whether it holds the keyboard.
-    pub focused: bool,
+    /// The name the surface knows it by, when it can hold the keyboard.
+    ///
+    /// The id rather than a boolean, because *which control has the keyboard* is
+    /// the surface's own value and `describe` has no `Cx` to ask. The surface
+    /// compares this against what it is holding, which it already knows.
+    pub focus: Option<FocusId>,
     /// Whether it is drawn but will not respond.
     pub enabled: bool,
+}
+
+/// The words that name what is inside it, for controls that carry none.
+///
+/// A switch is a track and a knob; a slider is a line. Neither holds any text,
+/// and the words that say what it does are in the row beside it — which the
+/// control cannot see. This is the row telling it.
+///
+/// Only descriptions that have no name of their own are filled in. A control
+/// that already named itself keeps what it said, because it knows more about
+/// what it is than the row around it does.
+pub struct Named<A> {
+    child: Child<A>,
+    name: String,
+}
+
+impl<A> Named<A> {
+    /// `child`, named `name` for anything that cannot see it.
+    pub fn new(name: impl Into<String>, child: Child<A>) -> Self {
+        Self {
+            child,
+            name: name.into(),
+        }
+    }
+}
+
+impl<A> Widget<A> for Named<A> {
+    fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
+        self.child.measure(available, cx)
+    }
+
+    fn place(&mut self, rect: Rect, cx: &mut Cx) {
+        self.child.place(rect, cx);
+    }
+
+    fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
+        self.child.draw(cx, list);
+    }
+
+    fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
+        self.child.event(event, cx)
+    }
+
+    fn flex(&self) -> f64 {
+        self.child.flex()
+    }
+
+    fn describe(&self, out: &mut Vec<Described>) {
+        let first = out.len();
+        self.child.describe(out);
+        for described in &mut out[first..] {
+            if described.label.is_empty() {
+                described.label.clone_from(&self.name);
+            }
+        }
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text().or_else(|| Some(self.name.clone()))
+    }
 }
 
 /// One piece of a surface, reporting actions of type `A`.
@@ -620,6 +684,10 @@ impl Label {
 }
 
 impl<A> Widget<A> for Label {
+    fn label_text(&self) -> Option<String> {
+        (!self.content.is_empty()).then(|| self.content.clone())
+    }
+
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         let width = cx.measure_text(&self.content, self.size);
         Size::new(width.min(available.width), cx.line_height(self.size))
@@ -873,6 +941,13 @@ impl<A> Widget<A> for Background<A> {
     fn flex(&self) -> f64 {
         self.child.flex()
     }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
 }
 
 /// Space around a child.
@@ -929,6 +1004,13 @@ impl<A> Widget<A> for Padding<A> {
 
     fn flex(&self) -> f64 {
         self.child.flex()
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
     }
 }
 
@@ -1020,6 +1102,13 @@ impl<A> Widget<A> for Fixed<A> {
             None => self.child.flex(),
         }
     }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
 }
 
 /// A child that claims a share of what a row or column has left over.
@@ -1054,6 +1143,13 @@ impl<A> Widget<A> for Flex<A> {
 
     fn flex(&self) -> f64 {
         self.share
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
     }
 }
 
@@ -1116,6 +1212,13 @@ impl<A> Widget<A> for Align<A> {
 
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         self.child.event(event, cx)
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
     }
 }
 
@@ -1184,6 +1287,13 @@ impl<A> Widget<A> for Clip<A> {
 
     fn flex(&self) -> f64 {
         self.child.flex()
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
     }
 }
 
@@ -1289,6 +1399,13 @@ impl<A> Widget<A> for Scroll<A> {
     fn flex(&self) -> f64 {
         1.0
     }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
 }
 
 /// Children drawn one over another, in the space they all share.
@@ -1347,6 +1464,15 @@ impl<A> Widget<A> for Overlay<A> {
             }
         }
         None
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        for child in &self.children {
+            child.describe(out);
+        }
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.children.iter().find_map(|child| child.label_text())
     }
 }
 
@@ -1416,6 +1542,13 @@ impl<A> Widget<A> for Anchored<A> {
 
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         self.child.event(event, cx)
+    }
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
     }
 }
 
@@ -1557,6 +1690,15 @@ impl<A> Widget<A> for Stack<A> {
         }
         None
     }
+    fn describe(&self, out: &mut Vec<Described>) {
+        for child in &self.children {
+            child.describe(out);
+        }
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.children.iter().find_map(|child| child.label_text())
+    }
 }
 
 // --- controls -------------------------------------------------------------
@@ -1572,6 +1714,8 @@ pub struct Button<A> {
     enabled: bool,
     focus: Option<FocusId>,
     rect: Rect,
+    role: Role,
+    value: Option<String>,
 }
 
 impl<A> Button<A> {
@@ -1583,7 +1727,30 @@ impl<A> Button<A> {
             enabled: true,
             focus: None,
             rect: Rect::ZERO,
+            role: Role::Button,
+            value: None,
         }
+    }
+
+    /// What this button is, when it is not a plain one.
+    ///
+    /// A checkbox, a radio and a switch are all a `Button` around a mark and a
+    /// label — the same press, the same focus, the same activation key — and the
+    /// only thing that differs is what a reader should call it. That difference
+    /// is one field, not three widgets.
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// What it currently holds, when that is not its name.
+    ///
+    /// A checkbox is *ticked* or not; the words beside it say what ticking it
+    /// means and never change. Anything a reader has to be told again after a
+    /// press belongs here rather than in the label.
+    pub fn value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
     }
 
     /// A button that is drawn but does nothing, like *back* with no history.
@@ -1641,6 +1808,21 @@ impl<A: Clone> Widget<A> for Button<A> {
 
     fn flex(&self) -> f64 {
         self.child.flex()
+    }
+
+    fn describe(&self, out: &mut Vec<Described>) {
+        out.push(Described {
+            rect: self.rect,
+            role: self.role,
+            label: self.child.label_text().unwrap_or_default(),
+            value: self.value.clone(),
+            focus: self.focus,
+            enabled: self.enabled,
+        });
+        // Then the child, because a button can hold one: the close cross lives
+        // inside the tab it closes. The label inside says nothing, so the usual
+        // case adds nothing here.
+        self.child.describe(out);
     }
 }
 

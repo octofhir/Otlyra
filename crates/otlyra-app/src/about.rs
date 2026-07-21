@@ -12,8 +12,8 @@ use otlyra_text::TextEngine;
 use crate::widget::controls;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Child, Cx, Event, Flex, Focus, FocusId, Gap, Insets, Label, Padding, Paragraph, Rect,
-    Size, Stack, fill_rounded,
+    Align, Child, Cx, Described, Event, Flex, Focus, FocusId, Gap, Insets, Label, Padding,
+    Paragraph, Rect, Size, Stack, fill_rounded,
 };
 
 /// What this build is called.
@@ -68,6 +68,29 @@ impl AboutSurface {
             builds: 0,
             root: None,
         }
+    }
+
+    /// What the last frame drew, for something that cannot see it.
+    pub fn describe(&self) -> Vec<Described> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            root.describe(&mut out);
+        }
+        out
+    }
+
+    /// Which control holds the keyboard.
+    pub fn focused(&self) -> Option<FocusId> {
+        self.focused
+    }
+
+    /// Activate the control a reader named, through the path a press takes.
+    pub fn activate_described(&mut self, index: usize, text: &mut TextEngine) -> Action {
+        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
+            return Action::None;
+        };
+        self.focused = Some(focus);
+        self.offer(&Event::Activate, text)
     }
 
     /// Note where the pointer is.

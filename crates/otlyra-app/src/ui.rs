@@ -30,8 +30,8 @@ use crate::widget::controls::{self, Elide, FieldView, TextInput};
 use crate::widget::icon;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Button, Child, Cx, Event, Fixed, Focus, FocusId, FocusKind, Insets, Label,
-    Padding, Painted, Size, Stack, Widget, fill_rounded,
+    Align, Background, Button, Child, Cx, Described, Event, Fixed, Focus, FocusId, FocusKind,
+    Insets, Label, Padding, Painted, Role, Size, Stack, Widget, fill_rounded,
 };
 
 /// Height of the tab strip, in logical pixels.
@@ -375,6 +375,27 @@ impl BrowserUi {
         }
     }
 
+    /// What the last frame drew, for something that cannot see it.
+    ///
+    /// Asked of the tree that drew the frame, like the cursor and like a press:
+    /// a description worked out a second time from state kept elsewhere would be
+    /// a second opinion about the interface, and the two would part company the
+    /// first time one of them was updated and the other was not.
+    ///
+    /// Empty before the first frame, which is honest — nothing has been drawn.
+    pub fn describe(&self) -> Vec<Described> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            root.describe(&mut out);
+        }
+        out
+    }
+
+    /// Which control holds the keyboard, for whoever is reading the description.
+    pub fn focused(&self) -> Option<FocusId> {
+        self.focused
+    }
+
     /// How many display lists this interface has built rather than reused.
     pub fn builds(&self) -> u64 {
         self.builds
@@ -503,6 +524,24 @@ impl BrowserUi {
                 UiAction::None
             }
         }
+    }
+
+    /// Activate the control a reader named, by the index it was described at.
+    ///
+    /// The focus is moved onto it and then the ordinary activation runs — the
+    /// same `Event::Activate` the space bar raises, reaching the same widget in
+    /// the same tree. A second path that reported the action directly would be a
+    /// second answer to *what does pressing this do*, and the two would agree
+    /// only until one of them was changed.
+    pub fn activate_described(&mut self, index: usize, text: &mut TextEngine) -> UiAction {
+        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
+            // A node with no focus id cannot be pressed: it is a label, or a
+            // field whose caret is its focus. Nothing happens, which is what a
+            // press on it would do.
+            return UiAction::None;
+        };
+        self.focused = Some(focus);
+        self.activate(text)
     }
 
     /// Activate whatever holds the keyboard, through the path a press takes.
@@ -858,6 +897,7 @@ fn tab_strip(
         focus,
         UiAction::NewTab,
         true,
+        "New tab",
         icon::plus,
     ));
     // Everything is pushed to the left; whatever is left over is empty strip.
@@ -980,7 +1020,14 @@ fn tab(
     let room = width - 14.0 - 18.0 - theme.gap * 3.0 - theme.inset;
     let title = controls::elide(cx, &label.title, room, Elide::End);
 
-    let close = controls::icon_button(theme, focus, UiAction::CloseTab(index), true, icon::cross);
+    let close = controls::icon_button(
+        theme,
+        focus,
+        UiAction::CloseTab(index),
+        true,
+        "Close tab",
+        icon::cross,
+    );
     let close = Box::new(Fixed::new(18.0, 18.0, Box::new(Align::centre(close))));
 
     let row = Stack::row(
@@ -1015,7 +1062,12 @@ fn tab(
 
     Box::new(Fixed::width(
         width,
-        Box::new(Button::new(UiAction::SelectTab(index), Box::new(background)).focus(id)),
+        Box::new(
+            Button::new(UiAction::SelectTab(index), Box::new(background))
+                .role(Role::Tab)
+                .value(if active { "selected" } else { "not selected" })
+                .focus(id),
+        ),
     ))
 }
 
@@ -1034,6 +1086,7 @@ fn toolbar(
         focus,
         UiAction::Back,
         can_go_back,
+        "Back",
         |list, rect, color| {
             icon::chevron(list, rect, icon::Direction::Left, color);
         },
@@ -1043,6 +1096,7 @@ fn toolbar(
         focus,
         UiAction::Forward,
         can_go_forward,
+        "Forward",
         |list, rect, color| icon::chevron(list, rect, icon::Direction::Right, color),
     );
     let reload = controls::icon_button(
@@ -1050,6 +1104,7 @@ fn toolbar(
         focus,
         UiAction::Reload,
         true,
+        "Reload",
         move |list, rect, color| {
             icon::reload(list, rect, spinner, color);
         },
@@ -1087,7 +1142,14 @@ fn toolbar(
                 controls::gap(theme.gap * 0.5),
                 field,
                 controls::gap(theme.gap * 0.5),
-                controls::icon_button(theme, focus, UiAction::ToggleMenu, true, icon::gear),
+                controls::icon_button(
+                    theme,
+                    focus,
+                    UiAction::ToggleMenu,
+                    true,
+                    "Browser menu",
+                    icon::gear,
+                ),
             ],
         )),
     ))
@@ -1192,6 +1254,119 @@ mod tests {
             None,
             text,
             &mut list,
+        );
+    }
+
+    // --- what a reader is told -------------------------------------------
+
+    /// The strip says one thing per tab, with its title and whether it is the
+    /// one being read.
+    #[test]
+    fn every_tab_is_described_with_its_title_and_whether_it_is_selected() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        frame(&mut ui, &mut text, 900.0, 3);
+
+        let tabs: Vec<_> = ui
+            .describe()
+            .into_iter()
+            .filter(|node| node.role == Role::Tab)
+            .map(|node| (node.label, node.value))
+            .collect();
+
+        assert_eq!(
+            tabs,
+            vec![
+                ("Tab 0".to_owned(), Some("selected".to_owned())),
+                ("Tab 1".to_owned(), Some("not selected".to_owned())),
+                ("Tab 2".to_owned(), Some("not selected".to_owned())),
+            ]
+        );
+    }
+
+    /// The address field reports what is in it, and that it is a field.
+    #[test]
+    fn the_address_field_reports_its_contents() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        ui.address = TextField::new("example.com/page");
+        frame(&mut ui, &mut text, 900.0, 1);
+
+        let field = ui
+            .describe()
+            .into_iter()
+            .find(|node| node.role == Role::TextInput)
+            .expect("the address field");
+        assert_eq!(field.value.as_deref(), Some("example.com/page"));
+    }
+
+    /// Nothing is described before a frame, because nothing has been drawn — and
+    /// a description of geometry that does not exist would be rectangles at zero.
+    #[test]
+    fn nothing_is_described_before_the_first_frame() {
+        assert!(BrowserUi::new().describe().is_empty());
+    }
+
+    /// Everything described has been placed, so a reader pointing at one is
+    /// pointing at where it actually is.
+    #[test]
+    fn everything_described_has_a_rectangle_on_screen() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        frame(&mut ui, &mut text, 900.0, 2);
+
+        for node in ui.describe() {
+            assert!(
+                node.rect.width > 0.0 && node.rect.height > 0.0,
+                "{:?} was described at {:?}",
+                node.role,
+                node.rect
+            );
+        }
+    }
+
+    /// A press through the accessibility path reports what a click reports.
+    #[test]
+    fn a_reader_pressing_a_tab_selects_it_like_a_click_would() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        frame(&mut ui, &mut text, 900.0, 3);
+
+        let index = ui
+            .describe()
+            .iter()
+            .position(|node| node.role == Role::Tab && node.label == "Tab 2")
+            .expect("the third tab");
+
+        assert_eq!(
+            ui.activate_described(index, &mut text),
+            UiAction::SelectTab(2)
+        );
+    }
+
+    /// A button that is drawn but cannot act says so, rather than being missing:
+    /// what a browser will do and what it does are different facts.
+    #[test]
+    fn a_disabled_button_is_described_and_marked_disabled() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        let mut list = DisplayList::default();
+        // Neither back nor forward has anywhere to go.
+        ui.build_display_list(
+            900.0,
+            600.0,
+            &labels(1),
+            0,
+            (false, false),
+            None,
+            &mut text,
+            &mut list,
+        );
+
+        let described = ui.describe();
+        assert!(
+            described.iter().any(|node| !node.enabled),
+            "a browser with no history describes no disabled control"
         );
     }
 

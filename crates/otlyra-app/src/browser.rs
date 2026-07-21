@@ -302,6 +302,17 @@ pub struct Browser {
 impl Browser {
     /// A browser with one blank tab, fetching through `loader`.
     pub fn new<L: Loader>(loader: L) -> Self {
+        Self::with_settings(loader, crate::settings::Settings::default())
+    }
+
+    /// A browser over `loader`, starting from `settings`.
+    ///
+    /// Preferences are handed in rather than read here. Reading them inside the
+    /// constructor made every browser depend on a file in the home directory,
+    /// which meant a test that saved one changed what the *next* test loaded —
+    /// and the suite passed or failed according to what had been clicked last.
+    /// Loading them is the shell's job; this is what a browser does with them.
+    pub fn with_settings<L: Loader>(loader: L, settings: crate::settings::Settings) -> Self {
         Self {
             text: TextEngine::new(),
             ui: BrowserUi::new(),
@@ -320,7 +331,7 @@ impl Browser {
                 .ok(),
             pointer: (0.0, 0.0),
             cursor: Cursor::Default,
-            settings: SettingsSurface::with(crate::preferences::load()),
+            settings: SettingsSurface::with(settings),
             inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
         }
@@ -1665,6 +1676,45 @@ impl Painter for Browser {
                 None => tracing::warn!(?id, "menu reported an id no command claims"),
             },
 
+            PlatformEvent::AccessibilityActivate(node) => {
+                // A node the page owns, not the interface. The page has nothing
+                // that can be pressed through this path yet — links are followed
+                // by a click, and that needs a point rather than a node.
+                let Some(index) = crate::a11y::described_index(node) else {
+                    tracing::debug!(?node, "accessibility press names a page node");
+                    return;
+                };
+
+                // The description is the toolbar's controls followed by the
+                // browser page's, so an index past the toolbar belongs to the
+                // page. Counting rather than tagging, because the two lists are
+                // built one after the other in the same frame and the count is
+                // what the identifiers were handed out from.
+                let toolbar = self.ui.describe().len();
+                if index < toolbar {
+                    let action = self.ui.activate_described(index, &mut self.text);
+                    self.apply(action);
+                    return;
+                }
+
+                let index = index - toolbar;
+                match self.tabs.get(self.active).and_then(|tab| tab.system) {
+                    Some(SystemPage::Settings) => {
+                        let before = self.settings.settings.clone();
+                        let action = self.settings.activate_described(index);
+                        self.save_preferences_if_changed(&before);
+                        self.close_settings_if(&action);
+                    }
+                    Some(SystemPage::About)
+                        if self.about.activate_described(index, &mut self.text)
+                            == about::Action::OpenSettings =>
+                    {
+                        self.open_system(SystemPage::Settings);
+                    }
+                    _ => {}
+                }
+            }
+
             PlatformEvent::CloseRequested => tracing::info!("close requested"),
             _ => {}
         }
@@ -1675,10 +1725,42 @@ impl Painter for Browser {
         // of the document and the last layout, so anything cheaper would be a
         // second copy of that state to keep honest.
         let tab = self.tabs.get(self.active)?;
-        Some(match tab.page.as_ref() {
+        let document = match tab.page.as_ref() {
             Some(page) => crate::a11y::tree_for(page, &tab.title),
             None => crate::a11y::empty_tree(&tab.title),
-        })
+        };
+
+        // With the interface hidden there is nothing over the page, so the page
+        // is the whole window and wrapping it would add a level describing a
+        // toolbar that was never drawn.
+        if !self.interface {
+            return Some(document);
+        }
+
+        let title = tab.title.clone();
+        let system = tab.system;
+
+        // The toolbar, and then whatever is under it. A browser page is drawn by
+        // its own surface, so its controls come from that surface rather than
+        // from the document tree, which for an `about:` page has nothing in it.
+        let mut described = self.ui.describe();
+        let (page_focus, page_described) = match system {
+            Some(SystemPage::Settings) => (self.settings.focused(), self.settings.describe()),
+            Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
+            // The pages that are still a placeholder draw no controls, so they
+            // describe none.
+            _ => (None, Vec::new()),
+        };
+        described.extend(page_described);
+
+        // Whichever of the two is holding the keyboard. They cannot both be: a
+        // press on one takes the focus off the other, which is what the surfaces
+        // already do to each other.
+        let focused = self.ui.focused().or(page_focus);
+
+        Some(crate::a11y::window_tree(
+            &described, focused, document, &title,
+        ))
     }
 
     fn cursor(&self) -> Cursor {
@@ -1879,6 +1961,101 @@ mod system_page_tests {
         };
         let mut target = otlyra_gfx::RecordingPainter::default();
         browser.paint(&mut target, viewport);
+    }
+
+    // --- what a screen reader is handed -----------------------------------
+
+    /// The identifiers `window_tree` hands out, in the order it hands them out.
+    fn described_labels(browser: &mut Browser) -> Vec<String> {
+        browser
+            .accessibility()
+            .expect("a tree")
+            .nodes
+            .into_iter()
+            .filter_map(|(id, node)| crate::a11y::described_index(id).map(|index| (index, node)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .map(|node| node.label().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// One tree, with the toolbar over the document rather than beside it.
+    #[test]
+    fn the_tree_holds_the_interface_and_the_document_together() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 1000.0, 700.0);
+
+        let labels = described_labels(&mut browser);
+        assert!(
+            labels.iter().any(|label| label == "New tab"),
+            "the toolbar is not in the tree: {labels:?}"
+        );
+    }
+
+    /// With no interface drawn there is nothing to wrap the page in, and a level
+    /// describing a toolbar that was never drawn would be a level about nothing.
+    #[test]
+    fn a_browser_with_no_interface_hands_over_the_page_alone() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.hide_interface();
+        frame(&mut browser, 1000.0, 700.0);
+
+        assert!(described_labels(&mut browser).is_empty());
+    }
+
+    /// The settings' own controls join the toolbar's, so a reader on the page
+    /// finds the switches rather than an empty document.
+    #[test]
+    fn a_browser_page_describes_the_controls_it_drew() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.open_system(SystemPage::Settings);
+        frame(&mut browser, 1000.0, 700.0);
+
+        let labels = described_labels(&mut browser);
+        assert!(
+            labels.iter().any(|label| label.starts_with("Text size")),
+            "the settings' controls are not in the tree: {labels:?}"
+        );
+    }
+
+    /// A press asked for by a reader does what a click on the same control does.
+    #[test]
+    fn a_reader_can_throw_a_switch_on_the_settings() {
+        // Throwing a switch saves the preferences, and saving them must not reach
+        // the file the person running the tests browses with. Nothing in this
+        // binary loads them any more, so pointing the write somewhere else is the
+        // whole of what this needs.
+        //
+        // SAFETY: set to one constant value, once, and only ever read by
+        // `preferences::path` — never changed under a running read.
+        unsafe {
+            std::env::set_var(
+                "OTLYRA_CONFIG_DIR",
+                std::env::temp_dir().join("otlyra-tests"),
+            )
+        };
+        std::fs::create_dir_all(std::env::temp_dir().join("otlyra-tests"))
+            .expect("a place to save preferences");
+
+        let mut browser = Browser::new(NoNetwork);
+        browser.open_system(SystemPage::Settings);
+        frame(&mut browser, 1000.0, 700.0);
+
+        let before = browser.settings.settings.load_images;
+        let update = browser.accessibility().expect("a tree");
+        let (id, _) = update
+            .nodes
+            .iter()
+            .find(|(id, node)| {
+                crate::a11y::described_index(*id).is_some() && node.label() == Some("Load images")
+            })
+            .expect("the images switch");
+
+        browser.on_event(PlatformEvent::AccessibilityActivate(*id));
+        assert_ne!(
+            browser.settings.settings.load_images, before,
+            "the switch did not move"
+        );
     }
 
     #[test]

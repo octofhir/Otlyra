@@ -25,8 +25,8 @@ use otlyra_gfx::{DisplayList, kurbo::RoundedRectRadii};
 use crate::widget::icon;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Button, Child, Cx, Event, Fixed, Focus, FocusId, Gap, Insets, Label,
-    Padding, Painted, Paragraph, Rect, Size, Stack, Widget, fill_rounded, ring,
+    Align, Background, Button, Child, Cx, Described, Event, Fixed, Focus, FocusId, Gap, Insets,
+    Label, Named, Padding, Painted, Paragraph, Rect, Role, Size, Stack, Widget, fill_rounded, ring,
 };
 
 /// A mark drawn into a rectangle in one colour: an icon, told what shade to be.
@@ -57,6 +57,7 @@ pub fn icon_button<A: Clone + 'static>(
     focus: &Focus,
     action: A,
     enabled: bool,
+    name: &str,
     mark: impl Fn(&mut DisplayList, Rect, Color) + 'static,
 ) -> Child<A> {
     let id = focus.claim(enabled);
@@ -81,11 +82,16 @@ pub fn icon_button<A: Clone + 'static>(
     Box::new(Fixed::new(
         size,
         size,
-        Box::new(
-            Button::new(action, Box::new(face))
-                .enabled(enabled)
-                .focus(id),
-        ),
+        // The name is the button's, not the row's: a mark is not words, and a
+        // reader told "button" and nothing else has been told nothing.
+        Box::new(Named::new(
+            name,
+            Box::new(
+                Button::new(action, Box::new(face))
+                    .enabled(enabled)
+                    .focus(id),
+            ),
+        )),
     ))
 }
 
@@ -173,6 +179,8 @@ pub fn checkbox<A: Clone + 'static>(
                 ],
             )),
         )
+        .role(Role::CheckBox)
+        .value(if checked { "ticked" } else { "not ticked" })
         .focus(id),
     )
 }
@@ -229,6 +237,8 @@ pub fn radio<A: Clone + 'static>(
                 ],
             )),
         )
+        .role(Role::RadioButton)
+        .value(if chosen { "chosen" } else { "not chosen" })
         .focus(id),
     )
 }
@@ -284,6 +294,8 @@ pub fn toggle_enabled<A: Clone + 'static>(
         height,
         Box::new(
             Button::new(action, Box::new(Align::centre(painted)))
+                .role(Role::Switch)
+                .value(if on { "on" } else { "off" })
                 .enabled(enabled)
                 .focus(id),
         ),
@@ -328,7 +340,12 @@ pub fn segmented<A: Clone + 'static>(
             if !selected {
                 face = face.on_hover(theme.hover);
             }
-            Box::new(Button::new(action, Box::new(face)).focus(id)) as Child<A>
+            Box::new(
+                Button::new(action, Box::new(face))
+                    .role(Role::RadioButton)
+                    .value(if selected { "chosen" } else { "not chosen" })
+                    .focus(id),
+            ) as Child<A>
         })
         .collect();
 
@@ -508,6 +525,21 @@ impl<A> Widget<A> for Slider<A> {
             _ => None,
         }
     }
+
+    fn describe(&self, out: &mut Vec<Described>) {
+        out.push(Described {
+            rect: self.rect,
+            role: Role::Slider,
+            // Named by the row it sits in; a slider holds no words of its own.
+            label: String::new(),
+            // The number, not the fraction: a reader is told *what the setting
+            // is*, and a percentage of a range it was never told the ends of
+            // says nothing.
+            value: Some(format!("{}", self.value.round())),
+            focus: self.focus,
+            enabled: true,
+        });
+    }
 }
 
 /// What a field is showing this frame.
@@ -588,6 +620,22 @@ impl TextInput {
 }
 
 impl<A> Widget<A> for TextInput {
+    fn describe(&self, out: &mut Vec<Described>) {
+        out.push(Described {
+            rect: self.rect,
+            role: Role::TextInput,
+            // The placeholder is the field's name: it is the words that say what
+            // belongs here, and they are the same words whether the field is
+            // empty or not.
+            label: self.view.placeholder.clone(),
+            value: Some(self.view.text.clone()),
+            // A field has no focus id — the caret being present *is* the field
+            // having the keyboard, and that is already in the view it was given.
+            focus: None,
+            enabled: true,
+        });
+    }
+
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         // No intrinsic width at all: a field wants whatever is left over, and it
         // asks for that through `flex` rather than by claiming the whole row and
@@ -686,6 +734,10 @@ struct Field<A> {
 }
 
 impl<A> Widget<A> for Field<A> {
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.inner.describe(out);
+    }
+
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         self.inner.measure(available, cx)
     }
@@ -737,6 +789,14 @@ impl<A> Outline<A> {
 }
 
 impl<A> Widget<A> for Outline<A> {
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
+
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         self.child.measure(available, cx)
     }
@@ -794,6 +854,11 @@ pub fn setting_row<A: 'static>(
     hint: Option<&str>,
     control: Child<A>,
 ) -> Child<A> {
+    let title = title.into();
+    // The control is named by the row, so a switch or a slider — neither of
+    // which holds any words — is called what the row calls it, with no second
+    // copy of the string to fall out of step.
+    let control: Child<A> = Box::new(Named::new(title.clone(), control));
     let mut text: Vec<Child<A>> = vec![Box::new(Label::new(title, theme.font_size, theme.ink))];
     if let Some(hint) = hint {
         text.push(Box::new(Paragraph::new(
@@ -877,6 +942,7 @@ pub fn menu_item<A: Clone + 'static>(
         30.0,
         Box::new(
             Button::new(action, Box::new(face))
+                .role(Role::MenuItem)
                 .enabled(enabled)
                 .focus(id),
         ),

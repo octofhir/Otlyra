@@ -288,6 +288,15 @@ impl WindowedApp<'_> {
 impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
     /// The loop woke because an animated frame is due; ask for it.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Anything a screen reader asked for arrived on its own thread and was
+        // queued. Drained here, between batches of window events, so it reaches
+        // the painter as an ordinary event on the loop's thread like every other.
+        if let Some(a11y) = self.a11y.as_ref() {
+            for node in a11y.take_actions() {
+                self.deliver(PlatformEvent::AccessibilityActivate(node));
+            }
+        }
+
         if self.painter.animating()
             && let Some(window) = self.window.as_ref()
         {

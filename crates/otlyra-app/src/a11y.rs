@@ -12,14 +12,24 @@
 //! expensive order to do it in.
 
 use otlyra_layout::{BoxId, BoxKind, BoxTree};
-use otlyra_platform::accesskit::{Node, NodeId, Rect, Role, Tree, TreeId, TreeUpdate};
+use otlyra_platform::accesskit::{Node, NodeId, Rect, Role, Toggled, Tree, TreeId, TreeUpdate};
 
 use crate::page::PageScene;
+use crate::widget::{Described, FocusId, Role as WidgetRole};
 
 /// The identifier of the tree's root. Everything else takes its identifier from
 /// the box it describes, which is already unique and already stable across a
 /// frame.
 const ROOT: NodeId = NodeId(0);
+
+/// Where the interface's identifiers start.
+///
+/// The document numbers its nodes from its box ids, which begin at one and count
+/// up; the interface numbers its own from the far end of the same space so the
+/// two cannot collide however large either grows. A shared counter would have
+/// been the alternative, and it would have made every node's identity depend on
+/// the order the two trees happened to be built in.
+const INTERFACE_BASE: u64 = u64::MAX / 2;
 
 /// Build the tree for `page`, titled `title`.
 pub fn tree_for(page: &PageScene, title: &str) -> TreeUpdate {
@@ -39,6 +49,122 @@ pub fn tree_for(page: &PageScene, title: &str) -> TreeUpdate {
         tree_id: TreeId::ROOT,
         focus: ROOT,
     }
+}
+
+/// The whole window: the interface, and the document under it.
+///
+/// One tree with one root, because that is what a screen reader walks. The
+/// interface comes first, in the order it was drawn, which is the order the
+/// keyboard travels it — the same rule that makes `Focus` work.
+pub fn window_tree(
+    interface: &[Described],
+    focused: Option<FocusId>,
+    document: TreeUpdate,
+    title: &str,
+) -> TreeUpdate {
+    let mut nodes = document.nodes;
+
+    // The document's own root becomes a child of the window's, so the page keeps
+    // being one thing a reader can move in and out of rather than its contents
+    // being tipped in beside the toolbar.
+    let mut page_children = Vec::new();
+    for (id, node) in &mut nodes {
+        if *id == ROOT {
+            *id = NodeId(INTERFACE_BASE - 1);
+            page_children.push(*id);
+            node.set_label(title.to_owned());
+        }
+    }
+
+    let mut children = Vec::new();
+    let mut interface_focus = None;
+    for (index, described) in interface.iter().enumerate() {
+        let id = NodeId(INTERFACE_BASE + index as u64);
+        if described.focus.is_some() && described.focus == focused {
+            interface_focus = Some(id);
+        }
+        nodes.push((id, node_for(described)));
+        children.push(id);
+    }
+    children.extend(page_children);
+
+    let mut root = Node::new(Role::Window);
+    root.set_label(title.to_owned());
+    root.set_children(children);
+    nodes.push((ROOT, root));
+
+    TreeUpdate {
+        nodes,
+        tree: Some(Tree::new(ROOT)),
+        tree_id: TreeId::ROOT,
+        // What the interface is holding, or the document. A reader is told where
+        // the keyboard *is*; claiming the window when a field has the caret would
+        // be describing a different browser than the one on screen.
+        focus: interface_focus.unwrap_or(document.focus.max(ROOT)),
+    }
+}
+
+/// Which described control a node identifier names, if it names one.
+///
+/// The inverse of how `window_tree` numbers them, kept beside it so the two
+/// cannot drift: an identifier is the base plus the control's position in the
+/// description, and a description is rebuilt every frame in drawing order.
+pub fn described_index(node: otlyra_platform::accesskit::NodeId) -> Option<usize> {
+    (node.0 >= INTERFACE_BASE).then(|| (node.0 - INTERFACE_BASE) as usize)
+}
+
+/// One described control, as a node.
+fn node_for(described: &Described) -> Node {
+    let mut node = Node::new(match described.role {
+        WidgetRole::Button => Role::Button,
+        WidgetRole::CheckBox => Role::CheckBox,
+        WidgetRole::RadioButton => Role::RadioButton,
+        WidgetRole::Switch => Role::Switch,
+        WidgetRole::TextInput => Role::TextInput,
+        WidgetRole::Slider => Role::Slider,
+        WidgetRole::Tab => Role::Tab,
+        WidgetRole::MenuItem => Role::MenuItem,
+        WidgetRole::Label => Role::Label,
+    });
+
+    if !described.label.is_empty() {
+        node.set_label(described.label.clone());
+    }
+    if let Some(value) = &described.value {
+        node.set_value(value.clone());
+    }
+    node.set_bounds(Rect::new(
+        described.rect.x,
+        described.rect.y,
+        described.rect.x + described.rect.width,
+        described.rect.y + described.rect.height,
+    ));
+
+    // A control that says *ticked* or *on* says it twice: once as a value a
+    // reader hears, and once as the state its own kind of control has, which is
+    // what a reader's shortcuts and its summary of a form both read.
+    match (described.role, described.value.as_deref()) {
+        (WidgetRole::CheckBox | WidgetRole::Switch, Some("ticked" | "on")) => {
+            node.set_toggled(Toggled::True);
+        }
+        (WidgetRole::CheckBox | WidgetRole::Switch, Some(_)) => node.set_toggled(Toggled::False),
+        (WidgetRole::RadioButton | WidgetRole::Tab, Some("chosen" | "selected")) => {
+            node.set_selected(true);
+        }
+        (WidgetRole::RadioButton | WidgetRole::Tab, Some(_)) => node.set_selected(false),
+        _ => {}
+    }
+
+    if described.enabled {
+        // Only the controls that can be pressed advertise the action, so a
+        // reader offering "press this" is never offering something that does
+        // nothing.
+        node.add_action(otlyra_platform::accesskit::Action::Click);
+    } else {
+        node.set_disabled();
+    }
+
+    node
 }
 
 /// The tree for a tab with no document — a blank tab, or one that failed.
@@ -266,6 +392,119 @@ mod tests {
             .expect("a heading");
         let bounds = heading.1.bounds().expect("bounds");
         assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+    }
+
+    // --- the interface, joined to the document ---------------------------
+
+    fn described(role: WidgetRole, label: &str, value: Option<&str>) -> Described {
+        Described {
+            rect: crate::widget::Rect::new(0.0, 0.0, 40.0, 20.0),
+            role,
+            label: label.to_owned(),
+            value: value.map(str::to_owned),
+            focus: None,
+            enabled: true,
+        }
+    }
+
+    /// The window is one tree: the toolbar, then the page as a thing of its own.
+    #[test]
+    fn the_window_holds_the_interface_and_the_page_under_it() {
+        let page = page("<body><p>text");
+        let interface = vec![described(WidgetRole::Button, "Reload", None)];
+        let update = window_tree(&interface, None, tree_for(&page, "A page"), "A page");
+
+        assert_eq!(
+            outline(&update),
+            vec![
+                "Window \"A page\"".to_owned(),
+                "  Button \"Reload\"".to_owned(),
+                "  Document \"A page\"".to_owned(),
+                "    Paragraph".to_owned(),
+                "      Label \"text\"".to_owned(),
+            ]
+        );
+    }
+
+    /// A tick is said twice on purpose: as words a reader hears, and as the state
+    /// its shortcuts and its summary of a form both read.
+    #[test]
+    fn a_ticked_box_and_a_thrown_switch_carry_their_state() {
+        let interface = vec![
+            described(WidgetRole::CheckBox, "Load images", Some("ticked")),
+            described(WidgetRole::Switch, "Run scripts", Some("off")),
+            described(WidgetRole::Tab, "Tab 0", Some("selected")),
+        ];
+        let update = window_tree(&interface, None, empty_tree("t"), "t");
+
+        let of = |role: Role| {
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == role)
+                .map(|(_, node)| node.clone())
+                .expect("the node")
+        };
+        assert_eq!(of(Role::CheckBox).toggled(), Some(Toggled::True));
+        assert_eq!(of(Role::Switch).toggled(), Some(Toggled::False));
+        assert!(of(Role::Tab).is_selected().unwrap_or(false));
+    }
+
+    /// A reader is told where the keyboard *is*. Claiming the window while a
+    /// control holds it would describe a different browser than the one on screen.
+    #[test]
+    fn focus_lands_on_the_control_holding_the_keyboard() {
+        let mut holder = described(WidgetRole::Button, "Reload", None);
+        holder.focus = Some(7);
+        let interface = vec![
+            described(WidgetRole::Tab, "Tab 0", Some("selected")),
+            holder,
+        ];
+
+        let update = window_tree(&interface, Some(7), empty_tree("t"), "t");
+        assert_eq!(update.focus, NodeId(INTERFACE_BASE + 1));
+    }
+
+    /// The identifiers the tree hands out are the ones a press comes back with.
+    #[test]
+    fn a_node_identifier_names_the_control_it_was_built_from() {
+        let interface = vec![
+            described(WidgetRole::Button, "Back", None),
+            described(WidgetRole::Button, "Reload", None),
+        ];
+        let update = window_tree(&interface, None, empty_tree("t"), "t");
+
+        let root = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == ROOT)
+            .expect("the root");
+        let first = root.1.children()[0];
+        assert_eq!(described_index(first), Some(0));
+    }
+
+    /// A page node is not an interface node, and must not be mistaken for the
+    /// control that happens to sit at that index.
+    #[test]
+    fn a_page_node_names_no_control() {
+        assert_eq!(described_index(NodeId(3)), None);
+    }
+
+    /// A control drawn but unable to act offers no press, so a reader never
+    /// offers one that would do nothing.
+    #[test]
+    fn a_control_that_cannot_be_pressed_is_marked_disabled() {
+        let mut dimmed = described(WidgetRole::Switch, "Run scripts", Some("off"));
+        dimmed.enabled = false;
+        let update = window_tree(&[dimmed], None, empty_tree("t"), "t");
+
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Switch)
+            .expect("the switch");
+        assert!(node.is_disabled());
+        assert!(!node.supports_action(otlyra_platform::accesskit::Action::Click));
     }
 
     #[test]

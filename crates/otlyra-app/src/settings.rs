@@ -23,8 +23,8 @@ use otlyra_text::TextEngine;
 use crate::widget::controls::{self, Emphasis};
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Child, Cx, Event, Flex, Focus, FocusId, FocusKind, Gap, Insets, Label, Overflow,
-    Padding, Rect, Scroll, Size, Stack, fill_rounded,
+    Align, Child, Cx, Described, Event, Flex, Focus, FocusId, FocusKind, Gap, Insets, Label,
+    Overflow, Padding, Rect, Scroll, Size, Stack, fill_rounded,
 };
 
 /// What happens when the browser starts.
@@ -506,6 +506,31 @@ impl SettingsSurface {
             builds: 0,
             root: None,
         }
+    }
+
+    /// What the last frame drew, for something that cannot see it.
+    ///
+    /// Empty before the first frame: nothing has been drawn to describe.
+    pub fn describe(&self) -> Vec<Described> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            root.describe(&mut out);
+        }
+        out
+    }
+
+    /// Which control holds the keyboard.
+    pub fn focused(&self) -> Option<FocusId> {
+        self.settings.focus
+    }
+
+    /// Activate the control a reader named, through the path a press takes.
+    pub fn activate_described(&mut self, index: usize) -> Action {
+        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
+            return Action::None;
+        };
+        self.settings.focus = Some(focus);
+        self.deliver(&Event::Activate)
     }
 
     /// Note where the pointer is.
