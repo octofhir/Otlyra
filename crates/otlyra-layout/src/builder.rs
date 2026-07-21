@@ -440,11 +440,12 @@ impl Builder<'_> {
                     Some(content) => BoxKind::Replaced(content),
                     None => match style.display {
                         Display::None => return,
-                        // A flex container is a block-level box; what makes it a
-                        // flex container is its style, which layout reads when it
-                        // gets to its children.
-                        Display::Block | Display::Flex | Display::Grid => BoxKind::Block,
                         Display::Inline => BoxKind::Inline,
+                        // A flex or grid container, a table and every part of one
+                        // are block-level boxes. What makes them more than that is
+                        // their style, which layout reads when it gets to their
+                        // children.
+                        _ => BoxKind::Block,
                     },
                 };
 

@@ -42,6 +42,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         viewport: initial,
         scroll_ports: Vec::new(),
         pending_marker: None,
+        table_width: None,
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -94,6 +95,14 @@ struct Flow<'a> {
     /// A list item's marker, between learning where its content starts and the
     /// first line being shaped inside it. See [`PendingMarker`].
     pending_marker: Option<PendingMarker>,
+    /// How wide the table just laid out turned out to be.
+    ///
+    /// A table is shrink-to-fit: it is as wide as its columns need and no wider,
+    /// however much room it was offered. Only the table's own formatting context
+    /// knows that width, and only after it has measured every cell — by which time
+    /// the block that holds the table has already committed to one. So it is
+    /// reported back here and the block narrows itself to it.
+    table_width: Option<f32>,
 }
 
 /// A list item's marker, waiting for the item's first line.
@@ -455,6 +464,43 @@ fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f32 {
     }
 }
 
+/// Share `available` out between columns that each want between a minimum and a
+/// maximum.
+///
+/// The three cases CSS names, in order. Everything fits unwrapped, so every column
+/// gets what it wants and the table is narrower than the room it was offered.
+/// Nothing fits, so every column is squeezed to its minimum and the table overflows
+/// rather than tearing words in half. Or it is in between, and the surplus over the
+/// minimums is shared in proportion to how much more each column could use — which
+/// is what makes a column of long prose take the room a column of dates does not.
+fn share_out(minimums: &[f32], maximums: &[f32], available: f32) -> Vec<f32> {
+    let wanted: f32 = maximums.iter().sum();
+    if wanted <= available {
+        return maximums.to_vec();
+    }
+
+    let needed: f32 = minimums.iter().sum();
+    if needed >= available {
+        return minimums.to_vec();
+    }
+
+    let surplus = available - needed;
+    let room: f32 = minimums
+        .iter()
+        .zip(maximums)
+        .map(|(min, max)| (max - min).max(0.0))
+        .sum();
+    if room <= 0.0 {
+        return minimums.to_vec();
+    }
+
+    minimums
+        .iter()
+        .zip(maximums)
+        .map(|(min, max)| min + surplus * (max - min).max(0.0) / room)
+        .collect()
+}
+
 fn any_side(sides: Sides<f32>) -> bool {
     sides.top > 0.0 || sides.right > 0.0 || sides.bottom > 0.0 || sides.left > 0.0
 }
@@ -494,6 +540,13 @@ impl<'a> Flow<'a> {
         match self.tree.node(parent).style.display {
             otlyra_css::Display::Flex => return self.layout_flex(parent, width, x, y, out),
             otlyra_css::Display::Grid => return self.layout_grid(parent, width, x, y, out),
+            // A table with no rows in it is not a table; it falls through and its
+            // children are stacked, which at least shows what is in them.
+            otlyra_css::Display::Table => {
+                if let Some(height) = self.layout_table(parent, width, x, y, out) {
+                    return height;
+                }
+            }
             _ => {}
         }
 
@@ -745,8 +798,13 @@ impl<'a> Flow<'a> {
         let content_x = x + border.left + padding.left;
         let content_y = y + border.top + padding.top;
         let mut children = Vec::new();
+        self.table_width = None;
         let content_height =
             self.layout_inside(id, content_width, content_x, content_y, &mut children);
+        // A box laid out at a width the caller chose keeps it, table or not — a
+        // flex item is as wide as its line gave it. Taken rather than left, so a
+        // table inside one does not report its width to the block outside.
+        self.table_width = None;
         let content_height = clamp(
             style.height.resolve(width).unwrap_or(content_height),
             style.min_height,
@@ -977,8 +1035,17 @@ impl<'a> Flow<'a> {
         let content_y = border_y + border.top + padding.top;
 
         let mut children = Vec::new();
+        self.table_width = None;
         let content_height =
             self.layout_inside(id, content_width, content_x, content_y, &mut children);
+        // A table with no width of its own is only as wide as its columns turned
+        // out to need. One that names a width keeps it, and its columns were
+        // stretched to fill it instead.
+        let shrunk = self.table_width.take();
+        let content_width = match style.width.resolve(containing_width) {
+            Some(_) => content_width,
+            None => shrunk.unwrap_or(content_width),
+        };
         let content_height = clamp(
             style
                 .height
@@ -1059,6 +1126,143 @@ impl<'a> Flow<'a> {
     /// share out whatever is left. Items are then placed in order, filling each row
     /// before starting the next, and each row is as tall as the tallest thing in it
     /// unless `grid-template-rows` says otherwise.
+    /// Lay out a table: rows of cells in columns sized by what is in them.
+    ///
+    /// This is *auto* table layout, which is the one the web is written against and
+    /// the one a table with no widths on it gets. Every column is measured twice —
+    /// how narrow it can be without its contents spilling, and how wide it would be
+    /// if nothing wrapped — and the room is shared out between those two answers.
+    /// A table is shrink-to-fit: if everything in it fits without wrapping, it is
+    /// exactly that wide and no wider, which is why a two-column table of short
+    /// words does not stretch across the page.
+    fn layout_table(
+        &mut self,
+        parent: BoxId,
+        width: f32,
+        x: f32,
+        y: f32,
+        out: &mut Vec<Fragment>,
+    ) -> Option<f32> {
+        let style = Arc::clone(&self.tree.node(parent).style);
+        let (spacing_x, spacing_y) = style.border_spacing;
+
+        let mut captions = Vec::new();
+        let mut rows: Vec<BoxId> = Vec::new();
+        self.collect_rows(parent, &mut captions, &mut rows);
+        let cells: Vec<Vec<BoxId>> = rows
+            .iter()
+            .map(|&row| {
+                self.tree
+                    .node(row)
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&cell| {
+                        self.tree.node(cell).style.display == otlyra_css::Display::TableCell
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+        if columns == 0 {
+            return None;
+        }
+
+        // Room for the gaps first: what is left is what the columns share.
+        let gaps = spacing_x * (columns + 1) as f32;
+        let available = (width - gaps).max(0.0);
+
+        let mut minimums = vec![0.0f32; columns];
+        let mut maximums = vec![0.0f32; columns];
+        for row in &cells {
+            for (column, &cell) in row.iter().enumerate() {
+                minimums[column] =
+                    minimums[column].max(self.min_content_width(cell, available, false));
+                maximums[column] = maximums[column].max(self.max_content_width(cell, available));
+            }
+        }
+
+        let mut widths = share_out(&minimums, &maximums, available);
+        // A table told how wide to be fills that width: the columns keep their
+        // proportions and share out what is left over, rather than sitting narrow
+        // in a box that was asked to be wide.
+        if style.width.resolve(width).is_some() {
+            let taken: f32 = widths.iter().sum();
+            if taken > 0.0 && available > taken {
+                let scale = available / taken;
+                for column in &mut widths {
+                    *column *= scale;
+                }
+            }
+        }
+        let table_width = widths.iter().sum::<f32>() + gaps;
+
+        let mut cursor = y;
+        let mut fragments = Vec::new();
+
+        // A caption is a block of its own, as wide as the table and above it. CSS
+        // can put it below; nothing writes that.
+        for caption in captions {
+            let fragment = self.layout_block(caption, table_width, x, cursor);
+            cursor = fragment.rect.bottom();
+            fragments.push(fragment);
+        }
+
+        for (index, row) in rows.iter().enumerate() {
+            cursor += spacing_y;
+            let row_style = Arc::clone(&self.tree.node(*row).style);
+            let mut placed = Vec::new();
+            let mut column_x = x + spacing_x;
+            let mut height = 0.0f32;
+
+            for (column, &cell) in cells[index].iter().enumerate() {
+                let fragment = self.layout_block(cell, widths[column], column_x, cursor);
+                height = height.max(fragment.rect.height);
+                column_x += widths[column] + spacing_x;
+                placed.push(fragment);
+            }
+
+            // Every cell is as tall as the tallest of them: a row is one band, and
+            // a cell that stopped short would leave a hole in its background.
+            for fragment in &mut placed {
+                fragment.rect.height = height;
+            }
+
+            fragments.push(Fragment {
+                box_id: Some(*row),
+                rect: Rect::new(x + spacing_x, cursor, table_width - spacing_x * 2.0, height),
+                kind: FragmentKind::Box,
+                style: row_style,
+                fixed: false,
+                scroll_port: None,
+                clip: None,
+                sticky: None,
+                layer: Layer::default(),
+                children: placed,
+            });
+            cursor += height;
+        }
+        cursor += spacing_y;
+
+        out.extend(fragments);
+        self.table_width = Some(table_width);
+        Some(cursor - y)
+    }
+
+    /// Walk a table's children for its captions and its rows, through whatever row
+    /// groups it has.
+    fn collect_rows(&self, parent: BoxId, captions: &mut Vec<BoxId>, rows: &mut Vec<BoxId>) {
+        for &child in &self.tree.node(parent).children {
+            match self.tree.node(child).style.display {
+                otlyra_css::Display::TableCaption => captions.push(child),
+                otlyra_css::Display::TableRow => rows.push(child),
+                otlyra_css::Display::TableRowGroup => self.collect_rows(child, captions, rows),
+                _ => {}
+            }
+        }
+    }
+
     fn layout_grid(
         &mut self,
         parent: BoxId,

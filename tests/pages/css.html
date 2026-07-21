@@ -134,6 +134,11 @@ drawn behind itself.</p>
 <code>cover</code>, <code>contain</code> or a size of its own, cut off at the box,
 tiled by <code>background-repeat</code> and placed by
 <code>background-position</code>.</p>
+<p><strong>Tables</strong>: <code>display: table</code> and its parts, with the
+columns sized by what is in them — measured for how narrow they can be and how
+wide they would like to be, and given the room in between. A table is as wide as
+its columns need unless it is told a width, and <code>border-spacing</code> sits
+between the cells.</p>
 <p><strong>Vertical alignment</strong>: <code>vertical-align</code> with
 <code>sub</code>, <code>super</code>, a length and a percentage — so
 <code>&lt;sub&gt;</code> and <code>&lt;sup&gt;</code> are lowered and raised, and
@@ -203,7 +208,9 @@ back to four square-cornered rectangles, and a rounded box clips its contents at
 square edge. A background picture tiles and can be positioned, but
 <code>background-repeat: space</code> is drawn as <code>repeat</code>; an inset
 <code>box-shadow</code> is not drawn, and a background is one layer rather than
-several. A resize that no rule reads costs nothing — the sheets are
+several. A table reads no <code>colspan</code> or <code>rowspan</code>, does not
+collapse its borders, and ignores the presentational attributes — a
+<code>border</code> attribute draws nothing. A resize that no rule reads costs nothing — the sheets are
 parsed once and the cascade is skipped — but a resize that does change something
 recomputes every element rather than the part that changed.</p>
 
@@ -237,6 +244,16 @@ moves nothing else.</p>
   <h3><code>position: sticky</code>, held at the top while this box scrolls past</h3>
   <p>Scroll the page to see it stop at the top and leave with its container.</p>
 </div>
+
+<h2>Tables</h2>
+<table>
+  <caption>Sized by what is in them</caption>
+  <thead><tr><th>Column</th><th>What decides its width</th></tr></thead>
+  <tbody>
+    <tr><td>first</td><td>the widest word in it, at least</td></tr>
+    <tr><td>second</td><td>and what it would be if nothing wrapped, at most</td></tr>
+  </tbody>
+</table>
 
 <h2>Vertical alignment</h2>
 <p>Water is H<sub>2</sub>O and a square is x<sup>2</sup>; a

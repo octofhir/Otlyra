@@ -56,6 +56,13 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         line_height: line_height(values),
         list_style: list_style(values),
         vertical_align: vertical_align(values),
+        border_spacing: {
+            let spacing = &values.get_inherited_table().border_spacing;
+            (
+                spacing.horizontal().to_f32_px(),
+                spacing.vertical().to_f32_px(),
+            )
+        },
         white_space: white_space(values),
         text_decoration: text_decoration(values),
         margin: Sides {
@@ -149,11 +156,36 @@ fn display_of(values: &ComputedValues) -> Display {
     if display.inside() == DisplayInside::Grid {
         return Display::Grid;
     }
+    if let Some(part) = table_part(display) {
+        return part;
+    }
     if display.outside() == DisplayOutside::Inline {
         Display::Inline
     } else {
         Display::Block
     }
+}
+
+/// The table displays, which are a formatting context of their own rather than a
+/// block that happens to hold rows.
+fn table_part(display: style::values::computed::Display) -> Option<Display> {
+    use style::values::specified::box_::{DisplayInside, DisplayOutside};
+
+    Some(match display.inside() {
+        DisplayInside::Table => Display::Table,
+        DisplayInside::TableRowGroup
+        | DisplayInside::TableHeaderGroup
+        | DisplayInside::TableFooterGroup => Display::TableRowGroup,
+        DisplayInside::TableRow => Display::TableRow,
+        DisplayInside::TableCell => Display::TableCell,
+        // A column and a column group draw nothing and place nothing; what they
+        // carry is width and background, which auto layout takes from the cells.
+        DisplayInside::TableColumn | DisplayInside::TableColumnGroup => Display::None,
+        _ => {
+            return (display.outside() == DisplayOutside::TableCaption)
+                .then_some(Display::TableCaption);
+        }
+    })
 }
 
 /// A computed colour, in the paint vocabulary.
@@ -1220,15 +1252,45 @@ mod tests {
 
     #[test]
     fn an_unsupported_display_falls_back_to_block() {
-        // `table` is a display with a formatting context we do not have; its boxes
+        // `ruby` is a display with a formatting context we do not have; its boxes
         // stack as blocks rather than being dropped.
         assert_eq!(
-            layout_style("<style>p { display: table }</style><p>x", "p").display,
+            layout_style("<style>p { display: ruby }</style><p>x", "p").display,
             Display::Block
         );
         assert_eq!(
             layout_style("<style>p { display: inline-block }</style><p>x", "p").display,
             Display::Inline
+        );
+    }
+
+    /// A table and every part of one is its own display: what tells a table apart
+    /// from a stack of blocks is that layout has a formatting context for it.
+    #[test]
+    fn the_table_displays_are_read_as_themselves() {
+        let display = |markup: &str, selector: &str| layout_style(markup, selector).display;
+
+        assert_eq!(display("<table><tr><td>x", "table"), Display::Table);
+        assert_eq!(display("<table><tr><td>x", "tr"), Display::TableRow);
+        assert_eq!(display("<table><tr><td>x", "td"), Display::TableCell);
+        assert_eq!(display("<table><tr><th>x", "th"), Display::TableCell);
+        assert_eq!(
+            display("<table><tbody><tr><td>x", "tbody"),
+            Display::TableRowGroup
+        );
+        assert_eq!(
+            display("<table><thead><tr><td>x", "thead"),
+            Display::TableRowGroup
+        );
+        assert_eq!(
+            display("<table><caption>c</caption><tr><td>x", "caption"),
+            Display::TableCaption
+        );
+        // Two pixels between the cells, which is what a table has unless it says
+        // otherwise, and it is inherited so the cells can read it.
+        assert_eq!(
+            layout_style("<table><tr><td>x", "table").border_spacing,
+            (2.0, 2.0)
         );
     }
 

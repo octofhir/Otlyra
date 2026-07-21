@@ -7,11 +7,23 @@
  */
 
 html, body, div, center, section, article, aside, header, footer, main, nav,
-figcaption, form, dl, dt, dd, table, tbody, thead, tfoot, tr, td, th, caption,
+figcaption, form, dl, dt, dd,
 li, details, summary, dialog, figure, hgroup, search, address, hr, p, pre,
 blockquote, ul, ol, fieldset, textarea { display: block; }
 
 head, title, meta, link, style, script, base, template, noscript { display: none; }
+
+/* A table is a formatting context of its own: rows and cells are placed into a
+   grid whose columns are sized by what is in them, not stacked as blocks. */
+table { display: table; border-spacing: 2px; border-collapse: separate; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; padding: 1px; }
+caption { display: table-caption; }
+col { display: table-column; }
+colgroup { display: table-column-group; }
 
 /* Neither a font-size nor a font-family here, on purpose. Both initial values are
    what a browser's own preferences answer: `medium` is sixteen pixels for prose and

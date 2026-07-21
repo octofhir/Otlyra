@@ -8,6 +8,30 @@ use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree};
 use otlyra_layout::{Viewport, build_box_tree, dump, layout};
 use otlyra_text::{FontStack, TextEngine};
 
+/// Lay out `html` at `width` logical pixels, with the document's own stylesheets
+/// applied — which is what a `style=` attribute in a fixture needs.
+fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
+    let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+    let styles = otlyra_css::cascade::style_document(
+        &parsed.document,
+        otlyra_css::cascade::Viewport {
+            width,
+            height: 600.0,
+            scale: 1.0,
+        },
+    );
+    let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+    let mut text = isolated_engine();
+    layout(
+        &boxes,
+        &mut text,
+        Viewport {
+            width,
+            height: 600.0,
+        },
+    )
+}
+
 /// Lay out `html` at `width` logical pixels.
 fn lay_out(html: &str, width: f32) -> FragmentTree {
     let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
@@ -359,5 +383,68 @@ fn a_raised_or_lowered_box_moves_and_makes_room() {
         baselines(&level)
             .iter()
             .all(|&y| (y - sitting).abs() < 0.01)
+    );
+}
+
+/// A table places its cells in columns sized by what is in them, and is only as
+/// wide as those columns need.
+#[test]
+fn a_table_sizes_its_columns_from_their_contents() {
+    let tree = lay_out(
+        "<body><table><tr><td>a</td><td>a much longer cell</td></tr>\
+         <tr><td>b</td><td>short</td></tr></table>",
+        800.0,
+    );
+
+    // Two rows of two, and every cell in a column starts at the same x and every
+    // cell in a row at the same y.
+    let cells: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|f| f.style.display == otlyra_layout::Display::TableCell)
+        .collect();
+    assert_eq!(cells.len(), 4);
+    assert_eq!(
+        cells[0].rect.x, cells[2].rect.x,
+        "one column, one left edge"
+    );
+    assert_eq!(cells[1].rect.x, cells[3].rect.x);
+    assert_eq!(cells[0].rect.y, cells[1].rect.y, "one row, one top edge");
+    assert!(cells[2].rect.y > cells[0].rect.y, "and the rows stack");
+
+    // The column holding a long sentence is wider than the one holding a letter.
+    assert!(
+        cells[1].rect.width > cells[0].rect.width * 3.0,
+        "columns are sized by their contents: {:?}",
+        cells.iter().map(|c| c.rect.width).collect::<Vec<_>>()
+    );
+
+    // And the table is nowhere near the eight hundred pixels it was offered.
+    let table = boxes_of(&tree)
+        .into_iter()
+        .find(|f| f.style.display == otlyra_layout::Display::Table)
+        .expect("a table");
+    assert!(
+        table.rect.width < 400.0,
+        "a table is as wide as its columns need: {}",
+        table.rect.width
+    );
+    assert!(table.rect.width > cells[0].rect.width + cells[1].rect.width);
+}
+
+/// A table told how wide to be fills that width rather than sitting narrow in it.
+#[test]
+fn a_table_with_a_width_fills_it() {
+    let tree = lay_out_styled(
+        "<body><table style='width: 400px'><tr><td>a</td><td>b</td></tr></table>",
+        800.0,
+    );
+    let table = boxes_of(&tree)
+        .into_iter()
+        .find(|f| f.style.display == otlyra_layout::Display::Table)
+        .expect("a table");
+    assert!(
+        (table.rect.width - 400.0).abs() < 0.01,
+        "table was {} wide",
+        table.rect.width
     );
 }

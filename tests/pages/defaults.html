@@ -31,10 +31,10 @@ the line without starting a new paragraph.</p>
 <var>var</var>, <cite>cite</cite>, <dfn>dfn</dfn>, <abbr>abbr</abbr>,
 <q>q</q>, <time>time</time>, <data>data</data>, H<sub>2</sub>O, x<sup>2</sup>,
 <a href="https://example.com/">a link</a>.</p>
-<p><small>Known gaps here: <code>&lt;q&gt;</code> should generate quotation
-marks, and <code>&lt;sub&gt;</code>/<code>&lt;sup&gt;</code> should be lowered
-and raised — both need generated content and <code>vertical-align</code>, which
-are not implemented. They currently differ only in size.</small></p>
+<p><small>Known gap here: <code>&lt;q&gt;</code> should generate quotation
+marks, which needs generated content and is not implemented.
+<code>&lt;sub&gt;</code> and <code>&lt;sup&gt;</code> are lowered and raised, and
+the line they sit on grows to hold them.</small></p>
 
 <h2>4. Lists</h2>
 <ul>
@@ -112,9 +112,11 @@ rest.</small></p>
   <tr><td>p</td><td>1em margins, top and bottom</td></tr>
   <tr><td>pre</td><td>monospace, whitespace preserved</td></tr>
 </table>
-<p><small>Not implemented: table layout. Cells stack as blocks instead of
-forming rows and columns, and there is no cell spacing. This is what that looks
-like, and it is not a claim that tables work.</small></p>
+<p><small>Auto table layout: the columns are as wide as what is in them needs,
+the table is only as wide as its columns, and two pixels sit between the cells.
+Not implemented: <code>colspan</code> and <code>rowspan</code>, collapsed
+borders, and the presentational attributes — a <code>border</code> attribute
+draws nothing.</small></p>
 
 <h2>8. Images and embedded content</h2>
 <p>An image with alt text: <img src="nothing.png" alt="[alt text stands in for

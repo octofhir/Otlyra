@@ -22,6 +22,31 @@ pub enum Display {
     Flex,
     /// A grid container: its children are placed into rows and columns.
     Grid,
+    /// A table: its rows and cells are placed into a grid of its own, with the
+    /// columns sized by what is in them.
+    Table,
+    /// `thead`, `tbody`, `tfoot`: a run of rows, which the table reads through.
+    TableRowGroup,
+    /// One row of cells.
+    TableRow,
+    /// One cell, which is a block container of its own inside its column.
+    TableCell,
+    /// A table's caption, laid out above it and as wide as it is.
+    TableCaption,
+}
+
+impl Display {
+    /// Whether this is a table or one of the parts a table is made of.
+    pub fn is_table_part(self) -> bool {
+        matches!(
+            self,
+            Self::Table
+                | Self::TableRowGroup
+                | Self::TableRow
+                | Self::TableCell
+                | Self::TableCaption
+        )
+    }
 }
 
 /// `flex-direction`, narrowed to the axis and whether it is reversed.
@@ -654,6 +679,9 @@ pub struct ComputedStyle {
     pub list_style: ListStyle,
     /// `vertical-align`. Not inherited: it moves the box it is written on.
     pub vertical_align: VerticalAlign,
+    /// `border-spacing`, horizontal and vertical, in CSS pixels. Inherited, which
+    /// is what lets it be written on the table and read by the cells.
+    pub border_spacing: (f32, f32),
     /// `margin`.
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
@@ -760,6 +788,7 @@ impl Default for ComputedStyle {
             line_height: LineHeight::Normal,
             list_style: ListStyle::Disc,
             vertical_align: VerticalAlign::Baseline,
+            border_spacing: (0.0, 0.0),
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
@@ -819,6 +848,7 @@ impl ComputedStyle {
             word_spacing: parent.word_spacing,
             line_height: parent.line_height,
             list_style: parent.list_style,
+            border_spacing: parent.border_spacing,
             white_space: parent.white_space,
             text_decoration: parent.text_decoration,
             text_align: parent.text_align,

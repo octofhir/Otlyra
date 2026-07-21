@@ -14,8 +14,8 @@ use std::sync::Arc;
 use peniko::Color;
 
 use crate::style::{
-    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, ListStyle, Sides, TextDecoration,
-    VerticalAlign, WhiteSpace,
+    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, ListStyle, Sides, TextAlign,
+    TextDecoration, VerticalAlign, WhiteSpace,
 };
 
 /// `1em` expressed against the parent font size.
@@ -53,9 +53,29 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
 
         "html" | "div" | "center" | "section" | "article" | "aside" | "header" | "footer"
-        | "main" | "nav" | "figcaption" | "form" | "dl" | "dt" | "table" | "tbody" | "thead"
-        | "tfoot" | "tr" | "td" | "th" | "caption" => {
+        | "main" | "nav" | "figcaption" | "form" | "dl" | "dt" => {
             style.display = Display::Block;
+        }
+
+        // A table is a formatting context of its own, and the parts are what tell
+        // it apart from a stack of blocks.
+        "table" => {
+            style.display = Display::Table;
+            style.border_spacing = (2.0, 2.0);
+        }
+        "thead" | "tbody" | "tfoot" => style.display = Display::TableRowGroup,
+        "tr" => style.display = Display::TableRow,
+        "caption" => {
+            style.display = Display::TableCaption;
+            style.text_align = TextAlign::Center;
+        }
+        "td" | "th" => {
+            style.display = Display::TableCell;
+            style.padding = Sides::all(Length::Px(1.0));
+            if element == "th" {
+                style.font_weight = 700;
+                style.text_align = TextAlign::Center;
+            }
         }
 
         "p" => {
