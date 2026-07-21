@@ -33,7 +33,7 @@ use otlyra_gfx::peniko::Color;
 use otlyra_platform::{Key, Modifiers};
 use otlyra_text::TextEngine;
 
-use crate::widget::controls::{self, Emphasis};
+use crate::widget::controls;
 use crate::widget::data::{Mono, Split, Table, Tree, TreeRow};
 use crate::widget::theme::Theme;
 use crate::widget::{
@@ -788,20 +788,25 @@ impl Inspector {
                 .unwrap_or(0),
         )));
 
-        // The picker stays lit while it is armed, because a mode with no sign
-        // that it is on is a mode that surprises the next click.
-        let picker = controls::button(
+        // An icon rather than a word, and on the left rather than after the
+        // tabs: this is where every browser's devtools put the picker, and a
+        // person who has used one already knows both the shape and the corner
+        // it lives in. A label reading "Pick" would be a word to read and a word
+        // to translate for the same meaning.
+        let picker: Child<Action> = Box::new(Align::centre(controls::icon_button(
             theme,
             &self.focus,
             Action::TogglePicker,
-            "Pick",
-            if self.picking {
-                Emphasis::Primary
-            } else {
-                Emphasis::Quiet
-            },
             true,
-        );
+            crate::widget::icon::picker,
+        )));
+        // Armed, it is lit, because a mode with no sign that it is on is a mode
+        // that surprises the next click.
+        let picker: Child<Action> = if self.picking {
+            Box::new(Background::new(theme.selection, theme.radius_small, picker))
+        } else {
+            picker
+        };
 
         Box::new(Fixed::height(
             HEADER,
@@ -813,6 +818,7 @@ impl Inspector {
                     Box::new(Stack::row(
                         theme.gap,
                         vec![
+                            picker,
                             tabs,
                             // The frame line takes what the tabs leave and is
                             // cut where it runs out, rather than the tabs
@@ -826,7 +832,6 @@ impl Inspector {
                                     frame_line(theme),
                                 )))),
                             )),
-                            Box::new(Align::centre(picker)),
                             Box::new(Align::centre(controls::icon_button(
                                 theme,
                                 &self.focus,

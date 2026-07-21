@@ -217,6 +217,45 @@ pub fn page(list: &mut DisplayList, rect: Rect, color: Color) {
     stroke(list, path, color, 1.3);
 }
 
+/// A pointer over a corner: choose an element on the page by pointing at it.
+///
+/// The mark every browser's inspector uses, and recognisable rather than
+/// invented: two edges of a box, and an arrow inside them. A label reading
+/// "Pick" would be a word to translate and a word to read, where this is a shape
+/// people already know from every other set of devtools.
+pub fn picker(list: &mut DisplayList, rect: Rect, color: Color) {
+    // The same reach as the cogwheel, so the two sit at one weight beside each
+    // other. Larger and the corner brackets touch the edges of a header that is
+    // barely taller than the button.
+    let (centre, reach) = centre(rect, 0.34);
+    let (left, top) = (centre.x - reach, centre.y - reach);
+    let (right, bottom) = (centre.x + reach, centre.y + reach);
+
+    // The corner: the top and left edges of a box, drawn as two brackets so the
+    // arrow has room to sit across the rest of it.
+    let mut corner = BezPath::new();
+    corner.move_to(Point::new(left, top + reach * 0.7));
+    corner.line_to(Point::new(left, top));
+    corner.line_to(Point::new(left + reach * 0.7, top));
+    stroke(list, corner, color, 1.3);
+
+    let mut far = BezPath::new();
+    far.move_to(Point::new(right - reach * 0.5, bottom));
+    far.line_to(Point::new(right, bottom));
+    far.line_to(Point::new(right, bottom - reach * 0.5));
+    stroke(list, far, color, 1.3);
+
+    // The arrow, filled: an outlined one at this size is a smudge.
+    let tip = Point::new(centre.x - reach * 0.25, centre.y - reach * 0.35);
+    let mut arrow = BezPath::new();
+    arrow.move_to(tip);
+    arrow.line_to(Point::new(tip.x, tip.y + reach * 1.45));
+    arrow.line_to(Point::new(tip.x + reach * 0.4, tip.y + reach * 1.0));
+    arrow.line_to(Point::new(tip.x + reach * 1.0, tip.y + reach * 0.95));
+    arrow.close_path();
+    fill(list, arrow, color);
+}
+
 /// A filled dot, used where a tab has no icon of its own yet.
 pub fn dot(list: &mut DisplayList, rect: Rect, color: Color) {
     let (centre, radius) = centre(rect, 0.2);
