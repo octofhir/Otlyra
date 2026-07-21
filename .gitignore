@@ -37,3 +37,6 @@ target
 # Python bytecode from the example client
 __pycache__/
 *.pyc
+
+# insta writes these beside a snapshot that needs accepting
+*.snap.new

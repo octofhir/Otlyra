@@ -174,6 +174,15 @@ pub struct Session {
     open: bool,
     /// How large a screenshot is taken at.
     viewport: (u32, u32),
+    /// How far through the journal this client has been told.
+    log_cursor: u64,
+    /// Which requests it has been told about, and which of those have finished.
+    ///
+    /// By request number rather than by a count: a request finishes long after
+    /// it was made, and out of order with its neighbours, so *how many* is not a
+    /// place in either stream.
+    announced: std::collections::HashSet<u64>,
+    completed: std::collections::HashSet<u64>,
 }
 
 /// The context id the one tab is known by.
@@ -197,6 +206,12 @@ impl Session {
             events: Vec::new(),
             open: false,
             viewport,
+            // Start where the journal is *now*: a client that connects to a
+            // browser which has been running for an hour wants what happens
+            // next, not an hour of backlog it never asked for.
+            log_cursor: crate::observability::journal().cursor(),
+            announced: std::collections::HashSet::new(),
+            completed: std::collections::HashSet::new(),
         }
     }
 
@@ -330,6 +345,49 @@ impl Session {
 
             other => Err(Error::unknown_command(other)),
         }
+    }
+
+    /// Everything that has happened since this was last asked, as events.
+    ///
+    /// Pulled rather than pushed. The browser is driven from one thread and the
+    /// things worth reporting — what it said, what it fetched — are already kept
+    /// where they can be read; a callback into the socket from wherever they are
+    /// produced would put the protocol inside the fetcher and inside the log.
+    /// This keeps the protocol at the edge, where it belongs.
+    pub fn drain_events(&mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        if self.subscribed("log.entryAdded") {
+            let (records, cursor) = crate::observability::journal().since(self.log_cursor);
+            self.log_cursor = cursor;
+            events.extend(records.into_iter().map(log_entry));
+        }
+        if self.subscribed("network.beforeRequestSent")
+            || self.subscribed("network.responseCompleted")
+        {
+            events.extend(self.network_events());
+        }
+        events
+    }
+
+    /// What the fetcher has done that this client has not been told about.
+    fn network_events(&mut self) -> Vec<Value> {
+        use crate::fetcher::Status;
+
+        let exchanges: Vec<crate::fetcher::Exchange> = self.browser.exchanges().to_vec();
+        let mut events = Vec::new();
+        for exchange in exchanges {
+            if self.announced.insert(exchange.id) && self.subscribed("network.beforeRequestSent") {
+                events.push(request_event(&exchange));
+            }
+            let finished = !matches!(exchange.status, Status::Pending);
+            if finished
+                && self.completed.insert(exchange.id)
+                && self.subscribed("network.responseCompleted")
+            {
+                events.push(response_event(&exchange));
+            }
+        }
+        events
     }
 
     /// Find the nodes a locator names.
@@ -532,6 +590,113 @@ impl Session {
     fn viewport(&self) -> otlyra_platform::Viewport {
         otlyra_platform::Viewport::new(self.viewport.0, self.viewport.1, 1.0)
     }
+}
+
+/// The envelope every event arrives in.
+fn event(method: &str, params: Value) -> Value {
+    json!({ "type": "event", "method": method, "params": params })
+}
+
+/// Milliseconds since the epoch, which is what the protocol stamps with.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// One line the browser said, as a `log.entryAdded`.
+fn log_entry(record: crate::observability::Record) -> Value {
+    event(
+        "log.entryAdded",
+        json!({
+            "level": match record.level {
+                tracing::Level::ERROR => "error",
+                tracing::Level::WARN => "warn",
+                tracing::Level::INFO => "info",
+                _ => "debug",
+            },
+            // The specification names `console` and `javascript` for the entries
+            // it knows about. This is neither: it is the browser talking about
+            // itself, and calling it `javascript` would be a lie a client could
+            // act on.
+            "type": VENDOR,
+            "source": { "context": CONTEXT },
+            "text": record.message,
+            "timestamp": now(),
+            "otlyra:target": record.target,
+        }),
+    )
+}
+
+/// A request the browser made, as a `network.beforeRequestSent`.
+fn request_event(exchange: &crate::fetcher::Exchange) -> Value {
+    event(
+        "network.beforeRequestSent",
+        json!({
+            "context": CONTEXT,
+            "isRedirect": false,
+            "navigation": Value::Null,
+            "redirectCount": 0,
+            "timestamp": now(),
+            "request": {
+                "request": exchange.id.to_string(),
+                "url": exchange.url,
+                // Every fetch this browser makes is a GET. When it makes another
+                // kind this will say so, rather than saying so early.
+                "method": "GET",
+                "headers": [],
+                "cookies": [],
+            },
+            "otlyra:kind": format!("{:?}", exchange.kind).to_lowercase(),
+        }),
+    )
+}
+
+/// What became of it, as a `network.responseCompleted`.
+///
+/// A failure is reported here too, with its reason, rather than through
+/// `fetchError`: the browser knows the request ended and why, and a client
+/// waiting on one event for both outcomes is a client that cannot hang.
+fn response_event(exchange: &crate::fetcher::Exchange) -> Value {
+    use crate::fetcher::Status;
+    let (status, text, bytes) = match &exchange.status {
+        Status::Ok(bytes) => (200, String::new(), *bytes),
+        Status::Failed(error) => (0, error.clone(), 0),
+        Status::Pending => (0, "still out".to_owned(), 0),
+    };
+    event(
+        "network.responseCompleted",
+        json!({
+            "context": CONTEXT,
+            "isRedirect": false,
+            "navigation": Value::Null,
+            "redirectCount": 0,
+            "timestamp": now(),
+            "request": {
+                "request": exchange.id.to_string(),
+                "url": exchange.url,
+                "method": "GET",
+                "headers": [],
+                "cookies": [],
+            },
+            "response": {
+                "url": exchange.url,
+                "status": status,
+                "statusText": text,
+                "bytesReceived": bytes,
+                "fromCache": false,
+                "headers": [],
+                "mimeType": Value::Null,
+                "protocol": Value::Null,
+                "content": { "size": bytes },
+            },
+            // Two numbers, because they answer different questions: how slow the
+            // transport was, and how long the request waited for a thread.
+            "otlyra:took": exchange.took.map(|took| took.as_secs_f64() * 1000.0),
+            "otlyra:waited": exchange.waited.map(|waited| waited.as_secs_f64() * 1000.0),
+        }),
+    )
 }
 
 /// One node, as the protocol describes one.
@@ -1022,6 +1187,129 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "unsupported operation");
         assert!(error.message.contains("pointerCancel"), "{}", error.message);
+    }
+
+    #[test]
+    fn nothing_is_reported_to_a_client_that_did_not_ask() {
+        let mut session = opened();
+        // A navigation fetched something, and a client that subscribed to
+        // nothing hears about none of it. Sending events nobody asked for is
+        // how a protocol turns a quiet connection into a firehose.
+        assert!(session.drain_events().is_empty());
+    }
+
+    #[test]
+    fn a_request_is_reported_once_when_made_and_once_when_it_ends() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({"events": ["network"]}),
+            ))
+            .expect("subscribed");
+        session
+            .dispatch(&command(
+                2,
+                "browsingContext.navigate",
+                json!({"url": "https://driven.example/"}),
+            ))
+            .expect("navigated");
+
+        let events = session.drain_events();
+        let methods: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["method"].as_str())
+            .collect();
+        assert!(
+            methods.contains(&"network.beforeRequestSent"),
+            "{methods:?}"
+        );
+        assert!(
+            methods.contains(&"network.responseCompleted"),
+            "{methods:?}"
+        );
+
+        // The address it was asked for, and how much came back.
+        let completed = events
+            .iter()
+            .find(|event| event["method"] == json!("network.responseCompleted"))
+            .expect("one completed");
+        assert_eq!(
+            completed["params"]["request"]["url"],
+            json!("https://driven.example/")
+        );
+        assert!(
+            completed["params"]["response"]["bytesReceived"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
+
+        // And asked again, the same request is not reported a second time: an
+        // event stream that repeated itself would have a client counting the
+        // same load twice.
+        assert!(session.drain_events().is_empty());
+    }
+
+    #[test]
+    fn a_failed_request_ends_with_a_reason_rather_than_never_ending() {
+        struct Broken;
+        impl Loader for Broken {
+            fn load(&self, _url: &str) -> Result<Loaded, String> {
+                Err("the socket said no".to_owned())
+            }
+        }
+
+        let mut session = Session::new(Browser::new(Broken), (400, 300));
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({"events": ["network.responseCompleted"]}),
+            ))
+            .expect("subscribed");
+        session
+            .dispatch(&command(
+                2,
+                "browsingContext.navigate",
+                json!({"url": "https://broken.example/"}),
+            ))
+            .expect("navigation is answered even when the load is not");
+
+        let events = session.drain_events();
+        let completed = events
+            .iter()
+            .find(|event| event["method"] == json!("network.responseCompleted"))
+            .expect("a request that failed still ended");
+        // A client waiting on one event for both outcomes cannot hang on this.
+        assert_eq!(
+            completed["params"]["response"]["statusText"],
+            json!("the socket said no")
+        );
+    }
+
+    #[test]
+    fn what_the_browser_says_reaches_a_client_that_asked_for_it() {
+        let journal = crate::observability::journal();
+        let mut session = session();
+        session
+            .dispatch(&command(1, "session.subscribe", json!({"events": ["log"]})))
+            .expect("subscribed");
+        // Whatever the journal held when the session opened is behind the
+        // cursor, so only what happens next arrives.
+        session.drain_events();
+
+        journal.record_for_test(tracing::Level::WARN, "otlyra_app::test", "something odd");
+        let events = session.drain_events();
+        let entry = events
+            .iter()
+            .find(|event| event["method"] == json!("log.entryAdded"))
+            .expect("the line arrived");
+        assert_eq!(entry["params"]["text"], json!("something odd"));
+        assert_eq!(entry["params"]["level"], json!("warn"));
+        // Not `javascript`: this is the browser talking about itself, and saying
+        // otherwise would be a lie a client could act on.
+        assert_eq!(entry["params"]["type"], json!(VENDOR));
     }
 
     #[test]

@@ -42,14 +42,16 @@ use crate::widget::{
 };
 
 /// Which pane of the panel is showing.
+///
+/// Each one takes the whole panel, which is how every other browser's devtools
+/// behave and is not what this started as: the DOM tree used to sit on the left
+/// whatever was chosen, so *Elements* was permanently open and the tabs only
+/// swapped the half beside it. A console that shares the window with a tree is a
+/// console with half a window.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Pane {
-    /// The tree, and what the chosen node is.
+    /// The tree, and a sidebar about the chosen node.
     Elements,
-    /// What the cascade computed for it.
-    Styles,
-    /// What the layout made of it, in numbers.
-    Layout,
     /// What the browser said while it worked.
     Console,
     /// What it asked the network for.
@@ -58,32 +60,44 @@ pub enum Pane {
 
 impl Pane {
     /// The three of them, in the order they are offered.
-    pub const ALL: [Self; 5] = [
-        Self::Elements,
-        Self::Styles,
-        Self::Layout,
-        Self::Console,
-        Self::Network,
-    ];
+    pub const ALL: [Self; 3] = [Self::Elements, Self::Console, Self::Network];
 
     /// What this is called on the panel.
     pub fn label(self) -> &'static str {
         match self {
             Self::Elements => "Elements",
-            Self::Styles => "Styles",
-            Self::Layout => "Layout",
             Self::Console => "Console",
             Self::Network => "Network",
         }
     }
+}
 
-    /// Whether this pane is about the chosen element rather than the page.
-    ///
-    /// The console and the network list have nothing to do with a selection, so
-    /// asking for one before they will say anything would be asking for
-    /// something they never needed.
-    pub fn needs_a_selection(self) -> bool {
-        matches!(self, Self::Elements | Self::Styles | Self::Layout)
+/// Which sidebar is showing beside the tree.
+///
+/// Inside *Elements* rather than beside it at the top, because each of these is
+/// about the node the tree has chosen: a Styles tab with no tree to choose from
+/// would be a tab about nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Sidebar {
+    /// What the node is, and what it carries.
+    Node,
+    /// What the cascade computed for it.
+    Styles,
+    /// What the layout made of it, in numbers.
+    Layout,
+}
+
+impl Sidebar {
+    /// The three of them, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Node, Self::Styles, Self::Layout];
+
+    /// What this is called on the sidebar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Node => "Node",
+            Self::Styles => "Styles",
+            Self::Layout => "Layout",
+        }
     }
 }
 
@@ -128,6 +142,8 @@ pub enum Action {
     TogglePicker,
     /// Show this pane.
     Show(Pane),
+    /// Show this sidebar, beside the tree.
+    ShowSidebar(Sidebar),
     /// Put the panel away.
     Close,
 }
@@ -168,6 +184,7 @@ struct Appearance {
     pane_scroll: f64,
     picking: bool,
     pane: Pane,
+    sidebar: Sidebar,
     pointer: (f64, f64),
     pointer_down: bool,
     focus: Option<crate::widget::FocusId>,
@@ -183,6 +200,8 @@ pub struct Inspector {
     pub selected: Option<NodeId>,
     /// Which pane is showing.
     pub pane: Pane,
+    /// Which sidebar is showing beside the tree.
+    pub sidebar: Sidebar,
     /// How much of the content area the panel takes.
     pub height: f64,
     /// Every colour and measurement it is drawn from.
@@ -228,6 +247,7 @@ impl Inspector {
             picking: false,
             selected: None,
             pane: Pane::Elements,
+            sidebar: Sidebar::Node,
             height: DEFAULT_HEIGHT,
             theme: Theme::light(),
             expanded: HashSet::new(),
@@ -302,6 +322,12 @@ impl Inspector {
                 }
                 self.pane = pane;
             }
+            Action::ShowSidebar(sidebar) => {
+                if sidebar != self.sidebar {
+                    self.pane_scroll = 0.0;
+                }
+                self.sidebar = sidebar;
+            }
             Action::Close => {
                 self.open = false;
                 self.picking = false;
@@ -316,6 +342,10 @@ impl Inspector {
     /// or the tree scrolls to a row that is not there.
     pub fn reveal(&mut self, document: &Document, node: NodeId) {
         self.selected = Some(node);
+        // And show the tree it was revealed in. Choosing an element while the
+        // console is open would put the selection somewhere nobody is looking,
+        // which is the same as not showing it at all.
+        self.pane = Pane::Elements;
         let mut current = document.get(node).and_then(|node| node.parent);
         while let Some(id) = current {
             self.expanded.insert(id);
@@ -374,7 +404,9 @@ impl Inspector {
         // The wheel goes to whatever is under the pointer, which here is one of
         // two lists side by side. Which one is arithmetic against the divider
         // the last frame drew, so it cannot disagree with what was drawn.
-        if self.pointer.0 < self.panel.x + self.panel.width * self.split {
+        if self.pane == Pane::Elements
+            && self.pointer.0 < self.panel.x + self.panel.width * self.split
+        {
             self.scroll = (self.scroll + delta).clamp(0.0, self.overflow.get());
         } else {
             self.pane_scroll = (self.pane_scroll + delta).clamp(0.0, self.pane_overflow.get());
@@ -596,6 +628,7 @@ impl Inspector {
             pane_scroll: self.pane_scroll,
             picking: self.picking,
             pane: self.pane,
+            sidebar: self.sidebar,
             pointer: self.pointer,
             pointer_down: self.pointer_down,
             focus: self.focused,
@@ -640,7 +673,37 @@ impl Inspector {
     }
 
     fn build(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
-        let tree: Child<Action> = match facts.document {
+        // Each pane takes the whole panel. Only *Elements* is two things side
+        // by side, because only it has a selection for a sidebar to be about.
+        let body: Child<Action> = match self.pane {
+            Pane::Elements => Box::new(Split::row(
+                self.split,
+                Box::new(Padding::new(
+                    Insets::all(theme.gap * 0.5),
+                    self.tree(theme, facts),
+                )),
+                self.sidebar(theme, facts),
+                Action::SplitAt,
+            )),
+            Pane::Console => Box::new(Padding::new(
+                Insets::all(theme.gap),
+                self.console_pane(theme),
+            )),
+            Pane::Network => Box::new(Padding::new(
+                Insets::all(theme.gap),
+                self.network_pane(theme, facts),
+            )),
+        };
+
+        Box::new(Stack::column(
+            0.0,
+            vec![self.header(theme), Box::new(Flex::new(1.0, body))],
+        ))
+    }
+
+    /// The document, as rows.
+    fn tree(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        match facts.document {
             Some(_) => Box::new(
                 Tree::new(
                     self.rows.iter().map(|row| row.row.clone()).collect(),
@@ -660,18 +723,50 @@ impl Inspector {
                 theme.font_size,
                 theme.ink_dim,
             )))),
-        };
+        }
+    }
 
-        let panes: Child<Action> = Box::new(Split::row(
-            self.split,
-            Box::new(Padding::new(Insets::all(theme.gap * 0.5), tree)),
-            self.pane(theme, facts),
-            Action::SplitAt,
+    /// The sidebar beside the tree: its own tabs, and whichever is chosen.
+    fn sidebar(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        let tabs: Child<Action> = Box::new(Padding::new(
+            Insets::symmetric(theme.gap * 0.5, theme.gap * 0.5),
+            Box::new(Align::left(controls::segmented(
+                theme,
+                &self.focus,
+                Sidebar::ALL
+                    .iter()
+                    .map(|sidebar| (sidebar.label().to_owned(), Action::ShowSidebar(*sidebar)))
+                    .collect(),
+                Sidebar::ALL
+                    .iter()
+                    .position(|sidebar| *sidebar == self.sidebar)
+                    .unwrap_or(0),
+            ))),
         ));
+
+        let body: Child<Action> = if self.selected.is_none() || facts.document.is_none() {
+            Box::new(Align::centre(Box::new(Label::new(
+                "Choose an element.",
+                theme.font_size_small,
+                theme.ink_dim,
+            ))))
+        } else {
+            match self.sidebar {
+                Sidebar::Node => self.elements_pane(theme, facts),
+                Sidebar::Styles => self.styles_pane(theme, facts),
+                Sidebar::Layout => self.layout_pane(theme, facts),
+            }
+        };
 
         Box::new(Stack::column(
             0.0,
-            vec![self.header(theme), Box::new(Flex::new(1.0, panes))],
+            vec![
+                tabs,
+                Box::new(Flex::new(
+                    1.0,
+                    Box::new(Padding::new(Insets::all(theme.gap), body)),
+                )),
+            ],
         ))
     }
 
@@ -744,25 +839,6 @@ impl Inspector {
                 )),
             )),
         ))
-    }
-
-    /// The right-hand pane, whichever one is showing.
-    fn pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
-        if self.pane.needs_a_selection() && (self.selected.is_none() || facts.document.is_none()) {
-            return Box::new(Align::centre(Box::new(Label::new(
-                "Choose an element.",
-                theme.font_size_small,
-                theme.ink_dim,
-            ))));
-        }
-        let body = match self.pane {
-            Pane::Elements => self.elements_pane(theme, facts),
-            Pane::Styles => self.styles_pane(theme, facts),
-            Pane::Layout => self.layout_pane(theme, facts),
-            Pane::Console => self.console_pane(theme),
-            Pane::Network => self.network_pane(theme, facts),
-        };
-        Box::new(Padding::new(Insets::all(theme.gap), body))
     }
 
     /// What the chosen node is: its tag, and the attributes it carries.
@@ -1974,15 +2050,35 @@ mod tests {
     }
 
     #[test]
-    fn the_panes_that_are_about_the_page_do_not_wait_for_a_selection() {
-        // The console and the network list have nothing to do with an element,
-        // so asking for one before they will say anything asks for something
-        // they never needed.
-        assert!(Pane::Elements.needs_a_selection());
-        assert!(Pane::Styles.needs_a_selection());
-        assert!(Pane::Layout.needs_a_selection());
-        assert!(!Pane::Console.needs_a_selection());
-        assert!(!Pane::Network.needs_a_selection());
+    fn a_pane_takes_the_whole_panel_and_only_elements_has_a_sidebar() {
+        // What this replaced: the tree sat on the left whatever was chosen, so
+        // Elements was permanently open and the tabs swapped only the half
+        // beside it. A console with half a window is not a console.
+        assert_eq!(Pane::ALL.len(), 3);
+        assert_eq!(
+            Pane::ALL.map(Pane::label),
+            ["Elements", "Console", "Network"]
+        );
+        // Styles and Layout are about the chosen node, so they live inside the
+        // pane that has a tree to choose from.
+        assert_eq!(
+            Sidebar::ALL.map(Sidebar::label),
+            ["Node", "Styles", "Layout"]
+        );
+    }
+
+    #[test]
+    fn choosing_an_element_shows_the_tree_it_was_chosen_in() {
+        let document = document();
+        let mut inspector = panel();
+        inspector.apply(Action::Show(Pane::Console));
+
+        let node = every_node(&document)[1];
+        inspector.reveal(&document, node);
+        // Otherwise the selection lands somewhere nobody is looking, which is
+        // the same as not showing it at all.
+        assert_eq!(inspector.pane, Pane::Elements);
+        assert_eq!(inspector.selected, Some(node));
     }
 
     #[test]
@@ -2006,7 +2102,7 @@ mod tests {
         // The styles table is long and the tree, closed, is one row: held to one
         // scroll position between them, the long list would be held to the short
         // one's travel and would not move at all.
-        inspector.apply(Action::Show(Pane::Styles));
+        inspector.apply(Action::ShowSidebar(Sidebar::Styles));
         inspector.selected = Some(document.root());
         frame_with_style(&mut inspector, &document);
 
@@ -2030,7 +2126,7 @@ mod tests {
     fn a_new_pane_opens_at_its_top() {
         let document = document();
         let mut inspector = panel();
-        inspector.apply(Action::Show(Pane::Styles));
+        inspector.apply(Action::ShowSidebar(Sidebar::Styles));
         inspector.selected = Some(document.root());
         frame_with_style(&mut inspector, &document);
         inspector.pointer_moved(800.0, 500.0);
@@ -2039,7 +2135,7 @@ mod tests {
 
         // A short list opened at the position a long one was left at would open
         // already scrolled past its own end.
-        inspector.apply(Action::Show(Pane::Elements));
+        inspector.apply(Action::ShowSidebar(Sidebar::Node));
         assert_eq!(inspector.pane_scroll, 0.0);
     }
 
@@ -2050,7 +2146,7 @@ mod tests {
         frame(&mut inspector, &document);
         assert_eq!(inspector.builds(), 1);
 
-        inspector.apply(Action::Show(Pane::Styles));
+        inspector.apply(Action::ShowSidebar(Sidebar::Styles));
         frame(&mut inspector, &document);
         assert_eq!(
             inspector.builds(),

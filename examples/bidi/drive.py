@@ -61,6 +61,28 @@ def main():
         size = os.path.getsize(shot)
         print(f"→ captureScreenshot\n← {size} bytes of PNG at {shot}\n")
 
+        # Events arrive unasked once they are subscribed to. The browser already
+        # keeps its own log and its own list of requests — these are the same
+        # facts, sent rather than shown.
+        browser.subscribe("log", "network")
+        print("→ subscribe log, network")
+        browser.navigate(page)
+        for message in browser.collect():
+            params = message["params"]
+            if message["method"] == "network.responseCompleted":
+                response = params["response"]
+                took = params.get("otlyra:took")
+                took = f"{took:.1f} ms" if took else "?"
+                print(
+                    f"←   {message['method']}: {response['status']} "
+                    f"{response['bytesReceived']} bytes in {took}"
+                )
+            elif message["method"] == "network.beforeRequestSent":
+                print(f"←   {message['method']}: {params['request']['url']}")
+            else:
+                print(f"←   {message['method']}: {params.get('text', '')}")
+        print()
+
         # The honest gap, asked for on purpose. A protocol that answered this
         # with silence, or with an empty result, would be worse than one that
         # says which milestone it is waiting on.

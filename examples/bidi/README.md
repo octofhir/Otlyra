@@ -47,6 +47,9 @@ Working now:
 | `browsingContext.captureScreenshot` | A PNG of what is on screen |
 | `browsingContext.locateNodes` | Find nodes by CSS selector |
 | `input.performActions` | Move, click, scroll, type |
+| `log.entryAdded` | What the browser said, as it says it |
+| `network.beforeRequestSent` | Every request, as it goes out |
+| `network.responseCompleted` | What came back, with sizes and timings |
 
 Waiting on other work, and saying so when asked:
 
@@ -54,9 +57,8 @@ Waiting on other work, and saying so when asked:
   M12. Stock Playwright leans on it for nearly everything, so Playwright will
   connect to this and then fail. That is a real limitation and not a bug to
   report.
-- `log` and `network` events: the browser already keeps both — its console and
-  its request list are what the inspector panel reads — so this is a matter of
-  broadcasting them, not of collecting them.
+- The `otlyra:` module — computed styles, fragment geometry, the tracks a grid
+  was given. The engine knows all of it; the standard has no command for asking.
 
 ## Naming an element rather than a point
 
@@ -74,6 +76,38 @@ disagree the first time anything moved.
 
 The selector is matched by the engine's own matcher, the one the cascade styles
 with, so `.card` finds exactly the elements a stylesheet would have hit.
+
+## Events
+
+Subscribe, and the browser sends things without being asked:
+
+```python
+browser.subscribe("log", "network")
+browser.navigate(page)
+for message in browser.collect():
+    print(message["method"], message["params"])
+```
+
+```
+network.beforeRequestSent  file:///…/page.html
+network.responseCompleted  200, 887 bytes in 2.1 ms
+```
+
+These are not a second set of measurements taken for the protocol's sake. The
+browser already keeps its own log and its own list of requests — they are what
+the inspector's Console and Network panes read — so an event is the same fact,
+sent rather than shown. Naming a module subscribes to everything in it, which is
+what the specification says.
+
+Two timings come back under `otlyra:` keys, because they answer different
+questions: `otlyra:took` is how slow the transport was and `otlyra:waited` is how
+long the request sat waiting for a fetch thread. One number would hide which of
+the two a slow page is suffering from.
+
+A client that subscribed to nothing is sent nothing. A request is reported once
+when it goes out and once when it ends — including when it ends badly, with the
+reason in `statusText`, so a client waiting on one event for both outcomes
+cannot hang.
 
 ## The client
 

@@ -109,6 +109,12 @@ pub struct Journal {
 struct Inner {
     records: VecDeque<Record>,
     timings: VecDeque<Timing>,
+    /// How many records have ever been pushed, including those since dropped.
+    ///
+    /// What a reader holds its place by. A count of what is *present* would move
+    /// under a reader every time the ring dropped its oldest, and the reader
+    /// would see lines twice or not at all.
+    pushed: u64,
 }
 
 impl Journal {
@@ -151,7 +157,47 @@ impl Journal {
         if let Ok(mut inner) = self.inner.lock() {
             inner.records.clear();
             inner.timings.clear();
+            // The count keeps going: a reader holding a cursor is holding a
+            // place in a stream, and restarting the numbering would hand it a
+            // place in a different one.
         }
+    }
+
+    /// Everything said since `cursor`, and where to read from next.
+    ///
+    /// For a reader that wants each line once — the protocol, which pushes them
+    /// to a client. A line that fell off the front before it was read is gone,
+    /// and the gap is visible in the returned cursor rather than papered over.
+    pub fn since(&self, cursor: u64) -> (Vec<Record>, u64) {
+        let Ok(inner) = self.inner.lock() else {
+            return (Vec::new(), cursor);
+        };
+        let oldest = inner.pushed - inner.records.len() as u64;
+        let from = cursor.max(oldest);
+        let skip = (from - oldest) as usize;
+        (
+            inner.records.iter().skip(skip).cloned().collect(),
+            inner.pushed,
+        )
+    }
+
+    /// Where a reader that wants only what happens next should start.
+    pub fn cursor(&self) -> u64 {
+        self.inner.lock().map(|inner| inner.pushed).unwrap_or(0)
+    }
+
+    /// Put one line in the journal without a subscriber to carry it.
+    ///
+    /// For tests that need something to have been said. The layer is the only
+    /// other writer, and installing a global subscriber from a test would fight
+    /// every other test in the binary for it.
+    #[cfg(test)]
+    pub fn record_for_test(&self, level: tracing::Level, target: &str, message: &str) {
+        self.push_record(Record {
+            level,
+            target: target.to_owned(),
+            message: message.to_owned(),
+        });
     }
 
     fn push_record(&self, record: Record) {
@@ -160,6 +206,7 @@ impl Journal {
                 inner.records.pop_front();
             }
             inner.records.push_back(record);
+            inner.pushed += 1;
         }
     }
 

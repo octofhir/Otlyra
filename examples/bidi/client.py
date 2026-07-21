@@ -37,16 +37,53 @@ class Otlyra:
             raise RuntimeError(f"expected a ws:// address and got {url!r}")
         self.socket = _connect(url)
         self.next_id = 0
+        self.events = []
         self.send("session.new")
 
     def send(self, method, **params):
-        """Send one command and return its result, raising on an error."""
+        """Send one command and return its result, raising on an error.
+
+        Events that arrive while waiting for the answer are kept, not dropped:
+        the browser sends them unasked, and an answer can arrive behind several.
+        """
         self.next_id += 1
         _write(self.socket, {"id": self.next_id, "method": method, "params": params})
-        reply = _read(self.socket)
-        if reply.get("type") == "error":
-            raise BiDiError(method, reply.get("error"), reply.get("message"))
-        return reply.get("result", {})
+        while True:
+            reply = _read(self.socket)
+            if reply.get("type") == "event":
+                self.events.append(reply)
+                continue
+            if reply.get("type") == "error":
+                raise BiDiError(method, reply.get("error"), reply.get("message"))
+            return reply.get("result", {})
+
+    def subscribe(self, *events):
+        """Ask to be told about things as they happen."""
+        return self.send("session.subscribe", events=list(events))
+
+    def collect(self, seconds=0.5):
+        """Everything the browser has said since the last look.
+
+        The socket is polled rather than blocked on, because an event may never
+        come and a driver that waited forever for one would be a driver that
+        hangs on a quiet page.
+        """
+        deadline = time.time() + seconds
+        self.socket.settimeout(0.05)
+        try:
+            while time.time() < deadline:
+                try:
+                    message = _read(self.socket)
+                except (TimeoutError, socket.timeout):
+                    continue
+                except EOFError:
+                    break
+                if message.get("type") == "event":
+                    self.events.append(message)
+        finally:
+            self.socket.settimeout(None)
+        found, self.events = self.events, []
+        return found
 
     def navigate(self, url):
         """Go to `url` and wait for it to arrive."""

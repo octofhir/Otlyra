@@ -57,6 +57,12 @@ impl Server {
     pub fn serve_one(&self, session: &mut Session) -> std::io::Result<()> {
         let (stream, peer) = self.listener.accept()?;
         tracing::info!(%peer, "a driver connected");
+        // A read that gives up after a moment, so a client that subscribes and
+        // then waits still hears about things. Without it the loop would sit in
+        // `read` until the client said something, and an event would only ever
+        // arrive behind the next command — which is not an event, it is an
+        // answer with a delay.
+        stream.set_read_timeout(Some(POLL))?;
         let mut socket = match tungstenite::accept(stream) {
             Ok(socket) => socket,
             Err(error) => {
@@ -67,7 +73,10 @@ impl Server {
 
         loop {
             let message = match socket.read() {
-                Ok(message) => message,
+                Ok(message) => Some(message),
+                // Nothing was said in time, which is not a failure: it is the
+                // gap events are delivered in.
+                Err(tungstenite::Error::Io(error)) if would_block(&error) => None,
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                     break;
                 }
@@ -77,19 +86,31 @@ impl Server {
                 }
             };
 
-            let text = match message {
-                tungstenite::Message::Text(text) => text.to_string(),
-                tungstenite::Message::Close(_) => break,
-                // Ping and pong are answered by tungstenite itself; a binary
-                // frame is not something this protocol ever sends.
-                _ => continue,
-            };
+            if let Some(message) = message {
+                let text = match message {
+                    tungstenite::Message::Text(text) => text.to_string(),
+                    tungstenite::Message::Close(_) => break,
+                    // Ping and pong are answered by tungstenite itself; a binary
+                    // frame is not something this protocol ever sends.
+                    _ => continue,
+                };
 
-            let reply = answer(session, &text);
-            if socket
-                .send(tungstenite::Message::Text(reply.to_string().into()))
-                .is_err()
-            {
+                let reply = answer(session, &text);
+                if !send(&mut socket, &reply) {
+                    break;
+                }
+            }
+
+            // After the answer, so a command that causes an event — a navigation
+            // causes several — is answered before the events it caused arrive.
+            let mut failed = false;
+            for event in session.drain_events() {
+                if !send(&mut socket, &event) {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
                 break;
             }
         }
@@ -97,6 +118,31 @@ impl Server {
         tracing::info!(%peer, "the driver went away");
         Ok(())
     }
+}
+
+/// How long a read waits before the loop goes round to deliver events.
+///
+/// Short enough that an event is not noticeably late, long enough that an idle
+/// connection is not a spin. A driver watching a page load is watching something
+/// that takes tens of milliseconds a step.
+const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether an IO error is *nothing happened yet* rather than a failure.
+///
+/// A timed-out read is spelled differently on different systems, and both mean
+/// the same thing here.
+fn would_block(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Send one message, saying whether the connection survived it.
+fn send(socket: &mut tungstenite::WebSocket<std::net::TcpStream>, message: &Value) -> bool {
+    socket
+        .send(tungstenite::Message::Text(message.to_string().into()))
+        .is_ok()
 }
 
 /// Turn one message into one reply.

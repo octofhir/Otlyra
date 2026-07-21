@@ -1147,6 +1147,14 @@ impl Browser {
         list.append(&built);
     }
 
+    /// Every request the browser has made, oldest first.
+    ///
+    /// The fetcher's own list, which is what the inspector's network pane reads:
+    /// one account of what was asked for, however it is being looked at.
+    pub fn exchanges(&self) -> &[crate::fetcher::Exchange] {
+        self.fetcher.exchanges()
+    }
+
     /// The page the active tab is showing, if it has one.
     ///
     /// For a driver asking about the document rather than about the browser: the

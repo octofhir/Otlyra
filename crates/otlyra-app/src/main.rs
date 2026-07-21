@@ -408,13 +408,19 @@ fn open_inspector(browser: &mut Browser, cli: &Cli) {
         browser.inspector_mut().open = true;
     }
     if let Some(pane) = cli.inspect_pane {
-        browser.inspector_mut().pane = match pane {
-            InspectorPane::Elements => otlyra_app::inspector::Pane::Elements,
-            InspectorPane::Styles => otlyra_app::inspector::Pane::Styles,
-            InspectorPane::Layout => otlyra_app::inspector::Pane::Layout,
-            InspectorPane::Console => otlyra_app::inspector::Pane::Console,
-            InspectorPane::Network => otlyra_app::inspector::Pane::Network,
+        use otlyra_app::inspector::{Pane, Sidebar};
+        // Styles and Layout are sidebars inside Elements rather than panes of
+        // their own — the same shape every other browser's devtools have — so
+        // naming one on the command line chooses the pane *and* the sidebar.
+        let (pane, sidebar) = match pane {
+            InspectorPane::Elements => (Pane::Elements, Sidebar::Node),
+            InspectorPane::Styles => (Pane::Elements, Sidebar::Styles),
+            InspectorPane::Layout => (Pane::Elements, Sidebar::Layout),
+            InspectorPane::Console => (Pane::Console, Sidebar::Node),
+            InspectorPane::Network => (Pane::Network, Sidebar::Node),
         };
+        browser.inspector_mut().pane = pane;
+        browser.inspector_mut().sidebar = sidebar;
     }
 }
 
