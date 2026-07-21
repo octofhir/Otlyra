@@ -1,0 +1,133 @@
+---
+import Base from "../layouts/Base.astro";
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+<Base
+  title="For agents — Otlyra"
+  description="Drive Otlyra over WebDriver BiDi, or connect it to an agent as an MCP server. Seven tools, no script engine required."
+>
+  <h1>Driving it from outside</h1>
+  <p class="lede">
+    Otlyra answers <a href="https://www.w3.org/TR/webdriver-bidi/">WebDriver BiDi</a>,
+    the W3C protocol for driving a browser from another program — and speaks the
+    Model Context Protocol for agents, which is the same vocabulary wearing a
+    different shape.
+  </p>
+
+  <h2>An agent, in one line</h2>
+  <pre><code>claude mcp add otlyra -- /path/to/otlyra --mcp</code></pre>
+  <table>
+    <tr><th>Tool</th><th>What it is for</th></tr>
+    <tr><td><code>browser_navigate</code></td><td>Open a page and wait for it to load</td></tr>
+    <tr><td><code>browser_screenshot</code></td><td>A picture of the page as it is now</td></tr>
+    <tr><td><code>browser_find</code></td><td>Find elements by CSS selector; returns a handle for each</td></tr>
+    <tr><td><code>browser_explain</code></td><td>Why an element looks the way it does — computed style, box model, grid tracks</td></tr>
+    <tr><td><code>browser_highlight</code></td><td>Draw the inspector's overlay, so a screenshot shows which element is meant</td></tr>
+    <tr><td><code>browser_act</code></td><td>Click, type, scroll</td></tr>
+    <tr><td><code>browser_timings</code></td><td>How long each stage of the last frame took</td></tr>
+  </table>
+  <p>
+    Seven, and deliberately seven: a tool list is read in full before every
+    decision, so one that is rarely the right answer costs something on every turn
+    it is not used — which is most of them.
+  </p>
+
+  <h3>Two things shaped for an agent rather than a program</h3>
+  <ul>
+    <li>
+      A screenshot comes back as an <strong>image</strong>, not as base64 in a
+      string. An agent that can see the page settles questions no amount of JSON
+      would.
+    </li>
+    <li>
+      A tool that could not do something answers with a sentence, not a transport
+      error. The call reached the browser and the browser answered; an agent can
+      read what it said and try something else.
+    </li>
+  </ul>
+
+  <h2>Naming an element instead of a point</h2>
+  <pre><code>first = browser.find("#first")[0]
+browser.click(first)          # no coordinates anywhere</code></pre>
+  <p>
+    The centre is resolved against where the engine <em>actually drew</em> the
+    element — the same rectangle a real click is tested against. A driver that
+    computed the point itself would be keeping a second opinion about the layout,
+    and the two would part company the first time anything moved.
+  </p>
+  <p>
+    The selector is matched by the engine's own matcher, the one the cascade
+    styles with, so <code>.card</code> finds exactly the elements a stylesheet
+    would have hit.
+  </p>
+
+  <h2>Why BiDi and not Chrome's protocol</h2>
+  <p>
+    The obvious answer was the Chrome DevTools Protocol, because that is what most
+    tools speak. It does not survive contact:
+  </p>
+  <ul>
+    <li>CDP is Chromium's private protocol. Firefox dropped it in 129.</li>
+    <li>
+      Playwright's CDP client is written against Chromium's internals rather than
+      against a specification, so answering to the same method names would not
+      make it drive a different engine.
+    </li>
+    <li>
+      The path by which Playwright, Puppeteer and Selenium drive a
+      <em>non-Chromium</em> browser is BiDi.
+    </li>
+  </ul>
+  <p>
+    So BiDi is both the standard and the practical answer. Where the standard has
+    no command for something — computed styles, fragment geometry, the tracks a
+    grid was given — those live under an <code>otlyra:</code> prefix, which is
+    what the specification reserves vendor extensions for.
+  </p>
+
+  <h2>The protocol directly</h2>
+  <pre><code>$ otlyra --bidi 0
+ws://127.0.0.1:52999/session</code></pre>
+  <p>
+    Port <code>0</code> asks the system for a free one and the browser prints what
+    it got, because guessing a port is how two drivers come to fight each other.
+    It binds the loopback and nothing else: this endpoint navigates, clicks and
+    reads what is on screen, and a port that answered the network would hand all
+    of that to whoever asked.
+  </p>
+  <table>
+    <tr><th>Working now</th><th></th></tr>
+    <tr><td><code>session.*</code></td><td>status, new, end, subscribe, unsubscribe</td></tr>
+    <tr><td><code>browsingContext.*</code></td><td>getTree, navigate, reload, captureScreenshot, locateNodes</td></tr>
+    <tr><td><code>input.performActions</code></td><td>pointer, key and wheel actions, with an element as an origin</td></tr>
+    <tr><td><code>log.entryAdded</code></td><td>What the browser said, as it says it</td></tr>
+    <tr><td><code>network.*</code></td><td>Every request, and what came back — with two timings</td></tr>
+    <tr><td><code>otlyra:*</code></td><td>explain, highlight, frameTimings</td></tr>
+  </table>
+
+  <h3>What it cannot do yet</h3>
+  <p>
+    <code>script.evaluate</code> needs a script engine, and there is not one yet.
+    Stock Playwright leans on it for nearly everything, so Playwright will connect
+    to this and then fail. The browser answers that command with
+    <code>unsupported operation</code> and names the milestone it is waiting on —
+    told apart from <code>unknown command</code> deliberately, because a client
+    that meets it is looking at a gap with a date on it rather than at a typo.
+  </p>
+
+  <h2>A client you can read</h2>
+  <p>
+    <a href="https://github.com/octofhir/Otlyra/tree/main/examples/bidi">
+      <code>examples/bidi/</code>
+    </a> holds a complete BiDi client in the Python standard library — no
+    <code>pip install</code>, about ninety lines of which most is WebSocket
+    framing — and a script that drives the browser the way an agent would. It is
+    there to be read: the protocol is JSON in and JSON out, and seeing that is
+    worth more than a dependency.
+  </p>
+  <p>
+    For real work, use a real client. Puppeteer and Selenium both speak BiDi and
+    handle reconnection, timeouts and events properly.
+  </p>
+</Base>

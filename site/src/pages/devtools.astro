@@ -1,0 +1,102 @@
+---
+import Base from "../layouts/Base.astro";
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+<Base
+  title="Devtools — Otlyra"
+  description="An inspector drawn by the browser's own widget layer: the DOM, computed styles, the box model, grid tracks, the console and the network."
+>
+  <h1>The inspector</h1>
+  <p class="lede">
+    Everything else in the interface can be checked by looking at it. The engine
+    cannot. Open it with <kbd>⌥⌘I</kbd>, or from the cogwheel menu.
+  </p>
+
+  <h2>Why it is not a toolkit</h2>
+  <p>
+    Embedding a GUI toolkit to draw devtools panels would bring a second event
+    model, a second text stack, a second theme and a second accessibility tree
+    into the same window — in order to draw panels, scrolling lists and rows the
+    browser's own widget layer already draws.
+  </p>
+  <p>
+    What devtools needed beyond what was there was four widgets: a tree, a
+    splitter, a table and monospace text. Every one of them is general — the
+    settings and the toolbar can use them the day they want them. That is less
+    work than the integration, and it leaves one stack instead of two.
+  </p>
+
+  <h2>Asking the engine, not a script</h2>
+  <p>
+    The usual way to ask what an element's computed style is would be to run
+    <code>getComputedStyle</code> in the page. That needs a script engine, and it
+    answers with what a script can see rather than with what the engine did. Here
+    the answer comes from the layout that actually ran — and there is no script
+    engine at all.
+  </p>
+  <ul>
+    <li><strong>Elements</strong> — the live DOM, with a picker that highlights what you point at.</li>
+    <li><strong>Styles</strong> — the computed values, spelled the way a stylesheet spells them.</li>
+    <li><strong>Layout</strong> — the box taken apart into margin, border, padding and content, with the numbers on each.</li>
+    <li><strong>Console</strong> — what the browser said while it worked.</li>
+    <li><strong>Network</strong> — every request, its status, size and <em>two</em> timings.</li>
+  </ul>
+  <p>
+    Two timings because they answer different questions: how slow the transport
+    was, and how long the request sat waiting for a fetch thread. One figure would
+    hide which of the two a slow page is suffering from.
+  </p>
+
+  <h2>Grid and flex overlays</h2>
+  <p>
+    A container that lays its children into tracks gets dashed lines where those
+    tracks fall, with a grid's lines numbered. Two decisions there are CSS being
+    taken at its word rather than the geometry at face value:
+  </p>
+  <ul>
+    <li>
+      A gutter has two edges and both are drawn, but CSS numbers the <em>line</em>
+      and the gap is how thick that one line was asked to be. Numbering both would
+      name every track after the first twice.
+    </li>
+    <li>
+      The container's own edge bounds the overlay but is only a line when a track
+      reaches it. <code>grid-template-columns: 100px 100px</code> in a container
+      twice that wide has a right edge no stylesheet can address, and a number on
+      it would point at nothing.
+    </li>
+  </ul>
+  <p>
+    What it cannot show is a track nothing was placed in: the lines are derived
+    from where the items were actually drawn, because the engine sizes its tracks
+    internally and does not report them.
+  </p>
+
+  <h2>The dock is a subtraction</h2>
+  <p>
+    The panel takes its height <em>out</em> of the content area and the page is
+    laid out for what is left. A page under a floating panel would be laid out for
+    a height it does not have, and every number the panel then reported about it
+    would be a number about a different page.
+  </p>
+
+  <h2>From the command line</h2>
+  <pre><code>otlyra --url https://example.com/ \
+  --screenshot /tmp/shot.png \
+  --inspect-at 120,110 \
+  --inspect-pane styles</code></pre>
+  <p>
+    Picking needs a frame to pick against — the hit test reads what the last frame
+    drew, the same rule a click follows — so the flag draws one frame and shoots
+    the next.
+  </p>
+  <p>
+    A program can ask for all of it too, over
+    <a href={`${base}/agents/`}>the protocol</a>: <code>otlyra:explain</code>
+    answers the computed style, the box model and the tracks in one command,
+    because the question a person actually has is <em>why is this element like
+    this</em> and four round trips would be four chances for the page to move
+    between them.
+  </p>
+</Base>

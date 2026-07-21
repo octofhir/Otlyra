@@ -1,0 +1,94 @@
+---
+import Base from "../layouts/Base.astro";
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+
+const parts = [
+  ["HTML", "Tokenizer and tree construction through html5ever, with the parts it leaves out written here"],
+  ["CSS", "Selector matching, the cascade, inheritance and computed values through Stylo"],
+  ["Layout", "Block and inline, floats, flexbox, grid, tables — its own box tree and fragment tree"],
+  ["Text", "Shaping and line breaking through parley, with variable-font axes read from the fonts themselves"],
+  ["Paint", "A display list, replayed into a rasterizer behind a seven-method seam"],
+  ["Interface", "The toolbar, the tabs and the browser's own pages, drawn into the same display list the page is"],
+];
+---
+
+<Base
+  wide
+  title="Otlyra — a web browser powered by Otter"
+  description="A browser engine written from the parser up: its own DOM, box tree and display list, with devtools and a WebDriver BiDi endpoint an agent can drive."
+>
+  <div class="hero">
+    <img src={`${base}/logo-circle.png`} alt="The Otlyra otter" width="108" height="108" />
+    <h1>A web browser <span class="gradient-text">powered by Otter</span></h1>
+    <p class="lede">
+      Written from the parser up: its own DOM, its own cascade, its own box tree,
+      its own display list. The devtools are drawn by the same widget layer as
+      the toolbar, and a program — or an agent — can drive the whole thing over a
+      standard protocol.
+    </p>
+    <div class="buttons">
+      <a class="btn primary" href={`${base}/agents/`}>Drive it from an agent</a>
+      <a class="btn" href="https://github.com/octofhir/Otlyra">Source on GitHub</a>
+    </div>
+  </div>
+
+  <h2>What is actually here</h2>
+  <div class="cards">
+    {parts.map(([name, what]) => (
+      <div class="card">
+        <span class="tag">{name}</span>
+        <p>{what}</p>
+      </div>
+    ))}
+  </div>
+
+  <h2>One of each thing</h2>
+  <p>
+    The rule the whole design is held together by. A browser already <em>is</em> a
+    rendering engine, a text stack, an event loop and a hit tester. A second one of
+    any of them does not add capability — it adds a seam where two answers to the
+    same question have to be kept agreeing, and one more thing to keep alive at
+    every future change.
+  </p>
+  <p>
+    So the devtools are not a toolkit embedded in a window; they are widgets
+    painting into the same display list. The remote protocol is not a second model
+    of the page; it is a second way to ask the questions the inspector already
+    asks. When something is missing, the answer is to improve what we own or to
+    write the small piece we lack.
+  </p>
+
+  <div class="note">
+    <p>
+      <strong>This site is also a test page.</strong> It is written in the CSS this
+      engine is meant to lay out, and it is served from a URL the browser can open.
+      Anything it gets wrong is a bug with a reproduction already written.
+    </p>
+  </div>
+
+  <h2>Building it</h2>
+  <pre><code>git clone https://github.com/octofhir/Otlyra
+cd Otlyra
+cargo run -p otlyra-app -- --url https://example.com/</code></pre>
+  <p>
+    macOS is the platform it is developed on. Linux support is a matter of
+    re-enabling the windowing backends that are switched off in the dependency
+    tree, and has not been kept honest yet.
+  </p>
+
+  <h2>Where to go next</h2>
+  <div class="cards">
+    <a class="card" href={`${base}/agents/`} style="text-decoration:none">
+      <h3>For agents</h3>
+      <p>Drive the browser over WebDriver BiDi, or connect it as an MCP server.</p>
+    </a>
+    <a class="card" href={`${base}/devtools/`} style="text-decoration:none">
+      <h3>Devtools</h3>
+      <p>The inspector, and what it can tell you that a script cannot.</p>
+    </a>
+    <a class="card" href={`${base}/name/`} style="text-decoration:none">
+      <h3>The name</h3>
+      <p>Why Otlyra, and the legend nobody asked for.</p>
+    </a>
+  </div>
+</Base>

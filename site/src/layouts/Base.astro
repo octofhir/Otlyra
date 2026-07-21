@@ -1,0 +1,335 @@
+---
+const { title, description, wide } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const nav = [
+  ["", "Home"],
+  ["/name", "The name"],
+  ["/agents", "For agents"],
+  ["/devtools", "Devtools"],
+];
+const here = Astro.url.pathname.replace(/\/$/, "");
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={`${base}/logo-square.png`} />
+    <link rel="icon" href={`${base}/mark-256.png`} />
+    <link rel="apple-touch-icon" href={`${base}/icon-512.png`} />
+    <style is:global>
+      /* Nothing on this page is separated by a line. Surfaces are told apart by
+         fill, radius and a soft shadow, which is how depth actually reads — a
+         hairline is a hole punched in the design to admit the layout underneath.
+
+         The palette is read off the mark itself: the ring around the otter runs
+         violet to cyan through blue, and every accent here is a point on that
+         same run, so the colour has one source rather than an opinion. */
+      :root {
+        --violet: #6d3ff0;
+        --blue: #1b6ef5;
+        --cyan: #22d3ee;
+        --brand: linear-gradient(105deg, var(--violet), var(--blue) 55%, var(--cyan));
+
+        --ink: #101016;
+        --dim: #5c5c6b;
+        --faint: #8a8a99;
+        --page: #fbfbfd;
+        --sunken: #f1f1f6;
+        --raised: #ffffff;
+        --accent: #2258d6;
+        --tint: rgba(109, 63, 240, .07);
+        --lift: 0 1px 3px rgba(16, 16, 40, .04), 0 10px 30px -14px rgba(16, 16, 60, .18);
+        --lift-hover: 0 2px 6px rgba(16, 16, 40, .06), 0 18px 44px -18px rgba(16, 16, 60, .28);
+        --glow: rgba(109, 63, 240, .09);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #f0f0f6;
+          --dim: #9d9dad;
+          --faint: #74748a;
+          --page: #0a0a0e;
+          --sunken: #16161d;
+          --raised: #16161d;
+          --accent: #94b8ff;
+          --tint: rgba(122, 160, 255, .09);
+          --lift: 0 1px 3px rgba(0, 0, 0, .5), 0 14px 36px -18px rgba(0, 0, 0, .9);
+          --lift-hover: 0 2px 8px rgba(0, 0, 0, .6), 0 22px 50px -20px rgba(0, 0, 0, 1);
+          --glow: rgba(34, 211, 238, .10);
+        }
+      }
+
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--page);
+        font: 17px/1.7 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        /* Two soft brand-coloured lights sitting where the header and the hero
+           are. They fade out well before the body text, so nothing is ever read
+           against a gradient. */
+        background-image:
+          radial-gradient(64rem 34rem at 10% -10%, var(--glow), transparent 68%),
+          radial-gradient(52rem 30rem at 94% -6%, var(--glow), transparent 68%);
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+      }
+
+      main { max-width: 48rem; margin: 0 auto; padding: 1rem 1.5rem 7rem; }
+      main.wide { max-width: 64rem; }
+
+      a { color: var(--accent); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+      a:hover { color: var(--violet); }
+
+      h1 {
+        font-size: clamp(2.1rem, 5.5vw, 3rem);
+        line-height: 1.1;
+        margin: 0 0 .7rem;
+        letter-spacing: -.035em;
+        font-weight: 720;
+      }
+      h2 {
+        font-size: 1.4rem;
+        margin: 3.5rem 0 .8rem;
+        letter-spacing: -.02em;
+        font-weight: 660;
+      }
+      h3 { font-size: 1.05rem; margin: 2rem 0 .4rem; font-weight: 660; letter-spacing: -.01em; }
+      .lede { font-size: 1.18rem; line-height: 1.6; color: var(--dim); margin-top: 0; }
+
+      .gradient-text {
+        background: var(--brand);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      code, pre, kbd {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: .875em;
+      }
+      code {
+        background: var(--sunken);
+        padding: .12em .42em;
+        border-radius: 6px;
+      }
+      kbd {
+        background: var(--sunken);
+        border-radius: 6px;
+        padding: .15em .45em;
+        box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .07);
+      }
+      pre {
+        background: var(--sunken);
+        border-radius: 14px;
+        padding: 1.1rem 1.25rem;
+        overflow-x: auto;
+        line-height: 1.6;
+      }
+      @media (prefers-color-scheme: dark) {
+        pre, code { background: #101018; }
+      }
+      pre code { background: none; padding: 0; }
+
+      /* Rows are separated by their own fill, in pairs. Ruled lines under every
+         row turn a five-row table into five more horizontal edges competing with
+         the headings for the eye. */
+      table {
+        border-collapse: separate;
+        border-spacing: 0;
+        width: 100%;
+        display: block;
+        overflow-x: auto;
+        margin: 1.2rem 0;
+        font-size: .95rem;
+      }
+      th, td { text-align: left; padding: .65rem .9rem; }
+      th {
+        color: var(--faint);
+        font-weight: 600;
+        font-size: .74rem;
+        text-transform: uppercase;
+        letter-spacing: .07em;
+        padding-bottom: .35rem;
+      }
+      tbody tr:nth-child(odd) td, tr:nth-child(even) td { background: none; }
+      tr:nth-child(even) td { background: var(--sunken); }
+      tr td:first-child { border-radius: 9px 0 0 9px; }
+      tr td:last-child { border-radius: 0 9px 9px 0; }
+      td code { white-space: nowrap; }
+
+      blockquote {
+        margin: 1.6rem 0;
+        padding: 1.2rem 1.4rem;
+        background: var(--sunken);
+        border-radius: 14px;
+        color: var(--dim);
+      }
+      blockquote p:first-child { margin-top: 0; }
+      blockquote p:last-child { margin-bottom: 0; }
+
+      hr { border: 0; height: 1px; background: var(--sunken); margin: 3rem 0; }
+
+      ul { padding-left: 1.15rem; }
+      li { margin: .35rem 0; }
+      li::marker { color: var(--blue); }
+
+      /* Header ------------------------------------------------------------ */
+      header.site {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: color-mix(in srgb, var(--page) 72%, transparent);
+        backdrop-filter: saturate(180%) blur(16px);
+      }
+      header.site .bar {
+        display: flex;
+        align-items: center;
+        gap: .7rem;
+        max-width: 64rem;
+        margin: 0 auto;
+        padding: .8rem 1.5rem;
+      }
+      header.site .brand {
+        display: flex;
+        align-items: center;
+        gap: .55rem;
+        margin-right: auto;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      header.site img { width: 30px; height: 30px; display: block; }
+      header.site .wordmark { font-weight: 700; letter-spacing: -.025em; font-size: 1.05rem; }
+      /* The nav never wraps: four links folding onto a second line push the whole
+         page down and read as a layout mistake rather than as a design. */
+      header.site nav {
+        display: flex;
+        gap: .1rem;
+        font-size: .93rem;
+        flex-wrap: nowrap;
+      }
+      header.site nav a {
+        color: var(--dim);
+        text-decoration: none;
+        padding: .34rem .68rem;
+        border-radius: 999px;
+        white-space: nowrap;
+      }
+      header.site nav a:hover { color: var(--ink); background: var(--sunken); }
+      header.site nav a[aria-current] { color: var(--ink); background: var(--sunken); font-weight: 600; }
+      @media (max-width: 34rem) {
+        header.site .wordmark { display: none; }
+        header.site nav a { padding: .34rem .5rem; }
+      }
+
+      /* Pieces the pages build with ---------------------------------------- */
+      .hero { text-align: center; padding: 4rem 0 1.5rem; }
+      .hero img { width: 112px; height: 112px; }
+      .hero .lede { max-width: 35rem; margin: 1rem auto 0; }
+
+      .buttons { display: flex; gap: .7rem; justify-content: center; flex-wrap: wrap; margin: 2.2rem 0 0; }
+      .btn {
+        display: inline-block;
+        padding: .65rem 1.3rem;
+        border-radius: 999px;
+        text-decoration: none;
+        font-weight: 600;
+        font-size: .95rem;
+        color: var(--ink);
+        background: var(--sunken);
+      }
+      .btn:hover { color: var(--ink); box-shadow: var(--lift); }
+      .btn.primary {
+        background: var(--brand);
+        color: #fff;
+        box-shadow: 0 8px 24px -10px var(--violet);
+      }
+      .btn.primary:hover { color: #fff; filter: brightness(1.08); }
+
+      .cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); margin: 1.4rem 0; }
+      .card {
+        border-radius: 16px;
+        padding: 1.15rem 1.25rem;
+        background: var(--raised);
+        box-shadow: var(--lift);
+        text-decoration: none;
+        color: var(--ink);
+      }
+      a.card:hover { box-shadow: var(--lift-hover); color: var(--ink); }
+      .card h3 { margin: 0 0 .3rem; }
+      .card p { margin: 0; color: var(--dim); font-size: .95rem; }
+      .card .tag {
+        font: 600 .7rem/1 ui-sans-serif, system-ui, sans-serif;
+        letter-spacing: .09em;
+        text-transform: uppercase;
+        color: var(--blue);
+        display: block;
+        margin-bottom: .5rem;
+      }
+
+      .note {
+        border-radius: 14px;
+        background: var(--tint);
+        padding: 1rem 1.25rem;
+        margin: 1.8rem 0;
+        font-size: .96rem;
+      }
+      .note p { margin: 0; }
+      .note strong { color: var(--ink); }
+
+      .marks { display: flex; gap: 1.4rem; align-items: center; flex-wrap: wrap; margin: 1.2rem 0 1.6rem; }
+      .marks img { width: 84px; height: 84px; }
+
+      /* Footer ------------------------------------------------------------- */
+      footer.site { background: var(--sunken); }
+      footer.site .bar {
+        max-width: 64rem;
+        margin: 0 auto;
+        padding: 2.2rem 1.5rem 3rem;
+        color: var(--dim);
+        font-size: .92rem;
+        display: flex;
+        align-items: center;
+        gap: .7rem;
+        flex-wrap: wrap;
+      }
+      footer.site img { width: 26px; height: 26px; }
+      footer.site p { margin: 0; }
+    </style>
+  </head>
+  <body>
+    <header class="site">
+      <div class="bar">
+        <a class="brand" href={`${base}/`}>
+          <img src={`${base}/mark-256.png`} alt="" />
+          <span class="wordmark">Otlyra</span>
+        </a>
+        <nav>
+          {nav.map(([path, label]) => (
+            <a href={`${base}${path}/`} aria-current={here === `${base}${path}` ? "page" : undefined}>
+              {label}
+            </a>
+          ))}
+        </nav>
+      </div>
+    </header>
+    <main class={wide ? "wide" : undefined}>
+      <slot />
+    </main>
+    <footer class="site">
+      <div class="bar">
+        <img src={`${base}/mark-256.png`} alt="" />
+        <p>
+          Otlyra is a web browser powered by Otter. Source on
+          <a href="https://github.com/octofhir/Otlyra">GitHub</a>.
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,55 @@
+name: site
+
+# Published from `main` only. A branch that built the site would publish a
+# version of it nobody agreed to, over the one everybody is reading.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "assets/logo/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+# One deployment at a time, and a queued one replaces a queued one: what should
+# be published is the newest commit, not every commit in order.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile and
+      # fails if the two disagree, which is the difference between a build that
+      # is reproducible and one that merely worked today.
+      - run: npm ci
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
