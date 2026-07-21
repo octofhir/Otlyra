@@ -224,6 +224,47 @@ pub enum BackgroundSize {
     Fixed(Length, Length),
 }
 
+/// `list-style-type`, in the counters a list actually uses.
+///
+/// The three bullets and the four numberings the HTML `type` attribute has always
+/// had. A counter style we do not know is drawn as a disc rather than as nothing,
+/// which is what a reader can still follow.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ListStyle {
+    /// No marker at all.
+    None,
+    /// A filled circle.
+    Disc,
+    /// A hollow one.
+    Circle,
+    /// A filled square.
+    Square,
+    /// 1, 2, 3.
+    Decimal,
+    /// a, b, c.
+    LowerAlpha,
+    /// A, B, C.
+    UpperAlpha,
+    /// i, ii, iii.
+    LowerRoman,
+    /// I, II, III.
+    UpperRoman,
+}
+
+impl ListStyle {
+    /// Whether this style counts its items rather than marking each the same.
+    pub fn is_ordered(self) -> bool {
+        matches!(
+            self,
+            Self::Decimal
+                | Self::LowerAlpha
+                | Self::UpperAlpha
+                | Self::LowerRoman
+                | Self::UpperRoman
+        )
+    }
+}
+
 /// `background-repeat` along one axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Repeat {
@@ -589,6 +630,8 @@ pub struct ComputedStyle {
     pub word_spacing: f32,
     /// `line-height`. Inherited.
     pub line_height: LineHeight,
+    /// `list-style-type`. Inherited, because a list sets it and its items read it.
+    pub list_style: ListStyle,
     /// `margin`.
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
@@ -693,6 +736,7 @@ impl Default for ComputedStyle {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             line_height: LineHeight::Normal,
+            list_style: ListStyle::Disc,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
@@ -751,6 +795,7 @@ impl ComputedStyle {
             letter_spacing: parent.letter_spacing,
             word_spacing: parent.word_spacing,
             line_height: parent.line_height,
+            list_style: parent.list_style,
             white_space: parent.white_space,
             text_decoration: parent.text_decoration,
             text_align: parent.text_align,

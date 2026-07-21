@@ -247,13 +247,48 @@ mod tests {
         assert_eq!(text_of(&tree_of("<img src=x alt=''>")), "");
     }
 
-    #[test]
-    fn list_markers_are_bullets_and_numbers() {
-        assert!(text_of(&tree_of("<ul><li>one<li>two")).starts_with("• one• two"));
+    /// The marker of each list item, in document order.
+    fn markers(html: &str) -> Vec<String> {
+        let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+        let styles = otlyra_css::cascade::style_document(&parsed.document, Default::default());
+        let tree = build_styled_box_tree(&parsed.document, &styles);
 
-        let ordered = text_of(&tree_of("<ol><li>one<li>two<li>three"));
-        assert!(ordered.contains("1. one"), "{ordered}");
-        assert!(ordered.contains("3. three"), "{ordered}");
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root()];
+        while let Some(id) = stack.pop() {
+            if let Some(marker) = tree.marker(id) {
+                out.push(marker.text.to_string());
+            }
+            stack.extend(tree.node(id).children.iter().rev().copied());
+        }
+        out
+    }
+
+    /// A marker is not in the item's text: CSS puts it outside the content, so it
+    /// is recorded on the item and placed by layout rather than being a box inside
+    /// it. What it says, and how the levels of a nested list differ, is here.
+    #[test]
+    fn list_markers_sit_beside_the_text_rather_than_in_it() {
+        assert_eq!(text_of(&tree_of("<ul><li>one<li>two")), "onetwo");
+        assert_eq!(markers("<ul><li>one<li>two"), ["\u{2022}", "\u{2022}"]);
+        assert_eq!(markers("<ol><li>one<li>two<li>three"), ["1.", "2.", "3."]);
+
+        // The levels are told apart by shape, as they are in every browser.
+        assert_eq!(
+            markers("<ul><li>a<ul><li>b<ul><li>c"),
+            ["\u{2022}", "\u{25e6}", "\u{25aa}"]
+        );
+
+        // And a page may say otherwise, on the list or on one item.
+        assert_eq!(
+            markers("<style>ul{list-style-type:upper-roman}</style><ul><li>a<li>b<li>c<li>d"),
+            ["I.", "II.", "III.", "IV."]
+        );
+        assert_eq!(
+            markers("<style>ol{list-style-type:lower-alpha}</style><ol><li>a<li>b"),
+            ["a.", "b."]
+        );
+        assert!(markers("<style>li{list-style-type:none}</style><ul><li>a").is_empty());
     }
 
     #[test]

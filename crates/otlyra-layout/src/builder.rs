@@ -160,41 +160,111 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
     out
 }
 
-/// The marker text for a list item, given the list it is in.
-fn marker_text(ordered: bool, index: usize) -> String {
-    if ordered {
-        format!("{}. ", index + 1)
-    } else {
-        "• ".to_owned()
+/// The marker text for one item, given the counter its list uses and its place in
+/// it.
+///
+/// A number carries the `.` its counter style puts after it; a bullet is the
+/// character alone, and where it sits is layout's question rather than this one's.
+fn marker_text(style: otlyra_css::ListStyle, index: usize) -> Option<String> {
+    use otlyra_css::ListStyle;
+
+    Some(match style {
+        ListStyle::None => return None,
+        ListStyle::Disc => "\u{2022}".to_owned(),
+        ListStyle::Circle => "\u{25e6}".to_owned(),
+        ListStyle::Square => "\u{25aa}".to_owned(),
+        ListStyle::Decimal => format!("{}.", index + 1),
+        ListStyle::LowerAlpha => format!("{}.", alphabetic(index, false)),
+        ListStyle::UpperAlpha => format!("{}.", alphabetic(index, true)),
+        ListStyle::LowerRoman => format!("{}.", roman(index + 1).to_lowercase()),
+        ListStyle::UpperRoman => format!("{}.", roman(index + 1)),
+    })
+}
+
+/// The bijective base-26 counter: a…z, then aa…az, ba… — which is what CSS's
+/// alphabetic counters are, and is not the same as writing the number in base 26.
+fn alphabetic(index: usize, upper: bool) -> String {
+    let first = if upper { b'A' } else { b'a' };
+    let mut out = Vec::new();
+    let mut n = index + 1;
+    while n > 0 {
+        n -= 1;
+        out.push(first + (n % 26) as u8);
+        n /= 26;
     }
+    out.reverse();
+    String::from_utf8(out).expect("ASCII letters")
+}
+
+/// Roman numerals, in the additive-subtractive form CSS specifies.
+///
+/// Above 3999 CSS says to fall back to decimal, which is what this does: there is
+/// no numeral for four thousand that anybody agrees on.
+fn roman(mut value: usize) -> String {
+    const NUMERALS: [(usize, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+
+    if !(1..4000).contains(&value) {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    for (amount, numeral) in NUMERALS {
+        while value >= amount {
+            out.push_str(numeral);
+            value -= amount;
+        }
+    }
+    out
 }
 
 impl Builder<'_> {
-    /// The marker a list item should show, or `None` if it is not in a list we
-    /// recognise.
-    fn marker_for(&self, item: NodeId) -> Option<String> {
+    /// The marker a list item should show, or `None` if it shows none.
+    ///
+    /// Which counter it is comes from the item's own style, because
+    /// `list-style-type` is inherited and the list is what sets it — so a page that
+    /// changes it on the list, or on one item, is obeyed without this having to
+    /// look at either.
+    fn marker_for(&self, item: NodeId, style: &ComputedStyle) -> Option<crate::box_tree::Marker> {
         let parent = self.document.get(item)?.parent?;
         let list = self.document.get(parent)?.element()?;
-        let ordered = match list.name.local.as_ref() {
-            "ol" => true,
-            "ul" | "menu" => false,
-            _ => return None,
-        };
+        if !matches!(list.name.local.as_ref(), "ol" | "ul" | "menu") {
+            return None;
+        }
 
         // Counted over the items, not over every child: whitespace between them is
-        // still text, and a numbered list that counts it numbers nothing.
-        let index = self
-            .document
-            .children(parent)
-            .filter(|&child| {
-                self.document
-                    .get(child)
-                    .and_then(|node| node.element())
-                    .is_some_and(|element| element.name.local.as_ref() == "li")
-            })
-            .position(|child| child == item)?;
+        // still text, and a numbered list that counts it numbers nothing. Only an
+        // ordered list pays for the walk.
+        let index = if style.list_style.is_ordered() {
+            self.document
+                .children(parent)
+                .filter(|&child| {
+                    self.document
+                        .get(child)
+                        .and_then(|node| node.element())
+                        .is_some_and(|element| element.name.local.as_ref() == "li")
+                })
+                .position(|child| child == item)?
+        } else {
+            0
+        };
 
-        Some(marker_text(ordered, index))
+        Some(crate::box_tree::Marker {
+            text: marker_text(style.list_style, index)?.into(),
+            bullet: !style.list_style.is_ordered(),
+        })
     }
 
     /// The text a replaced or attribute-driven element shows.
@@ -415,25 +485,14 @@ impl Builder<'_> {
                     );
                 }
 
-                // A list item's marker. CSS generates it as a `::marker` box
-                // outside the item's content; putting it inside the content is
-                // coarser and visible in one place — a marker cannot sit in the
-                // margin — but it is what makes a list look like a list.
+                // A list item's marker, recorded on the item rather than pushed
+                // into it: CSS puts a `::marker` outside its item's content, and a
+                // box inside the content cannot be outside it. Layout places it
+                // against the item's first line.
                 if name == "li"
-                    && let Some(marker) = self.marker_for(node)
+                    && let Some(marker) = self.marker_for(node, &style)
                 {
-                    self.tree.push(
-                        id,
-                        BoxNode {
-                            kind: BoxKind::Text(marker.into()),
-                            style: Arc::clone(&style),
-                            node: None,
-                            tag: None,
-                            anonymous: true,
-                            children: Vec::new(),
-                            parent: None,
-                        },
-                    );
+                    self.tree.set_marker(id, marker);
                 }
 
                 if has_renderable_children(name) {

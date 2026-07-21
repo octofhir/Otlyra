@@ -54,6 +54,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             .resolve(style::values::computed::Length::new(font_size))
             .px(),
         line_height: line_height(values),
+        list_style: list_style(values),
         white_space: white_space(values),
         text_decoration: text_decoration(values),
         margin: Sides {
@@ -331,6 +332,32 @@ fn background_size(values: &ComputedValues) -> BackgroundSize {
             }
         }
         _ => BackgroundSize::Auto,
+    }
+}
+
+/// `list-style-type`, in the counters we can draw.
+///
+/// A named counter style we do not know — and the whole of `@counter-style` — is
+/// taken as a disc. Drawing nothing would lose the reader their place in the list;
+/// drawing the wrong shape only loses them the author's choice of it.
+fn list_style(values: &ComputedValues) -> crate::style::ListStyle {
+    use crate::style::ListStyle;
+    use style::counter_style::CounterStyle;
+
+    match &values.get_list().list_style_type.0 {
+        CounterStyle::None => ListStyle::None,
+        CounterStyle::Name(name) => match name.0.as_ref() {
+            "none" => ListStyle::None,
+            "circle" => ListStyle::Circle,
+            "square" => ListStyle::Square,
+            "decimal" => ListStyle::Decimal,
+            "lower-alpha" | "lower-latin" => ListStyle::LowerAlpha,
+            "upper-alpha" | "upper-latin" => ListStyle::UpperAlpha,
+            "lower-roman" => ListStyle::LowerRoman,
+            "upper-roman" => ListStyle::UpperRoman,
+            _ => ListStyle::Disc,
+        },
+        _ => ListStyle::Disc,
     }
 }
 

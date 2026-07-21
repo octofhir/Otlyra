@@ -14,7 +14,8 @@ use std::sync::Arc;
 use peniko::Color;
 
 use crate::style::{
-    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, Sides, TextDecoration, WhiteSpace,
+    ComputedStyle, Display, FontStyle, Length, LengthOrAuto, ListStyle, Sides, TextDecoration,
+    WhiteSpace,
 };
 
 /// `1em` expressed against the parent font size.
@@ -72,12 +73,20 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
             };
         }
 
-        "ul" | "ol" => {
+        "ul" | "menu" | "ol" => {
             style.display = Display::Block;
             style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
             style.padding = Sides {
                 left: Length::Px(40.0),
                 ..Sides::all(Length::ZERO)
+            };
+            // Inherited, so the items read it without being told. A list inside a
+            // list changes shape in the stylesheet, which has selectors; this table
+            // does not, so here every level looks the same.
+            style.list_style = if element == "ol" {
+                ListStyle::Decimal
+            } else {
+                ListStyle::Disc
             };
         }
 

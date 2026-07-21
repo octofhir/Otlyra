@@ -84,6 +84,20 @@ impl BoxNode {
     }
 }
 
+/// What a list item shows beside itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    /// The text of it: a counter with its full stop, or a bullet character.
+    pub text: Arc<str>,
+    /// Whether it marks the item rather than counting it.
+    ///
+    /// The two are placed differently and both are worth getting right: a counter
+    /// is set as text and ends against the item's words, a bullet hangs further
+    /// back than its own width would put it. Which it is cannot be recovered from
+    /// the text, so it is carried.
+    pub bullet: bool,
+}
+
 /// An arena of boxes with one root.
 #[derive(Debug)]
 pub struct BoxTree {
@@ -92,6 +106,14 @@ pub struct BoxTree {
     /// Which box each DOM node generated. Sparse: most documents have nodes that
     /// generate none.
     by_node: SecondaryMap<NodeId, BoxId>,
+    /// The marker text of each list item, for the few boxes that are one.
+    ///
+    /// Beside the tree rather than in the node, for the same reason `by_node` is:
+    /// a marker belongs to a handful of boxes on a page and a field would cost
+    /// every other box the space. It is not a child box because CSS does not make
+    /// it one — a marker sits outside its item's content, and a box inside the
+    /// content cannot.
+    markers: SecondaryMap<BoxId, Marker>,
 }
 
 impl BoxTree {
@@ -111,7 +133,18 @@ impl BoxTree {
             boxes,
             root,
             by_node: SecondaryMap::new(),
+            markers: SecondaryMap::new(),
         }
+    }
+
+    /// Give a list item the marker it shows.
+    pub fn set_marker(&mut self, id: BoxId, marker: Marker) {
+        self.markers.insert(id, marker);
+    }
+
+    /// The marker a box shows, if it is a list item that shows one.
+    pub fn marker(&self, id: BoxId) -> Option<&Marker> {
+        self.markers.get(id)
     }
 
     /// The root box.

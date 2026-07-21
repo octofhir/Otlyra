@@ -41,6 +41,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         containing_blocks: vec![initial],
         viewport: initial,
         scroll_ports: Vec::new(),
+        pending_marker: None,
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -90,6 +91,22 @@ struct Flow<'a> {
     viewport: Rect,
     /// The boxes that cut their contents off and have more than they can show.
     scroll_ports: Vec<ScrollPort>,
+    /// A list item's marker, between learning where its content starts and the
+    /// first line being shaped inside it. See [`PendingMarker`].
+    pending_marker: Option<PendingMarker>,
+}
+
+/// A list item's marker, waiting for the item's first line.
+///
+/// Where it goes horizontally is known as soon as the item's content edge is —
+/// outside it, to the left — but where it goes vertically is the first line's
+/// baseline, and nothing knows that until the line has been shaped.
+struct PendingMarker {
+    marker: crate::box_tree::Marker,
+    /// The item's own style: a marker is set in its item's font and colour.
+    style: Arc<ComputedStyle>,
+    /// The item's content edge, which is what identifies the line it belongs to.
+    x: f32,
 }
 
 /// A box taken out of the flow and put against an edge.
@@ -426,6 +443,22 @@ impl<'a> Flow<'a> {
         y: f32,
         out: &mut Vec<Fragment>,
     ) -> f32 {
+        // A list item's marker waits here for the first line laid out at this
+        // item's own content edge. It cannot be placed now — where it sits
+        // vertically is the first line's baseline, which only shaping knows — and
+        // it cannot be a box inside the content, because CSS puts it outside.
+        //
+        // Matched on the left edge rather than taken by whoever asks first: an item
+        // whose only child is a nested list would otherwise hand its marker to that
+        // list's first item, which is indented and is not the line it belongs to.
+        if let Some(marker) = self.tree.marker(parent) {
+            self.pending_marker = Some(PendingMarker {
+                marker: marker.clone(),
+                style: Arc::clone(&self.tree.node(parent).style),
+                x,
+            });
+        }
+
         let children = &self.tree.node(parent).children;
         if children.is_empty() {
             return 0.0;
@@ -1821,6 +1854,16 @@ impl<'a> Flow<'a> {
         // first line starts, so everything is rebased onto that.
         let paragraph_top = shaped.lines.first().map_or(0.0, |line| line.top);
 
+        // The marker of the list item this is the first line of, if it is one.
+        if let Some(marker) = self
+            .pending_marker
+            .take_if(|marker| (marker.x - x).abs() < 0.01)
+            && let Some(line) = shaped.lines.first()
+            && let Some(fragment) = self.marker_fragment(&marker, x, y, line, paragraph_top)
+        {
+            out.push(fragment);
+        }
+
         let placed: std::collections::HashMap<u64, PlacedSpacer> = shaped
             .spacers
             .iter()
@@ -2007,6 +2050,74 @@ impl<'a> Flow<'a> {
             .entry(key)
             .or_insert_with(|| FontStack::parse_css(&style.font_family))
             .clone()
+    }
+
+    /// A list item's marker, shaped and placed against the item's first line.
+    ///
+    /// Outside the content box, which is what `list-style-position: outside` means
+    /// and is the whole point of not making it a child: the marker hangs to the
+    /// left, and the item's text — including the second line of a long item —
+    /// starts at the content edge. Put inside, it pushes the first line right and
+    /// the rest of them line up under the marker instead of under the words.
+    ///
+    /// Where it starts is two rules at once, and both are visible the moment
+    /// either is missing. It **ends** one space before the content edge, so the
+    /// numbers of a list line up on their full stops however many digits they have
+    /// — `i`, `ii` and `iii` all end in the same column. And it **starts** at least
+    /// a full em back, so a bullet, which needs far less room than that, still
+    /// hangs where a reader expects rather than crowding the word beside it.
+    fn marker_fragment(
+        &mut self,
+        marker: &PendingMarker,
+        x: f32,
+        y: f32,
+        line: &otlyra_text::LineMetrics,
+        paragraph_top: f32,
+    ) -> Option<Fragment> {
+        let stack = self.font_stack(&marker.style);
+        let mut measure = |text: &str| {
+            let mut span = span_for(text, &marker.style, stack.clone());
+            // Whatever the item's first line does, the marker is one line of its own.
+            span.line_height = None;
+            self.text.shape_spans(&[span], &[], None)
+        };
+        let shaped = measure(&marker.marker.text);
+        // The gap is a space set in the item's own font, which is what CSS puts
+        // after a counter — measured with the space *leading*, because a shaper
+        // drops a trailing one from the width it reports.
+        let gap = (measure(&format!(" {}", marker.marker.text)).metrics.width
+            - shaped.metrics.width)
+            .max(0.0);
+
+        let mut run = shaped.runs.into_iter().next()?;
+        // A counter ends against the item's words; a bullet hangs an em back,
+        // which is further than its own narrow width would put it.
+        let left = if marker.marker.bullet {
+            x - marker.style.font_size
+        } else {
+            x - gap - shaped.metrics.width
+        };
+        let room = x - left;
+        // On the item's baseline rather than its own: a marker that sat on its own
+        // baseline would ride up and down with whatever the first line happens to
+        // contain.
+        let baseline = line.baseline - paragraph_top;
+        for glyph in &mut run.glyphs {
+            glyph.y = baseline;
+        }
+
+        Some(Fragment {
+            box_id: None,
+            rect: Rect::new(left, y, room, line.height),
+            kind: FragmentKind::Text(run),
+            style: Arc::clone(&marker.style),
+            fixed: false,
+            scroll_port: None,
+            clip: None,
+            sticky: None,
+            layer: Layer::default(),
+            children: Vec::new(),
+        })
     }
 
     /// The span one text box contributes, with `line-height: normal` already

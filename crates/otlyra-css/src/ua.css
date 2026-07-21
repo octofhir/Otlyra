@@ -7,7 +7,7 @@
  */
 
 html, body, div, center, section, article, aside, header, footer, main, nav,
-figcaption, form, dl, dt, table, tbody, thead, tfoot, tr, td, th, caption,
+figcaption, form, dl, dt, dd, table, tbody, thead, tfoot, tr, td, th, caption,
 li, details, summary, dialog, figure, hgroup, search, address, hr, p, pre,
 blockquote, ul, ol, fieldset, textarea { display: block; }
 
@@ -31,7 +31,19 @@ h6 { display: block; font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
 
 p { margin: 1em 0; }
 blockquote { margin: 1em 40px; }
-ul, ol { margin: 1em 0; padding-left: 40px; }
+ul, menu { list-style-type: disc; }
+ol { list-style-type: decimal; }
+ul, menu, ol { margin: 1em 0; padding-left: 40px; }
+/* A list inside a list is part of the item above it, not a paragraph of its own,
+   so it gets no margin of its own — and its bullets change shape so a reader can
+   tell the levels apart at a glance. */
+ul ul, ul menu, ul ol, menu ul, menu menu, menu ol,
+ol ul, ol menu, ol ol { margin-top: 0; margin-bottom: 0; }
+ul ul, ul menu, menu ul, menu menu,
+ol ul, ol menu { list-style-type: circle; }
+ul ul ul, ul ul menu, ul menu ul, ul menu menu,
+ul ol ul, ul ol menu, menu ul ul, menu ul menu,
+ol ul ul, ol ul menu, ol ol ul, ol ol menu { list-style-type: square; }
 dd { margin-left: 40px; }
 pre { font-family: monospace; white-space: pre; margin: 1em 0; }
 /* A rule is a border, not a filled strip: `border-style: inset` renders as one
