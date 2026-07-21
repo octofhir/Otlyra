@@ -2475,6 +2475,7 @@ version = "0.0.0"
 dependencies = [
  "kurbo",
  "peniko",
+ "png",
  "serde",
  "serde_json",
  "skia-safe",

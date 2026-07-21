@@ -35,13 +35,19 @@ defaults-shot path=(screenshot_dir / "defaults.png"):
 #
 # The comparison is the point: several real bugs were invisible in a dump and
 # obvious the moment the same page was rendered by something that gets it right.
+#
+# Widths under about five hundred are not worth asking for: the reference lays out
+# wider than the picture it then writes, and every comparison comes back as a page
+# that does not fit.
 reference page width="820" height="900":
     #!/usr/bin/env bash
     set -euo pipefail
     out="{{screenshot_dir}}/reference"
     mkdir -p "$out"
     name="$(basename {{page}} .html)"
-    cargo run --quiet -- --file {{page}} --screenshot "$out/$name.ours.png" \
+    # Without our own interface: the page has to start at the top of the picture,
+    # or every comparison is a comparison of two toolbars.
+    cargo run --quiet -- --file {{page}} --no-interface --screenshot "$out/$name.ours.png" \
         --width {{width}} --height {{height}} --scale-factor 1
     if [ -z "${OTLYRA_REFERENCE:-}" ]; then
         echo "set OTLYRA_REFERENCE to a browser binary for the other half"
@@ -51,7 +57,9 @@ reference page width="820" height="900":
         --window-size={{width}},{{height}} \
         --screenshot="$out/$name.reference.png" "file://$(cd "$(dirname {{page}})" && pwd)/$(basename {{page}})" \
         >/dev/null 2>&1
-    echo "wrote $out/$name.ours.png and $out/$name.reference.png"
+    cargo run --quiet -p otlyra-gfx --example compare -- \
+        "$out/$name.ours.png" "$out/$name.reference.png" "$out/$name.difference.png" || true
+    echo "wrote $out/$name.{ours,reference,difference}.png"
 
 # Open the image test page: intrinsic sizes, ratios, and pictures in a line.
 images:

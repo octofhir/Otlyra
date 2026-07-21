@@ -21,6 +21,8 @@ tracing.workspace = true
 skia-safe = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
+# For the comparison example, which writes the picture of what differed.
+png.workspace = true
 serde_json.workspace = true
 
 [lints]

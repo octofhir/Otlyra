@@ -50,6 +50,14 @@ pub struct PageScene {
     scroll: f32,
     /// The scrollbar the pointer is holding, if it is holding one.
     drag: Option<Drag>,
+    /// Whether scrollbars are drawn.
+    scrollbars: bool,
+    /// Pictures behind boxes, by the address the style names.
+    ///
+    /// A background is named by a rule rather than by the markup, so what a page
+    /// wants is only known once it has been styled — which is after it is first
+    /// shown. They arrive late and the page is painted again.
+    background_pictures: std::collections::HashMap<String, otlyra_gfx::peniko::ImageData>,
     /// How far each scrollable box inside the page has been scrolled.
     ///
     /// Kept here rather than on the fragment tree, which is rebuilt by every
@@ -82,6 +90,8 @@ impl PageScene {
             scroll: 0.0,
             port_scroll: std::collections::HashMap::new(),
             drag: None,
+            scrollbars: true,
+            background_pictures: std::collections::HashMap::new(),
             viewport_height: 0.0,
             damage: Damage::STYLE,
         }
@@ -190,11 +200,19 @@ impl PageScene {
         // Taken before the layout is borrowed: the offsets are a handful of floats,
         // and the alternative is holding a borrow of the page across the walk.
         let ports = self.port_scroll.clone();
+        let pictures = self.background_pictures.clone();
+        let scrollbars = self.scrollbars;
         let fragments = self.fragments(text, width, height);
-        let mut list =
-            otlyra_paint::build_display_list_scrolled(fragments, (width, height), scroll, &|id| {
-                ports.get(&id).copied().unwrap_or(0.0)
-            });
+        let mut list = otlyra_paint::build_display_list_with(
+            fragments,
+            &otlyra_paint::Frame {
+                viewport: (width, height),
+                scroll_y: scroll,
+                port_offset: Some(&|id| ports.get(&id).copied().unwrap_or(0.0)),
+                background: Some(&|url: &str| pictures.get(url).cloned()),
+                scrollbars,
+            },
+        );
         if top != 0.0 {
             list.transform(otlyra_gfx::kurbo::Affine::translate((0.0, f64::from(top))));
         }
@@ -292,6 +310,38 @@ impl PageScene {
     /// clamp against.
     pub fn set_scroll(&mut self, scroll: f32) {
         self.scroll = scroll.max(0.0);
+        self.damage.add(Damage::PAINT);
+    }
+
+    /// Draw no scrollbars, for a picture that is going to be compared with one
+    /// from elsewhere.
+    pub fn hide_scrollbars(&mut self) {
+        self.scrollbars = false;
+    }
+
+    /// The background pictures this page names and has not been given.
+    ///
+    /// Asked for after a frame, because the styles that name them are computed on
+    /// the way to one.
+    pub fn wanted_pictures(&self) -> Vec<String> {
+        let mut wanted: Vec<String> = Vec::new();
+        for id in self.boxes.descendants(self.boxes.root()) {
+            let Some(url) = self.boxes.node(id).style.background_image.as_deref() else {
+                continue;
+            };
+            if self.background_pictures.contains_key(url) {
+                continue;
+            }
+            if !wanted.iter().any(|already| already == url) {
+                wanted.push(url.to_owned());
+            }
+        }
+        wanted
+    }
+
+    /// Hand over a picture the page asked for.
+    pub fn set_picture(&mut self, url: String, picture: otlyra_gfx::peniko::ImageData) {
+        self.background_pictures.insert(url, picture);
         self.damage.add(Damage::PAINT);
     }
 

@@ -48,6 +48,10 @@
               border-radius: 8px; margin: 12px 0 20px; }
   .ringed { background: #fff; box-shadow: 0 0 0 3px #06c; padding: 8px;
             border-radius: 8px; margin: 12px 0 20px; }
+  .shadowed-text { text-shadow: 0 1px 2px rgba(0,0,0,0.45); }
+  .picture { background-image: url(images/wide.png); background-size: cover;
+             height: 90px; color: #fff; padding: 8px; border-radius: 8px; margin: 8px 0;
+             text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
   .gradient { background: linear-gradient(to right, #06c, #0c6); color: #fff;
               padding: 8px; border-radius: 8px; margin: 8px 0; }
   .gradient-angle { background: linear-gradient(135deg, #309, #c39); color: #fff;
@@ -102,7 +106,11 @@ heights, and <code>text-align</code>. On an <strong>inline</strong> box too:
 its padding and borders take room in the line, and a box broken over two lines
 keeps the border on the edge each piece owns.</p>
 <p><strong>Shadows</strong>: <code>box-shadow</code> with an offset, a blur and a
-spread, several at once, painted behind the box in the order CSS gives them.</p>
+spread, several at once, painted behind the box in the order CSS gives them, and
+<code class="shadowed-text">text-shadow</code>, which is the same run of glyphs
+drawn behind itself.</p>
+<p><strong>Background pictures</strong>: <code>background-image: url()</code> with
+<code>cover</code>, <code>contain</code> or a size of its own, cut off at the box.</p>
 <p><strong>Gradients</strong>: a <code>linear-gradient</code> background, by angle
 or by keyword, with stops that are spread evenly when they say nothing.</p>
 <p><strong>Grid</strong>: <code>display: grid</code> with
@@ -157,7 +165,9 @@ its own, so <code>overflow</code> does not yet stop one.</p>
 text, and <code>vertical-align</code> does not exist. Border styles other than
 solid are drawn solid, a border that is rounded and different on each side falls
 back to four square-cornered rectangles, and a rounded box clips its contents at a
-square edge. A resize that no rule reads costs nothing — the sheets are
+square edge. A background picture does not tile and cannot be positioned, an inset
+<code>box-shadow</code> is not drawn, and a background is one layer rather than
+several. A resize that no rule reads costs nothing — the sheets are
 parsed once and the cascade is skipped — but a resize that does change something
 recomputes every element rather than the part that changed.</p>
 
@@ -191,6 +201,10 @@ moves nothing else.</p>
   <h3><code>position: sticky</code>, held at the top while this box scrolls past</h3>
   <p>Scroll the page to see it stop at the top and leave with its container.</p>
 </div>
+
+<h2>Background pictures</h2>
+<div class="picture">A picture behind a box, sized with
+<code>background-size: cover</code> and cut off at the box's own rounded edge.</div>
 
 <h2>Shadows</h2>
 <div class="shadowed">A <code>box-shadow</code>, offset and blurred behind the box.</div>

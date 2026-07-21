@@ -116,20 +116,40 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
     )
 }
 
+/// Where a background picture is found, by the address a style names.
+pub type BackgroundLookup<'a> = &'a dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>;
+
+/// How far a scroll port has been scrolled.
+pub type PortOffset<'a> = &'a dyn Fn(otlyra_layout::BoxId) -> f32;
+
 /// Everything a frame needs beyond the fragments themselves.
 ///
 /// A struct rather than four more arguments: what a frame is made of grows, and a
 /// caller that wants only the scroll offset should not have to know about the rest.
-#[derive(Default)]
 pub struct Frame<'a> {
     /// The size of the visible area, in logical pixels.
     pub viewport: (f32, f32),
     /// How far down the page the reader is.
     pub scroll_y: f32,
     /// How far each scroll port has been scrolled.
-    pub port_offset: Option<&'a dyn Fn(otlyra_layout::BoxId) -> f32>,
+    pub port_offset: Option<PortOffset<'a>>,
     /// The decoded picture behind a box, by the address its style names.
-    pub background: Option<&'a dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>>,
+    pub background: Option<BackgroundLookup<'a>>,
+    /// Whether scrollbars are drawn. Off for a picture that is going to be compared
+    /// with one from elsewhere: a scrollbar is the browser's, not the page's.
+    pub scrollbars: bool,
+}
+
+impl Default for Frame<'_> {
+    fn default() -> Self {
+        Self {
+            viewport: (0.0, 0.0),
+            scroll_y: 0.0,
+            port_offset: None,
+            background: None,
+            scrollbars: true,
+        }
+    }
 }
 
 /// Build the display list, with each scroll port at the offset the caller says.
@@ -150,7 +170,7 @@ pub fn build_display_list_scrolled(
             viewport,
             scroll_y,
             port_offset: Some(port_offset),
-            background: None,
+            ..Frame::default()
         },
     )
 }
@@ -167,11 +187,26 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
     // to the element: it covers the whole viewport however short the document is,
     // and the element does not paint it a second time — which is what lets a box
     // with a negative `z-index` show through from under the flow.
+    // And when the root element has none of its own, the body's goes to the canvas
+    // instead — which is why a page that colours only its body still has that
+    // colour behind its margins, and out past the end of its content.
     let root_element = tree.root.children.first();
-    let canvas = root_element
-        .map(|element| element.style.background_color)
+    let body = root_element.and_then(|root| {
+        root.children
+            .iter()
+            .find(|child| matches!(child.kind, FragmentKind::Box))
+    });
+    let opaque = |fragment: &&Fragment| fragment.style.background_color.components[3] > 0.0;
+    let canvas_from = root_element.filter(opaque).or_else(|| body.filter(opaque));
+    // White when nobody says otherwise: the canvas is not an element and has no
+    // style of its own, and a page that names no background is drawn on white. The
+    // user-agent sheet deliberately does not put one on `html` — a background there
+    // would be painted rather than propagated, and the body's would have nowhere
+    // to go.
+    let canvas = canvas_from
+        .map(|fragment| fragment.style.background_color)
         .filter(|colour| colour.components[3] > 0.0)
-        .unwrap_or(tree.root.style.background_color);
+        .unwrap_or(Color::WHITE);
     list.push(DisplayItem::Fill {
         style: Fill::NonZero,
         transform: Affine::IDENTITY,
@@ -196,8 +231,10 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         if std::ptr::eq(fragment, &tree.root) {
             continue;
         }
-        // The root element's background went to the canvas with it.
-        let is_root_element = root_element.is_some_and(|root| std::ptr::eq(fragment, root));
+        // Whichever background went to the canvas is not painted again by the box
+        // it came from.
+        let is_root_element = canvas_from.is_some_and(|from| std::ptr::eq(fragment, from))
+            || root_element.is_some_and(|root| std::ptr::eq(fragment, root));
         let inside = fragment.scroll_port.map_or(0.0, &port_offset);
         paint(
             fragment,
@@ -212,6 +249,10 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
 
     // Scrollbars last, over everything: the page's, and one for each port that has
     // more to show than it can.
+    if !frame.scrollbars {
+        tracing::debug!(items = list.len(), "display list built");
+        return list;
+    }
     paint_scrollbar(
         &mut list,
         Rect::new(0.0, 0.0, width, height),
@@ -244,7 +285,7 @@ fn paint(
     page_scroll: f32,
     viewport_height: f32,
     background_on_canvas: bool,
-    background_picture: Option<&dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>>,
+    background_picture: Option<BackgroundLookup<'_>>,
     list: &mut DisplayList,
 ) {
     // A sticky box moves with the page until the scroll would take it past its
@@ -362,15 +403,24 @@ fn paint(
                     f64::from(width) / f64::from(picture.width),
                     f64::from(height) / f64::from(picture.height),
                 );
+
+                // A background belongs to its box: `cover` is meant to overflow and
+                // be cut off, not to spill onto whatever is drawn next. The box's
+                // own outline is the edge, so rounded corners cut the picture too.
+                list.push(DisplayItem::PushLayer {
+                    blend: otlyra_gfx::peniko::BlendMode::default(),
+                    alpha: 1.0,
+                    transform: Affine::IDENTITY,
+                    clip: box_shape(rect, scroll_y, &fragment.style),
+                });
                 list.push(DisplayItem::Image {
                     image: otlyra_gfx::ImageResource::from(picture),
                     sampler: otlyra_gfx::peniko::ImageSampler::default(),
-                    transform: Affine::translate((
-                        f64::from(rect.x),
-                        f64::from(rect.y - scroll_y),
-                    )) * scale,
+                    transform: Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)))
+                        * scale,
                     clip_rect: None,
                 });
+                list.push(DisplayItem::PopLayer);
             }
 
             // The gradient goes over the colour, which is the order CSS paints them
@@ -1174,6 +1224,73 @@ mod tests {
         assert_eq!(text_blur, 0.0, "the text itself is not blurred");
         assert_eq!(shadow_at[4] - text_at[4], 2.0, "moved right by two");
         assert_eq!(shadow_at[5] - text_at[5], 3.0, "and down by three");
+    }
+
+    /// A picture named by a rule is drawn behind the box, sized as the rule says.
+    #[test]
+    fn a_background_picture_is_drawn_behind_its_box() {
+        let parsed = otlyra_html::parse(
+            b"<style>body { margin: 0 } div { height: 50px; width: 200px; \
+              background-image: url(behind.png); background-size: cover }</style><div></div>",
+            Some("utf-8"),
+        );
+        let styles = otlyra_css::cascade::style_document(
+            &parsed.document,
+            otlyra_css::cascade::Viewport {
+                width: 800.0,
+                height: 600.0,
+                scale: 1.0,
+            },
+        );
+        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+
+        // A twenty by ten picture: `cover` should draw it 200 wide and 100 tall,
+        // cropped by the box rather than squashed into it.
+        let picture = otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; 20 * 10 * 4])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: 20,
+            height: 10,
+        };
+
+        let list = build_display_list_with(
+            &fragments,
+            &Frame {
+                viewport: (800.0, 600.0),
+                background: Some(&|url: &str| (url == "behind.png").then(|| picture.clone())),
+                ..Frame::default()
+            },
+        );
+
+        let (width, height) = list
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image {
+                    image, transform, ..
+                } => {
+                    let coeffs = transform.as_coeffs();
+                    Some((
+                        coeffs[0] * f64::from(image.width),
+                        coeffs[3] * f64::from(image.height),
+                    ))
+                }
+                _ => None,
+            })
+            .expect("a background picture");
+
+        assert_eq!(width, 200.0, "cover fills the box across");
+        assert_eq!(height, 100.0, "and overflows it down rather than squashing");
     }
 
     /// A sticky heading rides with the page, stops at its inset, and is carried off

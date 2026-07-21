@@ -43,6 +43,13 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     dump_display_list: Option<PathBuf>,
 
+    /// Draw the page alone, with none of the browser's own interface.
+    ///
+    /// For a screenshot that is going to be compared with one from another browser:
+    /// the page has to start at the top of the picture.
+    #[arg(long)]
+    no_interface: bool,
+
     /// Which rasterizer to use.
     #[arg(long, value_enum, default_value_t = Renderer::Skia)]
     renderer: Renderer,
@@ -231,6 +238,9 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         || cli.dump_selectors.is_some();
     if !wants_bytes {
         let mut browser = Browser::new(NetLoader::default());
+        if cli.no_interface {
+            browser.hide_interface();
+        }
         browser.navigate(&match &source {
             Source::Url(url) => url.clone(),
             Source::File(path) => path.display().to_string(),
@@ -238,6 +248,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         return match cli.screenshot.as_deref() {
             Some(path) => {
                 browser.wait_for_load(LOAD_TIMEOUT);
+                browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
                 Ok(write_screenshot(&mut browser, cli.viewport(), path)?)
             }
             None => Ok(run_window(window_config(cli), &mut browser)?),
@@ -329,6 +340,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
             // A screenshot has one frame to get right and no event loop to be woken
             // by, so this is the one place that waits for a load.
             browser.wait_for_load(LOAD_TIMEOUT);
+            browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
             write_screenshot(&mut browser, cli.viewport(), path)?;
         }
         None => run_window(window_config(cli), &mut browser)?,

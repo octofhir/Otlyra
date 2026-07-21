@@ -12,9 +12,10 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    AlignItems, Border, Clear, ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float,
-    FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow,
-    BackgroundSize, Placement, Position, Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
+    AlignItems, BackgroundSize, Border, Clear, ComputedStyle, Corners, Display, FlexDirection,
+    FlexWrap, Float, FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto,
+    LineHeight, Overflow, Placement, Position, Shadow, Sides, TextAlign, TextDecoration, Track,
+    WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -275,10 +276,14 @@ fn background_image(values: &ComputedValues) -> Option<Arc<str>> {
     let Image::Url(url) = values.get_background().background_image.0.first()? else {
         return None;
     };
-    // Resolved against the stylesheet it was written in, which for us is the
-    // document — a sheet fetched from elsewhere would need its own base, and that
-    // is the day this stops being a string and starts being a URL.
-    Some(Arc::from(url.url()?.as_str()))
+    // The address as written, not as resolved: stylesheets are parsed against a
+    // placeholder base, so the engine cannot resolve a relative `url()` for us.
+    // Resolving it against the page is the caller's, exactly as it is for the
+    // address in an `<img src>`.
+    Some(match url {
+        style::url::ComputedUrl::Valid(resolved) => Arc::from(resolved.as_str()),
+        style::url::ComputedUrl::Invalid(specified) => Arc::from(specified.as_str()),
+    })
 }
 
 /// `background-size` for that layer.
@@ -891,6 +896,15 @@ mod tests {
 
     /// A formatting context layout does not have still generates a box, laid out as
     /// a block. Dropping the element instead would hide its content entirely.
+    #[test]
+    fn a_background_picture_keeps_the_address_it_was_written_with() {
+        let style = layout_style(
+            "<style>div { background-image: url(pic.png) }</style><div>x</div>",
+            "div",
+        );
+        assert_eq!(style.background_image.as_deref(), Some("pic.png"));
+    }
+
     #[test]
     fn a_grid_container_is_recognized() {
         let style = layout_style("<style>div { display: grid }</style><div>x</div>", "div");

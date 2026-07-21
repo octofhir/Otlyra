@@ -263,8 +263,18 @@ pub struct Browser {
     fetcher: Fetcher,
     /// When the current load started, so the spinner has something to turn by.
     load_started: std::time::Instant,
+    /// Whether the browser's own interface is drawn at all.
+    ///
+    /// Off is for a screenshot that is going to be compared against another
+    /// browser's: the page has to start at the top of the picture, or every
+    /// comparison is a comparison of two toolbars.
+    interface: bool,
     /// Pictures that have already been decoded.
     images: ImageCache,
+    /// Background pictures asked for, so none is asked for twice.
+    background_requests: HashMap<String, usize>,
+    /// Background fetches in flight, by request number.
+    background_fetches: HashMap<u64, (usize, String)>,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
@@ -295,7 +305,10 @@ impl Browser {
             active: 0,
             fetcher: Fetcher::spawn(loader),
             load_started: std::time::Instant::now(),
+            interface: true,
             images: ImageCache::default(),
+            background_requests: HashMap::new(),
+            background_fetches: HashMap::new(),
             last_width: 1024.0,
             last_height: 768.0,
             mark: otlyra_gfx::decode_image(crate::MARK)
@@ -304,6 +317,17 @@ impl Browser {
             pointer: (0.0, 0.0),
             settings: SettingsSurface::new(),
             about: AboutSurface::new(),
+        }
+    }
+
+    /// Draw the page and nothing else, for a picture that is going to be compared
+    /// with one from elsewhere.
+    pub fn hide_interface(&mut self) {
+        self.interface = false;
+        for tab in &mut self.tabs {
+            if let Some(page) = tab.page.as_mut() {
+                page.hide_scrollbars();
+            }
         }
     }
 
@@ -545,6 +569,30 @@ impl Browser {
         changed
     }
 
+    /// Paint one frame nobody sees, so that everything a frame *asks for* has been
+    /// asked for, and wait for it.
+    ///
+    /// A background picture is named by a rule, and a rule is computed on the way to
+    /// a frame: a window paints again when the picture lands, and a caller with one
+    /// frame to get right has to do the first one itself. Only for those callers —
+    /// a screenshot, a test — never for the window.
+    pub fn prepare_frame(&mut self, viewport: Viewport, timeout: std::time::Duration) {
+        let mut discarded = otlyra_gfx::RecordingPainter::new();
+        self.paint(&mut discarded, viewport);
+
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.background_fetches.is_empty() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("gave up waiting for a background picture");
+                return;
+            }
+            for fetched in self.fetcher.wait(remaining.min(FETCH_POLL)) {
+                self.receive(fetched);
+            }
+        }
+    }
+
     /// Wait for the tab to finish loading, for callers with no event loop.
     ///
     /// The window never calls this — it is woken instead. A screenshot and a test
@@ -563,8 +611,70 @@ impl Browser {
         }
     }
 
+    /// Ask for the background pictures the pages have found they need.
+    ///
+    /// A background is named by a rule, so what a page wants is known only once it
+    /// has been styled — which happens on the way to a frame. This is called after
+    /// one, and the pictures arrive for the frame after that.
+    fn fetch_backgrounds(&mut self) {
+        for index in 0..self.tabs.len() {
+            let Some(page) = self.tabs[index].page.as_ref() else {
+                continue;
+            };
+            let base = self.tabs[index].url.clone();
+            let wanted: Vec<String> = page
+                .wanted_pictures()
+                .into_iter()
+                .filter(|url| !self.background_requests.contains_key(url))
+                .take(IMAGE_LIMIT)
+                .collect();
+
+            for url in wanted {
+                if let Some(picture) = self.images.get(&url) {
+                    if let Some(page) = self.tabs[index].page.as_mut() {
+                        page.set_picture(url.clone(), picture);
+                    }
+                    self.background_requests.insert(url, index);
+                    continue;
+                }
+                let Some(target) = Self::subresource_url(&base, &url) else {
+                    // Recorded anyway: a picture that may not be fetched must not be
+                    // asked for again on every frame.
+                    self.background_requests.insert(url, index);
+                    continue;
+                };
+                let id = self.fetcher.request(&target, ResourceKind::Image);
+                self.background_requests.insert(url.clone(), index);
+                self.background_fetches.insert(id, (index, url));
+            }
+        }
+    }
+
     /// One finished fetch. Returns whether it changed anything on screen.
     fn receive(&mut self, fetched: Fetched) -> bool {
+        // A background picture belongs to a page rather than to a load, and may
+        // arrive long after the page it is for.
+        if let Some((index, url)) = self.background_fetches.remove(&fetched.id) {
+            let Ok(loaded) = fetched.result else {
+                tracing::warn!(%url, "background picture failed to load");
+                return false;
+            };
+            match otlyra_gfx::decode_image(&loaded.bytes) {
+                Ok(picture) => {
+                    self.images.insert(fetched.url.clone(), picture.clone());
+                    match self.tabs.get_mut(index).and_then(|tab| tab.page.as_mut()) {
+                        Some(page) => page.set_picture(url, picture),
+                        None => tracing::warn!(%url, "no page to give the picture to"),
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(%url, %error, "background picture failed to decode");
+                    return false;
+                }
+            }
+        }
+
         let Some(index) = self.tabs.iter().position(|tab| {
             tab.pending.as_ref().is_some_and(|pending| {
                 pending.document == fetched.id || pending.outstanding.contains_key(&fetched.id)
@@ -589,6 +699,7 @@ impl Browser {
     /// have been asked for: a page that is readable now and styled a moment later
     /// beats a blank window for the length of the slowest thing it links to.
     fn receive_document(&mut self, index: usize, fetched: Fetched) -> bool {
+        let interface = self.interface;
         let loaded = match fetched.result {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -674,6 +785,9 @@ impl Browser {
         tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
         tab.url = final_url.clone();
         tab.page = Some(PageScene::new(parsed.document));
+        if !interface && let Some(page) = tab.page.as_mut() {
+            page.hide_scrollbars();
+        }
         if index == self.active {
             self.ui.address.set_text(&final_url);
         }
@@ -777,6 +891,10 @@ impl Browser {
 
     /// Everything the page asked for has arrived or failed: build it for real.
     fn finish_load(&mut self, index: usize) {
+        // A new page names its own backgrounds; what the last one asked for is not
+        // an answer for this one.
+        self.background_requests.clear();
+
         let Some(pending) = self.tabs[index].pending.take() else {
             return;
         };
@@ -1179,6 +1297,9 @@ impl Painter for Browser {
         self.last_height = height;
 
         let scale = otlyra_gfx::kurbo::Affine::scale(viewport.scale_factor);
+        // Where the page starts: under the interface, or at the top of the window
+        // when there is none.
+        let top = if self.interface { UI_HEIGHT } else { 0.0 };
 
         // The page first, then the interface over it. The page is inset by the
         // interface's height and culled to what is visible, so it cannot paint
@@ -1187,8 +1308,7 @@ impl Painter for Browser {
         if let Some(system) = self.tabs[self.active].system {
             // A browser page takes the whole content area: it is not a document
             // in a tab, it is the browser looked at from the front.
-            let content =
-                crate::ui::Rect::new(0.0, UI_HEIGHT, width, (height - UI_HEIGHT).max(0.0));
+            let content = crate::ui::Rect::new(0.0, top, width, (height - top).max(0.0));
             let mut list = otlyra_gfx::DisplayList::new();
             match system {
                 SystemPage::Settings => {
@@ -1205,8 +1325,8 @@ impl Painter for Browser {
             let mut list = page.build_display_list(
                 &mut self.text,
                 width as f32,
-                (height - UI_HEIGHT).max(0.0) as f32,
-                UI_HEIGHT as f32,
+                (height - top).max(0.0) as f32,
+                top as f32,
             );
             list.transform(scale);
             render(&list, target);
@@ -1222,6 +1342,13 @@ impl Painter for Browser {
             );
             list.transform(scale);
             render(&list, target);
+        }
+
+        if !self.interface {
+            // Still after the page, because the pictures a rule names are only known
+            // once the rule has been computed on the way to a frame.
+            self.fetch_backgrounds();
+            return;
         }
 
         let mut list = otlyra_gfx::DisplayList::new();
@@ -1241,6 +1368,10 @@ impl Painter for Browser {
         );
         list.transform(scale);
         render(&list, target);
+
+        // After the frame, because a rule that names a picture is only computed on
+        // the way to one.
+        self.fetch_backgrounds();
     }
 }
 
