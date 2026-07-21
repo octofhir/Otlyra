@@ -48,6 +48,18 @@ impl Rect {
         self.x + self.width
     }
 
+    /// The part of this rectangle that is also inside `other`.
+    pub fn intersection(&self, other: &Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        Rect::new(
+            x,
+            y,
+            (self.right().min(other.right()) - x).max(0.0),
+            (self.bottom().min(other.bottom()) - y).max(0.0),
+        )
+    }
+
     /// Whether this rectangle overlaps `other` at all.
     pub fn intersects(&self, other: &Rect) -> bool {
         self.x < other.right()
@@ -86,6 +98,27 @@ pub struct Fragment {
     pub kind: FragmentKind,
     /// The style to paint it with.
     pub style: Arc<ComputedStyle>,
+    /// Where in the painting order this fragment belongs.
+    ///
+    /// Everything in the flow is at zero. A positioned box is above it at the same
+    /// `z-index`, and `z-index` moves it further up or below — which is the whole
+    /// of the painting order CSS gives a document with no transforms, opacity or
+    /// filters in it. Descendants take their ancestor's level, so a positioned box
+    /// and its contents travel together.
+    pub layer: Layer,
+    /// The scroll port this fragment moves with, if it is inside one.
+    ///
+    /// The innermost one: a box inside two scrollable ancestors moves with the
+    /// nearer of them, and that one moves with the outer.
+    pub scroll_port: Option<BoxId>,
+    /// The rectangle this fragment is cut off at, if an ancestor cuts it off.
+    ///
+    /// In page coordinates, and already the intersection of every ancestor that
+    /// clips — so paint applies one rectangle rather than walking back up a tree it
+    /// does not have.
+    pub clip: Option<Rect>,
+    /// What holds this fragment in view while the page scrolls, if anything.
+    pub sticky: Option<Sticky>,
     /// Whether scrolling the page moves it.
     ///
     /// A fixed box is placed against the viewport, and so is everything inside it;
@@ -96,11 +129,62 @@ pub struct Fragment {
     pub children: Vec<Fragment>,
 }
 
+/// What `position: sticky` needs at paint time.
+///
+/// Layout knows where the box is and how far it may travel; only paint knows how
+/// far the page has been scrolled. So layout resolves the constraint and paint
+/// applies it — the box is where the flow put it until the scroll would take it
+/// past its inset, and then it stops there until its container runs out.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Sticky {
+    /// Distance from the top of the viewport it may not pass, if `top` says so.
+    pub top: Option<f32>,
+    /// The same at the bottom.
+    pub bottom: Option<f32>,
+    /// The box's own border box, where the flow put it.
+    pub own: Rect,
+    /// The containing block it may not leave.
+    pub container: Rect,
+}
+
+/// A place in the painting order.
+///
+/// Ordered by `z-index` first and by whether the box is positioned second, so a
+/// positioned box with `z-index: auto` paints over its in-flow neighbours, and one
+/// with a negative `z-index` paints under them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Layer {
+    /// `z-index`, with `auto` counting as zero.
+    pub index: i32,
+    /// Whether the box is positioned at all.
+    pub positioned: bool,
+}
+
+/// A box that cuts its contents off and has more of them than it can show.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollPort {
+    /// The box itself.
+    pub id: BoxId,
+    /// What is on screen: its padding box, in page coordinates.
+    pub port: Rect,
+    /// How tall its contents are.
+    pub content_height: f32,
+}
+
+impl ScrollPort {
+    /// The furthest it can be scrolled.
+    pub fn range(&self) -> f32 {
+        (self.content_height - self.port.height).max(0.0)
+    }
+}
+
 /// A laid-out page.
 #[derive(Clone, Debug)]
 pub struct FragmentTree {
     /// The root fragment: the initial containing block.
     pub root: Fragment,
+    /// The boxes inside the page that scroll, outermost first.
+    pub scroll_ports: Vec<ScrollPort>,
 }
 
 impl FragmentTree {
@@ -134,6 +218,12 @@ impl FragmentTree {
         screen: &'a Rect,
     ) -> impl Iterator<Item = &'a Fragment> {
         self.iter().filter(move |fragment| {
+            // A sticky fragment is culled by where it may travel rather than by
+            // where the flow put it: a heading held at the top of the screen is on
+            // screen precisely when its section still is.
+            if let Some(sticky) = fragment.sticky {
+                return sticky.container.intersects(scrolled);
+            }
             let against = if fragment.fixed { screen } else { scrolled };
             fragment.rect.intersects(against)
         })

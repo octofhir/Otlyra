@@ -31,12 +31,17 @@ pub enum ResourceKind {
 }
 
 /// What one fetch returned.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Loaded {
     /// The bytes.
     pub bytes: Vec<u8>,
     /// The charset the transport declared, if it declared one.
     pub charset: Option<String>,
+    /// The `Content-Type` the transport declared, if it declared one. What the
+    /// bytes actually are is decided from this *and* from them, which is sniffing.
+    pub content_type: Option<String>,
+    /// Whether the transport said not to sniff.
+    pub nosniff: bool,
     /// The address it actually came from, after redirects.
     pub final_url: String,
 }
@@ -64,9 +69,9 @@ pub struct Fetched {
 /// fetch thread: a loader holds a client and a connection pool, and one per thread
 /// would be several of both.
 pub trait Loader: Send + Sync + 'static {
-    /// Fetch `url`, returning the bytes, the transport's charset, and the address
-    /// the bytes actually came from.
-    fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String>;
+    /// Fetch `url`, returning the bytes and the little the transport knows about
+    /// them. What they *are* is decided above this, from the bytes as well.
+    fn load(&self, url: &str) -> Result<Loaded, String>;
 }
 
 /// How many fetches may be in flight at once.
@@ -133,14 +138,7 @@ impl Fetcher {
                         let queue = queue.lock().expect("no panic while taking a request");
                         queue.recv()
                     } {
-                        let result =
-                            loader
-                                .load(&request.url)
-                                .map(|(bytes, charset, final_url)| Loaded {
-                                    bytes,
-                                    charset,
-                                    final_url,
-                                });
+                        let result = loader.load(&request.url);
                         let fetched = Fetched {
                             id: request.id,
                             kind: request.kind,
@@ -225,12 +223,15 @@ mod tests {
     }
 
     impl Loader for SlowLoader {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.highest.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(50));
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok((Vec::new(), None, url.to_owned()))
+            Ok(Loaded {
+                final_url: url.to_owned(),
+                ..Default::default()
+            })
         }
     }
 

@@ -58,7 +58,7 @@ impl OnStart {
 /// reason, and none of these has one yet. Persisting them is a later milestone —
 /// what matters now is that the surface has real state to be a view of rather
 /// than a mock-up that cannot be wrong.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     /// Where a new window starts.
     pub on_start: OnStart,
@@ -406,6 +406,15 @@ impl Settings {
     }
 }
 
+/// Everything the settings' appearance is a function of.
+#[derive(Clone, PartialEq)]
+struct Appearance {
+    rect: Rect,
+    settings: Settings,
+    pointer: (f64, f64),
+    pointer_down: bool,
+}
+
 /// A settings surface that has been drawn, and can therefore be pressed.
 ///
 /// Holds the tree the last frame built, for the same reason the toolbar does:
@@ -420,6 +429,14 @@ pub struct SettingsSurface {
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
     engine: TextEngine,
+    /// What the last built list was built from, and the list itself.
+    ///
+    /// The same rule the toolbar follows: a frame that agrees with the last one
+    /// on everything it draws from would draw the same list, so it does not
+    /// build one. This page is a scrolling column of cards, and rebuilding it
+    /// every frame shapes every label on it again.
+    cache: Option<(Appearance, DisplayList)>,
+    builds: u64,
     root: Option<Child<Action>>,
 }
 
@@ -439,6 +456,8 @@ impl SettingsSurface {
             pointer_down: false,
             press_origin: None,
             engine: TextEngine::new(),
+            cache: None,
+            builds: 0,
             root: None,
         }
     }
@@ -521,12 +540,24 @@ impl SettingsSurface {
     /// window: it sits under the browser's toolbar, and the pointer positions it
     /// is asked about are the window's. Placing it anywhere else would mean
     /// translating every press on the way in.
-    pub fn build_display_list(
-        &mut self,
-        rect: Rect,
-        text: &mut TextEngine,
-        list: &mut DisplayList,
-    ) {
+    pub fn build_display_list(&mut self, rect: Rect, text: &mut TextEngine, out: &mut DisplayList) {
+        let appearance = Appearance {
+            rect,
+            settings: self.settings.clone(),
+            pointer: self.pointer,
+            pointer_down: self.pointer_down,
+        };
+        if let Some((built, list)) = &self.cache
+            && *built == appearance
+            && self.root.is_some()
+        {
+            out.append(list);
+            return;
+        }
+
+        self.builds += 1;
+        let mut built = DisplayList::new();
+        let list = &mut built;
         let theme = self.theme.clone();
         let (width, height) = (rect.width, rect.height);
         fill_rounded(list, rect, theme.surface_sunken, 0.0);
@@ -550,6 +581,14 @@ impl SettingsSurface {
         );
 
         self.root = Some(root);
+        self.cache = Some((appearance, built));
+        let (_, built) = self.cache.as_ref().expect("just stored");
+        out.append(built);
+    }
+
+    /// How many display lists this surface has built rather than reused.
+    pub fn builds(&self) -> u64 {
+        self.builds
     }
 }
 
@@ -582,6 +621,22 @@ mod tests {
             }
         }
         panic!("nothing on the surface reports {wanted:?}");
+    }
+
+    #[test]
+    fn an_unchanged_frame_is_not_built_a_second_time() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        assert_eq!(surface.builds(), 1);
+
+        frame(&mut surface);
+        assert_eq!(surface.builds(), 1, "nothing about it moved");
+
+        // A preference is part of what it is drawn from, so changing one does
+        // rebuild it — otherwise the switch would not appear to flip.
+        surface.settings.apply(Action::ToggleImages);
+        frame(&mut surface);
+        assert_eq!(surface.builds(), 2);
     }
 
     #[test]

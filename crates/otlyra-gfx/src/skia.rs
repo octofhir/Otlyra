@@ -58,6 +58,8 @@ pub struct SkiaPainter {
     /// [`PaintTarget::pop_layer`] cannot restore past our own baseline.
     layer_depth: usize,
     typefaces: TypefaceCache,
+    /// The blur the run being drawn asks for, while it is being drawn.
+    blur: Option<f64>,
 }
 
 /// Parsing a font file is expensive and every glyph run asks for the same handful
@@ -147,13 +149,99 @@ impl TypefaceCache {
         }
 
         let font_mgr = self.font_mgr.get_or_insert_with(sk::FontMgr::new);
-        let base = font_mgr.new_from_data(font.data.as_ref(), index as usize)?;
+        let bytes = font.data.as_ref();
+        let base = match font_mgr.new_from_data(bytes, index as usize) {
+            Some(typeface) => typeface,
+            // A face inside a font collection: the platform's font manager here
+            // takes a collection only at index zero, so the face is lifted out into
+            // a font of its own and handed over as that. Without this, every face
+            // past the first in a `.ttc` — which on this platform is every bold and
+            // italic monospace — draws nothing at all.
+            None => {
+                let extracted = face_from_collection(bytes, index as usize)?;
+                font_mgr.new_from_data(&extracted, 0)?
+            }
+        };
         let typeface = instantiate(&base, normalized_coords).unwrap_or(base);
 
         self.entries
             .push((key, index, normalized_coords.to_vec(), typeface.clone()));
         Some(typeface)
     }
+}
+
+/// Lift one face out of a font collection into a font of its own.
+///
+/// A collection is a header, a list of offsets, and one table directory per face
+/// pointing into shared table data. A single font is the same table directory with
+/// the tables behind it — so this copies the records, copies the tables they name,
+/// and fixes the offsets. Checksums are the originals and stay correct, because no
+/// table's bytes change.
+fn face_from_collection(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
+    /// Read a big-endian `u32` at `at`.
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    }
+    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+    }
+
+    if bytes.get(..4)? != b"ttcf" {
+        return None;
+    }
+    let faces = u32_at(bytes, 8)? as usize;
+    if index >= faces {
+        return None;
+    }
+
+    // The face's own table directory.
+    let directory = u32_at(bytes, 12 + index * 4)? as usize;
+    let sfnt_version = u32_at(bytes, directory)?;
+    let tables = u16_at(bytes, directory + 4)? as usize;
+
+    const HEADER: usize = 12;
+    const RECORD: usize = 16;
+    let mut out = Vec::with_capacity(bytes.len() / faces.max(1));
+    out.extend_from_slice(&sfnt_version.to_be_bytes());
+    out.extend_from_slice(&(tables as u16).to_be_bytes());
+    // The three fields after the count are a binary-search hint, and are allowed to
+    // be anything a reader can survive; every reader recomputes them.
+    for value in [
+        u16_at(bytes, directory + 6)?,
+        u16_at(bytes, directory + 8)?,
+        u16_at(bytes, directory + 10)?,
+    ] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    // The records first, with room for the offsets that are not known until the
+    // tables have been placed.
+    let records_at = out.len();
+    out.resize(HEADER + tables * RECORD, 0);
+
+    for table in 0..tables {
+        let record = directory + HEADER + table * RECORD;
+        let tag = bytes.get(record..record + 4)?;
+        let checksum = u32_at(bytes, record + 4)?;
+        let offset = u32_at(bytes, record + 8)? as usize;
+        let length = u32_at(bytes, record + 12)? as usize;
+        let data = bytes.get(offset..offset + length)?;
+
+        // Tables start on four-byte boundaries, as the format requires.
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        let placed = out.len() as u32;
+        out.extend_from_slice(data);
+
+        let record_out = records_at + table * RECORD;
+        out[record_out..record_out + 4].copy_from_slice(tag);
+        out[record_out + 4..record_out + 8].copy_from_slice(&checksum.to_be_bytes());
+        out[record_out + 8..record_out + 12].copy_from_slice(&placed.to_be_bytes());
+        out[record_out + 12..record_out + 16].copy_from_slice(&(length as u32).to_be_bytes());
+    }
+
+    Some(out)
 }
 
 /// Build the variable-font instance the shaper asked for.
@@ -226,6 +314,7 @@ impl SkiaPainter {
             height,
             layer_depth: 0,
             typefaces: TypefaceCache::default(),
+            blur: None,
         })
     }
 
@@ -392,36 +481,87 @@ fn to_skia_blend(blend: BlendMode) -> sk::BlendMode {
 
 /// Build a Skia `Paint` from a peniko brush.
 ///
-/// Gradients and image brushes are not lowered yet. Falling back to a flat colour
-/// and logging it beats painting nothing or painting a wrong gradient silently.
+/// Image brushes are not lowered yet; a gradient is, since a page that says
+/// `linear-gradient` and gets its first colour is a page that looks wrong in a way
+/// nobody can see the cause of.
 fn to_skia_paint(brush: BrushRef<'_>, brush_transform: Option<Affine>) -> sk::Paint {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
 
-    let color = match brush {
-        BrushRef::Solid(color) => color,
-        BrushRef::Gradient(gradient) => {
-            tracing::warn!(
-                stops = gradient.stops.len(),
-                "gradient brushes are not lowered to skia yet; using the first stop"
-            );
-            gradient
-                .stops
-                .first()
-                .map(|stop| stop.color.to_alpha_color())
-                .unwrap_or(Color::BLACK)
+    match brush {
+        BrushRef::Solid(color) => {
+            paint.set_color4f(to_skia_color(color), None);
         }
+        BrushRef::Gradient(gradient) => match to_skia_gradient(gradient, brush_transform) {
+            Some(shader) => {
+                paint.set_shader(shader);
+            }
+            None => {
+                let color = gradient
+                    .stops
+                    .first()
+                    .map(|stop| stop.color.to_alpha_color())
+                    .unwrap_or(Color::BLACK);
+                paint.set_color4f(to_skia_color(color), None);
+            }
+        },
         BrushRef::Image(_) => {
             tracing::warn!("image brushes are not lowered to skia yet; using transparent black");
-            Color::TRANSPARENT
+            paint.set_color4f(to_skia_color(Color::TRANSPARENT), None);
         }
-    };
-    paint.set_color4f(to_skia_color(color), None);
-
-    if brush_transform.is_some() {
-        tracing::warn!("brush_transform is ignored until gradient brushes are lowered");
     }
+
     paint
+}
+
+/// Lower a peniko gradient to a Skia shader.
+///
+/// Linear and radial only, in the two extend modes a browser uses; a sweep gradient
+/// is a shape CSS spells `conic-gradient` and nothing above asks for yet.
+fn to_skia_gradient(
+    gradient: &peniko::Gradient,
+    brush_transform: Option<Affine>,
+) -> Option<sk::Shader> {
+    if gradient.stops.len() < 2 {
+        return None;
+    }
+
+    let colors: Vec<sk::Color4f> = gradient
+        .stops
+        .iter()
+        .map(|stop| to_skia_color(stop.color.to_alpha_color()))
+        .collect();
+    let offsets: Vec<f32> = gradient.stops.iter().map(|stop| stop.offset).collect();
+    let mode = match gradient.extend {
+        peniko::Extend::Pad => sk::TileMode::Clamp,
+        peniko::Extend::Repeat => sk::TileMode::Repeat,
+        peniko::Extend::Reflect => sk::TileMode::Mirror,
+    };
+    let matrix = brush_transform.map(to_skia_matrix);
+
+    let stops = sk::gradient::Colors::new(&colors, Some(&offsets[..]), mode, None);
+    let shader = sk::gradient::Gradient::new(stops, sk::gradient::Interpolation::default());
+
+    match gradient.kind {
+        peniko::GradientKind::Linear(line) => sk::shaders::linear_gradient(
+            (
+                sk::Point::new(line.start.x as f32, line.start.y as f32),
+                sk::Point::new(line.end.x as f32, line.end.y as f32),
+            ),
+            &shader,
+            matrix.as_ref(),
+        ),
+        peniko::GradientKind::Radial(circles) => sk::shaders::radial_gradient(
+            (
+                sk::Point::new(circles.end_center.x as f32, circles.end_center.y as f32),
+                circles.end_radius,
+            ),
+            &shader,
+            matrix.as_ref(),
+        ),
+        // A sweep gradient is `conic-gradient`, which nothing asks for yet.
+        _ => None,
+    }
 }
 
 fn apply_stroke(paint: &mut sk::Paint, style: &Stroke) {
@@ -517,6 +657,35 @@ impl PaintTarget for SkiaPainter {
         canvas.restore();
     }
 
+    fn fill_blurred(
+        &mut self,
+        transform: Affine,
+        brush: BrushRef<'_>,
+        blur: f64,
+        shape: &dyn PaintShape,
+    ) {
+        let path = to_skia_path(shape, sk::PathFillType::Winding);
+        let mut paint = to_skia_paint(brush, None);
+        paint.set_style(sk::paint::Style::Fill);
+
+        // CSS's blur radius is twice the standard deviation the blur is done with,
+        // which is the conversion every engine applies and the reason a shadow
+        // written as `10px` does not look ten pixels wide.
+        if blur > 0.0
+            && let Some(filter) =
+                sk::MaskFilter::blur(sk::BlurStyle::Normal, (blur / 2.0) as f32, None)
+        {
+            paint.set_mask_filter(filter);
+        }
+
+        let matrix = to_skia_matrix(transform);
+        let canvas = self.canvas();
+        canvas.save();
+        canvas.concat(&matrix);
+        canvas.draw_path(&path, &paint);
+        canvas.restore();
+    }
+
     fn stroke(
         &mut self,
         style: &Stroke,
@@ -535,6 +704,30 @@ impl PaintTarget for SkiaPainter {
         canvas.concat(&matrix);
         canvas.draw_path(&path, &paint);
         canvas.restore();
+    }
+
+    fn draw_glyph_run(
+        &mut self,
+        font: &FontData,
+        font_size: f32,
+        normalized_coords: &[i16],
+        brush: BrushRef<'_>,
+        blur: f64,
+        transform: Affine,
+        hint: bool,
+        glyphs: &mut dyn Iterator<Item = Glyph>,
+    ) {
+        self.blur = (blur > 0.0).then_some(blur);
+        self.draw_glyphs(
+            font,
+            font_size,
+            normalized_coords,
+            brush,
+            transform,
+            hint,
+            glyphs,
+        );
+        self.blur = None;
     }
 
     fn draw_glyphs(
@@ -561,12 +754,26 @@ impl PaintTarget for SkiaPainter {
             .typefaces
             .font(font, normalized_coords, font_size, hint)
         else {
-            tracing::error!("skia could not parse the font for a glyph run; dropping it");
+            tracing::error!(
+                bytes = font.data.as_ref().len(),
+                index = font.index,
+                glyphs = ids.len(),
+                "skia could not parse the font for a glyph run; dropping it"
+            );
             return;
         };
 
         let mut paint = to_skia_paint(brush, None);
         paint.set_style(sk::paint::Style::Fill);
+        // A run being drawn as a shadow: the same glyphs, softened. Set by
+        // `draw_glyph_run` for the length of one call rather than passed down, so
+        // that the seven required methods keep the signatures they have.
+        if let Some(blur) = self.blur
+            && let Some(filter) =
+                sk::MaskFilter::blur(sk::BlurStyle::Normal, (blur / 2.0) as f32, None)
+        {
+            paint.set_mask_filter(filter);
+        }
 
         let canvas = self.canvas();
         canvas.save();
@@ -845,5 +1052,92 @@ mod tests {
         painter.clear(Color::WHITE);
         let png = painter.encode_png().expect("encode");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::face_from_collection;
+
+    /// Build a collection of two faces, each with one table of its own, sharing a
+    /// third: the shape a real `.ttc` has, in miniature.
+    fn collection() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&2u32.to_be_bytes());
+        // Two directory offsets, filled in once their positions are known.
+        let offsets_at = out.len();
+        out.extend_from_slice(&[0; 8]);
+
+        // The shared table data, first, so the directories point backwards as they
+        // may in a real file.
+        let shared_at = out.len() as u32;
+        out.extend_from_slice(b"shared--");
+        let first_at = out.len() as u32;
+        out.extend_from_slice(b"first---");
+        let second_at = out.len() as u32;
+        out.extend_from_slice(b"second--");
+
+        let directory = |own_tag: &[u8; 4], own_at: u32, out: &mut Vec<u8>| -> u32 {
+            let at = out.len() as u32;
+            out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+            out.extend_from_slice(&2u16.to_be_bytes());
+            out.extend_from_slice(&[0; 6]);
+            for (tag, offset) in [(b"shrd", shared_at), (own_tag, own_at)] {
+                out.extend_from_slice(tag);
+                out.extend_from_slice(&0u32.to_be_bytes());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out.extend_from_slice(&8u32.to_be_bytes());
+            }
+            at
+        };
+
+        let first = directory(b"one_", first_at, &mut out);
+        let second = directory(b"two_", second_at, &mut out);
+        out[offsets_at..offsets_at + 4].copy_from_slice(&first.to_be_bytes());
+        out[offsets_at + 4..offsets_at + 8].copy_from_slice(&second.to_be_bytes());
+        out
+    }
+
+    /// Each face comes out as a font of its own, carrying the tables it named and
+    /// the shared one, with offsets that point at them.
+    #[test]
+    fn a_face_is_lifted_out_of_a_collection_whole() {
+        let bytes = collection();
+
+        for (index, own) in [(0usize, &b"first---"[..]), (1, &b"second--"[..])] {
+            let face = face_from_collection(&bytes, index).expect("a face");
+
+            assert_eq!(
+                &face[..4],
+                &0x0001_0000u32.to_be_bytes(),
+                "an sfnt, not a collection"
+            );
+            assert_eq!(u16::from_be_bytes([face[4], face[5]]), 2, "both tables");
+
+            for table in 0..2 {
+                let record = 12 + table * 16;
+                let offset =
+                    u32::from_be_bytes(face[record + 8..record + 12].try_into().unwrap()) as usize;
+                let length =
+                    u32::from_be_bytes(face[record + 12..record + 16].try_into().unwrap()) as usize;
+                assert_eq!(offset % 4, 0, "tables start on a four-byte boundary");
+                let data = &face[offset..offset + length];
+                if table == 0 {
+                    assert_eq!(data, b"shared--");
+                } else {
+                    assert_eq!(data, own);
+                }
+            }
+        }
+    }
+
+    /// Anything that is not a collection, or a face that is not in it, is refused
+    /// rather than guessed at.
+    #[test]
+    fn only_a_real_collection_is_taken_apart() {
+        assert!(face_from_collection(b"not a font at all", 0).is_none());
+        assert!(face_from_collection(&collection(), 2).is_none());
     }
 }

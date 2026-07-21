@@ -20,6 +20,8 @@ pub enum Display {
     /// A flex container: block-level outside, and its children are flex items
     /// rather than a block or inline formatting context.
     Flex,
+    /// A grid container: its children are placed into rows and columns.
+    Grid,
 }
 
 /// `flex-direction`, narrowed to the axis and whether it is reversed.
@@ -208,6 +210,130 @@ pub enum TextAlign {
     End,
 }
 
+/// `background-size`, in the three shapes that mean something without a full
+/// two-value model behind them.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum BackgroundSize {
+    /// The picture's own size.
+    Auto,
+    /// As large as fits inside the box, whole.
+    Contain,
+    /// As small as covers the box, cropped.
+    Cover,
+    /// A size of its own.
+    Fixed(Length, Length),
+}
+
+/// One `box-shadow`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Shadow {
+    /// How far right it is offset.
+    pub x: f32,
+    /// How far down.
+    pub y: f32,
+    /// The CSS blur radius: how far the edge is spread, not its deviation.
+    pub blur: f32,
+    /// How much larger than the box the shadow is drawn.
+    pub spread: f32,
+    /// Its colour.
+    pub color: Color,
+}
+
+/// A colour at a point along a gradient.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GradientStop {
+    /// Where along the line it sits, 0 to 1.
+    pub at: f32,
+    /// What colour it is there.
+    pub color: Color,
+}
+
+/// A background that is a gradient rather than a colour.
+///
+/// Linear only, and the direction is kept as the angle CSS gives it: zero points
+/// up the page, and it turns clockwise, which is the one convention CSS does not
+/// share with the geometry underneath.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    /// The angle in radians, clockwise from pointing up.
+    pub angle: f32,
+    /// The stops, in order.
+    pub stops: Vec<GradientStop>,
+}
+
+/// Where a grid item sits along one axis.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Placement {
+    /// The line it starts on, counting from one, or `None` for wherever it lands.
+    pub line: Option<i32>,
+    /// How many tracks it covers.
+    pub span: u32,
+}
+
+impl Placement {
+    /// Placed wherever the auto-placement gets to, one track wide.
+    pub const AUTO: Self = Self {
+        line: None,
+        span: 1,
+    };
+}
+
+/// One track of a grid: a column's width or a row's height.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Track {
+    /// A length or a percentage of the container.
+    Fixed(Length),
+    /// A share of what is left over, in `fr`.
+    Fraction(f32),
+    /// As big as its contents need.
+    Auto,
+}
+
+/// The four corner radii of a box, in CSS order.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Corners {
+    /// Top left.
+    pub top_left: Length,
+    /// Top right.
+    pub top_right: Length,
+    /// Bottom right.
+    pub bottom_right: Length,
+    /// Bottom left.
+    pub bottom_left: Length,
+}
+
+impl Corners {
+    /// No rounding at all.
+    pub const SQUARE: Self = Self {
+        top_left: Length::ZERO,
+        top_right: Length::ZERO,
+        bottom_right: Length::ZERO,
+        bottom_left: Length::ZERO,
+    };
+
+    /// Whether any corner is rounded.
+    pub fn any(&self) -> bool {
+        [
+            self.top_left,
+            self.top_right,
+            self.bottom_right,
+            self.bottom_left,
+        ]
+        .iter()
+        .any(|corner| *corner != Length::ZERO)
+    }
+}
+
+/// `overflow`, in the distinction layout can act on: whether content that does not
+/// fit is shown or cut off.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Overflow {
+    /// Content spills out of the box and is drawn.
+    Visible,
+    /// Content is cut off at the box's padding edge.
+    Clip,
+}
+
 /// `position`, which decides what a box's coordinates mean.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Position {
@@ -347,6 +473,22 @@ pub struct ComputedStyle {
     pub color: Color,
     /// `background-color`.
     pub background_color: Color,
+    /// `text-shadow`. Inherited, and drawn behind the text rather than behind the
+    /// box, which is why it is a list of its own.
+    pub text_shadows: Vec<Shadow>,
+    /// `box-shadow`, outermost last — the order they are painted in, which is the
+    /// reverse of the order they are written.
+    pub shadows: Vec<Shadow>,
+    /// `background-image`, when it is a picture: the address, exactly as written.
+    /// Resolving and fetching it is the caller's, as it is for a stylesheet.
+    pub background_image: Option<Arc<str>>,
+    /// How a background picture is sized against its box.
+    pub background_size: BackgroundSize,
+    /// Whether a background picture is tiled.
+    pub background_repeat: bool,
+    /// `background-image`, when it is a gradient. A picture behind a box is not
+    /// read yet; a gradient is, because it is what a page uses it for.
+    pub background_gradient: Option<Gradient>,
     /// `font-family`, as the CSS source list. Inherited.
     pub font_family: Arc<str>,
     /// `font-size` in CSS pixels. Inherited.
@@ -396,6 +538,24 @@ pub struct ComputedStyle {
     pub position: Position,
     /// `top`, `right`, `bottom` and `left`, which only a positioned box reads.
     pub inset: Sides<LengthOrAuto>,
+    /// `z-index`, or `None` for `auto`. Only a positioned box reads it.
+    pub z_index: Option<i32>,
+    /// `overflow`, as the one thing layout does about it.
+    pub overflow: Overflow,
+    /// `border-radius`, per corner. Only the horizontal radius of each: an ellipse
+    /// with two different radii is a corner nobody writes.
+    pub radius: Corners,
+    /// `grid-template-columns`, with `repeat()` of a definite count expanded.
+    pub grid_columns: Vec<Track>,
+    /// `grid-template-rows`, the same.
+    pub grid_rows: Vec<Track>,
+    /// The pattern of `repeat(auto-fill, ...)` in the columns, if there is one: how
+    /// many times it goes in depends on the container, so layout decides.
+    pub grid_columns_fill: Option<Vec<Track>>,
+    /// `grid-column`, read by an item rather than by the container.
+    pub grid_column: Placement,
+    /// `grid-row`.
+    pub grid_row: Placement,
     /// `flex-direction`, read by a flex container.
     pub flex_direction: FlexDirection,
     /// `flex-wrap`.
@@ -426,6 +586,12 @@ impl Default for ComputedStyle {
             display: Display::Inline,
             color: Color::from_rgb8(0, 0, 0),
             background_color: Color::TRANSPARENT,
+            background_gradient: None,
+            background_image: None,
+            background_size: BackgroundSize::Auto,
+            background_repeat: true,
+            shadows: Vec::new(),
+            text_shadows: Vec::new(),
             font_family: Arc::from("system-ui, sans-serif"),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -447,6 +613,14 @@ impl Default for ComputedStyle {
             clear: Clear::None,
             position: Position::Static,
             inset: Sides::all(LengthOrAuto::Auto),
+            z_index: None,
+            overflow: Overflow::Visible,
+            radius: Corners::SQUARE,
+            grid_columns: Vec::new(),
+            grid_rows: Vec::new(),
+            grid_columns_fill: None,
+            grid_column: Placement::AUTO,
+            grid_row: Placement::AUTO,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::Start,
@@ -469,6 +643,7 @@ impl ComputedStyle {
     /// colour and font it sits in.
     pub fn inheriting_from(parent: &Self) -> Self {
         Self {
+            text_shadows: parent.text_shadows.clone(),
             color: parent.color,
             font_family: Arc::clone(&parent.font_family),
             font_size: parent.font_size,

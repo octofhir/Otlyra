@@ -35,6 +35,40 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = false
 
+# One of each thing.
+#
+# A browser is already a rendering engine, a text stack, an event loop and a hit
+# tester. Every crate below is a second one of something we own, and a second one
+# does not add capability — it adds a seam where two answers to the same question
+# have to be kept agreeing. The interface, the settings and the devtools panels
+# are all drawn by `otlyra-app::widget` into the same display list the page uses.
+#
+# This list is what makes that a rule rather than a memory. Removing an entry is
+# a deliberate act, and the reasoning belongs in BROWSER_RESEARCH_PLAN.md §4
+# beside the decision it reverses.
+deny = [
+    # GUI toolkits: a second event model, a second layout pass, a second theme.
+    { crate = "egui", reason = "we draw our own interface; §4.6 and INTERFACE_PLAN.md D1" },
+    { crate = "eframe", reason = "egui's shell, same reason" },
+    { crate = "iced", reason = "a second toolkit for a browser that owns its own" },
+    { crate = "slint", reason = "same" },
+    { crate = "xilem", reason = "same" },
+    { crate = "masonry", reason = "same" },
+    { crate = "freya", reason = "same" },
+    { crate = "gpui", reason = "rejected in §4.1" },
+    { crate = "dioxus", reason = "a second document model on top of ours" },
+    # Text: parley + harfrust + fontique is the stack. A second shaper or a
+    # second font database means two answers to how wide a string is.
+    { crate = "cosmic-text", reason = "parley is the text stack; §1" },
+    { crate = "swash", reason = "harfrust shapes for us; §1" },
+    { crate = "fontdb", reason = "fontique enumerates for us; §1" },
+    # Rasterizers: Skia is the one behind `PaintTarget`. Vello is a planned
+    # second *backend* behind that same seam, which is why it is not here.
+    { crate = "tiny-skia", reason = "skia-safe is the rasterizer; §4.3" },
+    { crate = "femtovg", reason = "same" },
+    { crate = "raqote", reason = "same" },
+]
+
 [advisories]
 version = 2
 yanked = "deny"

@@ -27,11 +27,22 @@ pub enum Action {
     OpenSettings,
 }
 
+/// Everything this page's appearance is a function of: where it was put, and
+/// where the pointer is, because the one button on it lights up under it.
+type Appearance = (Rect, (f64, f64));
+
 /// The about page.
 pub struct AboutSurface {
     /// Every colour and measurement it is drawn from.
     pub theme: Theme,
     pointer: (f64, f64),
+    /// What the last built list was built from, and the list itself.
+    ///
+    /// This page is a fixed set of facts about the build, so it is built once
+    /// and reused until the window changes shape or the pointer moves over the
+    /// one button on it.
+    cache: Option<(Appearance, DisplayList)>,
+    builds: u64,
     root: Option<Child<Action>>,
 }
 
@@ -47,6 +58,8 @@ impl AboutSurface {
         Self {
             theme: Theme::light(),
             pointer: (-1.0, -1.0),
+            cache: None,
+            builds: 0,
             root: None,
         }
     }
@@ -69,12 +82,19 @@ impl AboutSurface {
     }
 
     /// Paint the page into `rect`, in window coordinates.
-    pub fn build_display_list(
-        &mut self,
-        rect: Rect,
-        text: &mut TextEngine,
-        list: &mut DisplayList,
-    ) {
+    pub fn build_display_list(&mut self, rect: Rect, text: &mut TextEngine, out: &mut DisplayList) {
+        let appearance = (rect, self.pointer);
+        if let Some((built, list)) = &self.cache
+            && *built == appearance
+            && self.root.is_some()
+        {
+            out.append(list);
+            return;
+        }
+
+        self.builds += 1;
+        let mut built = DisplayList::new();
+        let list = &mut built;
         let theme = self.theme.clone();
         fill_rounded(list, rect, theme.surface_sunken, 0.0);
 
@@ -87,6 +107,14 @@ impl AboutSurface {
         root.place(rect, &mut cx);
         root.draw(&mut cx, list);
         self.root = Some(root);
+        self.cache = Some((appearance, built));
+        let (_, built) = self.cache.as_ref().expect("just stored");
+        out.append(built);
+    }
+
+    /// How many display lists this surface has built rather than reused.
+    pub fn builds(&self) -> u64 {
+        self.builds
     }
 
     fn build(&self, theme: &Theme) -> Child<Action> {
@@ -184,6 +212,23 @@ impl AboutSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_of_fixed_facts_is_built_once() {
+        let mut about = AboutSurface::new();
+        let mut text = TextEngine::new();
+        let mut list = DisplayList::new();
+        let rect = Rect::new(0.0, 0.0, 900.0, 700.0);
+
+        about.build_display_list(rect, &mut text, &mut list);
+        about.build_display_list(rect, &mut text, &mut list);
+        assert_eq!(about.builds(), 1);
+
+        // A different window is a different layout; the pointer moving is the
+        // hover on the one button.
+        about.build_display_list(Rect::new(0.0, 0.0, 600.0, 700.0), &mut text, &mut list);
+        assert_eq!(about.builds(), 2);
+    }
 
     #[test]
     fn the_settings_button_is_reachable_where_it_is_drawn() {

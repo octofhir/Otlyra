@@ -10,13 +10,13 @@ repository.workspace = true
 
 [dependencies]
 otlyra-gfx.workspace = true
+otlyra-css.workspace = true
 otlyra-layout.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# The cascade, so that a test can say what it means in CSS rather than building a
-# box tree by hand.
-otlyra-css.workspace = true
+# The parser, so a test can say what it means in HTML and CSS rather than building
+# a box tree by hand.
 otlyra-html.workspace = true
 otlyra-text.workspace = true
 

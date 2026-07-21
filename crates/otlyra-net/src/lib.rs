@@ -26,10 +26,12 @@
 
 pub mod limits;
 pub mod loader;
+pub mod mime;
 pub mod url;
 
 pub use limits::Limits;
 pub use loader::{LoadRequest, LoadedResource, Loader, NetError};
+pub use mime::{Sniffed, sniff};
 pub use url::{is_fetchable, may_navigate, normalize, resolve};
 
 /// Install the process-wide rustls crypto provider.

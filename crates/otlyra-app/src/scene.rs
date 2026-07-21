@@ -242,6 +242,7 @@ mod tests {
             .iter()
             .map(|op| match op {
                 PaintOp::Fill { .. } => "fill",
+                PaintOp::FillBlurred { .. } => "shadow",
                 PaintOp::Stroke { .. } => "stroke",
                 PaintOp::DrawGlyphs { .. } => "glyphs",
                 PaintOp::DrawImage { .. } => "image",

@@ -12,9 +12,9 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    AlignItems, Border, Clear, ComputedStyle, Display, FlexDirection, FlexWrap, Float, FontStyle,
-    JustifyContent, Length, LengthOrAuto, LineHeight, Position, Sides, TextAlign, TextDecoration,
-    WhiteSpace,
+    AlignItems, Border, Clear, ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float,
+    FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow,
+    BackgroundSize, Placement, Position, Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -70,6 +70,29 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             bottom: inset(&values.get_position().bottom),
             left: inset(&values.get_position().left),
         },
+        z_index: match values.clone_z_index() {
+            style::values::computed::ZIndex::Integer(value) => Some(value),
+            style::values::computed::ZIndex::Auto => None,
+        },
+        overflow: overflow_of(values),
+        radius: corners(values),
+        background_gradient: background_gradient(values),
+        background_image: background_image(values),
+        background_size: background_size(values),
+        background_repeat: background_repeat(values),
+        shadows: shadows(values),
+        text_shadows: text_shadows(values),
+        grid_columns: tracks(&values.get_position().grid_template_columns),
+        grid_rows: tracks(&values.get_position().grid_template_rows),
+        grid_columns_fill: auto_repeat(&values.get_position().grid_template_columns),
+        grid_column: placement(
+            &values.get_position().grid_column_start,
+            &values.get_position().grid_column_end,
+        ),
+        grid_row: placement(
+            &values.get_position().grid_row_start,
+            &values.get_position().grid_row_end,
+        ),
         flex_direction: flex_direction(values),
         flex_wrap: flex_wrap(values),
         justify_content: justify_content(values),
@@ -104,6 +127,9 @@ fn display_of(values: &ComputedValues) -> Display {
     // layout cannot express yet.
     if display.inside() == DisplayInside::Flex {
         return Display::Flex;
+    }
+    if display.inside() == DisplayInside::Grid {
+        return Display::Grid;
     }
     if display.outside() == DisplayOutside::Inline {
         Display::Inline
@@ -234,6 +260,344 @@ fn text_align(values: &ComputedValues) -> TextAlign {
         // `justify` spaces a line out, which inline layout does not do; its start
         // edge is where a start-aligned line begins, so that is what it gets.
         _ => TextAlign::Start,
+    }
+}
+
+/// `overflow`, narrowed to whether the box cuts off what does not fit.
+///
+/// `scroll` and `auto` cut off too — the part of them that layout can honour today
+/// is the clip; scrolling the box itself is a scroll port, which is more than a
+/// clip and arrives with one.
+/// `background-image`, when the topmost layer is a picture.
+fn background_image(values: &ComputedValues) -> Option<Arc<str>> {
+    use style::values::generics::image::GenericImage as Image;
+
+    let Image::Url(url) = values.get_background().background_image.0.first()? else {
+        return None;
+    };
+    // Resolved against the stylesheet it was written in, which for us is the
+    // document — a sheet fetched from elsewhere would need its own base, and that
+    // is the day this stops being a string and starts being a URL.
+    Some(Arc::from(url.url()?.as_str()))
+}
+
+/// `background-size` for that layer.
+fn background_size(values: &ComputedValues) -> BackgroundSize {
+    use style::values::generics::background::GenericBackgroundSize as Generic;
+
+    match values.get_background().background_size.0.first() {
+        Some(Generic::Cover) => BackgroundSize::Cover,
+        Some(Generic::Contain) => BackgroundSize::Contain,
+        Some(Generic::ExplicitSize { width, height }) => {
+            let side = |value: &style::values::computed::NonNegativeLengthPercentageOrAuto| {
+                match value {
+                    style::values::generics::length::GenericLengthPercentageOrAuto::Auto => None,
+                    style::values::generics::length::GenericLengthPercentageOrAuto::LengthPercentage(
+                        value,
+                    ) => Some(length(&value.0)),
+                }
+            };
+            match (side(width), side(height)) {
+                (Some(width), Some(height)) => BackgroundSize::Fixed(width, height),
+                // One side given and the other from the picture's own ratio is
+                // sizing this does not do; its own size is the honest stand-in.
+                _ => BackgroundSize::Auto,
+            }
+        }
+        _ => BackgroundSize::Auto,
+    }
+}
+
+/// Whether the topmost background layer repeats. `no-repeat` on either axis is
+/// taken as not repeating at all, which is the distinction paint can act on.
+fn background_repeat(values: &ComputedValues) -> bool {
+    use style::values::specified::background::BackgroundRepeatKeyword as Keyword;
+
+    match values.get_background().background_repeat.0.first() {
+        Some(repeat) => repeat.0 != Keyword::NoRepeat && repeat.1 != Keyword::NoRepeat,
+        None => true,
+    }
+}
+
+/// `box-shadow`, outer only.
+///
+/// An inset shadow is drawn inside the box against its own edges, which is a
+/// different shape from the one this draws and is left out rather than approximated.
+/// The list comes back in painting order: CSS paints the first-written shadow on
+/// top, so the last one is drawn first.
+fn shadows(values: &ComputedValues) -> Vec<Shadow> {
+    let current = colour_of(values);
+    values
+        .get_effects()
+        .box_shadow
+        .0
+        .iter()
+        .filter(|shadow| !shadow.inset)
+        .map(|shadow| Shadow {
+            x: shadow.base.horizontal.px(),
+            y: shadow.base.vertical.px(),
+            blur: shadow.base.blur.0.px(),
+            spread: shadow.spread.px(),
+            color: resolve_colour(&shadow.base.color, current),
+        })
+        .rev()
+        .collect()
+}
+
+/// `text-shadow`, in painting order like `box-shadow`.
+///
+/// No spread: a text shadow is the glyphs themselves, softened and moved, and
+/// there is nothing to grow.
+fn text_shadows(values: &ComputedValues) -> Vec<Shadow> {
+    let current = colour_of(values);
+    values
+        .get_inherited_text()
+        .text_shadow
+        .0
+        .iter()
+        .map(|shadow| Shadow {
+            x: shadow.horizontal.px(),
+            y: shadow.vertical.px(),
+            blur: shadow.blur.0.px(),
+            spread: 0.0,
+            color: resolve_colour(&shadow.color, current),
+        })
+        .rev()
+        .collect()
+}
+
+/// The element's own `color`, which is what `currentColor` means.
+fn colour_of(values: &ComputedValues) -> Color {
+    colour(values.clone_color())
+}
+
+/// `background-image`, when the topmost layer of it is a linear gradient.
+///
+/// One layer, because a box with several backgrounds is a box that needs the
+/// painting order for them, and the top one is what a page means when it names two.
+fn background_gradient(values: &ComputedValues) -> Option<Gradient> {
+    use style::values::computed::image::LineDirection;
+    use style::values::generics::image::{
+        GenericGradient, GenericGradientItem as Item, GenericImage as Image,
+    };
+
+    let images = &values.get_background().background_image.0;
+    let Image::Gradient(gradient) = images.first()? else {
+        return None;
+    };
+    let GenericGradient::Linear {
+        direction, items, ..
+    } = &**gradient
+    else {
+        return None;
+    };
+
+    // CSS measures the angle clockwise from up; a corner keyword is turned into the
+    // angle that points at it, which is exact for a square box and close enough for
+    // one that is not — the alternative needs the box's own proportions, which the
+    // cascade does not have.
+    let angle = match direction {
+        LineDirection::Angle(angle) => angle.radians(),
+        LineDirection::Horizontal(side) => match side {
+            style::values::specified::position::HorizontalPositionKeyword::Left => {
+                -std::f32::consts::FRAC_PI_2
+            }
+            _ => std::f32::consts::FRAC_PI_2,
+        },
+        LineDirection::Vertical(side) => match side {
+            style::values::specified::position::VerticalPositionKeyword::Top => 0.0,
+            _ => std::f32::consts::PI,
+        },
+        LineDirection::Corner(horizontal, vertical) => {
+            use style::values::specified::position::{
+                HorizontalPositionKeyword as H, VerticalPositionKeyword as V,
+            };
+            match (horizontal, vertical) {
+                (H::Right, V::Top) => std::f32::consts::FRAC_PI_4,
+                (H::Right, V::Bottom) => 3.0 * std::f32::consts::FRAC_PI_4,
+                (H::Left, V::Bottom) => 5.0 * std::f32::consts::FRAC_PI_4,
+                (H::Left, V::Top) => 7.0 * std::f32::consts::FRAC_PI_4,
+            }
+        }
+    };
+
+    // Stops without a position are spread evenly, which is what CSS does when a
+    // gradient names only its colours.
+    let colours: Vec<(Color, Option<f32>)> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::SimpleColorStop(colour) => Some((resolve_colour(colour, Color::BLACK), None)),
+            Item::ComplexColorStop { color, position } => Some((
+                resolve_colour(color, Color::BLACK),
+                position.to_percentage().map(|percentage| percentage.0),
+            )),
+            Item::InterpolationHint(_) => None,
+        })
+        .collect();
+    if colours.len() < 2 {
+        return None;
+    }
+
+    let last = colours.len() - 1;
+    let stops = colours
+        .into_iter()
+        .enumerate()
+        .map(|(index, (color, at))| GradientStop {
+            at: at.unwrap_or(index as f32 / last as f32),
+            color,
+        })
+        .collect();
+
+    Some(Gradient { angle, stops })
+}
+
+/// The tracks a `grid-template-*` names.
+///
+/// `repeat()` with a count is expanded here, where the count is known; `auto-fill`
+/// and `auto-fit` depend on the container's size and are left for layout, which
+/// does not do them yet and treats them as one track.
+fn tracks(template: &style::values::computed::GridTemplateComponent) -> Vec<Track> {
+    use style::values::generics::grid::{
+        GenericTrackListValue as ListValue, GenericTrackSize as Size, RepeatCount,
+        TrackBreadth as Breadth,
+    };
+
+    let breadth = |value: &Breadth<style::values::computed::LengthPercentage>| match value {
+        Breadth::Breadth(length) => Track::Fixed(length_percentage(length)),
+        Breadth::Flex(flex) => Track::Fraction(flex.0),
+        _ => Track::Auto,
+    };
+    let size = |value: &Size<style::values::computed::LengthPercentage>| match value {
+        Size::Breadth(value) => breadth(value),
+        // A range is laid out at its larger end, which is what a grid does when
+        // there is room; the smaller end matters when there is not, and that needs
+        // sizing this does not do.
+        Size::Minmax(_, max) => breadth(max),
+        Size::FitContent(_) => Track::Auto,
+    };
+
+    let mut out = Vec::new();
+    let style::values::generics::grid::GenericGridTemplateComponent::TrackList(list) = template
+    else {
+        return out;
+    };
+
+    for value in list.values.iter() {
+        match value {
+            ListValue::TrackSize(track) => out.push(size(track)),
+            ListValue::TrackRepeat(repeat) => {
+                // `auto-fill` and `auto-fit` need the container's size to know how
+                // many times they go in; they come back through `auto_repeat`
+                // instead, and layout decides.
+                let RepeatCount::Number(count) = repeat.count else {
+                    continue;
+                };
+                for _ in 0..count.max(0) {
+                    out.extend(repeat.track_sizes.iter().map(&size));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Where a grid item sits along one axis, from the two lines it names.
+///
+/// A named line needs the container's line names, which an item cannot see from
+/// here; a numbered one is what a page writes and is what this reads.
+fn placement(
+    start: &style::values::computed::GridLine,
+    end: &style::values::computed::GridLine,
+) -> Placement {
+    let numbered = |line: &style::values::computed::GridLine| {
+        (!line.is_span && line.line_num != 0).then_some(line.line_num)
+    };
+    let span_of = |line: &style::values::computed::GridLine| {
+        (line.is_span && line.line_num > 0).then_some(line.line_num as u32)
+    };
+
+    let line = numbered(start);
+    let span = match (span_of(start), span_of(end), line, numbered(end)) {
+        (Some(span), _, _, _) | (_, Some(span), _, _) => span,
+        // Two numbered lines: the item covers what is between them.
+        (None, None, Some(from), Some(to)) if to > from => (to - from) as u32,
+        _ => 1,
+    };
+
+    Placement {
+        line,
+        span: span.max(1),
+    }
+}
+
+/// The pattern inside a `repeat(auto-fill)` or `repeat(auto-fit)`, if the template
+/// has one: how many times it goes in is the container's business.
+fn auto_repeat(template: &style::values::computed::GridTemplateComponent) -> Option<Vec<Track>> {
+    use style::values::generics::grid::{
+        GenericTrackListValue as ListValue, GenericTrackSize as Size, RepeatCount,
+        TrackBreadth as Breadth,
+    };
+
+    let style::values::generics::grid::GenericGridTemplateComponent::TrackList(list) = template
+    else {
+        return None;
+    };
+
+    list.values.iter().find_map(|value| {
+        let ListValue::TrackRepeat(repeat) = value else {
+            return None;
+        };
+        if matches!(repeat.count, RepeatCount::Number(_)) {
+            return None;
+        }
+        Some(
+            repeat
+                .track_sizes
+                .iter()
+                .map(|size| match size {
+                    Size::Breadth(Breadth::Breadth(length)) => {
+                        Track::Fixed(length_percentage(length))
+                    }
+                    Size::Breadth(Breadth::Flex(flex)) => Track::Fraction(flex.0),
+                    Size::Minmax(_, Breadth::Breadth(length)) => {
+                        Track::Fixed(length_percentage(length))
+                    }
+                    _ => Track::Auto,
+                })
+                .collect(),
+        )
+    })
+}
+
+/// A computed `<length-percentage>`, as the length layout reads.
+fn length_percentage(value: &style::values::computed::LengthPercentage) -> Length {
+    match value.to_percentage() {
+        Some(percentage) => Length::Percent(percentage.0),
+        None => Length::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
+    }
+}
+
+/// `border-radius`, taking the horizontal radius of each corner.
+fn corners(values: &ComputedValues) -> Corners {
+    let border = values.get_border();
+    let radius = |corner: &style::values::computed::BorderCornerRadius| length(&corner.0.width.0);
+    Corners {
+        top_left: radius(&border.border_top_left_radius),
+        top_right: radius(&border.border_top_right_radius),
+        bottom_right: radius(&border.border_bottom_right_radius),
+        bottom_left: radius(&border.border_bottom_left_radius),
+    }
+}
+
+fn overflow_of(values: &ComputedValues) -> Overflow {
+    use style::computed_values::overflow_x::T as Computed;
+
+    let box_ = values.get_box();
+    let clipped = |value: Computed| value != Computed::Visible;
+    if clipped(box_.overflow_x) || clipped(box_.overflow_y) {
+        Overflow::Clip
+    } else {
+        Overflow::Visible
     }
 }
 
@@ -528,10 +892,22 @@ mod tests {
     /// A formatting context layout does not have still generates a box, laid out as
     /// a block. Dropping the element instead would hide its content entirely.
     #[test]
+    fn a_grid_container_is_recognized() {
+        let style = layout_style("<style>div { display: grid }</style><div>x</div>", "div");
+        assert_eq!(style.display, Display::Grid);
+    }
+
+    #[test]
     fn an_unsupported_display_falls_back_to_block() {
+        // `table` is a display with a formatting context we do not have; its boxes
+        // stack as blocks rather than being dropped.
         assert_eq!(
-            layout_style("<style>p { display: grid }</style><p>x", "p").display,
+            layout_style("<style>p { display: table }</style><p>x", "p").display,
             Display::Block
+        );
+        assert_eq!(
+            layout_style("<style>p { display: inline-block }</style><p>x", "p").display,
+            Display::Inline
         );
     }
 

@@ -48,6 +48,13 @@ pub struct PageScene {
     styled: bool,
     /// How far down the page the reader is, in logical pixels.
     scroll: f32,
+    /// The scrollbar the pointer is holding, if it is holding one.
+    drag: Option<Drag>,
+    /// How far each scrollable box inside the page has been scrolled.
+    ///
+    /// Kept here rather than on the fragment tree, which is rebuilt by every
+    /// layout: where the reader had got to inside a panel must survive a resize.
+    port_scroll: std::collections::HashMap<BoxId, f32>,
     /// The last frame's content height, so a scroll can be clamped without waiting
     /// for the next one.
     viewport_height: f32,
@@ -73,6 +80,8 @@ impl PageScene {
             styler: None,
             styled: false,
             scroll: 0.0,
+            port_scroll: std::collections::HashMap::new(),
+            drag: None,
             viewport_height: 0.0,
             damage: Damage::STYLE,
         }
@@ -178,8 +187,14 @@ impl PageScene {
         self.viewport_height = height;
         self.damage.take();
         let scroll = self.scroll;
+        // Taken before the layout is borrowed: the offsets are a handful of floats,
+        // and the alternative is holding a borrow of the page across the walk.
+        let ports = self.port_scroll.clone();
         let fragments = self.fragments(text, width, height);
-        let mut list = otlyra_paint::build_display_list(fragments, (width, height), scroll);
+        let mut list =
+            otlyra_paint::build_display_list_scrolled(fragments, (width, height), scroll, &|id| {
+                ports.get(&id).copied().unwrap_or(0.0)
+            });
         if top != 0.0 {
             list.transform(otlyra_gfx::kurbo::Affine::translate((0.0, f64::from(top))));
         }
@@ -280,7 +295,143 @@ impl PageScene {
         self.damage.add(Damage::PAINT);
     }
 
-    /// Scroll by `delta` logical pixels, clamped to the content.
+    /// Take hold of a scrollbar under (`x`, `y`), if one is there.
+    ///
+    /// Returns whether it grabbed anything: a press that lands on a scrollbar
+    /// belongs to it and not to the page behind it.
+    pub fn grab_scrollbar(&mut self, x: f32, y: f32, width: f32, height: f32) -> bool {
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return false;
+        };
+
+        // The page's own bar first: it is drawn over everything, so it is grabbed
+        // before anything under it.
+        let page_area = otlyra_layout::fragment::Rect::new(0.0, 0.0, width, height);
+        if let Some(thumb) =
+            otlyra_paint::scrollbar_thumb(page_area, tree.content_height(), self.scroll)
+            && contains(thumb, x, y)
+        {
+            self.drag = Some(Drag {
+                target: None,
+                grabbed_at: y - thumb.y,
+            });
+            return true;
+        }
+
+        for port in &tree.scroll_ports {
+            let mut area = port.port;
+            area.y -= self.scroll;
+            let at = self.port_scroll.get(&port.id).copied().unwrap_or(0.0);
+            if let Some(thumb) = otlyra_paint::scrollbar_thumb(area, port.content_height, at)
+                && contains(thumb, x, y)
+            {
+                self.drag = Some(Drag {
+                    target: Some(port.id),
+                    grabbed_at: y - thumb.y,
+                });
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Whether a scrollbar is being dragged.
+    pub fn dragging_scrollbar(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Let go of whatever was grabbed.
+    pub fn release_scrollbar(&mut self) {
+        self.drag = None;
+    }
+
+    /// Drag the grabbed scrollbar to `y`.
+    ///
+    /// The thumb follows the pointer and the content follows the thumb, which is
+    /// the way round that makes a drag feel attached to the hand rather than to the
+    /// document.
+    pub fn drag_scrollbar(&mut self, y: f32, width: f32, height: f32) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return;
+        };
+
+        let (area, content, range) = match drag.target {
+            None => {
+                let area = otlyra_layout::fragment::Rect::new(0.0, 0.0, width, height);
+                let content = tree.content_height();
+                (area, content, (content - height).max(0.0))
+            }
+            Some(id) => {
+                let Some(port) = tree.scroll_ports.iter().find(|port| port.id == id) else {
+                    return;
+                };
+                let mut area = port.port;
+                area.y -= self.scroll;
+                (area, port.content_height, port.range())
+            }
+        };
+
+        let travel = otlyra_paint::scrollbar_travel(area, content);
+        if travel <= 0.0 {
+            return;
+        }
+        let wanted = ((y - drag.grabbed_at - area.y) / travel).clamp(0.0, 1.0) * range;
+
+        match drag.target {
+            None => self.set_scroll(wanted),
+            Some(id) => {
+                self.port_scroll.insert(id, wanted);
+                self.damage.add(Damage::PAINT);
+            }
+        }
+    }
+
+    /// Scroll whatever is under (`x`, `y`) by `delta` logical pixels.
+    ///
+    /// A box that cuts its contents off and has more of them than it can show takes
+    /// the wheel before the page does, and hands it back once it has reached its
+    /// end — which is what makes a scrollable panel inside a page feel right rather
+    /// than trapping the reader in it.
+    pub fn scroll_at(&mut self, x: f32, y: f32, delta: f32) {
+        let page_point = (x, y + self.scroll);
+        let port = self.layout.as_ref().and_then(|(_, tree)| {
+            // Innermost last: a port inside a port is pushed after it.
+            tree.scroll_ports
+                .iter()
+                .rev()
+                .find(|port| {
+                    let offset = self.port_scroll.get(&port.id).copied().unwrap_or(0.0);
+                    let _ = offset;
+                    let rect = port.port;
+                    page_point.0 >= rect.x
+                        && page_point.0 < rect.right()
+                        && page_point.1 >= rect.y
+                        && page_point.1 < rect.bottom()
+                })
+                .copied()
+        });
+
+        if let Some(port) = port {
+            let at = self.port_scroll.entry(port.id).or_insert(0.0);
+            let wanted = *at + delta;
+            let clamped = wanted.clamp(0.0, port.range());
+            if (clamped - *at).abs() > f32::EPSILON {
+                *at = clamped;
+                self.damage.add(Damage::PAINT);
+                return;
+            }
+            // At its end: the page takes the rest, rather than the wheel doing
+            // nothing at all.
+        }
+
+        self.scroll_by(delta);
+    }
+
+    /// Scroll the page by `delta` logical pixels, clamped to the content.
     ///
     /// Damages paint and no more: where the content is has not changed, only which
     /// part of it is on screen.
@@ -293,6 +444,20 @@ impl PageScene {
         let max = (content - self.viewport_height).max(0.0);
         self.scroll = (self.scroll + delta).clamp(0.0, max);
     }
+}
+
+/// A scrollbar being dragged.
+#[derive(Copy, Clone, Debug)]
+struct Drag {
+    /// Which scroll port's bar, or the page's own.
+    target: Option<BoxId>,
+    /// Where on the thumb it was taken hold of, so it does not jump to the pointer.
+    grabbed_at: f32,
+}
+
+/// Whether a rectangle contains a point.
+fn contains(rect: otlyra_layout::fragment::Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
 /// The document's `<title>`, if it has one.
@@ -399,6 +564,169 @@ mod tests {
             300.0,
             "laid out at the new width"
         );
+    }
+
+    /// A scrollbar can be taken hold of and dragged, and the content follows the
+    /// thumb rather than the other way round.
+    #[test]
+    fn dragging_a_scrollbar_scrolls_the_page() {
+        let (mut page, mut text) =
+            scene("<style>body { margin: 0 } p { height: 3000px }</style><p>tall</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        // Nowhere near the bar: the press is not for it.
+        assert!(!page.grab_scrollbar(400.0, 300.0, 800.0, 600.0));
+
+        // On the thumb, which sits at the top of a page that has not been scrolled.
+        assert!(page.grab_scrollbar(795.0, 10.0, 800.0, 600.0));
+        assert!(page.dragging_scrollbar());
+
+        page.drag_scrollbar(300.0, 800.0, 600.0);
+        let halfway = page.scroll();
+        assert!(halfway > 0.0, "the drag did not move the page");
+
+        page.drag_scrollbar(600.0, 800.0, 600.0);
+        assert!(
+            page.scroll() > halfway,
+            "further down did not scroll further"
+        );
+
+        page.release_scrollbar();
+        page.drag_scrollbar(0.0, 800.0, 600.0);
+        assert!(page.scroll() > halfway, "it moved after being let go");
+    }
+
+    /// A scrolled panel's contents stay inside it. The regression this pins: the
+    /// clip was decided by whether the contents fitted where the flow put them,
+    /// which stopped being true the moment the panel scrolled — and the contents
+    /// were then drawn over everything around the panel instead of under its edge.
+    #[test]
+    fn a_scrolled_panel_clips_what_it_has_moved() {
+        let (mut page, mut text) = scene(
+            "<style>body { margin: 0 } \
+             .panel { overflow: hidden; height: 100px } \
+             .item { height: 60px }</style>\
+             <div class=panel><div class=item>a</div><div class=item>b</div>\
+             <div class=item>c</div></div>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        page.scroll_at(50.0, 50.0, 80.0);
+
+        let list = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let mut painter = RecordingPainter::new();
+        render(&list, &mut painter);
+
+        // Everything drawn while a layer is open is inside it; the panel's own
+        // rectangle is what that layer is.
+        let mut depth = 0i32;
+        let mut clipped_glyphs = 0;
+        let mut loose_glyphs = 0;
+        for op in painter.take() {
+            match op {
+                PaintOp::PushLayer { .. } => depth += 1,
+                PaintOp::PopLayer => depth -= 1,
+                PaintOp::DrawGlyphs { transform, .. } => {
+                    let y = transform.as_coeffs()[5];
+                    // The panel is the first hundred pixels of the page.
+                    if !(0.0..=100.0).contains(&y) {
+                        if depth > 0 {
+                            clipped_glyphs += 1;
+                        } else {
+                            loose_glyphs += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            clipped_glyphs > 0,
+            "the scroll moved nothing out of the panel, so this proves nothing"
+        );
+        assert_eq!(
+            loose_glyphs, 0,
+            "text scrolled out of the panel was drawn outside it"
+        );
+    }
+
+    /// What a scrolled panel actually draws: the contents move, the box does not.
+    #[test]
+    fn scrolling_a_panel_moves_its_contents_and_not_its_edge() {
+        let (mut page, mut text) = scene(
+            "<style>body { margin: 0 } \
+             .panel { overflow: hidden; height: 100px; background: rgb(0, 0, 255) } \
+             .tall { height: 400px; background: rgb(255, 0, 0) }</style>\
+             <div class=panel><div class=tall>inside</div></div>",
+        );
+
+        let tops = |page: &mut PageScene, text: &mut TextEngine| {
+            let list = page.build_display_list(text, 800.0, 600.0, 0.0);
+            let mut painter = RecordingPainter::new();
+            render(&list, &mut painter);
+            let mut panel = None;
+            let mut inside = None;
+            use otlyra_gfx::kurbo::Shape as _;
+            for op in painter.take() {
+                if let PaintOp::Fill { brush, shape, .. } = op {
+                    if brush
+                        == otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
+                            0, 0, 255,
+                        ))
+                    {
+                        panel = Some(shape.bounding_box().y0);
+                    }
+                    if brush
+                        == otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
+                            255, 0, 0,
+                        ))
+                    {
+                        inside = Some(shape.bounding_box().y0);
+                    }
+                }
+            }
+            (panel.expect("the panel"), inside.expect("its contents"))
+        };
+
+        let (panel_before, inside_before) = tops(&mut page, &mut text);
+        page.scroll_at(50.0, 50.0, 60.0);
+        let (panel_after, inside_after) = tops(&mut page, &mut text);
+
+        assert_eq!(panel_before, panel_after, "the box itself moved");
+        assert_eq!(
+            inside_before - inside_after,
+            60.0,
+            "its contents did not move by what the wheel said"
+        );
+    }
+
+    /// A box that cuts its contents off and has more than it can show takes the
+    /// wheel; the page takes it once that box has reached its end.
+    #[test]
+    fn a_scrollable_box_takes_the_wheel_before_the_page_does() {
+        let (mut page, mut text) = scene(
+            "<style>body { margin: 0 } \
+             .panel { overflow: hidden; height: 100px } \
+             .tall { height: 400px } \
+             .after { height: 2000px }</style>\
+             <div class=panel><div class=tall>inside</div></div>\
+             <div class=after>after</div>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        // Over the panel: the panel scrolls and the page does not.
+        page.scroll_at(50.0, 50.0, 60.0);
+        assert_eq!(page.scroll(), 0.0, "the page moved instead of the panel");
+
+        // Past the panel's end, the rest goes to the page.
+        page.scroll_at(50.0, 50.0, 1000.0);
+        page.scroll_at(50.0, 50.0, 40.0);
+        assert!(page.scroll() > 0.0, "the panel kept the wheel to itself");
+
+        // Below the panel, the page scrolls from the first turn.
+        let was = page.scroll();
+        page.scroll_at(50.0, 400.0, 30.0);
+        assert!(page.scroll() > was);
     }
 
     #[test]

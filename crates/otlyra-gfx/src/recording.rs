@@ -74,6 +74,17 @@ pub enum PaintOp {
         /// The run's glyphs, in order.
         glyphs: Vec<Glyph>,
     },
+    /// [`PaintTarget::fill_blurred`].
+    FillBlurred {
+        /// Transform applied to the shape.
+        transform: Affine,
+        /// Paint.
+        brush: Brush,
+        /// The CSS blur radius.
+        blur: f64,
+        /// Geometry, flattened.
+        shape: BezPath,
+    },
     /// [`PaintTarget::draw_image`].
     DrawImage {
         /// Image width in px.
@@ -176,6 +187,21 @@ impl PaintTarget for RecordingPainter {
             transform,
             brush: brush.to_owned(),
             brush_transform,
+            shape: flatten(shape),
+        });
+    }
+
+    fn fill_blurred(
+        &mut self,
+        transform: Affine,
+        brush: BrushRef<'_>,
+        blur: f64,
+        shape: &dyn PaintShape,
+    ) {
+        self.record(PaintOp::FillBlurred {
+            transform,
+            brush: brush.to_owned(),
+            blur,
             shape: flatten(shape),
         });
     }

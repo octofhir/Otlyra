@@ -30,6 +30,29 @@ defaults-shot path=(screenshot_dir / "defaults.png"):
     cargo run --quiet -- --file tests/pages/defaults.html --screenshot {{path}} --width 820 --height 3000 --scale-factor 1
     @echo "wrote {{path}}"
 
+# Render a page twice — through us, and through whatever browser
+# $OTLYRA_REFERENCE points at — so the two can be put side by side.
+#
+# The comparison is the point: several real bugs were invisible in a dump and
+# obvious the moment the same page was rendered by something that gets it right.
+reference page width="820" height="900":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="{{screenshot_dir}}/reference"
+    mkdir -p "$out"
+    name="$(basename {{page}} .html)"
+    cargo run --quiet -- --file {{page}} --screenshot "$out/$name.ours.png" \
+        --width {{width}} --height {{height}} --scale-factor 1
+    if [ -z "${OTLYRA_REFERENCE:-}" ]; then
+        echo "set OTLYRA_REFERENCE to a browser binary for the other half"
+        exit 0
+    fi
+    "$OTLYRA_REFERENCE" --headless --disable-gpu --hide-scrollbars \
+        --window-size={{width}},{{height}} \
+        --screenshot="$out/$name.reference.png" "file://$(cd "$(dirname {{page}})" && pwd)/$(basename {{page}})" \
+        >/dev/null 2>&1
+    echo "wrote $out/$name.ours.png and $out/$name.reference.png"
+
 # Open the image test page: intrinsic sizes, ratios, and pictures in a line.
 images:
     cargo run -- --file tests/pages/images.html

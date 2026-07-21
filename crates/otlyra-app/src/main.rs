@@ -221,6 +221,29 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         };
     }
 
+    // The dumps want the bytes here, on the way past; a window does not — it
+    // fetches for itself, off its own thread, and fetching twice would be a second
+    // request for the same page and a second parse of it.
+    let wants_bytes = cli.dump_source
+        || cli.dump_dom.is_some()
+        || cli.dump_boxes
+        || cli.dump_fragments
+        || cli.dump_selectors.is_some();
+    if !wants_bytes {
+        let mut browser = Browser::new(NetLoader::default());
+        browser.navigate(&match &source {
+            Source::Url(url) => url.clone(),
+            Source::File(path) => path.display().to_string(),
+        });
+        return match cli.screenshot.as_deref() {
+            Some(path) => {
+                browser.wait_for_load(LOAD_TIMEOUT);
+                Ok(write_screenshot(&mut browser, cli.viewport(), path)?)
+            }
+            None => Ok(run_window(window_config(cli), &mut browser)?),
+        };
+    }
+
     let (bytes, transport_charset) = match &source {
         Source::Url(input) => {
             let resource = fetch(input)?;
@@ -374,8 +397,33 @@ fn file_url(input: &str) -> Option<url::Url> {
     url::Url::from_file_path(absolute).ok()
 }
 
+/// The type a filename claims, by its extension.
+///
+/// Only the ones a browser has to get right: a document, a stylesheet, a script and
+/// the pictures. Anything else is left unsaid, and the bytes decide.
+fn content_type_of(path: &std::path::Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "html" | "htm" | "xhtml" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "svg" => "image/svg+xml",
+        "txt" | "md" | "rs" | "toml" => "text/plain",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => return None,
+    };
+    Some(mime.to_owned())
+}
+
 impl otlyra_app::fetcher::Loader for NetLoader {
-    fn load(&self, input: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+    fn load(&self, input: &str) -> Result<otlyra_app::fetcher::Loaded, String> {
         // A path typed into the address bar becomes the `file:` URL it names, so
         // that what the bar shows is an address and not a filename — and so that a
         // relative link on the page has something to resolve against.
@@ -385,7 +433,15 @@ impl otlyra_app::fetcher::Loader for NetLoader {
                 .map_err(|()| format!("not a path: {input}"))?;
             let bytes =
                 std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-            return Ok((bytes, None, url.to_string()));
+            // A filesystem has no `Content-Type`, so the extension stands in for
+            // one — which is what every browser does with a `file:` URL, and is why
+            // opening a `.css` shows the stylesheet rather than rendering it.
+            return Ok(otlyra_app::fetcher::Loaded {
+                bytes,
+                content_type: content_type_of(&path),
+                final_url: url.to_string(),
+                ..Default::default()
+            });
         }
 
         otlyra_net::install_crypto_provider();
@@ -402,7 +458,13 @@ impl otlyra_app::fetcher::Loader for NetLoader {
             .fetch_blocking(otlyra_net::LoadRequest::new(url))
             .map_err(|error| error.to_string())?;
         let charset = resource.charset();
-        Ok((resource.body, charset, resource.final_url))
+        Ok(otlyra_app::fetcher::Loaded {
+            bytes: resource.body,
+            charset,
+            content_type: resource.content_type,
+            nosniff: resource.nosniff,
+            final_url: resource.final_url,
+        })
     }
 }
 

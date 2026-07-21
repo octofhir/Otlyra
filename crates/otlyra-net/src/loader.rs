@@ -35,6 +35,9 @@ pub struct LoadedResource {
     pub status: u16,
     /// The raw `Content-Type` header, if the server sent one.
     pub content_type: Option<String>,
+    /// Whether the server sent `X-Content-Type-Options: nosniff`, which is it
+    /// saying that what it declared is what it means.
+    pub nosniff: bool,
     /// The body, decompressed but otherwise untouched.
     pub body: Vec<u8>,
 }
@@ -244,6 +247,11 @@ impl Loader {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let nosniff = response
+            .headers()
+            .get(reqwest::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("nosniff"));
 
         // Before the body, not after: a declared length over the cap is a request we
         // decline to make memory available for.
@@ -274,6 +282,7 @@ impl Loader {
             final_url,
             status,
             content_type,
+            nosniff,
             body,
         })
     }
@@ -306,6 +315,7 @@ mod tests {
             final_url: "https://example.com/".to_owned(),
             status: 200,
             content_type: content_type.map(str::to_owned),
+            nosniff: false,
             body: body.to_vec(),
         }
     }

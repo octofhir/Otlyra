@@ -54,7 +54,7 @@ const NEW_TAB_SIZE: f64 = 28.0;
 ///
 /// Byte offsets, not character counts: the text is UTF-8 and a caret that can land
 /// mid-character is a panic waiting for the first non-ASCII address.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextField {
     text: String,
     caret: usize,
@@ -281,6 +281,33 @@ pub struct TabLabel {
     pub loading: bool,
 }
 
+/// Everything the interface's appearance is a function of.
+///
+/// If two frames agree on all of it, they would draw the same list, so the
+/// second frame does not build one. This is the whole of the caching rule, and
+/// keeping it as one comparable value is what stops it from rotting: a new thing
+/// the interface draws has to be added here to be drawn, because otherwise it
+/// does not appear until something else changes.
+///
+/// The window's *height* is deliberately absent. The interface is a fixed band
+/// at the top: dragging the bottom edge of the window changes what the page has
+/// to lay out in and nothing about the toolbar. The one exception is an open
+/// menu, which hangs below the band — so the height only counts while it is
+/// open, and that is what `menu` carries.
+#[derive(Clone, PartialEq)]
+struct Appearance {
+    width: f64,
+    tabs: Vec<(String, bool)>,
+    active: usize,
+    history: (bool, bool),
+    spinner: Option<f32>,
+    pointer: (f64, f64),
+    pointer_down: bool,
+    address: String,
+    caret: Option<usize>,
+    menu: Option<f64>,
+}
+
 /// The interface's own state: what is focused, where the pointer is, what is typed.
 pub struct BrowserUi {
     /// The address field.
@@ -293,6 +320,13 @@ pub struct BrowserUi {
     pub theme: Theme,
     pointer: (f64, f64),
     pointer_down: bool,
+    /// What the last built list was built from, and the list itself.
+    cache: Option<(Appearance, DisplayList)>,
+    /// How many lists have been built, as opposed to reused.
+    ///
+    /// Kept because "it did not rebuild" is the whole claim of the cache, and a
+    /// claim a test cannot see is a claim that quietly stops being true.
+    builds: u64,
     /// Last frame's tree, kept only so a press lands on what was drawn.
     root: Option<Child<UiAction>>,
 }
@@ -324,8 +358,15 @@ impl BrowserUi {
             theme: Theme::light(),
             pointer: (-1.0, -1.0),
             pointer_down: false,
+            cache: None,
+            builds: 0,
             root: None,
         }
+    }
+
+    /// How many display lists this interface has built rather than reused.
+    pub fn builds(&self) -> u64 {
+        self.builds
     }
 
     /// Note where the pointer is. Kept so a press can be tested against the same
@@ -499,8 +540,38 @@ impl BrowserUi {
         history: (bool, bool),
         spinner: Option<f32>,
         text: &mut TextEngine,
-        list: &mut DisplayList,
+        out: &mut DisplayList,
     ) {
+        let appearance = Appearance {
+            width,
+            tabs: tabs
+                .iter()
+                .map(|tab| (tab.title.clone(), tab.loading))
+                .collect(),
+            active,
+            history,
+            spinner,
+            pointer: self.pointer,
+            pointer_down: self.pointer_down,
+            address: self.address.text().to_owned(),
+            caret: self.address_focused.then(|| self.address.caret()),
+            menu: self.menu_open.then_some(height),
+        };
+
+        // Nothing it is drawn from has moved, so last frame's list is this
+        // frame's list. The tree is kept too, so a press still meets the
+        // rectangles that are on screen.
+        if let Some((built, list_of)) = &self.cache
+            && *built == appearance
+            && self.root.is_some()
+        {
+            out.append(list_of);
+            return;
+        }
+
+        self.builds += 1;
+        let mut built = DisplayList::new();
+        let list = &mut built;
         let theme = self.theme.clone();
 
         // The two surfaces, painted before the tree so that everything the tree
@@ -544,6 +615,9 @@ impl BrowserUi {
         );
 
         self.root = Some(root);
+        self.cache = Some((appearance, built));
+        let (_, built) = self.cache.as_ref().expect("just stored");
+        out.append(built);
     }
 
     /// A drawing context over `text`, carrying this interface's pointer and theme.
@@ -967,6 +1041,79 @@ mod tests {
     fn press(ui: &mut BrowserUi, text: &mut TextEngine, x: f64, y: f64) -> UiAction {
         ui.pointer_moved(x, y);
         ui.pointer_pressed(text)
+    }
+
+    /// Draw one frame at a given window size, and say what it drew.
+    fn frame_at(ui: &mut BrowserUi, text: &mut TextEngine, width: f64, height: f64) -> DisplayList {
+        let mut list = DisplayList::new();
+        ui.build_display_list(
+            width,
+            height,
+            &labels(2),
+            0,
+            (true, true),
+            None,
+            text,
+            &mut list,
+        );
+        list
+    }
+
+    #[test]
+    fn a_taller_window_does_not_rebuild_the_interface() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        let first = frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        assert_eq!(ui.builds(), 1);
+
+        // Dragging the bottom edge changes what the *page* has to lay out in.
+        // The interface is a fixed band at the top of the window: nothing about
+        // it moved, so nothing about it is measured, shaped or built again.
+        let taller = frame_at(&mut ui, &mut text, 1000.0, 400.0);
+        assert_eq!(ui.builds(), 1, "a height-only resize rebuilds nothing");
+        assert_eq!(taller, first, "and draws exactly what the last frame drew");
+    }
+
+    #[test]
+    fn a_narrower_window_does_rebuild_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        // Width is the one thing the interface is laid out against: the tabs
+        // share it and the address field takes what is left.
+        frame_at(&mut ui, &mut text, 700.0, 800.0);
+        assert_eq!(ui.builds(), 2);
+    }
+
+    #[test]
+    fn an_open_menu_makes_the_height_matter_again() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.menu_open = true;
+
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        // The panel hangs below the band and its sheet covers the window, so
+        // this is the one case where the window's height is the interface's
+        // business.
+        frame_at(&mut ui, &mut text, 1000.0, 400.0);
+        assert_eq!(ui.builds(), 2);
+    }
+
+    #[test]
+    fn moving_the_pointer_rebuilds_it_because_hover_is_drawn() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.pointer_moved(60.0, UI_HEIGHT - 20.0);
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        assert_eq!(
+            ui.builds(),
+            2,
+            "the wash under the pointer is part of the frame"
+        );
     }
 
     #[test]

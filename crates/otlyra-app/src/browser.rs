@@ -10,7 +10,7 @@ use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::NodeId;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_layout::Images;
-use otlyra_platform::{Cursor, Painter, PlatformEvent, Viewport, Waker};
+use otlyra_platform::{Cursor, Key, Painter, PlatformEvent, Viewport, Waker};
 use otlyra_text::TextEngine;
 
 use crate::about::{self, AboutSurface};
@@ -78,6 +78,12 @@ pub struct Tab {
     pub page: Option<PageScene>,
     /// What went wrong, if anything.
     pub error: Option<String>,
+    /// The browser's own page this tab is showing, if it is showing one.
+    ///
+    /// On the tab rather than on the browser, because `about:settings` is a
+    /// place a tab can be — one tab may sit on the preferences while another
+    /// reads a document, and going back from it must reach what was there.
+    pub system: Option<SystemPage>,
     /// The load in flight, if one is.
     pending: Option<PendingLoad>,
     /// Where this tab has been, oldest first.
@@ -98,6 +104,7 @@ impl Tab {
             title: "New tab".to_owned(),
             page: None,
             error: None,
+            system: None,
             pending: None,
             history: Vec::new(),
             position: 0,
@@ -140,12 +147,104 @@ const STYLESHEET_LIMIT: usize = 32;
 /// How many pictures one document may pull in, for the same reason.
 const IMAGE_LIMIT: usize = 64;
 
-/// Decode a fetched stylesheet.
+/// How many bytes of decoded pictures are kept between loads.
 ///
-/// A BOM or a charset from the transport decides; anything else is UTF-8, which
-/// is CSS's own default and not HTML's — an unlabelled *document* is assumed to be
+/// Decoded, not encoded: a 200 KB photograph is 8 MB of pixels, and it is the
+/// pixels this holds. Sixty-four megabytes is a few screenfuls of them.
+const IMAGE_CACHE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Decoded pictures, kept by address.
+///
+/// A page that shows the same picture twice decodes it once, and going back to a
+/// page that has been visited does not decode its pictures again. Least recently
+/// used goes first, because the page in front of the reader is the one whose
+/// pictures are worth keeping.
+#[derive(Default)]
+struct ImageCache {
+    /// Oldest use first; the end is the most recently used.
+    entries: Vec<(String, otlyra_gfx::peniko::ImageData)>,
+    bytes: usize,
+}
+
+impl ImageCache {
+    /// The picture at `url`, if it is here, marked as just used.
+    fn get(&mut self, url: &str) -> Option<otlyra_gfx::peniko::ImageData> {
+        let at = self.entries.iter().position(|(key, _)| key == url)?;
+        let entry = self.entries.remove(at);
+        let image = entry.1.clone();
+        self.entries.push(entry);
+        Some(image)
+    }
+
+    /// Keep `image` under `url`, evicting the least recently used until it fits.
+    fn insert(&mut self, url: String, image: otlyra_gfx::peniko::ImageData) {
+        let size = image.data.as_ref().len();
+        if size > IMAGE_CACHE_BUDGET {
+            // One picture larger than the whole budget is not worth evicting
+            // everything else for.
+            return;
+        }
+        if let Some(at) = self.entries.iter().position(|(key, _)| *key == url) {
+            let (_, old) = self.entries.remove(at);
+            self.bytes -= old.data.as_ref().len();
+        }
+
+        while self.bytes + size > IMAGE_CACHE_BUDGET && !self.entries.is_empty() {
+            let (_, evicted) = self.entries.remove(0);
+            self.bytes -= evicted.data.as_ref().len();
+        }
+        self.bytes += size;
+        self.entries.push((url, image));
+    }
+}
+
+/// The document a picture is shown in.
+///
+/// A browser given a picture and nothing else wraps it in a document of its own —
+/// there is no markup to render, and an `<img>` is what the rest of the engine
+/// already knows how to place.
+fn image_document(url: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8><title>{name}</title>\
+         <style>html {{ background: #1c1c1e }} \
+         body {{ margin: 0; height: 100vh; display: flex; \
+         justify-content: center; align-items: center }} \
+         img {{ max-width: 100%; max-height: 100% }}</style>\
+         <img src=\"{url}\" alt=\"\">",
+        name = escape(url.rsplit('/').next().unwrap_or(url)),
+        url = escape(url),
+    )
+}
+
+/// The document text is shown in.
+///
+/// Text is text: it is wrapped in a `<pre>` so that its own line breaks and spacing
+/// survive, and escaped so that a file full of markup is *shown* rather than
+/// rendered — which is the whole point of having decided it was not a document.
+fn text_document(text: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8>\
+         <style>pre {{ font-family: monospace; white-space: pre; margin: 8px }}</style>\
+         <pre>{}</pre>",
+        escape(text)
+    )
+}
+
+/// The four characters that would otherwise be markup.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Decode bytes that are not a document: a stylesheet, or a text file being shown
+/// as itself.
+///
+/// A BOM or a charset from the transport decides; anything else is UTF-8, which is
+/// CSS's own default and not HTML's — an unlabelled *document* is assumed to be
 /// windows-1252, an unlabelled *stylesheet* is not.
-fn decode_css(bytes: &[u8], charset: Option<&str>) -> String {
+fn decode_text(bytes: &[u8], charset: Option<&str>) -> String {
     let decision = otlyra_html::determine(bytes, charset);
     match decision.source {
         otlyra_html::EncodingSource::Bom | otlyra_html::EncodingSource::TransportCharset => {
@@ -164,9 +263,13 @@ pub struct Browser {
     fetcher: Fetcher,
     /// When the current load started, so the spinner has something to turn by.
     load_started: std::time::Instant,
+    /// Pictures that have already been decoded.
+    images: ImageCache,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
+    /// And its height, which is what a page key scrolls by.
+    last_height: f64,
     /// The mark shown on an empty tab. `None` if it failed to decode, which is a
     /// cosmetic problem and not a reason to refuse to draw a frame.
     mark: Option<otlyra_gfx::peniko::ImageData>,
@@ -180,12 +283,6 @@ pub struct Browser {
     settings: SettingsSurface,
     /// What this program is.
     about: AboutSurface,
-    /// Which of the browser's own pages the active tab is showing, if any.
-    ///
-    /// Per tab would be better and is what a real `about:` scheme gives; this
-    /// is the smaller version of that, and the thing that replaces it is the
-    /// navigation path rather than another field.
-    system: Option<SystemPage>,
 }
 
 impl Browser {
@@ -198,14 +295,15 @@ impl Browser {
             active: 0,
             fetcher: Fetcher::spawn(loader),
             load_started: std::time::Instant::now(),
+            images: ImageCache::default(),
             last_width: 1024.0,
+            last_height: 768.0,
             mark: otlyra_gfx::decode_image(crate::MARK)
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
             pointer: (0.0, 0.0),
             settings: SettingsSurface::new(),
             about: AboutSurface::new(),
-            system: None,
         }
     }
 
@@ -231,36 +329,35 @@ impl Browser {
     /// why M9 replaces this body with a channel and a pending state rather than
     /// replacing the caller.
     pub fn navigate(&mut self, url: &str) {
-        // A browser's own page is not fetched, not parsed and not laid out: it
-        // is a surface this program draws. Catching it here rather than in the
-        // fetcher means every way of asking for one — the menu, the address
-        // bar, a keyboard shortcut — arrives at the same place.
-        if let Some(page) = SystemPage::from_url(url) {
-            self.open_system(page);
-            return;
-        }
-        self.system = None;
         self.navigate_from(url, true);
     }
 
     /// Show one of the browser's own pages in the active tab.
+    ///
+    /// Navigation like any other, so it earns a history entry and back reaches
+    /// whatever was there before it.
     pub fn open_system(&mut self, page: SystemPage) {
-        if !page.available() {
-            self.tabs[self.active].error = Some(format!("{} is not built yet.", page.label()));
-            tracing::info!(?page, "system page requested before it exists");
-            return;
-        }
-        self.system = Some(page);
-        let tab = &mut self.tabs[self.active];
-        tab.url = page.url().to_owned();
-        tab.title = page.label().to_owned();
-        tab.error = None;
-        self.ui.address.set_text(page.url());
+        self.navigate(page.url());
     }
 
-    /// Which of the browser's own pages is showing, if any.
+    /// Show one of the browser's own pages in a tab of its own.
+    ///
+    /// A blank tab is used rather than added to: opening the settings from an
+    /// empty new tab should fill it, not leave an empty one behind.
+    pub fn open_system_in_new_tab(&mut self, page: SystemPage) {
+        let blank = {
+            let tab = &self.tabs[self.active];
+            tab.url.is_empty() && tab.page.is_none() && tab.system.is_none()
+        };
+        if !blank {
+            self.new_tab();
+        }
+        self.open_system(page);
+    }
+
+    /// Which of the browser's own pages the active tab is showing, if any.
     pub fn system_page(&self) -> Option<SystemPage> {
-        self.system
+        self.tabs[self.active].system
     }
 
     /// Go back one entry in the active tab's history.
@@ -353,6 +450,17 @@ impl Browser {
     fn start_load(&mut self, url: &str, user_initiated: bool, record: bool, restore_scroll: f32) {
         let _span = tracing::info_span!("navigation", url).entered();
 
+        // A browser's own page is fetched from nothing and parsed from nothing:
+        // it is a surface this program draws. Catching it in the one place every
+        // navigation passes through — the menu, the address bar, the command
+        // line, and a step through the history — is what makes it a place a tab
+        // can be rather than a mode the window is in.
+        if let Some(page) = SystemPage::from_url(url) {
+            self.show_system(page, record);
+            return;
+        }
+        self.tabs[self.active].system = None;
+
         if !user_initiated && let Ok(target) = otlyra_net::normalize(url) {
             let from = self.tabs[self.active].url.clone();
             if !otlyra_net::may_navigate(Some(&from), &target) {
@@ -383,6 +491,33 @@ impl Browser {
             outstanding: HashMap::new(),
         });
         self.ui.address.set_text(url);
+    }
+
+    /// Scroll the page by whatever a key means, if it means one.
+    ///
+    /// The keys every browser scrolls by, and only when nothing is being typed
+    /// into: a space bar that pages down while an address is half-written is the
+    /// classic way to lose what was typed.
+    fn scroll_by_key(&mut self, key: Key) {
+        /// How far an arrow moves, in logical pixels.
+        const LINE: f32 = 48.0;
+        /// How much of the window a page key keeps, so the reader has an anchor.
+        const PAGE_OVERLAP: f32 = 48.0;
+
+        let Some(page) = self.tabs[self.active].page.as_mut() else {
+            return;
+        };
+        let screen = (self.last_height as f32 - UI_HEIGHT as f32 - PAGE_OVERLAP).max(LINE);
+
+        match key {
+            Key::Down => page.scroll_by(LINE),
+            Key::Up => page.scroll_by(-LINE),
+            Key::PageDown | Key::Character(' ') => page.scroll_by(screen),
+            Key::PageUp => page.scroll_by(-screen),
+            Key::Home => page.set_scroll(0.0),
+            Key::End => page.scroll_by(f32::MAX / 4.0),
+            _ => {}
+        }
     }
 
     /// How far round the spinner is, or `None` when nothing is loading.
@@ -467,11 +602,33 @@ impl Browser {
             }
         };
 
-        let parsed = otlyra_html::parse(&loaded.bytes, loaded.charset.as_deref());
+        // What the response is, from what the server said and from the bytes: a
+        // picture is shown as one and text is shown as text, rather than everything
+        // being fed to the HTML parser and rendering as whatever that makes of it.
+        let sniffed = otlyra_net::sniff(
+            loaded.content_type.as_deref(),
+            loaded.nosniff,
+            &loaded.bytes,
+        );
         let final_url = loaded.final_url;
+        tracing::debug!(kind = sniffed.essence(), url = %final_url, "response sniffed");
+        let parsed = match &sniffed {
+            kind if kind.is_document() => {
+                otlyra_html::parse(&loaded.bytes, loaded.charset.as_deref())
+            }
+            otlyra_net::Sniffed::Image(_) => {
+                otlyra_html::parse(image_document(&final_url).as_bytes(), Some("utf-8"))
+            }
+            _ => {
+                let text = decode_text(&loaded.bytes, loaded.charset.as_deref());
+                otlyra_html::parse(text_document(&text).as_bytes(), Some("utf-8"))
+            }
+        };
 
         // What the page asks for, decided here and fetched on the other thread.
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
+        // Pictures that were decoded for an earlier page and are still here.
+        let mut ready = Images::default();
         let links = otlyra_css::cascade::stylesheet_links(&parsed.document);
         self.request_subresources(
             &mut outstanding,
@@ -485,17 +642,31 @@ impl Browser {
             }),
         );
         let pictures = otlyra_layout::image_sources(&parsed.document);
-        self.request_subresources(
-            &mut outstanding,
-            &final_url,
-            pictures.iter().take(IMAGE_LIMIT).map(|source| {
+        let wanted: Vec<_> = pictures
+            .iter()
+            .take(IMAGE_LIMIT)
+            .filter(|source| {
+                // Already decoded: no request, no decode, straight into the page.
+                let Some(url) = Self::subresource_url(&final_url, &source.src) else {
+                    return true;
+                };
+                match self.images.get(&url) {
+                    Some(image) => {
+                        ready.insert(source.node, image);
+                        false
+                    }
+                    None => true,
+                }
+            })
+            .map(|source| {
                 (
                     source.src.clone(),
                     PendingResource::Image(source.node),
                     ResourceKind::Image,
                 )
-            }),
-        );
+            })
+            .collect();
+        self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
         report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
         report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
 
@@ -511,6 +682,7 @@ impl Browser {
             return true;
         };
         pending.outstanding = outstanding;
+        pending.images.extend(ready);
         let record = pending.record;
         let previous = pending.previous_url.clone();
 
@@ -559,22 +731,37 @@ impl Browser {
 
         match fetched.result {
             Ok(loaded) => {
+                // Decoded once, however many elements asked for it.
+                let decoded = wanted
+                    .iter()
+                    .any(|resource| matches!(resource, PendingResource::Image(_)))
+                    .then(|| {
+                        otlyra_gfx::decode_image(&loaded.bytes)
+                            .inspect_err(
+                                |error| tracing::warn!(url = %fetched.url, %error, "image failed to decode"),
+                            )
+                            .ok()
+                    })
+                    .flatten();
+
+                if let Some(image) = decoded.clone() {
+                    self.images.insert(fetched.url.clone(), image);
+                }
+
                 for resource in wanted {
                     match resource {
                         PendingResource::Stylesheet(node) => {
-                            let source = decode_css(&loaded.bytes, loaded.charset.as_deref());
+                            let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
                             pending.sheets.insert(node, source);
                         }
-                        PendingResource::Image(node) => {
-                            match otlyra_gfx::decode_image(&loaded.bytes) {
-                                Ok(image) => {
-                                    pending.images.insert(node, image);
-                                }
-                                Err(error) => {
-                                    tracing::warn!(url = %fetched.url, %error, "image failed to decode");
-                                }
+                        PendingResource::Image(node) => match decoded.as_ref() {
+                            Some(image) => {
+                                pending.images.insert(node, image.clone());
                             }
-                        }
+                            None => {
+                                tracing::warn!(url = %fetched.url, "image failed to decode");
+                            }
+                        },
                     }
                 }
             }
@@ -610,6 +797,35 @@ impl Browser {
         if let Some(page) = tab.page.as_mut() {
             page.set_scroll(scroll);
         }
+    }
+
+    /// Put one of the browser's own pages in the active tab.
+    ///
+    /// Everything a finished load does, minus the loading: the tab's address and
+    /// title change, whatever was there is dropped, and the arrival earns a
+    /// history entry if this navigation was the kind that earns one.
+    fn show_system(&mut self, page: SystemPage, record: bool) {
+        if !page.available() {
+            let tab = &mut self.tabs[self.active];
+            tab.error = Some(format!("{} is not built yet.", page.label()));
+            tracing::info!(?page, "system page requested before it exists");
+            return;
+        }
+
+        let index = self.active;
+        let previous_url = self.tabs[index].url.clone();
+        let tab = &mut self.tabs[index];
+        tab.system = Some(page);
+        tab.url = page.url().to_owned();
+        tab.title = page.label().to_owned();
+        tab.error = None;
+        tab.page = None;
+        tab.pending = None;
+
+        if record {
+            self.record_history(index, &previous_url);
+        }
+        self.sync_address();
     }
 
     /// Add the entry this load earned, if it earned one.
@@ -693,17 +909,24 @@ impl Browser {
 
     /// Leave the settings when the surface says it is done with them.
     ///
-    /// Back to a blank tab rather than to the document that was there: there is
-    /// no document — the settings replaced the tab's contents, and restoring it
-    /// is what a real history entry will do once `about:` is a navigation.
+    /// *Done* is *back*, now that the settings are a history entry like any
+    /// other: it returns to whatever the tab was showing before, at the scroll
+    /// position it was left at. With nothing behind it — the settings opened in
+    /// a fresh tab — the tab is emptied instead, because there is nowhere to
+    /// return to and staying would make the button do nothing.
     fn close_settings_if(&mut self, action: &settings::Action) {
-        if *action == settings::Action::Close {
-            self.system = None;
-            let tab = &mut self.tabs[self.active];
-            tab.url = String::new();
-            tab.title = "New tab".to_owned();
-            self.ui.address.clear();
+        if *action != settings::Action::Close {
+            return;
         }
+        if self.tabs[self.active].can_go_back() {
+            self.go_back();
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        tab.system = None;
+        tab.url = String::new();
+        tab.title = "New tab".to_owned();
+        self.ui.address.clear();
     }
 
     fn apply(&mut self, action: UiAction) {
@@ -713,10 +936,12 @@ impl Browser {
             // the press handler applies them and reports `None`, so these arms
             // are only here to keep the match honest about the whole enum.
             UiAction::FocusAddress | UiAction::ToggleMenu | UiAction::CloseMenu => {}
-            // One way in for all of them: the menu, the address bar and the
-            // command line all end up in `open_system`, which is also the only
-            // place that knows which of these pages exists yet.
-            UiAction::OpenPage(page) => self.open_system(page),
+            // Chosen from the menu, a browser page opens beside what you were
+            // reading rather than over it: the menu is reached *while* looking
+            // at something, and losing that to check a preference is the whole
+            // reason browsers open these in a tab of their own. Typing the same
+            // address, which is a decision to leave, still navigates in place.
+            UiAction::OpenPage(page) => self.open_system_in_new_tab(page),
             UiAction::Navigate(url) => self.navigate(&url),
             UiAction::Back => self.go_back(),
             UiAction::Forward => self.go_forward(),
@@ -779,7 +1004,21 @@ impl Painter for Browser {
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
                 self.ui.pointer_moved(x, y);
-                match self.system {
+
+                // A scrollbar being dragged keeps the pointer until it is let go,
+                // wherever the pointer wanders.
+                let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
+                if let Some(page) = self.tabs[self.active].page.as_mut()
+                    && page.dragging_scrollbar()
+                {
+                    page.drag_scrollbar(
+                        (y - UI_HEIGHT) as f32,
+                        width as f32,
+                        height.max(0.0) as f32,
+                    );
+                    return;
+                }
+                match self.tabs[self.active].system {
                     // Moves matter to a surface that has a slider on it: that is
                     // what a drag is made of.
                     Some(SystemPage::Settings) => {
@@ -792,11 +1031,28 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerPressed => {
+                // A press on a scrollbar belongs to it rather than to the page
+                // behind it.
+                if self.pointer.1 >= UI_HEIGHT && self.tabs[self.active].system.is_none() {
+                    let (x, y) = self.pointer;
+                    let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
+                    if let Some(page) = self.tabs[self.active].page.as_mut()
+                        && page.grab_scrollbar(
+                            x as f32,
+                            (y - UI_HEIGHT) as f32,
+                            width as f32,
+                            height.max(0.0) as f32,
+                        )
+                    {
+                        return;
+                    }
+                }
+
                 // The settings surface owns everything below the toolbar while it
                 // is showing, so a press there never reaches the document behind
                 // it — there is no document behind it.
                 if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
-                    match self.system {
+                    match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
                             let action = self.settings.pointer_pressed();
                             self.close_settings_if(&action);
@@ -826,11 +1082,14 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerReleased => {
+                if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    page.release_scrollbar();
+                }
                 self.settings.pointer_released();
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
-                if self.system == Some(SystemPage::Settings) {
+                if self.tabs[self.active].system == Some(SystemPage::Settings) {
                     let action = self.settings.settings.key_pressed(key, modifiers);
                     self.close_settings_if(&action);
                     if action != settings::Action::None {
@@ -838,11 +1097,14 @@ impl Painter for Browser {
                     }
                 }
                 let action = self.ui.key_pressed(key, modifiers);
+                if action == UiAction::None && !self.ui.address_focused {
+                    self.scroll_by_key(key);
+                }
                 self.apply(action);
             }
 
             PlatformEvent::TextInput(character) => {
-                if self.system == Some(SystemPage::Settings)
+                if self.tabs[self.active].system == Some(SystemPage::Settings)
                     && self.settings.settings.text_input(character)
                 {
                     return;
@@ -856,10 +1118,14 @@ impl Painter for Browser {
                 if self.ui.owns_pointer() {
                     return;
                 }
-                if self.system == Some(SystemPage::Settings) {
+                if self.tabs[self.active].system == Some(SystemPage::Settings) {
                     self.settings.scroll_by(-y);
                 } else if let Some(page) = self.tabs[self.active].page.as_mut() {
-                    page.scroll_by(y as f32);
+                    // The wheel goes to whatever is under the pointer: a box that
+                    // scrolls takes it first, and the page takes it once that box
+                    // has reached its end.
+                    let (x, pointer_y) = self.pointer;
+                    page.scroll_at(x as f32, (pointer_y - UI_HEIGHT) as f32, y as f32);
                 }
             }
 
@@ -910,6 +1176,7 @@ impl Painter for Browser {
         let width = viewport.logical_width();
         let height = viewport.logical_height();
         self.last_width = width;
+        self.last_height = height;
 
         let scale = otlyra_gfx::kurbo::Affine::scale(viewport.scale_factor);
 
@@ -917,7 +1184,7 @@ impl Painter for Browser {
         // interface's height and culled to what is visible, so it cannot paint
         // underneath it — but painting in this order means a future translucent
         // toolbar composites correctly rather than needing a clip.
-        if let Some(system) = self.system {
+        if let Some(system) = self.tabs[self.active].system {
             // A browser page takes the whole content area: it is not a document
             // in a tab, it is the browser looked at from the front.
             let content =
@@ -980,6 +1247,7 @@ impl Painter for Browser {
 #[cfg(test)]
 mod system_page_tests {
     use super::*;
+    use crate::fetcher::Loaded;
     use crate::ui::SystemPage;
 
     /// A loader that fails everything, so a test that reaches the network is a
@@ -987,7 +1255,7 @@ mod system_page_tests {
     struct NoNetwork;
 
     impl Loader for NoNetwork {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             Err(format!("nothing may be fetched in this test: {url}"))
         }
     }
@@ -1053,6 +1321,102 @@ mod system_page_tests {
     }
 
     #[test]
+    fn choosing_a_page_from_the_menu_opens_it_beside_what_was_being_read() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 1000.0, 700.0);
+        press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        frame(&mut browser, 1000.0, 700.0);
+
+        // The first tab is blank, so the settings fill it rather than leaving an
+        // empty tab behind.
+        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 34.0);
+        assert_eq!(browser.tabs().len(), 1);
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+
+        // From a tab that is showing something, a second one opens.
+        browser.open_system_in_new_tab(SystemPage::About);
+        assert_eq!(browser.tabs().len(), 2);
+        assert_eq!(browser.active(), 1);
+        assert_eq!(browser.system_page(), Some(SystemPage::About));
+        assert_eq!(
+            browser.tabs()[0].system,
+            Some(SystemPage::Settings),
+            "what was being read stayed where it was"
+        );
+    }
+
+    #[test]
+    fn typing_the_same_address_navigates_in_place() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:otlyra");
+        browser.navigate("about:settings");
+
+        assert_eq!(browser.tabs().len(), 1, "typing is a decision to leave");
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+    }
+
+    #[test]
+    fn a_browser_page_belongs_to_its_tab_and_not_to_the_window() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:settings");
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+
+        // A second tab is a second place, and it is not on the settings.
+        browser.new_tab();
+        assert_eq!(browser.system_page(), None);
+
+        browser.select_tab(0);
+        assert_eq!(
+            browser.system_page(),
+            Some(SystemPage::Settings),
+            "the first tab kept what it was showing"
+        );
+    }
+
+    #[test]
+    fn a_browser_page_earns_a_history_entry_and_back_leaves_it() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:otlyra");
+        browser.navigate("about:settings");
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+        assert!(browser.can_go_back());
+
+        browser.go_back();
+        assert_eq!(
+            browser.system_page(),
+            Some(SystemPage::About),
+            "back reaches the browser page that was there"
+        );
+
+        browser.go_forward();
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+    }
+
+    #[test]
+    fn done_on_the_settings_goes_back_rather_than_emptying_the_tab() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:otlyra");
+        browser.navigate("about:settings");
+
+        browser.close_settings_if(&crate::settings::Action::Close);
+        assert_eq!(
+            browser.system_page(),
+            Some(SystemPage::About),
+            "done is back"
+        );
+    }
+
+    #[test]
+    fn done_with_nowhere_behind_it_empties_the_tab() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:settings");
+
+        browser.close_settings_if(&crate::settings::Action::Close);
+        assert_eq!(browser.system_page(), None);
+        assert_eq!(browser.tabs()[0].title, "New tab");
+    }
+
+    #[test]
     fn typing_a_browser_address_opens_a_surface_rather_than_fetching() {
         let mut browser = Browser::new(NoNetwork);
         browser.navigate("about:settings");
@@ -1115,6 +1479,16 @@ mod tests {
     use otlyra_platform::{Key, Modifiers};
 
     use super::*;
+    use crate::fetcher::Loaded;
+
+    /// The smallest PNG that decodes: one opaque pixel.
+    const ONE_PIXEL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
 
     /// What a fake loader was asked for, shared because the loader itself lives on
     /// the fetch thread and a test cannot reach into it.
@@ -1128,7 +1502,7 @@ mod tests {
     }
 
     impl Loader for FakeLoader {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             self.requested
                 .lock()
                 .expect("no panic on the fetch thread")
@@ -1137,11 +1511,13 @@ mod tests {
                 "broken.example" => Err("could not fetch broken.example".to_owned()),
                 // A `file:` URL loads as itself; anything else becomes an https
                 // address, the way a bare hostname does.
-                _ if url.starts_with("file://") => Ok((
-                    format!("<title>Local</title><body><p>Body of {url}").into_bytes(),
-                    Some("utf-8".to_owned()),
-                    url.to_owned(),
-                )),
+                _ if url.starts_with("file://") => Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: format!("<title>Local</title><body><p>Body of {url}").into_bytes(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                }),
                 // A bare hostname becomes an https address, the way the real
                 // loader normalizes one; an address that already is one is left
                 // alone, or going back to it would grow a second scheme each time.
@@ -1151,11 +1527,14 @@ mod tests {
                     } else {
                         format!("https://{url}/")
                     };
-                    Ok((
-                        format!("<title>Title of {url}</title><body><p>Body of {url}").into_bytes(),
-                        Some("utf-8".to_owned()),
+                    Ok(Loaded {
+                        content_type: Some("text/html".to_owned()),
+                        bytes: format!("<title>Title of {url}</title><body><p>Body of {url}")
+                            .into_bytes(),
+                        charset: Some("utf-8".to_owned()),
                         final_url,
-                    ))
+                        ..Default::default()
+                    })
                 }
             }
         }
@@ -1370,19 +1749,117 @@ mod tests {
     struct LinkLoader;
 
     impl Loader for LinkLoader {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             // Anything that is not already an address on this host is treated as
             // its root, which is what typing a bare hostname means.
             let path = match url.strip_prefix("https://start.example") {
                 Some("") | None => "/",
                 Some(path) => path,
             };
-            Ok((
-                b"<title>Linked</title><body><p><a href=\"/next\">go on</a></p>".to_vec(),
-                Some("utf-8".to_owned()),
-                format!("https://start.example{path}"),
-            ))
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<title>Linked</title><body><p><a href=\"/next\">go on</a></p>".to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: format!("https://start.example{path}"),
+                ..Default::default()
+            })
         }
+    }
+
+    /// A picture of `bytes` bytes, with no pixels worth looking at.
+    fn picture(bytes: usize) -> otlyra_gfx::peniko::ImageData {
+        let side = 1u32;
+        otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; bytes])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: side,
+            height: side,
+        }
+    }
+
+    /// The cache keeps what fits and drops what has not been looked at longest.
+    #[test]
+    fn the_image_cache_evicts_the_least_recently_used() {
+        let mut cache = ImageCache::default();
+        let big = IMAGE_CACHE_BUDGET / 2;
+
+        cache.insert("a".to_owned(), picture(big));
+        cache.insert("b".to_owned(), picture(big));
+        assert!(cache.get("a").is_some(), "both fit");
+
+        // `a` was just used, so `b` is the one that goes.
+        cache.insert("c".to_owned(), picture(big));
+        assert!(cache.get("b").is_none(), "the older one should have gone");
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(cache.bytes <= IMAGE_CACHE_BUDGET);
+    }
+
+    /// One larger than the whole budget is not worth emptying the cache for.
+    #[test]
+    fn an_oversized_picture_is_not_cached_at_all() {
+        let mut cache = ImageCache::default();
+        cache.insert("small".to_owned(), picture(1024));
+        cache.insert("huge".to_owned(), picture(IMAGE_CACHE_BUDGET + 1));
+
+        assert!(cache.get("huge").is_none());
+        assert!(cache.get("small").is_some(), "it emptied the cache anyway");
+    }
+
+    /// A picture that has already been decoded is not fetched again — which is what
+    /// the cache is for, and is visible in what the loader was asked for.
+    #[test]
+    fn a_cached_picture_is_not_fetched_twice() {
+        struct PictureLoader {
+            requested: Requests,
+        }
+
+        impl Loader for PictureLoader {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.requested
+                    .lock()
+                    .expect("no panic on the fetch thread")
+                    .push(url.to_owned());
+                if url.ends_with(".png") {
+                    // A one-pixel PNG, so the decoder has something real to do.
+                    return Ok(Loaded {
+                        content_type: Some("image/png".to_owned()),
+                        bytes: ONE_PIXEL_PNG.to_vec(),
+                        final_url: url.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><img src=\"/pic.png\"><img src=\"/pic.png\">".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://pictures.example/".to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let requested = Requests::default();
+        let mut browser = Browser::new(PictureLoader {
+            requested: std::sync::Arc::clone(&requested),
+        });
+
+        go(&mut browser, "pictures.example");
+        let first = asked_for(&requested);
+        assert_eq!(
+            first.iter().filter(|url| url.ends_with(".png")).count(),
+            1,
+            "one address, one fetch, however many elements ask for it"
+        );
+
+        go(&mut browser, "pictures.example");
+        let second = asked_for(&requested);
+        assert_eq!(
+            second.iter().filter(|url| url.ends_with(".png")).count(),
+            1,
+            "the picture was decoded again on the second visit"
+        );
     }
 
     /// A frame takes in whatever has arrived, even when nothing woke the loop.
@@ -1517,27 +1994,31 @@ mod tests {
     }
 
     impl Loader for SiteLoader {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             self.requested
                 .lock()
                 .expect("no panic on the fetch thread")
                 .push(url.to_owned());
             match url {
-                "https://site.example/site.css" => Ok((
-                    b"p { color: rgb(0, 128, 0) }".to_vec(),
-                    Some("utf-8".to_owned()),
-                    url.to_owned(),
-                )),
+                "https://site.example/site.css" => Ok(Loaded {
+                    content_type: Some("text/css".to_owned()),
+                    bytes: b"p { color: rgb(0, 128, 0) }".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                }),
                 "https://site.example/missing.css" => Err("404".to_owned()),
-                _ => Ok((
-                    b"<link rel=stylesheet href=site.css>\
+                _ => Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<link rel=stylesheet href=site.css>\
                       <link rel=stylesheet href=missing.css>\
                       <link rel=icon href=favicon.ico>\
                       <body><p>text"
                         .to_vec(),
-                    Some("utf-8".to_owned()),
-                    "https://site.example/".to_owned(),
-                )),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://site.example/".to_owned(),
+                    ..Default::default()
+                }),
             }
         }
     }
@@ -1586,16 +2067,19 @@ mod tests {
         struct DiskLoader;
 
         impl Loader for DiskLoader {
-            fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
                 assert!(
                     !url.starts_with("file:"),
                     "the loader must never be asked for {url}"
                 );
-                Ok((
-                    b"<link rel=stylesheet href=\"file:///etc/theme.css\"><body><p>x".to_vec(),
-                    Some("utf-8".to_owned()),
-                    "https://site.example/".to_owned(),
-                ))
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<link rel=stylesheet href=\"file:///etc/theme.css\"><body><p>x"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://site.example/".to_owned(),
+                    ..Default::default()
+                })
             }
         }
 
@@ -1710,13 +2194,15 @@ mod tests {
     struct LongLoader;
 
     impl Loader for LongLoader {
-        fn load(&self, url: &str) -> Result<(Vec<u8>, Option<String>, String), String> {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
             let body = "<title>Long</title><body>".to_owned() + &"<p>a paragraph</p>".repeat(200);
-            Ok((
-                body.into_bytes(),
-                Some("utf-8".to_owned()),
-                format!("https://{url}/"),
-            ))
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: body.into_bytes(),
+                charset: Some("utf-8".to_owned()),
+                final_url: format!("https://{url}/"),
+                ..Default::default()
+            })
         }
     }
 

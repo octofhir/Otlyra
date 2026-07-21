@@ -44,6 +44,34 @@
   .pinned { position: absolute; right: 8px; bottom: 8px; background: #fc9; padding: 4px; }
   .corner { position: absolute; left: 8px; top: 8px; background: #cfc; padding: 4px; }
   .nudged { position: relative; left: 30px; background: #fdd; }
+  .shadowed { background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.22); padding: 8px;
+              border-radius: 8px; margin: 12px 0 20px; }
+  .ringed { background: #fff; box-shadow: 0 0 0 3px #06c; padding: 8px;
+            border-radius: 8px; margin: 12px 0 20px; }
+  .gradient { background: linear-gradient(to right, #06c, #0c6); color: #fff;
+              padding: 8px; border-radius: 8px; margin: 8px 0; }
+  .gradient-angle { background: linear-gradient(135deg, #309, #c39); color: #fff;
+                    padding: 8px; border-radius: 8px; margin: 8px 0; }
+  .grid { display: grid; gap: 8px; margin: 8px 0; grid-template-columns: repeat(3, 1fr); }
+  .grid > div { background: #cde; padding: 4px 8px; }
+  .grid-sidebar { grid-template-columns: 160px 1fr; }
+  .grid-placed .wide { grid-column: span 2; background: #fed; }
+  .grid-placed .last { grid-column: 4; background: #cfc; }
+  .grid-fill { grid-template-columns: repeat(auto-fill, 120px); }
+  .rounded { border-radius: 10px; background: #cde; padding: 8px; margin: 8px 0; }
+  .pill { border-radius: 999px; background: #fed; padding: 4px 12px; display: inline-block; }
+  .rounded-border { border: 2px solid #c30; border-radius: 12px; padding: 6px; margin: 8px 0; }
+  .card { overflow: hidden; height: 60px; width: 300px; background: #eef; padding: 6px;
+          margin: 8px 0; }
+  .card > div { height: 140px; background: #cde; padding: 4px; }
+  .layers { position: relative; height: 90px; margin: 8px 0; }
+  .over { position: absolute; left: 0; top: 0; width: 240px; height: 50px;
+          background: #8ac; padding: 4px; }
+  .below { position: absolute; left: 120px; top: 25px; width: 240px; height: 50px;
+           background: #c8f; padding: 4px; z-index: -1; }
+  .sticky-frame { height: 120px; background: #f6f6fa; }
+  .sticky-frame h3 { position: sticky; top: 0; margin: 0; background: #123; color: #fff;
+                     padding: 4px; }
   .flex { display: flex; gap: 8px; background: #f2f2f6; margin: 8px 0; }
   .flex > div { background: #cde; padding: 4px 8px; }
   .flex-grow > div:first-child { flex-grow: 1; }
@@ -73,10 +101,31 @@ margins, which is how a box is centred — padding, borders per side, widths and
 heights, and <code>text-align</code>. On an <strong>inline</strong> box too:
 its padding and borders take room in the line, and a box broken over two lines
 keeps the border on the edge each piece owns.</p>
+<p><strong>Shadows</strong>: <code>box-shadow</code> with an offset, a blur and a
+spread, several at once, painted behind the box in the order CSS gives them.</p>
+<p><strong>Gradients</strong>: a <code>linear-gradient</code> background, by angle
+or by keyword, with stops that are spread evenly when they say nothing.</p>
+<p><strong>Grid</strong>: <code>display: grid</code> with
+<code>grid-template-columns</code> and <code>grid-template-rows</code> in
+lengths, percentages, <code>fr</code>, <code>auto</code> and
+<code>repeat()</code> of a definite count or of <code>auto-fill</code>, a gap
+between the tracks, and items placed in order — or on the line
+<code>grid-column</code> names, over as many tracks as it says to span, with the
+rest placed around them and the cells they stepped over left free.</p>
+<p><strong>Rounded corners</strong>: <code>border-radius</code> per corner, on the
+background and on a border that is the same on all four sides. A radius larger
+than the box is scaled down rather than folding over itself.</p>
+<p><strong>Overflow</strong>: <code>hidden</code>, <code>scroll</code> and
+<code>auto</code> all cut their contents off at the padding edge and establish a
+formatting context, and a box with more in it than it can show scrolls under the
+wheel, with a scrollbar to say where you are.</p>
 <p><strong>Position</strong>: <code>relative</code> moves a box without moving
 its neighbours, <code>absolute</code> takes it out of the flow and places it
-against the nearest positioned ancestor, and <code>fixed</code> places it against
-the viewport and leaves it there while the page scrolls.</p>
+against the nearest positioned ancestor, <code>fixed</code> places it against the
+viewport and leaves it there while the page scrolls, and <code>sticky</code> holds
+a box at its inset until its container runs out from under it. A positioned box
+paints over what it overlaps, and <code>z-index</code> moves it further up or
+below the flow.</p>
 <p><strong>Flex</strong>: <code>display: flex</code> with a direction, a gap,
 <code>flex-grow</code> and <code>flex-shrink</code>, <code>justify-content</code>,
 <code>align-items</code> and <code>align-self</code>, and wrapping onto as many
@@ -95,18 +144,20 @@ match" against a real document.</p>
 
 <h2>What does not work yet</h2>
 <p>A rule the cascade computes correctly can still change nothing, because
-layout reads a subset of what CSS defines: grid has no formatting context behind
-it, an unsupported <code>display</code> lays out as a block,
-<code>position: sticky</code> lays out as <code>static</code>, and
-<code>z-index</code> is not read — a positioned box paints in document order like
-everything else. In a flex container, <code>order</code>, <code>align-content</code>
+layout reads a subset of what CSS defines: an unsupported <code>display</code>
+lays out as a block, a grid item cannot be given a *named* line and
+<code>grid-auto-flow: dense</code> is not read, and a stacking
+context is not a thing yet — `z-index` orders boxes against the whole page rather
+than against their nearest positioned ancestor. In a flex container, <code>order</code>, <code>align-content</code>
 and baseline alignment are not read, an item may shrink below its content, and
 <code>inline-flex</code> is placed as a block. A float with no width of its own takes the whole column rather than
 shrinking to its contents, and only a float establishes a formatting context of
 its own, so <code>overflow</code> does not yet stop one.</p>
 <p>An inline box is as tall as the line it sits on rather than as tall as its own
 text, and <code>vertical-align</code> does not exist. Border styles other than
-solid are drawn solid. A resize that no rule reads costs nothing — the sheets are
+solid are drawn solid, a border that is rounded and different on each side falls
+back to four square-cornered rectangles, and a rounded box clips its contents at a
+square edge. A resize that no rule reads costs nothing — the sheets are
 parsed once and the cascade is skipped — but a resize that does change something
 recomputes every element rather than the part that changed.</p>
 
@@ -132,6 +183,44 @@ two pieces, open where the break is.</p>
 <p class="nudged"><code>position: relative</code> moves this line 30px right and
 moves nothing else.</p>
 <p>Which is why this one is where it always was.</p>
+<div class="layers">
+  <div class="over">A positioned box paints over what it overlaps…</div>
+  <div class="below">…and <code>z-index: -1</code> puts this one under it.</div>
+</div>
+<div class="sticky-frame">
+  <h3><code>position: sticky</code>, held at the top while this box scrolls past</h3>
+  <p>Scroll the page to see it stop at the top and leave with its container.</p>
+</div>
+
+<h2>Shadows</h2>
+<div class="shadowed">A <code>box-shadow</code>, offset and blurred behind the box.</div>
+<div class="ringed">Spread with no blur is a ring, and its corners grow with it.</div>
+
+<h2>Gradients</h2>
+<div class="gradient">A background that is a <code>linear-gradient</code>, left to right.</div>
+<div class="gradient-angle">And one at <code>135deg</code>, with the line long
+enough to reach the corners it points at.</div>
+
+<h2>Grid</h2>
+<div class="grid"><div>one</div><div>two</div><div>three</div><div>four</div><div>five</div></div>
+<div class="grid grid-sidebar"><div>160px</div><div>whatever is left</div></div>
+<div class="grid grid-placed" style="grid-template-columns: repeat(4, 1fr)">
+  <div class="wide">grid-column: span 2</div><div class="last">column 4</div>
+  <div>a</div><div>b</div><div>c</div>
+</div>
+<div class="grid grid-fill"><div>auto</div><div>fill</div><div>as many</div>
+  <div>as fit</div><div>the width</div></div>
+
+<h2>Rounded corners</h2>
+<div class="rounded">A background with <code>border-radius: 10px</code>.</div>
+<div class="rounded-border">A border that follows its corners.</div>
+<p><span class="pill">A radius larger than the box is scaled down to fit.</span></p>
+
+<h2>Overflow</h2>
+<div class="card"><div><code>overflow: hidden</code> on the box above cuts this
+one off at its padding edge, and makes it a formatting context of its own so a
+float inside it stays inside. Point at it and turn the wheel: it scrolls, and
+hands the page back the wheel once it has reached its end.</div></div>
 
 <h2>Flex</h2>
 <div class="flex"><div>one</div><div>two</div><div>three</div></div>

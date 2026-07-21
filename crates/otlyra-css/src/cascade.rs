@@ -128,6 +128,7 @@ impl Styler {
     /// Parse the user-agent sheet and the document's own, once.
     pub fn new(document: &Document, viewport: Viewport, external: &ExternalSheets) -> Self {
         let _span = tracing::info_span!("parse_stylesheets").entered();
+        enable_features();
 
         let lock = SharedRwLock::new();
         let url = base_url();
@@ -260,6 +261,22 @@ impl Styler {
         tracing::debug!(elements = styles.len(), "styled");
         StyledDocument { style_data, styles }
     }
+}
+
+/// Turn on the parts of the engine that ship switched off.
+///
+/// The style engine carries preferences from the browser it was taken from, and
+/// some of them gate whether a value parses at all: with `layout.grid.enabled`
+/// false, `display: grid` is not a display value and every grid on the web lays out
+/// as a block. Set before the first stylesheet is parsed, because a value that did
+/// not parse is not stored anywhere to be reconsidered.
+fn enable_features() {
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        stylo_static_prefs::set_pref!("layout.grid.enabled", true);
+    });
 }
 
 /// The device a viewport describes: what a media query is evaluated against and

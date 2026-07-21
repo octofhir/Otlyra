@@ -17,7 +17,7 @@ use otlyra_css::{
 use otlyra_text::{FontStack, PlacedSpacer, Spacer, TextEngine, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind, BoxTree};
-use crate::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
+use crate::fragment::{Fragment, FragmentKind, FragmentTree, Layer, Rect, ScrollPort, Sticky};
 
 /// The size of the viewport, in logical pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -40,6 +40,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         floats: Vec::new(),
         containing_blocks: vec![initial],
         viewport: initial,
+        scroll_ports: Vec::new(),
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -51,12 +52,17 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         kind: FragmentKind::Box,
         style: Arc::clone(&tree.node(root).style),
         fixed: false,
+        scroll_port: None,
+        clip: None,
+        sticky: None,
+        layer: Layer::default(),
         children,
     };
 
     tracing::debug!(height, "laid out");
     FragmentTree {
         root: root_fragment,
+        scroll_ports: engine.scroll_ports,
     }
 }
 
@@ -82,6 +88,8 @@ struct Flow<'a> {
     containing_blocks: Vec<Rect>,
     /// The viewport, which is what a fixed box measures against.
     viewport: Rect,
+    /// The boxes that cut their contents off and have more than they can show.
+    scroll_ports: Vec<ScrollPort>,
 }
 
 /// A box taken out of the flow and put against an edge.
@@ -136,6 +144,8 @@ struct FlexLine {
 struct FlexItem {
     id: BoxId,
     style: Arc<ComputedStyle>,
+    /// The smallest it may be shrunk to along the main axis.
+    floor: f32,
     /// Its size along the main axis before growing or shrinking.
     base: f32,
     /// Its size along the main axis after.
@@ -270,11 +280,121 @@ fn relative_offset(style: &ComputedStyle, containing: f32) -> (f32, f32) {
     (x, y)
 }
 
+/// Give a fragment and everything inside it the same sticky constraint, so the
+/// whole box travels together when the page scrolls past it.
+fn mark_sticky(fragment: &mut Fragment, sticky: Sticky) {
+    fragment.sticky = Some(sticky);
+    for child in &mut fragment.children {
+        mark_sticky(child, sticky);
+    }
+}
+
+/// Say which scroll port a fragment moves with.
+///
+/// The innermost wins: a fragment already inside a nearer port keeps it, and that
+/// port's own fragment is the one this marks.
+fn set_scroll_port(fragment: &mut Fragment, port: BoxId) {
+    if fragment.scroll_port.is_none() {
+        fragment.scroll_port = Some(port);
+    }
+    for child in &mut fragment.children {
+        set_scroll_port(child, port);
+    }
+}
+
+/// Cut a fragment and everything inside it off at `clip`.
+///
+/// Intersected rather than replaced: a box inside two clipping ancestors is cut off
+/// by both, and the smaller rectangle is the one that survives.
+fn set_clip(fragment: &mut Fragment, clip: Rect) {
+    fragment.clip = Some(match fragment.clip {
+        Some(existing) => existing.intersection(&clip),
+        None => clip,
+    });
+    for child in &mut fragment.children {
+        set_clip(child, clip);
+    }
+}
+
+/// Correct the containers of the sticky boxes directly inside a laid-out box.
+fn set_sticky_containers(children: &mut [Fragment], container: Rect) {
+    for child in children {
+        if child.sticky.is_some() {
+            set_container(child, container);
+        }
+    }
+}
+
+/// Tell a sticky subtree how far it may travel.
+fn set_container(fragment: &mut Fragment, container: Rect) {
+    if let Some(sticky) = fragment.sticky.as_mut() {
+        sticky.container = container;
+    }
+    for child in &mut fragment.children {
+        set_container(child, container);
+    }
+}
+
+/// Put a fragment and everything inside it on one painting layer.
+///
+/// The whole subtree, because a positioned box takes its contents with it: text
+/// inside a box that paints above its neighbours paints above them too.
+fn mark_layer(fragment: &mut Fragment, layer: Layer) {
+    fragment.layer = layer;
+    for child in &mut fragment.children {
+        // A positioned descendant has a place of its own in the order and keeps it:
+        // an absolutely positioned box with a negative `z-index` inside a relative
+        // one still paints below the flow, not with its parent.
+        if child.layer.positioned {
+            continue;
+        }
+        mark_layer(child, layer);
+    }
+}
+
 /// Mark a fragment and everything inside it as not moving with the page.
 fn mark_fixed(fragment: &mut Fragment) {
     fragment.fixed = true;
     for child in &mut fragment.children {
         mark_fixed(child);
+    }
+}
+
+/// The fragment a replaced box becomes: its content, at the size it was given.
+fn replaced_fragment(
+    id: BoxId,
+    style: &Arc<ComputedStyle>,
+    image: Option<otlyra_gfx::peniko::ImageData>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Fragment {
+    Fragment {
+        box_id: Some(id),
+        rect: Rect::new(x, y, width, height),
+        kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
+        style: Arc::clone(style),
+        fixed: false,
+        scroll_port: None,
+        clip: None,
+        sticky: None,
+        layer: Layer::default(),
+        children: Vec::new(),
+    }
+}
+
+/// The column a grid line names.
+///
+/// Lines count from one, and a negative line counts back from the end — which is
+/// how `grid-column: -1` means the last one without knowing how many there are.
+fn line_to_column(line: i32, count: usize) -> usize {
+    if line > 0 {
+        ((line - 1) as usize).min(count.saturating_sub(1))
+    } else if line < 0 && count != usize::MAX {
+        count.saturating_sub((-line) as usize)
+    } else {
+        0
     }
 }
 
@@ -311,8 +431,10 @@ impl<'a> Flow<'a> {
             return 0.0;
         }
 
-        if self.tree.node(parent).style.display == otlyra_css::Display::Flex {
-            return self.layout_flex(parent, width, x, y, out);
+        match self.tree.node(parent).style.display {
+            otlyra_css::Display::Flex => return self.layout_flex(parent, width, x, y, out),
+            otlyra_css::Display::Grid => return self.layout_grid(parent, width, x, y, out),
+            _ => {}
         }
 
         // The invariant from the box tree: all block-level, or all inline-level.
@@ -332,6 +454,10 @@ impl<'a> Flow<'a> {
         let mut cursor = y;
         let mut pending = 0.0;
         let last = children.len() - 1;
+        // Which fragments are waiting to be told how far they may travel: a sticky
+        // box may not leave its container, and how tall that is is only known once
+        // everything in it has been laid out.
+        let mut sticky: Vec<usize> = Vec::new();
 
         for (index, &child) in children.clone().iter().enumerate() {
             let style = Arc::clone(&self.tree.node(child).style);
@@ -380,6 +506,13 @@ impl<'a> Flow<'a> {
             if style.position == otlyra_css::Position::Relative {
                 let (dx, dy) = relative_offset(&style, width);
                 offset(&mut fragment, dx, dy);
+                mark_layer(
+                    &mut fragment,
+                    Layer {
+                        index: style.z_index.unwrap_or(0),
+                        positioned: true,
+                    },
+                );
             }
 
             let bottom = if index == last && bottom_open {
@@ -391,6 +524,20 @@ impl<'a> Flow<'a> {
             // A box with no height and nothing to separate its own two margins
             // collapses through: its top and bottom join the same run rather than
             // opening a gap on each side of nothing.
+            if style.position == otlyra_css::Position::Sticky {
+                mark_sticky(
+                    &mut fragment,
+                    Sticky {
+                        top: style.inset.top.resolve(width),
+                        bottom: style.inset.bottom.resolve(width),
+                        own: flowed,
+                        // Filled in below, once the container's height is known.
+                        container: flowed,
+                    },
+                );
+                sticky.push(out.len());
+            }
+
             if flowed.height == 0.0 {
                 pending = collapse(pending, bottom);
             } else {
@@ -400,7 +547,19 @@ impl<'a> Flow<'a> {
             out.push(fragment);
         }
 
-        cursor + pending - y
+        let used = cursor + pending - y;
+
+        // A provisional container: the height the children came to. Whoever laid
+        // this box out replaces it once the box's own height is settled, since a
+        // `height` of its own is what a sticky child may actually travel down.
+        if !sticky.is_empty() {
+            let container = Rect::new(x, y, width, used);
+            for index in sticky {
+                set_container(&mut out[index], container);
+            }
+        }
+
+        used
     }
 
     /// Lay out a box's children, making it the containing block for the absolutely
@@ -496,6 +655,13 @@ impl<'a> Flow<'a> {
         if style.position == otlyra_css::Position::Fixed {
             mark_fixed(&mut fragment);
         }
+        mark_layer(
+            &mut fragment,
+            Layer {
+                index: style.z_index.unwrap_or(0),
+                positioned: true,
+            },
+        );
         fragment
     }
 
@@ -503,6 +669,14 @@ impl<'a> Flow<'a> {
     /// from its containing block.
     fn layout_sized(&mut self, id: BoxId, x: f32, y: f32, width: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
+
+        // A picture is its own content: it has no children to lay out and its
+        // height comes from its own proportions rather than from anything inside it.
+        if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
+            let (_, height) = replaced_size(&style, content, width);
+            return replaced_fragment(id, &style, content.image.clone(), x, y, width, height);
+        }
+
         let padding = resolve_padding(&style, width);
         let border = resolve_border(&style);
         let content_width =
@@ -531,6 +705,10 @@ impl<'a> Flow<'a> {
             kind: FragmentKind::Box,
             style,
             fixed: false,
+            scroll_port: None,
+            clip: None,
+            sticky: None,
+            layer: Layer::default(),
             children,
         }
     }
@@ -547,7 +725,26 @@ impl<'a> Flow<'a> {
         // it do not shorten the lines inside it, and the ones inside it do not
         // reach out. Hiding the list for the duration is the whole of that rule.
         let outer_floats = std::mem::take(&mut self.floats);
-        let mut fragment = self.layout_block(id, containing_width, x, y);
+
+        // A float with no width of its own shrinks to fit: as wide as its content
+        // wants, and never wider than what is left for it. A block would have taken
+        // the whole column, which is the one thing a float must not do.
+        let mut fragment = match style.width.resolve(containing_width) {
+            Some(_) => self.layout_block(id, containing_width, x, y),
+            None => {
+                let margin = resolve_margin(&style, containing_width);
+                let available = (containing_width - margin.left - margin.right).max(0.0);
+                let content = self.max_content_width(id, containing_width);
+                let floor = self.min_content_width(id, containing_width, true);
+                let width = clamp(
+                    content.clamp(floor.min(available), available),
+                    style.min_width,
+                    style.max_width,
+                    containing_width,
+                );
+                self.layout_sized(id, x + margin.left, y, width)
+            }
+        };
         self.floats = outer_floats;
 
         let margin = resolve_margin(&style, containing_width);
@@ -685,6 +882,11 @@ impl<'a> Flow<'a> {
     /// contains.
     fn layout_block(&mut self, id: BoxId, containing_width: f32, x: f32, y: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
+        // A box that cuts its contents off is a formatting context of its own: the
+        // floats outside it do not shorten the lines inside it, and its own do not
+        // reach out. This is the rule `overflow: hidden` is best known for.
+        let outer_floats = (style.overflow == otlyra_css::Overflow::Clip)
+            .then(|| std::mem::take(&mut self.floats));
         // A block-level picture is its own size and has no children to lay out;
         // everything else about it — margins, borders — is an ordinary block's.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
@@ -697,6 +899,10 @@ impl<'a> Flow<'a> {
                 kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
                 style,
                 fixed: false,
+                scroll_port: None,
+                clip: None,
+                sticky: None,
+                layer: Layer::default(),
                 children: Vec::new(),
             };
         }
@@ -723,6 +929,48 @@ impl<'a> Flow<'a> {
             containing_width,
         );
 
+        if let Some(floats) = outer_floats {
+            self.floats = floats;
+        }
+
+        set_sticky_containers(
+            &mut children,
+            Rect::new(content_x, content_y, content_width, content_height),
+        );
+
+        // `overflow` other than `visible` cuts its contents off at the padding
+        // edge. The rectangle is handed down rather than pushed as a layer, so a
+        // fragment carries the one rectangle it is cut off at however deep it is.
+        if style.overflow == otlyra_css::Overflow::Clip {
+            let padding_box = Rect::new(
+                border_x + border.left,
+                border_y + border.top,
+                content_width + padding.left + padding.right,
+                content_height + padding.top + padding.bottom,
+            );
+            for child in &mut children {
+                set_clip(child, padding_box);
+            }
+
+            // How much there is to see: the furthest any of its contents reaches.
+            // More than the box can show is what makes it a scroll port.
+            let reach = children
+                .iter()
+                .map(|child| child.rect.bottom())
+                .fold(content_y, f32::max);
+            let inside = reach - content_y + padding.top + padding.bottom;
+            if inside > padding_box.height + 0.5 {
+                self.scroll_ports.push(ScrollPort {
+                    id,
+                    port: padding_box,
+                    content_height: inside,
+                });
+                for child in &mut children {
+                    set_scroll_port(child, id);
+                }
+            }
+        }
+
         Fragment {
             box_id: Some(id),
             // The border box: the rectangle a background paints and a border is
@@ -736,8 +984,270 @@ impl<'a> Flow<'a> {
             kind: FragmentKind::Box,
             style,
             fixed: false,
+            scroll_port: None,
+            clip: None,
+            sticky: None,
+            layer: Layer::default(),
             children,
         }
+    }
+
+    /// A grid formatting context: the children are placed into rows and columns.
+    ///
+    /// The columns come from `grid-template-columns`: a fixed track takes what it
+    /// asks for, an `auto` one takes what its widest item wants, and the `fr` tracks
+    /// share out whatever is left. Items are then placed in order, filling each row
+    /// before starting the next, and each row is as tall as the tallest thing in it
+    /// unless `grid-template-rows` says otherwise.
+    fn layout_grid(
+        &mut self,
+        parent: BoxId,
+        width: f32,
+        x: f32,
+        y: f32,
+        out: &mut Vec<Fragment>,
+    ) -> f32 {
+        let style = Arc::clone(&self.tree.node(parent).style);
+        let children = self.tree.node(parent).children.clone();
+        if children.is_empty() {
+            return 0.0;
+        }
+
+        let column_gap = style.gap.1.resolve(width);
+        let row_gap = style.gap.0.resolve(width);
+
+        // A grid with no template is one column of everything, which is what a
+        // block container would have done and is the least surprising fallback.
+        let mut template = style.grid_columns.clone();
+
+        // `repeat(auto-fill, …)`: the pattern goes in as many times as the room
+        // left over allows, which is what makes a card grid answer to its width
+        // without a media query.
+        if let Some(pattern) = style.grid_columns_fill.as_ref()
+            && !pattern.is_empty()
+        {
+            let spent: f32 = template
+                .iter()
+                .map(|track| match track {
+                    otlyra_css::Track::Fixed(length) => length.resolve(width),
+                    _ => 0.0,
+                })
+                .sum::<f32>()
+                + column_gap * template.len() as f32;
+            let one: f32 = pattern
+                .iter()
+                .map(|track| match track {
+                    otlyra_css::Track::Fixed(length) => length.resolve(width),
+                    _ => 0.0,
+                })
+                .sum::<f32>()
+                + column_gap * (pattern.len().saturating_sub(1)) as f32;
+
+            let times = if one > 0.0 {
+                (((width - spent + column_gap) / (one + column_gap)).floor() as usize).max(1)
+            } else {
+                1
+            };
+            for _ in 0..times {
+                template.extend(pattern.iter().copied());
+            }
+        }
+
+        if template.is_empty() {
+            template.push(otlyra_css::Track::Auto);
+        }
+        let count = template.len();
+
+        // Where every item goes. An item that names a line takes those cells; the
+        // rest are placed in order into whatever is still free, which is the
+        // auto-placement CSS describes, in its simple row-major form.
+        let mut taken: Vec<bool> = Vec::new();
+        let mut cells: Vec<(usize, usize, usize)> = Vec::with_capacity(children.len());
+        let mut cursor_cell = 0usize;
+        let occupied = |taken: &mut Vec<bool>, row: usize, column: usize| -> bool {
+            let at = row * count + column;
+            if at >= taken.len() {
+                taken.resize(at + 1, false);
+            }
+            taken[at]
+        };
+        let occupy = |taken: &mut Vec<bool>, row: usize, column: usize| {
+            let at = row * count + column;
+            if at >= taken.len() {
+                taken.resize(at + 1, false);
+            }
+            taken[at] = true;
+        };
+
+        for &child in &children {
+            let item = Arc::clone(&self.tree.node(child).style);
+            let span = (item.grid_column.span as usize).clamp(1, count);
+
+            let (row, column) = match (item.grid_column.line, item.grid_row.line) {
+                // A line of its own. The cursor never goes backwards, so a free cell
+                // left behind by an item placed further along stays empty — CSS
+                // fills those only when asked to, with `grid-auto-flow: dense`.
+                (Some(line), row) => {
+                    let column = line_to_column(line, count);
+                    let from = cursor_cell / count;
+                    let row = row.map_or_else(
+                        || {
+                            (from..)
+                                .find(|row| {
+                                    (0..span).all(|offset| {
+                                        !occupied(
+                                            &mut taken,
+                                            *row,
+                                            (column + offset).min(count - 1),
+                                        )
+                                    })
+                                })
+                                .unwrap_or(from)
+                        },
+                        |line| line_to_column(line, usize::MAX),
+                    );
+                    (row, column)
+                }
+                (None, Some(line)) => {
+                    let row = line_to_column(line, usize::MAX);
+                    let column = (0..count)
+                        .find(|column| !occupied(&mut taken, row, *column))
+                        .unwrap_or(0);
+                    (row, column)
+                }
+                (None, None) => {
+                    // The next free run of `span` cells, from wherever the cursor
+                    // has got to.
+                    loop {
+                        let row = cursor_cell / count;
+                        let column = cursor_cell % count;
+                        let fits = column + span <= count
+                            && (0..span).all(|offset| !occupied(&mut taken, row, column + offset));
+                        if fits {
+                            break (row, column);
+                        }
+                        cursor_cell += 1;
+                    }
+                }
+            };
+
+            // Wherever it went, the next item starts after it.
+            cursor_cell = cursor_cell.max(row * count + column + span);
+
+            for offset in 0..span {
+                occupy(&mut taken, row, (column + offset).min(count - 1));
+            }
+            cells.push((row, column, span));
+        }
+
+        // What each column has to hold, which is what an `auto` track is measured
+        // from: the widest item in it, and an item spanning several tracks counts
+        // towards none of them on its own.
+        let mut column_content = vec![0.0f32; count];
+        for (index, &child) in children.iter().enumerate() {
+            let (_, column, span) = cells[index];
+            if span == 1 {
+                let wanted = self.max_content_width(child, width);
+                column_content[column] = column_content[column].max(wanted);
+            }
+        }
+
+        // The columns: fixed first, then `auto` from content, then the leftover
+        // shared out by `fr`.
+        let gaps = column_gap * (count.saturating_sub(1)) as f32;
+        let mut columns = vec![0.0f32; count];
+        let mut fractions = 0.0f32;
+        let mut used = gaps;
+        for (index, track) in template.iter().enumerate() {
+            match track {
+                otlyra_css::Track::Fixed(length) => {
+                    columns[index] = length.resolve(width);
+                    used += columns[index];
+                }
+                otlyra_css::Track::Auto => {
+                    columns[index] = column_content[index];
+                    used += columns[index];
+                }
+                otlyra_css::Track::Fraction(share) => fractions += share.max(0.0),
+            }
+        }
+        let leftover = (width - used).max(0.0);
+        if fractions > 0.0 {
+            for (index, track) in template.iter().enumerate() {
+                if let otlyra_css::Track::Fraction(share) = track {
+                    columns[index] = leftover * share.max(0.0) / fractions;
+                }
+            }
+        }
+
+        // Where each column starts.
+        let mut offsets = Vec::with_capacity(count);
+        let mut at = x;
+        for column in &columns {
+            offsets.push(at);
+            at += column + column_gap;
+        }
+
+        // A grid establishes a formatting context of its own.
+        let outer_floats = std::mem::take(&mut self.floats);
+
+        let rows = cells.iter().map(|(row, _, _)| row + 1).max().unwrap_or(0);
+        let mut row_tops = vec![y; rows + 1];
+        let mut fragments: Vec<(usize, Fragment)> = Vec::with_capacity(children.len());
+
+        // One row at a time, because a row is as tall as the tallest thing in it and
+        // the next row starts where it ends.
+        for row in 0..rows {
+            let mut height = 0.0f32;
+            for (index, &child) in children.iter().enumerate() {
+                let (item_row, column, span) = cells[index];
+                if item_row != row {
+                    continue;
+                }
+                // A span covers its columns and the gaps between them.
+                let cell_width: f32 = (0..span)
+                    .map(|offset| columns.get(column + offset).copied().unwrap_or(0.0))
+                    .sum::<f32>()
+                    + column_gap * (span.saturating_sub(1)) as f32;
+                let fragment = self.layout_sized(
+                    child,
+                    offsets.get(column).copied().unwrap_or(x),
+                    row_tops[row],
+                    cell_width,
+                );
+                height = height.max(fragment.rect.height);
+                fragments.push((index, fragment));
+            }
+
+            // A row with a size of its own takes it, whatever is in it. An `fr` down
+            // the block axis needs a definite height to share out; without one it is
+            // what the content needs, which is what `auto` already gives.
+            if let Some(otlyra_css::Track::Fixed(length)) = style.grid_rows.get(row) {
+                height = length.resolve(width);
+            }
+
+            for (index, fragment) in &mut fragments {
+                if cells[*index].0 != row {
+                    continue;
+                }
+                // Stretched to the row, which is `align-items: stretch` and is what
+                // makes a row of cards the same height.
+                let id = fragment.box_id.expect("a grid item came from a box");
+                let has_height = self.tree.node(id).style.height != LengthOrAuto::Auto;
+                if !has_height && fragment.rect.height < height {
+                    fragment.rect.height = height;
+                }
+            }
+
+            row_tops[row + 1] = row_tops[row] + height + row_gap;
+        }
+
+        for (_, fragment) in fragments {
+            out.push(fragment);
+        }
+
+        self.floats = outer_floats;
+        (row_tops[rows] - row_gap - y).max(0.0)
     }
 
     /// A flex formatting context: the children are items along one axis.
@@ -795,8 +1305,19 @@ impl<'a> Flow<'a> {
                 None => fragment.rect.height,
             };
 
+            // A flex item's automatic minimum size: it may be shrunk, but not past
+            // the point where its own content spills out of it. An item that says
+            // `min-width` or `overflow` of its own would override this; neither is
+            // read yet, so the content is the floor.
+            let floor = if row && item_style.min_width == Length::ZERO {
+                self.min_content_width(child, width, true).min(basis)
+            } else {
+                item_style.min_width.resolve(width)
+            };
+
             items.push(FlexItem {
                 id: child,
+                floor,
                 base: basis,
                 main: basis,
                 cross: if row {
@@ -941,7 +1462,7 @@ impl<'a> Flow<'a> {
             if factors > 0.0 {
                 for item in &mut items[line.clone()] {
                     let factor = if free > 0.0 { item.grow } else { item.shrink };
-                    item.main = (item.base + free * factor / factors).max(0.0);
+                    item.main = (item.base + free * factor / factors).max(item.floor);
                 }
             }
         }
@@ -1089,9 +1610,84 @@ impl<'a> Flow<'a> {
         inner + extra
     }
 
+    /// The narrowest a box can be without its content spilling out of it.
+    ///
+    /// CSS calls this the min-content size: the widest single unbreakable thing
+    /// inside, which for text is its longest word. It is what a flex item may not
+    /// be shrunk below, and what a float with no width of its own shrinks to.
+    /// `from_content` asks what the box's own contents need whatever width it
+    /// declared, which is what a flex item's automatic minimum size is: a box that
+    /// says `width: 300px` may still be shrunk, just not past its longest word.
+    fn min_content_width(&mut self, id: BoxId, containing_width: f32, from_content: bool) -> f32 {
+        let node = self.tree.node(id);
+        let style = Arc::clone(&node.style);
+        let padding = resolve_padding(&style, containing_width);
+        let border = resolve_border(&style);
+        let extra = padding.left + padding.right + border.left + border.right;
+
+        if !from_content && let Some(width) = style.width.resolve(containing_width) {
+            return width + extra;
+        }
+
+        let inner = match &node.kind {
+            BoxKind::Replaced(content) => replaced_size(&style, content, containing_width).0,
+            _ if node.children.is_empty() => 0.0,
+            _ if self.tree.node(node.children[0]).is_inline_level() => {
+                // Broken as hard as it will break: the widest line that comes back
+                // is the widest word.
+                let mut spans = Vec::new();
+                let mut sources = Vec::new();
+                let mut inlines = Vec::new();
+                let mut replaced = Vec::new();
+                self.collect_spans(
+                    id,
+                    containing_width,
+                    &mut spans,
+                    &mut sources,
+                    &mut inlines,
+                    &mut replaced,
+                );
+                let text = if spans.is_empty() {
+                    0.0
+                } else {
+                    self.text
+                        .shape_spans(&spans, &[], Some(0.0))
+                        .lines
+                        .iter()
+                        .map(|line| line.width)
+                        .fold(0.0, f32::max)
+                };
+                let pictures = replaced.iter().map(|box_| box_.width).fold(0.0, f32::max);
+                text.max(pictures)
+            }
+            _ => {
+                let children = node.children.clone();
+                children
+                    .into_iter()
+                    .map(|child| {
+                        let child_style = &self.tree.node(child).style;
+                        let margin = resolve_margin(child_style, containing_width);
+                        self.min_content_width(child, containing_width, false)
+                            + margin.left
+                            + margin.right
+                    })
+                    .fold(0.0, f32::max)
+            }
+        };
+
+        inner + extra
+    }
+
     /// One flex item, laid out at the size the container decided for it.
     fn layout_item(&mut self, id: BoxId, x: f32, y: f32, width: f32, height: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
+
+        // A picture is its own content: the container decided its size, and there is
+        // nothing inside it to lay out.
+        if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
+            return replaced_fragment(id, &style, content.image.clone(), x, y, width, height);
+        }
+
         let padding = resolve_padding(&style, width);
         let border = resolve_border(&style);
 
@@ -1120,6 +1716,10 @@ impl<'a> Flow<'a> {
             kind: FragmentKind::Box,
             style,
             fixed: false,
+            scroll_port: None,
+            clip: None,
+            sticky: None,
+            layer: Layer::default(),
             children,
         }
     }
@@ -1307,6 +1907,10 @@ impl<'a> Flow<'a> {
                         kind: FragmentKind::Box,
                         style,
                         fixed: false,
+                        scroll_port: None,
+                        clip: None,
+                        sticky: None,
+                        layer: Layer::default(),
                         children: Vec::new(),
                     })
                 })
@@ -1334,6 +1938,10 @@ impl<'a> Flow<'a> {
                         box_id,
                         rect: Rect::new(line_x + run.offset_x, line_y, run.advance, height),
                         fixed: false,
+                        scroll_port: None,
+                        clip: None,
+                        sticky: None,
+                        layer: Layer::default(),
                         kind: FragmentKind::Text(run),
                         // The run's own style, not the paragraph's: the underline
                         // on a link belongs to the link, and painting from the
@@ -1367,6 +1975,10 @@ impl<'a> Flow<'a> {
                     kind: FragmentKind::Image(image),
                     style: Arc::clone(&box_.style),
                     fixed: false,
+                    scroll_port: None,
+                    clip: None,
+                    sticky: None,
+                    layer: Layer::default(),
                     children: Vec::new(),
                 })
             }));
@@ -1377,6 +1989,10 @@ impl<'a> Flow<'a> {
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
                 fixed: false,
+                scroll_port: None,
+                clip: None,
+                sticky: None,
+                layer: Layer::default(),
                 children,
             });
         }
@@ -2204,6 +2820,194 @@ mod tests {
             bar[0].children.iter().all(|child| child.fixed),
             "what is inside it does not scroll either"
         );
+    }
+
+    /// A float with no width of its own is as wide as its content, not as wide as
+    /// the column it sits in.
+    #[test]
+    fn a_float_with_no_width_shrinks_to_fit() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .f { float: left }</style>\
+             <div class=f>short</div><p>text beside it</p>",
+            400.0,
+        );
+        let float = rect_of(&tree, &boxes, "div");
+        assert!(float.width > 0.0);
+        assert!(
+            float.width < 200.0,
+            "a floated word took {}px of a 400px column",
+            float.width
+        );
+    }
+
+    /// An item may be shrunk, but not past the point where its own content spills
+    /// out of it: the automatic minimum size.
+    #[test]
+    fn a_flex_item_is_not_shrunk_below_its_content() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: flex } \
+             .a { width: 400px } .b { width: 400px }</style>\
+             <div class=flex><div class=a>an unbreakable-looking phrase</div>\
+             <div class=b>another phrase</div></div>",
+            200.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        let widest_word = 20.0;
+        assert!(
+            items[1].rect.width > widest_word,
+            "shrunk to {}px, which is past its content",
+            items[1].rect.width
+        );
+    }
+
+    /// A box that cuts its contents off is a formatting context of its own: a float
+    /// inside it does not shorten the lines outside it.
+    #[test]
+    fn a_clipping_box_keeps_its_floats_to_itself() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } p { margin: 0 } \
+             .card { overflow: hidden; height: 40px } \
+             .f { float: left; width: 200px; height: 100px }</style>\
+             <div class=card><div class=f>f</div></div><p>text</p>",
+            400.0,
+        );
+        let paragraph = boxes_of(&tree, &boxes, "p");
+        let line = paragraph[0]
+            .children
+            .iter()
+            .find(|child| matches!(child.kind, FragmentKind::Line))
+            .expect("a line");
+        assert_eq!(line.rect.x, 0.0, "the float reached out of the box");
+    }
+
+    /// `fr` shares out what is left after the fixed tracks and the gaps.
+    #[test]
+    fn grid_columns_take_their_share_of_the_row() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: 100px 1fr 1fr; gap: 20px }</style>\
+             <div class=grid><div>a</div><div>b</div><div>c</div></div>",
+            520.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        // The container is first; then the three cells.
+        assert_eq!(items[1].rect.width, 100.0);
+        // 520 - 100 - two 20px gaps = 380, halved.
+        assert_eq!(items[2].rect.width, 190.0);
+        assert_eq!(items[3].rect.width, 190.0);
+        assert_eq!(items[2].rect.x, 120.0, "after the first column and its gap");
+        assert_eq!(items[3].rect.x, 330.0);
+    }
+
+    /// Items fill a row before starting the next one, and a row is as tall as the
+    /// tallest thing in it — which is what makes a grid of cards line up.
+    #[test]
+    fn grid_items_wrap_into_rows_of_equal_height() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: 1fr 1fr } \
+             .tall { height: 60px }</style>\
+             <div class=grid><div class=tall>a</div><div>b</div><div>c</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(
+            items[1].rect.y, items[2].rect.y,
+            "the first two share a row"
+        );
+        assert_eq!(
+            items[2].rect.height, 60.0,
+            "the shorter one is stretched to the row"
+        );
+        assert_eq!(items[3].rect.y, 60.0, "the third starts the next row");
+        assert_eq!(items[3].rect.x, 0.0);
+    }
+
+    /// `grid-template-rows` gives a row a height of its own, whatever is in it.
+    #[test]
+    fn a_template_row_takes_the_height_it_asks_for() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: 1fr; \
+             grid-template-rows: 80px 30px }</style>\
+             <div class=grid><div>a</div><div>b</div></div>",
+            300.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(items[1].rect.height, 80.0);
+        assert_eq!(items[2].rect.y, 80.0);
+        assert_eq!(items[2].rect.height, 30.0);
+    }
+
+    /// An item can be given a line to sit on and a number of tracks to cover, and
+    /// the rest are placed around it.
+    #[test]
+    fn a_grid_item_can_be_placed_on_a_line_and_span_tracks() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: 100px 100px 100px } \
+             .wide { grid-column: span 2 } .last { grid-column: 3 }</style>\
+             <div class=grid><div class=wide>wide</div><div class=last>last</div>\
+             <div>after</div></div>",
+            300.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        assert_eq!(items[1].rect.x, 0.0);
+        assert_eq!(items[1].rect.width, 200.0, "two tracks and the gap between");
+        assert_eq!(items[2].rect.x, 200.0, "the third line is the third column");
+        assert_eq!(
+            items[2].rect.y, items[1].rect.y,
+            "and it fits on the first row"
+        );
+        assert_eq!(items[3].rect.x, 0.0, "the next item starts a new row");
+        assert!(items[3].rect.y > items[1].rect.y);
+    }
+
+    /// Auto-placement does not go backwards: a cell left free by an item placed
+    /// further along stays free, because filling it is what `grid-auto-flow: dense`
+    /// is for and nobody asked for it.
+    #[test]
+    fn auto_placement_leaves_the_gaps_it_stepped_over() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: repeat(4, 100px) } \
+             .wide { grid-column: span 2 } .last { grid-column: 4 }</style>\
+             <div class=grid><div class=wide>wide</div><div class=last>last</div>\
+             <div>after</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        let after = items[3].rect;
+        assert_eq!(after.x, 0.0);
+        assert!(
+            after.y > items[1].rect.y,
+            "it filled the free cell in the first row instead of starting a new one"
+        );
+    }
+
+    /// `repeat(auto-fill, …)` puts in as many tracks as the container has room for,
+    /// which is what makes a card grid answer to its width without a media query.
+    #[test]
+    fn auto_fill_puts_in_as_many_tracks_as_fit() {
+        let wide = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: repeat(auto-fill, 100px) }</style>\
+             <div class=grid><div>a</div><div>b</div><div>c</div></div>",
+            320.0,
+        );
+        let items = boxes_of(&wide.0, &wide.1, "div");
+        assert_eq!(items[1].rect.y, items[2].rect.y, "three fit across 320px");
+        assert_eq!(items[2].rect.y, items[3].rect.y);
+
+        let narrow = laid_out(
+            "<style>body { margin: 0 } \
+             .grid { display: grid; grid-template-columns: repeat(auto-fill, 100px) }</style>\
+             <div class=grid><div>a</div><div>b</div><div>c</div></div>",
+            220.0,
+        );
+        let items = boxes_of(&narrow.0, &narrow.1, "div");
+        assert_eq!(items[1].rect.y, items[2].rect.y, "two fit across 220px");
+        assert!(items[3].rect.y > items[1].rect.y, "and the third wraps");
     }
 
     /// Two margins that meet make one gap, the larger of them.

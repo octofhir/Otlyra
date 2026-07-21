@@ -137,6 +137,54 @@ pub trait PaintTarget {
     fn push_clip_rect(&mut self, transform: Affine, rect: Rect) {
         self.push_layer(BlendMode::default(), 1.0, transform, &rect);
     }
+
+    /// One shaped run, with its edges blurred where `blur` is not zero — a text
+    /// shadow, which is the same run drawn behind itself.
+    ///
+    /// Provided, for the same reason as [`Self::fill_blurred`]: a backend that
+    /// cannot blur draws the run sharp, which is a shadow with a hard edge rather
+    /// than a run of missing text.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph_run(
+        &mut self,
+        font: &FontData,
+        font_size: f32,
+        normalized_coords: &[i16],
+        brush: BrushRef<'_>,
+        blur: f64,
+        transform: Affine,
+        hint: bool,
+        glyphs: &mut dyn Iterator<Item = Glyph>,
+    ) {
+        let _ = blur;
+        self.draw_glyphs(
+            font,
+            font_size,
+            normalized_coords,
+            brush,
+            transform,
+            hint,
+            glyphs,
+        );
+    }
+
+    /// Fill a shape with its edges blurred — CSS `box-shadow`, and later
+    /// `text-shadow` and `filter: blur()`.
+    ///
+    /// Provided rather than required, so a backend that cannot blur is still a
+    /// backend: the default draws the shape sharp, which is a shadow with a hard
+    /// edge rather than no shadow at all. `blur` is the CSS blur radius, which is
+    /// twice the standard deviation the blur is actually done with.
+    fn fill_blurred(
+        &mut self,
+        transform: Affine,
+        brush: BrushRef<'_>,
+        blur: f64,
+        shape: &dyn PaintShape,
+    ) {
+        let _ = blur;
+        self.fill(Fill::NonZero, transform, brush, None, shape);
+    }
 }
 
 /// Compile-time proof that the seam is object safe. If a required method ever gains

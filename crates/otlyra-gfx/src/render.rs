@@ -24,6 +24,13 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
 
             DisplayItem::PopLayer => target.pop_layer(),
 
+            DisplayItem::Blurred {
+                transform,
+                brush,
+                blur,
+                shape,
+            } => target.fill_blurred(*transform, brush.into(), *blur, shape),
+
             DisplayItem::Fill {
                 style,
                 transform,
@@ -47,6 +54,7 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                 brush,
                 transform,
                 hint,
+                blur,
                 glyphs,
             } => {
                 let Some(font) = list.fonts().get(*font) else {
@@ -55,11 +63,12 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                     tracing::error!(?font, "glyph run references a font not in the table");
                     continue;
                 };
-                target.draw_glyphs(
+                target.draw_glyph_run(
                     font,
                     *font_size,
                     normalized_coords,
                     brush.into(),
+                    *blur,
                     *transform,
                     *hint,
                     &mut glyphs.iter().copied(),

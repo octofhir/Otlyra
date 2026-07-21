@@ -21,7 +21,7 @@
 //!    than clipping in the rasterizer, and on a long page it removes most of the
 //!    page.
 
-use otlyra_gfx::kurbo::{Affine, Rect as KurboRect, Shape};
+use otlyra_gfx::kurbo::{Affine, BezPath, Rect as KurboRect, Shape};
 use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList, HitTestId};
 use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
@@ -30,19 +30,152 @@ use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 /// backend's, so a display list and its recording agree.
 const PATH_TOLERANCE: f64 = 0.1;
 
+/// How wide a scrollbar is drawn, in logical pixels.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+
+/// How far a scrollbar sits from the edge it runs along.
+const SCROLLBAR_INSET: f32 = 2.0;
+
+/// The shortest a scrollbar's thumb is drawn, so a very long page still has
+/// something to see and to aim at.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// The scrollbar's thumb.
+const SCROLLBAR_THUMB: Color = Color::from_rgba8(0, 0, 0, 0x59);
+
+/// Where a scrollbar's thumb is, for an area showing `content_height` scrolled to
+/// `scroll` — or `None` when the content fits and there is no scrollbar.
+///
+/// One function, used to draw it and to decide what a press landed on: a scrollbar
+/// that is drawn in one place and grabbed in another is the same bug as a link that
+/// is clickable somewhere else.
+pub fn scrollbar_thumb(area: Rect, content_height: f32, scroll: f32) -> Option<Rect> {
+    let range = content_height - area.height;
+    if range <= 0.5 || area.height <= 0.0 {
+        return None;
+    }
+
+    let visible = (area.height / content_height).clamp(0.0, 1.0);
+    let thumb = (area.height * visible).max(SCROLLBAR_MIN_THUMB.min(area.height));
+    let travel = area.height - thumb;
+    let at = area.y + travel * (scroll / range).clamp(0.0, 1.0);
+    Some(Rect::new(
+        area.right() - SCROLLBAR_WIDTH - SCROLLBAR_INSET,
+        at,
+        SCROLLBAR_WIDTH,
+        thumb,
+    ))
+}
+
+/// How far a scrollbar's thumb travels: the pixels of thumb movement that stand for
+/// the whole of the content.
+pub fn scrollbar_travel(area: Rect, content_height: f32) -> f32 {
+    match scrollbar_thumb(area, content_height, 0.0) {
+        Some(thumb) => (area.height - thumb.height).max(0.0),
+        None => 0.0,
+    }
+}
+
+/// Draw a scrollbar down the right edge of `area`.
+///
+/// Nothing is drawn for content that fits: a scrollbar that says the page cannot
+/// move is noise. The thumb's length is the fraction of the content on screen and
+/// its position is how far through the content that fraction is, which is the whole
+/// of what a scrollbar says.
+fn paint_scrollbar(list: &mut DisplayList, area: Rect, content_height: f32, scroll: f32) {
+    let Some(thumb) = scrollbar_thumb(area, content_height, scroll) else {
+        return;
+    };
+
+    list.push(DisplayItem::Fill {
+        style: Fill::NonZero,
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(SCROLLBAR_THUMB),
+        brush_transform: None,
+        shape: otlyra_gfx::kurbo::RoundedRect::new(
+            f64::from(thumb.x),
+            f64::from(thumb.y),
+            f64::from(thumb.right()),
+            f64::from(thumb.bottom()),
+            f64::from(SCROLLBAR_WIDTH / 2.0),
+        )
+        .to_path(PATH_TOLERANCE),
+    });
+}
+
 /// Build the display list for `tree`, showing the part of the page under
 /// `scroll_y`, at `viewport` logical size.
 pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f32) -> DisplayList {
+    build_display_list_with(
+        tree,
+        &Frame {
+            viewport,
+            scroll_y,
+            ..Frame::default()
+        },
+    )
+}
+
+/// Everything a frame needs beyond the fragments themselves.
+///
+/// A struct rather than four more arguments: what a frame is made of grows, and a
+/// caller that wants only the scroll offset should not have to know about the rest.
+#[derive(Default)]
+pub struct Frame<'a> {
+    /// The size of the visible area, in logical pixels.
+    pub viewport: (f32, f32),
+    /// How far down the page the reader is.
+    pub scroll_y: f32,
+    /// How far each scroll port has been scrolled.
+    pub port_offset: Option<&'a dyn Fn(otlyra_layout::BoxId) -> f32>,
+    /// The decoded picture behind a box, by the address its style names.
+    pub background: Option<&'a dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>>,
+}
+
+/// Build the display list, with each scroll port at the offset the caller says.
+///
+/// The page's own scroll is one argument and a box's is another because they are
+/// different things: the page moves everything, and a scroll port moves only what
+/// is inside it — while the box itself, and the edge it cuts its contents off at,
+/// stay where they are.
+pub fn build_display_list_scrolled(
+    tree: &FragmentTree,
+    viewport: (f32, f32),
+    scroll_y: f32,
+    port_offset: &dyn Fn(otlyra_layout::BoxId) -> f32,
+) -> DisplayList {
+    build_display_list_with(
+        tree,
+        &Frame {
+            viewport,
+            scroll_y,
+            port_offset: Some(port_offset),
+            background: None,
+        },
+    )
+}
+
+/// Build the display list for one frame.
+pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> DisplayList {
+    let (viewport, scroll_y) = (frame.viewport, frame.scroll_y);
+    let port_offset = |id| frame.port_offset.map_or(0.0, |lookup| lookup(id));
     let _span = tracing::info_span!("build_display_list").entered();
     let (width, height) = viewport;
     let mut list = DisplayList::new();
 
-    // The canvas itself. The initial containing block's background paints over the
-    // whole viewport, not just the height the content happened to need.
+    // The canvas. CSS gives the root element's background to the canvas rather than
+    // to the element: it covers the whole viewport however short the document is,
+    // and the element does not paint it a second time — which is what lets a box
+    // with a negative `z-index` show through from under the flow.
+    let root_element = tree.root.children.first();
+    let canvas = root_element
+        .map(|element| element.style.background_color)
+        .filter(|colour| colour.components[3] > 0.0)
+        .unwrap_or(tree.root.style.background_color);
     list.push(DisplayItem::Fill {
         style: Fill::NonZero,
         transform: Affine::IDENTITY,
-        brush: Brush::Solid(tree.root.style.background_color),
+        brush: Brush::Solid(canvas),
         brush_transform: None,
         shape: KurboRect::new(0.0, 0.0, f64::from(width), f64::from(height))
             .to_path(PATH_TOLERANCE),
@@ -50,13 +183,49 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
 
     let scrolled = Rect::new(0.0, scroll_y, width, height);
     let screen = Rect::new(0.0, 0.0, width, height);
-    for fragment in tree.visible(&scrolled, &screen) {
+
+    // Painting order is the tree's, and then the layers': everything in the flow,
+    // then whatever a `position` and a `z-index` lifted above it or pushed below.
+    // A stable sort, so that within one layer document order still decides.
+    let mut visible: Vec<&Fragment> = tree.visible(&scrolled, &screen).collect();
+    visible.sort_by_key(|fragment| fragment.layer);
+
+    for fragment in visible {
         // The initial containing block was painted as the canvas above; painting it
         // again would put a second full-viewport fill in every frame.
         if std::ptr::eq(fragment, &tree.root) {
             continue;
         }
-        paint(fragment, scroll_y, &mut list);
+        // The root element's background went to the canvas with it.
+        let is_root_element = root_element.is_some_and(|root| std::ptr::eq(fragment, root));
+        let inside = fragment.scroll_port.map_or(0.0, &port_offset);
+        paint(
+            fragment,
+            scroll_y + inside,
+            scroll_y,
+            height,
+            is_root_element,
+            frame.background,
+            &mut list,
+        );
+    }
+
+    // Scrollbars last, over everything: the page's, and one for each port that has
+    // more to show than it can.
+    paint_scrollbar(
+        &mut list,
+        Rect::new(0.0, 0.0, width, height),
+        tree.content_height(),
+        scroll_y,
+    );
+    for port in &tree.scroll_ports {
+        let offset = port_offset(port.id);
+        let mut area = port.port;
+        area.y -= scroll_y;
+        if area.bottom() < 0.0 || area.y > height {
+            continue;
+        }
+        paint_scrollbar(&mut list, area, port.content_height, offset);
     }
 
     tracing::debug!(items = list.len(), "display list built");
@@ -65,11 +234,64 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
 
 /// One fragment's own drawing. Children are visited by the caller's walk, so this
 /// never recurses — a fragment whose parent was culled may still be visible.
-fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
-    let rect = fragment.rect;
+/// `scroll_y` moves this fragment; `page_scroll` moves the page. They differ by
+/// however far the scroll port this fragment is inside has been scrolled — and the
+/// edge that port cuts its contents off at moves with the page, not with them.
+#[allow(clippy::too_many_arguments)]
+fn paint(
+    fragment: &Fragment,
+    scroll_y: f32,
+    page_scroll: f32,
+    viewport_height: f32,
+    background_on_canvas: bool,
+    background_picture: Option<&dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>>,
+    list: &mut DisplayList,
+) {
+    // A sticky box moves with the page until the scroll would take it past its
+    // inset, and then holds there until its container runs out from under it.
+    let rect = match fragment.sticky {
+        Some(sticky) => {
+            let mut rect = fragment.rect;
+            rect.y += sticky_shift(sticky, scroll_y, viewport_height);
+            rect
+        }
+        None => fragment.rect,
+    };
     // A fixed fragment is already in screen coordinates: it stays where it is
     // however far the page has been scrolled.
     let scroll_y = if fragment.fixed { 0.0 } else { scroll_y };
+
+    // Whatever an ancestor cuts this fragment off at, as a layer around its own
+    // drawing. One layer per fragment rather than one around a subtree, because the
+    // walk is flat: a fragment carries the rectangle it is cut off at, so the two
+    // cannot disagree about where the edge is.
+    // The clip belongs to the box rather than to what is inside it, so it does not
+    // move when the port is scrolled: only the contents do.
+    let clip_scroll = if fragment.scroll_port.is_some() {
+        page_scroll
+    } else {
+        scroll_y
+    };
+    // Every fragment inside a clipping box is clipped, without asking whether it
+    // needs to be. It was asked once — whether the fragment fits inside the
+    // rectangle — and that was wrong the moment the box scrolled: a fragment that
+    // fits where the flow put it does not fit once it has been moved, and the
+    // answer was computed before the move.
+    let clip = fragment.clip;
+    if let Some(clip) = clip {
+        list.push(DisplayItem::PushLayer {
+            blend: otlyra_gfx::peniko::BlendMode::default(),
+            alpha: 1.0,
+            transform: Affine::IDENTITY,
+            clip: KurboRect::new(
+                f64::from(clip.x),
+                f64::from(clip.y - clip_scroll),
+                f64::from(clip.right()),
+                f64::from(clip.bottom() - clip_scroll),
+            )
+            .to_path(PATH_TOLERANCE),
+        });
+    }
     let origin = Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)));
 
     // Hit testing is a display list too, emitted into the same sequence as the
@@ -92,21 +314,77 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
 
     match &fragment.kind {
         FragmentKind::Box => {
+            // Shadows first: they are behind the box that casts them, and behind
+            // each other in the order CSS paints them.
+            for shadow in &fragment.style.shadows {
+                if shadow.color.components[3] <= 0.0 {
+                    continue;
+                }
+                let cast = Rect::new(
+                    rect.x + shadow.x - shadow.spread,
+                    rect.y + shadow.y - shadow.spread,
+                    (rect.width + shadow.spread * 2.0).max(0.0),
+                    (rect.height + shadow.spread * 2.0).max(0.0),
+                );
+                list.push(DisplayItem::Blurred {
+                    transform: Affine::IDENTITY,
+                    brush: Brush::Solid(shadow.color),
+                    blur: f64::from(shadow.blur),
+                    shape: shape_with_radii(cast, scroll_y, &fragment.style, shadow.spread),
+                });
+            }
+
             let background = fragment.style.background_color;
             // Transparent is the initial value, so most boxes paint nothing at all.
-            if background.components[3] > 0.0 {
+            if background.components[3] > 0.0 && !background_on_canvas {
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
                     transform: Affine::IDENTITY,
                     brush: Brush::Solid(background),
                     brush_transform: None,
-                    shape: KurboRect::new(
+                    shape: box_shape(rect, scroll_y, &fragment.style),
+                });
+            }
+
+            // A picture behind the box, over the colour and under the gradient —
+            // which is the order CSS layers them in, topmost written first.
+            if let Some(url) = fragment.style.background_image.as_deref()
+                && !background_on_canvas
+                && let Some(lookup) = background_picture
+                && let Some(picture) = lookup(url)
+                && picture.width > 0
+                && picture.height > 0
+                && rect.width > 0.0
+                && rect.height > 0.0
+            {
+                let (width, height) = background_extent(&fragment.style, rect, &picture);
+                let scale = Affine::scale_non_uniform(
+                    f64::from(width) / f64::from(picture.width),
+                    f64::from(height) / f64::from(picture.height),
+                );
+                list.push(DisplayItem::Image {
+                    image: otlyra_gfx::ImageResource::from(picture),
+                    sampler: otlyra_gfx::peniko::ImageSampler::default(),
+                    transform: Affine::translate((
                         f64::from(rect.x),
                         f64::from(rect.y - scroll_y),
-                        f64::from(rect.right()),
-                        f64::from(rect.bottom() - scroll_y),
-                    )
-                    .to_path(PATH_TOLERANCE),
+                    )) * scale,
+                    clip_rect: None,
+                });
+            }
+
+            // The gradient goes over the colour, which is the order CSS paints them
+            // in: a box may name both, and the colour is what shows through where
+            // the gradient is transparent.
+            if let Some(gradient) = fragment.style.background_gradient.as_ref()
+                && !background_on_canvas
+            {
+                list.push(DisplayItem::Fill {
+                    style: Fill::NonZero,
+                    transform: Affine::IDENTITY,
+                    brush: Brush::Gradient(gradient_brush(gradient, rect, scroll_y)),
+                    brush_transform: None,
+                    shape: box_shape(rect, scroll_y, &fragment.style),
                 });
             }
 
@@ -115,10 +393,9 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
 
         FragmentKind::Line => {}
 
-        FragmentKind::Image(image) => {
-            if rect.width <= 0.0 || rect.height <= 0.0 || image.width == 0 || image.height == 0 {
-                return;
-            }
+        FragmentKind::Image(image)
+            if rect.width > 0.0 && rect.height > 0.0 && image.width > 0 && image.height > 0 =>
+        {
             // The image carries its own pixel size, so the transform is what makes
             // it the size the page asked for: a scale to the fragment, then a move
             // to where the fragment is.
@@ -138,11 +415,9 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
             });
         }
 
-        FragmentKind::Text(run) => {
-            if run.glyphs.is_empty() {
-                return;
-            }
+        FragmentKind::Image(_) => {}
 
+        FragmentKind::Text(run) if !run.glyphs.is_empty() => {
             // Decorations first, so the glyphs sit on top of them: a line drawn
             // over text is a strikethrough whatever it was meant to be. The offset
             // and thickness come from the font, by way of the shaper.
@@ -167,6 +442,25 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                 });
             }
 
+            // The text's own shadows, behind it: the same glyphs, moved and
+            // softened. A shadow has no spread — there is nothing to grow but the
+            // letters themselves.
+            for shadow in &fragment.style.text_shadows {
+                if shadow.color.components[3] <= 0.0 {
+                    continue;
+                }
+                list.push_glyph_run(
+                    &run.font,
+                    run.font_size,
+                    run.normalized_coords.clone(),
+                    Brush::Solid(shadow.color),
+                    origin * Affine::translate((f64::from(shadow.x), f64::from(shadow.y))),
+                    true,
+                    f64::from(shadow.blur),
+                    run.glyphs.clone(),
+                );
+            }
+
             list.push_glyphs(
                 &run.font,
                 run.font_size,
@@ -177,7 +471,185 @@ fn paint(fragment: &Fragment, scroll_y: f32, list: &mut DisplayList) {
                 run.glyphs.clone(),
             );
         }
+
+        FragmentKind::Text(_) => {}
     }
+
+    if clip.is_some() {
+        list.push(DisplayItem::PopLayer);
+    }
+}
+
+/// How far a sticky box has been pushed from where the flow put it.
+///
+/// Zero until the page has scrolled far enough to take it past its inset, then
+/// however much keeps it there — and never so far that it leaves its container,
+/// which is what makes a sticky heading hand over to the next one.
+fn sticky_shift(
+    sticky: otlyra_layout::fragment::Sticky,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> f32 {
+    let own = sticky.own;
+    let container = sticky.container;
+
+    if let Some(top) = sticky.top {
+        let wanted = scroll_y + top - own.y;
+        let room = (container.bottom() - own.bottom()).max(0.0);
+        return wanted.clamp(0.0, room);
+    }
+    if let Some(bottom) = sticky.bottom {
+        let wanted = (scroll_y + viewport_height - bottom) - own.bottom();
+        let room = (container.y - own.y).min(0.0);
+        return wanted.clamp(room, 0.0);
+    }
+    0.0
+}
+
+/// How large a background picture is drawn.
+///
+/// `cover` and `contain` are the two that need the picture's own proportions:
+/// one fills the box and is cropped, the other fits inside it whole. Neither
+/// tiles — repeating is a gap stated in the plan rather than a shape guessed at.
+fn background_extent(
+    style: &otlyra_css::ComputedStyle,
+    rect: Rect,
+    picture: &otlyra_gfx::peniko::ImageData,
+) -> (f32, f32) {
+    let (own_width, own_height) = (picture.width as f32, picture.height as f32);
+    let ratio = own_width / own_height.max(1.0);
+
+    match style.background_size {
+        otlyra_css::BackgroundSize::Auto => (own_width, own_height),
+        otlyra_css::BackgroundSize::Fixed(width, height) => {
+            (width.resolve(rect.width), height.resolve(rect.width))
+        }
+        otlyra_css::BackgroundSize::Cover => {
+            if rect.width / rect.height.max(1.0) > ratio {
+                (rect.width, rect.width / ratio)
+            } else {
+                (rect.height * ratio, rect.height)
+            }
+        }
+        otlyra_css::BackgroundSize::Contain => {
+            if rect.width / rect.height.max(1.0) > ratio {
+                (rect.height * ratio, rect.height)
+            } else {
+                (rect.width, rect.width / ratio)
+            }
+        }
+    }
+}
+
+/// The gradient a box's background is painted with, as a line across that box.
+///
+/// CSS gives the angle clockwise from pointing up, and the line is as long as the
+/// box needs for the gradient to cover its corners — which is what makes a diagonal
+/// gradient reach the ones it points at rather than stopping short of them.
+fn gradient_brush(
+    gradient: &otlyra_css::Gradient,
+    rect: Rect,
+    scroll_y: f32,
+) -> otlyra_gfx::peniko::Gradient {
+    use otlyra_gfx::kurbo::Point;
+
+    let (width, height) = (f64::from(rect.width), f64::from(rect.height));
+    let centre = Point::new(
+        f64::from(rect.x) + width / 2.0,
+        f64::from(rect.y - scroll_y) + height / 2.0,
+    );
+
+    // Up is negative y on the screen and zero degrees in CSS, and the angle turns
+    // clockwise; the length is the specification's own, the projection of the box
+    // onto the line.
+    let angle = f64::from(gradient.angle);
+    let (sin, cos) = angle.sin_cos();
+    let length = (width * sin.abs() + height * cos.abs()) / 2.0;
+    let along = Point::new(sin * length, -cos * length);
+
+    let mut brush = otlyra_gfx::peniko::Gradient::new_linear(
+        Point::new(centre.x - along.x, centre.y - along.y),
+        Point::new(centre.x + along.x, centre.y + along.y),
+    );
+    for stop in &gradient.stops {
+        brush.stops.push(otlyra_gfx::peniko::ColorStop {
+            offset: stop.at,
+            color: stop.color.into(),
+        });
+    }
+    brush
+}
+
+/// The outline of a box: a rectangle, or a rounded one where `border-radius` says.
+///
+/// One radius per corner rather than an ellipse's two, and the radii are scaled
+/// down together if they overlap — which is the rule CSS gives for a box asked for
+/// rounder corners than it has room for.
+fn box_shape(rect: Rect, scroll_y: f32, style: &otlyra_css::ComputedStyle) -> BezPath {
+    shape_with_radii(rect, scroll_y, style, 0.0)
+}
+
+/// The same outline, grown by `spread` at every corner as well as every edge.
+///
+/// A shadow spread outwards is not the box's own curve moved: the specification
+/// grows each non-zero radius by the spread, so the shadow of a rounded box stays
+/// the same shape rather than turning into a rounded rectangle with tighter corners.
+fn shape_with_radii(
+    rect: Rect,
+    scroll_y: f32,
+    style: &otlyra_css::ComputedStyle,
+    spread: f32,
+) -> BezPath {
+    let bounds = KurboRect::new(
+        f64::from(rect.x),
+        f64::from(rect.y - scroll_y),
+        f64::from(rect.right()),
+        f64::from(rect.bottom() - scroll_y),
+    );
+
+    if !style.radius.any() {
+        return bounds.to_path(PATH_TOLERANCE);
+    }
+
+    let corner = |value: otlyra_css::Length| {
+        let radius = value.resolve(rect.width);
+        if radius <= 0.0 {
+            // A square corner stays square however far the shadow spreads.
+            return 0.0;
+        }
+        f64::from((radius + spread).max(0.0))
+    };
+    let mut radii = [
+        corner(style.radius.top_left),
+        corner(style.radius.top_right),
+        corner(style.radius.bottom_right),
+        corner(style.radius.bottom_left),
+    ];
+
+    // Two radii along one edge cannot together be longer than the edge.
+    let width = f64::from(rect.width);
+    let height = f64::from(rect.height);
+    let scale = [
+        (radii[0] + radii[1], width),
+        (radii[2] + radii[3], width),
+        (radii[0] + radii[3], height),
+        (radii[1] + radii[2], height),
+    ]
+    .iter()
+    .filter(|(sum, _)| *sum > 0.0)
+    .map(|(sum, edge)| edge / sum)
+    .fold(1.0_f64, f64::min);
+    if scale < 1.0 {
+        for radius in &mut radii {
+            *radius *= scale;
+        }
+    }
+
+    otlyra_gfx::kurbo::RoundedRect::from_rect(
+        bounds,
+        otlyra_gfx::kurbo::RoundedRectRadii::new(radii[0], radii[1], radii[2], radii[3]),
+    )
+    .to_path(PATH_TOLERANCE)
 }
 
 /// The colour a shaped run carried, back as a paint colour.
@@ -197,6 +669,35 @@ fn paint_borders(
     let border = fragment.style.border;
     let (left, top) = (f64::from(rect.x), f64::from(rect.y - scroll_y));
     let (right, bottom) = (f64::from(rect.right()), f64::from(rect.bottom() - scroll_y));
+
+    // A rounded box's border follows its corners, which four rectangles cannot do.
+    // One stroke can, as long as every side is the same — and a border that is
+    // rounded and different on each side is a shape CSS defines and nobody writes.
+    let uniform =
+        border.top == border.right && border.right == border.bottom && border.bottom == border.left;
+    if fragment.style.radius.any() && uniform {
+        let side = border.top;
+        if !side.is_visible() {
+            return;
+        }
+        let width = f64::from(side.width);
+        // Strokes straddle the path, so the path is inset by half the width to put
+        // the whole of it inside the box — where CSS draws it.
+        let inset = otlyra_layout::Rect::new(
+            rect.x + side.width / 2.0,
+            rect.y + side.width / 2.0,
+            (rect.width - side.width).max(0.0),
+            (rect.height - side.width).max(0.0),
+        );
+        list.push(DisplayItem::Stroke {
+            style: otlyra_gfx::kurbo::Stroke::new(width),
+            transform: Affine::IDENTITY,
+            brush: Brush::Solid(side.color),
+            brush_transform: None,
+            shape: box_shape(inset, scroll_y, &fragment.style),
+        });
+        return;
+    }
 
     let sides = [
         (
@@ -322,6 +823,393 @@ mod tests {
             },
         );
         build_display_list(&fragments, (800.0, 600.0), scroll_y)
+    }
+
+    /// The order the fills come out in, by colour, which is the painting order.
+    fn fill_order(list: &DisplayList) -> Vec<Color> {
+        list.items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    ..
+                } => Some(*colour),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A positioned box paints over the boxes it overlaps, whatever document order
+    /// says; `z-index` moves it further up, or below the flow entirely.
+    #[test]
+    fn a_positioned_box_paints_above_the_flow_and_z_index_moves_it() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let blue = Color::from_rgb8(0, 0, 255);
+
+        // The positioned box is written first, so document order alone would paint
+        // it under the one after it.
+        let over = fill_order(&styled_page(
+            "<style>body { margin: 0 } div { height: 50px }              .a { position: relative; background: rgb(255, 0, 0) }              .b { background: rgb(0, 0, 255) }</style>             <div class=a></div><div class=b></div>",
+            0.0,
+        ));
+        let (red_at, blue_at) = (
+            over.iter().position(|colour| *colour == red),
+            over.iter().position(|colour| *colour == blue),
+        );
+        assert!(
+            red_at > blue_at,
+            "the positioned box painted under the flow"
+        );
+
+        let under = fill_order(&styled_page(
+            "<style>body { margin: 0 } div { height: 50px }              .a { position: relative; z-index: -1; background: rgb(255, 0, 0) }              .b { background: rgb(0, 0, 255) }</style>             <div class=a></div><div class=b></div>",
+            0.0,
+        ));
+        assert!(
+            under.iter().position(|colour| *colour == red)
+                < under.iter().position(|colour| *colour == blue),
+            "a negative z-index must paint below the flow"
+        );
+    }
+
+    /// The same for an absolutely positioned box, which takes a different path
+    /// through layout than a relative one.
+    #[test]
+    fn an_absolute_box_with_a_negative_z_index_paints_under_the_flow() {
+        let order = fill_order(&styled_page(
+            "<style>body { margin: 0 } .row { position: relative; height: 90px }              .flow { height: 90px; background: rgb(0, 0, 255) }              .under { position: absolute; left: 20px; top: 20px; width: 100px;              height: 40px; background: rgb(255, 0, 0); z-index: -1 }</style>             <div class=row><div class=flow>flow</div><div class=under>under</div></div>",
+            0.0,
+        ));
+        let red = order.iter().position(|c| *c == Color::from_rgb8(255, 0, 0));
+        let blue = order.iter().position(|c| *c == Color::from_rgb8(0, 0, 255));
+        assert!(red.is_some() && blue.is_some(), "both boxes painted");
+        assert!(red < blue, "the negative z-index painted over the flow");
+    }
+
+    /// The root element's background belongs to the canvas, not to the element:
+    /// it covers the viewport however short the document is, and it is not painted
+    /// a second time over whatever a negative `z-index` put below the flow.
+    #[test]
+    fn the_root_background_is_the_canvas_and_is_painted_once() {
+        let list = styled_page(
+            "<style>html { background: rgb(0, 128, 0) } \
+             .below { position: relative; z-index: -1; background: rgb(255, 0, 0); \
+             height: 40px }</style><div class=below>below</div>",
+            0.0,
+        );
+        let greens: Vec<_> = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    shape,
+                    ..
+                } if *colour == Color::from_rgb8(0, 128, 0) => Some(shape.bounding_box()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(greens.len(), 1, "the root background was painted twice");
+        assert_eq!(
+            greens[0].y1, 600.0,
+            "and not only as far as the content goes"
+        );
+        assert!(
+            fill_order(&list)
+                .iter()
+                .position(|colour| *colour == Color::from_rgb8(255, 0, 0))
+                > Some(0),
+            "the box below the flow still paints over the canvas"
+        );
+    }
+
+    /// `overflow: hidden` cuts its contents off, which reaches the rasterizer as a
+    /// clip layer around whatever is inside the box — and every layer pushed is
+    /// popped, or everything after it would be clipped too.
+    #[test]
+    fn a_clipping_box_wraps_its_contents_in_a_layer() {
+        let list = styled_page(
+            "<style>body { margin: 0 } \
+             .card { overflow: hidden; height: 40px; width: 100px } \
+             .tall { height: 200px; background: rgb(255, 0, 0) }</style>\
+             <div class=card><div class=tall>tall</div></div>",
+            0.0,
+        );
+
+        let mut depth = 0i32;
+        let mut deepest = 0i32;
+        let mut clips = Vec::new();
+        for item in list.items() {
+            match item {
+                DisplayItem::PushLayer { clip, .. } => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                    clips.push(clip.bounding_box());
+                }
+                DisplayItem::PopLayer => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "a layer was popped that was never pushed");
+        }
+
+        assert_eq!(depth, 0, "a layer was left open");
+        assert!(deepest > 0, "nothing was clipped");
+        assert_eq!(clips[0].y1, 40.0, "cut off at the box, not at its contents");
+    }
+
+    /// A scrollbar says two things and nothing else: how much of the content is on
+    /// screen, and how far through it the reader is. Content that fits gets none.
+    #[test]
+    fn a_scrollbar_shows_where_the_reader_is_and_only_when_there_is_somewhere_to_go() {
+        let thumb = |list: &DisplayList| -> Option<otlyra_gfx::kurbo::Rect> {
+            list.items()
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::Fill {
+                        brush: Brush::Solid(colour),
+                        shape,
+                        ..
+                    } if *colour == SCROLLBAR_THUMB => Some(shape.bounding_box()),
+                    _ => None,
+                })
+                .next_back()
+        };
+
+        let short = "<style>body { margin: 0 } p { height: 100px }</style><p>short</p>";
+        assert!(
+            thumb(&styled_page(short, 0.0)).is_none(),
+            "a page that fits was given a scrollbar"
+        );
+
+        let long = "<style>body { margin: 0 } p { height: 3000px }</style><p>long</p>";
+        let at_top = thumb(&styled_page(long, 0.0)).expect("a scrollbar");
+        let further = thumb(&styled_page(long, 1000.0)).expect("a scrollbar");
+
+        assert!(
+            at_top.y0.abs() < 0.01,
+            "at the top of the page it is at the top"
+        );
+        assert!(further.y0 > at_top.y0, "it did not move with the reader");
+        assert!(
+            at_top.height() < 600.0 / 4.0,
+            "a fifth of the content on screen should be a short thumb"
+        );
+        assert!(at_top.x1 <= 800.0, "it is drawn inside the viewport");
+    }
+
+    /// `border-radius` rounds the background and the border together, and a radius
+    /// larger than the box is scaled down rather than folding over itself.
+    #[test]
+    fn a_rounded_box_is_drawn_round() {
+        use otlyra_gfx::kurbo::PathEl;
+
+        let curves = |html: &str| -> usize {
+            styled_page(html, 0.0)
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::Fill { shape, .. } | DisplayItem::Stroke { shape, .. } => {
+                        Some(shape)
+                    }
+                    _ => None,
+                })
+                .flat_map(|shape| shape.elements())
+                .filter(|element| matches!(element, PathEl::CurveTo(..) | PathEl::QuadTo(..)))
+                .count()
+        };
+
+        let square = "<style>body { margin: 0 } div { background: rgb(0, 0, 255); height: 40px }                      </style><div></div>";
+        let round = "<style>body { margin: 0 } div { background: rgb(0, 0, 255); height: 40px;                      border-radius: 8px }</style><div></div>";
+        assert_eq!(curves(square), 0, "a square box has no curves in it");
+        assert!(curves(round) > 0, "a rounded one does");
+
+        // A pill: the radius is larger than the box and has to be scaled down, or
+        // the corners would overlap and the path would fold over itself.
+        let pill = "<style>body { margin: 0 } div { background: rgb(0, 0, 255); height: 40px;                     width: 100px; border-radius: 999px }</style><div></div>";
+        let bounds = styled_page(pill, 0.0)
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    shape,
+                    ..
+                } if *colour == Color::from_rgb8(0, 0, 255) => Some(shape.bounding_box()),
+                _ => None,
+            })
+            .expect("the box");
+        assert_eq!(bounds.width(), 100.0, "it is still the size it was");
+        assert_eq!(bounds.height(), 40.0);
+    }
+
+    /// A gradient background reaches the rasterizer as a gradient, with its stops
+    /// in order and its line pointing where CSS says.
+    #[test]
+    fn a_gradient_background_is_painted_as_one() {
+        let gradient = |css: &str| {
+            let html = format!(
+                "<style>body {{ margin: 0 }} div {{ height: 100px; width: 200px; \
+                 background: {css} }}</style><div></div>"
+            );
+            styled_page(&html, 0.0)
+                .items()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Fill {
+                        brush: Brush::Gradient(gradient),
+                        ..
+                    } => Some(gradient.clone()),
+                    _ => None,
+                })
+                .expect("a gradient")
+        };
+
+        let down = gradient("linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255))");
+        assert_eq!(down.stops.len(), 2);
+        assert_eq!(down.stops[0].offset, 0.0);
+        assert_eq!(down.stops[1].offset, 1.0);
+        let otlyra_gfx::peniko::GradientKind::Linear(line) = down.kind else {
+            panic!("a linear gradient");
+        };
+        assert!(line.end.y > line.start.y, "the default runs down the box");
+        assert!(
+            (line.start.x - line.end.x).abs() < 0.01,
+            "and straight down, not across"
+        );
+
+        let across = gradient("linear-gradient(to right, rgb(255, 0, 0), rgb(0, 0, 255))");
+        let otlyra_gfx::peniko::GradientKind::Linear(line) = across.kind else {
+            panic!("a linear gradient");
+        };
+        assert!(line.end.x > line.start.x, "to right runs across the box");
+        assert!((line.start.y - line.end.y).abs() < 0.01);
+
+        // Stops without a position are spread evenly.
+        let three = gradient("linear-gradient(rgb(255,0,0), rgb(0,255,0), rgb(0,0,255))");
+        assert_eq!(three.stops.len(), 3);
+        assert!((three.stops[1].offset - 0.5).abs() < 0.001);
+    }
+
+    /// A shadow is drawn behind the box that casts it, offset and blurred as the
+    /// page asked, and a spread grows its corners with it.
+    #[test]
+    fn a_box_shadow_is_cast_behind_the_box() {
+        let list = styled_page(
+            "<style>body { margin: 0 } \
+             div { height: 40px; width: 100px; background: rgb(0, 128, 0); \
+             border-radius: 6px; box-shadow: 4px 8px 12px 2px rgb(0, 0, 0) }</style>\
+             <div></div>",
+            0.0,
+        );
+
+        let (blur, bounds) = list
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Blurred { shape, blur, .. } => Some((*blur, shape.bounding_box())),
+                _ => None,
+            })
+            .expect("a shadow");
+
+        assert_eq!(blur, 12.0, "the CSS radius reaches the rasterizer as it is");
+        // Offset by four and eight, grown by two on every side.
+        assert_eq!(bounds.x0, 2.0);
+        assert_eq!(bounds.y0, 6.0);
+        assert_eq!(bounds.width(), 104.0);
+        assert_eq!(bounds.height(), 44.0);
+
+        // Behind the box: the shadow comes first in the list.
+        let shadow_index = list
+            .items()
+            .iter()
+            .position(|item| matches!(item, DisplayItem::Blurred { .. }))
+            .expect("a shadow");
+        let background = list
+            .items()
+            .iter()
+            .position(|item| {
+                matches!(item, DisplayItem::Fill { brush: Brush::Solid(colour), .. }
+                    if *colour == Color::from_rgb8(0, 128, 0))
+            })
+            .expect("the background");
+        assert!(shadow_index < background, "the shadow painted over its box");
+    }
+
+    /// A text shadow is the same run drawn behind itself, moved and softened.
+    #[test]
+    fn text_shadows_are_drawn_behind_the_text() {
+        let list = styled_page(
+            "<style>body { margin: 0 } \
+             p { color: rgb(0, 0, 0); text-shadow: 2px 3px 4px rgb(255, 0, 0) }</style>\
+             <p>text</p>",
+            0.0,
+        );
+
+        let runs: Vec<_> = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Glyphs {
+                    brush: Brush::Solid(colour),
+                    transform,
+                    blur,
+                    ..
+                } => Some((*colour, transform.as_coeffs(), *blur)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(runs.len(), 2, "one shadow and the text itself");
+        let (shadow, shadow_at, blur) = runs[0];
+        let (text, text_at, text_blur) = runs[1];
+
+        assert_eq!(
+            shadow,
+            Color::from_rgb8(255, 0, 0),
+            "the shadow comes first"
+        );
+        assert_eq!(text, Color::from_rgb8(0, 0, 0));
+        assert_eq!(blur, 4.0);
+        assert_eq!(text_blur, 0.0, "the text itself is not blurred");
+        assert_eq!(shadow_at[4] - text_at[4], 2.0, "moved right by two");
+        assert_eq!(shadow_at[5] - text_at[5], 3.0, "and down by three");
+    }
+
+    /// A sticky heading rides with the page, stops at its inset, and is carried off
+    /// the top when its section runs out.
+    #[test]
+    fn a_sticky_box_stops_at_its_inset_and_leaves_with_its_container() {
+        let green = Color::from_rgb8(0, 128, 0);
+        // The heading starts 60px down its section, so at rest it is below its
+        // inset and has nothing to stick to yet.
+        let html = "<style>body { margin: 0 }                     section { height: 400px; padding-top: 60px }                     h2 { position: sticky; top: 10px; height: 30px; margin: 0;                     background: rgb(0, 128, 0) }                     p { height: 300px; margin: 0 }</style>                    <section><h2>one</h2><p>body</p></section>                    <section><h2>two</h2><p>body</p></section>";
+
+        let heading_tops = |scroll: f32| -> Vec<f64> {
+            styled_page(html, scroll)
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::Fill { brush, shape, .. } if *brush == Brush::Solid(green) => {
+                        Some(shape.bounding_box().y0)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(heading_tops(0.0).first().copied(), Some(60.0), "at rest");
+        assert_eq!(
+            heading_tops(100.0).first().copied(),
+            Some(10.0),
+            "held at its inset while its section is still under it"
+        );
+        // Far enough down that the first section has nearly gone: the heading is
+        // pushed back off the top rather than following the reader forever.
+        assert!(
+            heading_tops(430.0).first().copied().expect("the heading") < 10.0,
+            "its container ran out and did not take it with it"
+        );
     }
 
     /// A fixed box stays on screen while the page moves under it — which is the

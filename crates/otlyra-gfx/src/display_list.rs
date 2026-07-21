@@ -47,6 +47,17 @@ pub enum DisplayItem {
     },
     /// End the most recent compositing group.
     PopLayer,
+    /// Fill a shape with a blurred edge: a shadow.
+    Blurred {
+        /// Transform applied to `shape`.
+        transform: Affine,
+        /// Paint.
+        brush: Brush,
+        /// The CSS blur radius, twice the standard deviation of the blur itself.
+        blur: f64,
+        /// Geometry.
+        shape: BezPath,
+    },
     /// Fill a shape.
     Fill {
         /// Fill rule.
@@ -87,6 +98,8 @@ pub enum DisplayItem {
         transform: Affine,
         /// Whether to grid fit.
         hint: bool,
+        /// The CSS blur radius, for a run drawn as a shadow. Zero for ordinary text.
+        blur: f64,
         /// The glyphs, in visual order.
         glyphs: Vec<Glyph>,
     },
@@ -321,6 +334,7 @@ impl DisplayList {
         for item in &mut self.items {
             match item {
                 DisplayItem::PushLayer { transform: t, .. }
+                | DisplayItem::Blurred { transform: t, .. }
                 | DisplayItem::Fill { transform: t, .. }
                 | DisplayItem::Stroke { transform: t, .. }
                 | DisplayItem::Glyphs { transform: t, .. }
@@ -343,6 +357,34 @@ impl DisplayList {
         hint: bool,
         glyphs: Vec<Glyph>,
     ) {
+        self.push_glyph_run(
+            font,
+            font_size,
+            normalized_coords,
+            brush,
+            transform,
+            hint,
+            0.0,
+            glyphs,
+        );
+    }
+
+    /// Append a glyph run with its edges blurred: a text shadow.
+    ///
+    /// `blur` is the CSS blur radius. Zero is the same as [`Self::push_glyphs`],
+    /// which is what it delegates to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_glyph_run(
+        &mut self,
+        font: &FontData,
+        font_size: f32,
+        normalized_coords: Vec<i16>,
+        brush: Brush,
+        transform: Affine,
+        hint: bool,
+        blur: f64,
+        glyphs: Vec<Glyph>,
+    ) {
         let font = self.fonts.intern(font);
         self.items.push(DisplayItem::Glyphs {
             font,
@@ -351,8 +393,55 @@ impl DisplayList {
             brush,
             transform,
             hint,
+            blur,
             glyphs,
         });
+    }
+
+    /// Append another list's items to this one, in paint order.
+    ///
+    /// Fonts are re-interned rather than copied across, because a `FontId` names
+    /// a row in *its own* list's table: moving a glyph run without remapping it
+    /// would draw whatever font happened to sit at that index here. This is what
+    /// lets a surface keep the list it built last frame and hand it to a frame
+    /// it did not build — the whole point of not rebuilding an interface that
+    /// has not changed.
+    pub fn append(&mut self, other: &Self) {
+        self.items.reserve(other.items.len());
+        for item in &other.items {
+            match item {
+                DisplayItem::Glyphs {
+                    font,
+                    font_size,
+                    normalized_coords,
+                    brush,
+                    transform,
+                    hint,
+                    blur,
+                    glyphs,
+                } => {
+                    let Some(data) = other.fonts.get(*font) else {
+                        // A run naming a font its own list does not have is a
+                        // list built wrong; dropping the run loses text, and
+                        // keeping it would draw the wrong face.
+                        tracing::warn!(?font, "glyph run names a font its list has not interned");
+                        continue;
+                    };
+                    let font = self.fonts.intern(data);
+                    self.items.push(DisplayItem::Glyphs {
+                        blur: *blur,
+                        font,
+                        font_size: *font_size,
+                        normalized_coords: normalized_coords.clone(),
+                        brush: brush.clone(),
+                        transform: *transform,
+                        hint: *hint,
+                        glyphs: glyphs.clone(),
+                    });
+                }
+                other => self.items.push(other.clone()),
+            }
+        }
     }
 
     /// Hit-test regions, innermost last, in the order they were emitted.
@@ -380,6 +469,93 @@ const _: () = {
     let _ = assert_send::<DisplayList>;
     let _ = assert_sync::<DisplayList>;
 };
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+    use kurbo::Shape;
+
+    fn a_font() -> FontData {
+        FontData::new(
+            peniko::Blob::new(std::sync::Arc::new(vec![1u8, 2, 3, 4])),
+            0,
+        )
+    }
+
+    fn another_font() -> FontData {
+        FontData::new(peniko::Blob::new(std::sync::Arc::new(vec![9u8, 9, 9])), 0)
+    }
+
+    /// A glyph run names its font by an index into its own list's table. Moving
+    /// a run to a list whose table holds something else at that index has to
+    /// remap it, or the text is drawn in whatever face happened to be there.
+    #[test]
+    fn appending_remaps_the_fonts_a_run_names() {
+        let mut destination = DisplayList::new();
+        destination.push_glyphs(
+            &another_font(),
+            12.0,
+            Vec::new(),
+            peniko::Brush::Solid(peniko::Color::BLACK),
+            kurbo::Affine::IDENTITY,
+            true,
+            Vec::new(),
+        );
+
+        let mut source = DisplayList::new();
+        source.push_glyphs(
+            &a_font(),
+            13.0,
+            Vec::new(),
+            peniko::Brush::Solid(peniko::Color::BLACK),
+            kurbo::Affine::IDENTITY,
+            true,
+            Vec::new(),
+        );
+
+        destination.append(&source);
+
+        let DisplayItem::Glyphs { font, .. } = destination.items()[1] else {
+            panic!("the appended item is a glyph run");
+        };
+        let landed = destination
+            .fonts()
+            .get(font)
+            .expect("interned on the way in");
+        assert_eq!(
+            landed.data.as_ref(),
+            a_font().data.as_ref(),
+            "the run kept the face it was drawn with"
+        );
+        assert_eq!(
+            destination.fonts().len(),
+            2,
+            "and did not overwrite the other"
+        );
+    }
+
+    #[test]
+    fn appending_keeps_paint_order_and_everything_that_is_not_a_run() {
+        let mut destination = DisplayList::new();
+        destination.push(DisplayItem::PopLayer);
+
+        let mut source = DisplayList::new();
+        source.push(DisplayItem::PushLayer {
+            blend: peniko::BlendMode::default(),
+            alpha: 1.0,
+            transform: kurbo::Affine::IDENTITY,
+            clip: kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1),
+        });
+        source.push(DisplayItem::PopLayer);
+
+        destination.append(&source);
+        assert_eq!(destination.len(), 3);
+        assert!(matches!(
+            destination.items()[1],
+            DisplayItem::PushLayer { .. }
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
