@@ -44,6 +44,7 @@ pub mod bidi;
 pub mod browser;
 pub mod fetcher;
 pub mod inspector;
+pub mod mcp;
 pub mod menu;
 pub mod observability;
 pub mod page;

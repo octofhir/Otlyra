@@ -157,6 +157,42 @@ worth more than a dependency.
 For real work, use a real client. Puppeteer and Selenium both speak BiDi and
 handle reconnection, timeouts and events properly.
 
+## For an agent: the Model Context Protocol
+
+A program driving a browser has a client library. An agent has a list of tools
+and a sentence about each, which is a different shape — and is what MCP is for.
+
+```sh
+claude mcp add otlyra -- /path/to/otlyra --mcp
+```
+
+```
+browser_navigate    Open a page and wait for it to load.
+browser_screenshot  A picture of the page as it is now.
+browser_find        Find elements by CSS selector…
+browser_explain     Why an element looks the way it does…
+browser_highlight   Draw the inspector's overlay over an element…
+browser_act         Click, type or scroll…
+browser_timings     How long each stage of the last frame took…
+```
+
+This is not a second protocol. Every tool is one BiDi command, dispatched
+through the same session against the same browser: nothing in the MCP server
+knows anything about a page that the protocol does not. A second implementation
+of *what is on this page* is the one thing the whole design exists to avoid.
+
+Two things are shaped for an agent rather than for a program:
+
+- A screenshot comes back as an **image**, not as base64 in a string. An agent
+  that can see the page can settle questions no amount of JSON would.
+- A tool that could not do something answers with `isError` and a sentence,
+  rather than with a transport error. The call reached the browser and the
+  browser answered; an agent can read what it said and try something else.
+
+`--mcp` speaks JSON-RPC on stdin and stdout, which is why every diagnostic in
+this program goes to stderr. One stray `println!` would be a parse error in
+somebody's agent.
+
 ## The address
 
 The browser binds the **loopback only**, and prints the address it got on

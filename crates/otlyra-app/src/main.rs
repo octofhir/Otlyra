@@ -121,6 +121,14 @@ struct Cli {
     /// `ws://` address for whatever started this to read.
     #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "9222")]
     bidi: Option<u16>,
+
+    /// Answer the Model Context Protocol on stdin and stdout, and drive nothing
+    /// else.
+    ///
+    /// For an agent, which has no client library but does have a list of tools.
+    /// Every tool is one command against the same browser the protocol drives.
+    #[arg(long)]
+    mcp: bool,
 }
 
 impl Cli {
@@ -171,6 +179,21 @@ fn main() -> ExitCode {
     // Answering the protocol is a mode of its own: a driver navigates, so a
     // document named on the command line would be a page the first command
     // replaces.
+    if cli.mcp {
+        // stdout is the wire from here on. Everything this program says about
+        // itself already goes to stderr, which is what makes that safe.
+        let browser = Browser::new(NetLoader::default());
+        let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
+        let input = std::io::BufReader::new(std::io::stdin().lock());
+        return match otlyra_app::mcp::serve(&mut session, input, std::io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("otlyra: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some(port) = cli.bidi {
         return match serve_bidi(port, &cli) {
             Ok(()) => ExitCode::SUCCESS,
