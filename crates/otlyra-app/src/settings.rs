@@ -166,6 +166,22 @@ impl Settings {
         }
     }
 
+    /// Whether two sets of preferences agree about everything that is saved.
+    ///
+    /// Which is everything except where the caret is, how far the page is
+    /// scrolled and what holds the keyboard: those are how the surface is being
+    /// looked at rather than what the reader has chosen, and writing them to
+    /// disk would make a file that changed every time somebody scrolled.
+    pub fn persisted_eq(&self, other: &Self) -> bool {
+        self.on_start == other.on_start
+            && self.home.text() == other.home.text()
+            && self.load_images == other.load_images
+            && self.run_scripts == other.run_scripts
+            && self.do_not_track == other.do_not_track
+            && self.restore_tabs == other.restore_tabs
+            && (self.text_scale - other.text_scale).abs() < f64::EPSILON
+    }
+
     /// Edit the home field with `key`, if it is a key that edits one.
     ///
     /// Only reached while the field holds the focus, which is why the arrows
@@ -324,7 +340,8 @@ impl Settings {
 
     fn content_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
         let images = controls::toggle(theme, focus, Action::ToggleImages, self.load_images);
-        let scripts = controls::toggle(theme, focus, Action::ToggleScripts, self.run_scripts);
+        let scripts =
+            controls::toggle_enabled(theme, focus, Action::ToggleScripts, self.run_scripts, false);
         // Five at a time, so the keyboard lands on the same values the pointer
         // does — `apply` rounds to fives, and a step that did not would leave
         // the arrow keys moving the slider without moving the number.
@@ -347,14 +364,20 @@ impl Settings {
                 controls::setting_row(
                     theme,
                     "Run scripts",
-                    Some("Execute the JavaScript a page carries."),
+                    // A switch that changed nothing would be a switch that lied.
+                    // What a browser cannot do *yet* is worth saying, and saying
+                    // it here is cheaper than a reader working it out from a
+                    // page that never runs.
+                    Some("There is no script engine yet, so this changes nothing."),
                     scripts,
                 ),
                 controls::divider(theme),
                 controls::setting_row(
                     theme,
                     format!("Text size — {}%", self.text_scale as i64),
-                    Some("Scales the text on every page."),
+                    // The same honesty: the number is kept and saved, and the
+                    // engine has nowhere to be told about it yet.
+                    Some("Saved, but the engine has no way to be told yet."),
                     scale,
                 ),
             ],
@@ -460,6 +483,14 @@ impl Default for SettingsSurface {
 }
 
 impl SettingsSurface {
+    /// A surface over `settings`, which is what a browser hands its saved ones.
+    pub fn with(settings: Settings) -> Self {
+        Self {
+            settings,
+            ..Self::new()
+        }
+    }
+
     /// A surface over default settings.
     pub fn new() -> Self {
         Self {
@@ -850,7 +881,7 @@ mod tests {
 
     /// What every control on the surface reports, in the order Tab reaches them.
     fn traversal() -> Vec<Action> {
-        (1..=14).filter_map(activate_after).collect()
+        (1..=13).filter_map(activate_after).collect()
     }
 
     #[test]
@@ -870,7 +901,9 @@ mod tests {
                 Action::None,
                 Action::ToggleRestoreTabs,
                 Action::ToggleImages,
-                Action::ToggleScripts,
+                // Not `ToggleScripts`: there is no script engine, so that switch
+                // is drawn dimmed and traversal skips it — a control that cannot
+                // be pressed is not a place the keyboard stops.
                 // The slider answers the arrows, not Return.
                 Action::None,
                 Action::ToggleDoNotTrack,
@@ -921,7 +954,7 @@ mod tests {
             pressed.pointer_moved(x, y);
             assert_eq!(pressed.pointer_pressed(), wanted);
 
-            let by_key = (1..=14)
+            let by_key = (1..=13)
                 .filter_map(activate_after)
                 .find(|action| *action == wanted);
             assert_eq!(by_key, Some(wanted), "the keyboard cannot reach it");
@@ -951,8 +984,9 @@ mod tests {
     fn the_arrows_move_a_slider_that_holds_the_keyboard() {
         let mut surface = SettingsSurface::new();
         frame(&mut surface);
-        // The text-size slider is the ninth control down.
-        for _ in 0..9 {
+        // The text-size slider is the eighth control the keyboard stops at —
+        // the ninth thing drawn, with the dimmed scripts switch passed over.
+        for _ in 0..8 {
             surface.key_pressed(Key::Tab, Modifiers::default());
         }
         assert_eq!(surface.settings.text_scale, 100.0);

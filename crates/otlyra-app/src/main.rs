@@ -179,6 +179,35 @@ fn main() -> ExitCode {
     // Answering the protocol is a mode of its own: a driver navigates, so a
     // document named on the command line would be a page the first command
     // replaces.
+    // Nothing was named on the command line, so what happens is what the
+    // preferences say happens.
+    if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
+        let mut browser = Browser::new(NetLoader::default());
+        let start = browser.settings_on_start();
+        if start == otlyra_app::settings::OnStart::Home {
+            browser.go_home();
+        }
+        return match cli.screenshot.as_deref() {
+            Some(path) => match screenshot(&mut browser, &cli, path) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("otlyra: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                open_inspector(&mut browser, &cli);
+                match run_window(window_config(&cli), &mut browser) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("otlyra: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        };
+    }
+
     if cli.mcp {
         // stdout is the wire from here on. Everything this program says about
         // itself already goes to stderr, which is what makes that safe.

@@ -320,7 +320,7 @@ impl Browser {
                 .ok(),
             pointer: (0.0, 0.0),
             cursor: Cursor::Default,
-            settings: SettingsSurface::new(),
+            settings: SettingsSurface::with(crate::preferences::load()),
             inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
         }
@@ -631,6 +631,9 @@ impl Browser {
     /// has been styled — which happens on the way to a frame. This is called after
     /// one, and the pictures arrive for the frame after that.
     fn fetch_backgrounds(&mut self) {
+        if !self.settings.settings.load_images {
+            return;
+        }
         for index in 0..self.tabs.len() {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
@@ -838,6 +841,13 @@ impl Browser {
         // is asking for it once.
         let mut asked: HashMap<String, u64> = HashMap::new();
         for (href, resource, kind) in wanted {
+            // A preference the browser reads where the behaviour lives. Refusing
+            // here rather than dropping the bytes later is what makes it mean
+            // anything: a picture that is fetched and then not shown has already
+            // cost the reader their bandwidth and told the server they were here.
+            if kind == ResourceKind::Image && !self.settings.settings.load_images {
+                continue;
+            }
             let Some(url) = Self::subresource_url(base, &href) else {
                 continue;
             };
@@ -1050,6 +1060,37 @@ impl Browser {
     /// position it was left at. With nothing behind it — the settings opened in
     /// a fresh tab — the tab is emptied instead, because there is nowhere to
     /// return to and staying would make the button do nothing.
+    /// Where the home button and a new window go.
+    pub fn home(&self) -> String {
+        self.settings.settings.home.text().to_owned()
+    }
+
+    /// What the preferences say should happen when the browser opens.
+    pub fn settings_on_start(&self) -> settings::OnStart {
+        self.settings.settings.on_start
+    }
+
+    /// Go where the preferences say home is.
+    pub fn go_home(&mut self) {
+        let home = self.home();
+        if home.trim().is_empty() {
+            return;
+        }
+        self.navigate(&home);
+    }
+
+    /// Save the preferences if the surface has changed one.
+    ///
+    /// Compared rather than announced, because every change already goes through
+    /// one place — `Settings::apply` — and a second signal saying *and this one
+    /// was worth saving* would be a second thing to keep in step with the first.
+    fn save_preferences_if_changed(&mut self, before: &settings::Settings) {
+        if self.settings.settings.persisted_eq(before) {
+            return;
+        }
+        crate::preferences::save(&self.settings.settings);
+    }
+
     fn close_settings_if(&mut self, action: &settings::Action) {
         if *action != settings::Action::Close {
             return;
@@ -1483,7 +1524,9 @@ impl Painter for Browser {
                 if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
                     match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
+                            let before = self.settings.settings.clone();
                             let action = self.settings.pointer_pressed();
+                            self.save_preferences_if_changed(&before);
                             self.close_settings_if(&action);
                             return;
                         }
@@ -1541,7 +1584,9 @@ impl Painter for Browser {
                 // rather than the toolbar's.
                 match self.tabs[self.active].system {
                     Some(SystemPage::Settings) => {
+                        let before = self.settings.settings.clone();
                         if let Some(action) = self.settings.key_pressed(key, modifiers) {
+                            self.save_preferences_if_changed(&before);
                             self.close_settings_if(&action);
                             return;
                         }
@@ -1566,10 +1611,14 @@ impl Painter for Browser {
             }
 
             PlatformEvent::TextInput(character) => {
-                if self.tabs[self.active].system == Some(SystemPage::Settings)
-                    && self.settings.text_input(character)
-                {
-                    return;
+                if self.tabs[self.active].system == Some(SystemPage::Settings) {
+                    let before = self.settings.settings.clone();
+                    if self.settings.text_input(character) {
+                        // Typing in the home field is a preference changing, one
+                        // character at a time.
+                        self.save_preferences_if_changed(&before);
+                        return;
+                    }
                 }
                 self.ui.text_input(character);
             }
@@ -2842,6 +2891,69 @@ mod tests {
         assert!(
             by_url("https://site.example/site.css").took.is_some(),
             "a finished request knows how long the transport took"
+        );
+    }
+
+    #[test]
+    fn turning_pictures_off_means_none_are_asked_for() {
+        /// A page with a picture in it, and a log of everything asked for.
+        #[derive(Default)]
+        struct Pictures {
+            requested: Requests,
+        }
+
+        impl Loader for Pictures {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.requested
+                    .lock()
+                    .expect("no panic on the fetch thread")
+                    .push(url.to_owned());
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><img src=picture.png><p>text".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://pictures.example/".to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let asked = |browser: &mut Browser, requested: &Requests| {
+            browser.navigate("https://pictures.example/");
+            settle(browser);
+            let mut painter = otlyra_gfx::RecordingPainter::new();
+            browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+            settle(browser);
+            requested
+                .lock()
+                .expect("no panic on the fetch thread")
+                .clone()
+        };
+
+        let loader = Pictures::default();
+        let requested = std::sync::Arc::clone(&loader.requested);
+        let mut browser = Browser::new(loader);
+        let with = asked(&mut browser, &requested);
+        assert!(
+            with.iter().any(|url| url.contains("picture.png")),
+            "the picture is asked for by default: {with:?}"
+        );
+
+        let loader = Pictures::default();
+        let requested = std::sync::Arc::clone(&loader.requested);
+        let mut browser = Browser::new(loader);
+        browser.settings.settings.load_images = false;
+        let without = asked(&mut browser, &requested);
+        // Refused before the request rather than after it: a picture fetched and
+        // then not shown has already cost the reader their bandwidth and told
+        // the server they were here.
+        assert!(
+            !without.iter().any(|url| url.contains("picture.png")),
+            "and not asked for at all when the preference says so: {without:?}"
+        );
+        assert!(
+            without.iter().any(|url| url.contains("pictures.example")),
+            "the page itself still loads"
         );
     }
 

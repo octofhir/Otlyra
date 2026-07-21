@@ -238,10 +238,29 @@ pub fn radio<A: Clone + 'static>(
 /// A checkbox is for a choice confirmed later, a switch for one that is not, and
 /// drawing them differently is the only way that difference is visible.
 pub fn toggle<A: Clone + 'static>(theme: &Theme, focus: &Focus, action: A, on: bool) -> Child<A> {
-    let id = focus.claim(true);
+    toggle_enabled(theme, focus, action, on, true)
+}
+
+/// The same, drawn dimmed and unable to respond.
+///
+/// A switch for something the browser cannot do yet is drawn rather than hidden:
+/// what a browser *will* do and what it does are different facts, and a settings
+/// page that silently omits the first reads as one that was never going to.
+pub fn toggle_enabled<A: Clone + 'static>(
+    theme: &Theme,
+    focus: &Focus,
+    action: A,
+    on: bool,
+    enabled: bool,
+) -> Child<A> {
+    let id = focus.claim(enabled);
     let (width, height) = (36.0, 20.0);
-    let track = if on { theme.accent } else { theme.border };
-    let knob = theme.raised;
+    let track = match (on, enabled) {
+        (_, false) => theme.border,
+        (true, true) => theme.accent,
+        (false, true) => theme.border,
+    };
+    let knob = if enabled { theme.raised } else { theme.surface };
 
     let painted: Child<A> = Box::new(Painted::new(width, height, move |rect, _cx, list| {
         fill_rounded(list, rect, track, rect.height / 2.0);
@@ -263,7 +282,11 @@ pub fn toggle<A: Clone + 'static>(theme: &Theme, focus: &Focus, action: A, on: b
     Box::new(Fixed::new(
         width,
         height,
-        Box::new(Button::new(action, Box::new(Align::centre(painted))).focus(id)),
+        Box::new(
+            Button::new(action, Box::new(Align::centre(painted)))
+                .enabled(enabled)
+                .focus(id),
+        ),
     ))
 }
 

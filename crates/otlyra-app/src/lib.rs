@@ -48,6 +48,7 @@ pub mod mcp;
 pub mod menu;
 pub mod observability;
 pub mod page;
+pub mod preferences;
 pub mod scene;
 pub mod settings;
 pub mod ui;
