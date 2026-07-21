@@ -57,8 +57,46 @@ Waiting on other work, and saying so when asked:
   M12. Stock Playwright leans on it for nearly everything, so Playwright will
   connect to this and then fail. That is a real limitation and not a bug to
   report.
-- The `otlyra:` module — computed styles, fragment geometry, the tracks a grid
-  was given. The engine knows all of it; the standard has no command for asking.
+(Nothing else is waiting on anything; the list above is what exists.)
+
+## Asking the engine, not a script
+
+The standard's way to ask what an element's computed style is would be
+`script.evaluate` running `getComputedStyle` in the page. That needs a script
+engine, and it answers with what a script can see rather than with what the
+engine did. So there is an `otlyra:` module — the prefix the specification
+reserves for exactly this — and it answers from the layout that actually ran:
+
+```python
+grid = browser.find(".grid")[0]
+facts = browser.explain(grid)
+```
+
+```
+display grid, columns 200px 1fr 1fr
+drawn at 1000×195 at (0, 81)
+column lines a stylesheet can name: [1, 2, 3, 4]
+```
+
+One command rather than four, because the question a person actually has is
+*why is this element like this* and the answer is made of all of it at once:
+what the cascade computed, what the layout made of it, and where its tracks
+fell. Four round trips would be four chances for the page to move between them.
+
+| Command | What it answers |
+|---|---|
+| `otlyra:explain` | Computed style, box model and tracks, for one node |
+| `otlyra:highlight` | Pick a node out, so a screenshot shows which one is meant |
+| `otlyra:frameTimings` | How long each stage of the last frame took |
+
+`otlyra:highlight` draws the overlay a person would see — the four shades of the
+box model, and a grid's dashed track lines with their numbers. An agent that has
+to show somebody *which* element it means has the same problem a person does,
+and the browser had already solved it once.
+
+Values are spelled the way a stylesheet spells them. `200px 1fr 1fr`, not the
+engine's own `fixed(px(200.0)) fraction(1.0)`: a computed value you cannot put
+back into a stylesheet is most of the way to no answer at all.
 
 ## Naming an element rather than a point
 

@@ -338,6 +338,32 @@ impl Session {
                 Ok(json!({}))
             }
 
+            // --- the vendor module -----------------------------------------
+            //
+            // What the standard has no command for. BiDi's own answer to "what
+            // is this element's computed style" is `script.evaluate` running
+            // `getComputedStyle` in the page — which needs a script engine and,
+            // worse, returns what a script can see rather than what the engine
+            // did. These come from the layout that actually ran.
+            "otlyra:explain" => {
+                self.check_context(command)?;
+                self.explain(command)
+            }
+            "otlyra:highlight" => {
+                self.check_context(command)?;
+                self.highlight(command)
+            }
+            "otlyra:frameTimings" => Ok(json!({
+                "timings": crate::observability::journal()
+                    .latest()
+                    .into_iter()
+                    .map(|timing| json!({
+                        "stage": timing.span,
+                        "took": timing.took.as_secs_f64() * 1000.0,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
+
             // --- what waits on a script engine -----------------------------
             method if method.starts_with("script.") => {
                 Err(Error::not_yet(method, "a script engine, which is M12"))
@@ -388,6 +414,96 @@ impl Session {
             }
         }
         events
+    }
+
+    /// Everything the engine knows about one node, in one answer.
+    ///
+    /// One command rather than four, because the question a person actually has
+    /// is *why is this element like this* and the answer is made of all of it at
+    /// once: what the cascade computed, what the layout made of it, and — when
+    /// it lays its children into tracks — where those tracks fell. Four round
+    /// trips would be four chances for the page to move between them.
+    fn explain(&mut self, command: &Command) -> Result<Value, Error> {
+        let node = self.node_named(command)?;
+        let facts = self
+            .browser
+            .box_facts(node)
+            .ok_or_else(|| Error::no_such_node("that node was not drawn"))?;
+
+        let page = self
+            .browser
+            .active_page()
+            .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
+        let style = page
+            .boxes()
+            .box_for(node)
+            .and_then(|id| page.boxes().get(id))
+            .map(|box_node| crate::inspector::describe(&box_node.style))
+            .unwrap_or_default();
+
+        let content = facts.edges.content_of(facts.border);
+        let edges = |sides: (f64, f64, f64, f64)| json!({ "left": sides.0, "top": sides.1, "right": sides.2, "bottom": sides.3 });
+        let rect = |rect: crate::ui::Rect| json!({ "x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height });
+
+        Ok(json!({
+            "node": node_value(page.document(), node),
+            "computed": style
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), Value::String(value)))
+                .collect::<serde_json::Map<String, Value>>(),
+            "box": {
+                // The border box is where the last frame *drew* it, which is the
+                // same rectangle a click is tested against.
+                "border": rect(facts.border),
+                "content": rect(content),
+                "margin": edges(facts.edges.margin),
+                "borderWidth": edges(facts.edges.border),
+                "padding": edges(facts.edges.padding),
+                "containingWidth": facts.containing,
+            },
+            "tracks": facts.tracks.as_ref().map(|tracks| json!({
+                "numbered": tracks.numbered,
+                "columns": lines_json(&tracks.columns),
+                "rows": lines_json(&tracks.rows),
+            })),
+        }))
+    }
+
+    /// Choose a node, so the next screenshot shows it picked out.
+    ///
+    /// The overlay a person sees, asked for by a program. An agent that has to
+    /// show somebody *which* element it means has the same problem a person
+    /// does, and the browser already solved it once.
+    fn highlight(&mut self, command: &Command) -> Result<Value, Error> {
+        // A command with no node clears it, which is how a driver puts the page
+        // back the way it found it.
+        let node = match command.params.get("sharedId") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(self.node_named(command)?),
+        };
+        self.browser.inspector_mut().selected = node;
+        self.browser.prepare_frame(self.viewport(), LOAD_TIMEOUT);
+        Ok(json!({ "highlighted": node.map(shared_id) }))
+    }
+
+    /// The node a command names by handle.
+    fn node_named(&self, command: &Command) -> Result<otlyra_dom::NodeId, Error> {
+        let shared = command.string("sharedId")?;
+        let node = node_of(shared)
+            .ok_or_else(|| Error::no_such_node(&format!("{shared} names no node")))?;
+        let page = self
+            .browser
+            .active_page()
+            .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
+        // A handle from a document that has since been replaced names a node
+        // that is not there any more, and saying so beats answering about
+        // whatever else took its number.
+        if page.document().get(node).is_none() {
+            return Err(Error::no_such_node(&format!(
+                "{shared} is not in the document that is loaded"
+            )));
+        }
+        Ok(node)
     }
 
     /// Find the nodes a locator names.
@@ -590,6 +706,18 @@ impl Session {
     fn viewport(&self) -> otlyra_platform::Viewport {
         otlyra_platform::Viewport::new(self.viewport.0, self.viewport.1, 1.0)
     }
+}
+
+/// Track lines, as a client reads them.
+///
+/// The number is what a stylesheet names the line by, and it is absent where
+/// there is no name — the far side of a gutter is the same line seen from the
+/// other end, and a container edge no track reaches is not a line at all.
+fn lines_json(lines: &[crate::inspector::Line]) -> Vec<Value> {
+    lines
+        .iter()
+        .map(|line| json!({ "at": line.at, "number": line.number }))
+        .collect()
 }
 
 /// The envelope every event arrives in.
@@ -1310,6 +1438,129 @@ mod tests {
         // Not `javascript`: this is the browser talking about itself, and saying
         // otherwise would be a lie a client could act on.
         assert_eq!(entry["params"]["type"], json!(VENDOR));
+    }
+
+    /// The handle of the first node matching `selector`.
+    fn handle(session: &mut Session, selector: &str) -> String {
+        let found = session
+            .dispatch(&command(
+                99,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "css", "value": selector}}),
+            ))
+            .expect("located");
+        found["nodes"][0]["sharedId"]
+            .as_str()
+            .expect("a handle")
+            .to_owned()
+    }
+
+    #[test]
+    fn one_command_says_what_the_cascade_and_the_layout_both_did() {
+        let mut session = opened();
+        let shared = handle(&mut session, "#greeting");
+        let explained = session
+            .dispatch(&command(3, "otlyra:explain", json!({"sharedId": shared})))
+            .expect("explained");
+
+        // What the cascade computed, from the style the engine actually used
+        // rather than from a script asking the page about itself.
+        assert_eq!(explained["computed"]["display"], json!("block"));
+        assert!(explained["computed"]["font-size"].is_string());
+
+        // And what the layout made of it. The border box is where the last
+        // frame drew it, so it is the rectangle a click is tested against.
+        let border = &explained["box"]["border"];
+        assert!(border["width"].as_f64().is_some_and(|width| width > 0.0));
+        assert!(border["height"].as_f64().is_some_and(|height| height > 0.0));
+
+        // The content box is the border box less what is around it, and the
+        // arithmetic is the engine's rather than the client's to redo.
+        let content = &explained["box"]["content"];
+        assert!(
+            content["width"].as_f64().unwrap_or_default()
+                <= border["width"].as_f64().unwrap_or_default()
+        );
+
+        assert_eq!(explained["node"]["value"]["localName"], json!("p"));
+        // A paragraph lays nothing into tracks, and says so rather than
+        // returning an empty set that reads as *a grid with no lines*.
+        assert_eq!(explained["tracks"], Value::Null);
+    }
+
+    #[test]
+    fn a_container_explains_the_tracks_it_laid_its_children_into() {
+        struct Grid;
+        impl Loader for Grid {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<style>.g{display:grid;gap:10px;\
+                             grid-template-columns:100px 100px}</style>\
+                             <div class=g><div>a</div><div>b</div></div>"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut session = Session::new(Browser::new(Grid), (800, 600));
+        session
+            .dispatch(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://grid.example/"}),
+            ))
+            .expect("navigated");
+        let shared = handle(&mut session, ".g");
+        let explained = session
+            .dispatch(&command(3, "otlyra:explain", json!({"sharedId": shared})))
+            .expect("explained");
+
+        let tracks = &explained["tracks"];
+        assert_eq!(tracks["numbered"], json!(true));
+        let columns = tracks["columns"].as_array().expect("column lines");
+        // Every line is somewhere; only the ones a stylesheet can name are
+        // numbered, which is the whole of what the overlay draws.
+        assert!(columns.iter().all(|line| line["at"].as_f64().is_some()));
+        assert!(columns.iter().any(|line| line["number"] == json!(1)),);
+        assert_eq!(explained["computed"]["display"], json!("grid"));
+    }
+
+    #[test]
+    fn a_handle_from_a_document_that_has_gone_is_refused() {
+        let mut session = opened();
+        let error = session
+            .dispatch(&command(
+                3,
+                "otlyra:explain",
+                json!({"sharedId": "18446744073709551615"}),
+            ))
+            .unwrap_err();
+        // Answering about whatever else took that number would be worse than
+        // refusing: it would be an answer about the wrong element.
+        assert_eq!(error.code, "no such node");
+    }
+
+    #[test]
+    fn highlighting_picks_a_node_out_and_lets_it_go_again() {
+        let mut session = opened();
+        let shared = handle(&mut session, "#greeting");
+
+        let result = session
+            .dispatch(&command(3, "otlyra:highlight", json!({"sharedId": shared})))
+            .expect("highlighted");
+        assert_eq!(result["highlighted"], json!(shared));
+        assert!(session.browser.inspector_mut().selected.is_some());
+
+        // And with no node named, the page goes back the way it was found.
+        let cleared = session
+            .dispatch(&command(4, "otlyra:highlight", json!({})))
+            .expect("cleared");
+        assert_eq!(cleared["highlighted"], Value::Null);
+        assert!(session.browser.inspector_mut().selected.is_none());
     }
 
     #[test]

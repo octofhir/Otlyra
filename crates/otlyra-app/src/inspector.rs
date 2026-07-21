@@ -1221,7 +1221,7 @@ fn round(value: f64) -> String {
 /// What is missing, and known to be: *which rule* each value came from. The
 /// cascade is Stylo's and it knows, but it does not hand the winning declaration
 /// back with the value, so a pane that showed an origin would be inventing one.
-fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)> {
+pub fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)> {
     use otlyra_css::{Length, LengthOrAuto};
 
     let length = |value: Length| match value {
@@ -1329,8 +1329,20 @@ fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)> {
 }
 
 /// A track list, as CSS would write it.
+///
+/// Spelled the way a stylesheet spells it rather than the way the engine stores
+/// it. A pane — or a driver reading this over the protocol — that reported
+/// `fixed(px(200.0))` would be reporting a value nobody can put back into a
+/// stylesheet, which is most of what a computed value is for.
 fn tracks(template: &[otlyra_css::Track], fill: Option<&[otlyra_css::Track]>) -> String {
-    let one = |track: &otlyra_css::Track| format!("{track:?}").to_lowercase();
+    let one = |track: &otlyra_css::Track| match track {
+        otlyra_css::Track::Fixed(otlyra_css::Length::Px(px)) => format!("{px}px"),
+        otlyra_css::Track::Fixed(otlyra_css::Length::Percent(fraction)) => {
+            format!("{}%", fraction * 100.0)
+        }
+        otlyra_css::Track::Fraction(share) => format!("{share}fr"),
+        otlyra_css::Track::Auto => "auto".to_owned(),
+    };
     let mut out: Vec<String> = template.iter().map(one).collect();
     if let Some(fill) = fill {
         out.push(format!(

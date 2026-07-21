@@ -1089,7 +1089,32 @@ impl Browser {
         self.inspector.dock_height(height)
     }
 
-    /// The highlight over the page, and the panel below it.
+    /// The four shades of the chosen box, and its tracks if it has any.
+    fn paint_highlight(&mut self, list: &mut otlyra_gfx::DisplayList) {
+        let Some(chosen) = self.chosen_box() else {
+            return;
+        };
+        let theme = self.inspector.theme.clone();
+        crate::inspector::paint_highlight(
+            list,
+            &theme,
+            chosen.border,
+            &chosen.edges,
+            chosen.tracks.is_none(),
+        );
+        if let Some(tracks) = chosen.tracks.as_ref() {
+            let mut cx = crate::widget::Cx::new(&mut self.text);
+            cx.theme = theme;
+            crate::inspector::paint_tracks(
+                list,
+                &mut cx,
+                chosen.edges.content_of(chosen.border),
+                tracks,
+            );
+        }
+    }
+
+    /// The panel below it.
     fn paint_inspector(
         &mut self,
         list: &mut otlyra_gfx::DisplayList,
@@ -1098,28 +1123,7 @@ impl Browser {
         content_height: f64,
         dock: f64,
     ) {
-        let theme = self.inspector.theme.clone();
         let chosen = self.chosen_box();
-        if let Some(chosen) = chosen.as_ref() {
-            crate::inspector::paint_highlight(
-                list,
-                &theme,
-                chosen.border,
-                &chosen.edges,
-                chosen.tracks.is_none(),
-            );
-            if let Some(tracks) = chosen.tracks.as_ref() {
-                let mut cx = crate::widget::Cx::new(&mut self.text);
-                cx.theme = theme.clone();
-                crate::inspector::paint_tracks(
-                    list,
-                    &mut cx,
-                    chosen.edges.content_of(chosen.border),
-                    tracks,
-                );
-            }
-        }
-
         let panel = crate::ui::Rect::new(0.0, top + content_height, width, dock);
         // Everything the panel is shown about the page, gathered before it is
         // built: the panel reads, and the browser is what does the reaching.
@@ -1201,7 +1205,15 @@ impl Browser {
     /// the overlay lands exactly where the box did and no second answer to
     /// *where is this* exists.
     fn chosen_box(&self) -> Option<Chosen> {
-        let node = self.inspector.selected?;
+        self.box_facts(self.inspector.selected?)
+    }
+
+    /// The same, for any node rather than the chosen one.
+    ///
+    /// What a driver asks about: it names a node and wants what the engine made
+    /// of it. The overlay and the panel ask through the chosen one, and all
+    /// three go through here, so there is one account of what a box is.
+    pub fn box_facts(&self, node: otlyra_dom::NodeId) -> Option<Chosen> {
         let page = self.tabs[self.active].page.as_ref()?;
         let id = page.boxes().box_for(node)?;
         let border = to_rect(page.rect_of(id)?);
@@ -1677,6 +1689,19 @@ impl Painter for Browser {
             render(&list, target);
         }
 
+        // The highlight goes over the page whether or not the panel is open.
+        // They are two things: the overlay says *this element*, and the panel
+        // says everything about it. A driver asking for the first has no use for
+        // the second, and neither does a person following the tree with the
+        // pointer — and the two were coupled here only because they were written
+        // in one go.
+        if self.chosen_box().is_some() {
+            let mut list = otlyra_gfx::DisplayList::new();
+            self.paint_highlight(&mut list);
+            list.transform(scale);
+            render(&list, target);
+        }
+
         if !self.interface {
             // Still after the page, because the pictures a rule names are only known
             // once the rule has been computed on the way to a frame.
@@ -1684,9 +1709,8 @@ impl Painter for Browser {
             return;
         }
 
-        // The highlight over the page, then the panel under it. The overlay goes
-        // on before the panel so a box that reaches the bottom of the content
-        // area is covered by the dock rather than drawn over it.
+        // The panel under the overlay, so a box that reaches the bottom of the
+        // content area is covered by the dock rather than drawn over it.
         if dock > 0.0 {
             let mut list = otlyra_gfx::DisplayList::new();
             self.paint_inspector(&mut list, width, top, content_height, dock);
@@ -1718,16 +1742,16 @@ impl Painter for Browser {
     }
 }
 
-/// The chosen node's box, as the overlay and the panel both need it.
-struct Chosen {
+/// One node's box, as the overlay, the panel and a driver all need it.
+pub struct Chosen {
     /// The border box, in window coordinates.
-    border: crate::ui::Rect,
+    pub border: crate::ui::Rect,
     /// What the style says its four edges are.
-    edges: crate::inspector::BoxEdges,
+    pub edges: crate::inspector::BoxEdges,
     /// How wide its containing block is, for a percentage.
-    containing: Option<f64>,
+    pub containing: Option<f64>,
     /// Where its children's tracks fall, when it lays its children into any.
-    tracks: Option<crate::inspector::Tracks>,
+    pub tracks: Option<crate::inspector::Tracks>,
 }
 
 /// A layout rectangle in the interface's own geometry vocabulary.

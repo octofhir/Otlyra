@@ -83,6 +83,32 @@ def main():
                 print(f"←   {message['method']}: {params.get('text', '')}")
         print()
 
+        # The reason this browser is worth driving: the answer comes from the
+        # layout that actually ran, not from a script asking the page about
+        # itself. There is no script engine here at all.
+        grid = browser.find(".grid")[0]
+        facts = browser.explain(grid)
+        box = facts["box"]["border"]
+        print("→ otlyra:explain .grid")
+        print(f"←   display {facts['computed']['display']}, "
+              f"columns {facts['computed']['grid-template-columns']}")
+        print(f"←   drawn at {box['width']:.0f}×{box['height']:.0f} "
+              f"at ({box['x']:.0f}, {box['y']:.0f})")
+        numbered = [line["number"] for line in facts["tracks"]["columns"]
+                    if line["number"] is not None]
+        print(f"←   column lines a stylesheet can name: {numbered}\n")
+
+        # And the same overlay a person would see, asked for by a program.
+        browser.highlight(grid)
+        browser.screenshot("/tmp/otlyra-highlighted.png")
+        print("→ otlyra:highlight + captureScreenshot")
+        print("←   /tmp/otlyra-highlighted.png, with the tracks drawn on it\n")
+
+        print("→ otlyra:frameTimings")
+        for timing in browser.timings():
+            print(f"←   {timing['stage']:20} {timing['took']:.1f} ms")
+        print()
+
         # The honest gap, asked for on purpose. A protocol that answered this
         # with silence, or with an empty result, would be worse than one that
         # says which milestone it is waiting on.

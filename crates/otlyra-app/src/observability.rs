@@ -262,6 +262,12 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+        // The journal keeps what a person would want to read after the fact.
+        // Every `debug!` in every dependency is not that, and would push the
+        // browser's own lines out of a bounded ring within a second.
+        if *event.metadata().level() > tracing::Level::INFO {
+            return;
+        }
         let mut message = Message(String::new());
         event.record(&mut message);
         journal().push_record(Record {
@@ -318,7 +324,6 @@ pub fn init() -> bool {
     let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new("warn"));
 
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 // Every span in `spans` is a stage of the pipeline, and the
@@ -328,10 +333,15 @@ pub fn init() -> bool {
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
                 .with_target(true)
                 .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-                .with_writer(std::io::stderr),
+                .with_writer(std::io::stderr)
+                // The filter is the *terminal's*, not the journal's. A person
+                // opts into a noisy terminal; the panel and the protocol are
+                // instruments that are always on, and a driver that asked for
+                // frame timings and got nothing because an environment variable
+                // was unset would be looking at a browser that appeared to do no
+                // work at all.
+                .with_filter(filter),
         )
-        // Beneath the filter, so what the terminal shows and what the panel
-        // shows are the same stream and `OTLYRA_LOG` governs both.
         .with(Recorder)
         .try_init()
         .is_ok()

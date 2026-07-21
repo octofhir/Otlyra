@@ -159,6 +159,27 @@ class Otlyra:
             ],
         )
 
+    def explain(self, node):
+        """Everything the engine knows about a node, in one answer.
+
+        What the cascade computed, what the layout made of it, and — when it
+        lays its children into tracks — where those tracks fell. One round trip
+        rather than four, because four would be four chances for the page to
+        move between them.
+        """
+        return self.send("otlyra:explain", sharedId=node["sharedId"])
+
+    def highlight(self, node=None):
+        """Pick a node out, so the next screenshot shows which one is meant."""
+        return self.send(
+            "otlyra:highlight",
+            sharedId=node["sharedId"] if node else None,
+        )
+
+    def timings(self):
+        """How long each stage of the last frame took."""
+        return self.send("otlyra:frameTimings")["timings"]
+
     def close(self):
         try:
             self.send("session.end")
