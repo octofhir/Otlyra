@@ -484,6 +484,51 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// What a control is, to something that cannot see it.
+///
+/// The layer's own vocabulary rather than the accessibility library's, for the
+/// same reason `Widget<A>` is generic over the action: this layer knows nothing
+/// of the browser and nothing of the platform, and a `Role` from a windowing
+/// crate in here would put one in every control that has a name.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Something to press.
+    Button,
+    /// A box that is ticked or not.
+    CheckBox,
+    /// One of several exclusive choices.
+    RadioButton,
+    /// A setting that takes effect the moment it is thrown.
+    Switch,
+    /// A field text is typed into.
+    TextInput,
+    /// A value picked along a line.
+    Slider,
+    /// One tab of several.
+    Tab,
+    /// A row of a menu.
+    MenuItem,
+    /// Something with a name and no behaviour: a heading, a caption.
+    Label,
+}
+
+/// What a widget says about itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Described {
+    /// Where it is, so a reader can point at it.
+    pub rect: Rect,
+    /// What kind of thing it is.
+    pub role: Role,
+    /// What it is called.
+    pub label: String,
+    /// What it currently says or holds, when that is not its name.
+    pub value: Option<String>,
+    /// Whether it holds the keyboard.
+    pub focused: bool,
+    /// Whether it is drawn but will not respond.
+    pub enabled: bool,
+}
+
 /// One piece of a surface, reporting actions of type `A`.
 ///
 /// The four verbs run in order, once per frame for the first three: `measure`
@@ -511,6 +556,25 @@ pub trait Widget<A> {
     /// children until one answers.
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         let _ = (event, cx);
+        None
+    }
+
+    /// Say what this is, for something that cannot see it.
+    ///
+    /// The default is *nothing to say*, so a leaf that is decoration — a gap, a
+    /// hairline, a mark inside a button that already has a name — stays silent
+    /// rather than filling a screen reader with furniture. A container forwards
+    /// to its children; a control pushes itself.
+    fn describe(&self, out: &mut Vec<Described>) {
+        let _ = out;
+    }
+
+    /// The words inside this, for a control that takes its name from them.
+    ///
+    /// A button holds no label of its own: it is wrapped around one. Asking the
+    /// child is what lets the button be named without the caller saying the same
+    /// string twice, and without a second copy of it to fall out of step.
+    fn label_text(&self) -> Option<String> {
         None
     }
 
