@@ -175,6 +175,8 @@ pub enum UiAction {
     Forward,
     /// Open one of the browser's own pages.
     OpenPage(SystemPage),
+    /// Show the inspector, or put it away.
+    ToggleInspector,
     /// Show the menu behind the cogwheel, or put it away.
     ///
     /// Never reaches the browser: the menu is the interface's own state, like
@@ -480,6 +482,12 @@ impl BrowserUi {
                 self.menu_open = false;
                 UiAction::OpenPage(page)
             }
+            // The same for the inspector: chosen from the menu, the menu goes
+            // away and what was chosen is what happens.
+            Some(UiAction::ToggleInspector) => {
+                self.menu_open = false;
+                UiAction::ToggleInspector
+            }
             Some(action) => {
                 if !matches!(
                     action,
@@ -516,6 +524,10 @@ impl BrowserUi {
             Some(UiAction::OpenPage(page)) => {
                 self.menu_open = false;
                 UiAction::OpenPage(page)
+            }
+            Some(UiAction::ToggleInspector) => {
+                self.menu_open = false;
+                UiAction::ToggleInspector
             }
             Some(action) => action,
             None => UiAction::None,
@@ -893,6 +905,16 @@ fn menu(theme: &Theme, focus: &Focus) -> Child<UiAction> {
             row(History, icon::clock, Some("⌘Y")),
             row(Bookmarks, icon::star, None),
             row(Downloads, icon::download, Some("⌘⇧J")),
+            controls::divider(theme),
+            controls::menu_item(
+                theme,
+                focus,
+                UiAction::ToggleInspector,
+                true,
+                icon::page,
+                "Inspect",
+                Some("⌥⌘I"),
+            ),
             controls::divider(theme),
             row(About, icon::info, None),
         ],

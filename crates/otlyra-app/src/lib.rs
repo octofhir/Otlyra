@@ -42,6 +42,7 @@ pub mod a11y;
 pub mod about;
 pub mod browser;
 pub mod fetcher;
+pub mod inspector;
 pub mod menu;
 pub mod observability;
 pub mod page;

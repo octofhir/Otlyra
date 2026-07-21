@@ -147,6 +147,83 @@ impl Painter for SettingsFrame {
     fn on_event(&mut self, _event: PlatformEvent) {}
 }
 
+/// The inspector docked under a page, with a node chosen.
+///
+/// The document is parsed here rather than fetched: what this state is for is
+/// looking at the panel, and a panel that needed a network to be drawn could not
+/// be looked at on a machine without one.
+struct InspectorFrame {
+    ui: BrowserUi,
+    inspector: otlyra_app::inspector::Inspector,
+    document: otlyra_dom::Document,
+    /// How many times Down is pressed before the frame that is written.
+    steps: usize,
+    text: TextEngine,
+}
+
+impl InspectorFrame {
+    fn new(steps: usize) -> Self {
+        let document = otlyra_html::parse(
+            b"<html><head><title>A page</title></head><body>\
+              <header class=\"top\"><h1 id=\"title\">A heading</h1></header>\
+              <main><p class=\"lead\">A paragraph of text.</p>\
+              <ul><li>one</li><li>two</li></ul></main></body></html>",
+            Some("utf-8"),
+        )
+        .document;
+        let mut inspector = otlyra_app::inspector::Inspector::new();
+        inspector.open = true;
+        Self {
+            ui: BrowserUi::new(),
+            inspector,
+            document,
+            steps,
+            text: TextEngine::new(),
+        }
+    }
+
+    fn settle(&mut self) {
+        self.inspector.selected = None;
+        for _ in 0..self.steps {
+            self.inspector
+                .key_pressed(Key::Down, Modifiers::default(), &self.document);
+            self.inspector
+                .key_pressed(Key::Right, Modifiers::default(), &self.document);
+        }
+    }
+}
+
+impl Painter for InspectorFrame {
+    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        let (width, height) = (viewport.logical_width(), viewport.logical_height());
+        let content = (height - UI_HEIGHT).max(0.0);
+        let dock = self.inspector.dock_height(content);
+
+        let mut list = DisplayList::new();
+        otlyra_app::ui::paint_blank_page(&mut list, width, height, None, None, &mut self.text);
+        self.inspector.build_display_list(
+            otlyra_app::ui::Rect::new(0.0, UI_HEIGHT + content - dock, width, dock),
+            Some(&self.document),
+            &mut self.text,
+            &mut list,
+        );
+        self.ui.build_display_list(
+            width,
+            height,
+            &tabs(&[("A page", false)]),
+            0,
+            (true, false),
+            None,
+            &mut self.text,
+            &mut list,
+        );
+        list.transform(Affine::scale(viewport.scale_factor));
+        otlyra_gfx::render(&list, target);
+    }
+
+    fn on_event(&mut self, _event: PlatformEvent) {}
+}
+
 fn tabs(titles: &[(&str, bool)]) -> Vec<TabLabel> {
     titles
         .iter()
@@ -284,6 +361,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.scroll = scroll;
         frame.tabs_pressed = tabs_pressed;
         write_states(&directory, name, &mut frame, width, height, |frame| {
+            frame.settle();
+        })?;
+    }
+
+    // The inspector, closed on the document and opened several levels into it.
+    for (name, steps) in [("inspector", 1), ("inspector-deep", 4)] {
+        let mut frame = InspectorFrame::new(steps);
+        write_states(&directory, name, &mut frame, 1000.0, 700.0, |frame| {
             frame.settle();
         })?;
     }

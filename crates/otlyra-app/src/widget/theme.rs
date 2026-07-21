@@ -56,6 +56,31 @@ pub struct Theme {
     pub hover: Color,
     /// A stronger wash, for the thing being pressed.
     pub press: Color,
+    /// Behind the row of a list or a tree that is the chosen one.
+    ///
+    /// A wash rather than the accent itself: a selected row still has to be read,
+    /// and the text on it is the ordinary ink.
+    pub selection: Color,
+
+    /// A tag name, in text that is code.
+    pub code_tag: Color,
+    /// An attribute's name.
+    pub code_name: Color,
+    /// An attribute's value, and a string.
+    pub code_value: Color,
+
+    /// The four shades a box is taken apart into, outermost first.
+    ///
+    /// Here rather than beside the inspector for the same reason every other
+    /// colour is: one place, or the interface drifts a shade at a time. They are
+    /// translucent because they are drawn over a page nobody wrote for them.
+    pub box_margin: Color,
+    /// The border ring of a box under inspection.
+    pub box_border: Color,
+    /// Its padding.
+    pub box_padding: Color,
+    /// Its content.
+    pub box_content: Color,
 
     /// Corner radius on a button, a field, a card.
     pub radius: f64,
@@ -68,10 +93,24 @@ pub struct Theme {
     pub font_size: f32,
     /// Text that is deliberately smaller: a hint, a badge.
     pub font_size_small: f32,
+    /// Text that is code: source, a selector, a tag name.
+    pub font_size_mono: f32,
+    /// The families code is drawn in, as a CSS list.
+    ///
+    /// A string parsed into a stack rather than one name, because the interface
+    /// cannot know which of these a machine has, and a family it does not have
+    /// is a row of hollow boxes where a tag name should be.
+    pub mono: &'static str,
     /// The line box a single line of interface text occupies, as a multiple of
     /// the font size.
     pub line_height: f64,
 
+    /// One row of a tree or a table.
+    ///
+    /// Fixed, and that is what makes a long list cheap: which row a point is in
+    /// is arithmetic, and which rows are on screen is arithmetic, so a tree of
+    /// ten thousand nodes measures and draws the twenty that are visible.
+    pub row_height: f64,
     /// The side of a square button holding one mark.
     pub control_size: f64,
     /// The height of a field, or of a button with a label in it.
@@ -108,6 +147,19 @@ impl Theme {
 
             hover: Color::from_rgba8(0x1c, 0x1c, 0x21, 0x14),
             press: Color::from_rgba8(0x1c, 0x1c, 0x21, 0x28),
+            selection: Color::from_rgba8(0x2f, 0x6f, 0xd6, 0x2e),
+
+            code_tag: Color::from_rgb8(0x8b, 0x1a, 0x8b),
+            code_name: Color::from_rgb8(0xa8, 0x5c, 0x00),
+            code_value: Color::from_rgb8(0x1a, 0x63, 0x2e),
+
+            // The shades every browser's inspector has used for twenty years.
+            // Familiarity is the whole point: an overlay that had to be learned
+            // would be one more thing between a person and their bug.
+            box_margin: Color::from_rgba8(0xf6, 0xb7, 0x3c, 0x66),
+            box_border: Color::from_rgba8(0xd6, 0xa0, 0x6a, 0x80),
+            box_padding: Color::from_rgba8(0x8b, 0xc4, 0x6a, 0x66),
+            box_content: Color::from_rgba8(0x6b, 0xa8, 0xd6, 0x66),
 
             radius: 8.0,
             radius_small: 7.0,
@@ -115,8 +167,11 @@ impl Theme {
 
             font_size: 13.0,
             font_size_small: 11.0,
+            font_size_mono: 11.5,
+            mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
             line_height: 1.35,
 
+            row_height: 18.0,
             control_size: 28.0,
             control_height: 30.0,
             gap: 6.0,

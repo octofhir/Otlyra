@@ -10,7 +10,7 @@ use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::NodeId;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_layout::Images;
-use otlyra_platform::{Cursor, Key, Painter, PlatformEvent, Viewport, Waker};
+use otlyra_platform::{Cursor, Key, Modifiers, Painter, PlatformEvent, Viewport, Waker};
 use otlyra_text::TextEngine;
 
 use crate::about::{self, AboutSurface};
@@ -295,6 +295,8 @@ pub struct Browser {
     settings: SettingsSurface,
     /// What this program is.
     about: AboutSurface,
+    /// The panel that shows what the engine built.
+    inspector: crate::inspector::Inspector,
 }
 
 impl Browser {
@@ -319,6 +321,7 @@ impl Browser {
             pointer: (0.0, 0.0),
             cursor: Cursor::Default,
             settings: SettingsSurface::new(),
+            inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
         }
     }
@@ -1057,6 +1060,7 @@ impl Browser {
             // the press handler applies them and reports `None`, so these arms
             // are only here to keep the match honest about the whole enum.
             UiAction::Focus(_) | UiAction::ToggleMenu | UiAction::CloseMenu => {}
+            UiAction::ToggleInspector => self.inspector.toggle(),
             // Chosen from the menu, a browser page opens beside what you were
             // reading rather than over it: the menu is reached *while* looking
             // at something, and losing that to check a preference is the whole
@@ -1073,6 +1077,94 @@ impl Browser {
         }
     }
 
+    /// How much of a content area `height` tall the inspector takes.
+    ///
+    /// Only over a document: a browser page is the browser looked at from the
+    /// front and has no DOM of its own to inspect, so the panel stays out of the
+    /// way rather than showing an empty tree beside one.
+    fn dock_height(&self, height: f64) -> f64 {
+        if self.tabs[self.active].system.is_some() {
+            return 0.0;
+        }
+        self.inspector.dock_height(height)
+    }
+
+    /// The highlight over the page, and the panel below it.
+    fn paint_inspector(
+        &mut self,
+        list: &mut otlyra_gfx::DisplayList,
+        width: f64,
+        top: f64,
+        content_height: f64,
+        dock: f64,
+    ) {
+        let theme = self.inspector.theme.clone();
+        if let Some((rect, edges)) = self.highlight() {
+            crate::inspector::paint_highlight(list, &theme, rect, &edges);
+        }
+
+        let panel = crate::ui::Rect::new(0.0, top + content_height, width, dock);
+        let document = self.tabs[self.active]
+            .page
+            .as_ref()
+            .map(|page| page.document());
+        // Split off the borrow the panel needs from the one the browser holds:
+        // the document is the page's and the panel only reads it.
+        let mut built = otlyra_gfx::DisplayList::new();
+        match document {
+            Some(document) => {
+                self.inspector.build_display_list(
+                    panel,
+                    Some(document),
+                    &mut self.text,
+                    &mut built,
+                );
+            }
+            None => {
+                self.inspector
+                    .build_display_list(panel, None, &mut self.text, &mut built);
+            }
+        }
+        list.append(&built);
+    }
+
+    /// Where the chosen node was drawn, and what its edges are.
+    ///
+    /// The rectangle comes from the same targets a click is tested against, so
+    /// the overlay lands exactly where the box did. The edges come from the
+    /// computed style, because a fragment carries one rectangle and the four
+    /// rings are the differences between four.
+    fn highlight(&self) -> Option<(crate::ui::Rect, crate::inspector::BoxEdges)> {
+        let node = self.inspector.selected?;
+        let page = self.tabs[self.active].page.as_ref()?;
+        let id = page.boxes().box_for(node)?;
+        let rect = page.rect_of(id)?;
+        let style = &page.boxes().get(id)?.style;
+        Some((
+            crate::ui::Rect::new(
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.width),
+                f64::from(rect.height),
+            ),
+            crate::inspector::BoxEdges {
+                margin: Self::sides(&style.margin, |side| match side {
+                    otlyra_css::LengthOrAuto::Px(px) => f64::from(px),
+                    // A percentage needs the containing block and `auto` needs
+                    // the layout that resolved it; neither is on the style. The
+                    // ring is drawn as nothing rather than as a guess — D2 is
+                    // where these numbers come from the fragment.
+                    _ => 0.0,
+                }),
+                border: Self::sides(&style.border, |side| f64::from(side.width)),
+                padding: Self::sides(&style.padding, |side| match side {
+                    otlyra_css::Length::Px(px) => f64::from(px),
+                    otlyra_css::Length::Percent(_) => 0.0,
+                }),
+            },
+        ))
+    }
+
     /// Work out what the pointer should look like where it now is.
     ///
     /// Computed when the pointer moves rather than when the loop asks, because
@@ -1086,6 +1178,15 @@ impl Browser {
         } else if y < UI_HEIGHT || self.ui.menu_open {
             // Over the interface but over nothing in it.
             Cursor::Default
+        } else if y >= self.dock_top() {
+            match self.inspector.action_at(x, y) {
+                crate::inspector::Action::None => Cursor::Default,
+                _ => Cursor::Pointer,
+            }
+        } else if self.inspector.picking {
+            // Armed, the whole page is a target, and saying so is what tells a
+            // person the next click will not follow a link.
+            Cursor::Pointer
         } else {
             match self.tabs[self.active].system {
                 Some(SystemPage::Settings) => self.settings.cursor_at(x, y),
@@ -1095,6 +1196,66 @@ impl Browser {
                 None => Cursor::Default,
             }
         };
+    }
+
+    /// Choose the element drawn at `x`, `y`, and reveal it in the tree.
+    ///
+    /// The hit test is the page's own — the one a click is tested against — so
+    /// the element the overlay names is the element a click would have hit.
+    /// Nothing new is measured and no second answer to *what is here* exists.
+    fn pick_at(&mut self, x: f64, y: f64) {
+        let Some(page) = self.tabs[self.active].page.as_ref() else {
+            return;
+        };
+        let Some(node) = page
+            .box_at(x, y)
+            .and_then(|id| page.boxes().get(id))
+            // A box the parser never made a node for is an anonymous one the
+            // layout invented. Its nearest real ancestor is what a person means
+            // by "this element".
+            .and_then(|node| node.node.or_else(|| self.nearest_node(page, node)))
+        else {
+            return;
+        };
+        let document = page.document();
+        self.inspector.reveal(document, node);
+    }
+
+    /// The first node an anonymous box's ancestors carry.
+    fn nearest_node(
+        &self,
+        page: &PageScene,
+        node: &otlyra_layout::BoxNode,
+    ) -> Option<otlyra_dom::NodeId> {
+        let mut current = node.parent;
+        while let Some(id) = current {
+            let box_node = page.boxes().get(id)?;
+            if let Some(node) = box_node.node {
+                return Some(node);
+            }
+            current = box_node.parent;
+        }
+        None
+    }
+
+    /// Where the inspector's panel starts, or the bottom of the window when it
+    /// is not showing.
+    fn dock_top(&self) -> f64 {
+        let top = if self.interface { UI_HEIGHT } else { 0.0 };
+        self.last_height - self.dock_height(self.last_height - top)
+    }
+
+    /// The four sides of a style's box edge, as left, top, right, bottom.
+    ///
+    /// The order the overlay wants, which is not the order CSS writes them in.
+    #[allow(clippy::needless_pass_by_value)]
+    fn sides<T: Copy>(sides: &otlyra_css::Sides<T>, of: impl Fn(T) -> f64) -> (f64, f64, f64, f64) {
+        (
+            of(sides.left),
+            of(sides.top),
+            of(sides.right),
+            of(sides.bottom),
+        )
     }
 
     /// The link under the pointer, resolved against the tab's own address.
@@ -1150,6 +1311,14 @@ impl Painter for Browser {
                 self.pointer = (x, y);
                 self.ui.pointer_moved(x, y);
                 self.update_cursor(x, y);
+                self.inspector.pointer_moved(x, y);
+                // While the picker is armed, moving over the page is enough to
+                // show what would be chosen: an overlay that only appeared after
+                // a click would be an overlay nobody could aim.
+                if self.inspector.picking && y >= UI_HEIGHT && y < self.dock_top() {
+                    self.pick_at(x, y);
+                    return;
+                }
 
                 // A scrollbar being dragged keeps the pointer until it is let go,
                 // wherever the pointer wanders.
@@ -1177,6 +1346,21 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerPressed => {
+                // The panel owns everything below its own top edge.
+                if self.pointer.1 >= self.dock_top() && !self.ui.menu_open {
+                    self.inspector.pointer_pressed();
+                    return;
+                }
+                // Armed, a press on the page chooses an element instead of
+                // following whatever is under it — which is the whole point of
+                // arming it, and why the picker disarms itself afterwards.
+                if self.inspector.picking && self.pointer.1 >= UI_HEIGHT {
+                    self.pick_at(self.pointer.0, self.pointer.1);
+                    // One press, one element: staying armed would make the next
+                    // click on a link choose a node instead of following it.
+                    self.inspector.picking = false;
+                    return;
+                }
                 // A press on a scrollbar belongs to it rather than to the page
                 // behind it.
                 if self.pointer.1 >= UI_HEIGHT && self.tabs[self.active].system.is_none() {
@@ -1235,6 +1419,24 @@ impl Painter for Browser {
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
+                // The one accelerator that is the inspector's. Alt as well as
+                // the platform's own modifier, which is what every browser uses
+                // and what keeps it clear of ⌘I.
+                if key == Key::Character('i') && modifiers.alt && inspector_modifier(modifiers) {
+                    self.inspector.toggle();
+                    return;
+                }
+                // The panel takes the keys that walk its tree, but only while it
+                // is the thing being looked at.
+                if self.inspector.open
+                    && let Some(page) = self.tabs[self.active].page.as_ref()
+                    && self
+                        .inspector
+                        .key_pressed(key, modifiers, page.document())
+                        .is_some()
+                {
+                    return;
+                }
                 // A browser page shown in the tab gets the key first: it is what
                 // the reader is looking at, and Tab on it walks its own controls
                 // rather than the toolbar's.
@@ -1275,12 +1477,23 @@ impl Painter for Browser {
 
             // Scrolling belongs to the page unless the pointer is over the
             // interface, where there is nothing to scroll.
+            //
+            // Every one of these adds the delta to an offset and none of them
+            // negates it. The event already says which way the reader went, and
+            // a consumer that decided that for itself is how the settings came
+            // to scroll the opposite way from a document.
             PlatformEvent::Scroll { y, .. } => {
                 if self.ui.owns_pointer() {
                     return;
                 }
+                // The wheel goes to whatever is under the pointer, and the panel
+                // is a thing under the pointer like any other.
+                if self.pointer.1 >= self.dock_top() {
+                    self.inspector.scroll_by(y);
+                    return;
+                }
                 if self.tabs[self.active].system == Some(SystemPage::Settings) {
-                    self.settings.scroll_by(-y);
+                    self.settings.scroll_by(y);
                 } else if let Some(page) = self.tabs[self.active].page.as_mut() {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box
@@ -1339,6 +1552,12 @@ impl Painter for Browser {
         // Where the page starts: under the interface, or at the top of the window
         // when there is none.
         let top = if self.interface { UI_HEIGHT } else { 0.0 };
+        // The inspector takes its height *out* of the content area rather than
+        // sitting over it. A page laid out under a floating panel would be laid
+        // out for a width and a height it does not have, and every number the
+        // panel then reported about it would be a number about a different page.
+        let dock = self.dock_height(height - top);
+        let content_height = (height - top - dock).max(0.0);
 
         // The page first, then the interface over it. The page is inset by the
         // interface's height and culled to what is visible, so it cannot paint
@@ -1347,7 +1566,7 @@ impl Painter for Browser {
         if let Some(system) = self.tabs[self.active].system {
             // A browser page takes the whole content area: it is not a document
             // in a tab, it is the browser looked at from the front.
-            let content = crate::ui::Rect::new(0.0, top, width, (height - top).max(0.0));
+            let content = crate::ui::Rect::new(0.0, top, width, content_height);
             let mut list = otlyra_gfx::DisplayList::new();
             match system {
                 SystemPage::Settings => {
@@ -1364,7 +1583,7 @@ impl Painter for Browser {
             let mut list = page.build_display_list(
                 &mut self.text,
                 width as f32,
-                (height - top).max(0.0) as f32,
+                content_height as f32,
                 top as f32,
             );
             list.transform(scale);
@@ -1390,6 +1609,16 @@ impl Painter for Browser {
             return;
         }
 
+        // The highlight over the page, then the panel under it. The overlay goes
+        // on before the panel so a box that reaches the bottom of the content
+        // area is covered by the dock rather than drawn over it.
+        if dock > 0.0 {
+            let mut list = otlyra_gfx::DisplayList::new();
+            self.paint_inspector(&mut list, width, top, content_height, dock);
+            list.transform(scale);
+            render(&list, target);
+        }
+
         let mut list = otlyra_gfx::DisplayList::new();
         let labels = self.labels();
         self.ui.build_display_list(
@@ -1411,6 +1640,21 @@ impl Painter for Browser {
         // After the frame, because a rule that names a picture is only computed on
         // the way to one.
         self.fetch_backgrounds();
+    }
+}
+
+/// Whether these modifiers are the platform's "open the inspector" pair.
+///
+/// Alt and the platform's own accelerator: ⌥⌘I on macOS, Ctrl-Alt-I elsewhere,
+/// which is what a person's fingers already know.
+fn inspector_modifier(modifiers: Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.command
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control
     }
 }
 
@@ -1646,7 +1890,6 @@ mod system_page_tests {
 
 #[cfg(test)]
 mod tests {
-    use otlyra_platform::{Key, Modifiers};
 
     use super::*;
     use crate::fetcher::Loaded;
@@ -1842,7 +2085,11 @@ mod tests {
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
         browser.ui.pointer_moved(400.0, 400.0);
-        browser.on_event(PlatformEvent::Scroll { x: 0.0, y: 50.0 });
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 50.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+        });
 
         let active = browser.active;
         assert_eq!(
@@ -1863,7 +2110,11 @@ mod tests {
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
         browser.ui.pointer_moved(400.0, 10.0);
-        browser.on_event(PlatformEvent::Scroll { x: 0.0, y: 100.0 });
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 100.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+        });
         assert_eq!(browser.tabs[0].page.as_ref().expect("page").scroll(), 0.0);
     }
 
@@ -1951,6 +2202,108 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    #[test]
+    fn the_inspector_takes_its_height_out_of_the_page_rather_than_over_it() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+        settle(&mut browser);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        let content = 600.0 - UI_HEIGHT;
+        assert_eq!(
+            browser.dock_height(content),
+            0.0,
+            "closed, it takes nothing"
+        );
+
+        browser.inspector.toggle();
+        let dock = browser.dock_height(content);
+        assert!(dock > 0.0);
+        assert!(
+            dock < content,
+            "the page keeps room to be a page: {dock} of {content}"
+        );
+        // The panel starts where the page stops, so neither is drawn over the
+        // other and the page is laid out for the height it actually has.
+        assert_eq!(browser.dock_top(), 600.0 - dock);
+    }
+
+    #[test]
+    fn the_picker_chooses_the_element_a_click_would_have_hit() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+        settle(&mut browser);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.inspector.toggle();
+        browser.inspector.picking = true;
+
+        // Where the link is — the same point that would follow it if the picker
+        // were not armed, which is the property worth having: one hit test, two
+        // readings of the answer.
+        let (x, y) = link_position(&browser);
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed);
+
+        assert_eq!(
+            browser.tabs[0].url, "https://start.example/",
+            "armed, the press picked rather than followed the link"
+        );
+        let selected = browser.inspector.selected.expect("something was chosen");
+        let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
+        let named = page
+            .document()
+            .get(selected)
+            .map(|node| match &node.data {
+                otlyra_dom::NodeData::Element(element) => element.name.local.to_string(),
+                otlyra_dom::NodeData::Text(_) => "#text".to_owned(),
+                _ => "other".to_owned(),
+            })
+            .expect("the chosen node is in the document it came from");
+        assert!(
+            ["a", "p", "body", "#text"].contains(&named.as_str()),
+            "picked {named}, which is not on the line that was pointed at"
+        );
+
+        // And the picker disarms itself, so the next press is a press again.
+        assert!(!browser.inspector.picking);
+    }
+
+    #[test]
+    fn the_highlight_is_where_the_engine_drew_the_chosen_box() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.navigate("start.example");
+        settle(&mut browser);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.inspector.toggle();
+        let (x, y) = link_position(&browser);
+        browser.inspector.picking = true;
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed);
+
+        let (rect, _) = browser.highlight().expect("the chosen box was drawn");
+        // Asserted against the engine's own answer rather than against numbers:
+        // whatever box the hit test names, the overlay is that box's rectangle.
+        let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
+        let id = page
+            .boxes()
+            .box_for(browser.inspector.selected.expect("something was chosen"))
+            .expect("the chosen node has a box");
+        let expected = page.rect_of(id).expect("the box was drawn");
+        assert_eq!(rect.x, f64::from(expected.x));
+        assert_eq!(rect.y, f64::from(expected.y));
+        assert_eq!(rect.width, f64::from(expected.width));
+        assert_eq!(rect.height, f64::from(expected.height));
+        assert!(
+            rect.y >= UI_HEIGHT,
+            "the overlay is in window coordinates, below the toolbar"
+        );
     }
 
     /// A picture of `bytes` bytes, with no pixels worth looking at.
@@ -2153,6 +2506,63 @@ mod tests {
 
     /// Where the reader had got to comes back with the page, which is the part of
     /// a back button people actually notice.
+    /// One scroll event, and everything it can land on goes the same way.
+    ///
+    /// The property that was broken: the page added the delta and the browser's
+    /// own surfaces subtracted it, so a wheel that went down a document went up
+    /// the settings. Nobody notices which of the two is "right" until they are
+    /// different, which is why this is asserted rather than commented.
+    #[test]
+    fn a_scroll_goes_the_same_way_on_a_document_and_on_a_browser_page() {
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        settle(&mut browser);
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        browser.on_event(PlatformEvent::PointerMoved { x: 400.0, y: 400.0 });
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 120.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+        });
+        let page = browser.tabs[0].page.as_ref().expect("a page").scroll();
+        assert!(page > 0.0, "a positive delta goes down the document");
+
+        browser.open_system(SystemPage::Settings);
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 120.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+        });
+        assert!(
+            browser.settings.settings.scroll > 0.0,
+            "and down the browser's own page, by the same event"
+        );
+    }
+
+    /// A trackpad's small precise deltas are a distance, not a notch.
+    #[test]
+    fn a_trackpad_scrolls_by_what_it_says_rather_than_by_a_notch() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        settle(&mut browser);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        browser.on_event(PlatformEvent::PointerMoved { x: 400.0, y: 400.0 });
+
+        // Three pixels is three pixels. A browser that read this as a notch
+        // would jump the page by a wheel's worth for a gesture that moved a
+        // finger a hair.
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 3.0,
+            source: otlyra_platform::ScrollSource::Trackpad,
+        });
+        assert_eq!(browser.tabs[0].page.as_ref().expect("a page").scroll(), 3.0);
+    }
+
     #[test]
     fn going_back_restores_where_the_reader_was() {
         let mut browser = Browser::new(LongLoader);
@@ -2320,7 +2730,11 @@ mod tests {
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
         browser.ui.pointer_moved(400.0, 400.0);
-        browser.on_event(PlatformEvent::Scroll { x: 0.0, y: 200.0 });
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 200.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+        });
         let scrolled = browser.tabs[0].page.as_ref().expect("page").scroll();
         assert!(scrolled > 0.0);
 

@@ -88,6 +88,28 @@ impl Viewport {
     }
 }
 
+/// What a scroll came from.
+///
+/// The two are not the same gesture wearing different hardware. A wheel sends
+/// *notches*: a handful of discrete events, each worth a jump of some fixed
+/// distance the platform decides. A trackpad sends a *distance*, in a stream of
+/// small precise deltas, followed by momentum after the fingers have left. Treat
+/// a three-pixel trackpad delta as a notch and the page leaps; treat a notch as
+/// three pixels and the wheel does nothing.
+///
+/// It matters for direction too, on macOS. The system applies its natural
+/// scrolling preference to the delta before it reaches us, and there is no way
+/// to ask which way it decided — so a browser that wants to offer its own
+/// preference has to know which device the delta came from to apply it to the
+/// right one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ScrollSource {
+    /// A mouse wheel, in notches converted to pixels.
+    Wheel,
+    /// A trackpad or another precise device, already in pixels.
+    Trackpad,
+}
+
 /// Something happened that the browser above may care about.
 ///
 /// Deliberately small: a variant with no consumer only makes the translation layer
@@ -101,7 +123,12 @@ pub enum PlatformEvent {
     /// The drawable changed size, the scale factor changed, or both.
     Resized(Viewport),
     /// The user scrolled, by this many **logical** pixels. Positive `y` means the
-    /// content should move up, i.e. the reader is going down the page.
+    /// reader is going *down* the page — the scroll offset grows.
+    ///
+    /// One convention, stated once, and every consumer adds it to an offset
+    /// rather than deciding for itself which way is down. Two consumers that
+    /// each negated it their own way is exactly how a browser ends up scrolling
+    /// one direction on a document and the other on its own settings.
     ///
     /// Line-based wheels are converted here, because how many pixels a wheel notch
     /// is worth is a platform fact and this crate is where platform facts live.
@@ -110,6 +137,8 @@ pub enum PlatformEvent {
         x: f64,
         /// Vertical delta in logical pixels.
         y: f64,
+        /// What the reader scrolled with.
+        source: ScrollSource,
     },
     /// The pointer moved to this position, in logical pixels from the top left of
     /// the drawable.

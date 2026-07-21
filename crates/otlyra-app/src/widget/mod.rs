@@ -55,6 +55,7 @@
 //!   either side of it.
 
 pub mod controls;
+pub mod data;
 pub mod icon;
 pub mod theme;
 
