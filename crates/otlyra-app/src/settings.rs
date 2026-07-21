@@ -20,6 +20,7 @@ use otlyra_gfx::DisplayList;
 use otlyra_platform::{Key, Modifiers};
 use otlyra_text::TextEngine;
 
+use crate::clipboard::Clipboard;
 use crate::widget::controls::{self, Emphasis};
 use crate::widget::theme::Theme;
 use crate::widget::{
@@ -52,6 +53,31 @@ impl OnStart {
     }
 }
 
+/// Which palette the interface is drawn from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Appearance {
+    /// The light palette, whatever the system says.
+    Light,
+    /// The dark one, likewise.
+    Dark,
+    /// Whichever the system currently says, and follow it when it changes.
+    System,
+}
+
+impl Appearance {
+    /// The three of them, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Light, Self::Dark, Self::System];
+
+    /// What this is called on the surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::System => "System",
+        }
+    }
+}
+
 /// Everything the browser lets someone change about it.
 ///
 /// Plain fields, no indirection: a preference that needed a setter would need a
@@ -72,6 +98,8 @@ pub struct Settings {
     pub do_not_track: bool,
     /// Restore the tabs that were open, when `on_start` says to.
     pub restore_tabs: bool,
+    /// Which palette the interface is drawn from.
+    pub appearance: Appearance,
     /// The size text is drawn at, as a percentage of the default.
     pub text_scale: f64,
     /// Which control has the keyboard.
@@ -94,6 +122,7 @@ impl Default for Settings {
             run_scripts: true,
             do_not_track: false,
             restore_tabs: true,
+            appearance: Appearance::System,
             text_scale: 100.0,
             focus: None,
             scroll: 0.0,
@@ -114,6 +143,8 @@ pub enum Action {
     /// The id is claimed while the frame is built, so it names the control that
     /// was actually drawn there rather than a number chosen in advance.
     Focus(FocusId),
+    /// The pointer landed in the home field, at this offset in its text.
+    HomeHit(controls::FieldHit),
     /// Load pictures, or stop.
     ToggleImages,
     /// Run scripts, or stop.
@@ -122,6 +153,8 @@ pub enum Action {
     ToggleDoNotTrack,
     /// Restore tabs, or stop.
     ToggleRestoreTabs,
+    /// Draw the interface from this palette.
+    SetAppearance(Appearance),
     /// Draw text at this percentage of the default.
     SetTextScale(f64),
     /// Put everything back the way it came.
@@ -145,10 +178,14 @@ impl Settings {
             Action::None | Action::Close => {}
             Action::SetOnStart(choice) => self.on_start = choice,
             Action::Focus(id) => self.focus = Some(id),
+            // The hit needs the field's focus id too, and only the surface has
+            // it; `SettingsSurface::deliver` handles the whole of it there.
+            Action::HomeHit(_) => {}
             Action::ToggleImages => self.load_images = !self.load_images,
             Action::ToggleScripts => self.run_scripts = !self.run_scripts,
             Action::ToggleDoNotTrack => self.do_not_track = !self.do_not_track,
             Action::ToggleRestoreTabs => self.restore_tabs = !self.restore_tabs,
+            Action::SetAppearance(choice) => self.appearance = choice,
             // Rounded to fives: a text size of 103% is a number nobody asked for
             // and cannot aim at a second time.
             Action::SetTextScale(scale) => {
@@ -179,24 +216,8 @@ impl Settings {
             && self.run_scripts == other.run_scripts
             && self.do_not_track == other.do_not_track
             && self.restore_tabs == other.restore_tabs
+            && self.appearance == other.appearance
             && (self.text_scale - other.text_scale).abs() < f64::EPSILON
-    }
-
-    /// Edit the home field with `key`, if it is a key that edits one.
-    ///
-    /// Only reached while the field holds the focus, which is why the arrows
-    /// move the caret here and move between controls everywhere else.
-    fn edit_home(&mut self, key: Key) -> bool {
-        match key {
-            Key::Backspace => self.home.backspace(),
-            Key::Delete => self.home.delete(),
-            Key::Left => self.home.move_left(),
-            Key::Right => self.home.move_right(),
-            Key::Home => self.home.move_home(),
-            Key::End => self.home.move_end(),
-            _ => return false,
-        }
-        true
     }
 
     /// Scroll by `delta` logical pixels, stopping at the ends.
@@ -218,6 +239,7 @@ impl Settings {
         let rows = vec![
             self.startup_card(theme, focus),
             self.content_card(theme, focus),
+            self.appearance_card(theme, focus),
             self.privacy_card(theme, focus),
             self.reset_row(theme, focus),
             Box::new(Gap::new(0.0, theme.inset * 2.0)) as Child<Action>,
@@ -303,12 +325,17 @@ impl Settings {
         // too: whether it shows a caret is whether the surface's focus is on it.
         // Nothing has to be told about it afterwards.
         let home_id = focus.claim_text(true);
-        let home_field = controls::TextInput::new(controls::FieldView {
-            text: self.home.text().to_owned(),
-            caret: (self.focus == Some(home_id)).then(|| self.home.caret()),
-            placeholder: "https://".to_owned(),
-        })
-        .into_widget::<Action>(theme);
+        let focused = self.focus == Some(home_id);
+        let home_field = controls::TextInput::new(
+            controls::FieldView {
+                text: self.home.text().to_owned(),
+                caret: focused.then(|| self.home.caret()),
+                selection: focused.then(|| self.home.selection()).flatten(),
+                placeholder: "https://".to_owned(),
+            },
+            Action::HomeHit,
+        )
+        .into_widget(theme);
 
         controls::card(
             theme,
@@ -320,13 +347,7 @@ impl Settings {
                     theme,
                     "Home page",
                     Some("Where the home button and a new window go."),
-                    Box::new(crate::widget::Fixed::width(
-                        280.0,
-                        Box::new(
-                            crate::widget::Button::new(Action::Focus(home_id), home_field)
-                                .focus(home_id),
-                        ),
-                    )),
+                    Box::new(crate::widget::Fixed::width(280.0, home_field)),
                 ),
                 controls::setting_row(
                     theme,
@@ -389,32 +410,36 @@ impl Settings {
         controls::card(
             theme,
             "Privacy",
-            vec![
-                controls::setting_row(
+            vec![controls::setting_row(
+                theme,
+                "Do Not Track",
+                Some("Sends a request sites are free to ignore, and most do."),
+                controls::toggle(theme, focus, Action::ToggleDoNotTrack, self.do_not_track),
+            )],
+        )
+    }
+
+    fn appearance_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
+        controls::card(
+            theme,
+            "Appearance",
+            vec![controls::setting_row(
+                theme,
+                "Theme",
+                Some("System follows the platform, and follows it live."),
+                controls::segmented(
                     theme,
-                    "Do Not Track",
-                    Some("Sends a request sites are free to ignore, and most do."),
-                    controls::toggle(theme, focus, Action::ToggleDoNotTrack, self.do_not_track),
+                    focus,
+                    Appearance::ALL
+                        .iter()
+                        .map(|choice| (choice.label().to_owned(), Action::SetAppearance(*choice)))
+                        .collect(),
+                    Appearance::ALL
+                        .iter()
+                        .position(|choice| *choice == self.appearance)
+                        .unwrap_or(0),
                 ),
-                controls::divider(theme),
-                controls::setting_row(
-                    theme,
-                    "Start with",
-                    None,
-                    controls::segmented(
-                        theme,
-                        focus,
-                        OnStart::ALL
-                            .iter()
-                            .map(|choice| (choice.label().to_owned(), Action::SetOnStart(*choice)))
-                            .collect(),
-                        OnStart::ALL
-                            .iter()
-                            .position(|choice| *choice == self.on_start)
-                            .unwrap_or(0),
-                    ),
-                ),
-            ],
+            )],
         )
     }
 
@@ -439,7 +464,7 @@ impl Settings {
 
 /// Everything the settings' appearance is a function of.
 #[derive(Clone, PartialEq)]
-struct Appearance {
+struct Drawn {
     rect: Rect,
     settings: Settings,
     pointer: (f64, f64),
@@ -459,6 +484,8 @@ pub struct SettingsSurface {
     pointer: (f64, f64),
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
+    /// How many clicks the current press is the latest of.
+    clicks: u32,
     engine: TextEngine,
     /// The focusable controls the last frame built, in the order it built them.
     ///
@@ -472,7 +499,7 @@ pub struct SettingsSurface {
     /// on everything it draws from would draw the same list, so it does not
     /// build one. This page is a scrolling column of cards, and rebuilding it
     /// every frame shapes every label on it again.
-    cache: Option<(Appearance, DisplayList)>,
+    cache: Option<(Drawn, DisplayList)>,
     builds: u64,
     root: Option<Child<Action>>,
 }
@@ -500,6 +527,7 @@ impl SettingsSurface {
             pointer: (-1.0, -1.0),
             pointer_down: false,
             press_origin: None,
+            clicks: 1,
             engine: TextEngine::new(),
             focus: Focus::default(),
             cache: None,
@@ -524,6 +552,15 @@ impl SettingsSurface {
         self.settings.focus
     }
 
+    /// Draw from `theme` from the next frame on. The cache does not key on the
+    /// theme, so the stored list goes with the old palette.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.cache = None;
+        }
+    }
+
     /// Activate the control a reader named, through the path a press takes.
     pub fn activate_described(&mut self, index: usize) -> Action {
         let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
@@ -544,14 +581,15 @@ impl SettingsSurface {
         self.deliver(&Event::PointerMoved)
     }
 
-    /// Press at the last reported position.
-    pub fn pointer_pressed(&mut self) -> Action {
+    /// Press at the last reported position, `clicks` deep into a run of them.
+    pub fn pointer_pressed(&mut self, clicks: u32) -> Action {
         self.pointer_down = true;
         self.press_origin = Some(self.pointer);
+        self.clicks = clicks;
         let action = self.deliver(&Event::PointerPressed);
         // A press on anything that does not ask for the keyboard takes it away
         // from whatever had it — which is what takes the caret out of the field.
-        if !matches!(action, Action::Focus(_)) {
+        if !matches!(action, Action::Focus(_) | Action::HomeHit(_)) {
             self.settings.focus = None;
         }
         action
@@ -565,15 +603,25 @@ impl SettingsSurface {
     /// is what built the order. What the layer does is compare ids, so a control
     /// activated from here reports through exactly the path a press reports
     /// through and the two cannot drift.
-    pub fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Option<Action> {
-        // An accelerator is the browser's, wherever it is pressed: reload and
-        // new-tab do not stop working because a preference is on screen.
-        if modifiers.is_accelerator() {
-            return None;
-        }
-
+    pub fn key_pressed(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+        clipboard: &mut dyn Clipboard,
+    ) -> Option<Action> {
         let holder = self.settings.focus;
         let editing = self.focus.kind(holder) == Some(FocusKind::Text);
+
+        // An accelerator is the browser's, wherever it is pressed: reload and
+        // new-tab do not stop working because a preference is on screen. The
+        // one exception is a focused field, which owns the editing four —
+        // ⌘C over the home page address is a copy, not a browser command.
+        if modifiers.is_accelerator() {
+            if editing && self.settings.home.edit(key, modifiers, clipboard) {
+                return Some(Action::None);
+            }
+            return None;
+        }
 
         if key == Key::Tab {
             self.settings.focus = if modifiers.shift {
@@ -592,7 +640,9 @@ impl SettingsSurface {
                     self.settings.focus = None;
                     return Some(Action::None);
                 }
-                _ if self.settings.edit_home(key) => return Some(Action::None),
+                _ if self.settings.home.edit(key, modifiers, clipboard) => {
+                    return Some(Action::None);
+                }
                 _ => {}
             }
         }
@@ -650,7 +700,7 @@ impl SettingsSurface {
     pub fn cursor_at(&mut self, x: f64, y: f64) -> otlyra_platform::Cursor {
         match self.action_at(x, y) {
             Action::None => otlyra_platform::Cursor::Default,
-            Action::Focus(_) => otlyra_platform::Cursor::Text,
+            Action::Focus(_) | Action::HomeHit(_) => otlyra_platform::Cursor::Text,
             _ => otlyra_platform::Cursor::Pointer,
         }
     }
@@ -683,6 +733,14 @@ impl SettingsSurface {
     /// Offer an event to the last frame's tree and apply what comes back.
     fn deliver(&mut self, event: &Event) -> Action {
         let action = self.offer(event);
+        // A hit in the home field is applied here rather than in
+        // `Settings::apply`: it moves the keyboard to the field, and the
+        // field's id belongs to the frame — only the surface has it.
+        if let Action::HomeHit(hit) = action {
+            self.settings.focus = self.focus.first_text();
+            self.settings.home.hit(hit);
+            return action;
+        }
         self.settings.apply(action.clone());
         action
     }
@@ -698,6 +756,8 @@ impl SettingsSurface {
         let mut cx = Cx::new(&mut self.engine);
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
+        cx.press_origin = self.press_origin;
+        cx.clicks = self.clicks;
         cx.focus = self.settings.focus;
         cx.theme = self.theme.clone();
 
@@ -711,7 +771,7 @@ impl SettingsSurface {
     /// is asked about are the window's. Placing it anywhere else would mean
     /// translating every press on the way in.
     pub fn build_display_list(&mut self, rect: Rect, text: &mut TextEngine, out: &mut DisplayList) {
-        let appearance = Appearance {
+        let appearance = Drawn {
             rect,
             settings: self.settings.clone(),
             pointer: self.pointer,
@@ -774,7 +834,7 @@ mod tests {
     fn frame(surface: &mut SettingsSurface) {
         let mut text = TextEngine::new();
         let mut list = DisplayList::new();
-        surface.build_display_list(Rect::new(0.0, 0.0, 900.0, 700.0), &mut text, &mut list);
+        surface.build_display_list(Rect::new(0.0, 0.0, 900.0, 1000.0), &mut text, &mut list);
     }
 
     /// Where on a freshly drawn surface a press reports `wanted`.
@@ -787,7 +847,7 @@ mod tests {
         let mut probe = SettingsSurface::new();
         frame(&mut probe);
         for x in (0..900).step_by(8) {
-            for y in (0..700).step_by(2) {
+            for y in (0..1000).step_by(2) {
                 if probe.action_at(f64::from(x), f64::from(y)) == *wanted {
                     return (f64::from(x), f64::from(y));
                 }
@@ -821,7 +881,7 @@ mod tests {
         assert!(surface.settings.load_images);
 
         surface.pointer_moved(x, y);
-        assert_eq!(surface.pointer_pressed(), Action::ToggleImages);
+        assert_eq!(surface.pointer_pressed(1), Action::ToggleImages);
         assert!(!surface.settings.load_images, "the press took effect");
     }
 
@@ -834,7 +894,7 @@ mod tests {
         assert_eq!(surface.settings.on_start, OnStart::Blank);
 
         surface.pointer_moved(x, y);
-        surface.pointer_pressed();
+        surface.pointer_pressed(1);
         assert_eq!(surface.settings.on_start, OnStart::Restore);
     }
 
@@ -886,7 +946,11 @@ mod tests {
         // Tab until the caret is somewhere, which is the field and nothing else:
         // it is the one control on the surface text goes into.
         while !surface.text_input('h') {
-            surface.key_pressed(Key::Tab, Modifiers::default());
+            surface.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default(),
+            );
         }
         assert!(surface.settings.home.text().ends_with('h'));
     }
@@ -900,9 +964,17 @@ mod tests {
         let mut surface = SettingsSurface::new();
         frame(&mut surface);
         for _ in 0..steps {
-            surface.key_pressed(Key::Tab, Modifiers::default());
+            surface.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default(),
+            );
         }
-        surface.key_pressed(Key::Enter, Modifiers::default())
+        surface.key_pressed(
+            Key::Enter,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        )
     }
 
     /// What every control on the surface reports, in the order Tab reaches them.
@@ -932,10 +1004,10 @@ mod tests {
                 // be pressed is not a place the keyboard stops.
                 // The slider answers the arrows, not Return.
                 Action::None,
+                Action::SetAppearance(Appearance::Light),
+                Action::SetAppearance(Appearance::Dark),
+                Action::SetAppearance(Appearance::System),
                 Action::ToggleDoNotTrack,
-                Action::SetOnStart(Blank),
-                Action::SetOnStart(Home),
-                Action::SetOnStart(Restore),
                 Action::Reset,
             ]
         );
@@ -956,9 +1028,14 @@ mod tests {
                 shift: true,
                 ..Modifiers::default()
             },
+            &mut crate::clipboard::InMemory::default(),
         );
         assert_eq!(
-            surface.key_pressed(Key::Enter, Modifiers::default()),
+            surface.key_pressed(
+                Key::Enter,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default()
+            ),
             Some(Action::Reset)
         );
     }
@@ -978,7 +1055,7 @@ mod tests {
             let mut pressed = SettingsSurface::new();
             frame(&mut pressed);
             pressed.pointer_moved(x, y);
-            assert_eq!(pressed.pointer_pressed(), wanted);
+            assert_eq!(pressed.pointer_pressed(1), wanted);
 
             let by_key = (1..=13)
                 .filter_map(activate_after)
@@ -993,16 +1070,32 @@ mod tests {
         frame(&mut surface);
         // Onto the first of the three start-up choices.
         for _ in 0..2 {
-            surface.key_pressed(Key::Tab, Modifiers::default());
+            surface.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default(),
+            );
         }
         assert_eq!(surface.settings.on_start, OnStart::Blank);
 
-        surface.key_pressed(Key::Down, Modifiers::default());
+        surface.key_pressed(
+            Key::Down,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(surface.settings.on_start, OnStart::Home);
-        surface.key_pressed(Key::Down, Modifiers::default());
+        surface.key_pressed(
+            Key::Down,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(surface.settings.on_start, OnStart::Restore);
         // Round the end of the group rather than out of it.
-        surface.key_pressed(Key::Down, Modifiers::default());
+        surface.key_pressed(
+            Key::Down,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(surface.settings.on_start, OnStart::Blank);
     }
 
@@ -1013,14 +1106,30 @@ mod tests {
         // The text-size slider is the eighth control the keyboard stops at —
         // the ninth thing drawn, with the dimmed scripts switch passed over.
         for _ in 0..8 {
-            surface.key_pressed(Key::Tab, Modifiers::default());
+            surface.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default(),
+            );
         }
         assert_eq!(surface.settings.text_scale, 100.0);
 
-        surface.key_pressed(Key::Right, Modifiers::default());
+        surface.key_pressed(
+            Key::Right,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(surface.settings.text_scale, 105.0);
-        surface.key_pressed(Key::Left, Modifiers::default());
-        surface.key_pressed(Key::Left, Modifiers::default());
+        surface.key_pressed(
+            Key::Left,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
+        surface.key_pressed(
+            Key::Left,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(surface.settings.text_scale, 95.0);
     }
 
@@ -1028,15 +1137,27 @@ mod tests {
     fn escape_drops_the_focus_before_it_leaves_the_surface() {
         let mut surface = SettingsSurface::new();
         frame(&mut surface);
-        surface.key_pressed(Key::Tab, Modifiers::default());
+        surface.key_pressed(
+            Key::Tab,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
 
         assert_eq!(
-            surface.key_pressed(Key::Escape, Modifiers::default()),
+            surface.key_pressed(
+                Key::Escape,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default()
+            ),
             Some(Action::None),
             "the first press only lets go of the control"
         );
         assert_eq!(
-            surface.key_pressed(Key::Escape, Modifiers::default()),
+            surface.key_pressed(
+                Key::Escape,
+                Modifiers::default(),
+                &mut crate::clipboard::InMemory::default()
+            ),
             Some(Action::Close),
             "with nothing focused, it leaves"
         );
@@ -1048,7 +1169,11 @@ mod tests {
         frame(&mut surface);
         assert_eq!(surface.builds(), 1);
 
-        surface.key_pressed(Key::Tab, Modifiers::default());
+        surface.key_pressed(
+            Key::Tab,
+            Modifiers::default(),
+            &mut crate::clipboard::InMemory::default(),
+        );
         frame(&mut surface);
         assert_eq!(surface.builds(), 2, "the ring is part of the frame");
     }
@@ -1063,10 +1188,72 @@ mod tests {
             ..Modifiers::default()
         };
         assert_eq!(
-            surface.key_pressed(Key::Character('t'), accelerator),
+            surface.key_pressed(
+                Key::Character('t'),
+                accelerator,
+                &mut crate::clipboard::InMemory::default()
+            ),
             None,
             "a new tab is not the settings' to swallow"
         );
+    }
+
+    #[test]
+    fn the_focused_home_field_owns_the_editing_accelerators() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        surface.settings.focus = surface.focus.first_text();
+        surface.settings.home.select_all();
+
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        let mut clipboard = crate::clipboard::InMemory::default();
+        assert_eq!(
+            surface.key_pressed(Key::Character('c'), accelerator, &mut clipboard),
+            Some(Action::None),
+            "⌘C over the field is the field's"
+        );
+        assert_eq!(clipboard.read().as_deref(), Some("https://example.com/"));
+        assert_eq!(
+            surface.key_pressed(Key::Character('t'), accelerator, &mut clipboard),
+            None,
+            "and ⌘T still is not"
+        );
+    }
+
+    #[test]
+    fn a_press_in_the_home_field_lands_the_caret_and_a_drag_selects() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+
+        // The field, found the way the cursor finds it: by what a press there
+        // would report.
+        let (x, y) = (56..700)
+            .step_by(2)
+            .find_map(|y| {
+                matches!(surface.action_at(485.0, f64::from(y)), Action::HomeHit(_))
+                    .then_some((485.0, f64::from(y)))
+            })
+            .expect("the surface has a field to press in");
+
+        surface.pointer_moved(x, y);
+        surface.pointer_pressed(1);
+        assert_eq!(
+            surface.focused(),
+            surface.focus.first_text(),
+            "a press in the field moves the keyboard there"
+        );
+
+        // Drag towards the field's end: the selection grows behind the
+        // pointer, anchored where the press landed.
+        let pressed_at = surface.settings.home.caret();
+        surface.pointer_moved(x + 120.0, y);
+        let selection = surface.settings.home.selection().expect("a drag selects");
+        assert_eq!(selection.start, pressed_at, "anchored at the press");
+        surface.pointer_released();
     }
 
     #[test]
@@ -1081,7 +1268,7 @@ mod tests {
         // Over the field, where a caret can go, it becomes a text bar.
         let field = (56..700)
             .step_by(2)
-            .find(|y| matches!(surface.action_at(485.0, f64::from(*y)), Action::Focus(_)))
+            .find(|y| matches!(surface.action_at(485.0, f64::from(*y)), Action::HomeHit(_)))
             .expect("the surface has a field to type into");
         assert_eq!(surface.cursor_at(485.0, f64::from(field)), Cursor::Text);
 

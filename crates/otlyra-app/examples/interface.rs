@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use otlyra_app::clipboard::InMemory;
 use otlyra_app::ui::{BrowserUi, TabLabel, UI_HEIGHT};
 use otlyra_gfx::DisplayList;
 use otlyra_gfx::PaintTarget;
@@ -34,9 +35,13 @@ struct Frame {
     /// order a frame built, so until one has been built there is no field to
     /// focus. Every state here is therefore drawn twice and the second one kept.
     focus_address: bool,
+    /// Keep the whole address selected, the way ⌘L leaves it. Without this a
+    /// focused frame collapses the selection so the caret itself is visible.
+    select_address: bool,
     /// How many times Tab is pressed before the frame that is written.
     tabs_pressed: usize,
     text: TextEngine,
+    clipboard: InMemory,
 }
 
 impl Frame {
@@ -46,14 +51,25 @@ impl Frame {
     /// start, or the second one would be a different number of Tabs along than
     /// the first and the two shots would not be of one state.
     fn settle(&mut self) {
-        self.ui
-            .key_pressed(Key::Escape, Modifiers::default(), &mut self.text);
+        self.ui.key_pressed(
+            Key::Escape,
+            Modifiers::default(),
+            &mut self.text,
+            &mut self.clipboard,
+        );
         if self.focus_address {
             self.ui.focus_address();
+            if !self.select_address {
+                self.ui.address.move_end(false);
+            }
         }
         for _ in 0..self.tabs_pressed {
-            self.ui
-                .key_pressed(Key::Tab, Modifiers::default(), &mut self.text);
+            self.ui.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut self.text,
+                &mut self.clipboard,
+            );
         }
     }
 }
@@ -65,6 +81,7 @@ impl Painter for Frame {
         let mut list = DisplayList::new();
         otlyra_app::ui::paint_blank_page(
             &mut list,
+            &self.ui.theme,
             viewport.logical_width(),
             viewport.logical_height(),
             None,
@@ -78,6 +95,75 @@ impl Painter for Frame {
             self.active,
             self.history,
             self.spinner,
+            &mut self.text,
+            &mut list,
+        );
+        list.transform(Affine::scale(viewport.scale_factor));
+        otlyra_gfx::render(&list, target);
+    }
+
+    fn on_event(&mut self, _event: PlatformEvent) {}
+}
+
+/// The history, with a couple of days behind it, as the browser shows it.
+struct HistoryFrame {
+    ui: BrowserUi,
+    surface: otlyra_app::history::HistorySurface,
+    store: otlyra_app::history::HistoryStore,
+    today: jiff::civil::Date,
+    text: TextEngine,
+}
+
+impl HistoryFrame {
+    fn new() -> Self {
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("about:history");
+        let mut store = otlyra_app::history::HistoryStore::default();
+        let today: jiff::civil::Date = "2026-07-22".parse().expect("a date");
+        let at = |text: &str| text.parse::<jiff::Timestamp>().expect("a timestamp");
+        store.record(
+            "https://octofhir.github.io/Otlyra/",
+            "Otlyra — a browser engine",
+            at("2026-07-20T10:15:00Z"),
+        );
+        store.record(
+            "https://example.com/some/very/long/path/that/needs/cutting",
+            "A page with a long address",
+            at("2026-07-21T18:40:00Z"),
+        );
+        store.record(
+            "https://example.com/search?q=widgets",
+            "Search results",
+            at("2026-07-22T09:05:00Z"),
+        );
+        Self {
+            ui,
+            surface: otlyra_app::history::HistorySurface::new(),
+            store,
+            today,
+            text: TextEngine::new(),
+        }
+    }
+}
+
+impl Painter for HistoryFrame {
+    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        let (width, height) = (viewport.logical_width(), viewport.logical_height());
+        let mut list = DisplayList::new();
+        self.surface.build_display_list(
+            otlyra_app::ui::Rect::new(0.0, UI_HEIGHT, width, (height - UI_HEIGHT).max(0.0)),
+            &self.store,
+            self.today,
+            &mut self.text,
+            &mut list,
+        );
+        self.ui.build_display_list(
+            width,
+            height,
+            &tabs(&[("History", false)]),
+            0,
+            (true, false),
+            None,
             &mut self.text,
             &mut list,
         );
@@ -116,7 +202,8 @@ impl SettingsFrame {
         self.surface.settings.focus = None;
         self.surface.scroll_by(self.scroll);
         for _ in 0..self.tabs_pressed {
-            self.surface.key_pressed(Key::Tab, Modifiers::default());
+            self.surface
+                .key_pressed(Key::Tab, Modifiers::default(), &mut InMemory::default());
         }
     }
 }
@@ -185,10 +272,18 @@ impl InspectorFrame {
     fn settle(&mut self) {
         self.inspector.selected = None;
         for _ in 0..self.steps {
-            self.inspector
-                .key_pressed(Key::Down, Modifiers::default(), &self.document);
-            self.inspector
-                .key_pressed(Key::Right, Modifiers::default(), &self.document);
+            self.inspector.key_pressed(
+                Key::Down,
+                Modifiers::default(),
+                &self.document,
+                &mut InMemory::default(),
+            );
+            self.inspector.key_pressed(
+                Key::Right,
+                Modifiers::default(),
+                &self.document,
+                &mut InMemory::default(),
+            );
         }
     }
 }
@@ -200,7 +295,15 @@ impl Painter for InspectorFrame {
         let dock = self.inspector.dock_height(content);
 
         let mut list = DisplayList::new();
-        otlyra_app::ui::paint_blank_page(&mut list, width, height, None, None, &mut self.text);
+        otlyra_app::ui::paint_blank_page(
+            &mut list,
+            &self.ui.theme,
+            width,
+            height,
+            None,
+            None,
+            &mut self.text,
+        );
         let facts = otlyra_app::inspector::Facts {
             document: Some(&self.document),
             style: None,
@@ -272,8 +375,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         history,
         spinner,
         focus_address: false,
+        select_address: false,
         tabs_pressed: 0,
         text: TextEngine::new(),
+        clipboard: InMemory::default(),
     };
 
     let mut frames = Vec::new();
@@ -321,6 +426,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     focused.focus_address = true;
     frames.push(focused);
 
+    // The same field with everything selected, the way ⌘L leaves it: the wash
+    // has to read as selection against the field's focused white.
+    let mut selected = toolbar(
+        "selected",
+        tabs(&[("Otlyra", false), ("Second", false)]),
+        1,
+        (true, false),
+        None,
+    );
+    selected
+        .ui
+        .address
+        .set_text("https://example.com/search?q=widgets");
+    selected.focus_address = true;
+    selected.select_address = true;
+    frames.push(selected);
+
     // The keyboard on the first tab, which is where the focus ring has to be
     // legible against the strip it is drawn on.
     let mut traversed = toolbar(
@@ -350,7 +472,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     );
     hovered.ui.address.set_text("https://example.com/");
-    hovered.ui.pointer_moved(80.0, UI_HEIGHT - 20.0);
+    let mut engine = TextEngine::new();
+    hovered
+        .ui
+        .pointer_moved(80.0, UI_HEIGHT - 20.0, &mut engine);
     frames.push(hovered);
 
     // The settings: the whole page, then the states a tall window cannot show —
@@ -371,6 +496,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame.settle();
         })?;
     }
+
+    // The history: a searchable list with two days behind it.
+    write_states(
+        &directory,
+        "history",
+        &mut HistoryFrame::new(),
+        900.0,
+        700.0,
+        |_| {},
+    )?;
 
     // The inspector, closed on the document and opened several levels into it.
     for (name, steps) in [("inspector", 1), ("inspector-deep", 4)] {

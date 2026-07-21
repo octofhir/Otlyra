@@ -26,7 +26,8 @@ use otlyra_text::TextEngine;
 
 pub use crate::widget::Rect;
 
-use crate::widget::controls::{self, Elide, FieldView, TextInput};
+use crate::clipboard::Clipboard;
+use crate::widget::controls::{self, Elide, FieldHit, FieldView, TextInput};
 use crate::widget::icon;
 use crate::widget::theme::Theme;
 use crate::widget::{
@@ -54,10 +55,17 @@ const NEW_TAB_SIZE: f64 = 28.0;
 ///
 /// Byte offsets, not character counts: the text is UTF-8 and a caret that can land
 /// mid-character is a panic waiting for the first non-ASCII address.
+///
+/// A selection is the stretch between `anchor` and `caret`. The anchor is where
+/// the selection began — a shift-press or a drag leaves it behind while the
+/// caret travels — and when the two agree there is no selection. One pair of
+/// offsets rather than a range beside a flag, so an empty selection and a
+/// missing one cannot be two different states.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextField {
     text: String,
     caret: usize,
+    anchor: usize,
 }
 
 impl TextField {
@@ -66,6 +74,7 @@ impl TextField {
         let text = text.into();
         Self {
             caret: text.len(),
+            anchor: text.len(),
             text,
         }
     }
@@ -80,77 +89,266 @@ impl TextField {
         self.caret
     }
 
+    /// The selected range, lowest offset first. `None` when nothing is selected.
+    pub fn selection(&self) -> Option<std::ops::Range<usize>> {
+        (self.anchor != self.caret)
+            .then(|| self.anchor.min(self.caret)..self.anchor.max(self.caret))
+    }
+
+    /// The selected text. `None` when nothing is selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|range| &self.text[range])
+    }
+
+    /// Select everything, with the caret at the end.
+    pub fn select_all(&mut self) {
+        self.anchor = 0;
+        self.caret = self.text.len();
+    }
+
     /// Replace the text and put the caret at the end.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.caret = self.text.len();
+        self.anchor = self.caret;
     }
 
-    /// Insert a character at the caret and step over it.
+    /// Insert a character at the caret and step over it. A live selection is
+    /// what the character replaces.
     pub fn insert(&mut self, character: char) {
+        self.remove_selection();
         self.text.insert(self.caret, character);
         self.caret += character.len_utf8();
+        self.anchor = self.caret;
     }
 
-    /// Delete the character before the caret.
+    /// Delete the selection, or the character before the caret.
     pub fn backspace(&mut self) {
-        if self.caret == 0 {
+        if self.remove_selection() || self.caret == 0 {
             return;
         }
-        let previous = self.previous_boundary();
+        let previous = self.previous_boundary(self.caret);
         self.text.replace_range(previous..self.caret, "");
         self.caret = previous;
+        self.anchor = previous;
     }
 
-    /// Delete the character after the caret.
+    /// Delete the selection, or the character after the caret.
     pub fn delete(&mut self) {
-        if self.caret >= self.text.len() {
+        if self.remove_selection() || self.caret >= self.text.len() {
             return;
         }
-        let next = self.next_boundary();
+        let next = self.next_boundary(self.caret);
         self.text.replace_range(self.caret..next, "");
+        self.anchor = self.caret;
     }
 
-    /// Move the caret one character left.
-    pub fn move_left(&mut self) {
-        self.caret = self.previous_boundary();
+    /// Move the caret one character left; extending leaves the anchor behind.
+    ///
+    /// With a selection and no shift, the caret collapses to the selection's
+    /// start rather than stepping — the selection was the position, and left
+    /// means its left end.
+    pub fn move_left(&mut self, extend: bool) {
+        if extend {
+            self.caret = self.previous_boundary(self.caret);
+            return;
+        }
+        self.caret = match self.selection() {
+            Some(range) => range.start,
+            None => self.previous_boundary(self.caret),
+        };
+        self.anchor = self.caret;
     }
 
-    /// Move the caret one character right.
-    pub fn move_right(&mut self) {
-        self.caret = self.next_boundary();
+    /// Move the caret one character right; extending leaves the anchor behind.
+    pub fn move_right(&mut self, extend: bool) {
+        if extend {
+            self.caret = self.next_boundary(self.caret);
+            return;
+        }
+        self.caret = match self.selection() {
+            Some(range) => range.end,
+            None => self.next_boundary(self.caret),
+        };
+        self.anchor = self.caret;
     }
 
-    /// Move the caret to the start.
-    pub fn move_home(&mut self) {
+    /// Move the caret to the start; extending selects back to it.
+    pub fn move_home(&mut self, extend: bool) {
         self.caret = 0;
+        if !extend {
+            self.anchor = 0;
+        }
     }
 
-    /// Move the caret to the end.
-    pub fn move_end(&mut self) {
+    /// Move the caret to the end; extending selects forward to it.
+    pub fn move_end(&mut self, extend: bool) {
         self.caret = self.text.len();
+        if !extend {
+            self.anchor = self.caret;
+        }
     }
 
     /// Empty the field.
     pub fn clear(&mut self) {
         self.text.clear();
         self.caret = 0;
+        self.anchor = 0;
     }
 
-    fn previous_boundary(&self) -> usize {
-        self.text[..self.caret]
+    /// Apply what the pointer did, where the field reported it landing.
+    pub fn hit(&mut self, hit: FieldHit) {
+        match hit {
+            FieldHit::Press { offset, clicks } => self.point(offset, clicks),
+            FieldHit::Drag { offset } => self.drag_to(offset),
+        }
+    }
+
+    /// Put the caret at `offset`: a click. Two clicks select the word there,
+    /// three the lot.
+    pub fn point(&mut self, offset: usize, clicks: u32) {
+        match clicks {
+            1 => {
+                self.caret = self.snap(offset);
+                self.anchor = self.caret;
+            }
+            2 => {
+                let word = self.word_at(offset);
+                self.anchor = word.start;
+                self.caret = word.end;
+            }
+            _ => self.select_all(),
+        }
+    }
+
+    /// Drag the caret to `offset`, leaving the anchor where the press put it.
+    pub fn drag_to(&mut self, offset: usize) {
+        self.caret = self.snap(offset);
+    }
+
+    /// Edit with `key`, if it is a key that edits a field.
+    ///
+    /// The one place a keystroke becomes an edit, shared by every surface that
+    /// owns a field — two copies of this table would already have disagreed
+    /// about shift. Returns whether the key was one of the field's.
+    pub fn edit(&mut self, key: Key, modifiers: Modifiers, clipboard: &mut dyn Clipboard) -> bool {
+        if modifiers.is_accelerator() {
+            match key {
+                Key::Character('a') => self.select_all(),
+                Key::Character('c') => self.copy(clipboard),
+                Key::Character('x') => self.cut(clipboard),
+                Key::Character('v') => self.paste(clipboard),
+                _ => return false,
+            }
+            return true;
+        }
+        match key {
+            Key::Backspace => self.backspace(),
+            Key::Delete => self.delete(),
+            Key::Left => self.move_left(modifiers.shift),
+            Key::Right => self.move_right(modifiers.shift),
+            Key::Home => self.move_home(modifiers.shift),
+            Key::End => self.move_end(modifiers.shift),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Put the selected text on the clipboard. Nothing selected, nothing
+    /// written: copy with no selection must not eat what was there.
+    pub fn copy(&self, clipboard: &mut dyn Clipboard) {
+        if let Some(selected) = self.selected_text() {
+            clipboard.write(selected.to_owned());
+        }
+    }
+
+    /// Copy the selection and remove it.
+    pub fn cut(&mut self, clipboard: &mut dyn Clipboard) {
+        self.copy(clipboard);
+        self.remove_selection();
+    }
+
+    /// Insert the clipboard's text, replacing a live selection.
+    ///
+    /// Control characters are dropped: this is a single-line field, and a
+    /// newline pasted into an address is a keystroke nobody typed.
+    pub fn paste(&mut self, clipboard: &mut dyn Clipboard) {
+        let Some(pasted) = clipboard.read() else {
+            return;
+        };
+        self.remove_selection();
+        for character in pasted.chars().filter(|c| !c.is_control()) {
+            self.text.insert(self.caret, character);
+            self.caret += character.len_utf8();
+        }
+        self.anchor = self.caret;
+    }
+
+    /// Delete the selected range, if there is one. Whether there was.
+    fn remove_selection(&mut self) -> bool {
+        let Some(range) = self.selection() else {
+            return false;
+        };
+        self.caret = range.start;
+        self.anchor = range.start;
+        self.text.replace_range(range, "");
+        true
+    }
+
+    /// The nearest character boundary at or before `offset`.
+    fn snap(&self, offset: usize) -> usize {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    /// The run of like characters around `offset`: what a double-click selects.
+    ///
+    /// Letters, digits and the underscore run together; anything else runs with
+    /// its own kind, so a double-click in the middle of `://` picks up the
+    /// punctuation and not half the host beside it.
+    fn word_at(&self, offset: usize) -> std::ops::Range<usize> {
+        if self.text.is_empty() {
+            return 0..0;
+        }
+        let is_word = |character: char| character.is_alphanumeric() || character == '_';
+        // A click at the very end lands on the last character, not after it.
+        let offset = match self.snap(offset) {
+            at if at >= self.text.len() => self.previous_boundary(self.text.len()),
+            at => at,
+        };
+        let kind = self.text[offset..].chars().next().is_some_and(is_word);
+
+        let start = self.text[..offset]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| is_word(*character) == kind)
+            .last()
+            .map_or(offset, |(index, _)| index);
+        let end = self.text[offset..]
+            .char_indices()
+            .take_while(|(_, character)| is_word(*character) == kind)
+            .last()
+            .map_or(offset, |(index, character)| {
+                offset + index + character.len_utf8()
+            });
+        start..end
+    }
+
+    fn previous_boundary(&self, from: usize) -> usize {
+        self.text[..from]
             .char_indices()
             .next_back()
             .map_or(0, |(index, _)| index)
     }
 
-    fn next_boundary(&self) -> usize {
-        self.text[self.caret..]
+    fn next_boundary(&self, from: usize) -> usize {
+        self.text[from..]
             .chars()
             .next()
-            .map_or(self.text.len(), |character| {
-                self.caret + character.len_utf8()
-            })
+            .map_or(self.text.len(), |character| from + character.len_utf8())
     }
 }
 
@@ -194,6 +392,10 @@ pub enum UiAction {
     /// it. The id comes from the frame that drew the field, so it names what is
     /// on screen rather than a number chosen in advance.
     Focus(FocusId),
+    /// The pointer landed in the address field, at this offset in its text.
+    /// The field reports where; what a click, a double-click or a drag there
+    /// means to the caret and the anchor is the interface's to decide.
+    AddressHit(FieldHit),
 }
 
 /// A page the browser serves about itself.
@@ -221,7 +423,7 @@ impl SystemPage {
     /// The menu lists all of them and dims the rest, rather than growing an
     /// entry per milestone: what a browser cannot do *yet* is worth saying.
     pub fn available(self) -> bool {
-        matches!(self, Self::Settings | Self::About)
+        matches!(self, Self::Settings | Self::History | Self::About)
     }
 
     /// The address that names this page.
@@ -308,6 +510,7 @@ struct Appearance {
     pointer_down: bool,
     address: String,
     caret: Option<usize>,
+    selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
     menu: Option<f64>,
 }
@@ -330,6 +533,11 @@ pub struct BrowserUi {
     focus: Focus,
     pointer: (f64, f64),
     pointer_down: bool,
+    /// Where the pointer went down, while it is still down. What lets a drag
+    /// that began in the address field keep selecting past its edge.
+    press_origin: Option<(f64, f64)>,
+    /// How many clicks the current press is the latest of.
+    clicks: u32,
     /// What the last built list was built from, and the list itself.
     cache: Option<(Appearance, DisplayList)>,
     /// How many lists have been built, as opposed to reused.
@@ -369,6 +577,8 @@ impl BrowserUi {
             focus: Focus::default(),
             pointer: (-1.0, -1.0),
             pointer_down: false,
+            press_origin: None,
+            clicks: 1,
             cache: None,
             builds: 0,
             root: None,
@@ -401,10 +611,37 @@ impl BrowserUi {
         self.builds
     }
 
+    /// Draw from `theme` from the next frame on.
+    ///
+    /// Through a method rather than the field, because the cache does not key
+    /// on the theme: a stored list is a list in the old palette, and it has to
+    /// go when the palette does.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.cache = None;
+        }
+    }
+
     /// Note where the pointer is. Kept so a press can be tested against the same
     /// geometry the last frame drew.
-    pub fn pointer_moved(&mut self, x: f64, y: f64) {
+    ///
+    /// While the button is down, the move is offered to the tree: a drag that
+    /// began in the address field is a selection growing, and the field is the
+    /// one that knows which offset the pointer is over.
+    pub fn pointer_moved(&mut self, x: f64, y: f64, text: &mut TextEngine) {
         self.pointer = (x, y);
+        if self.press_origin.is_none() {
+            return;
+        }
+        let mut cx = self.cx(text);
+        let action = self
+            .root
+            .as_mut()
+            .and_then(|root| root.event(&Event::PointerMoved, &mut cx));
+        if let Some(UiAction::AddressHit(hit)) = action {
+            self.address.hit(hit);
+        }
     }
 
     /// Whether the address field has the keyboard.
@@ -418,19 +655,23 @@ impl BrowserUi {
 
     /// Put the caret in the address field, for an accelerator that names it.
     ///
-    /// Nothing happens before the first frame, because until then no field has
-    /// been drawn for the caret to be in.
+    /// The whole address is selected, which is what ⌘L is *for*: the next
+    /// keystroke replaces it. Nothing happens before the first frame, because
+    /// until then no field has been drawn for the caret to be in.
     pub fn focus_address(&mut self) {
         if let Some(id) = self.focus.first_text() {
             self.focused = Some(id);
+            self.address.select_all();
         }
     }
 
-    /// What the pointer should look like at `x`, `y`, if the interface claims it.
+    /// What a press at `x`, `y` would report, without reporting it.
     ///
-    /// Asked of the tree that drew the frame — *what would a press here report* —
-    /// rather than worked out a second time from rectangles kept elsewhere.
-    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Option<Cursor> {
+    /// Asked of the tree that drew the frame — the surface knows where it drew
+    /// things, and this is how anything else asks rather than working the
+    /// geometry out a second time and drifting from it. The same shape every
+    /// surface answers, which is what lets one test helper probe them all.
+    pub fn action_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Option<UiAction> {
         let (pointer, down) = (self.pointer, self.pointer_down);
         self.pointer = (x, y);
         self.pointer_down = false;
@@ -441,9 +682,13 @@ impl BrowserUi {
             .and_then(|root| root.event(&Event::PointerPressed, &mut cx));
         self.pointer = pointer;
         self.pointer_down = down;
+        action
+    }
 
-        match action {
-            Some(UiAction::Focus(_)) => Some(Cursor::Text),
+    /// What the pointer should look like at `x`, `y`, if the interface claims it.
+    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Option<Cursor> {
+        match self.action_at(x, y, text) {
+            Some(UiAction::Focus(_) | UiAction::AddressHit(_)) => Some(Cursor::Text),
             // The sheet behind an open menu answers everywhere, and everywhere
             // is not a thing to point at: dismissing is what happens when you
             // press *nothing*, so it reads as nothing.
@@ -465,8 +710,10 @@ impl BrowserUi {
     /// The press is offered to the tree the last frame drew. Nothing is measured
     /// again and no rectangle is worked out a second time, so a control cannot
     /// be drawn in one place and clicked in another.
-    pub fn pointer_pressed(&mut self, text: &mut TextEngine) -> UiAction {
+    pub fn pointer_pressed(&mut self, text: &mut TextEngine, clicks: u32) -> UiAction {
         self.pointer_down = true;
+        self.press_origin = Some(self.pointer);
+        self.clicks = clicks;
         if self.pointer.1 >= UI_HEIGHT && !self.menu_open {
             // The press belongs to the page, and it takes focus away from the
             // address field — which is what every browser does, and what makes
@@ -485,6 +732,18 @@ impl BrowserUi {
             Some(UiAction::Focus(id)) => {
                 self.focused = Some(id);
                 self.menu_open = false;
+                UiAction::None
+            }
+            // A press in the field: the keyboard moves there and the caret goes
+            // where the press landed — or the word does, or the lot, by the
+            // click count. The field said where; whose keyboard it is stays
+            // the surface's business.
+            Some(UiAction::AddressHit(hit)) => {
+                if let Some(id) = self.focus.first_text() {
+                    self.focused = Some(id);
+                }
+                self.menu_open = false;
+                self.address.hit(hit);
                 UiAction::None
             }
             Some(UiAction::ToggleMenu) => {
@@ -524,6 +783,12 @@ impl BrowserUi {
                 UiAction::None
             }
         }
+    }
+
+    /// The press ended: drags stop growing selections.
+    pub fn pointer_released(&mut self) {
+        self.pointer_down = false;
+        self.press_origin = None;
     }
 
     /// Activate the control a reader named, by the index it was described at.
@@ -579,6 +844,7 @@ impl BrowserUi {
         key: Key,
         modifiers: Modifiers,
         text: &mut TextEngine,
+        clipboard: &mut dyn Clipboard,
     ) -> UiAction {
         // Accelerators work whether or not the field has focus.
         // F5 reloads whatever has focus, including the address field: it is not
@@ -593,6 +859,12 @@ impl BrowserUi {
         }
 
         if modifiers.is_accelerator() {
+            // A focused field gets first claim on the editing accelerators —
+            // ⌘C in the address bar is a copy, not a browser command. The rest
+            // stay the browser's: ⌘L and ⌘R work from inside the field too.
+            if self.address_focused() && self.address.edit(key, modifiers, clipboard) {
+                return UiAction::None;
+            }
             return match key {
                 Key::Character('r') => UiAction::Reload,
                 // The bracket keys are what this platform's browsers use, and the
@@ -646,31 +918,10 @@ impl BrowserUi {
                 self.focused = None;
                 UiAction::None
             }
-            Key::Backspace => {
-                self.address.backspace();
+            _ => {
+                self.address.edit(key, modifiers, clipboard);
                 UiAction::None
             }
-            Key::Delete => {
-                self.address.delete();
-                UiAction::None
-            }
-            Key::Left => {
-                self.address.move_left();
-                UiAction::None
-            }
-            Key::Right => {
-                self.address.move_right();
-                UiAction::None
-            }
-            Key::Home => {
-                self.address.move_home();
-                UiAction::None
-            }
-            Key::End => {
-                self.address.move_end();
-                UiAction::None
-            }
-            _ => UiAction::None,
         }
     }
 
@@ -709,6 +960,10 @@ impl BrowserUi {
             pointer_down: self.pointer_down,
             address: self.address.text().to_owned(),
             caret: self.address_focused().then(|| self.address.caret()),
+            selection: self
+                .address_focused()
+                .then(|| self.address.selection())
+                .flatten(),
             focus: self.focused,
             menu: self.menu_open.then_some(height),
         };
@@ -781,6 +1036,8 @@ impl BrowserUi {
         let mut cx = Cx::new(text);
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
+        cx.press_origin = self.press_origin;
+        cx.clicks = self.clicks;
         cx.focus = self.focused;
         cx.theme = self.theme.clone();
         cx
@@ -1114,11 +1371,16 @@ fn toolbar(
     // gets the padlock. Everything else gets a page, which claims nothing.
     let secure = ui.address.text().starts_with("https://");
     let address_id = focus.claim_text(true);
-    let field = TextInput::new(FieldView {
-        text: ui.address.text().to_owned(),
-        caret: (ui.focused == Some(address_id)).then(|| ui.address.caret()),
-        placeholder: "Search or enter address".to_owned(),
-    })
+    let focused = ui.focused == Some(address_id);
+    let field = TextInput::new(
+        FieldView {
+            text: ui.address.text().to_owned(),
+            caret: focused.then(|| ui.address.caret()),
+            selection: focused.then(|| ui.address.selection()).flatten(),
+            placeholder: "Search or enter address".to_owned(),
+        },
+        UiAction::AddressHit,
+    )
     .leading(move |list, rect, color| {
         if secure {
             icon::lock(list, rect, color);
@@ -1128,8 +1390,6 @@ fn toolbar(
     })
     .face(theme.surface)
     .into_widget(theme);
-
-    let field = Box::new(Button::new(UiAction::Focus(address_id), field).focus(address_id));
 
     Box::new(Padding::new(
         Insets::symmetric(theme.inset, (TOOLBAR_HEIGHT - theme.control_height) / 2.0),
@@ -1164,13 +1424,13 @@ const BLANK_MARK_SIZE: f64 = 96.0;
 /// not creep upward as the interface grows a toolbar.
 pub fn paint_blank_page(
     list: &mut DisplayList,
+    theme: &Theme,
     width: f64,
     height: f64,
     error: Option<&str>,
     mark: Option<&ImageData>,
     text: &mut TextEngine,
 ) {
-    let theme = Theme::light();
     fill_rounded(list, Rect::new(0.0, 0.0, width, height), theme.raised, 0.0);
 
     let mut cx = Cx::new(text);
@@ -1372,8 +1632,8 @@ mod tests {
 
     /// The rectangle the widget tree placed something at, found by pressing.
     fn press(ui: &mut BrowserUi, text: &mut TextEngine, x: f64, y: f64) -> UiAction {
-        ui.pointer_moved(x, y);
-        ui.pointer_pressed(text)
+        ui.pointer_moved(x, y, text);
+        ui.pointer_pressed(text, 1)
     }
 
     /// Draw one frame at a given window size, and say what it drew.
@@ -1440,7 +1700,7 @@ mod tests {
         let mut ui = BrowserUi::new();
 
         frame_at(&mut ui, &mut text, 1000.0, 800.0);
-        ui.pointer_moved(60.0, UI_HEIGHT - 20.0);
+        ui.pointer_moved(60.0, UI_HEIGHT - 20.0, &mut text);
         frame_at(&mut ui, &mut text, 1000.0, 800.0);
         assert_eq!(
             ui.builds(),
@@ -1520,6 +1780,22 @@ mod tests {
     }
 
     #[test]
+    fn asking_what_a_press_would_do_does_not_do_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+        assert_eq!(
+            ui.action_at(80.0, middle, &mut text),
+            Some(UiAction::Reload),
+            "the probe answers what the press helper presses"
+        );
+        assert_eq!(ui.pointer, (-1.0, -1.0), "and the pointer has not moved");
+        assert!(!ui.pointer_down, "and no press happened");
+    }
+
+    #[test]
     fn a_press_on_empty_strip_focuses_nothing_and_does_nothing() {
         let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
@@ -1554,10 +1830,20 @@ mod tests {
         // The tab, its cross, the button that opens another, and then — past
         // both dimmed arrows without stopping on either — reload.
         for _ in 0..4 {
-            ui.key_pressed(Key::Tab, Modifiers::default(), &mut text);
+            ui.key_pressed(
+                Key::Tab,
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default(),
+            );
         }
         assert_eq!(
-            ui.key_pressed(Key::Enter, Modifiers::default(), &mut text),
+            ui.key_pressed(
+                Key::Enter,
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
             UiAction::Reload,
             "a control that cannot be pressed is not a place the keyboard stops"
         );
@@ -1571,9 +1857,19 @@ mod tests {
 
         // The first thing Tab reaches is the first tab, which is what a press
         // on it reports too — one path, so the two cannot drift apart.
-        ui.key_pressed(Key::Tab, Modifiers::default(), &mut text);
+        ui.key_pressed(
+            Key::Tab,
+            Modifiers::default(),
+            &mut text,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(
-            ui.key_pressed(Key::Character(' '), Modifiers::default(), &mut text),
+            ui.key_pressed(
+                Key::Character(' '),
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
             UiAction::SelectTab(0)
         );
         assert_eq!(
@@ -1614,7 +1910,12 @@ mod tests {
             ui.text_input(character);
         }
 
-        let action = ui.key_pressed(Key::Enter, Modifiers::default(), &mut text);
+        let action = ui.key_pressed(
+            Key::Enter,
+            Modifiers::default(),
+            &mut text,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(action, UiAction::Navigate("example.com".to_owned()));
         assert!(!ui.address_focused());
     }
@@ -1626,7 +1927,12 @@ mod tests {
         frame(&mut ui, &mut text, 1000.0, 1);
         ui.focus_address();
         assert_eq!(
-            ui.key_pressed(Key::Enter, Modifiers::default(), &mut text),
+            ui.key_pressed(
+                Key::Enter,
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
             UiAction::None
         );
     }
@@ -1636,15 +1942,15 @@ mod tests {
         // Every one of these steps lands mid-byte-sequence if the field counts
         // bytes: each of these characters is two bytes.
         let mut field = TextField::new("привет");
-        field.move_left();
+        field.move_left(false);
         field.backspace();
         assert_eq!(field.text(), "привт", "backspace deletes before the caret");
 
-        field.move_home();
+        field.move_home(false);
         field.delete();
         assert_eq!(field.text(), "ривт", "delete removes after it");
 
-        field.move_end();
+        field.move_end(false);
         field.insert('о');
         assert_eq!(field.text(), "ривто", "the caret survives at the end");
     }
@@ -1653,13 +1959,280 @@ mod tests {
     fn the_caret_never_lands_inside_a_character() {
         let mut field = TextField::new("日本語");
         for _ in 0..5 {
-            field.move_left();
+            field.move_left(false);
         }
         assert_eq!(field.caret(), 0);
         for _ in 0..5 {
-            field.move_right();
+            field.move_right(false);
         }
         assert_eq!(field.caret(), field.text().len());
+    }
+
+    #[test]
+    fn selection_offsets_never_land_inside_a_character() {
+        // The same non-ASCII strings the caret tests use: every character here
+        // is more than one byte, so a selection counted in bytes tears one.
+        for text in ["привет", "日本語", "héllo"] {
+            let mut field = TextField::new(text);
+            let shift = Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            };
+            for _ in 0..text.chars().count() + 2 {
+                field.move_left(shift.shift);
+                let range = field.selection().expect("extending selects");
+                assert!(field.text().is_char_boundary(range.start));
+                assert!(field.text().is_char_boundary(range.end));
+                assert_eq!(field.selected_text(), Some(&field.text()[range]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_off_a_boundary_snaps_to_one() {
+        let mut field = TextField::new("привет");
+        // Byte 1 is inside the first two-byte character.
+        field.point(1, 1);
+        assert_eq!(field.caret(), 0);
+        field.drag_to(3);
+        assert_eq!(field.selection(), Some(0..2), "a drag snaps too");
+    }
+
+    #[test]
+    fn copy_puts_exactly_the_selected_bytes_on_the_clipboard() {
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut field = TextField::new("https://example.com/путь");
+        field.select_all();
+        field.copy(&mut clipboard);
+        assert_eq!(
+            clipboard.read().as_deref(),
+            Some("https://example.com/путь")
+        );
+
+        // A copy with nothing selected keeps its hands off what was there.
+        let field = TextField::new("something else");
+        field.copy(&mut clipboard);
+        assert_eq!(
+            clipboard.read().as_deref(),
+            Some("https://example.com/путь")
+        );
+    }
+
+    #[test]
+    fn a_paste_over_a_selection_replaces_it() {
+        let mut clipboard = crate::clipboard::InMemory::default();
+        clipboard.write("отлира".to_owned());
+
+        let mut field = TextField::new("example.com/old");
+        // Select "old": the last three characters.
+        field.move_end(false);
+        for _ in 0..3 {
+            field.move_left(true);
+        }
+        field.paste(&mut clipboard);
+        assert_eq!(field.text(), "example.com/отлира");
+        assert_eq!(field.selection(), None, "the pasted text is not selected");
+        assert_eq!(field.caret(), field.text().len());
+    }
+
+    #[test]
+    fn a_paste_drops_control_characters() {
+        let mut clipboard = crate::clipboard::InMemory::default();
+        clipboard.write("two\nlines\tand a tab\r".to_owned());
+        let mut field = TextField::new("");
+        field.paste(&mut clipboard);
+        assert_eq!(field.text(), "twolinesand a tab");
+    }
+
+    #[test]
+    fn cut_copies_and_removes_in_one_motion() {
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut field = TextField::new("front-back");
+        field.move_home(false);
+        for _ in 0..5 {
+            field.move_right(true);
+        }
+        field.cut(&mut clipboard);
+        assert_eq!(clipboard.read().as_deref(), Some("front"));
+        assert_eq!(field.text(), "-back");
+        assert_eq!(field.caret(), 0);
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut field = TextField::new("привет");
+        field.select_all();
+        field.insert('a');
+        assert_eq!(field.text(), "a");
+        assert_eq!(field.caret(), 1);
+
+        let mut field = TextField::new("привет");
+        field.select_all();
+        field.backspace();
+        assert_eq!(
+            field.text(),
+            "",
+            "backspace eats the selection, not a character"
+        );
+    }
+
+    #[test]
+    fn two_clicks_take_the_word_and_three_take_the_lot() {
+        let mut field = TextField::new("https://example.com/path");
+        // In the middle of "example".
+        field.point(10, 2);
+        assert_eq!(field.selected_text(), Some("example"));
+        // On the punctuation, the punctuation is the word.
+        field.point(6, 2);
+        assert_eq!(field.selected_text(), Some("://"));
+        field.point(10, 3);
+        assert_eq!(field.selected_text(), Some("https://example.com/path"));
+        // At the very end, the last word rather than nothing.
+        field.point(field.text().len(), 2);
+        assert_eq!(field.selected_text(), Some("path"));
+    }
+
+    #[test]
+    fn arrows_collapse_a_selection_to_its_ends() {
+        let mut field = TextField::new("абвгд");
+        field.select_all();
+        field.move_left(false);
+        assert_eq!(field.selection(), None);
+        assert_eq!(field.caret(), 0, "left lands at the selection's start");
+
+        field.select_all();
+        field.move_right(false);
+        assert_eq!(field.caret(), field.text().len(), "right at its end");
+    }
+
+    #[test]
+    fn focusing_the_address_by_accelerator_selects_the_lot() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("https://example.com/");
+        frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
+        assert_eq!(
+            ui.address.selection(),
+            Some(0..ui.address.text().len()),
+            "⌘L means: the next keystroke replaces the address"
+        );
+    }
+
+    /// Where the address field was drawn, according to the frame that drew it.
+    fn field_rect(ui: &BrowserUi) -> Rect {
+        ui.describe()
+            .into_iter()
+            .find(|node| node.role == Role::TextInput)
+            .expect("the toolbar has an address field")
+            .rect
+    }
+
+    #[test]
+    fn a_press_in_the_field_puts_the_caret_where_it_landed() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("example.com");
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        let rect = field_rect(&ui);
+        let middle = rect.y + rect.height / 2.0;
+
+        // Near the left edge of the text, before any glyph's midpoint.
+        assert_eq!(
+            press(&mut ui, &mut text, rect.x + 2.0, middle),
+            UiAction::None
+        );
+        assert!(
+            ui.address_focused(),
+            "a press in the field takes the keyboard"
+        );
+        assert_eq!(ui.address.caret(), 0);
+        ui.pointer_released();
+
+        // Well past the last glyph: the caret lands at the end.
+        assert_eq!(
+            press(&mut ui, &mut text, rect.x + rect.width - 4.0, middle),
+            UiAction::None
+        );
+        assert_eq!(ui.address.caret(), ui.address.text().len());
+        ui.pointer_released();
+    }
+
+    #[test]
+    fn a_drag_across_the_field_selects_what_it_crossed() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("example.com");
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        let rect = field_rect(&ui);
+        let middle = rect.y + rect.height / 2.0;
+
+        press(&mut ui, &mut text, rect.x + 2.0, middle);
+        // The pointer travels past the field's right edge, and the selection
+        // follows: the drag began in the field, so the field keeps it.
+        ui.pointer_moved(rect.x + rect.width + 40.0, middle, &mut text);
+        assert_eq!(
+            ui.address.selection(),
+            Some(0..ui.address.text().len()),
+            "dragging from the front past the end selects everything"
+        );
+        ui.pointer_released();
+
+        // The next frame draws the selection: it is part of the appearance.
+        let before = ui.builds();
+        frame(&mut ui, &mut text, 1000.0, 1);
+        assert_eq!(ui.builds(), before + 1, "a new selection is a new frame");
+    }
+
+    #[test]
+    fn a_double_click_in_the_field_selects_the_word_under_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("example.com");
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        let rect = field_rect(&ui);
+        let middle = rect.y + rect.height / 2.0;
+        ui.pointer_moved(rect.x + 30.0, middle, &mut text);
+        ui.pointer_pressed(&mut text, 2);
+        assert_eq!(
+            ui.address.selected_text(),
+            Some("example"),
+            "two clicks a few glyphs in select the first word"
+        );
+        ui.pointer_released();
+    }
+
+    #[test]
+    fn the_editing_accelerators_stay_the_fields_and_the_rest_the_browsers() {
+        let mut text = TextEngine::new();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("copied");
+        frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
+
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            ui.key_pressed(Key::Character('c'), accelerator, &mut text, &mut clipboard),
+            UiAction::None
+        );
+        assert_eq!(
+            clipboard.read().as_deref(),
+            Some("copied"),
+            "⌘C in the focused field copies its selection"
+        );
+        assert_eq!(
+            ui.key_pressed(Key::Character('r'), accelerator, &mut text, &mut clipboard),
+            UiAction::Reload,
+            "⌘R stays the browser's even while the field has the keyboard"
+        );
     }
 
     #[test]
@@ -1673,11 +2246,21 @@ mod tests {
             ..Modifiers::default()
         };
         assert_eq!(
-            ui.key_pressed(Key::Character('t'), accelerator, &mut text),
+            ui.key_pressed(
+                Key::Character('t'),
+                accelerator,
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
             UiAction::NewTab
         );
         assert_eq!(
-            ui.key_pressed(Key::Character('l'), accelerator, &mut text),
+            ui.key_pressed(
+                Key::Character('l'),
+                accelerator,
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
             UiAction::None
         );
         assert!(ui.address_focused(), "cmd-L focuses the address bar");

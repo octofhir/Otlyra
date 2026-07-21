@@ -429,6 +429,11 @@ pub struct Cx<'a> {
     pub pointer: (f64, f64),
     /// Whether the primary pointer button is down.
     pub pointer_down: bool,
+    /// How many clicks the current press is the latest of: `2` on the second
+    /// press of a double-click. Beside the pointer for the same reason the
+    /// pointer is here rather than on the event: a widget that had to be told
+    /// could be told wrong.
+    pub clicks: u32,
     /// Where it went down, while it is still down.
     ///
     /// What a captured pointer would be, without the capture. A slider tracks
@@ -451,6 +456,7 @@ impl<'a> Cx<'a> {
             text,
             pointer: (-1.0, -1.0),
             pointer_down: false,
+            clicks: 1,
             press_origin: None,
             focus: None,
             fonts: FontStack::parse_css("system-ui, sans-serif"),

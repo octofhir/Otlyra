@@ -198,7 +198,7 @@ fn main() -> ExitCode {
             },
             None => {
                 open_inspector(&mut browser, &cli);
-                match run_window(window_config(&cli), &mut browser) {
+                match run_windowed(&cli, &mut browser) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("otlyra: {error}");
@@ -292,7 +292,7 @@ fn main() -> ExitCode {
         None => {
             let mut browser =
                 Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
-            run_window(window_config(&cli), &mut browser)
+            run_windowed(&cli, &mut browser)
         }
     };
 
@@ -337,7 +337,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
             Some(path) => Ok(write_screenshot(&mut browser, cli.viewport(), path)?),
-            None => Ok(run_window(window_config(cli), &mut browser)?),
+            None => Ok(run_windowed(cli, &mut browser)?),
         };
     }
 
@@ -363,7 +363,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
             Some(path) => screenshot(&mut browser, cli, path),
             None => {
                 open_inspector(&mut browser, cli);
-                Ok(run_window(window_config(cli), &mut browser)?)
+                Ok(run_windowed(cli, &mut browser)?)
             }
         };
     }
@@ -452,7 +452,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         Some(path) => screenshot(&mut browser, cli, path)?,
         None => {
             open_inspector(&mut browser, cli);
-            run_window(window_config(cli), &mut browser)?;
+            run_windowed(cli, &mut browser)?;
         }
     }
     Ok(())
@@ -541,6 +541,16 @@ fn window_config(cli: &Cli) -> WindowConfig {
         menu_bar: menu_bar(),
         icon: Some(otlyra_app::ICON),
     }
+}
+
+/// Open the window, with the system clipboard attached first.
+///
+/// The one place the real pasteboard enters: a window means a person, and a
+/// person expects ⌘C to reach the clipboard the rest of their machine uses.
+/// Every headless mode keeps the in-memory default.
+fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppError> {
+    browser.set_clipboard(Box::new(otlyra_app::clipboard::System::new()));
+    run_window(window_config(cli), browser)
 }
 
 /// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.

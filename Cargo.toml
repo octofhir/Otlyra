@@ -91,6 +91,16 @@ accesskit = "=0.24.1"
 # advisories. Linux re-enables `accesskit_unix` per target.
 accesskit_winit = { version = "=0.33.2", default-features = false, features = ["rwh_06"] }
 
+# The system clipboard, for the interface's text fields. Text only:
+# `default-features = false` drops `image-data` (which drags in the `image`
+# crate) and the Linux Wayland backend; Linux re-enables the latter per target.
+arboard = { version = "=3.6.1", default-features = false }
+
+# Civil time, for grouping the history by the reader's local day. The one thing
+# std cannot answer is the local timezone, and answering it by hand means
+# maintaining a tz database — which is exactly what this crate is.
+jiff = "=0.2.34"
+
 # Observability.
 tracing = { version = "=0.1.44", features = ["log"] }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }

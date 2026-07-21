@@ -297,6 +297,19 @@ pub struct Browser {
     about: AboutSurface,
     /// The panel that shows what the engine built.
     inspector: crate::inspector::Inspector,
+    /// Where cut, copy and paste go. In memory by default, for the same reason
+    /// the preferences are handed in: a test that wrote the system pasteboard
+    /// would trade clipboards with the person running it. The shell swaps in
+    /// the system one at startup.
+    clipboard: Box<dyn crate::clipboard::Clipboard>,
+    /// Everywhere the browser has been. Outlives every tab, which is the point.
+    history: crate::history::HistoryStore,
+    /// The surface that shows it.
+    history_page: crate::history::HistorySurface,
+    /// What the platform last said the environment is. What *System* follows.
+    scheme: otlyra_platform::ColorScheme,
+    /// The palette every surface is currently drawn from.
+    theme: crate::widget::theme::Theme,
 }
 
 impl Browser {
@@ -313,7 +326,7 @@ impl Browser {
     /// and the suite passed or failed according to what had been clicked last.
     /// Loading them is the shell's job; this is what a browser does with them.
     pub fn with_settings<L: Loader>(loader: L, settings: crate::settings::Settings) -> Self {
-        Self {
+        let mut browser = Self {
             text: TextEngine::new(),
             ui: BrowserUi::new(),
             tabs: vec![Tab::blank()],
@@ -334,7 +347,42 @@ impl Browser {
             settings: SettingsSurface::with(settings),
             inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
-        }
+            clipboard: Box::new(crate::clipboard::InMemory::default()),
+            history: crate::history::HistoryStore::default(),
+            history_page: crate::history::HistorySurface::new(),
+            scheme: otlyra_platform::ColorScheme::Light,
+            theme: crate::widget::theme::Theme::light(),
+        };
+        browser.apply_theme();
+        browser
+    }
+
+    /// The palette the appearance preference and the platform agree on, applied
+    /// to every surface. Cheap when nothing changed: each surface compares.
+    fn apply_theme(&mut self) {
+        use crate::settings::Appearance;
+        use crate::widget::theme::Theme;
+        let theme = match self.settings.settings.appearance {
+            Appearance::Light => Theme::light(),
+            Appearance::Dark => Theme::dark(),
+            Appearance::System => match self.scheme {
+                otlyra_platform::ColorScheme::Light => Theme::light(),
+                otlyra_platform::ColorScheme::Dark => Theme::dark(),
+            },
+        };
+        self.theme = theme.clone();
+        self.ui.set_theme(theme.clone());
+        self.settings.set_theme(theme.clone());
+        self.inspector.set_theme(theme.clone());
+        self.history_page.set_theme(theme.clone());
+        self.about.set_theme(theme);
+    }
+
+    /// Cut, copy and paste against `clipboard` instead of the default memory.
+    ///
+    /// The shell hands in the system clipboard here; nothing else should.
+    pub fn set_clipboard(&mut self, clipboard: Box<dyn crate::clipboard::Clipboard>) {
+        self.clipboard = clipboard;
     }
 
     /// Draw the page and nothing else, for a picture that is going to be compared
@@ -1006,6 +1054,12 @@ impl Browser {
             scroll: 0.0,
         });
         tab.position = tab.history.len() - 1;
+
+        // The browser-wide record, beside the tab's own: same seam, so it is
+        // once per navigation by construction — a redirect chain arrived here
+        // as one final URL, and a reload returned before this line.
+        let (url, title) = (tab.url.clone(), tab.title.clone());
+        self.history.record(url, title, jiff::Timestamp::now());
     }
 
     /// The address a subresource is actually fetched from, or `None` if the page
@@ -1099,13 +1153,21 @@ impl Browser {
         if self.settings.settings.persisted_eq(before) {
             return;
         }
+        // The appearance is a preference like the rest, so the one place that
+        // notices a preference changing is the one place the palette follows it.
+        self.apply_theme();
         crate::preferences::save(&self.settings.settings);
     }
 
     fn close_settings_if(&mut self, action: &settings::Action) {
-        if *action != settings::Action::Close {
-            return;
+        if *action == settings::Action::Close {
+            self.close_system_page();
         }
+    }
+
+    /// Leave the browser page being shown: back if there is a back, a blank
+    /// tab if there is not.
+    fn close_system_page(&mut self) {
         if self.tabs[self.active].can_go_back() {
             self.go_back();
             return;
@@ -1117,13 +1179,28 @@ impl Browser {
         self.ui.address.clear();
     }
 
+    /// Act on what the history surface reported.
+    fn handle_history_action(&mut self, action: crate::history::Action) {
+        match action {
+            crate::history::Action::Open(url) => self.navigate_from(&url, false),
+            crate::history::Action::Clear => self.history.clear(),
+            crate::history::Action::Close => self.close_system_page(),
+            crate::history::Action::None
+            | crate::history::Action::Focus(_)
+            | crate::history::Action::SearchHit(_) => {}
+        }
+    }
+
     fn apply(&mut self, action: UiAction) {
         match action {
             UiAction::None => {}
             // Focus and the menu belong to the interface and are settled there:
             // the press handler applies them and reports `None`, so these arms
             // are only here to keep the match honest about the whole enum.
-            UiAction::Focus(_) | UiAction::ToggleMenu | UiAction::CloseMenu => {}
+            UiAction::Focus(_)
+            | UiAction::AddressHit(_)
+            | UiAction::ToggleMenu
+            | UiAction::CloseMenu => {}
             UiAction::ToggleInspector => self.inspector.toggle(),
             // Chosen from the menu, a browser page opens beside what you were
             // reading rather than over it: the menu is reached *while* looking
@@ -1354,6 +1431,7 @@ impl Browser {
         } else {
             match self.tabs[self.active].system {
                 Some(SystemPage::Settings) => self.settings.cursor_at(x, y),
+                Some(SystemPage::History) => self.history_page.cursor_at(x, y),
                 Some(SystemPage::About) => self.about.cursor_at(x, y, &mut self.text),
                 Some(_) => Cursor::Default,
                 None if self.link_under_pointer().is_some() => Cursor::Pointer,
@@ -1458,9 +1536,14 @@ impl Painter for Browser {
                 self.pump();
             }
 
+            PlatformEvent::AppearanceChanged(scheme) => {
+                self.scheme = scheme;
+                self.apply_theme();
+            }
+
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
-                self.ui.pointer_moved(x, y);
+                self.ui.pointer_moved(x, y, &mut self.text);
                 self.update_cursor(x, y);
                 self.inspector.pointer_moved(x, y);
                 // While the picker is armed, moving over the page is enough to
@@ -1491,12 +1574,13 @@ impl Painter for Browser {
                         let action = self.settings.pointer_moved(x, y);
                         self.close_settings_if(&action);
                     }
+                    Some(SystemPage::History) => self.history_page.pointer_moved(x, y),
                     Some(SystemPage::About) => self.about.pointer_moved(x, y),
                     _ => {}
                 }
             }
 
-            PlatformEvent::PointerPressed => {
+            PlatformEvent::PointerPressed { clicks } => {
                 // The panel owns everything below its own top edge.
                 if self.pointer.1 >= self.dock_top() && !self.ui.menu_open {
                     self.inspector.pointer_pressed();
@@ -1536,9 +1620,14 @@ impl Painter for Browser {
                     match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
                             let before = self.settings.settings.clone();
-                            let action = self.settings.pointer_pressed();
+                            let action = self.settings.pointer_pressed(clicks);
                             self.save_preferences_if_changed(&before);
                             self.close_settings_if(&action);
+                            return;
+                        }
+                        Some(SystemPage::History) => {
+                            let action = self.history_page.pointer_pressed(clicks);
+                            self.handle_history_action(action);
                             return;
                         }
                         Some(SystemPage::About) => {
@@ -1560,7 +1649,7 @@ impl Painter for Browser {
                 }
                 // The press is tested against the geometry of the last frame —
                 // which is the frame the user was looking at when they pressed.
-                let action = self.ui.pointer_pressed(&mut self.text);
+                let action = self.ui.pointer_pressed(&mut self.text, clicks);
                 self.apply(action);
             }
 
@@ -1569,6 +1658,8 @@ impl Painter for Browser {
                     page.release_scrollbar();
                 }
                 self.settings.pointer_released();
+                self.history_page.pointer_released();
+                self.ui.pointer_released();
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
@@ -1580,12 +1671,14 @@ impl Painter for Browser {
                     return;
                 }
                 // The panel takes the keys that walk its tree, but only while it
-                // is the thing being looked at.
+                // is the thing being looked at — and a caret in the address
+                // field means the field is, however open the panel may be.
                 if self.inspector.open
+                    && !self.ui.address_focused()
                     && let Some(page) = self.tabs[self.active].page.as_ref()
                     && self
                         .inspector
-                        .key_pressed(key, modifiers, page.document())
+                        .key_pressed(key, modifiers, page.document(), self.clipboard.as_mut())
                         .is_some()
                 {
                     return;
@@ -1596,9 +1689,21 @@ impl Painter for Browser {
                 match self.tabs[self.active].system {
                     Some(SystemPage::Settings) => {
                         let before = self.settings.settings.clone();
-                        if let Some(action) = self.settings.key_pressed(key, modifiers) {
+                        if let Some(action) =
+                            self.settings
+                                .key_pressed(key, modifiers, self.clipboard.as_mut())
+                        {
                             self.save_preferences_if_changed(&before);
                             self.close_settings_if(&action);
+                            return;
+                        }
+                    }
+                    Some(SystemPage::History) => {
+                        if let Some(action) =
+                            self.history_page
+                                .key_pressed(key, modifiers, self.clipboard.as_mut())
+                        {
+                            self.handle_history_action(action);
                             return;
                         }
                     }
@@ -1614,7 +1719,9 @@ impl Painter for Browser {
                     }
                     _ => {}
                 }
-                let action = self.ui.key_pressed(key, modifiers, &mut self.text);
+                let action =
+                    self.ui
+                        .key_pressed(key, modifiers, &mut self.text, self.clipboard.as_mut());
                 if action == UiAction::None && !self.ui.address_focused() {
                     self.scroll_by_key(key);
                 }
@@ -1622,6 +1729,11 @@ impl Painter for Browser {
             }
 
             PlatformEvent::TextInput(character) => {
+                if self.tabs[self.active].system == Some(SystemPage::History)
+                    && self.history_page.text_input(character)
+                {
+                    return;
+                }
                 if self.tabs[self.active].system == Some(SystemPage::Settings) {
                     let before = self.settings.settings.clone();
                     if self.settings.text_input(character) {
@@ -1653,6 +1765,8 @@ impl Painter for Browser {
                 }
                 if self.tabs[self.active].system == Some(SystemPage::Settings) {
                     self.settings.scroll_by(y);
+                } else if self.tabs[self.active].system == Some(SystemPage::History) {
+                    self.history_page.scroll_by(y);
                 } else if let Some(page) = self.tabs[self.active].page.as_mut() {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box
@@ -1705,6 +1819,10 @@ impl Painter for Browser {
                         self.save_preferences_if_changed(&before);
                         self.close_settings_if(&action);
                     }
+                    Some(SystemPage::History) => {
+                        let action = self.history_page.activate_described(index);
+                        self.handle_history_action(action);
+                    }
                     Some(SystemPage::About)
                         if self.about.activate_described(index, &mut self.text)
                             == about::Action::OpenSettings =>
@@ -1746,6 +1864,9 @@ impl Painter for Browser {
         let mut described = self.ui.describe();
         let (page_focus, page_described) = match system {
             Some(SystemPage::Settings) => (self.settings.focused(), self.settings.describe()),
+            Some(SystemPage::History) => {
+                (self.history_page.focused(), self.history_page.describe())
+            }
             Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
             // The pages that are still a placeholder draw no controls, so they
             // describe none.
@@ -1765,6 +1886,14 @@ impl Painter for Browser {
 
     fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    fn window_appearance(&self) -> Option<otlyra_platform::ColorScheme> {
+        match self.settings.settings.appearance {
+            crate::settings::Appearance::System => None,
+            crate::settings::Appearance::Light => Some(otlyra_platform::ColorScheme::Light),
+            crate::settings::Appearance::Dark => Some(otlyra_platform::ColorScheme::Dark),
+        }
     }
 
     fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
@@ -1804,6 +1933,15 @@ impl Painter for Browser {
                     self.settings
                         .build_display_list(content, &mut self.text, &mut list);
                 }
+                SystemPage::History => {
+                    self.history_page.build_display_list(
+                        content,
+                        &self.history,
+                        jiff::Zoned::now().date(),
+                        &mut self.text,
+                        &mut list,
+                    );
+                }
                 _ => self
                     .about
                     .build_display_list(content, &mut self.text, &mut list),
@@ -1827,6 +1965,7 @@ impl Painter for Browser {
             let mut list = otlyra_gfx::DisplayList::new();
             crate::ui::paint_blank_page(
                 &mut list,
+                &self.theme,
                 width,
                 height,
                 self.tabs[self.active].error.as_deref(),
@@ -1948,7 +2087,7 @@ mod system_page_tests {
     /// and whatever the browser makes of what comes back.
     fn press(browser: &mut Browser, x: f64, y: f64) {
         browser.on_event(PlatformEvent::PointerMoved { x, y });
-        browser.on_event(PlatformEvent::PointerPressed);
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
     }
 
     /// Draw one frame at `width` by `height`, which is what gives the interface
@@ -2084,16 +2223,29 @@ mod system_page_tests {
     }
 
     #[test]
+    fn the_history_row_opens_the_history() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 1000.0, 700.0);
+        press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        frame(&mut browser, 1000.0, 700.0);
+
+        // The second row is History, and since W8 it is a real page.
+        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 65.0);
+        assert!(!browser.ui().menu_open);
+        assert_eq!(browser.system_page(), Some(SystemPage::History));
+    }
+
+    #[test]
     fn a_row_for_a_page_that_does_not_exist_yet_only_closes_the_menu() {
         let mut browser = Browser::new(NoNetwork);
         frame(&mut browser, 1000.0, 700.0);
         press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
         frame(&mut browser, 1000.0, 700.0);
 
-        // The second row is History, which is dimmed: the press falls through it
-        // to the sheet behind the panel, which dismisses the menu and does
+        // The third row is Bookmarks, which is dimmed: the press falls through
+        // it to the sheet behind the panel, which dismisses the menu and does
         // nothing else. That is the whole of what a disabled row does.
-        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 65.0);
+        press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 96.0);
         assert!(!browser.ui().menu_open);
         assert_eq!(browser.system_page(), None);
     }
@@ -2378,6 +2530,60 @@ mod tests {
         assert!(browser.tabs[0].page.is_some());
     }
 
+    /// One navigation, one visit — and the visit is where the load *ended up*.
+    /// The loader normalizes `example.com` to `https://example.com/` the way a
+    /// redirect would move it, and only the final address is recorded.
+    #[test]
+    fn a_navigation_lands_in_the_history_once_with_its_final_url() {
+        let mut browser = browser();
+        go(&mut browser, "example.com");
+        let urls: Vec<&str> = browser
+            .history
+            .visits()
+            .map(|visit| visit.url.as_str())
+            .collect();
+        assert_eq!(urls, ["https://example.com/"]);
+
+        // The same address again moved nowhere, so it is not a second visit.
+        go(&mut browser, "https://example.com/");
+        assert_eq!(browser.history.visits().count(), 1);
+
+        // And going back re-reads a place already recorded.
+        go(&mut browser, "https://two.example/");
+        browser.go_back();
+        settle(&mut browser);
+        assert_eq!(
+            browser.history.visits().count(),
+            2,
+            "back re-reads, it does not re-visit"
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_history_row_navigates_there() {
+        let mut browser = browser();
+        go(&mut browser, "example.com");
+        browser.open_system(SystemPage::History);
+
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(900, 700, 1.0));
+
+        // Walk down the list area until a press lands on the visit's row. The
+        // frame was drawn once and presses are tested against it, which is the
+        // same rule every surface test follows.
+        let navigated = ((UI_HEIGHT as u32 + 120)..680).step_by(4).any(|y| {
+            browser.on_event(PlatformEvent::PointerMoved {
+                x: 300.0,
+                y: f64::from(y),
+            });
+            browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+            settle(&mut browser);
+            browser.system_page().is_none()
+        });
+        assert!(navigated, "a visit's row navigates when pressed");
+        assert_eq!(browser.ui.address.text(), "https://example.com/");
+    }
+
     /// The address bar shows where the load ended up, not what was typed: a
     /// redirect that leaves the old text in place is a lie about what is on screen.
     #[test]
@@ -2385,6 +2591,43 @@ mod tests {
         let mut browser = browser();
         type_url(&mut browser, "example.com");
         assert_eq!(browser.ui.address.text(), "https://example.com/");
+    }
+
+    /// The whole point of the *System* default: the platform saying "dark now"
+    /// is enough, with no restart and nothing saved.
+    #[test]
+    fn the_interface_follows_the_system_appearance_without_a_restart() {
+        use crate::widget::theme::Theme;
+        let mut browser = browser();
+        assert_eq!(browser.ui.theme, Theme::light());
+
+        browser.on_event(PlatformEvent::AppearanceChanged(
+            otlyra_platform::ColorScheme::Dark,
+        ));
+        assert_eq!(browser.ui.theme, Theme::dark());
+        assert_eq!(browser.settings.theme, Theme::dark());
+        assert_eq!(browser.about.theme, Theme::dark());
+    }
+
+    /// A person who chose a palette chose it over the platform's opinion.
+    #[test]
+    fn a_chosen_appearance_outranks_the_system() {
+        use crate::widget::theme::Theme;
+        let mut browser = browser();
+        browser
+            .settings
+            .settings
+            .apply(settings::Action::SetAppearance(settings::Appearance::Light));
+        browser.apply_theme();
+
+        browser.on_event(PlatformEvent::AppearanceChanged(
+            otlyra_platform::ColorScheme::Dark,
+        ));
+        assert_eq!(
+            browser.ui.theme,
+            Theme::light(),
+            "Light means light, whatever the platform says"
+        );
     }
 
     #[test]
@@ -2448,7 +2691,7 @@ mod tests {
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
-        browser.ui.pointer_moved(400.0, 400.0);
+        browser.ui.pointer_moved(400.0, 400.0, &mut browser.text);
         browser.on_event(PlatformEvent::Scroll {
             x: 0.0,
             y: 50.0,
@@ -2473,7 +2716,7 @@ mod tests {
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
-        browser.ui.pointer_moved(400.0, 10.0);
+        browser.ui.pointer_moved(400.0, 10.0, &mut browser.text);
         browser.on_event(PlatformEvent::Scroll {
             x: 0.0,
             y: 100.0,
@@ -2501,7 +2744,7 @@ mod tests {
             "the pointer says so first"
         );
 
-        browser.on_event(PlatformEvent::PointerPressed);
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
         assert_eq!(browser.tabs[0].url, "https://start.example/next");
     }
 
@@ -2542,7 +2785,7 @@ mod tests {
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
         browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
-        browser.on_event(PlatformEvent::PointerPressed);
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
         assert_eq!(browser.tabs[0].url, "https://start.example/");
     }
 
@@ -2611,7 +2854,7 @@ mod tests {
         // readings of the answer.
         let (x, y) = link_position(&browser);
         browser.on_event(PlatformEvent::PointerMoved { x, y });
-        browser.on_event(PlatformEvent::PointerPressed);
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
 
         assert_eq!(
             browser.tabs[0].url, "https://start.example/",
@@ -2649,7 +2892,7 @@ mod tests {
         let (x, y) = link_position(&browser);
         browser.inspector.picking = true;
         browser.on_event(PlatformEvent::PointerMoved { x, y });
-        browser.on_event(PlatformEvent::PointerPressed);
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
 
         let rect = browser
             .chosen_box()
@@ -3462,7 +3705,7 @@ mod tests {
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
-        browser.ui.pointer_moved(400.0, 400.0);
+        browser.ui.pointer_moved(400.0, 400.0, &mut browser.text);
         browser.on_event(PlatformEvent::Scroll {
             x: 0.0,
             y: 200.0,

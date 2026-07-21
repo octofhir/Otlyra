@@ -270,6 +270,15 @@ impl Inspector {
         }
     }
 
+    /// Draw from `theme` from the next frame on. The cache does not key on the
+    /// theme, so the stored list goes with the old palette.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.cache = None;
+        }
+    }
+
     /// How many display lists this panel has built rather than reused.
     pub fn builds(&self) -> u64 {
         self.builds
@@ -435,8 +444,24 @@ impl Inspector {
         key: Key,
         modifiers: Modifiers,
         document: &Document,
+        clipboard: &mut dyn crate::clipboard::Clipboard,
     ) -> Option<Action> {
-        if modifiers.is_accelerator() || !self.open {
+        if !self.open {
+            return None;
+        }
+        if modifiers.is_accelerator() {
+            // ⌘C with an element chosen copies the row as the tree shows it:
+            // what you see is exactly what lands on the clipboard. Everything
+            // else stays the browser's.
+            if key == Key::Character('c')
+                && let Some(row) = self
+                    .flatten(document)
+                    .into_iter()
+                    .find(|row| Some(row.node) == self.selected)
+            {
+                clipboard.write(row.row.text);
+                return Some(Action::None);
+            }
             return None;
         }
         let rows = self.flatten(document);
@@ -1742,6 +1767,8 @@ pub fn paint_tracks(list: &mut DisplayList, cx: &mut Cx, container: Rect, tracks
 mod tests {
     use super::*;
 
+    use crate::clipboard::Clipboard;
+
     /// The document every test here inspects.
     fn document() -> Document {
         otlyra_html::parse(
@@ -1932,18 +1959,76 @@ mod tests {
         frame(&mut inspector, &document);
 
         // Down from nothing lands on the first row, which is the document.
-        inspector.key_pressed(Key::Down, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Down,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(inspector.selected, Some(document.root()));
 
         // Right opens it rather than moving, and only then steps in.
-        inspector.key_pressed(Key::Right, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Right,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert!(inspector.expanded.contains(&document.root()));
-        inspector.key_pressed(Key::Right, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Right,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_ne!(inspector.selected, Some(document.root()));
 
         // Left steps back out to the parent.
-        inspector.key_pressed(Key::Left, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Left,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert_eq!(inspector.selected, Some(document.root()));
+    }
+
+    /// The copy the inspector was waiting on since D2: what the tree shows for
+    /// the chosen node is what ⌘C puts on the clipboard, byte for byte.
+    #[test]
+    fn copy_puts_the_selected_row_on_the_clipboard() {
+        let document = document();
+        let mut inspector = panel();
+        frame(&mut inspector, &document);
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        let mut clipboard = crate::clipboard::InMemory::default();
+
+        // Nothing chosen: the key is not the panel's, and the clipboard keeps
+        // what it had.
+        assert_eq!(
+            inspector.key_pressed(Key::Character('c'), accelerator, &document, &mut clipboard),
+            None
+        );
+        assert_eq!(clipboard.read(), None);
+
+        inspector.key_pressed(Key::Down, Modifiers::default(), &document, &mut clipboard);
+        assert_eq!(
+            inspector.key_pressed(Key::Character('c'), accelerator, &document, &mut clipboard),
+            Some(Action::None)
+        );
+        let copied = clipboard.read().expect("the chosen row was copied");
+        let shown = inspector
+            .flatten(&document)
+            .into_iter()
+            .find(|row| Some(row.node) == inspector.selected)
+            .expect("the selection is a visible row")
+            .row
+            .text;
+        assert_eq!(copied, shown, "what you see is what you copy");
     }
 
     #[test]
@@ -1952,11 +2037,21 @@ mod tests {
         let mut inspector = panel();
         inspector.picking = true;
 
-        inspector.key_pressed(Key::Escape, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Escape,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert!(!inspector.picking);
         assert!(inspector.open, "one press does one thing");
 
-        inspector.key_pressed(Key::Escape, Modifiers::default(), &document);
+        inspector.key_pressed(
+            Key::Escape,
+            Modifiers::default(),
+            &document,
+            &mut crate::clipboard::InMemory::default(),
+        );
         assert!(!inspector.open);
     }
 

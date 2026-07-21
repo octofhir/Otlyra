@@ -1,0 +1,72 @@
+---
+source: crates/otlyra-app/tests/surface_snapshot.rs
+expression: outline(&list)
+---
+fill #f4f4f7ff (0.0, 78.0) 900.0x622.0
+fill #e4e4eaff (0.0, 78.0) 900.0x52.0
+glyphs n=8 size=16 #1c1c21ff at (16.0, 93.2)
+fill #2f6fd6ff (830.0, 89.0) 54.0x30.0
+glyphs n=4 size=13 #ffffffff at (842.0, 95.2)
+layer alpha=1 clip (0.0, 130.0) 900.0x570.0
+fill #ffffffff (126.0, 146.0) 648.0x227.0
+glyphs n=8 size=13 #6e6e78ff at (138.0, 158.0)
+fill #ffffffff (138.0, 200.3) 16.0x16.0
+fill #2f6fd6ff (138.0, 200.3) 16.0x16.0
+glyphs n=7 size=13 #1c1c21ff at (160.0, 199.6)
+fill #ffffffff (138.0, 223.9) 16.0x16.0
+fill #d5d5ddff (138.0, 223.9) 16.0x16.0
+glyphs n=9 size=13 #1c1c21ff at (160.0, 223.1)
+fill #ffffffff (138.0, 247.4) 16.0x16.0
+fill #d5d5ddff (138.0, 247.4) 16.0x16.0
+glyphs n=12 size=13 #1c1c21ff at (160.0, 246.7)
+fill #cfcfd7ff (138.0, 273.2) 624.0x1.0
+glyphs n=9 size=13 #1c1c21ff at (138.0, 283.2)
+glyphs n=42 size=11 #6e6e78ff at (138.0, 302.8)
+fill #ffffffff (482.0, 285.4) 280.0x30.0
+fill #d5d5ddff (482.0, 285.4) 280.0x30.0
+glyphs n=20 size=13 #1c1c21ff at (491.0, 291.6)
+glyphs n=11 size=13 #1c1c21ff at (138.0, 326.6)
+glyphs n=54 size=11 #6e6e78ff at (138.0, 346.2)
+fill #2f6fd6ff (726.0, 333.8) 36.0x20.0
+fill #ffffffff (744.0, 335.8) 16.0x16.0
+fill #d5d5ddff (126.0, 146.0) 648.0x227.0
+fill #ffffffff (126.0, 385.0) 648.0x196.8
+glyphs n=7 size=13 #6e6e78ff at (138.0, 397.0)
+glyphs n=11 size=13 #1c1c21ff at (138.0, 438.6)
+glyphs n=35 size=11 #6e6e78ff at (138.0, 458.1)
+fill #2f6fd6ff (726.0, 445.8) 36.0x20.0
+fill #ffffffff (744.0, 447.8) 16.0x16.0
+glyphs n=11 size=13 #1c1c21ff at (138.0, 481.9)
+glyphs n=55 size=11 #6e6e78ff at (138.0, 501.5)
+fill #d5d5ddff (726.0, 489.1) 36.0x20.0
+fill #e4e4eaff (744.0, 491.1) 16.0x16.0
+fill #cfcfd7ff (138.0, 525.4) 624.0x1.0
+glyphs n=16 size=13 #1c1c21ff at (138.0, 535.4)
+glyphs n=47 size=11 #6e6e78ff at (138.0, 554.9)
+fill #d5d5ddff (562.0, 550.6) 200.0x4.0
+fill #2f6fd6ff (562.0, 550.6) 66.7x4.0
+fill #ffffffff (620.7, 544.6) 16.0x16.0
+fill #d5d5ddff (620.7, 544.6) 16.0x16.0
+fill #d5d5ddff (126.0, 385.0) 648.0x196.8
+fill #ffffffff (126.0, 593.8) 648.0x100.0
+glyphs n=10 size=13 #6e6e78ff at (138.0, 605.8)
+glyphs n=5 size=13 #1c1c21ff at (138.0, 647.3)
+glyphs n=49 size=11 #6e6e78ff at (138.0, 666.8)
+fill #e4e4eaff (601.5, 649.5) 160.5x30.0
+glyphs n=5 size=13 #6e6e78ff at (612.5, 655.7)
+glyphs n=4 size=13 #6e6e78ff at (661.3, 655.7)
+fill #ffffffff (698.9, 651.5) 61.1x26.0
+glyphs n=6 size=13 #1c1c21ff at (707.9, 655.7)
+fill #d5d5ddff (126.0, 593.8) 648.0x100.0
+fill #ffffffff (126.0, 705.7) 648.0x100.0
+glyphs n=7 size=13 #6e6e78ff at (138.0, 717.7)
+glyphs n=12 size=13 #1c1c21ff at (138.0, 759.2)
+glyphs n=54 size=11 #6e6e78ff at (138.0, 778.8)
+fill #d5d5ddff (726.0, 766.5) 36.0x20.0
+fill #ffffffff (728.0, 768.5) 16.0x16.0
+fill #d5d5ddff (126.0, 705.7) 648.0x100.0
+fill #c0362cff (700.7, 817.7) 73.3x30.0
+glyphs n=9 size=13 #ffffffff at (712.7, 823.9)
+end layer
+fill #b4b4bdff (893.0, 130.0) 4.0x426.6
+fill #cfcfd7ff (0.0, 129.0) 900.0x1.0

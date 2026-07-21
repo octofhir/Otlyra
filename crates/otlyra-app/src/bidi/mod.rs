@@ -592,7 +592,11 @@ impl Session {
                 Ok(())
             }
             ("pointer", "pointerDown") => {
-                self.browser.on_event(PlatformEvent::PointerPressed);
+                // A driver's press is always a fresh single click: the protocol
+                // has no click count, and a double-click arrives as two presses
+                // the *page* may interpret, not something to synthesise here.
+                self.browser
+                    .on_event(PlatformEvent::PointerPressed { clicks: 1 });
                 Ok(())
             }
             ("pointer", "pointerUp") => {

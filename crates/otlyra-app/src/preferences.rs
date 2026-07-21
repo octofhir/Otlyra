@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use crate::settings::{OnStart, Settings};
+use crate::settings::{Appearance, OnStart, Settings};
 
 /// What this program's directory is called inside the platform's.
 const FOLDER: &str = "Otlyra";
@@ -102,6 +102,7 @@ pub fn to_text(settings: &Settings) -> String {
          run_scripts = {}\n\
          do_not_track = {}\n\
          restore_tabs = {}\n\
+         appearance = \"{}\"\n\
          text_scale = {}\n",
         match settings.on_start {
             OnStart::Blank => "blank",
@@ -119,6 +120,11 @@ pub fn to_text(settings: &Settings) -> String {
         settings.run_scripts,
         settings.do_not_track,
         settings.restore_tabs,
+        match settings.appearance {
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+            Appearance::System => "system",
+        },
         settings.text_scale,
     )
 }
@@ -165,6 +171,17 @@ pub fn from_text(text: &str) -> Settings {
             "run_scripts" => settings.run_scripts = flag().unwrap_or(settings.run_scripts),
             "do_not_track" => settings.do_not_track = flag().unwrap_or(settings.do_not_track),
             "restore_tabs" => settings.restore_tabs = flag().unwrap_or(settings.restore_tabs),
+            "appearance" => {
+                settings.appearance = match text().as_deref() {
+                    Some("light") => Appearance::Light,
+                    Some("dark") => Appearance::Dark,
+                    Some("system") => Appearance::System,
+                    _ => {
+                        tracing::warn!(value, "an appearance nobody has heard of");
+                        settings.appearance
+                    }
+                };
+            }
             "text_scale" => {
                 if let Ok(scale) = value.parse::<f64>() {
                     // Clamped to what the control can express: a file saying
@@ -191,6 +208,7 @@ mod tests {
         settings.apply(crate::settings::Action::ToggleDoNotTrack);
         settings.apply(crate::settings::Action::SetTextScale(125.0));
         settings.apply(crate::settings::Action::SetOnStart(OnStart::Home));
+        settings.apply(crate::settings::Action::SetAppearance(Appearance::Dark));
         settings.home = crate::ui::TextField::new("https://example.org/start");
 
         let read = from_text(&to_text(&settings));
@@ -198,6 +216,7 @@ mod tests {
         assert_eq!(read.do_not_track, settings.do_not_track);
         assert_eq!(read.text_scale, 125.0);
         assert_eq!(read.on_start, OnStart::Home);
+        assert_eq!(read.appearance, Appearance::Dark);
         assert_eq!(read.home.text(), "https://example.org/start");
     }
 

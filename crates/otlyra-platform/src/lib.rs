@@ -149,7 +149,14 @@ pub enum PlatformEvent {
         y: f64,
     },
     /// The primary pointer button went down at the last reported position.
-    PointerPressed,
+    PointerPressed {
+        /// How many presses this is the latest of: `1` for a click, `2` for a
+        /// double-click, `3` for a triple, counted while the presses stay close
+        /// in time and place. A platform fact, because how close is *close
+        /// enough* is a platform convention and this crate is where platform
+        /// conventions live.
+        clicks: u32,
+    },
     /// The primary pointer button came up.
     PointerReleased,
     /// A key went down.
@@ -163,6 +170,9 @@ pub enum PlatformEvent {
     /// what a key *inserts* depends on layout, dead keys and the input method,
     /// and the answer is the platform's to give.
     TextInput(char),
+    /// The window's environment is light or dark, at creation and whenever the
+    /// person switches it. The embedder decides what, if anything, follows.
+    AppearanceChanged(ColorScheme),
     /// The user asked to close the window. The loop exits after this is delivered.
     CloseRequested,
     /// The user chose a menu item the embedder defined.
@@ -243,6 +253,19 @@ pub enum Key {
     /// A printable character, identified by what an unmodified press would type.
     /// Used for shortcuts: `Cmd+T` arrives as `Character('t')`.
     Character(char),
+}
+
+/// Whether the environment around the window is light or dark.
+///
+/// Two values and not three: *system* is a policy about which of these to use,
+/// and policies belong to the embedder. This layer only reports what the
+/// platform says the environment is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColorScheme {
+    /// A light environment.
+    Light,
+    /// A dark one.
+    Dark,
 }
 
 /// Modifier keys held during an event.
@@ -330,6 +353,17 @@ pub trait Painter {
     /// is under it — and a push would be a second copy of that.
     fn cursor(&self) -> Cursor {
         Cursor::Default
+    }
+
+    /// The scheme the *window itself* — its titlebar — should wear, or `None`
+    /// to follow the system.
+    ///
+    /// Polled like the cursor and for the same reason. This exists because an
+    /// embedder that draws itself dark under a light titlebar looks broken in a
+    /// way no amount of its own drawing can fix; the titlebar is the
+    /// platform's, so the platform has to be told.
+    fn window_appearance(&self) -> Option<ColorScheme> {
+        None
     }
 
     /// Paint one frame. `target` has already been reset for this frame.

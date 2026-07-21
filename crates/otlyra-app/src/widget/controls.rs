@@ -552,30 +552,69 @@ pub struct FieldView {
     pub text: String,
     /// The caret's byte offset, when the field has focus.
     pub caret: Option<usize>,
+    /// The selected byte range, when text is selected. Drawn behind the text,
+    /// and while it is non-empty the caret is not drawn: the caret is the
+    /// selection's live end, and a bar inside a wash says nothing the wash's
+    /// edge does not.
+    pub selection: Option<std::ops::Range<usize>>,
     /// What to show, dimmed, while the field is empty.
     pub placeholder: String,
+}
+
+/// Where in a field's text the pointer landed.
+///
+/// Byte offsets into the field's full text, snapped to character boundaries by
+/// construction: the map they come from has an entry per boundary of what was
+/// drawn and nothing else.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FieldHit {
+    /// The button went down at this offset. `clicks` counts the run the press
+    /// ends: `2` for a double-click, `3` for a triple.
+    Press {
+        /// The byte offset the press landed nearest.
+        offset: usize,
+        /// How many presses this is the latest of.
+        clicks: u32,
+    },
+    /// The pointer, still down from a press that began in this field, is over
+    /// this offset now. What a drag-selection is made of.
+    Drag {
+        /// The byte offset under the pointer.
+        offset: usize,
+    },
 }
 
 /// A single-line text field.
 ///
 /// It edits nothing. Keys are handled by whoever owns the text, because a field
 /// that consumed keystrokes would need to know about focus, and focus is a
-/// property of the surface rather than of any control on it.
-pub struct TextInput {
+/// property of the surface rather than of any control on it. What it does
+/// answer for itself is *where* in the text the pointer is: it reports a
+/// [`FieldHit`] through `on_hit`, and the owner decides what a click, a
+/// double-click or a drag at that offset means to its own caret and anchor.
+pub struct TextInput<A> {
     view: FieldView,
+    on_hit: Box<dyn Fn(FieldHit) -> A>,
     leading: Option<Mark>,
     face: Option<Color>,
     rect: Rect,
+    /// One `(x, byte offset)` entry per character boundary of the text drawn,
+    /// computed while drawing with the engine that drew it. Hit testing reads
+    /// this rather than measuring again — measured a second time, by a second
+    /// engine, a press would land a glyph away from where it was aimed.
+    hit_map: Vec<(f64, usize)>,
 }
 
-impl TextInput {
-    /// A field showing `view`.
-    pub fn new(view: FieldView) -> Self {
+impl<A> TextInput<A> {
+    /// A field showing `view`, reporting where presses and drags land.
+    pub fn new(view: FieldView, on_hit: impl Fn(FieldHit) -> A + 'static) -> Self {
         Self {
             view,
+            on_hit: Box::new(on_hit),
             leading: None,
             face: None,
             rect: Rect::ZERO,
+            hit_map: Vec::new(),
         }
     }
 
@@ -596,7 +635,10 @@ impl TextInput {
     }
 
     /// Wrap in the face, border and focus ring a field is drawn with.
-    pub fn into_widget<A: 'static>(self, theme: &Theme) -> Child<A> {
+    pub fn into_widget(self, theme: &Theme) -> Child<A>
+    where
+        A: 'static,
+    {
         let focused = self.view.caret.is_some();
         // Focus raises the field to white whatever it rests on, so the text
         // being edited always has the most contrast on screen behind it.
@@ -619,7 +661,7 @@ impl TextInput {
     }
 }
 
-impl<A> Widget<A> for TextInput {
+impl<A> Widget<A> for TextInput<A> {
     fn describe(&self, out: &mut Vec<Described>) {
         out.push(Described {
             rect: self.rect,
@@ -689,6 +731,58 @@ impl<A> Widget<A> for TextInput {
 
         let line = cx.line_height(theme.font_size);
         let top = self.rect.y + (self.rect.height - line) / 2.0;
+
+        // The map from x to byte offset, built from what is actually drawn and
+        // with the engine drawing it. Everything that answers *where in the
+        // text* — the selection wash, the caret, a press — reads this one map,
+        // so none of them can disagree about where a character is.
+        self.hit_map.clear();
+        if placeholder {
+            self.hit_map.push((text_x, 0));
+        } else {
+            // What survived elision is a literal slice of the text: the tail
+            // when the front was cut, the front when the tail was.
+            let visible = shown
+                .trim_start_matches(ELLIPSIS)
+                .trim_end_matches(ELLIPSIS);
+            let base = if shown.starts_with(ELLIPSIS) {
+                self.view.text.len() - visible.len()
+            } else {
+                0
+            };
+            let start_x = if shown.starts_with(ELLIPSIS) {
+                text_x + cx.measure_text(&ELLIPSIS.to_string(), theme.font_size)
+            } else {
+                text_x
+            };
+            self.hit_map.push((start_x, base));
+            for (index, character) in visible.char_indices() {
+                let end = index + character.len_utf8();
+                let advance = cx.measure_text(&visible[..end], theme.font_size);
+                self.hit_map.push((start_x + advance, base + end));
+            }
+        }
+
+        let selection = self
+            .view
+            .selection
+            .clone()
+            .filter(|range| !range.is_empty() && !placeholder);
+
+        if let Some(range) = &selection {
+            // Clamped to what is on screen: a selection running past the elided
+            // end is drawn to the edge of what is visible, which is where the
+            // selected text stops being visible too.
+            let from = self.x_of(range.start);
+            let to = self.x_of(range.end);
+            fill_rounded(
+                list,
+                Rect::new(from, top, (to - from).max(0.0), line),
+                theme.selection,
+                0.0,
+            );
+        }
+
         let ink = if placeholder {
             theme.ink_dim
         } else {
@@ -698,28 +792,78 @@ impl<A> Widget<A> for TextInput {
         Widget::<A>::place(&mut label, Rect::new(text_x, top, available, line), cx);
         Widget::<A>::draw(&mut label, cx, list);
 
-        if let Some(caret) = self.view.caret.filter(|_| !placeholder) {
-            // Measured against what was drawn rather than against the text,
-            // because the front may have been elided away — and with the same
-            // engine that drew it, or it drifts by a pixel per glyph.
+        if let Some(caret) = self
+            .view
+            .caret
+            .filter(|_| !placeholder && selection.is_none())
+        {
             let caret = caret.min(self.view.text.len());
-            let visible = shown.trim_start_matches(ELLIPSIS);
-            let before = match self.view.text[..caret].len().checked_sub(visible.len()) {
-                Some(dropped) if dropped > 0 => &shown[..shown.len() - visible.len()],
-                _ => &self.view.text[..caret],
-            };
-            let advance = cx.measure_text(before, theme.font_size);
+            let advance = self.x_of(caret);
             fill_rounded(
                 list,
-                Rect::new(text_x + advance, top + 1.0, 1.5, line - 2.0),
+                Rect::new(advance, top + 1.0, 1.5, line - 2.0),
                 theme.ink,
                 0.0,
             );
         }
     }
 
+    fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
+        match event {
+            Event::PointerPressed if cx.hovered(self.rect) => {
+                Some((self.on_hit)(FieldHit::Press {
+                    offset: self.offset_at(cx.pointer.0),
+                    clicks: cx.clicks,
+                }))
+            }
+            // A drag belongs to the field the press began in, wherever the
+            // pointer has wandered since — which is what lets a selection keep
+            // growing past the field's edge.
+            Event::PointerMoved if cx.pointer_down && cx.dragging_from(self.rect) => {
+                Some((self.on_hit)(FieldHit::Drag {
+                    offset: self.offset_at(cx.pointer.0),
+                }))
+            }
+            _ => None,
+        }
+    }
+
     fn flex(&self) -> f64 {
         1.0
+    }
+}
+
+impl<A> TextInput<A> {
+    /// The x where `offset` sits, read from the map the last draw built.
+    ///
+    /// An offset outside what was drawn answers with the nearest visible edge:
+    /// the caret of a selection scrolled out of view is at the view's edge, as
+    /// far as drawing is concerned.
+    fn x_of(&self, offset: usize) -> f64 {
+        let mut nearest = self.rect.x;
+        let mut distance = usize::MAX;
+        for &(x, at) in &self.hit_map {
+            let gap = at.abs_diff(offset);
+            if gap < distance {
+                distance = gap;
+                nearest = x;
+            }
+        }
+        nearest
+    }
+
+    /// The character boundary nearest to `x`, as a byte offset into the text.
+    fn offset_at(&self, x: f64) -> usize {
+        let mut nearest = 0;
+        let mut distance = f64::INFINITY;
+        for &(at, offset) in &self.hit_map {
+            let gap = (at - x).abs();
+            if gap < distance {
+                distance = gap;
+                nearest = offset;
+            }
+        }
+        nearest
     }
 }
 
@@ -828,7 +972,12 @@ pub fn card<A: 'static>(theme: &Theme, title: impl Into<String>, rows: Vec<Child
     let heading: Child<A> = Box::new(Label::new(title, theme.font_size, theme.ink_dim));
     let mut children: Vec<Child<A>> = vec![heading, Box::new(Gap::new(0.0, theme.gap))];
     children.extend(rows);
+    card_plain(theme, children)
+}
 
+/// A card with no heading: the raised face and the outline alone, for a group
+/// whose title lives outside it — a day's visits under the day's own label.
+pub fn card_plain<A: 'static>(theme: &Theme, rows: Vec<Child<A>>) -> Child<A> {
     Box::new(Background::new(
         theme.raised,
         theme.radius,
@@ -837,7 +986,7 @@ pub fn card<A: 'static>(theme: &Theme, title: impl Into<String>, rows: Vec<Child
             theme.radius,
             Box::new(Padding::new(
                 Insets::all(theme.inset * 1.5),
-                Box::new(Stack::column(theme.gap * 1.5, children)),
+                Box::new(Stack::column(theme.gap * 1.5, rows)),
             )),
         )),
     ))
@@ -1037,6 +1186,50 @@ pub fn gap<A: 'static>(size: f64) -> Child<A> {
 /// Corner radii for a control whose two bottom corners must stay square.
 pub fn top_rounded(radius: f64) -> RoundedRectRadii {
     RoundedRectRadii::new(radius, radius, 0.0, 0.0)
+}
+
+/// A one-line label that cuts itself with an ellipsis when it does not fit.
+///
+/// [`Label`] draws what it was given; this draws what *fits*, decided at draw
+/// time against the width it was actually placed at — the only moment that
+/// width is known.
+pub struct Elided {
+    text: String,
+    size: f32,
+    ink: Color,
+    end: Elide,
+    rect: Rect,
+}
+
+impl Elided {
+    /// A label showing `text`, cut at `end` when it must be.
+    pub fn new(text: impl Into<String>, size: f32, ink: Color, end: Elide) -> Self {
+        Self {
+            text: text.into(),
+            size,
+            ink,
+            end,
+            rect: Rect::ZERO,
+        }
+    }
+}
+
+impl<A> Widget<A> for Elided {
+    fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
+        let width = cx.measure_text(&self.text, self.size);
+        Size::new(width.min(available.width), cx.line_height(self.size))
+    }
+
+    fn place(&mut self, rect: Rect, _cx: &mut Cx) {
+        self.rect = rect;
+    }
+
+    fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
+        let shown = elide(cx, &self.text, self.rect.width, self.end);
+        let mut label = Label::new(shown, self.size, self.ink);
+        Widget::<A>::place(&mut label, self.rect, cx);
+        Widget::<A>::draw(&mut label, cx, list);
+    }
 }
 
 /// The character standing in for what was cut.

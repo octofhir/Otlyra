@@ -19,9 +19,9 @@ use otlyra_gfx::peniko::Color;
 /// The palette and the metrics the interface is drawn from.
 ///
 /// Passed by reference rather than read from a global, so a second theme is a
-/// value to construct and not a mode to switch the process into. Dark mode, when
-/// it comes, is another `Theme` and no change to any control.
-#[derive(Clone, Debug)]
+/// value to construct and not a mode to switch the process into. Dark mode is
+/// exactly that: another `Theme`, and no change to any control.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     /// Behind the toolbar and the tab strip.
     pub surface: Color,
@@ -184,6 +184,49 @@ impl Theme {
         }
     }
 
+    /// The interface as it is drawn in a dark environment.
+    ///
+    /// The same trace of blue in the greys, for the same reason. The accent is
+    /// lighter than the light theme's, because the same blue that clears the
+    /// contrast floor on white fails it on near-black; the washes are white
+    /// rather than black, because a wash has to differ from what it sits on.
+    /// Every metric is the light theme's: dark is a palette, not a layout.
+    pub fn dark() -> Self {
+        Self {
+            surface: Color::from_rgb8(0x1e, 0x1e, 0x24),
+            raised: Color::from_rgb8(0x2d, 0x2d, 0x35),
+            surface_sunken: Color::from_rgb8(0x26, 0x26, 0x2d),
+            hairline: Color::from_rgb8(0x3c, 0x3c, 0x45),
+            border: Color::from_rgb8(0x47, 0x47, 0x51),
+
+            ink: Color::from_rgb8(0xe9, 0xe9, 0xee),
+            ink_dim: Color::from_rgb8(0xa4, 0xa4, 0xb0),
+            ink_disabled: Color::from_rgb8(0x5e, 0x5e, 0x68),
+            // Dark on the accent, not white: the accent is lighter here than in
+            // the light theme, and white on it fails the floor white clears
+            // there.
+            ink_on_accent: Color::from_rgb8(0x14, 0x18, 0x20),
+
+            accent: Color::from_rgb8(0x6a, 0x9d, 0xe8),
+            accent_halo: Color::from_rgba8(0x6a, 0x9d, 0xe8, 0x38),
+            danger: Color::from_rgb8(0xe0, 0x60, 0x55),
+
+            hover: Color::from_rgba8(0xff, 0xff, 0xff, 0x14),
+            press: Color::from_rgba8(0xff, 0xff, 0xff, 0x28),
+            selection: Color::from_rgba8(0x6a, 0x9d, 0xe8, 0x3c),
+
+            code_tag: Color::from_rgb8(0xd8, 0x93, 0xd8),
+            code_name: Color::from_rgb8(0xdf, 0xb2, 0x6d),
+            code_value: Color::from_rgb8(0x92, 0xd0, 0xa5),
+
+            // The box overlays and grid lines are translucent washes over a
+            // page nobody wrote for them, and they read on dark pages already;
+            // changing them per theme would make the inspector's vocabulary
+            // depend on the toolbar's palette.
+            ..Self::light()
+        }
+    }
+
     /// Nothing, in the theme's own units: a colour that paints no pixels.
     ///
     /// Used where a control has a background only sometimes — an icon button is
@@ -195,5 +238,83 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::light()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance of an opaque colour.
+    fn luminance(color: Color) -> f64 {
+        let linear = |channel: f32| {
+            let channel = f64::from(channel);
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b, _] = color.components;
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    /// WCAG contrast ratio, 1 to 21.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (lighter, darker) = {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b), a.min(b))
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Every colour meets a floor against the surface it is drawn on.
+    ///
+    /// Table-driven, and over both themes, because a palette drifts one shade
+    /// at a time: no single change looks like the one that made a label
+    /// unreadable. The floors are what the light theme establishes — body text
+    /// at the AA level, secondary and iconography at the large-text level —
+    /// and dark has to clear the same bar, not its own.
+    #[test]
+    fn every_ink_clears_its_contrast_floor_in_both_themes() {
+        for (name, theme) in [("light", Theme::light()), ("dark", Theme::dark())] {
+            let table: [(&str, Color, Color, f64); 12] = [
+                ("ink on surface", theme.ink, theme.surface, 7.0),
+                ("ink on raised", theme.ink, theme.raised, 7.0),
+                ("ink on sunken", theme.ink, theme.surface_sunken, 7.0),
+                ("dim ink on surface", theme.ink_dim, theme.surface, 3.5),
+                ("dim ink on raised", theme.ink_dim, theme.raised, 3.5),
+                (
+                    "dim ink on sunken",
+                    theme.ink_dim,
+                    theme.surface_sunken,
+                    3.5,
+                ),
+                ("ink on accent", theme.ink_on_accent, theme.accent, 3.0),
+                ("accent on surface", theme.accent, theme.surface, 3.0),
+                ("accent on raised", theme.accent, theme.raised, 3.0),
+                ("danger on raised", theme.danger, theme.raised, 3.0),
+                ("code tag on raised", theme.code_tag, theme.raised, 3.5),
+                ("code value on raised", theme.code_value, theme.raised, 3.5),
+            ];
+            for (what, ink, on, floor) in table {
+                let ratio = contrast(ink, on);
+                assert!(
+                    ratio >= floor,
+                    "{name}: {what} is {ratio:.2}, below the {floor} floor"
+                );
+            }
+        }
+    }
+
+    /// The washes have to be washes: translucent, or they would erase what
+    /// they sit on instead of tinting it.
+    #[test]
+    fn the_washes_stay_translucent_in_both_themes() {
+        for theme in [Theme::light(), Theme::dark()] {
+            for wash in [theme.hover, theme.press, theme.selection, theme.accent_halo] {
+                assert!(wash.components[3] < 0.5, "a wash more than half opaque");
+            }
+        }
     }
 }

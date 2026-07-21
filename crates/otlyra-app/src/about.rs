@@ -84,6 +84,15 @@ impl AboutSurface {
         self.focused
     }
 
+    /// Draw from `theme` from the next frame on. The cache does not key on the
+    /// theme, so the stored list goes with the old palette.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.cache = None;
+        }
+    }
+
     /// Activate the control a reader named, through the path a press takes.
     pub fn activate_described(&mut self, index: usize, text: &mut TextEngine) -> Action {
         let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
@@ -136,13 +145,21 @@ impl AboutSurface {
         }
     }
 
-    /// What the pointer should look like at `x`, `y`.
-    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> otlyra_platform::Cursor {
+    /// What a press at `x`, `y` would report, without reporting it.
+    ///
+    /// The same probe every surface answers: the page knows where it drew its
+    /// one button, and this is how anything else asks.
+    pub fn action_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Action {
         let pointer = self.pointer;
         self.pointer = (x, y);
         let action = self.offer(&Event::PointerPressed, text);
         self.pointer = pointer;
-        match action {
+        action
+    }
+
+    /// What the pointer should look like at `x`, `y`.
+    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> otlyra_platform::Cursor {
+        match self.action_at(x, y, text) {
             Action::None => otlyra_platform::Cursor::Default,
             _ => otlyra_platform::Cursor::Pointer,
         }

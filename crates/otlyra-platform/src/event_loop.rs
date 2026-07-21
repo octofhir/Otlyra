@@ -23,6 +23,14 @@ const LINE_SCROLL: f64 = 40.0;
 /// How many frames in a row the swapchain may refuse before we stop asking.
 const MAX_DROPPED_FRAMES: u32 = 8;
 
+/// Translate winit's theme into our own vocabulary.
+fn translate_theme(theme: winit::window::Theme) -> crate::ColorScheme {
+    match theme {
+        winit::window::Theme::Light => crate::ColorScheme::Light,
+        winit::window::Theme::Dark => crate::ColorScheme::Dark,
+    }
+}
+
 /// Translate a winit key into our own vocabulary. `None` for keys nothing acts on.
 fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
     use winit::keyboard::{Key as WinitKey, NamedKey};
@@ -150,7 +158,10 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         a11y: None,
         frames: 0,
         modifiers: crate::Modifiers::default(),
+        pointer: (-1.0, -1.0),
+        last_press: None,
         cursor: crate::Cursor::default(),
+        pinned_scheme: None,
         dropped_frames: 0,
         failure: None,
     };
@@ -180,8 +191,19 @@ struct WindowedApp<'p> {
     /// Modifier state, tracked here because winit reports it as its own event and
     /// every key press needs it.
     modifiers: crate::Modifiers,
+    /// Where the pointer was last seen, in logical pixels. Kept for the
+    /// multi-click radius: winit reports a press with no position on it.
+    pointer: (f64, f64),
+    /// The last press: when, where, and how many clicks it was the latest of.
+    /// What turns three presses into a triple-click.
+    last_press: Option<(std::time::Instant, (f64, f64), u32)>,
     /// The cursor currently set, so it is only changed when it actually changes.
     cursor: crate::Cursor,
+    /// The scheme the window is currently pinned to, `None` while it follows
+    /// the system. Kept so the window is only told when the answer changes —
+    /// and so a `ThemeChanged` that merely echoes the pin is not reported as
+    /// the system changing its mind.
+    pinned_scheme: Option<crate::ColorScheme>,
     /// Consecutive frames the swapchain refused, so retrying stays bounded.
     dropped_frames: u32,
     /// First fatal error, so `run` can return it once the loop unwinds. An
@@ -191,6 +213,30 @@ struct WindowedApp<'p> {
 }
 
 impl WindowedApp<'_> {
+    /// How many clicks the press that just happened is the latest of.
+    ///
+    /// A press within half a second and four logical pixels of the last one
+    /// continues its run; anything further in time or place starts a new one.
+    /// winit does not count clicks for us, so the counting lives here.
+    fn count_click(&mut self) -> u32 {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const RADIUS: f64 = 4.0;
+
+        let now = std::time::Instant::now();
+        let clicks = match self.last_press {
+            Some((when, (x, y), count))
+                if now.duration_since(when) <= INTERVAL
+                    && (self.pointer.0 - x).abs() <= RADIUS
+                    && (self.pointer.1 - y).abs() <= RADIUS =>
+            {
+                count + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, self.pointer, clicks));
+        clicks
+    }
+
     fn viewport(&self) -> Viewport {
         let Some(window) = self.window.as_ref() else {
             return Viewport::new(1, 1, 1.0);
@@ -227,8 +273,41 @@ impl WindowedApp<'_> {
             self.cursor = cursor;
         }
 
+        self.sync_window_appearance();
+
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
+        }
+    }
+
+    /// Pin the window — its titlebar — to what the painter wants, or hand it
+    /// back to the system.
+    ///
+    /// On the way back, the system's current answer is delivered explicitly:
+    /// while the window was pinned the system may have changed its mind, and
+    /// the painter has to hear about it *now* rather than at the next change.
+    fn sync_window_appearance(&mut self) {
+        let wanted = self.painter.window_appearance();
+        if wanted == self.pinned_scheme {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        window.set_theme(wanted.map(|scheme| match scheme {
+            crate::ColorScheme::Light => winit::window::Theme::Light,
+            crate::ColorScheme::Dark => winit::window::Theme::Dark,
+        }));
+        self.pinned_scheme = wanted;
+        if wanted.is_none()
+            && let Some(scheme) = self
+                .window
+                .as_ref()
+                .and_then(|w| w.theme())
+                .map(translate_theme)
+        {
+            self.painter
+                .on_event(PlatformEvent::AppearanceChanged(scheme));
         }
     }
 
@@ -372,6 +451,21 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
         window.set_visible(true);
 
         window.request_redraw();
+        // The painter may already want the window pinned — a saved preference
+        // says Dark — and that has to land before the titlebar is ever seen.
+        if let Some(wanted) = self.painter.window_appearance() {
+            window.set_theme(Some(match wanted {
+                crate::ColorScheme::Light => winit::window::Theme::Light,
+                crate::ColorScheme::Dark => winit::window::Theme::Dark,
+            }));
+            self.pinned_scheme = Some(wanted);
+        } else if let Some(scheme) = window.theme().map(translate_theme) {
+            // What the environment is *now*, before the first frame: without
+            // this the embedder would draw its first frame in the default
+            // palette and switch on the first change, which reads as a flash.
+            self.painter
+                .on_event(PlatformEvent::AppearanceChanged(scheme));
+        }
         self.window = Some(window);
         self.painter.on_event(PlatformEvent::SurfaceReady(viewport));
         tracing::info!(
@@ -416,6 +510,18 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ThemeChanged(theme) => {
+                // While the window is pinned, this event is our own pin coming
+                // back, not the system changing its mind — reporting it would
+                // poison what *System* later resumes following.
+                if self.pinned_scheme.is_none() {
+                    self.deliver(PlatformEvent::AppearanceChanged(translate_theme(theme)));
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
                 self.modifiers = crate::Modifiers {
@@ -428,18 +534,23 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = self.viewport().scale_factor;
+                self.pointer = (position.x / scale, position.y / scale);
                 self.deliver(PlatformEvent::PointerMoved {
-                    x: position.x / scale,
-                    y: position.y / scale,
+                    x: self.pointer.0,
+                    y: self.pointer.1,
                 });
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == winit::event::MouseButton::Left {
-                    self.deliver(match state {
-                        winit::event::ElementState::Pressed => PlatformEvent::PointerPressed,
+                    let event = match state {
+                        winit::event::ElementState::Pressed => {
+                            let clicks = self.count_click();
+                            PlatformEvent::PointerPressed { clicks }
+                        }
                         winit::event::ElementState::Released => PlatformEvent::PointerReleased,
-                    });
+                    };
+                    self.deliver(event);
                 }
             }
 
