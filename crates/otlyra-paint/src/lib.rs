@@ -936,6 +936,7 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
                 scale: 1.0,
+                text_scale: 1.0,
             },
         );
         let images: otlyra_layout::Images = otlyra_layout::image_sources(&parsed.document)
@@ -965,6 +966,7 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
                 scale: 1.0,
+                text_scale: 1.0,
             },
         );
         let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
@@ -1345,6 +1347,7 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
                 scale: 1.0,
+                text_scale: 1.0,
             },
         );
         let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);

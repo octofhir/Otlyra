@@ -46,6 +46,8 @@ pub struct PageScene {
     styler: Option<otlyra_css::cascade::Styler>,
     /// Whether the styles the box tree was built from still hold.
     styled: bool,
+    /// The reader's default font size, as a multiple of the specification's.
+    text_scale: f32,
     /// How far down the page the reader is, in logical pixels.
     scroll: f32,
     /// The scrollbar the pointer is holding, if it is holding one.
@@ -87,6 +89,7 @@ impl PageScene {
             layout: None,
             styler: None,
             styled: false,
+            text_scale: 1.0,
             scroll: 0.0,
             port_scroll: std::collections::HashMap::new(),
             drag: None,
@@ -153,6 +156,7 @@ impl PageScene {
             width,
             height,
             scale: 1.0,
+            text_scale: self.text_scale,
         };
 
         let stale = match self.styler.as_mut() {
@@ -266,6 +270,19 @@ impl PageScene {
             current = node.parent;
         }
         None
+    }
+
+    /// What the reader has asked the default font size to be, as a multiple.
+    ///
+    /// A restyle when it changes, because it changes what `medium` computes to
+    /// and every element that inherited a size inherited that.
+    pub fn set_text_scale(&mut self, scale: f32) {
+        if (self.text_scale - scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.text_scale = scale;
+        self.styled = false;
+        self.damage.add(otlyra_layout::Damage::LAYOUT);
     }
 
     /// Where a box was drawn on the last frame, if it was.

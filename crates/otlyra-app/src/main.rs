@@ -565,6 +565,7 @@ fn styled_boxes(
             width: width as f32,
             height: height as f32,
             scale: 1.0,
+            text_scale: 1.0,
         },
     );
     otlyra_layout::build_styled_box_tree(document, &styles)

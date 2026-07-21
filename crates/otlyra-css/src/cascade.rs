@@ -63,6 +63,14 @@ pub struct Viewport {
     pub height: f32,
     /// Device pixels per CSS pixel.
     pub scale: f32,
+    /// What the reader has asked the default font size to be, as a multiple.
+    ///
+    /// A preference rather than a property: it changes what `medium` computes
+    /// to, which is what every page that does not name a size inherits — and
+    /// which a page that *does* name one still overrides, exactly as it would
+    /// override any other default. Scaling the used sizes afterwards instead
+    /// would enlarge a `1px` hairline along with the prose.
+    pub text_scale: f32,
 }
 
 impl Default for Viewport {
@@ -71,6 +79,7 @@ impl Default for Viewport {
             width: 1024.0,
             height: 768.0,
             scale: 1.0,
+            text_scale: 1.0,
         }
     }
 }
@@ -280,6 +289,25 @@ fn enable_features() {
     });
 }
 
+/// The initial font, with the default size multiplied by the reader's scale.
+///
+/// `computed_size` and `used_size` both, because they are the same value until
+/// something constrains one of them and nothing here does. The keyword
+/// information is left alone: `medium` is still what this is, and `font-size:
+/// larger` on top of it still means larger *than this*.
+fn scaled_font(scale: f32) -> style::properties::style_structs::Font {
+    use style::values::computed::length::NonNegativeLength;
+
+    let mut font = style::properties::style_structs::Font::initial_values();
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return font;
+    }
+    let scaled = font.font_size.computed_size.0.px() * scale;
+    font.font_size.computed_size = NonNegativeLength::new(scaled);
+    font.font_size.used_size = NonNegativeLength::new(scaled);
+    font
+}
+
 /// The device a viewport describes: what a media query is evaluated against and
 /// what `vw` and `vh` resolve to.
 fn device_for(viewport: Viewport, quirks_mode: QuirksMode) -> Device {
@@ -293,12 +321,13 @@ fn device_for(viewport: Viewport, quirks_mode: QuirksMode) -> Device {
         ),
         euclid::Scale::new(viewport.scale),
         Box::new(NoFontMetrics),
-        // The initial values every cascade starts from, with the default font taken
-        // from those same initial values: there is no platform font preference to
-        // consult yet.
-        ComputedValues::initial_values_with_font_override(
-            style::properties::style_structs::Font::initial_values(),
-        ),
+        // The initial values every cascade starts from, with the default font
+        // size the reader's own preference rather than the specification's
+        // sixteen pixels. This is the one place a browser's *default font size*
+        // setting belongs: everything that does not name a size inherits from
+        // here, and everything that names one overrides it, which is what makes
+        // the preference a default rather than an override.
+        ComputedValues::initial_values_with_font_override(scaled_font(viewport.text_scale)),
         style::queries::values::PrefersColorScheme::Light,
         style::servo::media_features::PointerCapabilities::FINE,
         style::servo::media_features::PointerCapabilities::FINE,

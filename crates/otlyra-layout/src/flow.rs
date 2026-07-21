@@ -2718,6 +2718,7 @@ mod tests {
                 width,
                 height: 600.0,
                 scale: 1.0,
+                text_scale: 1.0,
             },
         );
         let boxes = build_styled_box_tree(&document, &styles);
@@ -2918,6 +2919,7 @@ mod tests {
                 width,
                 height: 600.0,
                 scale: 1.0,
+                text_scale: 1.0,
             },
         );
         let images: crate::Images = crate::image_sources(&document)

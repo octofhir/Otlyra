@@ -18,6 +18,7 @@ fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
             width,
             height: 600.0,
             scale: 1.0,
+            text_scale: 1.0,
         },
     );
     let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);

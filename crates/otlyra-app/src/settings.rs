@@ -375,9 +375,10 @@ impl Settings {
                 controls::setting_row(
                     theme,
                     format!("Text size — {}%", self.text_scale as i64),
-                    // The same honesty: the number is kept and saved, and the
-                    // engine has nowhere to be told about it yet.
-                    Some("Saved, but the engine has no way to be told yet."),
+                    // What it actually does, including the part that surprises
+                    // people: it is a *default*, so a page that names its own
+                    // size still wins, exactly as it would over any other.
+                    Some("The default size on pages that do not name one."),
                     scale,
                 ),
             ],

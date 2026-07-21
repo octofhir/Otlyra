@@ -1706,6 +1706,7 @@ impl Painter for Browser {
         // panel then reported about it would be a number about a different page.
         let dock = self.dock_height(height - top);
         let content_height = (height - top - dock).max(0.0);
+        let text_scale = (self.settings.settings.text_scale / 100.0) as f32;
 
         // The page first, then the interface over it. The page is inset by the
         // interface's height and culled to what is visible, so it cannot paint
@@ -1728,6 +1729,10 @@ impl Painter for Browser {
             list.transform(scale);
             render(&list, target);
         } else if let Some(page) = self.tabs[self.active].page.as_mut() {
+            // Told before the frame is built, because it decides what `medium`
+            // computes to and every element that inherited a size inherited
+            // that. Setting it to what it already is costs nothing.
+            page.set_text_scale(text_scale);
             let mut list = page.build_display_list(
                 &mut self.text,
                 width as f32,
@@ -2891,6 +2896,67 @@ mod tests {
         assert!(
             by_url("https://site.example/site.css").took.is_some(),
             "a finished request knows how long the transport took"
+        );
+    }
+
+    #[test]
+    fn the_text_size_preference_is_the_default_a_page_inherits() {
+        /// A page that names no size, and one that names its own.
+        struct Sized;
+        impl Loader for Sized {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                let bytes = if url.contains("named") {
+                    b"<body><p style=\"font-size: 15px\">text".to_vec()
+                } else {
+                    b"<body><p>text".to_vec()
+                };
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes,
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        /// The size the one paragraph was computed at.
+        fn paragraph(browser: &mut Browser) -> f32 {
+            let mut painter = otlyra_gfx::RecordingPainter::new();
+            browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+            let page = browser.active_page().expect("a page");
+            let boxes = page.boxes();
+            boxes
+                .descendants(boxes.root())
+                .into_iter()
+                .filter_map(|id| boxes.get(id))
+                .find(|node| node.tag.as_ref().is_some_and(|tag| tag.as_ref() == "p"))
+                .expect("a paragraph")
+                .style
+                .font_size
+        }
+
+        let mut browser = Browser::new(Sized);
+        browser.navigate("https://plain.example/");
+        settle(&mut browser);
+        let ordinary = paragraph(&mut browser);
+
+        browser.settings.settings.text_scale = 200.0;
+        let doubled = paragraph(&mut browser);
+        assert!(
+            (doubled - ordinary * 2.0).abs() < 0.01,
+            "a page that names no size inherits the reader's default: \
+             {ordinary} became {doubled}"
+        );
+
+        // And a page that names one still wins, because this is a default and
+        // not an override — which is the part that surprises people, and the
+        // part that would be wrong the other way round.
+        browser.navigate("https://named.example/");
+        settle(&mut browser);
+        assert!(
+            (paragraph(&mut browser) - 15.0).abs() < 0.01,
+            "a page that names its own size keeps it"
         );
     }
 
