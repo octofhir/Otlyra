@@ -1,0 +1,25 @@
+<!doctype html>
+<title>Driven from outside</title>
+<style>
+  body { font: 15px/1.5 system-ui; margin: 0; color: #1c1c21; }
+  header { padding: 24px; background: #2f6fd6; color: #fff; }
+  h1 { margin: 0; font-size: 22px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 200px 1fr 1fr;
+    gap: 12px;
+    padding: 20px;
+  }
+  .card { background: #eef1f7; border: 1px solid #d5d5dd; padding: 12px; }
+  footer { padding: 20px; color: #6e6e78; }
+</style>
+<header><h1>This page was opened by a program, not a person</h1></header>
+<div class="grid">
+  <div class="card" id="first">A grid item, so the inspector has tracks to draw.</div>
+  <div class="card">Another.</div>
+  <div class="card">A third.</div>
+  <div class="card">Fourth.</div>
+  <div class="card">Fifth.</div>
+  <div class="card">Sixth.</div>
+</div>
+<footer>Everything above was laid out by Otlyra's own engine.</footer>

@@ -1147,6 +1147,20 @@ impl Browser {
         list.append(&built);
     }
 
+    /// Where the active tab is, which is what a driver asks after navigating.
+    pub fn url(&self) -> String {
+        self.tabs[self.active].url.clone()
+    }
+
+    /// One frame, as a PNG.
+    ///
+    /// For a driver with no window: the same path `--screenshot` takes, without
+    /// the file. A protocol that had to write to disk and read it back would be
+    /// a protocol with a temporary directory in its contract.
+    pub fn screenshot(&mut self, viewport: Viewport) -> Result<Vec<u8>, String> {
+        otlyra_platform::render_offscreen(self, viewport).map_err(|error| error.to_string())
+    }
+
     /// The inspector, for whoever is driving the browser rather than using it.
     ///
     /// The command line and the screenshot harness both need to open the panel

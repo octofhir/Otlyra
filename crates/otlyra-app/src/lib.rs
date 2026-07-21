@@ -40,6 +40,7 @@ pub const MARK: &[u8] = include_bytes!("../../../assets/logo/mark-256.png");
 
 pub mod a11y;
 pub mod about;
+pub mod bidi;
 pub mod browser;
 pub mod fetcher;
 pub mod inspector;

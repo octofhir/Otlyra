@@ -33,3 +33,7 @@ target
 /.agents/
 /.claude/
 /skills-lock.json
+
+# Python bytecode from the example client
+__pycache__/
+*.pyc

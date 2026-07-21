@@ -114,6 +114,13 @@ struct Cli {
     /// Which of the inspector's panes to show. Implies `--inspector`.
     #[arg(long, value_enum, value_name = "PANE")]
     inspect_pane: Option<InspectorPane>,
+
+    /// Answer WebDriver BiDi on a port of the loopback, and drive nothing else.
+    ///
+    /// `0` asks the system for a free port, which is printed on stdout as a
+    /// `ws://` address for whatever started this to read.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "9222")]
+    bidi: Option<u16>,
 }
 
 impl Cli {
@@ -137,9 +144,42 @@ enum Renderer {
     Record,
 }
 
+/// Answer the protocol until the process is stopped.
+///
+/// No window: a driver asks for frames and gets them offscreen, so this needs
+/// neither an event loop nor a compositor. Attaching to a window a person is
+/// looking at is a later transport onto the same vocabulary.
+fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let server = otlyra_app::bidi::listen(port)?;
+    // On stdout rather than through the log: whatever started this reads one
+    // line to learn where to connect, and the log belongs to a person.
+    println!("{}", server.url());
+    std::io::Write::flush(&mut std::io::stdout())?;
+    tracing::info!(address = %server.address(), "answering WebDriver BiDi");
+
+    let browser = Browser::new(NetLoader::default());
+    let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
+    loop {
+        server.serve_one(&mut session)?;
+    }
+}
+
 fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
+
+    // Answering the protocol is a mode of its own: a driver navigates, so a
+    // document named on the command line would be a page the first command
+    // replaces.
+    if let Some(port) = cli.bidi {
+        return match serve_bidi(port, &cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("otlyra: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Was a document named? `--dump-dom PATH` names one too.
     let document = cli

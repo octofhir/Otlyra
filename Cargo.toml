@@ -135,6 +135,17 @@ atomic_refcell = "=0.1.13"
 euclid = "=0.22.11"
 app_units = "=0.7.8"
 
+# The WebSocket the remote-debugging protocol speaks over.
+#
+# Synchronous, and deliberately: the browser is one `!Send` object on one thread —
+# the page holds `Rc`s all the way down — so an async runtime around it would buy
+# nothing and cost a second scheduler beside the fetcher's threads. Defaults are
+# off because a debugging endpoint listens on the loopback and has no business
+# terminating TLS.
+tungstenite = { version = "=0.30.0", default-features = false, features = [
+    "handshake",
+] }
+
 # Display-list serialization, for snapshots today and IPC later.
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.147"
