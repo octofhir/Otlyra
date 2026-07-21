@@ -434,8 +434,16 @@ impl Browser {
 
     /// Record where the reader is in the entry they are about to leave.
     fn remember_scroll(&mut self) {
+        // A browser page keeps its own, on the surface that draws it, so where
+        // the number lives depends on what the tab is showing — and the history
+        // entry does not care which it was.
+        let settings = self.settings.settings.scroll as f32;
         let tab = &mut self.tabs[self.active];
-        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        let scroll = match tab.system {
+            Some(SystemPage::Settings) => settings,
+            Some(_) => 0.0,
+            None => tab.page.as_ref().map_or(0.0, |page| page.scroll()),
+        };
         if let Some(entry) = tab.history.get_mut(tab.position) {
             entry.scroll = scroll;
         }
@@ -486,7 +494,7 @@ impl Browser {
         // line, and a step through the history — is what makes it a place a tab
         // can be rather than a mode the window is in.
         if let Some(page) = SystemPage::from_url(url) {
-            self.show_system(page, record);
+            self.show_system(page, record, restore_scroll);
             return;
         }
         self.tabs[self.active].system = None;
@@ -928,7 +936,7 @@ impl Browser {
     /// Everything a finished load does, minus the loading: the tab's address and
     /// title change, whatever was there is dropped, and the arrival earns a
     /// history entry if this navigation was the kind that earns one.
-    fn show_system(&mut self, page: SystemPage, record: bool) {
+    fn show_system(&mut self, page: SystemPage, record: bool, restore_scroll: f32) {
         if !page.available() {
             let tab = &mut self.tabs[self.active];
             tab.error = Some(format!("{} is not built yet.", page.label()));
@@ -949,6 +957,10 @@ impl Browser {
         if record {
             self.record_history(index, &previous_url);
         }
+        // A browser page is scrolled like any other, so coming back to one lands
+        // where the reader left it. Set rather than added, because the surface is
+        // the browser's and the last tab to use it left its own position there.
+        self.settings.settings.scroll = f64::from(restore_scroll);
         self.sync_address();
     }
 
@@ -2833,6 +2845,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_tabs_keep_their_own_contents_across_a_switch() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        settle(&mut browser);
+
+        browser.new_tab();
+        browser.open_system(SystemPage::Settings);
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+
+        // A browser page is a place a tab can be rather than a mode the window
+        // is in, so the other tab is still on its document.
+        browser.select_tab(0);
+        assert_eq!(browser.system_page(), None);
+        assert!(browser.tabs[0].page.is_some());
+
+        browser.select_tab(1);
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+        assert!(browser.tabs[1].page.is_none());
+    }
+
+    #[test]
+    fn the_history_walks_through_a_browser_page_like_any_other() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        settle(&mut browser);
+        let document = browser.tabs[0].url.clone();
+
+        // Left somewhere down the page, which is the thing going back has to
+        // bring back along with the document.
+        browser.tabs[0]
+            .page
+            .as_mut()
+            .expect("a page")
+            .set_scroll(120.0);
+
+        browser.open_system(SystemPage::Settings);
+        assert_eq!(browser.tabs[0].url, "about:settings");
+
+        browser.go_back();
+        settle(&mut browser);
+        assert_eq!(browser.tabs[0].url, document);
+        assert_eq!(
+            browser.tabs[0].page.as_ref().expect("a page").scroll(),
+            120.0,
+            "and at the place it was left at"
+        );
+
+        browser.go_forward();
+        settle(&mut browser);
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+    }
+
+    #[test]
+    fn done_goes_back_rather_than_wiping_the_tab() {
+        let mut browser = Browser::new(LongLoader);
+        browser.navigate("long.example");
+        settle(&mut browser);
+        let document = browser.tabs[0].url.clone();
+        browser.open_system(SystemPage::Settings);
+
+        browser.close_settings_if(&settings::Action::Close);
+        settle(&mut browser);
+        assert_eq!(
+            browser.tabs[0].url, document,
+            "the reader goes back to what they were reading"
+        );
+
+        // And with nowhere to go back to, an empty tab rather than a settings
+        // page nobody can leave.
+        let mut fresh = Browser::new(LongLoader);
+        fresh.open_system(SystemPage::Settings);
+        fresh.close_settings_if(&settings::Action::Close);
+        assert_eq!(fresh.system_page(), None);
+        assert!(fresh.tabs[0].url.is_empty());
+    }
+
+    #[test]
+    fn a_browser_page_is_left_and_returned_to_where_the_reader_was() {
+        let mut browser = Browser::new(LongLoader);
+        browser.open_system(SystemPage::Settings);
+        // Drawn, because how far a surface can scroll is only known once it has
+        // been: the same rule the panel and the page both follow.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        browser.settings.scroll_by(140.0);
+        let left_at = browser.settings.settings.scroll;
+        assert!(left_at > 0.0, "the settings scrolled at all");
+
+        browser.navigate("long.example");
+        settle(&mut browser);
+
+        // Scrambled while nobody is looking at it, because the surface is the
+        // browser's and another tab may have used it in between. What brings the
+        // reader back to where they were is the history entry, not the surface
+        // happening to still hold the number.
+        browser.settings.settings.scroll = 999.0;
+
+        browser.go_back();
+        settle(&mut browser);
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+        assert_eq!(
+            browser.settings.settings.scroll, left_at,
+            "and a browser page is returned to where the reader was, like any other"
+        );
+    }
+
+    #[test]
+    fn a_browser_page_is_reached_by_typing_its_address() {
+        let mut browser = Browser::new(LongLoader);
+        // Every navigation goes through one place, so the address bar reaches
+        // `about:` the same way the menu does.
+        browser.navigate("about:settings");
+        assert_eq!(browser.system_page(), Some(SystemPage::Settings));
+        assert_eq!(browser.ui.address.text(), "about:settings");
+    }
+
     /// A site whose CSS lives in a file next to the page.
     #[derive(Default)]
     struct SiteLoader {
@@ -3050,7 +3179,16 @@ mod tests {
                 content_type: Some("text/html".to_owned()),
                 bytes: body.into_bytes(),
                 charset: Some("utf-8".to_owned()),
-                final_url: format!("https://{url}/"),
+                // A transport hands back the address it actually reached, and an
+                // address that already has a scheme is one it reached as given.
+                // Prepending one unconditionally made a fake that a second visit
+                // to the same page — which is what going back is — turned into
+                // `https://https://…`, and only the browser looked wrong.
+                final_url: if url.contains("://") {
+                    url.to_owned()
+                } else {
+                    format!("https://{url}/")
+                },
                 ..Default::default()
             })
         }
