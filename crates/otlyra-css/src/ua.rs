@@ -15,7 +15,7 @@ use peniko::Color;
 
 use crate::style::{
     ComputedStyle, Display, FontStyle, Length, LengthOrAuto, ListStyle, Sides, TextDecoration,
-    WhiteSpace,
+    VerticalAlign, WhiteSpace,
 };
 
 /// `1em` expressed against the parent font size.
@@ -197,10 +197,15 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
             };
         }
 
-        // Smaller, and raised or lowered. The shift is not implemented — there is
-        // no vertical-align — so for now these differ only in size, which is
-        // wrong in a way that is visible and recorded rather than hidden.
-        "sub" | "sup" => style.font_size = parent.font_size * 0.83,
+        // Smaller, and raised or lowered.
+        "sub" | "sup" => {
+            style.font_size = parent.font_size * 0.83;
+            style.vertical_align = if element == "sub" {
+                VerticalAlign::Sub
+            } else {
+                VerticalAlign::Super
+            };
+        }
 
         "small" => style.font_size = parent.font_size * 0.83,
 

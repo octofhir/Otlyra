@@ -134,6 +134,10 @@ drawn behind itself.</p>
 <code>cover</code>, <code>contain</code> or a size of its own, cut off at the box,
 tiled by <code>background-repeat</code> and placed by
 <code>background-position</code>.</p>
+<p><strong>Vertical alignment</strong>: <code>vertical-align</code> with
+<code>sub</code>, <code>super</code>, a length and a percentage — so
+<code>&lt;sub&gt;</code> and <code>&lt;sup&gt;</code> are lowered and raised, and
+the line they are on grows to hold them.</p>
 <p><strong>Fonts</strong>: <code>font-family</code> down to the generic keywords,
 <code>font-size</code> — with monospace starting from a smaller base, as it does
 everywhere — <code>font-weight</code>, <code>font-style</code>,
@@ -191,7 +195,9 @@ and baseline alignment are not read, an item may shrink below its content, and
 shrinking to its contents, and only a float establishes a formatting context of
 its own, so <code>overflow</code> does not yet stop one.</p>
 <p>An inline box is as tall as the line it sits on rather than as tall as its own
-text, and <code>vertical-align</code> does not exist. Border styles other than
+text. <code>vertical-align: top</code>, <code>bottom</code> and
+<code>middle</code> are drawn on the baseline: the first two need the line box,
+which is not known until everything on it has been placed. Border styles other than
 solid are drawn solid, a border that is rounded and different on each side falls
 back to four square-cornered rectangles, and a rounded box clips its contents at a
 square edge. A background picture tiles and can be positioned, but
@@ -231,6 +237,12 @@ moves nothing else.</p>
   <h3><code>position: sticky</code>, held at the top while this box scrolls past</h3>
   <p>Scroll the page to see it stop at the top and leave with its container.</p>
 </div>
+
+<h2>Vertical alignment</h2>
+<p>Water is H<sub>2</sub>O and a square is x<sup>2</sup>; a
+<span style="vertical-align: 6px">length</span> raises,
+<span style="vertical-align: -6px">a negative one</span> lowers, and
+<span style="vertical-align: 40%">a percentage</span> is of the line height.</p>
 
 <h2>Fonts</h2>
 <p class="generics">Each generic keyword, at the same size:

@@ -294,10 +294,70 @@ fn a_smaller_inline_does_not_make_its_line_shorter() {
 
     let mixed = heights(&mixed);
     assert_eq!(mixed.len(), 2);
-    assert_eq!(mixed[0], mixed[1], "and so do both lines of two");
+    // Within the fraction of a pixel that separates a line measured from the next
+    // line's top from the last line, measured from its own height.
+    assert!(
+        (mixed[0] - mixed[1]).abs() < 0.5,
+        "and so do both lines of two: {mixed:?}"
+    );
     assert!(
         mixed[0] > plain[0],
         "a twenty-pixel paragraph has taller lines than a sixteen-pixel one: \
          {mixed:?} against {plain:?}"
+    );
+}
+
+/// `vertical-align` moves a box off the line's baseline and makes the line taller
+/// to fit it.
+///
+/// Both halves matter and only together: raised glyphs that do not grow the line
+/// are clipped by whatever is above them, and a taller line with the glyphs still
+/// on the baseline is a gap for nothing.
+#[test]
+fn a_raised_or_lowered_box_moves_and_makes_room() {
+    /// Every glyph baseline in the page, in page coordinates.
+    fn baselines(tree: &FragmentTree) -> Vec<f32> {
+        tree.iter()
+            .filter_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(run) => Some(fragment.rect.y + run.glyphs.first()?.y),
+                _ => None,
+            })
+            .collect()
+    }
+    fn line_height(tree: &FragmentTree) -> f32 {
+        tree.iter()
+            .find_map(|f| matches!(f.kind, FragmentKind::Line).then_some(f.rect.height))
+            .expect("a line")
+    }
+
+    let plain = lay_out("<body><p>x", 800.0);
+    let flat = baselines(&plain);
+    let sitting = flat[0];
+
+    let raised = lay_out("<body><p>x<sup>up</sup>", 800.0);
+    assert!(
+        baselines(&raised).iter().any(|&y| y < sitting - 1.0),
+        "a superscript sits above the baseline: {:?}",
+        baselines(&raised)
+    );
+    assert!(
+        line_height(&raised) > line_height(&plain),
+        "and its line grew to hold it"
+    );
+
+    let lowered = lay_out("<body><p>x<sub>dn</sub>", 800.0);
+    assert!(
+        baselines(&lowered).iter().any(|&y| y > sitting + 1.0),
+        "a subscript sits below it: {:?}",
+        baselines(&lowered)
+    );
+    assert!(line_height(&lowered) > line_height(&plain));
+
+    // And nothing moves when nothing asks to.
+    let level = lay_out("<body><p>x<b>y</b>", 800.0);
+    assert!(
+        baselines(&level)
+            .iter()
+            .all(|&y| (y - sitting).abs() < 0.01)
     );
 }

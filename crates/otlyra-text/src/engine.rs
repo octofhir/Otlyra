@@ -42,6 +42,28 @@ fn variations(span: &TextSpan<'_>) -> FontVariations<'static> {
     FontVariations::List(settings.into())
 }
 
+/// How far a font of one size reaches above and below its baseline.
+///
+/// The parts of a line box, kept apart rather than added up, because what needs
+/// them needs them apart: a raised or lowered box grows the line by its own reach
+/// plus how far it moved, and the two ends grow independently.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Strut {
+    /// Above the baseline.
+    pub ascent: f32,
+    /// Below it.
+    pub descent: f32,
+    /// Extra space the font asks for, which CSS splits above and below.
+    pub leading: f32,
+}
+
+impl Strut {
+    /// The whole line: everything above the baseline plus everything below.
+    pub fn height(self) -> f32 {
+        self.ascent + self.descent + self.leading
+    }
+}
+
 /// The families whose ascent is lengthened before a line is measured from it.
 ///
 /// See [`TextEngine::normal_line_height`] for what is done to them and why.
@@ -361,7 +383,7 @@ impl TextEngine {
         )
     }
 
-    /// How tall a line of this font at this size is when CSS says `normal`.
+    /// The line a font of this size makes when CSS says `line-height: normal`.
     ///
     /// This is the *strut*: the line box a block has before any text is put in it,
     /// which CSS derives from the block's own font. It is a browser decision rather
@@ -371,13 +393,13 @@ impl TextEngine {
     ///
     /// `None` if the stack resolves to no font at all, which leaves the caller to
     /// let the shaper decide.
-    pub fn normal_line_height(
+    pub fn strut(
         &mut self,
         stack: &FontStack,
         font_size: f32,
         font_weight: u16,
         italic: bool,
-    ) -> Option<f32> {
+    ) -> Option<Strut> {
         let (blob, index, family) = self.resolve(stack, font_weight, italic)?;
         let font = skrifa::FontRef::from_index(blob.as_ref(), index).ok()?;
         let metrics = skrifa::metrics::Metrics::new(
@@ -406,7 +428,11 @@ impl TextEngine {
         // difference is a pixel on many fonts and it is the difference between
         // lines landing where a reference browser puts them and landing a pixel out
         // per line, which accumulates down a page.
-        Some(ascent.round() + descent.round() + metrics.leading.round())
+        Some(Strut {
+            ascent: ascent.round(),
+            descent: descent.round(),
+            leading: metrics.leading.round(),
+        })
     }
 
     /// The first font in `stack` that exists, as bytes, face index and family name.

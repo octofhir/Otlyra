@@ -428,6 +428,33 @@ fn offset(fragment: &mut Fragment, x: f32, y: f32) {
 }
 
 /// Whether any of the four sides is non-zero.
+/// How far a rule has raised the box it is written on, in CSS pixels.
+///
+/// Positive is up. The two keywords are measured against the *parent's* font size
+/// rather than the box's own, which is what makes a superscript sit at the same
+/// height whether it is set small or not.
+///
+/// A third of the font size, and a fifth of it, are what the specification names as
+/// the amounts to use when a UA does not take them from the font — plus the pixel
+/// every engine adds on top, which is the amount the web was actually built
+/// against.
+fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f32 {
+    match style.vertical_align {
+        otlyra_css::VerticalAlign::Baseline => 0.0,
+        otlyra_css::VerticalAlign::Super => parent.font_size / 3.0 + 1.0,
+        otlyra_css::VerticalAlign::Sub => -(parent.font_size / 5.0 + 1.0),
+        otlyra_css::VerticalAlign::Length(px) => px,
+        // A percentage is of the box's own line height, which is the one place a
+        // percentage in CSS is not of the containing block.
+        otlyra_css::VerticalAlign::Percent(fraction) => {
+            fraction
+                * style
+                    .line_height
+                    .resolve(style.font_size, style.font_size * 1.2)
+        }
+    }
+}
+
 fn any_side(sides: Sides<f32>) -> bool {
     sides.top > 0.0 || sides.right > 0.0 || sides.bottom > 0.0 || sides.left > 0.0
 }
@@ -1786,7 +1813,7 @@ impl<'a> Flow<'a> {
         if spans.is_empty() && replaced.is_empty() {
             return 0.0;
         }
-        self.level_line_heights(parent, &mut spans);
+        self.level_line_heights(parent, &mut spans, &sources);
 
         // Where each span landed in the concatenated text, computed the same way
         // `shape_spans` concatenates it. This is what turns a shaped run back into
@@ -1977,6 +2004,20 @@ impl<'a> Flow<'a> {
                         .partition_point(|&start| start <= run.text_range.start)
                         .saturating_sub(1);
                     let box_id = sources.get(source).copied();
+                    let run_style = box_id.map_or_else(
+                        || Arc::clone(&style),
+                        |id| Arc::clone(&self.tree.node(id).style),
+                    );
+
+                    // `vertical-align`: the glyphs move off the line's baseline,
+                    // and the room they need was already added to the line's
+                    // height when its spans were levelled.
+                    let shift = baseline_shift(&run_style, &style);
+                    if shift != 0.0 {
+                        for glyph in &mut run.glyphs {
+                            glyph.y -= shift;
+                        }
+                    }
 
                     Fragment {
                         box_id,
@@ -1991,10 +2032,7 @@ impl<'a> Flow<'a> {
                         // on a link belongs to the link, and painting from the
                         // block's style would underline the whole paragraph or
                         // none of it.
-                        style: box_id.map_or_else(
-                            || Arc::clone(&style),
-                            |id| Arc::clone(&self.tree.node(id).style),
-                        ),
+                        style: run_style,
                         children: Vec::new(),
                     }
                 })
@@ -2054,7 +2092,8 @@ impl<'a> Flow<'a> {
     }
 
     /// Give every span of a paragraph the same line height: the tallest any of
-    /// them, or the block itself, asks for.
+    /// them, or the block itself, asks for — and enough room for anything a rule
+    /// has raised or lowered.
     ///
     /// CSS is finer than this. A line box is as tall as the tallest thing *on that
     /// line*, and the block's own font sets a floor — the strut — that a line has
@@ -2071,28 +2110,61 @@ impl<'a> Flow<'a> {
     /// floor is the answer CSS gives anyway. What it gets wrong is the opposite
     /// case: a paragraph with one larger inline in it is tall on every line rather
     /// than on the line that holds it.
-    fn level_line_heights(&mut self, parent: BoxId, spans: &mut [TextSpan<'_>]) {
+    fn level_line_heights(&mut self, parent: BoxId, spans: &mut [TextSpan<'_>], sources: &[BoxId]) {
         let style = Arc::clone(&self.tree.node(parent).style);
         let stack = self.font_stack(&style);
         // The strut: the line the block would have with no text in it at all.
-        let strut = match style.line_height {
-            otlyra_css::LineHeight::Normal => {
-                self.text
-                    .normal_line_height(&stack, style.font_size, style.font_weight, false)
-            }
-            other => Some(other.resolve(style.font_size, style.font_size * 1.2)),
+        let Some(strut) = self.strut_of(&style, &stack) else {
+            return;
         };
 
-        let tallest = spans
-            .iter()
-            .filter_map(|span| span.line_height)
-            .chain(strut)
-            .fold(f32::NEG_INFINITY, f32::max);
-        if tallest.is_finite() {
-            for span in spans {
-                span.line_height = Some(tallest);
+        // The two ends grow apart: a raised box reaches further above the baseline
+        // by however far it moved plus its own ascent, and a lowered one further
+        // below. A box on the baseline is already inside the strut wherever the
+        // block's font is the larger, which is the ordinary case.
+        let (mut above, mut below) = (strut.ascent, strut.descent);
+        for (index, span) in spans.iter().enumerate() {
+            let Some(source) = sources.get(index) else {
+                continue;
+            };
+            let span_style = Arc::clone(&self.tree.node(*source).style);
+            let shift = baseline_shift(&span_style, &style);
+            let own = match self.strut_of(&span_style, &span.font_stack.clone()) {
+                Some(own) => own,
+                None => continue,
+            };
+            above = above.max(shift + own.ascent);
+            below = below.max(own.descent - shift);
+            // An explicit `line-height` on a span still asks for its own room.
+            if let Some(asked) = span.line_height {
+                above = above.max(asked - strut.descent);
             }
         }
+
+        let height = above + below + strut.leading;
+        if height.is_finite() && height > 0.0 {
+            for span in spans {
+                span.line_height = Some(height);
+            }
+        }
+    }
+
+    /// The strut of one style: how far its font reaches above and below.
+    fn strut_of(&mut self, style: &ComputedStyle, stack: &FontStack) -> Option<otlyra_text::Strut> {
+        let mut strut = self
+            .text
+            .strut(stack, style.font_size, style.font_weight, false)?;
+        // An explicit `line-height` replaces what the font asked for, split evenly
+        // above and below the baseline, which is what half-leading is.
+        if let otlyra_css::LineHeight::Normal = style.line_height {
+            return Some(strut);
+        }
+        let asked = style.line_height.resolve(style.font_size, strut.height());
+        let half = (asked - strut.ascent - strut.descent) / 2.0;
+        strut.ascent += half;
+        strut.descent += half;
+        strut.leading = 0.0;
+        Some(strut)
     }
 
     /// A list item's marker, shaped and placed against the item's first line.
@@ -2175,12 +2247,10 @@ impl<'a> Flow<'a> {
         let stack = self.font_stack(style);
         let mut span = span_for(text, style, stack.clone());
         if span.line_height.is_none() {
-            span.line_height = self.text.normal_line_height(
-                &stack,
-                style.font_size,
-                style.font_weight,
-                span.italic,
-            );
+            span.line_height = self
+                .text
+                .strut(&stack, style.font_size, style.font_weight, span.italic)
+                .map(otlyra_text::Strut::height);
         }
         span
     }

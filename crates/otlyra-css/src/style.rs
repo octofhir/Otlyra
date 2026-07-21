@@ -224,6 +224,26 @@ pub enum BackgroundSize {
     Fixed(Length, Length),
 }
 
+/// `vertical-align`, in the values that can be answered from the fonts alone.
+///
+/// `top` and `bottom` align against the line box, which is not known until every
+/// box on the line has been placed — and where they are placed depends on how tall
+/// the line is. Resolving that needs a second pass over the line, so they are left
+/// on the baseline rather than guessed at.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum VerticalAlign {
+    /// On the parent's baseline. The initial value, and almost every box.
+    Baseline,
+    /// Lowered to where the parent's font puts a subscript.
+    Sub,
+    /// Raised to where it puts a superscript.
+    Super,
+    /// Raised by a length of its own, in CSS pixels; negative lowers.
+    Length(f32),
+    /// Raised by a fraction of the element's own `line-height`.
+    Percent(f32),
+}
+
 /// `list-style-type`, in the counters a list actually uses.
 ///
 /// The three bullets and the four numberings the HTML `type` attribute has always
@@ -632,6 +652,8 @@ pub struct ComputedStyle {
     pub line_height: LineHeight,
     /// `list-style-type`. Inherited, because a list sets it and its items read it.
     pub list_style: ListStyle,
+    /// `vertical-align`. Not inherited: it moves the box it is written on.
+    pub vertical_align: VerticalAlign,
     /// `margin`.
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
@@ -737,6 +759,7 @@ impl Default for ComputedStyle {
             word_spacing: 0.0,
             line_height: LineHeight::Normal,
             list_style: ListStyle::Disc,
+            vertical_align: VerticalAlign::Baseline,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),

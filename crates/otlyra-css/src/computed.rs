@@ -55,6 +55,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             .px(),
         line_height: line_height(values),
         list_style: list_style(values),
+        vertical_align: vertical_align(values),
         white_space: white_space(values),
         text_decoration: text_decoration(values),
         margin: Sides {
@@ -332,6 +333,32 @@ fn background_size(values: &ComputedValues) -> BackgroundSize {
             }
         }
         _ => BackgroundSize::Auto,
+    }
+}
+
+/// `vertical-align`, in the values that move a box without needing the line box.
+fn vertical_align(values: &ComputedValues) -> crate::style::VerticalAlign {
+    use crate::style::VerticalAlign;
+    use style::values::generics::box_::{BaselineShift, BaselineShiftKeyword as Keyword};
+
+    // The engine models this as CSS Inline 3 does: `vertical-align` is a shorthand,
+    // and the part that moves a box along the block axis is `baseline-shift`.
+    match &values.get_box().baseline_shift {
+        BaselineShift::Keyword(Keyword::Sub) => VerticalAlign::Sub,
+        BaselineShift::Keyword(Keyword::Super) => VerticalAlign::Super,
+        BaselineShift::Length(value) => match value.to_percentage() {
+            Some(percentage) if percentage.0 != 0.0 => VerticalAlign::Percent(percentage.0),
+            Some(_) => VerticalAlign::Baseline,
+            // The initial value is a zero length rather than a keyword, and a box
+            // that does not move is worth saying so about: everything downstream
+            // can then skip the arithmetic for the common case.
+            None => match value.to_used_value(app_units::Au(0)).to_f32_px() {
+                0.0 => VerticalAlign::Baseline,
+                px => VerticalAlign::Length(px),
+            },
+        },
+        // `top` and `bottom`, which need the line box.
+        BaselineShift::Keyword(_) => VerticalAlign::Baseline,
     }
 }
 
@@ -1058,6 +1085,41 @@ mod tests {
         assert_eq!(style.word_spacing, 0.0);
         assert!(style.optical_sizing);
         assert!(style.font_variations.is_empty());
+    }
+
+    /// `vertical-align` in the values that move a box without needing the line
+    /// box, plus the ones that do and are left where they were.
+    #[test]
+    fn vertical_align_is_read_where_the_fonts_can_answer_it() {
+        use crate::style::VerticalAlign;
+
+        let align = |source: &str| {
+            layout_style(
+                &format!("<style>span {{ vertical-align: {source} }}</style><p><span>x</span></p>"),
+                "span",
+            )
+            .vertical_align
+        };
+
+        assert_eq!(align("baseline"), VerticalAlign::Baseline);
+        assert_eq!(align("sub"), VerticalAlign::Sub);
+        assert_eq!(align("super"), VerticalAlign::Super);
+        assert_eq!(align("4px"), VerticalAlign::Length(4.0));
+        assert_eq!(align("-2px"), VerticalAlign::Length(-2.0));
+        assert_eq!(align("50%"), VerticalAlign::Percent(0.5));
+        // The two that need the line box, which is not known yet.
+        assert_eq!(align("top"), VerticalAlign::Baseline);
+        assert_eq!(align("bottom"), VerticalAlign::Baseline);
+
+        // And the user-agent sheet's own use of it.
+        assert_eq!(
+            layout_style("<p><sup>x</sup></p>", "sup").vertical_align,
+            VerticalAlign::Super
+        );
+        assert_eq!(
+            layout_style("<p><sub>x</sub></p>", "sub").vertical_align,
+            VerticalAlign::Sub
+        );
     }
 
     #[test]
