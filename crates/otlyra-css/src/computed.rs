@@ -1294,6 +1294,67 @@ mod tests {
         );
     }
 
+    /// The presentational attributes: style written in the markup, cascading below
+    /// every author rule and above the user-agent sheet.
+    #[test]
+    fn presentational_attributes_are_style() {
+        let style = layout_style(
+            "<table bgcolor=\"#ff0000\" width=\"300\"><tr><td>x",
+            "table",
+        );
+        assert_eq!(style.background_color.to_rgba8().r, 255);
+        assert_eq!(style.width, LengthOrAuto::Px(300.0));
+
+        // A percentage is a percentage, and a value that is not a dimension at all
+        // contributes nothing rather than being guessed at.
+        assert_eq!(
+            layout_style("<table width=\"50%\"><tr><td>x", "table").width,
+            LengthOrAuto::Percent(0.5)
+        );
+        assert_eq!(
+            layout_style("<table width=\"lots\"><tr><td>x", "table").width,
+            LengthOrAuto::Auto
+        );
+
+        // A border attribute draws on the table and on its cells.
+        let table = layout_style("<table border=\"3\"><tr><td>x", "table");
+        assert_eq!(table.border.top.width, 3.0);
+        assert_eq!(
+            layout_style("<table border=\"3\"><tr><td>x", "td")
+                .border
+                .top
+                .width,
+            1.0,
+            "a cell's own border is one pixel however wide the table's is"
+        );
+        assert_eq!(
+            layout_style("<table border=\"0\"><tr><td>x", "td")
+                .border
+                .top
+                .width,
+            0.0,
+            "and none at all when the attribute asks for none"
+        );
+
+        // Author CSS beats them, which is the whole reason they are an origin of
+        // their own rather than part of the user-agent sheet.
+        assert_eq!(
+            layout_style(
+                "<style>table { width: 100px }</style><table width=\"300\"><tr><td>x",
+                "table"
+            )
+            .width,
+            LengthOrAuto::Px(100.0)
+        );
+        // And they beat the user-agent sheet.
+        assert_eq!(
+            layout_style("<table align=\"center\"><tr><td>x", "table")
+                .margin
+                .left,
+            LengthOrAuto::Auto
+        );
+    }
+
     /// `border-style` decides whether a declared width is used at all, which is
     /// why layout is handed a width rather than a style to interpret.
     #[test]

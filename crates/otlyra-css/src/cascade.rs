@@ -235,7 +235,7 @@ impl Styler {
             registered_speculative_painters: &NoPainters,
         };
 
-        let tree = Tree::styled(document, &style_data);
+        let tree = Tree::styled(document, &style_data, &self.lock);
         let _scope = TreeScope::enter(&tree);
         let mut styles = HashMap::new();
         {

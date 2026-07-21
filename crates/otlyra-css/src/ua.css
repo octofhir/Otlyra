@@ -22,6 +22,14 @@ tfoot { display: table-footer-group; }
 tr { display: table-row; }
 td, th { display: table-cell; padding: 1px; }
 caption { display: table-caption; }
+/* The other half of a `border` attribute: it draws on the table itself, from the
+   presentational hints, *and* one pixel wide on every cell however wide the
+   table's own is — which is what makes `border=5` a thick frame around a thin
+   grid. `border=0` asks for neither. */
+table[border]:not([border="0"]) > tr > td,
+table[border]:not([border="0"]) > tr > th,
+table[border]:not([border="0"]) > * > tr > td,
+table[border]:not([border="0"]) > * > tr > th { border: 1px inset gray; }
 col { display: table-column; }
 colgroup { display: table-column-group; }
 

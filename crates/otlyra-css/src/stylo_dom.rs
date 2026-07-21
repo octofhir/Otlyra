@@ -20,6 +20,7 @@ use selectors::{Element as SelectorsElement, OpaqueElement};
 use style::selector_parser::{
     AttrValue, NonTSPseudoClass, PseudoElement, SelectorImpl as StyleSelectorImpl,
 };
+use style::shared_lock::SharedRwLock;
 use style::values::AtomIdent;
 
 /// The names Stylo hands the matcher.
@@ -48,6 +49,13 @@ pub struct Tree<'a> {
     ///
     /// Absent for a tree used only to match selectors, which needs no state.
     pub style_data: Option<&'a StyleData>,
+    /// The lock the cascade's own declarations are behind.
+    ///
+    /// A presentational attribute becomes a block of declarations, and every block
+    /// the engine reads has to be locked by the same lock the guards were taken
+    /// from — so the one the stylesheets were parsed under is handed down here.
+    /// Absent for a tree used only to match selectors, which never synthesizes any.
+    pub lock: Option<&'a SharedRwLock>,
 }
 
 impl<'a> Tree<'a> {
@@ -56,14 +64,20 @@ impl<'a> Tree<'a> {
         Self {
             document,
             style_data: None,
+            lock: None,
         }
     }
 
-    /// A tree that can be styled.
-    pub fn styled(document: &'a Document, style_data: &'a StyleData) -> Self {
+    /// A tree that can be styled, with the lock its declarations are read under.
+    pub fn styled(
+        document: &'a Document,
+        style_data: &'a StyleData,
+        lock: &'a SharedRwLock,
+    ) -> Self {
         Self {
             document,
             style_data: Some(style_data),
+            lock: Some(lock),
         }
     }
 
@@ -439,6 +453,91 @@ fn fxhash(value: &str) -> u32 {
         hash = hash.wrapping_mul(0x9E37_79B9);
     }
     hash
+}
+
+/// The CSS one element's presentational attributes stand for.
+///
+/// Only the attributes that are still worth honouring: the ones the old web is
+/// full of and that change what a page looks like rather than only where it sits.
+/// An attribute whose value is not what it should be contributes nothing, which is
+/// what a browser does with it too.
+fn presentational_css(element: &ElementData) -> String {
+    let attribute = |name: &str| {
+        element
+            .attrs
+            .iter()
+            .find(|attr| attr.name.local.as_ref() == name)
+            .map(|attr| attr.value.trim())
+            .filter(|value| !value.is_empty())
+    };
+
+    let tag = element.name.local.as_ref();
+    let mut css = String::new();
+
+    if let Some(colour) = attribute("bgcolor") {
+        css.push_str(&format!("background-color:{colour};"));
+    }
+    if let Some(colour) = attribute("color")
+        && matches!(tag, "font" | "basefont")
+    {
+        css.push_str(&format!("color:{colour};"));
+    }
+
+    // `width` and `height` on a picture are the picture's own size and are read
+    // where it is sized, not here; on everything else they are a used width.
+    if !matches!(
+        tag,
+        "img" | "input" | "embed" | "object" | "canvas" | "video"
+    ) {
+        if let Some(width) = attribute("width").and_then(html_dimension) {
+            css.push_str(&format!("width:{width};"));
+        }
+        if let Some(height) = attribute("height").and_then(html_dimension) {
+            css.push_str(&format!("height:{height};"));
+        }
+    }
+
+    // `align` on a table is not text alignment: it floats the table. On a row or a
+    // cell it is what it says.
+    if let Some(align) = attribute("align") {
+        match (tag, align.to_ascii_lowercase().as_str()) {
+            ("table", side @ ("left" | "right")) => css.push_str(&format!("float:{side};")),
+            ("table", "center") => css.push_str("margin-left:auto;margin-right:auto;"),
+            (
+                "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "div" | "p" | "caption",
+                side @ ("left" | "right" | "center"),
+            ) => css.push_str(&format!("text-align:{side};")),
+            _ => {}
+        }
+    }
+
+    if tag == "table" {
+        // A border attribute is a width, and it draws on the table *and*, one pixel
+        // wide however wide the table's is, on every cell — which is the rule that
+        // makes `border=5` a thick frame around a thin grid. The cells' half is in
+        // the user-agent sheet, selected on the attribute being there at all.
+        if let Some(width) = attribute("border").and_then(html_dimension) {
+            css.push_str(&format!("border:{width} outset gray;"));
+        }
+        if let Some(spacing) = attribute("cellspacing").and_then(html_dimension) {
+            css.push_str(&format!("border-spacing:{spacing};"));
+        }
+    }
+
+    css
+}
+
+/// An HTML *dimension*: a number of pixels, or a percentage.
+///
+/// Anything else — and old markup has a great deal of anything else in these
+/// attributes — is refused rather than guessed at.
+fn html_dimension(value: &str) -> Option<String> {
+    let (number, unit) = match value.strip_suffix('%') {
+        Some(number) => (number, "%"),
+        None => (value, "px"),
+    };
+    let number: f32 = number.trim().parse().ok()?;
+    (number.is_finite() && number >= 0.0).then(|| format!("{number}{unit}"))
 }
 
 /// Match `selector` against every element in `document`, in tree order.
@@ -1158,16 +1257,49 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
                 .is_some_and(|parent| parent.name.local.as_ref() == "html")
     }
 
+    /// `width`, `bgcolor`, `border` and the rest of the presentational attributes.
+    ///
+    /// They are style written in the markup, and they belong here rather than in a
+    /// stylesheet because of where they cascade: below every author rule, so a page
+    /// that says anything at all in CSS beats what its own tags asked for, and above
+    /// the user-agent sheet, so `<td bgcolor>` beats the default that would have
+    /// been transparent. The engine has an origin for exactly this.
+    ///
+    /// Written as CSS and parsed rather than assembled property by property: the
+    /// values are CSS values with CSS's own edge cases in them, and a parser that
+    /// already knows them is better than a second one that nearly does.
     fn synthesize_presentational_hints_for_legacy_attributes<V>(
         &self,
         _visited_handling: selectors::matching::VisitedHandlingMode,
-        _hints: &mut V,
+        hints: &mut V,
     ) where
         V: selectors::sink::Push<style::applicable_declarations::ApplicableDeclarationBlock>,
     {
-        // `width`, `bgcolor`, `align` and the rest of the presentational
-        // attributes. They belong here rather than in the stylesheet because they
-        // cascade below every author rule, and they are not implemented yet.
+        let Some(lock) = self.tree().lock else {
+            return;
+        };
+        let Some(element) = self.element() else {
+            return;
+        };
+        let source = presentational_css(element);
+        if source.is_empty() {
+            return;
+        }
+
+        let declarations = style::properties::parse_style_attribute(
+            &source,
+            &crate::cascade::base_url(),
+            None,
+            style::context::QuirksMode::NoQuirks,
+            style::stylesheets::CssRuleType::Style,
+        );
+        hints.push(
+            style::applicable_declarations::ApplicableDeclarationBlock::from_declarations(
+                servo_arc::Arc::new(lock.wrap(declarations)),
+                style::rule_tree::CascadeLevel::new(style::rule_tree::CascadeOrigin::PresHints),
+                style::stylesheets::layer_rule::LayerOrder::root(),
+            ),
+        );
     }
 
     fn local_name(&self) -> &html5ever::LocalName {
