@@ -55,9 +55,53 @@ pub struct Fetched {
     pub kind: ResourceKind,
     /// The address it was asked for at.
     pub url: String,
+    /// How long the transport took, measured around the loader itself.
+    ///
+    /// Around the loader rather than from when the browser asked, because the
+    /// two answer different questions: this one is how slow the network was, and
+    /// the wait before it is how busy the queue was. The panel shows both, so
+    /// neither has to stand in for the other.
+    pub took: std::time::Duration,
     /// What came back.
     pub result: Result<Loaded, String>,
 }
+
+/// How a request ended, as the panel lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Still out.
+    Pending,
+    /// Came back, with this many bytes.
+    Ok(usize),
+    /// Did not.
+    Failed(String),
+}
+
+/// One request the browser made, and what became of it.
+///
+/// Kept by the fetcher because the fetcher is what knows: it has the number, the
+/// address, the kind and the timing, and nowhere a person could see any of it.
+#[derive(Clone, Debug)]
+pub struct Exchange {
+    /// The number it was made under.
+    pub id: u64,
+    /// What it was for, which is the nearest thing to *what asked for it* the
+    /// browser currently records — the element that named it is not tracked.
+    pub kind: ResourceKind,
+    /// The address.
+    pub url: String,
+    /// How it ended.
+    pub status: Status,
+    /// How long the transport took, once it ended.
+    pub took: Option<std::time::Duration>,
+    /// How long from the ask to the browser noticing, which includes the wait
+    /// for a free fetch thread.
+    pub waited: Option<std::time::Duration>,
+    asked_at: std::time::Instant,
+}
+
+/// How many requests the list keeps before the oldest goes.
+const EXCHANGE_LIMIT: usize = 300;
 
 /// How a tab gets its bytes.
 ///
@@ -85,6 +129,8 @@ pub const FETCH_CONCURRENCY: usize = 6;
 
 /// The handle the browser keeps on the fetch thread.
 pub struct Fetcher {
+    /// Every request made, oldest first, bounded.
+    exchanges: Vec<Exchange>,
     requests: Sender<Request>,
     results: Receiver<Fetched>,
     /// Set once the platform hands one over, and shared with the fetch thread so a
@@ -138,11 +184,13 @@ impl Fetcher {
                         let queue = queue.lock().expect("no panic while taking a request");
                         queue.recv()
                     } {
+                        let started = std::time::Instant::now();
                         let result = loader.load(&request.url);
                         let fetched = Fetched {
                             id: request.id,
                             kind: request.kind,
                             url: request.url,
+                            took: started.elapsed(),
                             result,
                         };
                         if results.send(fetched).is_err() {
@@ -159,6 +207,7 @@ impl Fetcher {
         }
 
         Self {
+            exchanges: Vec::new(),
             requests: request_sender,
             results: result_receiver,
             waker,
@@ -177,6 +226,18 @@ impl Fetcher {
     pub fn request(&mut self, url: &str, kind: ResourceKind) -> u64 {
         self.next += 1;
         let id = self.next;
+        if self.exchanges.len() >= EXCHANGE_LIMIT {
+            self.exchanges.remove(0);
+        }
+        self.exchanges.push(Exchange {
+            id,
+            kind,
+            url: url.to_owned(),
+            status: Status::Pending,
+            took: None,
+            waited: None,
+            asked_at: std::time::Instant::now(),
+        });
         let _ = self.requests.send(Request {
             id,
             kind,
@@ -185,13 +246,40 @@ impl Fetcher {
         id
     }
 
+    /// Every request made, oldest first.
+    pub fn exchanges(&self) -> &[Exchange] {
+        &self.exchanges
+    }
+
     /// Everything that has finished since the last call. Never blocks.
     pub fn poll(&mut self) -> Vec<Fetched> {
         let mut finished = Vec::new();
         while let Ok(fetched) = self.results.try_recv() {
+            self.record(&fetched);
             finished.push(fetched);
         }
         finished
+    }
+
+    /// Note what became of one request.
+    ///
+    /// Here rather than at the call site that consumes the result: a caller that
+    /// forgot would leave a request listed as pending forever, and there are
+    /// three of them.
+    fn record(&mut self, fetched: &Fetched) {
+        let Some(exchange) = self
+            .exchanges
+            .iter_mut()
+            .find(|exchange| exchange.id == fetched.id)
+        else {
+            return;
+        };
+        exchange.status = match &fetched.result {
+            Ok(loaded) => Status::Ok(loaded.bytes.len()),
+            Err(error) => Status::Failed(error.clone()),
+        };
+        exchange.took = Some(fetched.took);
+        exchange.waited = Some(exchange.asked_at.elapsed());
     }
 
     /// Block until something finishes, or until `timeout` passes.
@@ -201,6 +289,7 @@ impl Fetcher {
     pub fn wait(&mut self, timeout: std::time::Duration) -> Vec<Fetched> {
         match self.results.recv_timeout(timeout) {
             Ok(first) => {
+                self.record(&first);
                 let mut finished = vec![first];
                 finished.extend(self.poll());
                 finished

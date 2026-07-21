@@ -372,6 +372,8 @@ fn open_inspector(browser: &mut Browser, cli: &Cli) {
             InspectorPane::Elements => otlyra_app::inspector::Pane::Elements,
             InspectorPane::Styles => otlyra_app::inspector::Pane::Styles,
             InspectorPane::Layout => otlyra_app::inspector::Pane::Layout,
+            InspectorPane::Console => otlyra_app::inspector::Pane::Console,
+            InspectorPane::Network => otlyra_app::inspector::Pane::Network,
         };
     }
 }
@@ -386,6 +388,8 @@ enum InspectorPane {
     Elements,
     Styles,
     Layout,
+    Console,
+    Network,
 }
 
 /// Write one screenshot, having settled whatever the command line asked to see.

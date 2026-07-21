@@ -119,9 +119,12 @@ fn draw_line(
     if content.is_empty() || rect.width <= 0.0 {
         return;
     }
-    let shaped = cx
-        .text
-        .shape(content, &cx.fonts, size, Some(rect.width as f32));
+    // Shaped without a wrap width and cut by the clip the row is drawn inside.
+    // Wrapping and then drawing only the first line loses everything after the
+    // last break that fits — and a message whose next word is a hundred-character
+    // path would show the sentence and drop the path, which is the half a person
+    // opened the panel for.
+    let shaped = cx.text.shape(content, &cx.fonts, size, None);
     for run in shaped.runs.iter().filter(|run| run.line == 0) {
         list.push_glyphs(
             &run.font,
@@ -434,7 +437,17 @@ impl<A> Widget<A> for Table {
 
         let header = Rect::new(self.rect.x, self.rect.y, self.rect.width, row_height);
         fill_rounded(list, header, theme.surface, 0.0);
+        // Clipped like the body: a column title is as able to run past the edge
+        // as a cell is, and text that escaped its table would land on whatever
+        // is beside it.
+        list.push(otlyra_gfx::DisplayItem::PushLayer {
+            blend: otlyra_gfx::peniko::BlendMode::default(),
+            alpha: 1.0,
+            transform: otlyra_gfx::kurbo::Affine::IDENTITY,
+            clip: otlyra_gfx::kurbo::Shape::to_path(&header.to_kurbo(), 0.1),
+        });
         draw_cells(cx, list, &self.header, &self.widths, header, theme.ink_dim);
+        list.push(otlyra_gfx::DisplayItem::PopLayer);
         controls::hairline(
             &theme,
             list,

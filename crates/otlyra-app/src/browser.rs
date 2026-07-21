@@ -1124,28 +1124,26 @@ impl Browser {
         // Everything the panel is shown about the page, gathered before it is
         // built: the panel reads, and the browser is what does the reaching.
         let mut built = otlyra_gfx::DisplayList::new();
-        match self.tabs[self.active].page.as_ref() {
-            Some(page) => {
-                let style = self
-                    .inspector
-                    .selected
-                    .and_then(|node| page.boxes().box_for(node))
-                    .and_then(|id| page.boxes().get(id))
-                    .map(|node| node.style.as_ref());
-                let facts = crate::inspector::Facts {
-                    document: page.document(),
-                    style,
-                    rect: chosen.as_ref().map(|chosen| chosen.border),
-                    containing: chosen.as_ref().and_then(|chosen| chosen.containing),
-                };
-                self.inspector
-                    .build_display_list(panel, Some(&facts), &mut self.text, &mut built);
-            }
-            None => {
-                self.inspector
-                    .build_display_list(panel, None, &mut self.text, &mut built);
-            }
-        }
+        let page = self.tabs[self.active].page.as_ref();
+        let style = page.and_then(|page| {
+            self.inspector
+                .selected
+                .and_then(|node| page.boxes().box_for(node))
+                .and_then(|id| page.boxes().get(id))
+                .map(|node| node.style.as_ref())
+        });
+        // Assembled whether or not the tab has a document: a load that failed
+        // has a network list saying why, and hiding the panel behind a page
+        // would hide the pane that explains the missing page.
+        let facts = crate::inspector::Facts {
+            document: page.map(PageScene::document),
+            style,
+            rect: chosen.as_ref().map(|chosen| chosen.border),
+            containing: chosen.as_ref().and_then(|chosen| chosen.containing),
+            exchanges: self.fetcher.exchanges(),
+        };
+        self.inspector
+            .build_display_list(panel, &facts, &mut self.text, &mut built);
         list.append(&built);
     }
 
@@ -2724,6 +2722,60 @@ mod tests {
         assert_eq!(
             browser.tabs[0].page.as_ref().expect("a page").scroll(),
             120.0
+        );
+    }
+
+    #[test]
+    fn the_network_list_holds_every_request_and_what_became_of_it() {
+        use crate::fetcher::{ResourceKind, Status};
+
+        let mut browser = Browser::new(SiteLoader::default());
+        browser.navigate("https://site.example/");
+        settle(&mut browser);
+        // A frame, because a stylesheet is asked for while the document is being
+        // turned into one.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        settle(&mut browser);
+
+        let listed: Vec<(&str, ResourceKind)> = browser
+            .fetcher
+            .exchanges()
+            .iter()
+            .map(|exchange| (exchange.url.as_str(), exchange.kind))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("https://site.example/", ResourceKind::Document),
+                ("https://site.example/site.css", ResourceKind::Stylesheet),
+                ("https://site.example/missing.css", ResourceKind::Stylesheet),
+            ],
+            "exactly what was asked for, in the order it was asked for"
+        );
+
+        // And what became of each: the one that arrived says how much of it
+        // there was, and the one that did not says why.
+        let by_url = |wanted: &str| {
+            browser
+                .fetcher
+                .exchanges()
+                .iter()
+                .find(|exchange| exchange.url == wanted)
+                .expect("listed above")
+                .clone()
+        };
+        assert!(matches!(
+            by_url("https://site.example/site.css").status,
+            Status::Ok(bytes) if bytes > 0
+        ));
+        assert_eq!(
+            by_url("https://site.example/missing.css").status,
+            Status::Failed("404".to_owned())
+        );
+        assert!(
+            by_url("https://site.example/site.css").took.is_some(),
+            "a finished request knows how long the transport took"
         );
     }
 

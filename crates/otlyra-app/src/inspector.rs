@@ -50,11 +50,21 @@ pub enum Pane {
     Styles,
     /// What the layout made of it, in numbers.
     Layout,
+    /// What the browser said while it worked.
+    Console,
+    /// What it asked the network for.
+    Network,
 }
 
 impl Pane {
     /// The three of them, in the order they are offered.
-    pub const ALL: [Self; 3] = [Self::Elements, Self::Styles, Self::Layout];
+    pub const ALL: [Self; 5] = [
+        Self::Elements,
+        Self::Styles,
+        Self::Layout,
+        Self::Console,
+        Self::Network,
+    ];
 
     /// What this is called on the panel.
     pub fn label(self) -> &'static str {
@@ -62,7 +72,18 @@ impl Pane {
             Self::Elements => "Elements",
             Self::Styles => "Styles",
             Self::Layout => "Layout",
+            Self::Console => "Console",
+            Self::Network => "Network",
         }
+    }
+
+    /// Whether this pane is about the chosen element rather than the page.
+    ///
+    /// The console and the network list have nothing to do with a selection, so
+    /// asking for one before they will say anything would be asking for
+    /// something they never needed.
+    pub fn needs_a_selection(self) -> bool {
+        matches!(self, Self::Elements | Self::Styles | Self::Layout)
     }
 }
 
@@ -73,14 +94,21 @@ impl Pane {
 /// engine owns, and the whole point of an inspector is that what it shows is
 /// what the engine actually has.
 pub struct Facts<'a> {
-    /// The document being shown.
-    pub document: &'a Document,
+    /// The document being shown, if the tab has one.
+    ///
+    /// Optional because two of the panes are about the browser rather than the
+    /// page: a tab whose load failed has a console worth reading and a network
+    /// list that says why, and gating the whole panel on a document would hide
+    /// exactly the two panes that could explain the failure.
+    pub document: Option<&'a Document>,
     /// What the cascade computed for the chosen node, if it has a box.
     pub style: Option<&'a otlyra_css::ComputedStyle>,
     /// Where its border box was drawn, in window coordinates.
     pub rect: Option<Rect>,
     /// How wide the containing block is, for resolving a percentage.
     pub containing: Option<f64>,
+    /// Every request the browser has made, oldest first.
+    pub exchanges: &'a [crate::fetcher::Exchange],
 }
 
 /// What the inspector reports.
@@ -137,6 +165,7 @@ struct Appearance {
     expanded: usize,
     split: f64,
     scroll: f64,
+    pane_scroll: f64,
     picking: bool,
     pane: Pane,
     pointer: (f64, f64),
@@ -160,8 +189,19 @@ pub struct Inspector {
     pub theme: Theme,
     expanded: HashSet<NodeId>,
     split: f64,
+    /// How far the tree is scrolled, and how far it could be.
     scroll: f64,
     overflow: Overflow,
+    /// The same for the pane beside it.
+    ///
+    /// Two positions rather than one, because they are two lists: a styles
+    /// table thirty rows long beside a tree of four would otherwise be held to
+    /// the tree's four rows of travel, which is a pane that will not scroll.
+    pane_scroll: f64,
+    pane_overflow: Overflow,
+    /// Where the panel was drawn, so the wheel can be given to whichever half
+    /// the pointer is over.
+    panel: Rect,
     rows: Vec<Row>,
     focus: Focus,
     focused: Option<crate::widget::FocusId>,
@@ -194,6 +234,9 @@ impl Inspector {
             split: DEFAULT_SPLIT,
             scroll: 0.0,
             overflow: Overflow::default(),
+            pane_scroll: 0.0,
+            pane_overflow: Overflow::default(),
+            panel: Rect::ZERO,
             rows: Vec::new(),
             focus: Focus::default(),
             focused: None,
@@ -251,7 +294,14 @@ impl Inspector {
                 self.height = share.clamp(MIN_HEIGHT, MAX_HEIGHT);
             }
             Action::TogglePicker => self.picking = !self.picking,
-            Action::Show(pane) => self.pane = pane,
+            Action::Show(pane) => {
+                // A new pane starts at its top. Keeping the old position would
+                // open a short list already scrolled past its end.
+                if pane != self.pane {
+                    self.pane_scroll = 0.0;
+                }
+                self.pane = pane;
+            }
             Action::Close => {
                 self.open = false;
                 self.picking = false;
@@ -321,7 +371,14 @@ impl Inspector {
 
     /// Scroll the tree.
     pub fn scroll_by(&mut self, delta: f64) {
-        self.scroll = (self.scroll + delta).clamp(0.0, self.overflow.get());
+        // The wheel goes to whatever is under the pointer, which here is one of
+        // two lists side by side. Which one is arithmetic against the divider
+        // the last frame drew, so it cannot disagree with what was drawn.
+        if self.pointer.0 < self.panel.x + self.panel.width * self.split {
+            self.scroll = (self.scroll + delta).clamp(0.0, self.overflow.get());
+        } else {
+            self.pane_scroll = (self.pane_scroll + delta).clamp(0.0, self.pane_overflow.get());
+        }
     }
 
     /// Whether the panel owns the point — it is inside the dock.
@@ -517,12 +574,17 @@ impl Inspector {
     pub fn build_display_list(
         &mut self,
         rect: Rect,
-        facts: Option<&Facts<'_>>,
+        facts: &Facts<'_>,
         text: &mut TextEngine,
         out: &mut DisplayList,
     ) {
+        // Kept every frame, not only when one is built: the wheel is given to
+        // whichever half the pointer is over, and a frame served from the cache
+        // is still a frame the pointer is over.
+        self.panel = rect;
         let rows = facts
-            .map(|facts| self.flatten(facts.document))
+            .document
+            .map(|document| self.flatten(document))
             .unwrap_or_default();
         let appearance = Appearance {
             rect,
@@ -531,6 +593,7 @@ impl Inspector {
             expanded: self.expanded.len(),
             split: self.split,
             scroll: self.scroll,
+            pane_scroll: self.pane_scroll,
             picking: self.picking,
             pane: self.pane,
             pointer: self.pointer,
@@ -576,8 +639,8 @@ impl Inspector {
         out.append(built);
     }
 
-    fn build(&self, theme: &Theme, facts: Option<&Facts<'_>>) -> Child<Action> {
-        let tree: Child<Action> = match facts {
+    fn build(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        let tree: Child<Action> = match facts.document {
             Some(_) => Box::new(
                 Tree::new(
                     self.rows.iter().map(|row| row.row.clone()).collect(),
@@ -617,7 +680,7 @@ impl Inspector {
         // The panes are chosen with the control the settings already use for a
         // short list of choices. A second one shaped like tabs would be a second
         // answer to the same question.
-        let tabs: Child<Action> = Box::new(Align::left(controls::segmented(
+        let tabs: Child<Action> = Box::new(Align::centre(controls::segmented(
             theme,
             &self.focus,
             Pane::ALL
@@ -655,7 +718,19 @@ impl Inspector {
                     Box::new(Stack::row(
                         theme.gap,
                         vec![
-                            Box::new(Flex::new(1.0, tabs)),
+                            tabs,
+                            // The frame line takes what the tabs leave and is
+                            // cut where it runs out, rather than the tabs
+                            // shrinking to make room: which pane is showing has
+                            // to stay legible on a narrow window, and a stage
+                            // timing that scrolled off is one a wider window
+                            // brings back.
+                            Box::new(Flex::new(
+                                1.0,
+                                Box::new(crate::widget::Clip::new(Box::new(Align::right(
+                                    frame_line(theme),
+                                )))),
+                            )),
                             Box::new(Align::centre(picker)),
                             Box::new(Align::centre(controls::icon_button(
                                 theme,
@@ -672,11 +747,8 @@ impl Inspector {
     }
 
     /// The right-hand pane, whichever one is showing.
-    fn pane(&self, theme: &Theme, facts: Option<&Facts<'_>>) -> Child<Action> {
-        let Some(facts) = facts else {
-            return Box::new(Gap::new(0.0, 0.0));
-        };
-        if self.selected.is_none() {
+    fn pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        if self.pane.needs_a_selection() && (self.selected.is_none() || facts.document.is_none()) {
             return Box::new(Align::centre(Box::new(Label::new(
                 "Choose an element.",
                 theme.font_size_small,
@@ -687,13 +759,18 @@ impl Inspector {
             Pane::Elements => self.elements_pane(theme, facts),
             Pane::Styles => self.styles_pane(theme, facts),
             Pane::Layout => self.layout_pane(theme, facts),
+            Pane::Console => self.console_pane(theme),
+            Pane::Network => self.network_pane(theme, facts),
         };
         Box::new(Padding::new(Insets::all(theme.gap), body))
     }
 
     /// What the chosen node is: its tag, and the attributes it carries.
     fn elements_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
-        let Some(selected) = self.selected.and_then(|node| facts.document.get(node)) else {
+        let Some(selected) = facts
+            .document
+            .and_then(|document| self.selected.and_then(|node| document.get(node)))
+        else {
             return Box::new(Gap::new(0.0, 0.0));
         };
 
@@ -721,8 +798,8 @@ impl Inspector {
                         Box::new(Table::new(
                             vec!["attribute".to_owned(), "value".to_owned()],
                             attributes,
-                            0.0,
-                            Overflow::default(),
+                            self.pane_scroll,
+                            std::rc::Rc::clone(&self.pane_overflow),
                         )),
                     )));
                 }
@@ -766,8 +843,113 @@ impl Inspector {
         Box::new(Table::new(
             vec!["property".to_owned(), "computed".to_owned()],
             rows,
-            0.0,
-            Overflow::default(),
+            self.pane_scroll,
+            std::rc::Rc::clone(&self.pane_overflow),
+        ))
+    }
+
+    /// What the browser said while it worked, newest last.
+    ///
+    /// The same stream the terminal gets, kept where the browser can read it.
+    /// When M12 brings a script engine this is where its console lands; until
+    /// then the pane says so rather than showing an empty box that looks broken.
+    fn console_pane(&self, theme: &Theme) -> Child<Action> {
+        let journal = crate::observability::journal();
+        let rows: Vec<Vec<String>> = journal
+            .records()
+            .into_iter()
+            .rev()
+            .take(200)
+            .map(|record| vec![record.level.to_string(), record.target, record.message])
+            .collect();
+
+        let note: Child<Action> = Box::new(Label::new(
+            "The browser's own log. A page's `console` lands here when there is a \
+             script engine to write to it.",
+            theme.font_size_small,
+            theme.ink_dim,
+        ));
+
+        if rows.is_empty() {
+            return Box::new(Stack::column(
+                theme.gap,
+                vec![
+                    note,
+                    Box::new(Label::new(
+                        "Nothing said yet. `OTLYRA_LOG=debug` is how to hear more.",
+                        theme.font_size_small,
+                        theme.ink_dim,
+                    )),
+                ],
+            ));
+        }
+
+        Box::new(Stack::column(
+            theme.gap,
+            vec![
+                note,
+                Box::new(Flex::new(
+                    1.0,
+                    Box::new(Table::new(
+                        vec!["level".to_owned(), "from".to_owned(), "said".to_owned()],
+                        rows,
+                        self.pane_scroll,
+                        std::rc::Rc::clone(&self.pane_overflow),
+                    )),
+                )),
+            ],
+        ))
+    }
+
+    /// What the browser asked the network for, and what came back.
+    fn network_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        use crate::fetcher::Status;
+
+        if facts.exchanges.is_empty() {
+            return Box::new(Align::centre(Box::new(Label::new(
+                "Nothing has been asked for in this tab.",
+                theme.font_size_small,
+                theme.ink_dim,
+            ))));
+        }
+
+        let rows: Vec<Vec<String>> = facts
+            .exchanges
+            .iter()
+            .rev()
+            .map(|exchange| {
+                let (status, size) = match &exchange.status {
+                    Status::Pending => ("pending".to_owned(), String::new()),
+                    Status::Ok(bytes) => ("ok".to_owned(), bytes_read(*bytes)),
+                    Status::Failed(error) => ("failed".to_owned(), error.clone()),
+                };
+                vec![
+                    format!("{:?}", exchange.kind).to_lowercase(),
+                    status,
+                    size,
+                    exchange.took.map(millis).unwrap_or_default(),
+                    // Two numbers rather than one: how slow the transport was,
+                    // and how long the request sat waiting for a thread to run
+                    // on. A single figure would hide which of the two a slow
+                    // page is suffering from.
+                    exchange.waited.map(millis).unwrap_or_default(),
+                    exchange.url.clone(),
+                ]
+            })
+            .collect();
+
+        Box::new(Table::new(
+            vec![
+                "kind".to_owned(),
+                "status".to_owned(),
+                "size".to_owned(),
+                "took".to_owned(),
+                "waited".to_owned(),
+                "address".to_owned(),
+            ],
+            rows,
+            self.pane_scroll,
+            std::rc::Rc::clone(&self.pane_overflow),
         ))
     }
 
@@ -889,6 +1071,54 @@ fn box_model(theme: &Theme, border: Rect, edges: BoxEdges) -> Child<Action> {
             );
         },
     ))
+}
+
+/// How long the last of each stage took, along the panel's own header.
+///
+/// A slow page needs a first place to look, and this is it: the stages are the
+/// pipeline in order, so the one that is out of proportion is the one to open a
+/// pane about. Only stages that have actually run are shown — a line of zeroes
+/// would be a line claiming work happened that did not.
+fn frame_line<A: 'static>(theme: &Theme) -> Child<A> {
+    let latest = crate::observability::journal().latest();
+    if latest.is_empty() {
+        return Box::new(Gap::new(0.0, 0.0));
+    }
+    let text = latest
+        .iter()
+        .map(|timing| format!("{} {}", short(timing.span), millis(timing.took)))
+        .collect::<Vec<_>>()
+        .join("   ");
+    Box::new(Mono::new(text, theme.ink_dim).size(theme.font_size_small))
+}
+
+/// A span name short enough to sit in a header.
+fn short(span: &str) -> &str {
+    match span {
+        crate::observability::spans::PARSE_HTML => "parse",
+        crate::observability::spans::RECALC_STYLE => "style",
+        crate::observability::spans::BUILD_DISPLAY_LIST => "list",
+        other => other,
+    }
+}
+
+/// A duration in milliseconds, as a person reads one.
+fn millis(took: std::time::Duration) -> String {
+    let ms = took.as_secs_f64() * 1000.0;
+    if ms >= 10.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{ms:.1} ms")
+    }
+}
+
+/// A byte count, in the units a person thinks in.
+fn bytes_read(bytes: usize) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} kB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
 }
 
 /// A number as a person reads it: whole where it is whole.
@@ -1434,20 +1664,42 @@ mod tests {
         inspector
     }
 
+    /// Draw one frame with a node chosen and a style for it, which is what the
+    /// panes that are about an element need in order to have anything in them.
+    fn frame_with_style(inspector: &mut Inspector, document: &Document) {
+        let mut text = TextEngine::new();
+        let mut list = DisplayList::new();
+        let style = otlyra_css::ComputedStyle::default();
+        let facts = Facts {
+            document: Some(document),
+            style: Some(&style),
+            rect: Some(Rect::new(0.0, 0.0, 100.0, 40.0)),
+            containing: Some(400.0),
+            exchanges: &[],
+        };
+        inspector.build_display_list(
+            Rect::new(0.0, 300.0, 900.0, 300.0),
+            &facts,
+            &mut text,
+            &mut list,
+        );
+    }
+
     /// Draw one frame, which is what gives the panel geometry to be pressed
     /// against.
     fn frame(inspector: &mut Inspector, document: &Document) {
         let mut text = TextEngine::new();
         let mut list = DisplayList::new();
         let facts = Facts {
-            document,
+            document: Some(document),
             style: None,
             rect: None,
             containing: None,
+            exchanges: &[],
         };
         inspector.build_display_list(
             Rect::new(0.0, 300.0, 900.0, 300.0),
-            Some(&facts),
+            &facts,
             &mut text,
             &mut list,
         );
@@ -1719,6 +1971,76 @@ mod tests {
         style.display = otlyra_css::Display::Grid;
         assert!(named(&style).contains(&"grid-template-columns"));
         assert!(!named(&style).contains(&"flex-direction"));
+    }
+
+    #[test]
+    fn the_panes_that_are_about_the_page_do_not_wait_for_a_selection() {
+        // The console and the network list have nothing to do with an element,
+        // so asking for one before they will say anything asks for something
+        // they never needed.
+        assert!(Pane::Elements.needs_a_selection());
+        assert!(Pane::Styles.needs_a_selection());
+        assert!(Pane::Layout.needs_a_selection());
+        assert!(!Pane::Console.needs_a_selection());
+        assert!(!Pane::Network.needs_a_selection());
+    }
+
+    #[test]
+    fn a_size_is_written_in_the_units_a_person_thinks_in() {
+        assert_eq!(bytes_read(512), "512 B");
+        assert_eq!(bytes_read(2048), "2.0 kB");
+        assert_eq!(bytes_read(3 * 1_048_576), "3.0 MB");
+    }
+
+    #[test]
+    fn a_duration_keeps_a_decimal_only_while_it_is_worth_one() {
+        use std::time::Duration;
+        assert_eq!(millis(Duration::from_micros(1500)), "1.5 ms");
+        assert_eq!(millis(Duration::from_millis(42)), "42 ms");
+    }
+
+    #[test]
+    fn the_two_halves_of_the_panel_scroll_apart() {
+        let document = document();
+        let mut inspector = panel();
+        // The styles table is long and the tree, closed, is one row: held to one
+        // scroll position between them, the long list would be held to the short
+        // one's travel and would not move at all.
+        inspector.apply(Action::Show(Pane::Styles));
+        inspector.selected = Some(document.root());
+        frame_with_style(&mut inspector, &document);
+
+        // Over the right-hand half.
+        inspector.pointer_moved(800.0, 500.0);
+        inspector.scroll_by(400.0);
+        assert!(inspector.pane_scroll > 0.0, "the pane took the wheel");
+        assert_eq!(inspector.scroll, 0.0, "and the tree did not move with it");
+
+        // And over the left-hand half, the tree takes it instead.
+        let pane_was = inspector.pane_scroll;
+        inspector.pointer_moved(100.0, 500.0);
+        inspector.scroll_by(400.0);
+        assert_eq!(
+            inspector.pane_scroll, pane_was,
+            "the pane stayed where it was put"
+        );
+    }
+
+    #[test]
+    fn a_new_pane_opens_at_its_top() {
+        let document = document();
+        let mut inspector = panel();
+        inspector.apply(Action::Show(Pane::Styles));
+        inspector.selected = Some(document.root());
+        frame_with_style(&mut inspector, &document);
+        inspector.pointer_moved(800.0, 500.0);
+        inspector.scroll_by(400.0);
+        assert!(inspector.pane_scroll > 0.0);
+
+        // A short list opened at the position a long one was left at would open
+        // already scrolled past its own end.
+        inspector.apply(Action::Show(Pane::Elements));
+        assert_eq!(inspector.pane_scroll, 0.0);
     }
 
     #[test]

@@ -202,14 +202,15 @@ impl Painter for InspectorFrame {
         let mut list = DisplayList::new();
         otlyra_app::ui::paint_blank_page(&mut list, width, height, None, None, &mut self.text);
         let facts = otlyra_app::inspector::Facts {
-            document: &self.document,
+            document: Some(&self.document),
             style: None,
             rect: None,
             containing: None,
+            exchanges: &[],
         };
         self.inspector.build_display_list(
             otlyra_app::ui::Rect::new(0.0, UI_HEIGHT + content - dock, width, dock),
-            Some(&facts),
+            &facts,
             &mut self.text,
             &mut list,
         );
