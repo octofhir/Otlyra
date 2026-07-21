@@ -368,13 +368,27 @@ fn background_size(values: &ComputedValues) -> BackgroundSize {
     }
 }
 
-/// `vertical-align`, in the values that move a box without needing the line box.
+/// `vertical-align`, in every value it can take.
 fn vertical_align(values: &ComputedValues) -> crate::style::VerticalAlign {
     use crate::style::VerticalAlign;
+    use style::values::computed::box_::AlignmentBaseline;
     use style::values::generics::box_::{BaselineShift, BaselineShiftKeyword as Keyword};
 
-    // The engine models this as CSS Inline 3 does: `vertical-align` is a shorthand,
-    // and the part that moves a box along the block axis is `baseline-shift`.
+    // The engine models this as CSS Inline 3 does: `vertical-align` is a shorthand
+    // of two properties. `baseline-shift` carries the values that move a box along
+    // the block axis, and `alignment-baseline` carries the ones that pick a
+    // *different baseline* to align to — which is where `text-top`, `text-bottom`
+    // and `middle` went. Reading only the first was how those three arrived as
+    // `baseline` and did nothing.
+    match values.get_box().alignment_baseline {
+        AlignmentBaseline::TextTop => return VerticalAlign::TextTop,
+        AlignmentBaseline::TextBottom => return VerticalAlign::TextBottom,
+        AlignmentBaseline::Middle => {
+            return VerticalAlign::Middle;
+        }
+        _ => {}
+    }
+
     match &values.get_box().baseline_shift {
         BaselineShift::Keyword(Keyword::Sub) => VerticalAlign::Sub,
         BaselineShift::Keyword(Keyword::Super) => VerticalAlign::Super,
@@ -389,8 +403,9 @@ fn vertical_align(values: &ComputedValues) -> crate::style::VerticalAlign {
                 px => VerticalAlign::Length(px),
             },
         },
-        // `top` and `bottom`, which need the line box.
-        BaselineShift::Keyword(_) => VerticalAlign::Baseline,
+        BaselineShift::Keyword(Keyword::Top) => VerticalAlign::Top,
+        BaselineShift::Keyword(Keyword::Bottom) => VerticalAlign::Bottom,
+        BaselineShift::Keyword(Keyword::Center) => VerticalAlign::Middle,
     }
 }
 
@@ -1122,7 +1137,7 @@ mod tests {
     /// `vertical-align` in the values that move a box without needing the line
     /// box, plus the ones that do and are left where they were.
     #[test]
-    fn vertical_align_is_read_where_the_fonts_can_answer_it() {
+    fn vertical_align_is_read_in_every_value_it_takes() {
         use crate::style::VerticalAlign;
 
         let align = |source: &str| {
@@ -1139,9 +1154,22 @@ mod tests {
         assert_eq!(align("4px"), VerticalAlign::Length(4.0));
         assert_eq!(align("-2px"), VerticalAlign::Length(-2.0));
         assert_eq!(align("50%"), VerticalAlign::Percent(0.5));
-        // The two that need the line box, which is not known yet.
-        assert_eq!(align("top"), VerticalAlign::Baseline);
-        assert_eq!(align("bottom"), VerticalAlign::Baseline);
+        // The five that are a position rather than a shift. Three of them —
+        // `middle`, `text-top` and `text-bottom` — arrive on
+        // `alignment-baseline` rather than on `baseline-shift`, which is how
+        // CSS Inline 3 splits the shorthand and is why reading only the second
+        // had them all landing on the baseline and doing nothing.
+        assert_eq!(align("top"), VerticalAlign::Top);
+        assert_eq!(align("bottom"), VerticalAlign::Bottom);
+        assert_eq!(align("middle"), VerticalAlign::Middle);
+        assert_eq!(align("text-top"), VerticalAlign::TextTop);
+        assert_eq!(align("text-bottom"), VerticalAlign::TextBottom);
+
+        // All five are settled while the line is levelled; a shift the box knows
+        // on its own is not.
+        assert!(VerticalAlign::Top.resolved_while_levelling());
+        assert!(VerticalAlign::Middle.resolved_while_levelling());
+        assert!(!VerticalAlign::Super.resolved_while_levelling());
 
         // And the user-agent sheet's own use of it.
         assert_eq!(

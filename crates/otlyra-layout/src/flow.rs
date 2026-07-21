@@ -37,6 +37,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         tree,
         text,
         font_stacks: std::collections::HashMap::new(),
+        line_shifts: std::collections::HashMap::new(),
         floats: Vec::new(),
         containing_blocks: vec![initial],
         viewport: initial,
@@ -78,6 +79,14 @@ struct Flow<'a> {
     /// own family shares one pointer — which makes this a handful of entries for a
     /// whole document instead of one parse per run per layout.
     font_stacks: std::collections::HashMap<usize, FontStack>,
+    /// What each line-relative `vertical-align` resolved to, for the paragraph
+    /// being laid out.
+    ///
+    /// `top`, `bottom`, `middle`, `text-top` and `text-bottom` are a position
+    /// within a line rather than a shift a box knows on its own, so they are
+    /// settled once the line has been levelled and read back when the glyphs are
+    /// placed. Working them out twice would be two answers to where a box sits.
+    line_shifts: std::collections::HashMap<BoxId, f32>,
     /// The floats placed so far, in page coordinates.
     ///
     /// One list for the document rather than one per formatting context: a float
@@ -448,8 +457,27 @@ fn offset(fragment: &mut Fragment, x: f32, y: f32) {
 /// every engine adds on top, which is the amount the web was actually built
 /// against.
 fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f32 {
-    match style.vertical_align {
+    baseline_shift_of(style.vertical_align, style, parent)
+}
+
+/// The same, for a value the caller has already picked out.
+fn baseline_shift_of(
+    align: otlyra_css::VerticalAlign,
+    style: &ComputedStyle,
+    parent: &ComputedStyle,
+) -> f32 {
+    match align {
         otlyra_css::VerticalAlign::Baseline => 0.0,
+        // These five are not a shift the box knows on its own: they are a place
+        // in a line whose height is not known until the boxes that *do* know
+        // have been levelled. `level_line_heights` resolves them in a second
+        // pass and records the answer; zero here is what a box sits at until
+        // then, and what it keeps if it is never levelled at all.
+        otlyra_css::VerticalAlign::Top
+        | otlyra_css::VerticalAlign::Bottom
+        | otlyra_css::VerticalAlign::Middle
+        | otlyra_css::VerticalAlign::TextTop
+        | otlyra_css::VerticalAlign::TextBottom => 0.0,
         otlyra_css::VerticalAlign::Super => parent.font_size / 3.0 + 1.0,
         otlyra_css::VerticalAlign::Sub => -(parent.font_size / 5.0 + 1.0),
         otlyra_css::VerticalAlign::Length(px) => px,
@@ -2164,6 +2192,17 @@ impl<'a> Flow<'a> {
                         Arc::new(broken)
                     };
 
+                    // The same shift its text got. An inline box drawn on the
+                    // baseline while its own glyphs sat somewhere else was a
+                    // background that missed the words it was behind — which is
+                    // what a `vertical-align` on a span with a background looks
+                    // like when only half of it moves.
+                    let shift = self
+                        .line_shifts
+                        .get(&inline.id)
+                        .copied()
+                        .unwrap_or_else(|| baseline_shift(&inline.style, &style));
+
                     Some(Fragment {
                         box_id: Some(inline.id),
                         // Vertical padding and a horizontal border spill outside
@@ -2171,7 +2210,7 @@ impl<'a> Flow<'a> {
                         // not push its neighbours apart vertically.
                         rect: Rect::new(
                             line_x + left,
-                            line_y - inline.border.top - inline.padding.top,
+                            line_y - shift - inline.border.top - inline.padding.top,
                             (right - left).max(0.0),
                             height
                                 + inline.border.top
@@ -2216,16 +2255,24 @@ impl<'a> Flow<'a> {
                     // `vertical-align`: the glyphs move off the line's baseline,
                     // and the room they need was already added to the line's
                     // height when its spans were levelled.
-                    let shift = baseline_shift(&run_style, &style);
-                    if shift != 0.0 {
-                        for glyph in &mut run.glyphs {
-                            glyph.y -= shift;
-                        }
-                    }
+                    // Resolved once, in the levelling pass, for the five values
+                    // that need the line box; worked out here for the rest,
+                    // which need only the two fonts.
+                    let shift = box_id
+                        .and_then(|id| self.line_shifts.get(&id).copied())
+                        .unwrap_or_else(|| baseline_shift(&run_style, &style));
+                    // The glyphs are placed relative to the fragment, so moving
+                    // the fragment moves them with it. Moving both was moving
+                    // everything twice as far as it was asked to go.
 
                     Fragment {
                         box_id,
-                        rect: Rect::new(line_x + run.offset_x, line_y, run.advance, height),
+                        // The fragment moves with its glyphs. Shifting only the
+                        // glyphs left the background, the underline and the
+                        // highlight behind on the baseline — invisible on a
+                        // `super` that moves three pixels, and unmissable on a
+                        // `text-top` span set larger than the line it is in.
+                        rect: Rect::new(line_x + run.offset_x, line_y - shift, run.advance, height),
                         fixed: false,
                         scroll_port: None,
                         clip: None,
@@ -2333,22 +2380,77 @@ impl<'a> Flow<'a> {
         // below. A box on the baseline is already inside the strut wherever the
         // block's font is the larger, which is the ordinary case.
         let (mut above, mut below) = (strut.ascent, strut.descent);
+        // Kept from the first pass so the second does not shape anything twice:
+        // a strut is a font lookup, and the line-relative boxes need theirs
+        // again once the line is known.
+        let mut line_relative: Vec<(BoxId, otlyra_css::VerticalAlign, otlyra_text::Strut)> =
+            Vec::new();
+        self.line_shifts.clear();
+
         for (index, span) in spans.iter().enumerate() {
             let Some(source) = sources.get(index) else {
                 continue;
             };
             let span_style = Arc::clone(&self.tree.node(*source).style);
-            let shift = baseline_shift(&span_style, &style);
             let own = match self.strut_of(&span_style, &span.font_stack.clone()) {
                 Some(own) => own,
                 None => continue,
             };
+
+            // `top` and `bottom` are the only two that need the line box, and
+            // they are a position *within* it: the line does not grow to fit
+            // them, it is what they are measured against. Everything else —
+            // including `text-top`, `text-bottom` and `middle`, which are
+            // measured against the parent's own font — is a shift the box knows
+            // here, and the line grows to hold it like any other.
+            if matches!(
+                span_style.vertical_align,
+                otlyra_css::VerticalAlign::Top | otlyra_css::VerticalAlign::Bottom
+            ) {
+                // Its own height still asks for room; where it goes does not
+                // depend on that, but how tall the line is does.
+                above = above.max(own.ascent);
+                below = below.max(own.descent);
+                line_relative.push((*source, span_style.vertical_align, own));
+                continue;
+            }
+
+            let shift = match span_style.vertical_align {
+                // The parent's own text rather than the whole line: what
+                // `text-top` and `text-bottom` mean is the edge of the text the
+                // box is set beside, not the edge of the tallest thing on the row.
+                otlyra_css::VerticalAlign::TextTop => strut.ascent - own.ascent,
+                otlyra_css::VerticalAlign::TextBottom => own.descent - strut.descent,
+                // The box's middle against the parent's baseline plus half its
+                // x-height. No font here reports an x-height, so half of it is
+                // taken as a quarter of the font size — the same shape of
+                // fallback the specification names for `sub` and `super`, and the
+                // number the web was built against.
+                otlyra_css::VerticalAlign::Middle => {
+                    style.font_size * 0.25 - (own.ascent - own.descent) / 2.0
+                }
+                other => baseline_shift_of(other, &span_style, &style),
+            };
+            if span_style.vertical_align.resolved_while_levelling() {
+                self.line_shifts.insert(*source, shift);
+            }
             above = above.max(shift + own.ascent);
             below = below.max(own.descent - shift);
             // An explicit `line-height` on a span still asks for its own room.
             if let Some(asked) = span.line_height {
                 above = above.max(asked - strut.descent);
             }
+        }
+
+        // The second pass, for the two that had to wait: the line box is settled
+        // now, so there is something for them to be a position in.
+        for (source, align, own) in line_relative {
+            let shift = match align {
+                otlyra_css::VerticalAlign::Top => above - own.ascent,
+                otlyra_css::VerticalAlign::Bottom => own.descent - below,
+                _ => 0.0,
+            };
+            self.line_shifts.insert(source, shift);
         }
 
         // A picture is deliberately *not* folded in. It sits with its bottom edge on
@@ -2789,6 +2891,63 @@ mod tests {
             .filter(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
             .map(|fragment| fragment.rect)
             .collect()
+    }
+
+    /// The five values of `vertical-align` that are a position rather than a
+    /// shift, each moving its box the way the specification says.
+    #[test]
+    fn vertical_align_puts_a_span_where_the_value_names() {
+        /// Where the span ended up, and how tall the line it is on came out.
+        fn span_and_line(value: &str) -> (Rect, Rect) {
+            let (tree, boxes) = laid_out(
+                &format!(
+                    "<style>body {{ margin: 0; font: 16px/80px monospace }} \
+                     span {{ font-size: 32px; background: #eee; \
+                     line-height: normal; vertical-align: {value} }}</style>\
+                     <p>base <span>x</span> after</p>"
+                ),
+                600.0,
+            );
+            let pieces = boxes_of(&tree, &boxes, "span");
+            let span = pieces.first().expect("a box for the span").rect;
+            (span, first_line(&tree))
+        }
+
+        let (baseline, _) = span_and_line("baseline");
+        let (top, top_line) = span_and_line("top");
+        let (bottom, bottom_line) = span_and_line("bottom");
+        let (text_top, _) = span_and_line("text-top");
+        let (text_bottom, _) = span_and_line("text-bottom");
+        let (middle, _) = span_and_line("middle");
+
+        // Ordering rather than absolute edges: an inline box's fragment is
+        // still drawn as tall as the *line* rather than as tall as its own
+        // text — a separate defect, visible as a background taller than the
+        // words it is behind — so its top edge is what can be trusted here.
+        assert!(
+            top.y < bottom.y,
+            "top {top:?} sits above bottom {bottom:?} on {top_line:?} / {bottom_line:?}"
+        );
+        assert!(
+            text_top.y < text_bottom.y,
+            "text-top {text_top:?} sits above text-bottom {text_bottom:?}"
+        );
+
+        // And every one of them is somewhere: a value that did nothing would
+        // land exactly where `baseline` did, which is how these five behaved
+        // before the cascade was read for them.
+        for (name, rect) in [
+            ("top", top),
+            ("bottom", bottom),
+            ("text-top", text_top),
+            ("text-bottom", text_bottom),
+            ("middle", middle),
+        ] {
+            assert!(
+                (rect.y - baseline.y).abs() > 0.5,
+                "{name} moved nothing: {rect:?} against baseline {baseline:?}"
+            );
+        }
     }
 
     /// An inline element with a background but nothing else different about it is

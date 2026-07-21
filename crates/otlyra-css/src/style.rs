@@ -267,6 +267,33 @@ pub enum VerticalAlign {
     Length(f32),
     /// Raised by a fraction of the element's own `line-height`.
     Percent(f32),
+    /// Top edge against the line box's top edge.
+    Top,
+    /// Bottom edge against the line box's bottom edge.
+    Bottom,
+    /// Middle against the parent's baseline plus half its x-height.
+    Middle,
+    /// Top edge against the top of the parent's own text.
+    TextTop,
+    /// Bottom edge against the bottom of the parent's own text.
+    TextBottom,
+}
+
+impl VerticalAlign {
+    /// Whether this is settled while a line is levelled rather than from the
+    /// two styles alone.
+    ///
+    /// These five are a *position* rather than a shift: three are measured
+    /// against the parent's own font and two against the finished line box. All
+    /// five are worked out once, where the fonts are already in hand, and read
+    /// back when the glyphs are placed — so nothing works them out twice and
+    /// gets two answers.
+    pub fn resolved_while_levelling(self) -> bool {
+        matches!(
+            self,
+            Self::Top | Self::Bottom | Self::Middle | Self::TextTop | Self::TextBottom
+        )
+    }
 }
 
 /// `list-style-type`, in the counters a list actually uses.
