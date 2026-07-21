@@ -41,6 +41,48 @@ use crate::widget::{
     Rect, Size, Stack, fill_rounded,
 };
 
+/// Which pane of the panel is showing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Pane {
+    /// The tree, and what the chosen node is.
+    Elements,
+    /// What the cascade computed for it.
+    Styles,
+    /// What the layout made of it, in numbers.
+    Layout,
+}
+
+impl Pane {
+    /// The three of them, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Elements, Self::Styles, Self::Layout];
+
+    /// What this is called on the panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Elements => "Elements",
+            Self::Styles => "Styles",
+            Self::Layout => "Layout",
+        }
+    }
+}
+
+/// What the panel is told about the page it is looking at.
+///
+/// Gathered by the browser and handed over for the length of one frame. The
+/// panel never holds a page: what it would hold is a second copy of state the
+/// engine owns, and the whole point of an inspector is that what it shows is
+/// what the engine actually has.
+pub struct Facts<'a> {
+    /// The document being shown.
+    pub document: &'a Document,
+    /// What the cascade computed for the chosen node, if it has a box.
+    pub style: Option<&'a otlyra_css::ComputedStyle>,
+    /// Where its border box was drawn, in window coordinates.
+    pub rect: Option<Rect>,
+    /// How wide the containing block is, for resolving a percentage.
+    pub containing: Option<f64>,
+}
+
 /// What the inspector reports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -56,6 +98,8 @@ pub enum Action {
     HeightAt(f64),
     /// Start or stop picking an element with the pointer.
     TogglePicker,
+    /// Show this pane.
+    Show(Pane),
     /// Put the panel away.
     Close,
 }
@@ -94,6 +138,7 @@ struct Appearance {
     split: f64,
     scroll: f64,
     picking: bool,
+    pane: Pane,
     pointer: (f64, f64),
     pointer_down: bool,
     focus: Option<crate::widget::FocusId>,
@@ -107,6 +152,8 @@ pub struct Inspector {
     pub picking: bool,
     /// The chosen node.
     pub selected: Option<NodeId>,
+    /// Which pane is showing.
+    pub pane: Pane,
     /// How much of the content area the panel takes.
     pub height: f64,
     /// Every colour and measurement it is drawn from.
@@ -140,6 +187,7 @@ impl Inspector {
             open: false,
             picking: false,
             selected: None,
+            pane: Pane::Elements,
             height: DEFAULT_HEIGHT,
             theme: Theme::light(),
             expanded: HashSet::new(),
@@ -203,6 +251,7 @@ impl Inspector {
                 self.height = share.clamp(MIN_HEIGHT, MAX_HEIGHT);
             }
             Action::TogglePicker => self.picking = !self.picking,
+            Action::Show(pane) => self.pane = pane,
             Action::Close => {
                 self.open = false;
                 self.picking = false;
@@ -468,12 +517,12 @@ impl Inspector {
     pub fn build_display_list(
         &mut self,
         rect: Rect,
-        document: Option<&Document>,
+        facts: Option<&Facts<'_>>,
         text: &mut TextEngine,
         out: &mut DisplayList,
     ) {
-        let rows = document
-            .map(|document| self.flatten(document))
+        let rows = facts
+            .map(|facts| self.flatten(facts.document))
             .unwrap_or_default();
         let appearance = Appearance {
             rect,
@@ -483,6 +532,7 @@ impl Inspector {
             split: self.split,
             scroll: self.scroll,
             picking: self.picking,
+            pane: self.pane,
             pointer: self.pointer,
             pointer_down: self.pointer_down,
             focus: self.focused,
@@ -511,7 +561,7 @@ impl Inspector {
         cx.theme = theme.clone();
 
         self.focus.begin();
-        let mut root = self.build(&theme, document);
+        let mut root = self.build(&theme, facts);
         root.measure(Size::new(rect.width, rect.height), &mut cx);
         root.place(rect, &mut cx);
         root.draw(&mut cx, list);
@@ -526,8 +576,8 @@ impl Inspector {
         out.append(built);
     }
 
-    fn build(&self, theme: &Theme, document: Option<&Document>) -> Child<Action> {
-        let tree: Child<Action> = match document {
+    fn build(&self, theme: &Theme, facts: Option<&Facts<'_>>) -> Child<Action> {
+        let tree: Child<Action> = match facts {
             Some(_) => Box::new(
                 Tree::new(
                     self.rows.iter().map(|row| row.row.clone()).collect(),
@@ -552,7 +602,7 @@ impl Inspector {
         let panes: Child<Action> = Box::new(Split::row(
             self.split,
             Box::new(Padding::new(Insets::all(theme.gap * 0.5), tree)),
-            self.details(theme, document),
+            self.pane(theme, facts),
             Action::SplitAt,
         ));
 
@@ -564,11 +614,21 @@ impl Inspector {
 
     /// The bar across the panel: what it is, the picker, and the way out.
     fn header(&self, theme: &Theme) -> Child<Action> {
-        let title: Child<Action> = Box::new(Align::left(Box::new(Label::new(
-            "Elements",
-            theme.font_size_small,
-            theme.ink_dim,
-        ))));
+        // The panes are chosen with the control the settings already use for a
+        // short list of choices. A second one shaped like tabs would be a second
+        // answer to the same question.
+        let tabs: Child<Action> = Box::new(Align::left(controls::segmented(
+            theme,
+            &self.focus,
+            Pane::ALL
+                .iter()
+                .map(|pane| (pane.label().to_owned(), Action::Show(*pane)))
+                .collect(),
+            Pane::ALL
+                .iter()
+                .position(|pane| *pane == self.pane)
+                .unwrap_or(0),
+        )));
 
         // The picker stays lit while it is armed, because a mode with no sign
         // that it is on is a mode that surprises the next click.
@@ -595,7 +655,7 @@ impl Inspector {
                     Box::new(Stack::row(
                         theme.gap,
                         vec![
-                            Box::new(Flex::new(1.0, title)),
+                            Box::new(Flex::new(1.0, tabs)),
                             Box::new(Align::centre(picker)),
                             Box::new(Align::centre(controls::icon_button(
                                 theme,
@@ -611,17 +671,30 @@ impl Inspector {
         ))
     }
 
-    /// The right-hand pane: what the chosen node is, in numbers and attributes.
-    fn details(&self, theme: &Theme, document: Option<&Document>) -> Child<Action> {
-        let Some(document) = document else {
+    /// The right-hand pane, whichever one is showing.
+    fn pane(&self, theme: &Theme, facts: Option<&Facts<'_>>) -> Child<Action> {
+        let Some(facts) = facts else {
             return Box::new(Gap::new(0.0, 0.0));
         };
-        let Some(selected) = self.selected.and_then(|node| document.get(node)) else {
+        if self.selected.is_none() {
             return Box::new(Align::centre(Box::new(Label::new(
                 "Choose an element.",
                 theme.font_size_small,
                 theme.ink_dim,
             ))));
+        }
+        let body = match self.pane {
+            Pane::Elements => self.elements_pane(theme, facts),
+            Pane::Styles => self.styles_pane(theme, facts),
+            Pane::Layout => self.layout_pane(theme, facts),
+        };
+        Box::new(Padding::new(Insets::all(theme.gap), body))
+    }
+
+    /// What the chosen node is: its tag, and the attributes it carries.
+    fn elements_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        let Some(selected) = self.selected.and_then(|node| facts.document.get(node)) else {
+            return Box::new(Gap::new(0.0, 0.0));
         };
 
         let mut rows: Vec<Child<Action>> = Vec::new();
@@ -672,11 +745,307 @@ impl Inspector {
                 theme.ink_dim,
             ))),
         }
+        Box::new(Stack::column(theme.gap, rows))
+    }
 
-        Box::new(Padding::new(
-            Insets::all(theme.gap),
-            Box::new(Stack::column(theme.gap, rows)),
+    /// What the cascade computed for the chosen node.
+    fn styles_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        let Some(style) = facts.style else {
+            // A node with no box is a node the cascade was never asked about:
+            // a comment, or an element under `display: none`.
+            return Box::new(Align::centre(Box::new(Label::new(
+                "This node has no box, so nothing was computed for it.",
+                theme.font_size_small,
+                theme.ink_dim,
+            ))));
+        };
+        let rows: Vec<Vec<String>> = describe(style)
+            .into_iter()
+            .map(|(name, value)| vec![name.to_owned(), value])
+            .collect();
+        Box::new(Table::new(
+            vec!["property".to_owned(), "computed".to_owned()],
+            rows,
+            0.0,
+            Overflow::default(),
         ))
+    }
+
+    /// What the layout made of it: the box, taken apart, in numbers.
+    fn layout_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        let (Some(style), Some(border)) = (facts.style, facts.rect) else {
+            return Box::new(Align::centre(Box::new(Label::new(
+                "This node was not drawn, so it has no box to take apart.",
+                theme.font_size_small,
+                theme.ink_dim,
+            ))));
+        };
+        let edges = BoxEdges::of(style, facts.containing);
+        let numbers = Box::new(Mono::new(
+            format!(
+                "{} × {} at ({}, {})",
+                round(border.width),
+                round(border.height),
+                round(border.x),
+                round(border.y)
+            ),
+            theme.ink_dim,
+        ));
+
+        Box::new(Stack::column(
+            theme.gap,
+            vec![
+                Box::new(Flex::new(1.0, box_model(theme, border, edges))),
+                numbers,
+            ],
+        ))
+    }
+}
+
+/// The box, drawn as the four rings it is made of, with the numbers on them.
+///
+/// The same shades as the overlay on the page, so the diagram and the thing it
+/// describes are recognisably one thing.
+fn box_model(theme: &Theme, border: Rect, edges: BoxEdges) -> Child<Action> {
+    let theme = theme.clone();
+    Box::new(crate::widget::Painted::new(
+        0.0,
+        118.0,
+        move |rect, cx, list| {
+            let label = |list: &mut DisplayList, cx: &mut Cx, text: &str, at: Rect| {
+                let mut mono = Mono::new(text, theme.ink).size(theme.font_size_small);
+                crate::widget::Widget::<Action>::place(&mut mono, at, cx);
+                crate::widget::Widget::<Action>::draw(&mut mono, cx, list);
+            };
+
+            // Nested rings of a fixed thickness rather than to scale: a margin
+            // of one pixel and a margin of two hundred have to be equally
+            // readable, and the numbers are what says which it is.
+            let step = 22.0;
+            let rings = [
+                (theme.box_margin, "margin", edges.margin),
+                (theme.box_border, "border", edges.border),
+                (theme.box_padding, "padding", edges.padding),
+            ];
+            let mut at = Rect::new(rect.x, rect.y, rect.width.min(340.0), rect.height);
+            for (color, name, sides) in rings {
+                fill_rounded(list, at, color, 2.0);
+                label(
+                    list,
+                    cx,
+                    name,
+                    Rect::new(at.x + 4.0, at.y + 3.0, 60.0, 12.0),
+                );
+                let (left, top, right, bottom) = sides;
+                label(
+                    list,
+                    cx,
+                    &round(top),
+                    Rect::new(at.x + at.width / 2.0 - 8.0, at.y + 3.0, 40.0, 12.0),
+                );
+                label(
+                    list,
+                    cx,
+                    &round(bottom),
+                    Rect::new(
+                        at.x + at.width / 2.0 - 8.0,
+                        at.y + at.height - 14.0,
+                        40.0,
+                        12.0,
+                    ),
+                );
+                label(
+                    list,
+                    cx,
+                    &round(left),
+                    Rect::new(at.x + 2.0, at.y + at.height / 2.0 - 6.0, 30.0, 12.0),
+                );
+                label(
+                    list,
+                    cx,
+                    &round(right),
+                    Rect::new(
+                        at.x + at.width - 26.0,
+                        at.y + at.height / 2.0 - 6.0,
+                        30.0,
+                        12.0,
+                    ),
+                );
+                at = Rect::new(
+                    at.x + step,
+                    at.y + step,
+                    (at.width - step * 2.0).max(0.0),
+                    (at.height - step * 2.0).max(0.0),
+                );
+            }
+
+            fill_rounded(list, at, theme.box_content, 2.0);
+            let content = edges.content_of(border);
+            label(
+                list,
+                cx,
+                &format!("{} × {}", round(content.width), round(content.height)),
+                Rect::new(at.x + 6.0, at.y + at.height / 2.0 - 6.0, 200.0, 12.0),
+            );
+        },
+    ))
+}
+
+/// A number as a person reads it: whole where it is whole.
+fn round(value: f64) -> String {
+    if (value - value.round()).abs() < 0.01 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// What the cascade computed, as rows a table can show.
+///
+/// A chosen list rather than every field on the struct. The whole of a computed
+/// style is a hundred values, most of them the initial one on most elements, and
+/// a pane that showed all of them would bury the four that explain the bug. This
+/// is the set an inspector is opened to look at.
+///
+/// What is missing, and known to be: *which rule* each value came from. The
+/// cascade is Stylo's and it knows, but it does not hand the winning declaration
+/// back with the value, so a pane that showed an origin would be inventing one.
+fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)> {
+    use otlyra_css::{Length, LengthOrAuto};
+
+    let length = |value: Length| match value {
+        Length::Px(px) => format!("{px}px"),
+        Length::Percent(percent) => format!("{}%", percent * 100.0),
+    };
+    let auto = |value: LengthOrAuto| match value {
+        LengthOrAuto::Px(px) => format!("{px}px"),
+        LengthOrAuto::Percent(percent) => format!("{}%", percent * 100.0),
+        LengthOrAuto::Auto => "auto".to_owned(),
+    };
+    let four = |sides: &otlyra_css::Sides<LengthOrAuto>| {
+        format!(
+            "{} {} {} {}",
+            auto(sides.top),
+            auto(sides.right),
+            auto(sides.bottom),
+            auto(sides.left)
+        )
+    };
+    let four_length = |sides: &otlyra_css::Sides<Length>| {
+        format!(
+            "{} {} {} {}",
+            length(sides.top),
+            length(sides.right),
+            length(sides.bottom),
+            length(sides.left)
+        )
+    };
+
+    let mut rows = vec![
+        ("display", format!("{:?}", style.display).to_lowercase()),
+        ("position", format!("{:?}", style.position).to_lowercase()),
+        ("width", auto(style.width)),
+        ("height", auto(style.height)),
+        ("margin", four(&style.margin)),
+        ("padding", four_length(&style.padding)),
+        (
+            "border-width",
+            format!(
+                "{}px {}px {}px {}px",
+                style.border.top.width,
+                style.border.right.width,
+                style.border.bottom.width,
+                style.border.left.width
+            ),
+        ),
+        ("color", hex(style.color)),
+        ("background-color", hex(style.background_color)),
+        ("font-family", style.font_family.to_string()),
+        ("font-size", format!("{}px", style.font_size)),
+        ("font-weight", style.font_weight.to_string()),
+        ("line-height", format!("{:?}", style.line_height)),
+        (
+            "text-align",
+            format!("{:?}", style.text_align).to_lowercase(),
+        ),
+        ("overflow", format!("{:?}", style.overflow).to_lowercase()),
+        ("float", format!("{:?}", style.float).to_lowercase()),
+        (
+            "z-index",
+            style.z_index.map_or("auto".to_owned(), |z| z.to_string()),
+        ),
+    ];
+
+    // The properties of a formatting context are only worth the rows when the
+    // element is in one: `flex-grow` on a block is noise, and noise is what
+    // buries the value that explains the bug.
+    if style.display == otlyra_css::Display::Flex {
+        rows.extend([
+            (
+                "flex-direction",
+                format!("{:?}", style.flex_direction).to_lowercase(),
+            ),
+            ("flex-wrap", format!("{:?}", style.flex_wrap).to_lowercase()),
+            (
+                "justify-content",
+                format!("{:?}", style.justify_content).to_lowercase(),
+            ),
+            (
+                "align-items",
+                format!("{:?}", style.align_items).to_lowercase(),
+            ),
+        ]);
+    }
+    if style.display == otlyra_css::Display::Grid {
+        rows.extend([
+            (
+                "grid-template-columns",
+                tracks(&style.grid_columns, style.grid_columns_fill.as_deref()),
+            ),
+            ("grid-template-rows", tracks(&style.grid_rows, None)),
+        ]);
+    }
+    if matches!(
+        style.display,
+        otlyra_css::Display::Flex | otlyra_css::Display::Grid
+    ) {
+        rows.push((
+            "gap",
+            format!("{} {}", length(style.gap.0), length(style.gap.1)),
+        ));
+    }
+    rows
+}
+
+/// A track list, as CSS would write it.
+fn tracks(template: &[otlyra_css::Track], fill: Option<&[otlyra_css::Track]>) -> String {
+    let one = |track: &otlyra_css::Track| format!("{track:?}").to_lowercase();
+    let mut out: Vec<String> = template.iter().map(one).collect();
+    if let Some(fill) = fill {
+        out.push(format!(
+            "repeat(auto-fill, {})",
+            fill.iter().map(one).collect::<Vec<_>>().join(" ")
+        ));
+    }
+    if out.is_empty() {
+        return "none".to_owned();
+    }
+    out.join(" ")
+}
+
+/// A colour as CSS writes it, which is what a person is looking for.
+fn hex(color: Color) -> String {
+    let [red, green, blue, alpha] = color.components;
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if alpha >= 1.0 {
+        format!("#{:02x}{:02x}{:02x}", byte(red), byte(green), byte(blue))
+    } else {
+        format!(
+            "rgba({}, {}, {}, {alpha:.2})",
+            byte(red),
+            byte(green),
+            byte(blue)
+        )
     }
 }
 
@@ -704,7 +1073,13 @@ fn cut(text: &str, limit: usize) -> String {
 /// The rectangle is the one the last frame drew, in window coordinates, so the
 /// overlay lands exactly where the box did — asked of the same targets a click
 /// is tested against rather than worked out a second time from the fragments.
-pub fn paint_highlight(list: &mut DisplayList, theme: &Theme, border: Rect, style: &BoxEdges) {
+pub fn paint_highlight(
+    list: &mut DisplayList,
+    theme: &Theme,
+    border: Rect,
+    style: &BoxEdges,
+    content_too: bool,
+) {
     let margin = Rect::new(
         border.x - style.margin.0,
         border.y - style.margin.1,
@@ -727,16 +1102,52 @@ pub fn paint_highlight(list: &mut DisplayList, theme: &Theme, border: Rect, styl
     // Outermost first, each over the last: the shades are the ones every
     // inspector has used for twenty years, and stacking them is what makes each
     // ring read as the space between two edges.
-    fill_rounded(list, margin, theme.box_margin, 0.0);
-    fill_rounded(list, border, theme.box_border, 0.0);
-    fill_rounded(list, padding, theme.box_padding, 0.0);
-    fill_rounded(list, content, theme.box_content, 0.0);
+    // Each shade is the *band* between two edges, not a rectangle laid over
+    // everything inside it. Stacked rectangles would put three washes over the
+    // content and leave the element unreadable under the thing that is meant to
+    // explain it — which is the difference between an overlay and a curtain.
+    band(list, margin, border, theme.box_margin);
+    band(list, border, padding, theme.box_border);
+    band(list, padding, content, theme.box_padding);
+    // The content is washed over only when there is nothing else to read there.
+    // A container with a track overlay has its items inside this rectangle, and
+    // a shade over them is a shade over the thing being looked at.
+    if content_too {
+        fill_rounded(list, content, theme.box_content, 0.0);
+    }
+}
+
+/// The ring between two rectangles, as its four strips.
+///
+/// Four fills rather than one even-odd path, because the sides have different
+/// widths — a box with `border-left: 8px` and no border anywhere else is the
+/// ordinary case, and a ring of one width cannot say that.
+fn band(list: &mut DisplayList, outer: Rect, inner: Rect, color: Color) {
+    let top = Rect::new(outer.x, outer.y, outer.width, (inner.y - outer.y).max(0.0));
+    let bottom = Rect::new(
+        outer.x,
+        inner.y + inner.height,
+        outer.width,
+        (outer.y + outer.height - inner.y - inner.height).max(0.0),
+    );
+    let left = Rect::new(outer.x, inner.y, (inner.x - outer.x).max(0.0), inner.height);
+    let right = Rect::new(
+        inner.x + inner.width,
+        inner.y,
+        (outer.x + outer.width - inner.x - inner.width).max(0.0),
+        inner.height,
+    );
+    for strip in [top, bottom, left, right] {
+        fill_rounded(list, strip, color, 0.0);
+    }
 }
 
 /// The four edges of a box, in logical pixels, left-top-right-bottom.
 ///
-/// Taken from the computed style rather than measured, because the fragment
-/// carries one rectangle and the rings are the difference between four.
+/// Border widths are used values and exact. Padding and margin are resolved
+/// here against the containing block, because a fragment carries one rectangle
+/// and the rings are the differences between four — and a percentage that has
+/// nothing to be a percentage *of* is drawn as nothing rather than as a guess.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct BoxEdges {
     /// Margin, left-top-right-bottom.
@@ -745,6 +1156,261 @@ pub struct BoxEdges {
     pub border: (f64, f64, f64, f64),
     /// Padding.
     pub padding: (f64, f64, f64, f64),
+}
+
+impl BoxEdges {
+    /// What `style` says the edges are, given how wide the containing block is.
+    ///
+    /// A percentage is a fraction of the containing block's *width* on every
+    /// side, vertically as well, which is what CSS says and what surprises
+    /// everyone once.
+    pub fn of(style: &otlyra_css::ComputedStyle, containing: Option<f64>) -> Self {
+        use otlyra_css::{Length, LengthOrAuto};
+        let percent = |fraction: f32| containing.unwrap_or(0.0) * f64::from(fraction);
+        let length = |value: Length| match value {
+            Length::Px(px) => f64::from(px),
+            Length::Percent(fraction) => percent(fraction),
+        };
+        // `auto` is resolved during layout and is not on the style. Nothing is
+        // drawn for it rather than a number nobody computed.
+        let auto = |value: LengthOrAuto| match value {
+            LengthOrAuto::Px(px) => f64::from(px),
+            LengthOrAuto::Percent(fraction) => percent(fraction),
+            LengthOrAuto::Auto => 0.0,
+        };
+        Self {
+            margin: (
+                auto(style.margin.left),
+                auto(style.margin.top),
+                auto(style.margin.right),
+                auto(style.margin.bottom),
+            ),
+            border: (
+                f64::from(style.border.left.width),
+                f64::from(style.border.top.width),
+                f64::from(style.border.right.width),
+                f64::from(style.border.bottom.width),
+            ),
+            padding: (
+                length(style.padding.left),
+                length(style.padding.top),
+                length(style.padding.right),
+                length(style.padding.bottom),
+            ),
+        }
+    }
+
+    /// The content box inside a border box.
+    pub fn content_of(&self, border: Rect) -> Rect {
+        Rect::new(
+            border.x + self.border.0 + self.padding.0,
+            border.y + self.border.1 + self.padding.1,
+            (border.width - self.border.0 - self.border.2 - self.padding.0 - self.padding.2)
+                .max(0.0),
+            (border.height - self.border.1 - self.border.3 - self.padding.1 - self.padding.3)
+                .max(0.0),
+        )
+    }
+}
+
+/// Where a container's tracks fall, for the dashed overlay over one.
+///
+/// Derived from where the items themselves were drawn rather than asked of the
+/// layout: the engine sizes its tracks internally and does not report them, and
+/// the edges of the boxes that landed in them are the same lines. What that
+/// cannot show is a track nothing was placed in — an empty column has no item to
+/// have an edge — and that is stated rather than papered over.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tracks {
+    /// Where the column lines are, in window coordinates.
+    pub columns: Vec<Line>,
+    /// Where the row lines are.
+    pub rows: Vec<Line>,
+    /// Whether the lines are numbered, which is a grid's habit and not a flex
+    /// container's.
+    pub numbered: bool,
+}
+
+/// One line of a track overlay.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Line {
+    /// Where it is, in window coordinates.
+    pub at: f64,
+    /// Its number, when it opens a track rather than closing a gutter.
+    pub number: Option<usize>,
+}
+
+impl Tracks {
+    /// The lines the boxes in `items` fall between, inside `container`.
+    ///
+    /// `gap` — rows first, then columns, as CSS writes it — matters to the
+    /// numbering and not to the drawing. A gutter has two edges and both are
+    /// drawn, but CSS numbers the *line*, and the gap is how thick that one line
+    /// was asked to be. Numbering both would name every track after the first
+    /// twice, which is the first thing a person would notice and disbelieve.
+    pub fn of(container: Rect, items: &[Rect], numbered: bool, gap: (f64, f64)) -> Self {
+        let mut columns: Vec<(f64, bool)> = Vec::new();
+        let mut rows: Vec<(f64, bool)> = Vec::new();
+        for item in items {
+            columns.push((item.x, true));
+            columns.push((item.x + item.width, true));
+            rows.push((item.y, true));
+            rows.push((item.y + item.height, true));
+        }
+        // The container's own edges are drawn — they bound the overlay — but
+        // they are not lines unless a track reaches them. `grid-template-columns:
+        // 100px 100px` in a container twice that wide has a right edge that no
+        // track ends at, and numbering it would name a line the stylesheet
+        // cannot address.
+        columns.push((container.x, false));
+        columns.push((container.x + container.width, false));
+        rows.push((container.y, false));
+        rows.push((container.y + container.height, false));
+        Self {
+            columns: lines(columns, gap.1),
+            rows: lines(rows, gap.0),
+            numbered,
+        }
+    }
+}
+
+/// The distinct lines in a list of edges, numbered.
+///
+/// Each edge says whether it came from an item. Sorted, with anything within
+/// half a pixel of its neighbour dropped — two items that share a line report it
+/// twice, and a line drawn twice looks heavier than the one beside it. What is
+/// left is numbered when it is a track's own edge and not:
+///
+/// - an edge exactly `gap` past the one before it, which is the far side of a
+///   gutter and so the same line seen from the other end, or
+/// - an edge only the container reached, which bounds the overlay without being
+///   a line any stylesheet can name.
+fn lines(mut values: Vec<(f64, bool)>, gap: f64) -> Vec<Line> {
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // An edge both an item and the container reached is the item's: keeping the
+    // truer of the two is what `dedup_by` is told to do here, since it drops the
+    // first of each pair.
+    values.dedup_by(|a, b| {
+        let same = (a.0 - b.0).abs() < 0.5;
+        if same {
+            b.1 |= a.1;
+        }
+        same
+    });
+
+    let mut out: Vec<Line> = Vec::with_capacity(values.len());
+    let mut number = 0;
+    let mut previous: Option<f64> = None;
+    for (at, from_item) in values {
+        let closes_a_gutter =
+            gap > 0.0 && previous.is_some_and(|last| (at - last - gap).abs() < 0.5);
+        if from_item && !closes_a_gutter {
+            number += 1;
+            out.push(Line {
+                at,
+                number: Some(number),
+            });
+        } else {
+            out.push(Line { at, number: None });
+        }
+        previous = Some(at);
+    }
+    out
+}
+
+/// How long one dash is, and the gap after it.
+const DASH: f64 = 4.0;
+
+/// A dashed line from one point to another, along one axis.
+///
+/// Drawn as a row of small fills rather than as a stroked path with a dash
+/// pattern, because the display list has no dashes and a rasterizer that grew
+/// them would be a feature carried for one overlay. This is four rectangles per
+/// twenty pixels and it is the same on every backend.
+fn dashed(list: &mut DisplayList, from: (f64, f64), to: (f64, f64), width: f64, color: Color) {
+    let horizontal = (to.1 - from.1).abs() < f64::EPSILON;
+    let length = if horizontal {
+        to.0 - from.0
+    } else {
+        to.1 - from.1
+    };
+    let mut at = 0.0;
+    while at < length {
+        let run = DASH.min(length - at);
+        let rect = if horizontal {
+            Rect::new(from.0 + at, from.1, run, width)
+        } else {
+            Rect::new(from.0, from.1 + at, width, run)
+        };
+        fill_rounded(list, rect, color, 0.0);
+        at += DASH * 2.0;
+    }
+}
+
+/// Paint the dashed track lines of a grid or flex container over the page.
+///
+/// What Firefox's grid overlay does, and for the same reason: the numbers in a
+/// stylesheet are lines, and until they are drawn on the page nobody can tell
+/// which of them the item actually landed against.
+pub fn paint_tracks(list: &mut DisplayList, cx: &mut Cx, container: Rect, tracks: &Tracks) {
+    let theme = cx.theme.clone();
+    let color = theme.grid_line;
+    for line in &tracks.columns {
+        dashed(
+            list,
+            (line.at, container.y),
+            (line.at, container.y + container.height),
+            1.0,
+            color,
+        );
+    }
+    for line in &tracks.rows {
+        dashed(
+            list,
+            (container.x, line.at),
+            (container.x + container.width, line.at),
+            1.0,
+            color,
+        );
+    }
+    if !tracks.numbered {
+        return;
+    }
+
+    // The line numbers, which are what a stylesheet names a track by. On a tab
+    // of the line's own colour, because text alone over a page of unknown
+    // colours is text nobody can read.
+    let badge = |list: &mut DisplayList, cx: &mut Cx, at: Rect, number: usize| {
+        fill_rounded(list, at, color, 2.0);
+        let mut label = Mono::new(number.to_string(), theme.ink_on_accent).size(9.0);
+        crate::widget::Widget::<Action>::place(
+            &mut label,
+            Rect::new(at.x + 3.0, at.y + 1.5, at.width, at.height),
+            cx,
+        );
+        crate::widget::Widget::<Action>::draw(&mut label, cx, list);
+    };
+
+    for line in &tracks.columns {
+        if let Some(number) = line.number {
+            badge(
+                list,
+                cx,
+                Rect::new(line.at, container.y - 13.0, 14.0, 12.0),
+                number,
+            );
+        }
+    }
+    for line in &tracks.rows {
+        if let Some(number) = line.number {
+            badge(
+                list,
+                cx,
+                Rect::new(container.x - 15.0, line.at, 14.0, 12.0),
+                number,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -773,9 +1439,15 @@ mod tests {
     fn frame(inspector: &mut Inspector, document: &Document) {
         let mut text = TextEngine::new();
         let mut list = DisplayList::new();
+        let facts = Facts {
+            document,
+            style: None,
+            rect: None,
+            containing: None,
+        };
         inspector.build_display_list(
             Rect::new(0.0, 300.0, 900.0, 300.0),
-            Some(document),
+            Some(&facts),
             &mut text,
             &mut list,
         );
@@ -957,19 +1629,133 @@ mod tests {
     }
 
     #[test]
-    fn the_highlight_is_the_four_shades_around_one_rectangle() {
-        let theme = Theme::light();
-        let mut list = DisplayList::new();
-        paint_highlight(
-            &mut list,
-            &theme,
-            Rect::new(100.0, 100.0, 200.0, 50.0),
-            &BoxEdges {
-                margin: (10.0, 10.0, 10.0, 10.0),
-                border: (2.0, 2.0, 2.0, 2.0),
-                padding: (5.0, 5.0, 5.0, 5.0),
-            },
+    fn a_gutter_is_one_line_however_many_edges_it_has() {
+        // Three columns of 100 with a 10px gap, as their items' edges report
+        // them: 0..100, 110..210, 220..320.
+        let edges = vec![
+            (0.0, true),
+            (100.0, true),
+            (110.0, true),
+            (210.0, true),
+            (220.0, true),
+            (320.0, true),
+        ];
+        let numbered: Vec<Option<usize>> = lines(edges, 10.0)
+            .into_iter()
+            .map(|line| line.number)
+            .collect();
+
+        // Four lines for three tracks, and the far side of each gutter is the
+        // same line seen from the other end rather than a fifth and a sixth.
+        assert_eq!(
+            numbered,
+            vec![Some(1), Some(2), None, Some(3), None, Some(4)]
         );
-        assert_eq!(list.items().len(), 4, "one fill per ring, outermost first");
+    }
+
+    #[test]
+    fn edges_that_share_a_line_are_one_line() {
+        // Two items that meet with no gap report the same edge twice.
+        let numbered: Vec<Option<usize>> = lines(
+            vec![(0.0, true), (50.0, true), (50.0, true), (100.0, true)],
+            0.0,
+        )
+        .into_iter()
+        .map(|line| line.number)
+        .collect();
+        assert_eq!(numbered, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn a_percentage_is_a_fraction_of_the_containing_block() {
+        let mut style = otlyra_css::ComputedStyle::default();
+        style.padding.left = otlyra_css::Length::Percent(0.1);
+        style.padding.top = otlyra_css::Length::Px(4.0);
+        style.margin.right = otlyra_css::LengthOrAuto::Auto;
+
+        let edges = BoxEdges::of(&style, Some(500.0));
+        // A tenth is not exactly a tenth in the single precision the style
+        // carries, which is why this is a distance and not an equality.
+        assert!(
+            (edges.padding.0 - 50.0).abs() < 0.001,
+            "ten per cent of five hundred, and got {}",
+            edges.padding.0
+        );
+        assert_eq!(edges.padding.1, 4.0);
+        // `auto` is resolved by the layout and is not on the style, so nothing
+        // is drawn for it rather than a number nobody computed.
+        assert_eq!(edges.margin.2, 0.0);
+    }
+
+    #[test]
+    fn the_content_box_is_the_border_box_less_what_is_around_it() {
+        let edges = BoxEdges {
+            margin: (10.0, 10.0, 10.0, 10.0),
+            border: (3.0, 3.0, 3.0, 3.0),
+            padding: (24.0, 24.0, 24.0, 24.0),
+        };
+        let content = edges.content_of(Rect::new(20.0, 98.0, 960.0, 148.0));
+        assert_eq!(content.width, 960.0 - 54.0);
+        assert_eq!(content.height, 148.0 - 54.0);
+        assert_eq!(content.x, 47.0);
+    }
+
+    #[test]
+    fn the_styles_pane_says_only_what_the_element_is_in() {
+        let mut style = otlyra_css::ComputedStyle::default();
+        let named = |style: &otlyra_css::ComputedStyle| -> Vec<&'static str> {
+            describe(style).into_iter().map(|(name, _)| name).collect()
+        };
+
+        // A block is not in a flex or a grid formatting context, and rows about
+        // one would bury the rows that explain it.
+        assert!(!named(&style).contains(&"flex-direction"));
+        assert!(!named(&style).contains(&"grid-template-columns"));
+
+        style.display = otlyra_css::Display::Flex;
+        assert!(named(&style).contains(&"flex-direction"));
+        assert!(named(&style).contains(&"gap"));
+
+        style.display = otlyra_css::Display::Grid;
+        assert!(named(&style).contains(&"grid-template-columns"));
+        assert!(!named(&style).contains(&"flex-direction"));
+    }
+
+    #[test]
+    fn changing_the_pane_rebuilds_the_frame() {
+        let document = document();
+        let mut inspector = panel();
+        frame(&mut inspector, &document);
+        assert_eq!(inspector.builds(), 1);
+
+        inspector.apply(Action::Show(Pane::Styles));
+        frame(&mut inspector, &document);
+        assert_eq!(
+            inspector.builds(),
+            2,
+            "a different pane is a different frame"
+        );
+    }
+
+    #[test]
+    fn the_overlay_leaves_the_content_readable_when_there_is_something_in_it() {
+        let theme = Theme::light();
+        let border = Rect::new(100.0, 100.0, 200.0, 50.0);
+        let edges = BoxEdges {
+            margin: (10.0, 10.0, 10.0, 10.0),
+            border: (2.0, 2.0, 2.0, 2.0),
+            padding: (5.0, 5.0, 5.0, 5.0),
+        };
+
+        // Three bands of four strips, and no wash over the middle: the items of
+        // a container are inside that rectangle and are the thing being looked
+        // at.
+        let mut bands = DisplayList::new();
+        paint_highlight(&mut bands, &theme, border, &edges, false);
+        assert_eq!(bands.items().len(), 12);
+
+        let mut filled = DisplayList::new();
+        paint_highlight(&mut filled, &theme, border, &edges, true);
+        assert_eq!(filled.items().len(), 13, "and one more when it is empty");
     }
 }

@@ -1099,26 +1099,47 @@ impl Browser {
         dock: f64,
     ) {
         let theme = self.inspector.theme.clone();
-        if let Some((rect, edges)) = self.highlight() {
-            crate::inspector::paint_highlight(list, &theme, rect, &edges);
+        let chosen = self.chosen_box();
+        if let Some(chosen) = chosen.as_ref() {
+            crate::inspector::paint_highlight(
+                list,
+                &theme,
+                chosen.border,
+                &chosen.edges,
+                chosen.tracks.is_none(),
+            );
+            if let Some(tracks) = chosen.tracks.as_ref() {
+                let mut cx = crate::widget::Cx::new(&mut self.text);
+                cx.theme = theme.clone();
+                crate::inspector::paint_tracks(
+                    list,
+                    &mut cx,
+                    chosen.edges.content_of(chosen.border),
+                    tracks,
+                );
+            }
         }
 
         let panel = crate::ui::Rect::new(0.0, top + content_height, width, dock);
-        let document = self.tabs[self.active]
-            .page
-            .as_ref()
-            .map(|page| page.document());
-        // Split off the borrow the panel needs from the one the browser holds:
-        // the document is the page's and the panel only reads it.
+        // Everything the panel is shown about the page, gathered before it is
+        // built: the panel reads, and the browser is what does the reaching.
         let mut built = otlyra_gfx::DisplayList::new();
-        match document {
-            Some(document) => {
-                self.inspector.build_display_list(
-                    panel,
-                    Some(document),
-                    &mut self.text,
-                    &mut built,
-                );
+        match self.tabs[self.active].page.as_ref() {
+            Some(page) => {
+                let style = self
+                    .inspector
+                    .selected
+                    .and_then(|node| page.boxes().box_for(node))
+                    .and_then(|id| page.boxes().get(id))
+                    .map(|node| node.style.as_ref());
+                let facts = crate::inspector::Facts {
+                    document: page.document(),
+                    style,
+                    rect: chosen.as_ref().map(|chosen| chosen.border),
+                    containing: chosen.as_ref().and_then(|chosen| chosen.containing),
+                };
+                self.inspector
+                    .build_display_list(panel, Some(&facts), &mut self.text, &mut built);
             }
             None => {
                 self.inspector
@@ -1128,41 +1149,80 @@ impl Browser {
         list.append(&built);
     }
 
-    /// Where the chosen node was drawn, and what its edges are.
+    /// The inspector, for whoever is driving the browser rather than using it.
+    ///
+    /// The command line and the screenshot harness both need to open the panel
+    /// and choose something in it, and neither has a pointer to do it with.
+    pub fn inspector_mut(&mut self) -> &mut crate::inspector::Inspector {
+        &mut self.inspector
+    }
+
+    /// Choose the element drawn at `x`, `y`, as the picker would.
+    ///
+    /// Tested against the last frame, like every other hit test here: a point
+    /// can only be resolved against a frame that has been drawn.
+    pub fn inspect_at(&mut self, x: f64, y: f64) {
+        self.inspector.open = true;
+        self.pick_at(x, y);
+    }
+
+    /// Everything about the chosen node's box that the panel and the overlay
+    /// both need.
     ///
     /// The rectangle comes from the same targets a click is tested against, so
-    /// the overlay lands exactly where the box did. The edges come from the
-    /// computed style, because a fragment carries one rectangle and the four
-    /// rings are the differences between four.
-    fn highlight(&self) -> Option<(crate::ui::Rect, crate::inspector::BoxEdges)> {
+    /// the overlay lands exactly where the box did and no second answer to
+    /// *where is this* exists.
+    fn chosen_box(&self) -> Option<Chosen> {
         let node = self.inspector.selected?;
         let page = self.tabs[self.active].page.as_ref()?;
         let id = page.boxes().box_for(node)?;
-        let rect = page.rect_of(id)?;
-        let style = &page.boxes().get(id)?.style;
-        Some((
-            crate::ui::Rect::new(
-                f64::from(rect.x),
-                f64::from(rect.y),
-                f64::from(rect.width),
-                f64::from(rect.height),
-            ),
-            crate::inspector::BoxEdges {
-                margin: Self::sides(&style.margin, |side| match side {
-                    otlyra_css::LengthOrAuto::Px(px) => f64::from(px),
-                    // A percentage needs the containing block and `auto` needs
-                    // the layout that resolved it; neither is on the style. The
-                    // ring is drawn as nothing rather than as a guess — D2 is
-                    // where these numbers come from the fragment.
-                    _ => 0.0,
-                }),
-                border: Self::sides(&style.border, |side| f64::from(side.width)),
-                padding: Self::sides(&style.padding, |side| match side {
-                    otlyra_css::Length::Px(px) => f64::from(px),
-                    otlyra_css::Length::Percent(_) => 0.0,
-                }),
-            },
-        ))
+        let border = to_rect(page.rect_of(id)?);
+        let box_node = page.boxes().get(id)?;
+        let style = &box_node.style;
+
+        // How wide the containing block is, for the percentages: the parent's
+        // content box, worked out the same way this one's is.
+        let containing = box_node
+            .parent
+            .and_then(|parent| Some((page.boxes().get(parent)?, page.rect_of(parent)?)))
+            .map(|(parent, rect)| {
+                crate::inspector::BoxEdges::of(&parent.style, None)
+                    .content_of(to_rect(rect))
+                    .width
+            });
+        let edges = crate::inspector::BoxEdges::of(style, containing);
+
+        // A container whose children were laid out into tracks gets the dashed
+        // overlay: the lines a stylesheet names are invisible until they are
+        // drawn on the page they laid out.
+        let tracks = matches!(
+            style.display,
+            otlyra_css::Display::Grid | otlyra_css::Display::Flex
+        )
+        .then(|| {
+            let items: Vec<crate::ui::Rect> = box_node
+                .children
+                .iter()
+                .filter_map(|child| page.rect_of(*child))
+                .map(to_rect)
+                .collect();
+            crate::inspector::Tracks::of(
+                edges.content_of(border),
+                &items,
+                style.display == otlyra_css::Display::Grid,
+                (
+                    f64::from(style.gap.0.resolve(border.width as f32)),
+                    f64::from(style.gap.1.resolve(border.width as f32)),
+                ),
+            )
+        });
+
+        Some(Chosen {
+            border,
+            edges,
+            containing,
+            tracks,
+        })
     }
 
     /// Work out what the pointer should look like where it now is.
@@ -1243,19 +1303,6 @@ impl Browser {
     fn dock_top(&self) -> f64 {
         let top = if self.interface { UI_HEIGHT } else { 0.0 };
         self.last_height - self.dock_height(self.last_height - top)
-    }
-
-    /// The four sides of a style's box edge, as left, top, right, bottom.
-    ///
-    /// The order the overlay wants, which is not the order CSS writes them in.
-    #[allow(clippy::needless_pass_by_value)]
-    fn sides<T: Copy>(sides: &otlyra_css::Sides<T>, of: impl Fn(T) -> f64) -> (f64, f64, f64, f64) {
-        (
-            of(sides.left),
-            of(sides.top),
-            of(sides.right),
-            of(sides.bottom),
-        )
     }
 
     /// The link under the pointer, resolved against the tab's own address.
@@ -1641,6 +1688,28 @@ impl Painter for Browser {
         // the way to one.
         self.fetch_backgrounds();
     }
+}
+
+/// The chosen node's box, as the overlay and the panel both need it.
+struct Chosen {
+    /// The border box, in window coordinates.
+    border: crate::ui::Rect,
+    /// What the style says its four edges are.
+    edges: crate::inspector::BoxEdges,
+    /// How wide its containing block is, for a percentage.
+    containing: Option<f64>,
+    /// Where its children's tracks fall, when it lays its children into any.
+    tracks: Option<crate::inspector::Tracks>,
+}
+
+/// A layout rectangle in the interface's own geometry vocabulary.
+fn to_rect(rect: otlyra_layout::Rect) -> crate::ui::Rect {
+    crate::ui::Rect::new(
+        f64::from(rect.x),
+        f64::from(rect.y),
+        f64::from(rect.width),
+        f64::from(rect.height),
+    )
 }
 
 /// Whether these modifiers are the platform's "open the inspector" pair.
@@ -2287,7 +2356,10 @@ mod tests {
         browser.on_event(PlatformEvent::PointerMoved { x, y });
         browser.on_event(PlatformEvent::PointerPressed);
 
-        let (rect, _) = browser.highlight().expect("the chosen box was drawn");
+        let rect = browser
+            .chosen_box()
+            .expect("the chosen box was drawn")
+            .border;
         // Asserted against the engine's own answer rather than against numbers:
         // whatever box the hit test names, the overlay is that box's rectangle.
         let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
@@ -2304,6 +2376,77 @@ mod tests {
             rect.y >= UI_HEIGHT,
             "the overlay is in window coordinates, below the toolbar"
         );
+    }
+
+    /// A page whose one element lays its children into tracks.
+    struct GridLoader;
+
+    impl Loader for GridLoader {
+        fn load(&self, _url: &str) -> Result<Loaded, String> {
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<style>.g { display: grid; gap: 10px; \
+                         grid-template-columns: 100px 100px; }</style>\
+                         <div class=g><div>a</div><div>b</div>\
+                         <div>c</div><div>d</div></div>\
+                         <p>a block, which lays nothing into anything"
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: "https://grid.example/".to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Choose the first element the document has whose tag is `tag`.
+    fn choose(browser: &mut Browser, tag: &str) {
+        let page = browser.tabs[0].page.as_ref().expect("a page");
+        let document = page.document();
+        let mut stack = vec![document.root()];
+        while let Some(node) = stack.pop() {
+            let matches = document.get(node).is_some_and(|node| {
+                matches!(&node.data,
+                    otlyra_dom::NodeData::Element(element)
+                        if element.name.local.as_ref() == tag)
+            });
+            if matches {
+                browser.inspector.selected = Some(node);
+                return;
+            }
+            stack.extend(document.children(node));
+        }
+        panic!("the document has no {tag}");
+    }
+
+    #[test]
+    fn a_container_that_lays_its_children_into_tracks_gets_the_dashed_overlay() {
+        let mut browser = Browser::new(GridLoader);
+        browser.navigate("grid.example");
+        settle(&mut browser);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        choose(&mut browser, "div");
+        let chosen = browser.chosen_box().expect("the grid was drawn");
+        let tracks = chosen.tracks.expect("a grid has tracks");
+        assert!(
+            tracks.numbered,
+            "a grid names its lines and a flex row does not"
+        );
+
+        // Two columns of a hundred with a ten-pixel gutter: three lines, and the
+        // far side of the gutter is the same line rather than a fourth.
+        let numbered = tracks
+            .columns
+            .iter()
+            .filter(|line| line.number.is_some())
+            .count();
+        assert_eq!(numbered, 3, "columns: {:?}", tracks.columns);
+
+        // And a block lays nothing into anything, so it has no lines to draw.
+        choose(&mut browser, "p");
+        let block = browser.chosen_box().expect("the paragraph was drawn");
+        assert!(block.tracks.is_none());
     }
 
     /// A picture of `bytes` bytes, with no pixels worth looking at.

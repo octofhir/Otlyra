@@ -96,6 +96,24 @@ struct Cli {
     /// Print the document's source instead of opening a window, then exit.
     #[arg(long)]
     dump_source: bool,
+
+    /// Open the inspector on the page, docked under it.
+    ///
+    /// Useful with `--screenshot`: the panel is a thing worth looking at, and it
+    /// cannot be opened from a command line otherwise.
+    #[arg(long)]
+    inspector: bool,
+
+    /// Choose the element drawn at `X,Y` and show it in the inspector.
+    ///
+    /// The point is in logical pixels from the top left of the window, the same
+    /// coordinates a click is in. Implies `--inspector`.
+    #[arg(long, value_name = "X,Y", value_parser = point)]
+    inspect_at: Option<(f64, f64)>,
+
+    /// Which of the inspector's panes to show. Implies `--inspector`.
+    #[arg(long, value_enum, value_name = "PANE")]
+    inspect_pane: Option<InspectorPane>,
 }
 
 impl Cli {
@@ -246,12 +264,11 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
             Source::File(path) => path.display().to_string(),
         });
         return match cli.screenshot.as_deref() {
-            Some(path) => {
-                browser.wait_for_load(LOAD_TIMEOUT);
-                browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
-                Ok(write_screenshot(&mut browser, cli.viewport(), path)?)
+            Some(path) => screenshot(&mut browser, cli, path),
+            None => {
+                open_inspector(&mut browser, cli);
+                Ok(run_window(window_config(cli), &mut browser)?)
             }
-            None => Ok(run_window(window_config(cli), &mut browser)?),
         };
     }
 
@@ -336,16 +353,75 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     });
 
     match cli.screenshot.as_deref() {
-        Some(path) => {
-            // A screenshot has one frame to get right and no event loop to be woken
-            // by, so this is the one place that waits for a load.
-            browser.wait_for_load(LOAD_TIMEOUT);
-            browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
-            write_screenshot(&mut browser, cli.viewport(), path)?;
+        Some(path) => screenshot(&mut browser, cli, path)?,
+        None => {
+            open_inspector(&mut browser, cli);
+            run_window(window_config(cli), &mut browser)?;
         }
-        None => run_window(window_config(cli), &mut browser)?,
     }
     Ok(())
+}
+
+/// Open the inspector if the command line asked for it.
+fn open_inspector(browser: &mut Browser, cli: &Cli) {
+    if cli.inspector || cli.inspect_at.is_some() || cli.inspect_pane.is_some() {
+        browser.inspector_mut().open = true;
+    }
+    if let Some(pane) = cli.inspect_pane {
+        browser.inspector_mut().pane = match pane {
+            InspectorPane::Elements => otlyra_app::inspector::Pane::Elements,
+            InspectorPane::Styles => otlyra_app::inspector::Pane::Styles,
+            InspectorPane::Layout => otlyra_app::inspector::Pane::Layout,
+        };
+    }
+}
+
+/// The panes, as the command line spells them.
+///
+/// A copy of the enum the panel owns rather than the enum itself: deriving
+/// clap's traits on it would put a command-line vocabulary into a module that
+/// has no command line, and there are three of them.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum InspectorPane {
+    Elements,
+    Styles,
+    Layout,
+}
+
+/// Write one screenshot, having settled whatever the command line asked to see.
+///
+/// A screenshot has one frame to get right and no event loop to be woken by, so
+/// this is the one place that waits for a load. Choosing an element needs a
+/// frame of its own first: the hit test reads what the last frame drew, which is
+/// the same rule a click follows.
+fn screenshot(
+    browser: &mut Browser,
+    cli: &Cli,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    browser.wait_for_load(LOAD_TIMEOUT);
+    browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
+    open_inspector(browser, cli);
+    if let Some((x, y)) = cli.inspect_at {
+        write_screenshot(browser, cli.viewport(), path)?;
+        browser.inspect_at(x, y);
+    }
+    write_screenshot(browser, cli.viewport(), path)?;
+    Ok(())
+}
+
+/// A point written as `X,Y`, for the flag that names one.
+fn point(text: &str) -> Result<(f64, f64), String> {
+    let (x, y) = text
+        .split_once(',')
+        .ok_or_else(|| format!("expected X,Y and got {text:?}"))?;
+    let parse = |value: &str| {
+        value
+            .trim()
+            .parse::<f64>()
+            .map_err(|error| format!("{value:?} is not a number: {error}"))
+    };
+    Ok((parse(x)?, parse(y)?))
 }
 
 /// How long `--screenshot` waits for the page it was given.

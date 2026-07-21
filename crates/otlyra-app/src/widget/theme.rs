@@ -81,6 +81,9 @@ pub struct Theme {
     pub box_padding: Color,
     /// Its content.
     pub box_content: Color,
+    /// The dashed lines a grid's or a flex container's tracks are drawn with,
+    /// and the tabs its line numbers sit on.
+    pub grid_line: Color,
 
     /// Corner radius on a button, a field, a card.
     pub radius: f64,
@@ -160,6 +163,7 @@ impl Theme {
             box_border: Color::from_rgba8(0xd6, 0xa0, 0x6a, 0x80),
             box_padding: Color::from_rgba8(0x8b, 0xc4, 0x6a, 0x66),
             box_content: Color::from_rgba8(0x6b, 0xa8, 0xd6, 0x66),
+            grid_line: Color::from_rgba8(0x9a, 0x3c, 0xc4, 0xcc),
 
             radius: 8.0,
             radius_small: 7.0,
