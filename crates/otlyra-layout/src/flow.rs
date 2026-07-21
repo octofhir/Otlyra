@@ -1786,6 +1786,7 @@ impl<'a> Flow<'a> {
         if spans.is_empty() && replaced.is_empty() {
             return 0.0;
         }
+        self.level_line_heights(parent, &mut spans);
 
         // Where each span landed in the concatenated text, computed the same way
         // `shape_spans` concatenates it. This is what turns a shaped run back into
@@ -2050,6 +2051,48 @@ impl<'a> Flow<'a> {
             .entry(key)
             .or_insert_with(|| FontStack::parse_css(&style.font_family))
             .clone()
+    }
+
+    /// Give every span of a paragraph the same line height: the tallest any of
+    /// them, or the block itself, asks for.
+    ///
+    /// CSS is finer than this. A line box is as tall as the tallest thing *on that
+    /// line*, and the block's own font sets a floor — the strut — that a line has
+    /// even when nothing on it is that tall. So a paragraph whose middle line holds
+    /// one large word should have one tall line and the rest short.
+    ///
+    /// Levelling them is a workaround, and it is worth stating what for. The shaper
+    /// closes a run of glyphs *after* it has already moved on to the next span's
+    /// style, so a run is measured with its neighbour's line height rather than its
+    /// own — which makes a paragraph of ordinary text with one `<code>` in it two
+    /// pixels short on every line, including the lines the `<code>` is nowhere
+    /// near. One height throughout cannot be got wrong that way, and for the shape
+    /// this actually happens in — a smaller inline inside ordinary prose — the
+    /// floor is the answer CSS gives anyway. What it gets wrong is the opposite
+    /// case: a paragraph with one larger inline in it is tall on every line rather
+    /// than on the line that holds it.
+    fn level_line_heights(&mut self, parent: BoxId, spans: &mut [TextSpan<'_>]) {
+        let style = Arc::clone(&self.tree.node(parent).style);
+        let stack = self.font_stack(&style);
+        // The strut: the line the block would have with no text in it at all.
+        let strut = match style.line_height {
+            otlyra_css::LineHeight::Normal => {
+                self.text
+                    .normal_line_height(&stack, style.font_size, style.font_weight, false)
+            }
+            other => Some(other.resolve(style.font_size, style.font_size * 1.2)),
+        };
+
+        let tallest = spans
+            .iter()
+            .filter_map(|span| span.line_height)
+            .chain(strut)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if tallest.is_finite() {
+            for span in spans {
+                span.line_height = Some(tallest);
+            }
+        }
     }
 
     /// A list item's marker, shaped and placed against the item's first line.

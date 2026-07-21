@@ -270,3 +270,34 @@ fn text_still_shapes_when_the_named_family_is_missing() {
     };
     assert!(!run.glyphs.is_empty());
 }
+
+/// A line is as tall as the block's own font asks for, however small the things
+/// inside it are.
+///
+/// This is the strut: a paragraph of ordinary text with a smaller inline in it —
+/// a `<code>`, a `<small>` — spaces its lines by its own font, not by whichever
+/// span happens to be on a line. Getting it from the span was worth two pixels a
+/// line, every line, and the lines the small span was nowhere near.
+#[test]
+fn a_smaller_inline_does_not_make_its_line_shorter() {
+    let plain = lay_out("<body><p>one<br>two", 800.0);
+    // A heading is larger than the text in it, and `<sub>` is smaller than the
+    // heading — so the second line holds something shorter than its own block.
+    let mixed = lay_out("<body><h2>one<br>two <sub>small</sub>", 800.0);
+
+    let heights = |tree: &FragmentTree| -> Vec<f32> {
+        lines(tree).iter().map(|line| line.rect.height).collect()
+    };
+    let plain = heights(&plain);
+    assert_eq!(plain.len(), 2);
+    assert_eq!(plain[0], plain[1], "both lines of one font agree");
+
+    let mixed = heights(&mixed);
+    assert_eq!(mixed.len(), 2);
+    assert_eq!(mixed[0], mixed[1], "and so do both lines of two");
+    assert!(
+        mixed[0] > plain[0],
+        "a twenty-pixel paragraph has taller lines than a sixteen-pixel one: \
+         {mixed:?} against {plain:?}"
+    );
+}
