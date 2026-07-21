@@ -52,6 +52,27 @@
   .picture { background-image: url(images/wide.png); background-size: cover;
              height: 90px; color: #fff; padding: 8px; border-radius: 8px; margin: 8px 0;
              text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+  .g-serif { font-family: serif; }
+  .g-sans { font-family: sans-serif; }
+  .g-mono { font-family: monospace; }
+  .g-cursive { font-family: cursive; }
+  .g-fantasy { font-family: fantasy; }
+  .g-system { font-family: system-ui; }
+  .tracked { letter-spacing: 0.25em; }
+  .worded { word-spacing: 20px; }
+  .narrow { font-stretch: 62.5%; }
+  .varied { font-variation-settings: "wght" 350; }
+  .unsized { font-optical-sizing: none; font-size: 12px; }
+  .tiled { background-image: url(images/small.png); background-size: 32px 32px;
+           height: 90px; padding: 8px; margin: 8px 0; border-radius: 8px; }
+  .tiled-x { background-image: url(images/small.png); background-size: 32px 32px;
+             background-repeat: repeat-x; background-position: 0 50%;
+             height: 90px; padding: 8px; margin: 8px 0; background-color: #eef; }
+  .placed { background-image: url(images/small.png); background-size: 32px 32px;
+            background-repeat: no-repeat; background-position: right 10px center;
+            height: 60px; padding: 8px; margin: 8px 0; background-color: #eef; }
+  .rounded-tiles { background-image: url(images/small.png); background-size: 48px 48px;
+                   background-repeat: round; height: 96px; padding: 8px; margin: 8px 0; }
   .gradient { background: linear-gradient(to right, #06c, #0c6); color: #fff;
               padding: 8px; border-radius: 8px; margin: 8px 0; }
   .gradient-angle { background: linear-gradient(135deg, #309, #c39); color: #fff;
@@ -110,7 +131,15 @@ spread, several at once, painted behind the box in the order CSS gives them, and
 <code class="shadowed-text">text-shadow</code>, which is the same run of glyphs
 drawn behind itself.</p>
 <p><strong>Background pictures</strong>: <code>background-image: url()</code> with
-<code>cover</code>, <code>contain</code> or a size of its own, cut off at the box.</p>
+<code>cover</code>, <code>contain</code> or a size of its own, cut off at the box,
+tiled by <code>background-repeat</code> and placed by
+<code>background-position</code>.</p>
+<p><strong>Fonts</strong>: <code>font-family</code> down to the generic keywords,
+<code>font-size</code> — with monospace starting from a smaller base, as it does
+everywhere — <code>font-weight</code>, <code>font-style</code>,
+<code>font-stretch</code>, <code>letter-spacing</code>,
+<code>word-spacing</code>, and the variable-font pair
+<code>font-optical-sizing</code> and <code>font-variation-settings</code>.</p>
 <p><strong>Gradients</strong>: a <code>linear-gradient</code> background, by angle
 or by keyword, with stops that are spread evenly when they say nothing.</p>
 <p><strong>Grid</strong>: <code>display: grid</code> with
@@ -165,7 +194,8 @@ its own, so <code>overflow</code> does not yet stop one.</p>
 text, and <code>vertical-align</code> does not exist. Border styles other than
 solid are drawn solid, a border that is rounded and different on each side falls
 back to four square-cornered rectangles, and a rounded box clips its contents at a
-square edge. A background picture does not tile and cannot be positioned, an inset
+square edge. A background picture tiles and can be positioned, but
+<code>background-repeat: space</code> is drawn as <code>repeat</code>; an inset
 <code>box-shadow</code> is not drawn, and a background is one layer rather than
 several. A resize that no rule reads costs nothing — the sheets are
 parsed once and the cascade is skipped — but a resize that does change something
@@ -202,9 +232,26 @@ moves nothing else.</p>
   <p>Scroll the page to see it stop at the top and leave with its container.</p>
 </div>
 
+<h2>Fonts</h2>
+<p class="generics">Each generic keyword, at the same size:
+<span class="g-serif">serif</span>, <span class="g-sans">sans-serif</span>,
+<span class="g-mono">monospace</span>, <span class="g-cursive">cursive</span>,
+<span class="g-fantasy">fantasy</span>, <span class="g-system">system-ui</span>.</p>
+<p class="tracked">Letter-spacing, a quarter of an em, after every letter.</p>
+<p class="worded">Word spacing of twenty pixels between these words.</p>
+<p class="narrow">Condensed, if the family has a width axis or a narrow face.</p>
+<p class="varied">A weight of 350 asked for by axis, between the two named ones.</p>
+<p class="unsized">Optical sizing turned off, so the large-size design is drawn
+small.</p>
+
 <h2>Background pictures</h2>
 <div class="picture">A picture behind a box, sized with
 <code>background-size: cover</code> and cut off at the box's own rounded edge.</div>
+<div class="tiled">Tiled: the picture repeats both ways from the box's top left.</div>
+<div class="tiled-x">Tiled across only, and put halfway down the box.</div>
+<div class="placed">Placed once, ten pixels in from the right-hand edge.</div>
+<div class="rounded-tiles">Tiled with <code>round</code>, so a whole number of
+them fits across the box instead of the last one being cut off.</div>
 
 <h2>Shadows</h2>
 <div class="shadowed">A <code>box-shadow</code>, offset and blurred behind the box.</div>

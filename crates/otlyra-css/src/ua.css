@@ -13,8 +13,13 @@ blockquote, ul, ol, fieldset, textarea { display: block; }
 
 head, title, meta, link, style, script, base, template, noscript { display: none; }
 
-html { color: black; font-family: system-ui, sans-serif;
-       font-size: 16px; }
+/* Neither a font-size nor a font-family here, on purpose. Both initial values are
+   what a browser's own preferences answer: `medium` is sixteen pixels for prose and
+   thirteen for monospace, and the default family is the serif one. Writing a length
+   here would pin every descendant to it and take the monospace base away with it;
+   writing a family here would make a page that says nothing look unlike the same
+   page everywhere else. */
+html { color: black; }
 body { margin: 8px; }
 
 h1 { display: block; font-size: 2em;    font-weight: bold; margin: 0.67em 0; }

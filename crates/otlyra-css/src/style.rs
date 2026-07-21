@@ -224,6 +224,79 @@ pub enum BackgroundSize {
     Fixed(Length, Length),
 }
 
+/// `background-repeat` along one axis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Repeat {
+    /// Tiled, and cut off where the box ends.
+    Repeat,
+    /// Drawn once.
+    None,
+    /// Tiled, with the tile stretched or squeezed so a whole number of them fits.
+    Round,
+}
+
+/// `background-repeat`, which CSS gives per axis and a page usually gives once.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundRepeat {
+    /// Across.
+    pub x: Repeat,
+    /// Down.
+    pub y: Repeat,
+}
+
+impl BackgroundRepeat {
+    /// The initial value: tiled both ways.
+    pub const REPEAT: Self = Self {
+        x: Repeat::Repeat,
+        y: Repeat::Repeat,
+    };
+}
+
+/// One axis of `background-position`: a fraction of the room the picture leaves
+/// in its box, plus a length.
+///
+/// Both parts at once, because CSS needs both: `50%` is half of what is left over
+/// rather than half the box, and `right 10px` computes to a percentage *and* an
+/// offset. A percentage of nothing left over is nothing, which is why a picture as
+/// large as its box sits at the same place whatever the position says.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Anchor {
+    /// The fraction of the leftover room, 0–1 rather than 0–100.
+    pub fraction: f32,
+    /// A length added to it, in CSS pixels.
+    pub offset: f32,
+}
+
+impl Anchor {
+    /// The start edge, which is the initial value on both axes.
+    pub const START: Self = Self {
+        fraction: 0.0,
+        offset: 0.0,
+    };
+
+    /// Where the picture's own edge goes, given how much room it leaves.
+    pub fn resolve(self, free: f32) -> f32 {
+        self.fraction * free + self.offset
+    }
+}
+
+/// `background-position`, one anchor per axis.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BackgroundPosition {
+    /// Across.
+    pub x: Anchor,
+    /// Down.
+    pub y: Anchor,
+}
+
+impl BackgroundPosition {
+    /// The initial value: the box's own top left corner.
+    pub const START: Self = Self {
+        x: Anchor::START,
+        y: Anchor::START,
+    };
+}
+
 /// One `box-shadow`.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Shadow {
@@ -484,8 +557,10 @@ pub struct ComputedStyle {
     pub background_image: Option<Arc<str>>,
     /// How a background picture is sized against its box.
     pub background_size: BackgroundSize,
-    /// Whether a background picture is tiled.
-    pub background_repeat: bool,
+    /// Whether and how a background picture is tiled, per axis.
+    pub background_repeat: BackgroundRepeat,
+    /// Where a background picture sits in the box it is behind.
+    pub background_position: BackgroundPosition,
     /// `background-image`, when it is a gradient. A picture behind a box is not
     /// read yet; a gradient is, because it is what a page uses it for.
     pub background_gradient: Option<Gradient>,
@@ -497,6 +572,21 @@ pub struct ComputedStyle {
     pub font_weight: u16,
     /// `font-style`. Inherited.
     pub font_style: FontStyle,
+    /// `font-width` (`font-stretch`) as a percentage, 100 being normal. Inherited.
+    pub font_width: f32,
+    /// `font-optical-sizing`: whether the optical-size axis takes the font size.
+    /// Inherited.
+    pub optical_sizing: bool,
+    /// `font-variation-settings`: axis tags and values, ordered by tag rather than
+    /// as written, which is the order a shaper resolves a repeated tag in.
+    /// Inherited, and empty on almost every element there is — shared rather than
+    /// copied, because inheriting it is the common case and cloning a list per
+    /// element would be a cost every page pays for a property almost none uses.
+    pub font_variations: Arc<[([u8; 4], f32)]>,
+    /// `letter-spacing` in CSS pixels. Inherited.
+    pub letter_spacing: f32,
+    /// `word-spacing` in CSS pixels. Inherited.
+    pub word_spacing: f32,
     /// `line-height`. Inherited.
     pub line_height: LineHeight,
     /// `margin`.
@@ -589,13 +679,19 @@ impl Default for ComputedStyle {
             background_gradient: None,
             background_image: None,
             background_size: BackgroundSize::Auto,
-            background_repeat: true,
+            background_repeat: BackgroundRepeat::REPEAT,
+            background_position: BackgroundPosition::START,
             shadows: Vec::new(),
             text_shadows: Vec::new(),
-            font_family: Arc::from("system-ui, sans-serif"),
+            font_family: Arc::from("serif"),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
+            font_width: 100.0,
+            optical_sizing: true,
+            font_variations: Arc::from([] as [([u8; 4], f32); 0]),
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
             line_height: LineHeight::Normal,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::NONE,
@@ -649,6 +745,11 @@ impl ComputedStyle {
             font_size: parent.font_size,
             font_weight: parent.font_weight,
             font_style: parent.font_style,
+            font_width: parent.font_width,
+            optical_sizing: parent.optical_sizing,
+            font_variations: Arc::clone(&parent.font_variations),
+            letter_spacing: parent.letter_spacing,
+            word_spacing: parent.word_spacing,
             line_height: parent.line_height,
             white_space: parent.white_space,
             text_decoration: parent.text_decoration,

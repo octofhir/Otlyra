@@ -398,29 +398,36 @@ fn paint(
                 && rect.width > 0.0
                 && rect.height > 0.0
             {
-                let (width, height) = background_extent(&fragment.style, rect, &picture);
-                let scale = Affine::scale_non_uniform(
-                    f64::from(width) / f64::from(picture.width),
-                    f64::from(height) / f64::from(picture.height),
-                );
-
-                // A background belongs to its box: `cover` is meant to overflow and
-                // be cut off, not to spill onto whatever is drawn next. The box's
-                // own outline is the edge, so rounded corners cut the picture too.
-                list.push(DisplayItem::PushLayer {
-                    blend: otlyra_gfx::peniko::BlendMode::default(),
-                    alpha: 1.0,
-                    transform: Affine::IDENTITY,
-                    clip: box_shape(rect, scroll_y, &fragment.style),
-                });
-                list.push(DisplayItem::Image {
-                    image: otlyra_gfx::ImageResource::from(picture),
-                    sampler: otlyra_gfx::peniko::ImageSampler::default(),
-                    transform: Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)))
-                        * scale,
-                    clip_rect: None,
-                });
-                list.push(DisplayItem::PopLayer);
+                let tiling = background_tiling(&fragment.style, rect, &picture);
+                if tiling.covered.width > 0.0 && tiling.covered.height > 0.0 {
+                    // A background belongs to its box: `cover` is meant to overflow
+                    // and be cut off, not to spill onto whatever is drawn next. The
+                    // box's own outline is the edge, so rounded corners cut the
+                    // picture too.
+                    list.push(DisplayItem::PushLayer {
+                        blend: otlyra_gfx::peniko::BlendMode::default(),
+                        alpha: 1.0,
+                        transform: Affine::IDENTITY,
+                        clip: box_shape(rect, scroll_y, &fragment.style),
+                    });
+                    list.push(DisplayItem::Fill {
+                        style: Fill::NonZero,
+                        transform: Affine::IDENTITY,
+                        brush: Brush::Image(otlyra_gfx::peniko::ImageBrush {
+                            image: picture,
+                            sampler: tiling.sampler,
+                        }),
+                        brush_transform: Some(tiling.brush_transform(scroll_y)),
+                        shape: KurboRect::new(
+                            f64::from(tiling.covered.x),
+                            f64::from(tiling.covered.y - scroll_y),
+                            f64::from(tiling.covered.right()),
+                            f64::from(tiling.covered.bottom() - scroll_y),
+                        )
+                        .to_path(PATH_TOLERANCE),
+                    });
+                    list.push(DisplayItem::PopLayer);
+                }
             }
 
             // The gradient goes over the colour, which is the order CSS paints them
@@ -556,36 +563,134 @@ fn sticky_shift(
     0.0
 }
 
-/// How large a background picture is drawn.
+/// Where a background picture's tiles go.
 ///
-/// `cover` and `contain` are the two that need the picture's own proportions:
-/// one fills the box and is cropped, the other fits inside it whole. Neither
-/// tiles — repeating is a gap stated in the plan rather than a shape guessed at.
-fn background_extent(
+/// One tile is placed, and the rest follow from it: a repeating axis is left to the
+/// brush, which tiles a picture from wherever its transform puts it, and a
+/// non-repeating one is handled by not painting past the one tile — which is what
+/// `covered` is narrowed to. The alternative, an extend mode that puts nothing
+/// outside the picture, is not one a brush has.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct Tiling {
+    /// The first tile: where the picture's own top left corner lands, and how
+    /// large it is drawn.
+    tile: Rect,
+    /// The picture's own size in pixels, which the tile is scaled from.
+    own: (f32, f32),
+    /// The part of the box the picture reaches: the whole of it along an axis that
+    /// repeats, one tile's worth along one that does not.
+    covered: Rect,
+    /// How the brush repeats around the tile.
+    sampler: otlyra_gfx::peniko::ImageSampler,
+}
+
+impl Tiling {
+    /// The brush's own transform: the tile's corner and the scale it is drawn at.
+    fn brush_transform(&self, scroll_y: f32) -> Affine {
+        Affine::translate((f64::from(self.tile.x), f64::from(self.tile.y - scroll_y)))
+            * Affine::scale_non_uniform(
+                f64::from(self.tile.width) / f64::from(self.own.0),
+                f64::from(self.tile.height) / f64::from(self.own.1),
+            )
+    }
+}
+
+/// Work out that placement from the style, the box and the picture.
+///
+/// The area a picture is positioned in is the box inside its border, which is what
+/// CSS positions a background against however far the painting itself spreads.
+fn background_tiling(
     style: &otlyra_css::ComputedStyle,
     rect: Rect,
     picture: &otlyra_gfx::peniko::ImageData,
-) -> (f32, f32) {
-    let (own_width, own_height) = (picture.width as f32, picture.height as f32);
+) -> Tiling {
+    use otlyra_css::Repeat;
+    use otlyra_gfx::peniko::Extend;
+
+    let border = style.border;
+    let area = Rect::new(
+        rect.x + border.left.width,
+        rect.y + border.top.width,
+        (rect.width - border.left.width - border.right.width).max(0.0),
+        (rect.height - border.top.width - border.bottom.width).max(0.0),
+    );
+
+    let own = (picture.width as f32, picture.height as f32);
+    let (mut width, mut height) = background_extent(style, area, own);
+
+    // `round` squeezes or stretches the tile so a whole number of them fits, which
+    // is the whole of what it does — everything after it is the ordinary tiling.
+    let rounded = |extent: f32, along: f32| {
+        let count = (along / extent).round().max(1.0);
+        along / count
+    };
+    if style.background_repeat.x == Repeat::Round && width > 0.0 {
+        width = rounded(width, area.width);
+    }
+    if style.background_repeat.y == Repeat::Round && height > 0.0 {
+        height = rounded(height, area.height);
+    }
+
+    let x = area.x + style.background_position.x.resolve(area.width - width);
+    let y = area.y + style.background_position.y.resolve(area.height - height);
+    let tile = Rect::new(x, y, width, height);
+
+    // Along an axis that does not repeat, the picture reaches only as far as the
+    // one tile; along one that does, as far as the box.
+    let extent = |repeat: Repeat, start: f32, size: f32, area_start: f32, area_size: f32| {
+        if repeat == Repeat::None {
+            (start.max(area_start), size.min(area_size))
+        } else {
+            (area_start, area_size)
+        }
+    };
+    let (left, covered_width) = extent(style.background_repeat.x, x, width, area.x, area.width);
+    let (top, covered_height) = extent(style.background_repeat.y, y, height, area.y, area.height);
+
+    let axis = |repeat: Repeat| match repeat {
+        // Nothing is painted outside the one tile, so what the brush would put
+        // there never shows; clamping is the cheapest answer that cannot smear.
+        Repeat::None => Extend::Pad,
+        Repeat::Repeat | Repeat::Round => Extend::Repeat,
+    };
+
+    Tiling {
+        tile,
+        own,
+        covered: Rect::new(left, top, covered_width.max(0.0), covered_height.max(0.0)),
+        sampler: otlyra_gfx::peniko::ImageSampler {
+            x_extend: axis(style.background_repeat.x),
+            y_extend: axis(style.background_repeat.y),
+            ..Default::default()
+        },
+    }
+}
+
+/// How large one tile of a background picture is drawn.
+///
+/// `cover` and `contain` are the two that need the picture's own proportions: one
+/// fills the area and is cropped, the other fits inside it whole.
+fn background_extent(style: &otlyra_css::ComputedStyle, area: Rect, own: (f32, f32)) -> (f32, f32) {
+    let (own_width, own_height) = own;
     let ratio = own_width / own_height.max(1.0);
 
     match style.background_size {
         otlyra_css::BackgroundSize::Auto => (own_width, own_height),
         otlyra_css::BackgroundSize::Fixed(width, height) => {
-            (width.resolve(rect.width), height.resolve(rect.width))
+            (width.resolve(area.width), height.resolve(area.height))
         }
         otlyra_css::BackgroundSize::Cover => {
-            if rect.width / rect.height.max(1.0) > ratio {
-                (rect.width, rect.width / ratio)
+            if area.width / area.height.max(1.0) > ratio {
+                (area.width, area.width / ratio)
             } else {
-                (rect.height * ratio, rect.height)
+                (area.height * ratio, area.height)
             }
         }
         otlyra_css::BackgroundSize::Contain => {
-            if rect.width / rect.height.max(1.0) > ratio {
-                (rect.height * ratio, rect.height)
+            if area.width / area.height.max(1.0) > ratio {
+                (area.height * ratio, area.height)
             } else {
-                (rect.width, rect.width / ratio)
+                (area.width, area.width / ratio)
             }
         }
     }
@@ -1226,14 +1331,14 @@ mod tests {
         assert_eq!(shadow_at[5] - text_at[5], 3.0, "and down by three");
     }
 
-    /// A picture named by a rule is drawn behind the box, sized as the rule says.
-    #[test]
-    fn a_background_picture_is_drawn_behind_its_box() {
-        let parsed = otlyra_html::parse(
-            b"<style>body { margin: 0 } div { height: 50px; width: 200px; \
-              background-image: url(behind.png); background-size: cover }</style><div></div>",
-            Some("utf-8"),
+    /// The one tile a background picture is placed by: where it starts, how large
+    /// it is, and how far the fill that repeats it reaches.
+    fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::ImageSampler) {
+        let source = format!(
+            "<style>body {{ margin: 0 }} div {{ height: 50px; width: 200px; \
+             background-image: url(behind.png); {declarations} }}</style><div></div>"
         );
+        let parsed = otlyra_html::parse(source.as_bytes(), Some("utf-8"));
         let styles = otlyra_css::cascade::style_document(
             &parsed.document,
             otlyra_css::cascade::Viewport {
@@ -1253,8 +1358,8 @@ mod tests {
             },
         );
 
-        // A twenty by ten picture: `cover` should draw it 200 wide and 100 tall,
-        // cropped by the box rather than squashed into it.
+        // A twenty by ten picture, so its own proportions are visible in what
+        // `cover` and `contain` make of it.
         let picture = otlyra_gfx::peniko::ImageData {
             data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; 20 * 10 * 4])),
             format: otlyra_gfx::peniko::ImageFormat::Rgba8,
@@ -1272,25 +1377,128 @@ mod tests {
             },
         );
 
-        let (width, height) = list
-            .items()
+        list.items()
             .iter()
             .find_map(|item| match item {
-                DisplayItem::Image {
-                    image, transform, ..
+                DisplayItem::Fill {
+                    brush: Brush::Image(image),
+                    brush_transform: Some(transform),
+                    shape,
+                    ..
                 } => {
                     let coeffs = transform.as_coeffs();
+                    let tile = Rect::new(
+                        coeffs[4] as f32,
+                        coeffs[5] as f32,
+                        (coeffs[0] * f64::from(image.image.width)) as f32,
+                        (coeffs[3] * f64::from(image.image.height)) as f32,
+                    );
+                    let covered = shape.bounding_box();
                     Some((
-                        coeffs[0] * f64::from(image.width),
-                        coeffs[3] * f64::from(image.height),
+                        tile,
+                        Rect::new(
+                            covered.x0 as f32,
+                            covered.y0 as f32,
+                            covered.width() as f32,
+                            covered.height() as f32,
+                        ),
+                        image.sampler,
                     ))
                 }
                 _ => None,
             })
-            .expect("a background picture");
+            .expect("a background picture")
+    }
 
-        assert_eq!(width, 200.0, "cover fills the box across");
-        assert_eq!(height, 100.0, "and overflows it down rather than squashing");
+    /// A picture named by a rule is drawn behind the box, sized as the rule says.
+    #[test]
+    fn a_background_picture_is_drawn_behind_its_box() {
+        let (tile, _, _) = background_tile("background-size: cover");
+        assert_eq!(tile.width, 200.0, "cover fills the box across");
+        assert_eq!(
+            tile.height, 100.0,
+            "and overflows it down rather than squashing"
+        );
+
+        let (tile, _, _) = background_tile("background-size: contain");
+        assert_eq!(tile.width, 100.0, "contain fits inside the box");
+        assert_eq!(tile.height, 50.0, "whole");
+    }
+
+    /// A picture tiles by default, and the fill that carries it covers the box; one
+    /// told not to repeat covers exactly one tile, which is what keeps a brush that
+    /// has no way to put nothing outside a picture from smearing its edge.
+    #[test]
+    fn a_background_picture_tiles_unless_told_not_to() {
+        use otlyra_gfx::peniko::Extend;
+
+        let (tile, covered, sampler) = background_tile("");
+        assert_eq!((tile.width, tile.height), (20.0, 10.0), "its own size");
+        assert_eq!(covered, Rect::new(0.0, 0.0, 200.0, 50.0), "the whole box");
+        assert_eq!(sampler.x_extend, Extend::Repeat);
+        assert_eq!(sampler.y_extend, Extend::Repeat);
+
+        let (_, covered, sampler) = background_tile("background-repeat: no-repeat");
+        assert_eq!(covered, Rect::new(0.0, 0.0, 20.0, 10.0), "one tile");
+        assert_eq!(sampler.x_extend, Extend::Pad);
+
+        let (_, covered, sampler) = background_tile("background-repeat: repeat-x");
+        assert_eq!(
+            covered,
+            Rect::new(0.0, 0.0, 200.0, 10.0),
+            "a band across the box"
+        );
+        assert_eq!(sampler.x_extend, Extend::Repeat);
+        assert_eq!(sampler.y_extend, Extend::Pad);
+    }
+
+    /// A position moves the tile within the room the picture leaves in its box,
+    /// which is why a percentage is not a percentage of the box.
+    #[test]
+    fn a_background_position_moves_the_tile_by_what_is_left_over() {
+        let (tile, _, _) =
+            background_tile("background-repeat: no-repeat; background-position: 0 0");
+        assert_eq!((tile.x, tile.y), (0.0, 0.0));
+
+        // 180 across and 40 down are what a twenty by ten picture leaves.
+        let (tile, _, _) =
+            background_tile("background-repeat: no-repeat; background-position: 50% 50%");
+        assert_eq!((tile.x, tile.y), (90.0, 20.0));
+
+        let (tile, _, _) =
+            background_tile("background-repeat: no-repeat; background-position: right bottom");
+        assert_eq!((tile.x, tile.y), (180.0, 40.0));
+
+        let (tile, _, _) = background_tile(
+            "background-repeat: no-repeat; background-position: right 10px top 4px",
+        );
+        assert_eq!((tile.x, tile.y), (170.0, 4.0));
+    }
+
+    /// `round` squeezes the tile so a whole number of them fits the box, which is
+    /// the whole of the difference between it and `repeat`.
+    #[test]
+    fn round_fits_a_whole_number_of_tiles() {
+        // A thirty-pixel tile across two hundred: seven of them at 28.57 rather
+        // than six and two thirds at thirty.
+        let (tile, _, _) = background_tile("background-repeat: round; background-size: 30px 10px");
+        assert!(
+            (tile.width - 200.0 / 7.0).abs() < 0.01,
+            "tile was {} wide",
+            tile.width
+        );
+        assert!((tile.height - 10.0).abs() < 0.01, "and untouched down");
+    }
+
+    /// A background is positioned against the box inside its border, however far
+    /// the painting itself spreads.
+    #[test]
+    fn a_background_is_positioned_inside_the_border() {
+        let (tile, covered, _) = background_tile(
+            "border: 5px solid black; background-repeat: no-repeat; background-position: 0 0",
+        );
+        assert_eq!((tile.x, tile.y), (5.0, 5.0));
+        assert_eq!(covered, Rect::new(5.0, 5.0, 20.0, 10.0));
     }
 
     /// A sticky heading rides with the page, stops at its inset, and is carried off

@@ -67,30 +67,36 @@ pub enum Family {
     Generic(GenericFamily),
 }
 
+/// The last resort behind every stack: the browser's standard font.
+///
+/// CSS says a list with nothing in it that matches falls back to the font the
+/// browser would have used anyway, and every browser makes that a serif.
+const STANDARD: GenericFamily = GenericFamily::Serif;
+
 /// An ordered list of families, tried left to right.
 ///
 /// This is the value of CSS `font-family`. It is always non-empty: a stack with no
 /// usable entry would leave the shaper with nothing to fall back to, so
-/// [`FontStack::new`] appends `sans-serif` when the caller supplies none.
+/// [`FontStack::new`] appends the standard font when the caller supplies no generic.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontStack {
     families: Vec<Family>,
 }
 
 impl FontStack {
-    /// Build a stack, appending `sans-serif` if `families` contains no generic.
+    /// Build a stack, appending the standard font if `families` contains no generic.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Self {
         let mut families: Vec<Family> = families.into_iter().collect();
         let has_generic = families
             .iter()
             .any(|family| matches!(family, Family::Generic(_)));
         if !has_generic {
-            families.push(Family::Generic(GenericFamily::SansSerif));
+            families.push(Family::Generic(STANDARD));
         }
         Self { families }
     }
 
-    /// A stack of one named family, plus the implied `sans-serif` fallback.
+    /// A stack of one named family, plus the implied fallback behind it.
     pub fn named(name: impl Into<String>) -> Self {
         Self::new([Family::Named(name.into())])
     }
@@ -152,7 +158,7 @@ impl FontStack {
 
 impl Default for FontStack {
     fn default() -> Self {
-        Self::generic(GenericFamily::SansSerif)
+        Self::generic(STANDARD)
     }
 }
 
@@ -167,7 +173,7 @@ mod tests {
             stack.families(),
             [
                 Family::Named("Helvetica".to_owned()),
-                Family::Generic(GenericFamily::SansSerif)
+                Family::Generic(GenericFamily::Serif)
             ]
         );
     }
@@ -200,7 +206,7 @@ mod tests {
             stack.families(),
             [
                 Family::Named("monospace".to_owned()),
-                Family::Generic(GenericFamily::SansSerif),
+                Family::Generic(GenericFamily::Serif),
             ]
         );
     }
@@ -221,9 +227,6 @@ mod tests {
     #[test]
     fn an_empty_list_still_yields_a_usable_stack() {
         let stack = FontStack::parse_css("");
-        assert_eq!(
-            stack.families(),
-            [Family::Generic(GenericFamily::SansSerif)]
-        );
+        assert_eq!(stack.families(), [Family::Generic(GenericFamily::Serif)]);
     }
 }

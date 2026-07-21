@@ -162,12 +162,58 @@ impl TypefaceCache {
                 font_mgr.new_from_data(&extracted, 0)?
             }
         };
-        let typeface = instantiate(&base, normalized_coords).unwrap_or(base);
+        let typeface = instantiate(
+            &base,
+            normalized_coords,
+            &axis_segment_maps(bytes, index as usize),
+        )
+        .unwrap_or(base);
 
         self.entries
             .push((key, index, normalized_coords.to_vec(), typeface.clone()));
         Some(typeface)
     }
+}
+
+/// Read a big-endian `u32` at `at`.
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Read a big-endian `u16` at `at`.
+fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+}
+
+/// Where face `index`'s table directory starts, in a font file or a collection.
+fn table_directory(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(..4)? != b"ttcf" {
+        return (index == 0).then_some(0);
+    }
+    let faces = u32_at(bytes, 8)? as usize;
+    if index >= faces {
+        return None;
+    }
+    Some(u32_at(bytes, 12 + index * 4)? as usize)
+}
+
+/// One table of one face, by tag.
+fn table<'a>(bytes: &'a [u8], index: usize, tag: &[u8; 4]) -> Option<&'a [u8]> {
+    const HEADER: usize = 12;
+    const RECORD: usize = 16;
+
+    let directory = table_directory(bytes, index)?;
+    let tables = u16_at(bytes, directory + 4)? as usize;
+    for table in 0..tables {
+        let record = directory + HEADER + table * RECORD;
+        if bytes.get(record..record + 4)? != tag {
+            continue;
+        }
+        let offset = u32_at(bytes, record + 8)? as usize;
+        let length = u32_at(bytes, record + 12)? as usize;
+        return bytes.get(offset..offset + length);
+    }
+    None
 }
 
 /// Lift one face out of a font collection into a font of its own.
@@ -178,24 +224,13 @@ impl TypefaceCache {
 /// and fixes the offsets. Checksums are the originals and stay correct, because no
 /// table's bytes change.
 fn face_from_collection(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
-    /// Read a big-endian `u32` at `at`.
-    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-    }
-    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-        Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
-    }
-
     if bytes.get(..4)? != b"ttcf" {
         return None;
     }
     let faces = u32_at(bytes, 8)? as usize;
-    if index >= faces {
-        return None;
-    }
 
     // The face's own table directory.
-    let directory = u32_at(bytes, 12 + index * 4)? as usize;
+    let directory = table_directory(bytes, index)?;
     let sfnt_version = u32_at(bytes, directory)?;
     let tables = u16_at(bytes, directory + 4)? as usize;
 
@@ -244,19 +279,98 @@ fn face_from_collection(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// One axis's `avar` segment map: pairs of coordinates, both normalized, the first
+/// what the linear normalization produced and the second what the font wants used.
+///
+/// Empty when the font has no such table, which means the identity.
+type SegmentMap = Vec<(f32, f32)>;
+
+/// The `avar` segment maps of a face, one per variation axis, in `fvar` order.
+///
+/// Only the version 1 body is read. Version 2 keeps that body byte for byte and
+/// adds a second, item-variation-store stage after it, so what is read here is
+/// still the right first half of a version 2 mapping.
+fn axis_segment_maps(bytes: &[u8], index: usize) -> Vec<SegmentMap> {
+    fn parse(table: &[u8]) -> Option<Vec<SegmentMap>> {
+        fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+            Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+        }
+        fn f2dot14_at(bytes: &[u8], at: usize) -> Option<f32> {
+            Some(f32::from(i16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?)) / 16384.0)
+        }
+
+        if u16_at(table, 0)? != 1 && u16_at(table, 0)? != 2 {
+            return None;
+        }
+        let axes = u16_at(table, 6)? as usize;
+        let mut maps = Vec::with_capacity(axes);
+        let mut at = 8;
+        for _ in 0..axes {
+            let pairs = u16_at(table, at)? as usize;
+            at += 2;
+            let mut map = Vec::with_capacity(pairs);
+            for _ in 0..pairs {
+                map.push((f2dot14_at(table, at)?, f2dot14_at(table, at + 2)?));
+                at += 4;
+            }
+            maps.push(map);
+        }
+        Some(maps)
+    }
+
+    table(bytes, index, b"avar")
+        .and_then(parse)
+        .unwrap_or_default()
+}
+
+/// Undo one axis's `avar` mapping: the coordinate that maps *to* `mapped`.
+///
+/// The table's `to` coordinates are required to be non-decreasing, so the segment
+/// containing `mapped` is found by walking them and the position within it is the
+/// same linear interpolation the forward direction uses. A segment with no width
+/// cannot be inverted and gives back its own start, which is the only answer that
+/// is in range.
+fn unmap_axis(map: &SegmentMap, mapped: f32) -> f32 {
+    if map.len() < 2 {
+        return mapped;
+    }
+    if mapped <= map[0].1 {
+        return map[0].0;
+    }
+    for pair in map.windows(2) {
+        let ((from_low, to_low), (from_high, to_high)) = (pair[0], pair[1]);
+        if mapped <= to_high {
+            let span = to_high - to_low;
+            if span <= 0.0 {
+                return from_low;
+            }
+            return from_low + (mapped - to_low) / span * (from_high - from_low);
+        }
+    }
+    map[map.len() - 1].0
+}
+
 /// Build the variable-font instance the shaper asked for.
 ///
 /// The shaper reports the position it chose as **normalized** coordinates — the
 /// OpenType convention where each axis runs -1 to 1 around its default — while Skia
-/// wants design-space values. The mapping is linear on each side of the default,
-/// which is the same conversion the specification defines, minus `avar`: a font with
-/// an axis-variation table will land slightly off the requested weight. That is a
-/// visible-if-you-look difference, not a missing feature, and it costs no glyphs.
+/// wants design-space values, and normalizes them again itself. So this runs the
+/// conversion backwards: undo the font's own `avar` mapping, then undo the linear
+/// normalization, which is linear on each side of the default.
 ///
-/// Without this, every variable font renders at its default instance — and on macOS
-/// the system UI font is variable, so `<b>` and every heading come out at regular
-/// weight. That is what this exists to fix.
-fn instantiate(typeface: &sk::Typeface, normalized_coords: &[i16]) -> Option<sk::Typeface> {
+/// Skipping `avar` was the earlier shape of this, and it lands a font that has the
+/// table off the position it was shaped at — on this platform, the system interface
+/// font's optical-size axis is mapped that way, so the glyphs are painted from a
+/// slightly different design to the one they were measured in.
+///
+/// Without any of this, a variable font renders at its default instance — on this
+/// platform the system interface font is variable, so `<b>` and every heading come
+/// out at regular weight. That is what this exists to fix.
+fn instantiate(
+    typeface: &sk::Typeface,
+    normalized_coords: &[i16],
+    segment_maps: &[SegmentMap],
+) -> Option<sk::Typeface> {
     if normalized_coords.is_empty() {
         return None;
     }
@@ -265,9 +379,14 @@ fn instantiate(typeface: &sk::Typeface, normalized_coords: &[i16]) -> Option<sk:
     let coordinates: Vec<sk::font_arguments::variation_position::Coordinate> = axes
         .iter()
         .zip(normalized_coords)
-        .map(|(axis, &normalized)| {
+        .enumerate()
+        .map(|(index, (axis, &normalized))| {
             // F2Dot14: 1.0 is 16384.
             let normalized = f32::from(normalized) / 16384.0;
+            let normalized = match segment_maps.get(index) {
+                Some(map) => unmap_axis(map, normalized),
+                None => normalized,
+            };
             let value = if normalized >= 0.0 {
                 axis.def + normalized * (axis.max - axis.def)
             } else {
@@ -505,13 +624,50 @@ fn to_skia_paint(brush: BrushRef<'_>, brush_transform: Option<Affine>) -> sk::Pa
                 paint.set_color4f(to_skia_color(color), None);
             }
         },
-        BrushRef::Image(_) => {
-            tracing::warn!("image brushes are not lowered to skia yet; using transparent black");
-            paint.set_color4f(to_skia_color(Color::TRANSPARENT), None);
-        }
+        BrushRef::Image(image) => match to_skia_image_shader(image, brush_transform) {
+            Some(shader) => {
+                paint.set_shader(shader);
+                paint.set_alpha_f(image.sampler.alpha);
+            }
+            None => {
+                paint.set_color4f(to_skia_color(Color::TRANSPARENT), None);
+            }
+        },
     }
 
     paint
+}
+
+/// A picture as a shader, so a shape can be filled with it repeated.
+///
+/// This is what tiles a background: one fill of the box rather than one drawing
+/// command per tile, which is the difference between a small texture costing
+/// nothing and costing a display-list item per square it covers.
+///
+/// The brush transform is the shader's own: it says where the picture's top left
+/// corner lands and how large one tile is drawn, both in the space the shape is in.
+fn to_skia_image_shader(
+    image: ImageBrushRef<'_>,
+    brush_transform: Option<Affine>,
+) -> Option<sk::Shader> {
+    fn tile_mode(extend: peniko::Extend) -> sk::TileMode {
+        match extend {
+            peniko::Extend::Pad => sk::TileMode::Clamp,
+            peniko::Extend::Repeat => sk::TileMode::Repeat,
+            peniko::Extend::Reflect => sk::TileMode::Mirror,
+        }
+    }
+
+    let sk_image = to_skia_image(image.image)?;
+    let matrix = brush_transform.map(to_skia_matrix);
+    sk_image.to_shader(
+        Some((
+            tile_mode(image.sampler.x_extend),
+            tile_mode(image.sampler.y_extend),
+        )),
+        to_skia_sampling(image.sampler.quality),
+        matrix.as_ref(),
+    )
 }
 
 /// Lower a peniko gradient to a Skia shader.
@@ -789,49 +945,7 @@ impl PaintTarget for SkiaPainter {
     }
 
     fn draw_image(&mut self, image: ImageBrushRef<'_>, transform: Affine, clip_rect: Option<Rect>) {
-        let data = image.image;
-        let Some(expected) = data.format.size_in_bytes(data.width, data.height) else {
-            tracing::error!(
-                width = data.width,
-                height = data.height,
-                "image dimensions overflow"
-            );
-            return;
-        };
-        if data.data.as_ref().len() < expected {
-            tracing::error!(
-                got = data.data.as_ref().len(),
-                expected,
-                "image buffer is smaller than its dimensions claim"
-            );
-            return;
-        }
-
-        let color_type = match data.format {
-            peniko::ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
-            peniko::ImageFormat::Bgra8 => sk::ColorType::BGRA8888,
-            // `ImageFormat` is non-exhaustive; an unknown format is better dropped
-            // loudly than guessed at.
-            other => {
-                tracing::error!(?other, "unsupported image format");
-                return;
-            }
-        };
-        let alpha_type = match data.alpha_type {
-            peniko::ImageAlphaType::Alpha => sk::AlphaType::Unpremul,
-            peniko::ImageAlphaType::AlphaPremultiplied => sk::AlphaType::Premul,
-        };
-
-        let info = sk::ImageInfo::new(
-            (data.width as i32, data.height as i32),
-            color_type,
-            alpha_type,
-            None,
-        );
-        let row_bytes = data.width as usize * 4;
-        let pixels = sk::Data::new_copy(&data.data.as_ref()[..expected]);
-        let Some(sk_image) = sk::images::raster_from_data(&info, pixels, row_bytes) else {
-            tracing::error!("skia rejected the image data");
+        let Some(sk_image) = to_skia_image(image.image) else {
             return;
         };
 
@@ -839,12 +953,7 @@ impl PaintTarget for SkiaPainter {
         paint.set_anti_alias(true);
         paint.set_alpha_f(image.sampler.alpha);
 
-        let sampling = match image.sampler.quality {
-            peniko::ImageQuality::Low => {
-                sk::SamplingOptions::new(sk::FilterMode::Nearest, sk::MipmapMode::None)
-            }
-            _ => sk::SamplingOptions::new(sk::FilterMode::Linear, sk::MipmapMode::Linear),
-        };
+        let sampling = to_skia_sampling(image.sampler.quality);
 
         let canvas = self.canvas();
         canvas.save();
@@ -863,6 +972,68 @@ impl PaintTarget for SkiaPainter {
         }
         canvas.draw_image_with_sampling_options(&sk_image, (0.0, 0.0), sampling, Some(&paint));
         canvas.restore();
+    }
+}
+
+/// Wrap decoded pixels in a Skia image, or refuse them loudly.
+///
+/// The buffer is checked against the dimensions it claims before Skia is handed a
+/// pointer to it: a short buffer here is a read past the end of an allocation.
+fn to_skia_image(data: &peniko::ImageData) -> Option<sk::Image> {
+    let Some(expected) = data.format.size_in_bytes(data.width, data.height) else {
+        tracing::error!(
+            width = data.width,
+            height = data.height,
+            "image dimensions overflow"
+        );
+        return None;
+    };
+    if data.data.as_ref().len() < expected {
+        tracing::error!(
+            got = data.data.as_ref().len(),
+            expected,
+            "image buffer is smaller than its dimensions claim"
+        );
+        return None;
+    }
+
+    let color_type = match data.format {
+        peniko::ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
+        peniko::ImageFormat::Bgra8 => sk::ColorType::BGRA8888,
+        // `ImageFormat` is non-exhaustive; an unknown format is better dropped
+        // loudly than guessed at.
+        other => {
+            tracing::error!(?other, "unsupported image format");
+            return None;
+        }
+    };
+    let alpha_type = match data.alpha_type {
+        peniko::ImageAlphaType::Alpha => sk::AlphaType::Unpremul,
+        peniko::ImageAlphaType::AlphaPremultiplied => sk::AlphaType::Premul,
+    };
+
+    let info = sk::ImageInfo::new(
+        (data.width as i32, data.height as i32),
+        color_type,
+        alpha_type,
+        None,
+    );
+    let row_bytes = data.width as usize * 4;
+    let pixels = sk::Data::new_copy(&data.data.as_ref()[..expected]);
+    let image = sk::images::raster_from_data(&info, pixels, row_bytes);
+    if image.is_none() {
+        tracing::error!("skia rejected the image data");
+    }
+    image
+}
+
+/// How a picture is sampled when it is drawn at other than its own size.
+fn to_skia_sampling(quality: peniko::ImageQuality) -> sk::SamplingOptions {
+    match quality {
+        peniko::ImageQuality::Low => {
+            sk::SamplingOptions::new(sk::FilterMode::Nearest, sk::MipmapMode::None)
+        }
+        _ => sk::SamplingOptions::new(sk::FilterMode::Linear, sk::MipmapMode::Linear),
     }
 }
 
@@ -957,6 +1128,62 @@ mod tests {
             [0xff, 0xff, 0xff, 0xff],
             "outside the rect"
         );
+    }
+
+    /// A shape filled with a picture repeats it across the shape, and the brush
+    /// transform is what says where one tile starts and how large it is. This is
+    /// how a background tiles: one fill, not one command per tile.
+    #[test]
+    fn a_shape_filled_with_a_picture_repeats_it() {
+        // Two pixels: red at the top left, blue at the bottom right, so a tile's
+        // own orientation is visible in the result.
+        let image = peniko::ImageData {
+            data: peniko::Blob::new(std::sync::Arc::new(vec![
+                0xff, 0x00, 0x00, 0xff, // red
+                0xff, 0x00, 0x00, 0xff, // red
+                0x00, 0x00, 0xff, 0xff, // blue
+                0x00, 0x00, 0xff, 0xff, // blue
+            ])),
+            format: peniko::ImageFormat::Rgba8,
+            alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+            width: 2,
+            height: 2,
+        };
+        let brush = peniko::Brush::Image(peniko::ImageBrush {
+            image,
+            sampler: peniko::ImageSampler {
+                x_extend: peniko::Extend::Repeat,
+                y_extend: peniko::Extend::Repeat,
+                quality: peniko::ImageQuality::Low,
+                alpha: 1.0,
+            },
+        });
+
+        let mut painter = SkiaPainter::new_raster(16, 16).expect("16x16 raster surface");
+        painter.clear(Color::WHITE);
+        // Four-pixel tiles, so each source pixel is two device pixels across.
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            (&brush).into(),
+            Some(Affine::scale(2.0)),
+            &Rect::new(0.0, 0.0, 16.0, 16.0),
+        );
+
+        let pixels = painter.read_rgba8().expect("read back");
+        // The first tile, and the third one along: the same picture, repeated.
+        for x in [1, 9] {
+            assert_eq!(
+                pixel_at(&pixels, 16, x, 1),
+                [0xff, 0x00, 0x00, 0xff],
+                "the top of a tile at x={x}"
+            );
+            assert_eq!(
+                pixel_at(&pixels, 16, x, 3),
+                [0x00, 0x00, 0xff, 0xff],
+                "and the bottom of it"
+            );
+        }
     }
 
     #[test]
@@ -1139,5 +1366,97 @@ mod collection_tests {
     fn only_a_real_collection_is_taken_apart() {
         assert!(face_from_collection(b"not a font at all", 0).is_none());
         assert!(face_from_collection(&collection(), 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod variation_tests {
+    use super::{SegmentMap, axis_segment_maps, unmap_axis};
+
+    /// A font of one table: an `avar` with the given per-axis maps.
+    fn font_with_avar(maps: &[&[(f32, f32)]]) -> Vec<u8> {
+        let f2dot14 = |value: f32| ((value * 16384.0).round() as i16).to_be_bytes();
+
+        let mut avar = Vec::new();
+        avar.extend_from_slice(&1u16.to_be_bytes());
+        avar.extend_from_slice(&0u16.to_be_bytes());
+        avar.extend_from_slice(&0u16.to_be_bytes());
+        avar.extend_from_slice(&(maps.len() as u16).to_be_bytes());
+        for map in maps {
+            avar.extend_from_slice(&(map.len() as u16).to_be_bytes());
+            for &(from, to) in *map {
+                avar.extend_from_slice(&f2dot14(from));
+                avar.extend_from_slice(&f2dot14(to));
+            }
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        let offset = (out.len() + 16) as u32;
+        out.extend_from_slice(b"avar");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&(avar.len() as u32).to_be_bytes());
+        out.extend_from_slice(&avar);
+        out
+    }
+
+    #[test]
+    fn segment_maps_are_read_one_per_axis() {
+        let identity: &[(f32, f32)] = &[(-1.0, -1.0), (0.0, 0.0), (1.0, 1.0)];
+        let bent: &[(f32, f32)] = &[(-1.0, -1.0), (-0.5, -0.25), (0.0, 0.0), (1.0, 1.0)];
+        let maps = axis_segment_maps(&font_with_avar(&[identity, bent]), 0);
+
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].len(), 3);
+        assert_eq!(maps[1], bent.to_vec());
+    }
+
+    /// A font with no such table maps nothing, and the caller must then treat every
+    /// axis as unmapped rather than as mapped by an empty table.
+    #[test]
+    fn a_font_without_the_table_has_no_maps() {
+        assert!(axis_segment_maps(b"not a font at all", 0).is_empty());
+        assert!(axis_segment_maps(&font_with_avar(&[]), 0).is_empty());
+    }
+
+    /// The inverse of the mapping is the mapping run backwards: whatever the
+    /// forward direction sends to a coordinate is what comes back from it.
+    #[test]
+    fn the_inverse_undoes_the_mapping() {
+        let map: SegmentMap = vec![(-1.0, -1.0), (-0.5, -0.25), (0.0, 0.0), (1.0, 1.0)];
+
+        // Segment ends land exactly.
+        assert!((unmap_axis(&map, -1.0) - -1.0).abs() < 1e-6);
+        assert!((unmap_axis(&map, -0.25) - -0.5).abs() < 1e-6);
+        assert!((unmap_axis(&map, 0.0)).abs() < 1e-6);
+        assert!((unmap_axis(&map, 1.0) - 1.0).abs() < 1e-6);
+
+        // And so does the middle of one: halfway from -1 to -0.25 in the mapped
+        // coordinate is halfway from -1 to -0.5 in the unmapped one.
+        assert!((unmap_axis(&map, -0.625) - -0.75).abs() < 1e-6);
+    }
+
+    /// An axis the font does not bend, and one it does not describe at all, both
+    /// come back untouched — the identity is the only safe answer.
+    #[test]
+    fn an_unmapped_axis_is_left_alone() {
+        let identity: SegmentMap = vec![(-1.0, -1.0), (0.0, 0.0), (1.0, 1.0)];
+        for value in [-1.0, -0.3, 0.0, 0.75, 1.0] {
+            assert!((unmap_axis(&identity, value) - value).abs() < 1e-6);
+            assert!((unmap_axis(&Vec::new(), value) - value).abs() < 1e-6);
+        }
+    }
+
+    /// Past either end the mapping stops rather than being extrapolated: a
+    /// coordinate is already clamped to -1..1 before it gets here, and running a
+    /// segment on past its own end is how a wrong instance is asked for.
+    #[test]
+    fn the_inverse_does_not_run_past_the_table() {
+        let map: SegmentMap = vec![(-0.5, -0.5), (0.5, 0.25)];
+        assert!((unmap_axis(&map, -1.0) - -0.5).abs() < 1e-6);
+        assert!((unmap_axis(&map, 1.0) - 0.5).abs() < 1e-6);
     }
 }

@@ -2559,6 +2559,7 @@ version = "0.0.0"
 dependencies = [
  "otlyra-gfx",
  "parley",
+ "skrifa",
  "tracing",
 ]
 

@@ -12,10 +12,10 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    AlignItems, BackgroundSize, Border, Clear, ComputedStyle, Corners, Display, FlexDirection,
-    FlexWrap, Float, FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto,
-    LineHeight, Overflow, Placement, Position, Shadow, Sides, TextAlign, TextDecoration, Track,
-    WhiteSpace,
+    AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border, Clear,
+    ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient,
+    GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow, Placement, Position,
+    Repeat, Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -39,6 +39,20 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         } else {
             FontStyle::Italic
         },
+        font_width: font.font_stretch.to_percentage().0 * 100.0,
+        optical_sizing: optical_sizing(values),
+        font_variations: font_variations(values),
+        letter_spacing: values
+            .get_inherited_text()
+            .letter_spacing
+            .0
+            .resolve(style::values::computed::Length::new(font_size))
+            .px(),
+        word_spacing: values
+            .get_inherited_text()
+            .word_spacing
+            .resolve(style::values::computed::Length::new(font_size))
+            .px(),
         line_height: line_height(values),
         white_space: white_space(values),
         text_decoration: text_decoration(values),
@@ -81,6 +95,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         background_image: background_image(values),
         background_size: background_size(values),
         background_repeat: background_repeat(values),
+        background_position: background_position(values),
         shadows: shadows(values),
         text_shadows: text_shadows(values),
         grid_columns: tracks(&values.get_position().grid_template_columns),
@@ -173,14 +188,20 @@ fn font_family(values: &ComputedValues) -> Arc<str> {
                 GenericFontFamily::Cursive => Some("cursive".to_owned()),
                 GenericFontFamily::Fantasy => Some("fantasy".to_owned()),
                 GenericFontFamily::SystemUi => Some("system-ui".to_owned()),
-                // An internal placeholder, not a family anything can be matched to.
+                // Not a family: the engine's placeholder for "whatever the browser
+                // calls its standard font", which is the initial value and so is
+                // what every element that says nothing has.
                 GenericFontFamily::None => None,
             },
         })
         .collect();
 
     if families.is_empty() {
-        Arc::from("sans-serif")
+        // The standard font, which every browser sets to a serif — and which
+        // `medium` is sixteen pixels of, the pair being two halves of one
+        // preference. A page that says nothing about its font should look like the
+        // same page does everywhere else.
+        Arc::from("serif")
     } else {
         Arc::from(families.join(", "))
     }
@@ -313,14 +334,78 @@ fn background_size(values: &ComputedValues) -> BackgroundSize {
     }
 }
 
-/// Whether the topmost background layer repeats. `no-repeat` on either axis is
-/// taken as not repeating at all, which is the distinction paint can act on.
-fn background_repeat(values: &ComputedValues) -> bool {
+/// `font-optical-sizing`, which is `auto` unless a page turns it off.
+fn optical_sizing(values: &ComputedValues) -> bool {
+    use style::computed_values::font_optical_sizing::T as Computed;
+
+    values.get_font().font_optical_sizing == Computed::Auto
+}
+
+/// `font-variation-settings`: the axes a page names and the values it wants.
+///
+/// Shared rather than copied, so an element that merely inherits the property —
+/// which is every element on every page that uses it, and every element on every
+/// page that does not — costs a refcount rather than a list.
+fn font_variations(values: &ComputedValues) -> Arc<[([u8; 4], f32)]> {
+    let settings = &values.get_font().font_variation_settings.0;
+    if settings.is_empty() {
+        return Arc::from([] as [([u8; 4], f32); 0]);
+    }
+    settings
+        .iter()
+        .map(|setting| (setting.tag.0.to_be_bytes(), setting.value))
+        .collect()
+}
+
+/// Whether the topmost background layer repeats, along each axis.
+///
+/// `space` — tiles spread apart so a whole number fits with gaps between them —
+/// is taken as `repeat`. It needs a step that is wider than the tile, which the
+/// one fill a tiled background is drawn with cannot express.
+fn background_repeat(values: &ComputedValues) -> BackgroundRepeat {
     use style::values::specified::background::BackgroundRepeatKeyword as Keyword;
 
+    let axis = |keyword: Keyword| match keyword {
+        Keyword::NoRepeat => Repeat::None,
+        Keyword::Round => Repeat::Round,
+        _ => Repeat::Repeat,
+    };
+
     match values.get_background().background_repeat.0.first() {
-        Some(repeat) => repeat.0 != Keyword::NoRepeat && repeat.1 != Keyword::NoRepeat,
-        None => true,
+        Some(repeat) => BackgroundRepeat {
+            x: axis(repeat.0),
+            y: axis(repeat.1),
+        },
+        None => BackgroundRepeat::REPEAT,
+    }
+}
+
+/// Where the topmost background layer sits in the box it is behind.
+///
+/// The computed value is a length, a percentage, or the sum of both — `right 10px`
+/// is `calc(100% - 10px)` by the time it gets here — and all three are the same
+/// affine function of the room the picture leaves. So each is measured rather than
+/// taken apart: what it gives for no room at all is the length, and how much it
+/// moves per unit of room is the fraction. A `calc()` that clamps is not affine and
+/// is the one shape this reads wrongly; none of the keywords produce one.
+fn background_position(values: &ComputedValues) -> BackgroundPosition {
+    use style::values::computed::Length;
+
+    let background = values.get_background();
+    let anchor = |value: Option<&style::values::computed::LengthPercentage>| match value {
+        Some(value) => {
+            let offset = value.resolve(Length::new(0.0)).px();
+            Anchor {
+                fraction: value.resolve(Length::new(1.0)).px() - offset,
+                offset,
+            }
+        }
+        None => Anchor::START,
+    };
+
+    BackgroundPosition {
+        x: anchor(background.background_position_x.0.first()),
+        y: anchor(background.background_position_y.0.first()),
     }
 }
 
@@ -903,6 +988,139 @@ mod tests {
             "div",
         );
         assert_eq!(style.background_image.as_deref(), Some("pic.png"));
+    }
+
+    /// A page that says nothing about its font gets the browser's standard one,
+    /// which is a serif — the same thing every browser shows it in.
+    #[test]
+    fn an_unstyled_element_takes_the_standard_font() {
+        let style = layout_style("<p>text</p>", "p");
+        assert_eq!(style.font_family.as_ref(), "serif");
+        assert_eq!(style.font_size, 16.0);
+    }
+
+    /// The rest of what CSS says about a font, all of which the shaper can act on.
+    #[test]
+    fn the_font_properties_a_shaper_needs_are_all_read() {
+        let style = layout_style(
+            "<style>p { font-stretch: 62.5%; letter-spacing: 0.25em; word-spacing: 4px; \
+             font-optical-sizing: none; \
+             font-variation-settings: \"wght\" 350, \"opsz\" 8 }</style><p>text</p>",
+            "p",
+        );
+
+        assert_eq!(style.font_width, 62.5);
+        // A quarter of the sixteen-pixel font size, not of anything else.
+        assert_eq!(style.letter_spacing, 4.0);
+        assert_eq!(style.word_spacing, 4.0);
+        assert!(!style.optical_sizing);
+        // By tag rather than as written: the engine orders them, and a shaper takes
+        // the last of a repeated tag, so the order has to be one both agree on.
+        assert_eq!(
+            style.font_variations.as_ref(),
+            [(*b"opsz", 8.0), (*b"wght", 350.0)]
+        );
+    }
+
+    /// And their initial values, which is what almost every element on a page has.
+    #[test]
+    fn the_font_properties_have_the_values_css_starts_them_at() {
+        let style = layout_style("<p>text</p>", "p");
+        assert_eq!(style.font_width, 100.0);
+        assert_eq!(style.letter_spacing, 0.0);
+        assert_eq!(style.word_spacing, 0.0);
+        assert!(style.optical_sizing);
+        assert!(style.font_variations.is_empty());
+    }
+
+    #[test]
+    fn background_repeat_is_read_per_axis() {
+        let repeat = |source: &str| {
+            layout_style(
+                &format!("<style>div {{ background-repeat: {source} }}</style><div>x</div>"),
+                "div",
+            )
+            .background_repeat
+        };
+
+        assert_eq!(repeat("repeat"), BackgroundRepeat::REPEAT);
+        assert_eq!(
+            repeat("no-repeat"),
+            BackgroundRepeat {
+                x: Repeat::None,
+                y: Repeat::None
+            }
+        );
+        assert_eq!(
+            repeat("repeat-x"),
+            BackgroundRepeat {
+                x: Repeat::Repeat,
+                y: Repeat::None
+            }
+        );
+        assert_eq!(
+            repeat("round no-repeat"),
+            BackgroundRepeat {
+                x: Repeat::Round,
+                y: Repeat::None
+            }
+        );
+    }
+
+    /// A position is a fraction of the room the picture leaves plus a length, and
+    /// every spelling CSS allows lands as some combination of the two — including
+    /// the ones that compute to a `calc()`, which is what makes the two-probe
+    /// reading worth having.
+    #[test]
+    fn background_position_reads_both_halves_of_a_calc() {
+        let position = |source: &str| {
+            layout_style(
+                &format!("<style>div {{ background-position: {source} }}</style><div>x</div>"),
+                "div",
+            )
+            .background_position
+        };
+
+        assert_eq!(position("0 0"), BackgroundPosition::START);
+        assert_eq!(
+            position("10px 4px"),
+            BackgroundPosition {
+                x: Anchor {
+                    fraction: 0.0,
+                    offset: 10.0
+                },
+                y: Anchor {
+                    fraction: 0.0,
+                    offset: 4.0
+                },
+            }
+        );
+        assert_eq!(
+            position("center"),
+            BackgroundPosition {
+                x: Anchor {
+                    fraction: 0.5,
+                    offset: 0.0
+                },
+                y: Anchor {
+                    fraction: 0.5,
+                    offset: 0.0
+                },
+            }
+        );
+        assert_eq!(
+            position("right 10px bottom 4px"),
+            BackgroundPosition {
+                x: Anchor {
+                    fraction: 1.0,
+                    offset: -10.0
+                },
+                y: Anchor {
+                    fraction: 1.0,
+                    offset: -4.0
+                },
+            }
+        );
     }
 
     #[test]

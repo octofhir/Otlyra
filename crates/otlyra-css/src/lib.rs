@@ -29,8 +29,9 @@ pub mod stylo_dom;
 pub mod ua;
 
 pub use style::{
-    AlignItems, BackgroundSize, Border, Clear, ComputedStyle, Corners, Display, FlexDirection,
-    FlexWrap, Float, FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto,
-    LineHeight, Overflow, Position, Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
+    AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border, Clear,
+    ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient,
+    GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow, Position, Repeat,
+    Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
 };
 pub use ua::{has_renderable_children, initial_style, ua_style};

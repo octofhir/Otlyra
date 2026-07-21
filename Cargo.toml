@@ -66,6 +66,13 @@ skia-safe = "=0.99.0"
 # Font enumeration, CSS family matching, shaping and line breaking.
 parley = "=0.11.0"
 
+# Reading a font's own tables. Already in the tree as parley's own dependency and
+# pinned to the same version, so this costs no package and cannot pull a second
+# copy — it is named here because we need one thing parley does not hand back: a
+# face's vertical metrics *before* a paragraph is shaped, which is what decides how
+# tall a line with `line-height: normal` is.
+skrifa = "=0.43.2"
+
 # Geometry and brush vocabulary shared by every PaintTarget backend.
 kurbo = "=0.13.1"
 peniko = "=0.6.1"

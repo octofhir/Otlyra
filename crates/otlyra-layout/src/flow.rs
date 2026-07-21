@@ -2009,6 +2009,28 @@ impl<'a> Flow<'a> {
             .clone()
     }
 
+    /// The span one text box contributes, with `line-height: normal` already
+    /// resolved against the font it will be set in.
+    ///
+    /// Resolved here rather than left to the shaper because `normal` is a browser
+    /// decision about a *font*, not about a paragraph: it is the strut, and the
+    /// strut comes from the block's own font whatever the runs inside it turn out
+    /// to be. Answering it needs the font, so it needs the engine, so it cannot
+    /// live in the plain function below.
+    fn styled_span<'t>(&mut self, text: &'t str, style: &'t Arc<ComputedStyle>) -> TextSpan<'t> {
+        let stack = self.font_stack(style);
+        let mut span = span_for(text, style, stack.clone());
+        if span.line_height.is_none() {
+            span.line_height = self.text.normal_line_height(
+                &stack,
+                style.font_size,
+                style.font_weight,
+                span.italic,
+            );
+        }
+        span
+    }
+
     /// Walk an inline subtree in order, turning each text box into a styled span.
     ///
     /// `sources` records which box each span came from, in step with `spans`: a
@@ -2041,7 +2063,7 @@ impl<'a> Flow<'a> {
                     });
                 }
                 BoxKind::Text(text) => {
-                    spans.push(span_for(text, &node.style, self.font_stack(&node.style)));
+                    spans.push(self.styled_span(text, &node.style));
                     // The text's own box is anonymous as far as the document is
                     // concerned; what a click means is the element around it.
                     sources.push(id);
@@ -2055,7 +2077,7 @@ impl<'a> Flow<'a> {
                         // between a `<br>` and a line ending in the source.
                         spans.push(TextSpan {
                             text: "\n",
-                            ..span_for("", &node.style, self.font_stack(&node.style))
+                            ..self.styled_span("", &node.style)
                         });
                         sources.push(child);
                     }
@@ -2102,13 +2124,14 @@ impl<'a> Flow<'a> {
 ///
 /// The text is already collapsed — the box tree did it at load time — so this
 /// borrows rather than copies.
-fn span_for<'a>(text: &'a str, style: &ComputedStyle, font_stack: FontStack) -> TextSpan<'a> {
+fn span_for<'a>(text: &'a str, style: &'a ComputedStyle, font_stack: FontStack) -> TextSpan<'a> {
     let color = style.color.to_rgba8();
     TextSpan {
         text,
         font_stack,
         font_size: style.font_size,
         font_weight: style.font_weight,
+        font_width: style.font_width,
         italic: style.font_style == otlyra_css::FontStyle::Italic,
         underline: style.text_decoration.underline,
         strikethrough: style.text_decoration.line_through,
@@ -2117,6 +2140,10 @@ fn span_for<'a>(text: &'a str, style: &ComputedStyle, font_stack: FontStack) -> 
             otlyra_css::LineHeight::Normal => None,
             other => Some(other.resolve(style.font_size, style.font_size * 1.2)),
         },
+        letter_spacing: style.letter_spacing,
+        word_spacing: style.word_spacing,
+        optical_sizing: style.optical_sizing,
+        variations: &style.font_variations,
     }
 }
 

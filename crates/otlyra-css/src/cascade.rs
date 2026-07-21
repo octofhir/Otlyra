@@ -276,6 +276,7 @@ fn enable_features() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         stylo_static_prefs::set_pref!("layout.grid.enabled", true);
+        stylo_static_prefs::set_pref!("layout.variable_fonts.enabled", true);
     });
 }
 
@@ -540,11 +541,27 @@ impl style::device::servo::FontMetricsProvider for NoFontMetrics {
         Default::default()
     }
 
+    /// What `font-size: medium` is, which is where every other keyword and every
+    /// unstyled element starts from.
+    ///
+    /// Monospace gets its own, smaller, base — the same thirteen pixels every
+    /// browser uses. A monospace face at the same size as the prose around it reads
+    /// as larger than it, because its letters are all as wide as its widest, so
+    /// `<code>` in a paragraph would stand out by size rather than by shape. The
+    /// keyword is what carries it: an element whose family is a single generic
+    /// resolves `medium` against that generic's base, and a size written in `em`
+    /// keeps the chain, so `<code>` inside a heading is scaled by the heading's own
+    /// ratio rather than pinned at thirteen.
     fn base_size_for_generic(
         &self,
-        _generic: style::values::computed::font::GenericFontFamily,
+        generic: style::values::computed::font::GenericFontFamily,
     ) -> style::values::computed::Length {
-        style::values::computed::Length::new(16.0)
+        use style::values::computed::font::GenericFontFamily;
+
+        style::values::computed::Length::new(match generic {
+            GenericFontFamily::Monospace => 13.0,
+            _ => 16.0,
+        })
     }
 }
 
@@ -745,6 +762,31 @@ mod tests {
         assert_eq!(
             heading.clone_display(),
             style::values::computed::Display::Block
+        );
+    }
+
+    /// Monospace has a base of its own, and it is the `font-size` *keyword* that
+    /// carries it: an element inherits the keyword and the ratio applied to it, so
+    /// the same `<code>` is thirteen pixels in prose and scaled with its heading
+    /// inside one — and none of it survives a size written as a length.
+    #[test]
+    fn monospace_starts_from_a_smaller_size_than_prose() {
+        let size = |html: &str, selector: &str| {
+            computed(html, selector).clone_font_size().used_size().px()
+        };
+
+        assert_eq!(size("<body><p>text", "p"), 16.0);
+        assert_eq!(size("<body><p><code>x", "code"), 13.0);
+        assert_eq!(size("<body><pre>x", "pre"), 13.0);
+        // A heading is 1.5em, and the ratio travels with the keyword.
+        assert_eq!(size("<body><h2><code>x", "code"), 19.5);
+        // A length breaks the chain, as it does in every browser.
+        assert_eq!(
+            size(
+                "<style>div { font-size: 32px }</style><body><div><code>x",
+                "code"
+            ),
+            32.0
         );
     }
 
