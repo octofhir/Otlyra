@@ -36,6 +36,27 @@ def main():
         context = tree["contexts"][0]
         print(f"→ getTree\n← one context, {context['context']}, at {context['url']}\n")
 
+        # The selector is matched by the engine's own matcher — the one the
+        # cascade styles with — so this reports the same elements a stylesheet
+        # would have hit.
+        cards = browser.find(".card")
+        print(f"→ locateNodes .card\n← {len(cards)} nodes")
+        for card in cards[:2]:
+            value = card["value"]
+            print(f"    <{value['localName']} {value.get('attributes', {})}>")
+        print()
+
+        first = browser.find("#first")[0]
+        print(f"→ locateNodes #first\n← sharedId {first['sharedId']}\n")
+
+        # No coordinates anywhere in this call. The browser knows where it drew
+        # the element; the driver does not have to, and so cannot be wrong.
+        browser.click(first)
+        print("→ click #first\n← the browser aimed at the centre of its own box\n")
+
+        browser.scroll(400, 300, 200)
+        print("→ scroll\n← the page took the wheel\n")
+
         shot = browser.screenshot("/tmp/otlyra-bidi.png")
         size = os.path.getsize(shot)
         print(f"→ captureScreenshot\n← {size} bytes of PNG at {shot}\n")

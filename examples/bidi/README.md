@@ -45,6 +45,8 @@ Working now:
 | `browsingContext.navigate` | Go somewhere, and wait for it |
 | `browsingContext.reload` | Again |
 | `browsingContext.captureScreenshot` | A PNG of what is on screen |
+| `browsingContext.locateNodes` | Find nodes by CSS selector |
+| `input.performActions` | Move, click, scroll, type |
 
 Waiting on other work, and saying so when asked:
 
@@ -52,11 +54,26 @@ Waiting on other work, and saying so when asked:
   M12. Stock Playwright leans on it for nearly everything, so Playwright will
   connect to this and then fail. That is a real limitation and not a bug to
   report.
-- `browsingContext.locateNodes` (find by CSS selector) and `input.performActions`
-  (click, type, scroll) are next, and neither needs a script engine.
 - `log` and `network` events: the browser already keeps both — its console and
   its request list are what the inspector panel reads — so this is a matter of
   broadcasting them, not of collecting them.
+
+## Naming an element rather than a point
+
+`input.performActions` takes an `origin`, and the useful one is an element:
+
+```python
+first = browser.find("#first")[0]
+browser.click(first)          # no coordinates anywhere
+```
+
+The browser resolves that against where it *actually drew* the element — the
+same rectangle a real click is tested against. A driver that computed the point
+itself would be keeping a second opinion about the layout, and the two would
+disagree the first time anything moved.
+
+The selector is matched by the engine's own matcher, the one the cascade styles
+with, so `.card` finds exactly the elements a stylesheet would have hit.
 
 ## The client
 

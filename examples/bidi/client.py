@@ -59,6 +59,69 @@ class Otlyra:
             file.write(base64.b64decode(data))
         return path
 
+    def find(self, selector):
+        """Every node matching a CSS selector, as the engine's own matcher sees it."""
+        return self.send(
+            "browsingContext.locateNodes",
+            locator={"type": "css", "value": selector},
+        )["nodes"]
+
+    def click(self, node):
+        """Click the centre of a node.
+
+        The centre is worked out by the browser, from where it actually drew the
+        element. That is the whole point of naming an element instead of a
+        coordinate: the driver does not have to know the layout, and so cannot
+        disagree with it.
+        """
+        origin = {"type": "element", "element": {"sharedId": node["sharedId"]}}
+        return self.send(
+            "input.performActions",
+            actions=[
+                {
+                    "type": "pointer",
+                    "id": "mouse",
+                    "actions": [
+                        {"type": "pointerMove", "x": 0, "y": 0, "origin": origin},
+                        {"type": "pointerDown", "button": 0},
+                        {"type": "pointerUp", "button": 0},
+                    ],
+                }
+            ],
+        )
+
+    def type(self, text):
+        """Type `text`, one key at a time, wherever the focus is."""
+        actions = []
+        for character in text:
+            actions.append({"type": "keyDown", "value": character})
+            actions.append({"type": "keyUp", "value": character})
+        return self.send(
+            "input.performActions",
+            actions=[{"type": "key", "id": "keyboard", "actions": actions}],
+        )
+
+    def scroll(self, x, y, amount):
+        """Turn the wheel by `amount` at a point."""
+        return self.send(
+            "input.performActions",
+            actions=[
+                {
+                    "type": "wheel",
+                    "id": "wheel",
+                    "actions": [
+                        {
+                            "type": "scroll",
+                            "x": x,
+                            "y": y,
+                            "deltaX": 0,
+                            "deltaY": amount,
+                        }
+                    ],
+                }
+            ],
+        )
+
     def close(self):
         try:
             self.send("session.end")

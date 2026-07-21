@@ -1147,6 +1147,14 @@ impl Browser {
         list.append(&built);
     }
 
+    /// The page the active tab is showing, if it has one.
+    ///
+    /// For a driver asking about the document rather than about the browser: the
+    /// same page the inspector reads, so the two cannot answer differently.
+    pub fn active_page(&self) -> Option<&PageScene> {
+        self.tabs[self.active].page.as_ref()
+    }
+
     /// Where the active tab is, which is what a driver asks after navigating.
     pub fn url(&self) -> String {
         self.tabs[self.active].url.clone()
