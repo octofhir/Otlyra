@@ -23,8 +23,8 @@ use otlyra_text::TextEngine;
 use crate::widget::controls::{self, Emphasis};
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Child, Cx, Event, Flex, Gap, Insets, Label, Overflow, Padding, Rect, Scroll, Size,
-    Stack, fill_rounded,
+    Align, Child, Cx, Event, Flex, Focus, FocusId, FocusKind, Gap, Insets, Label, Overflow,
+    Padding, Rect, Scroll, Size, Stack, fill_rounded,
 };
 
 /// What happens when the browser starts.
@@ -64,8 +64,6 @@ pub struct Settings {
     pub on_start: OnStart,
     /// The address the home button goes to.
     pub home: crate::ui::TextField,
-    /// Whether the home field has the keyboard.
-    pub home_focused: bool,
     /// Load the pictures a page asks for.
     pub load_images: bool,
     /// Run the scripts a page carries.
@@ -76,8 +74,12 @@ pub struct Settings {
     pub restore_tabs: bool,
     /// The size text is drawn at, as a percentage of the default.
     pub text_scale: f64,
-    /// Which control has the keyboard, for traversal by key.
-    pub focus: Option<u32>,
+    /// Which control has the keyboard.
+    ///
+    /// The whole of what focus is on this surface: whether the home field shows
+    /// a caret is *this* value landing on the field's id, not a second flag
+    /// beside it that something has to remember to keep in step.
+    pub focus: Option<FocusId>,
     /// How far the surface is scrolled.
     pub scroll: f64,
     overflow: Overflow,
@@ -88,7 +90,6 @@ impl Default for Settings {
         Self {
             on_start: OnStart::Blank,
             home: crate::ui::TextField::new("https://example.com/"),
-            home_focused: false,
             load_images: true,
             run_scripts: true,
             do_not_track: false,
@@ -108,8 +109,11 @@ pub enum Action {
     None,
     /// Start with this.
     SetOnStart(OnStart),
-    /// Put the caret in the home field.
-    FocusHome,
+    /// Give this control the keyboard.
+    ///
+    /// The id is claimed while the frame is built, so it names the control that
+    /// was actually drawn there rather than a number chosen in advance.
+    Focus(FocusId),
     /// Load pictures, or stop.
     ToggleImages,
     /// Run scripts, or stop.
@@ -140,7 +144,7 @@ impl Settings {
         match action {
             Action::None | Action::Close => {}
             Action::SetOnStart(choice) => self.on_start = choice,
-            Action::FocusHome => self.home_focused = true,
+            Action::Focus(id) => self.focus = Some(id),
             Action::ToggleImages => self.load_images = !self.load_images,
             Action::ToggleScripts => self.run_scripts = !self.run_scripts,
             Action::ToggleDoNotTrack => self.do_not_track = !self.do_not_track,
@@ -152,59 +156,30 @@ impl Settings {
             }
             Action::Reset => {
                 let scroll = self.scroll;
+                let focus = self.focus;
                 *self = Self::default();
                 self.scroll = scroll;
+                // Resetting the preferences is not a reason to take the keyboard
+                // away from whoever pressed the button that did it.
+                self.focus = focus;
             }
         }
     }
 
-    /// Handle a key. Typing goes to the home field when it has the caret.
-    pub fn key_pressed(&mut self, key: Key, _modifiers: Modifiers) -> Action {
-        if !self.home_focused {
-            return match key {
-                Key::Escape => Action::Close,
-                _ => Action::None,
-            };
-        }
+    /// Edit the home field with `key`, if it is a key that edits one.
+    ///
+    /// Only reached while the field holds the focus, which is why the arrows
+    /// move the caret here and move between controls everywhere else.
+    fn edit_home(&mut self, key: Key) -> bool {
         match key {
-            Key::Enter | Key::Escape => {
-                self.home_focused = false;
-                Action::None
-            }
-            Key::Backspace => {
-                self.home.backspace();
-                Action::None
-            }
-            Key::Delete => {
-                self.home.delete();
-                Action::None
-            }
-            Key::Left => {
-                self.home.move_left();
-                Action::None
-            }
-            Key::Right => {
-                self.home.move_right();
-                Action::None
-            }
-            Key::Home => {
-                self.home.move_home();
-                Action::None
-            }
-            Key::End => {
-                self.home.move_end();
-                Action::None
-            }
-            _ => Action::None,
+            Key::Backspace => self.home.backspace(),
+            Key::Delete => self.home.delete(),
+            Key::Left => self.home.move_left(),
+            Key::Right => self.home.move_right(),
+            Key::Home => self.home.move_home(),
+            Key::End => self.home.move_end(),
+            _ => return false,
         }
-    }
-
-    /// Handle typed text. Returns whether the surface consumed it.
-    pub fn text_input(&mut self, character: char) -> bool {
-        if !self.home_focused {
-            return false;
-        }
-        self.home.insert(character);
         true
     }
 
@@ -217,13 +192,18 @@ impl Settings {
         self.scroll = (self.scroll + delta).clamp(0.0, self.overflow.get());
     }
 
-    /// Build this frame's tree.
-    pub fn build(&self, theme: &Theme, width: f64) -> Child<Action> {
+    /// Build this frame's tree, claiming a focus id per control as it goes.
+    ///
+    /// Built in the order it is drawn, top down, so the order Tab travels in is
+    /// the order the eye travels in without either being written down twice.
+    /// The header first, then the cards, then the way out.
+    pub fn build(&self, theme: &Theme, width: f64, focus: &Focus) -> Child<Action> {
+        let header = self.header(theme, focus);
         let rows = vec![
-            self.startup_card(theme),
-            self.content_card(theme),
-            self.privacy_card(theme),
-            self.reset_row(theme),
+            self.startup_card(theme, focus),
+            self.content_card(theme, focus),
+            self.privacy_card(theme, focus),
+            self.reset_row(theme, focus),
             Box::new(Gap::new(0.0, theme.inset * 2.0)) as Child<Action>,
         ];
 
@@ -248,14 +228,14 @@ impl Settings {
         Box::new(Stack::column(
             0.0,
             vec![
-                self.header(theme),
+                header,
                 Box::new(Scroll::new(self.scroll, Rc::clone(&self.overflow), centred)),
             ],
         ))
     }
 
     /// The bar across the top: what this surface is, and the way out of it.
-    fn header(&self, theme: &Theme) -> Child<Action> {
+    fn header(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
         let title: Child<Action> = Box::new(Align::left(Box::new(Label::new(
             "Settings",
             theme.font_size + 3.0,
@@ -274,6 +254,7 @@ impl Settings {
                             Box::new(Flex::new(1.0, title)),
                             Box::new(Align::centre(controls::button(
                                 theme,
+                                focus,
                                 Action::Close,
                                 "Done",
                                 Emphasis::Primary,
@@ -286,12 +267,15 @@ impl Settings {
         ))
     }
 
-    fn startup_card(&self, theme: &Theme) -> Child<Action> {
+    fn startup_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
+        let choices_group = focus.group();
         let choices: Vec<Child<Action>> = OnStart::ALL
             .iter()
             .map(|choice| {
                 controls::radio(
                     theme,
+                    focus,
+                    choices_group,
                     Action::SetOnStart(*choice),
                     self.on_start == *choice,
                     choice.label(),
@@ -299,9 +283,13 @@ impl Settings {
             })
             .collect();
 
+        // The field's id is claimed here, where it is built, and answered here
+        // too: whether it shows a caret is whether the surface's focus is on it.
+        // Nothing has to be told about it afterwards.
+        let home_id = focus.claim_text(true);
         let home_field = controls::TextInput::new(controls::FieldView {
             text: self.home.text().to_owned(),
-            caret: self.home_focused.then(|| self.home.caret()),
+            caret: (self.focus == Some(home_id)).then(|| self.home.caret()),
             placeholder: "https://".to_owned(),
         })
         .into_widget::<Action>(theme);
@@ -318,20 +306,34 @@ impl Settings {
                     Some("Where the home button and a new window go."),
                     Box::new(crate::widget::Fixed::width(
                         280.0,
-                        Box::new(crate::widget::Button::new(Action::FocusHome, home_field)),
+                        Box::new(
+                            crate::widget::Button::new(Action::Focus(home_id), home_field)
+                                .focus(home_id),
+                        ),
                     )),
                 ),
                 controls::setting_row(
                     theme,
                     "Reopen tabs",
                     Some("Bring back what was open when the browser last closed."),
-                    controls::toggle(theme, Action::ToggleRestoreTabs, self.restore_tabs),
+                    controls::toggle(theme, focus, Action::ToggleRestoreTabs, self.restore_tabs),
                 ),
             ],
         )
     }
 
-    fn content_card(&self, theme: &Theme) -> Child<Action> {
+    fn content_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
+        let images = controls::toggle(theme, focus, Action::ToggleImages, self.load_images);
+        let scripts = controls::toggle(theme, focus, Action::ToggleScripts, self.run_scripts);
+        // Five at a time, so the keyboard lands on the same values the pointer
+        // does — `apply` rounds to fives, and a step that did not would leave
+        // the arrow keys moving the slider without moving the number.
+        let scale = Box::new(
+            controls::Slider::new(self.text_scale, (50.0, 200.0), Action::SetTextScale)
+                .step(5.0)
+                .focus(focus.claim(true)),
+        );
+
         controls::card(
             theme,
             "Content",
@@ -340,30 +342,26 @@ impl Settings {
                     theme,
                     "Load images",
                     Some("Fetch the pictures a page asks for."),
-                    controls::toggle(theme, Action::ToggleImages, self.load_images),
+                    images,
                 ),
                 controls::setting_row(
                     theme,
                     "Run scripts",
                     Some("Execute the JavaScript a page carries."),
-                    controls::toggle(theme, Action::ToggleScripts, self.run_scripts),
+                    scripts,
                 ),
                 controls::divider(theme),
                 controls::setting_row(
                     theme,
                     format!("Text size — {}%", self.text_scale as i64),
                     Some("Scales the text on every page."),
-                    Box::new(controls::Slider::new(
-                        self.text_scale,
-                        (50.0, 200.0),
-                        Action::SetTextScale,
-                    )),
+                    scale,
                 ),
             ],
         )
     }
 
-    fn privacy_card(&self, theme: &Theme) -> Child<Action> {
+    fn privacy_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
         controls::card(
             theme,
             "Privacy",
@@ -372,7 +370,7 @@ impl Settings {
                     theme,
                     "Do Not Track",
                     Some("Sends a request sites are free to ignore, and most do."),
-                    controls::toggle(theme, Action::ToggleDoNotTrack, self.do_not_track),
+                    controls::toggle(theme, focus, Action::ToggleDoNotTrack, self.do_not_track),
                 ),
                 controls::divider(theme),
                 controls::setting_row(
@@ -381,6 +379,7 @@ impl Settings {
                     None,
                     controls::segmented(
                         theme,
+                        focus,
                         OnStart::ALL
                             .iter()
                             .map(|choice| (choice.label().to_owned(), Action::SetOnStart(*choice)))
@@ -395,12 +394,20 @@ impl Settings {
         )
     }
 
-    fn reset_row(&self, theme: &Theme) -> Child<Action> {
+    fn reset_row(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
+        let reset = controls::button(
+            theme,
+            focus,
+            Action::Reset,
+            "Reset all",
+            Emphasis::Danger,
+            true,
+        );
         Box::new(Stack::row(
             theme.gap,
             vec![
                 Box::new(Flex::new(1.0, Box::new(Gap::new(0.0, 0.0)))),
-                controls::button(theme, Action::Reset, "Reset all", Emphasis::Danger, true),
+                reset,
             ],
         ))
     }
@@ -429,6 +436,12 @@ pub struct SettingsSurface {
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
     engine: TextEngine,
+    /// The focusable controls the last frame built, in the order it built them.
+    ///
+    /// Kept beside the tree rather than inside the preferences: it is a fact
+    /// about the frame, not about what the reader has chosen, and putting it in
+    /// a value the cache compares would make every frame differ from the last.
+    focus: Focus,
     /// What the last built list was built from, and the list itself.
     ///
     /// The same rule the toolbar follows: a frame that agrees with the last one
@@ -456,6 +469,7 @@ impl SettingsSurface {
             pointer_down: false,
             press_origin: None,
             engine: TextEngine::new(),
+            focus: Focus::default(),
             cache: None,
             builds: 0,
             root: None,
@@ -478,11 +492,110 @@ impl SettingsSurface {
         self.pointer_down = true;
         self.press_origin = Some(self.pointer);
         let action = self.deliver(&Event::PointerPressed);
-        // A press anywhere but the home field takes the caret out of it.
-        if action != Action::FocusHome {
-            self.settings.home_focused = false;
+        // A press on anything that does not ask for the keyboard takes it away
+        // from whatever had it — which is what takes the caret out of the field.
+        if !matches!(action, Action::Focus(_)) {
+            self.settings.focus = None;
         }
         action
+    }
+
+    /// Handle a key: traversal, activation, and the arrows.
+    ///
+    /// `None` means *not mine* — the same word the widgets use — so a key this
+    /// surface has no use for still reaches the toolbar behind it. Traversal is
+    /// the surface's own business rather than the layer's, because the surface
+    /// is what built the order. What the layer does is compare ids, so a control
+    /// activated from here reports through exactly the path a press reports
+    /// through and the two cannot drift.
+    pub fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Option<Action> {
+        // An accelerator is the browser's, wherever it is pressed: reload and
+        // new-tab do not stop working because a preference is on screen.
+        if modifiers.is_accelerator() {
+            return None;
+        }
+
+        let holder = self.settings.focus;
+        let editing = self.focus.kind(holder) == Some(FocusKind::Text);
+
+        if key == Key::Tab {
+            self.settings.focus = if modifiers.shift {
+                self.focus.previous(holder)
+            } else {
+                self.focus.next(holder)
+            };
+            return Some(Action::None);
+        }
+
+        // A focused field takes the editing keys before anything else can read
+        // them as navigation: Left in a field is a caret, not a control.
+        if editing {
+            match key {
+                Key::Enter | Key::Escape => {
+                    self.settings.focus = None;
+                    return Some(Action::None);
+                }
+                _ if self.settings.edit_home(key) => return Some(Action::None),
+                _ => {}
+            }
+        }
+
+        Some(match key {
+            // Escape leaves the surface only when there is no focus to drop
+            // first, so one press never does both.
+            Key::Escape => match holder {
+                Some(_) => {
+                    self.settings.focus = None;
+                    Action::None
+                }
+                None => Action::Close,
+            },
+            Key::Enter | Key::Character(' ') if holder.is_some() => self.deliver(&Event::Activate),
+            Key::Left | Key::Up | Key::Right | Key::Down => {
+                let forward = matches!(key, Key::Right | Key::Down);
+                let Some(holder) = holder else {
+                    // Nothing focused: the arrows are the page's, and a browser
+                    // page that scrolls is scrolled by them.
+                    return None;
+                };
+                // Inside a set of choices the arrows move between them and pick
+                // what they land on, which is what a radio group does
+                // everywhere. Outside one they are offered to the control
+                // itself, which is what a slider wants them for.
+                match self.focus.step_in_group(holder, forward) {
+                    Some(next) => {
+                        self.settings.focus = Some(next);
+                        self.deliver(&Event::Activate)
+                    }
+                    None => self.deliver(&Event::Adjust(if forward { 1 } else { -1 })),
+                }
+            }
+            // Anything else — a bare character, a function key — was never this
+            // surface's, and saying so is what lets it through.
+            _ => return None,
+        })
+    }
+
+    /// Handle typed text. Returns whether the surface consumed it.
+    pub fn text_input(&mut self, character: char) -> bool {
+        if self.focus.kind(self.settings.focus) != Some(FocusKind::Text) {
+            return false;
+        }
+        self.settings.home.insert(character);
+        true
+    }
+
+    /// What the pointer should look like at `x`, `y`.
+    ///
+    /// Asked of the tree that drew the frame rather than worked out again: the
+    /// answer is *what would a press here report*, so a control cannot light up
+    /// under the pointer in one place and respond in another.
+    pub fn cursor_at(&mut self, x: f64, y: f64) -> otlyra_platform::Cursor {
+        match self.action_at(x, y) {
+            Action::None => otlyra_platform::Cursor::Default,
+            Action::Focus(_) => otlyra_platform::Cursor::Text,
+            _ => otlyra_platform::Cursor::Pointer,
+        }
     }
 
     /// Let go.
@@ -569,7 +682,10 @@ impl SettingsSurface {
         cx.focus = self.settings.focus;
         cx.theme = theme.clone();
 
-        let mut root = self.settings.build(&theme, width);
+        // The order is rebuilt exactly when the tree is, so a frame served from
+        // the cache keeps the order that belongs to the tree still standing.
+        self.focus.begin();
+        let mut root = self.settings.build(&theme, width, &self.focus);
         root.measure(Size::new(width, height), &mut cx);
         root.place(rect, &mut cx);
         root.draw(&mut cx, list);
@@ -613,8 +729,8 @@ mod tests {
     fn find(wanted: &Action) -> (f64, f64) {
         let mut probe = SettingsSurface::new();
         frame(&mut probe);
-        for x in [730, 700, 620, 485, 200, 140] {
-            for y in (56..700).step_by(2) {
+        for x in (0..900).step_by(8) {
+            for y in (0..700).step_by(2) {
                 if probe.action_at(f64::from(x), f64::from(y)) == *wanted {
                     return (f64::from(x), f64::from(y));
                 }
@@ -706,12 +822,210 @@ mod tests {
 
     #[test]
     fn typing_reaches_the_home_field_only_when_it_has_the_caret() {
-        let mut settings = Settings::default();
-        assert!(!settings.text_input('x'));
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        assert!(!surface.text_input('x'), "nothing is focused yet");
 
-        settings.home_focused = true;
-        settings.home.clear();
-        assert!(settings.text_input('h'));
-        assert_eq!(settings.home.text(), "h");
+        // Tab until the caret is somewhere, which is the field and nothing else:
+        // it is the one control on the surface text goes into.
+        while !surface.text_input('h') {
+            surface.key_pressed(Key::Tab, Modifiers::default());
+        }
+        assert!(surface.settings.home.text().ends_with('h'));
+    }
+
+    /// Press Tab `steps` times on a surface that has been drawn, then activate
+    /// whatever holds the keyboard.
+    ///
+    /// A fresh surface each time, because activating changes the state the next
+    /// frame would be built from.
+    fn activate_after(steps: usize) -> Option<Action> {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        for _ in 0..steps {
+            surface.key_pressed(Key::Tab, Modifiers::default());
+        }
+        surface.key_pressed(Key::Enter, Modifiers::default())
+    }
+
+    /// What every control on the surface reports, in the order Tab reaches them.
+    fn traversal() -> Vec<Action> {
+        (1..=14).filter_map(activate_after).collect()
+    }
+
+    #[test]
+    fn tab_reaches_every_control_in_the_order_it_is_drawn() {
+        use OnStart::{Blank, Home, Restore};
+        assert_eq!(
+            traversal(),
+            vec![
+                // The header, then the cards top to bottom, then the way out —
+                // which is exactly the order they are read in.
+                Action::Close,
+                Action::SetOnStart(Blank),
+                Action::SetOnStart(Home),
+                Action::SetOnStart(Restore),
+                // The home field: Return there closes the caret rather than
+                // reporting anything, which is why it says nothing here.
+                Action::None,
+                Action::ToggleRestoreTabs,
+                Action::ToggleImages,
+                Action::ToggleScripts,
+                // The slider answers the arrows, not Return.
+                Action::None,
+                Action::ToggleDoNotTrack,
+                Action::SetOnStart(Blank),
+                Action::SetOnStart(Home),
+                Action::SetOnStart(Restore),
+                Action::Reset,
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_from_the_last_control_wraps_to_the_first() {
+        let first = activate_after(1);
+        let wrapped = activate_after(traversal().len() + 1);
+        assert_eq!(wrapped, first, "past the end is the beginning again");
+
+        // And backwards from nothing is the last of them, not the first.
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        surface.key_pressed(
+            Key::Tab,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert_eq!(
+            surface.key_pressed(Key::Enter, Modifiers::default()),
+            Some(Action::Reset)
+        );
+    }
+
+    #[test]
+    fn activating_by_key_reports_what_a_press_on_the_same_control_reports() {
+        // The property that keeps the two paths from drifting: whatever the
+        // keyboard reaches, a pointer reaches the same thing and says the same
+        // word about it.
+        for wanted in [
+            Action::ToggleImages,
+            Action::ToggleDoNotTrack,
+            Action::Reset,
+            Action::Close,
+        ] {
+            let (x, y) = find(&wanted);
+            let mut pressed = SettingsSurface::new();
+            frame(&mut pressed);
+            pressed.pointer_moved(x, y);
+            assert_eq!(pressed.pointer_pressed(), wanted);
+
+            let by_key = (1..=14)
+                .filter_map(activate_after)
+                .find(|action| *action == wanted);
+            assert_eq!(by_key, Some(wanted), "the keyboard cannot reach it");
+        }
+    }
+
+    #[test]
+    fn the_arrows_move_within_a_set_of_choices_and_pick_what_they_land_on() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        // Onto the first of the three start-up choices.
+        for _ in 0..2 {
+            surface.key_pressed(Key::Tab, Modifiers::default());
+        }
+        assert_eq!(surface.settings.on_start, OnStart::Blank);
+
+        surface.key_pressed(Key::Down, Modifiers::default());
+        assert_eq!(surface.settings.on_start, OnStart::Home);
+        surface.key_pressed(Key::Down, Modifiers::default());
+        assert_eq!(surface.settings.on_start, OnStart::Restore);
+        // Round the end of the group rather than out of it.
+        surface.key_pressed(Key::Down, Modifiers::default());
+        assert_eq!(surface.settings.on_start, OnStart::Blank);
+    }
+
+    #[test]
+    fn the_arrows_move_a_slider_that_holds_the_keyboard() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        // The text-size slider is the ninth control down.
+        for _ in 0..9 {
+            surface.key_pressed(Key::Tab, Modifiers::default());
+        }
+        assert_eq!(surface.settings.text_scale, 100.0);
+
+        surface.key_pressed(Key::Right, Modifiers::default());
+        assert_eq!(surface.settings.text_scale, 105.0);
+        surface.key_pressed(Key::Left, Modifiers::default());
+        surface.key_pressed(Key::Left, Modifiers::default());
+        assert_eq!(surface.settings.text_scale, 95.0);
+    }
+
+    #[test]
+    fn escape_drops_the_focus_before_it_leaves_the_surface() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        surface.key_pressed(Key::Tab, Modifiers::default());
+
+        assert_eq!(
+            surface.key_pressed(Key::Escape, Modifiers::default()),
+            Some(Action::None),
+            "the first press only lets go of the control"
+        );
+        assert_eq!(
+            surface.key_pressed(Key::Escape, Modifiers::default()),
+            Some(Action::Close),
+            "with nothing focused, it leaves"
+        );
+    }
+
+    #[test]
+    fn moving_the_focus_rebuilds_the_frame_so_the_ring_is_drawn() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        assert_eq!(surface.builds(), 1);
+
+        surface.key_pressed(Key::Tab, Modifiers::default());
+        frame(&mut surface);
+        assert_eq!(surface.builds(), 2, "the ring is part of the frame");
+    }
+
+    #[test]
+    fn an_accelerator_is_the_browsers_even_while_the_settings_are_open() {
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            surface.key_pressed(Key::Character('t'), accelerator),
+            None,
+            "a new tab is not the settings' to swallow"
+        );
+    }
+
+    #[test]
+    fn the_pointer_says_what_it_is_over() {
+        use otlyra_platform::Cursor;
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+
+        let (x, y) = find(&Action::ToggleImages);
+        assert_eq!(surface.cursor_at(x, y), Cursor::Pointer);
+
+        // Over the field, where a caret can go, it becomes a text bar.
+        let field = (56..700)
+            .step_by(2)
+            .find(|y| matches!(surface.action_at(485.0, f64::from(*y)), Action::Focus(_)))
+            .expect("the surface has a field to type into");
+        assert_eq!(surface.cursor_at(485.0, f64::from(field)), Cursor::Text);
+
+        // And over the surface itself it stays an arrow.
+        assert_eq!(surface.cursor_at(5.0, 5.0), Cursor::Default);
     }
 }

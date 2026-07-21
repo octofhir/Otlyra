@@ -12,6 +12,12 @@
 //! value its caller owns — a checkbox is told whether it is ticked — and what it
 //! reports is an action the caller applies to its own state. The next frame
 //! shows the result.
+//!
+//! Anything that can hold the keyboard takes a [`Focus`] and claims its own id
+//! from it, rather than being handed one. The id is then a control's position in
+//! the order the frame was built, so the traversal order cannot disagree with
+//! the drawing order — and there is no list of ids beside the tree for a caller
+//! to hand out twice or in the wrong sequence.
 
 use otlyra_gfx::peniko::Color;
 use otlyra_gfx::{DisplayList, kurbo::RoundedRectRadii};
@@ -19,8 +25,8 @@ use otlyra_gfx::{DisplayList, kurbo::RoundedRectRadii};
 use crate::widget::icon;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Button, Child, Cx, Event, Fixed, FocusId, Gap, Insets, Label, Padding,
-    Painted, Paragraph, Rect, Size, Stack, Widget, fill_rounded, ring,
+    Align, Background, Button, Child, Cx, Event, Fixed, Focus, FocusId, Gap, Insets, Label,
+    Padding, Painted, Paragraph, Rect, Size, Stack, Widget, fill_rounded, ring,
 };
 
 /// A mark drawn into a rectangle in one colour: an icon, told what shade to be.
@@ -48,10 +54,12 @@ pub enum Emphasis {
 /// `mark` is one of the functions in [`icon`], or anything with the same shape.
 pub fn icon_button<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
     action: A,
     enabled: bool,
     mark: impl Fn(&mut DisplayList, Rect, Color) + 'static,
 ) -> Child<A> {
+    let id = focus.claim(enabled);
     let ink = if enabled {
         theme.ink
     } else {
@@ -73,18 +81,24 @@ pub fn icon_button<A: Clone + 'static>(
     Box::new(Fixed::new(
         size,
         size,
-        Box::new(Button::new(action, Box::new(face)).enabled(enabled)),
+        Box::new(
+            Button::new(action, Box::new(face))
+                .enabled(enabled)
+                .focus(id),
+        ),
     ))
 }
 
 /// A button with a label in it.
 pub fn button<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
     action: A,
     text: impl Into<String>,
     emphasis: Emphasis,
     enabled: bool,
 ) -> Child<A> {
+    let id = focus.claim(enabled);
     let (face, ink, outline) = match (emphasis, enabled) {
         (_, false) => (theme.surface, theme.ink_disabled, false),
         (Emphasis::Primary, true) => (theme.accent, theme.ink_on_accent, false),
@@ -111,17 +125,19 @@ pub fn button<A: Clone + 'static>(
     }
     Box::new(Fixed::height(
         theme.control_height,
-        Box::new(Button::new(action, stack).enabled(enabled)),
+        Box::new(Button::new(action, stack).enabled(enabled).focus(id)),
     ))
 }
 
 /// A box that is ticked or not, with a label beside it.
 pub fn checkbox<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
     action: A,
     checked: bool,
     text: impl Into<String>,
 ) -> Child<A> {
+    let id = focus.claim(true);
     let side = 16.0;
     let (face, border) = if checked {
         (theme.accent, theme.accent)
@@ -142,32 +158,42 @@ pub fn checkbox<A: Clone + 'static>(
         },
     ))));
 
-    Box::new(Button::new(
-        action,
-        Box::new(Stack::row(
-            theme.gap,
-            vec![
-                mark,
-                Box::new(Align::left(Box::new(Label::new(
-                    text,
-                    theme.font_size,
-                    theme.ink,
-                )))),
-            ],
-        )),
-    ))
+    Box::new(
+        Button::new(
+            action,
+            Box::new(Stack::row(
+                theme.gap,
+                vec![
+                    mark,
+                    Box::new(Align::left(Box::new(Label::new(
+                        text,
+                        theme.font_size,
+                        theme.ink,
+                    )))),
+                ],
+            )),
+        )
+        .focus(id),
+    )
 }
 
 /// One of several exclusive choices, with a label beside it.
 ///
 /// A circle rather than a box, because that difference is the only thing telling
 /// a reader that picking this one un-picks another.
+///
+/// `group` is what the arrow keys travel within, and comes from
+/// [`Focus::group`]: a radio that belonged to no group would be reachable only
+/// by Tab, which is not how a set of choices behaves anywhere else.
 pub fn radio<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
+    group: u32,
     action: A,
     chosen: bool,
     text: impl Into<String>,
 ) -> Child<A> {
+    let id = focus.claim_in(group, true);
     let side = 16.0;
     let accent = theme.accent;
     let border = theme.border;
@@ -188,27 +214,31 @@ pub fn radio<A: Clone + 'static>(
         },
     ))));
 
-    Box::new(Button::new(
-        action,
-        Box::new(Stack::row(
-            theme.gap,
-            vec![
-                mark,
-                Box::new(Align::left(Box::new(Label::new(
-                    text,
-                    theme.font_size,
-                    theme.ink,
-                )))),
-            ],
-        )),
-    ))
+    Box::new(
+        Button::new(
+            action,
+            Box::new(Stack::row(
+                theme.gap,
+                vec![
+                    mark,
+                    Box::new(Align::left(Box::new(Label::new(
+                        text,
+                        theme.font_size,
+                        theme.ink,
+                    )))),
+                ],
+            )),
+        )
+        .focus(id),
+    )
 }
 
 /// A switch: a setting that takes effect the moment it is thrown.
 ///
 /// A checkbox is for a choice confirmed later, a switch for one that is not, and
 /// drawing them differently is the only way that difference is visible.
-pub fn toggle<A: Clone + 'static>(theme: &Theme, action: A, on: bool) -> Child<A> {
+pub fn toggle<A: Clone + 'static>(theme: &Theme, focus: &Focus, action: A, on: bool) -> Child<A> {
+    let id = focus.claim(true);
     let (width, height) = (36.0, 20.0);
     let track = if on { theme.accent } else { theme.border };
     let knob = theme.raised;
@@ -233,7 +263,7 @@ pub fn toggle<A: Clone + 'static>(theme: &Theme, action: A, on: bool) -> Child<A
     Box::new(Fixed::new(
         width,
         height,
-        Box::new(Button::new(action, Box::new(Align::centre(painted)))),
+        Box::new(Button::new(action, Box::new(Align::centre(painted))).focus(id)),
     ))
 }
 
@@ -244,13 +274,18 @@ pub fn toggle<A: Clone + 'static>(theme: &Theme, action: A, on: bool) -> Child<A
 /// overlay layer this surface does not have yet.
 pub fn segmented<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
     options: Vec<(String, A)>,
     chosen: usize,
 ) -> Child<A> {
+    // A segmented control *is* a group, so it makes its own rather than being
+    // told which one it is in.
+    let group = focus.group();
     let children: Vec<Child<A>> = options
         .into_iter()
         .enumerate()
         .map(|(index, (text, action))| {
+            let id = focus.claim_in(group, true);
             let selected = index == chosen;
             let (face, ink) = if selected {
                 (theme.raised, theme.ink)
@@ -270,7 +305,7 @@ pub fn segmented<A: Clone + 'static>(
             if !selected {
                 face = face.on_hover(theme.hover);
             }
-            Box::new(Button::new(action, Box::new(face))) as Child<A>
+            Box::new(Button::new(action, Box::new(face)).focus(id)) as Child<A>
         })
         .collect();
 
@@ -321,6 +356,8 @@ pub fn progress<A: 'static>(theme: &Theme, progress: Option<f64>) -> Child<A> {
 pub struct Slider<A> {
     value: f64,
     range: (f64, f64),
+    step: f64,
+    focus: Option<FocusId>,
     on_change: Box<dyn Fn(f64) -> A>,
     rect: Rect,
 }
@@ -331,9 +368,25 @@ impl<A> Slider<A> {
         Self {
             value,
             range,
+            // Twenty steps from end to end, which is a reachable number of key
+            // presses. A caller whose value has a grain of its own says so.
+            step: (range.1 - range.0) / 20.0,
+            focus: None,
             on_change: Box::new(on_change),
             rect: Rect::ZERO,
         }
+    }
+
+    /// How far one arrow key moves the value.
+    pub fn step(mut self, step: f64) -> Self {
+        self.step = step;
+        self
+    }
+
+    /// The name the surface knows this slider by, for keyboard traversal.
+    pub fn focus(mut self, id: FocusId) -> Self {
+        self.focus = Some(id);
+        self
     }
 
     /// Where the value sits along the track, as a fraction.
@@ -403,12 +456,25 @@ impl<A> Widget<A> for Slider<A> {
             knob / 2.0,
             1.0,
         );
+
+        if self.focus.is_some() && cx.focus == self.focus {
+            // Around the whole track rather than around the knob: a ring that
+            // travelled with the value would be a second thing moving for one
+            // change, and it would leave the control when the value did.
+            focus_ring(&theme, list, self.rect, theme.radius);
+        }
     }
 
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         let inside = cx.hovered(self.rect.inflate(4.0));
         match event {
             Event::PointerPressed if inside => Some((self.on_change)(self.value_at(cx.pointer.0))),
+            // The keyboard's version of a drag. Clamped here rather than by the
+            // caller, because the range is the slider's to know.
+            Event::Adjust(by) if self.focus.is_some() && cx.focus == self.focus => {
+                let wanted = self.value + f64::from(*by) * self.step;
+                Some((self.on_change)(wanted.clamp(self.range.0, self.range.1)))
+            }
             // A drag follows the pointer wherever it goes, as long as it began
             // on this slider: dragging past the end and holding there is how a
             // value is pinned to the maximum. No capture and no drag flag — the
@@ -734,12 +800,14 @@ pub fn setting_row<A: 'static>(
 /// silently omits the second reads as a browser that was never going to have it.
 pub fn menu_item<A: Clone + 'static>(
     theme: &Theme,
+    focus: &Focus,
     action: A,
     enabled: bool,
     mark: impl Fn(&mut DisplayList, Rect, Color) + 'static,
     text: impl Into<String>,
     shortcut: Option<&str>,
 ) -> Child<A> {
+    let id = focus.claim(enabled);
     let ink = if enabled {
         theme.ink
     } else {
@@ -784,7 +852,11 @@ pub fn menu_item<A: Clone + 'static>(
 
     Box::new(Fixed::height(
         30.0,
-        Box::new(Button::new(action, Box::new(face)).enabled(enabled)),
+        Box::new(
+            Button::new(action, Box::new(face))
+                .enabled(enabled)
+                .focus(id),
+        ),
     ))
 }
 
@@ -933,9 +1005,6 @@ pub fn elide(cx: &mut Cx, content: &str, available: f64, end: Elide) -> String {
     }
     best
 }
-
-/// A focus id that no control claims, for a surface with nothing focused.
-pub const NO_FOCUS: FocusId = FocusId::MAX;
 
 #[cfg(test)]
 mod tests {

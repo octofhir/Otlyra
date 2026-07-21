@@ -6,13 +6,14 @@
 //! not be shown to report that the engine does not.
 
 use otlyra_gfx::DisplayList;
+use otlyra_platform::{Key, Modifiers};
 use otlyra_text::TextEngine;
 
 use crate::widget::controls;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Child, Cx, Event, Flex, Gap, Insets, Label, Padding, Paragraph, Rect, Size, Stack,
-    fill_rounded,
+    Align, Child, Cx, Event, Flex, Focus, FocusId, Gap, Insets, Label, Padding, Paragraph, Rect,
+    Size, Stack, fill_rounded,
 };
 
 /// What this build is called.
@@ -27,15 +28,18 @@ pub enum Action {
     OpenSettings,
 }
 
-/// Everything this page's appearance is a function of: where it was put, and
-/// where the pointer is, because the one button on it lights up under it.
-type Appearance = (Rect, (f64, f64));
+/// Everything this page's appearance is a function of: where it was put, where
+/// the pointer is — the one button on it lights up under it — and what holds the
+/// keyboard, which is what draws the ring.
+type Appearance = (Rect, (f64, f64), Option<FocusId>);
 
 /// The about page.
 pub struct AboutSurface {
     /// Every colour and measurement it is drawn from.
     pub theme: Theme,
     pointer: (f64, f64),
+    focused: Option<FocusId>,
+    focus: Focus,
     /// What the last built list was built from, and the list itself.
     ///
     /// This page is a fixed set of facts about the build, so it is built once
@@ -58,6 +62,8 @@ impl AboutSurface {
         Self {
             theme: Theme::light(),
             pointer: (-1.0, -1.0),
+            focused: None,
+            focus: Focus::default(),
             cache: None,
             builds: 0,
             root: None,
@@ -71,19 +77,70 @@ impl AboutSurface {
 
     /// Press at the last reported position.
     pub fn pointer_pressed(&mut self, text: &mut TextEngine) -> Action {
+        self.offer(&Event::PointerPressed, text)
+    }
+
+    /// Handle a key: traversal, and activating what it lands on.
+    ///
+    /// `None` means the key was never this page's, and it goes on to the
+    /// toolbar behind it.
+    pub fn key_pressed(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+        text: &mut TextEngine,
+    ) -> Option<Action> {
+        if modifiers.is_accelerator() {
+            return None;
+        }
+        match key {
+            Key::Tab => {
+                self.focused = if modifiers.shift {
+                    self.focus.previous(self.focused)
+                } else {
+                    self.focus.next(self.focused)
+                };
+                Some(Action::None)
+            }
+            Key::Escape if self.focused.is_some() => {
+                self.focused = None;
+                Some(Action::None)
+            }
+            Key::Enter | Key::Character(' ') if self.focused.is_some() => {
+                Some(self.offer(&Event::Activate, text))
+            }
+            _ => None,
+        }
+    }
+
+    /// What the pointer should look like at `x`, `y`.
+    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> otlyra_platform::Cursor {
+        let pointer = self.pointer;
+        self.pointer = (x, y);
+        let action = self.offer(&Event::PointerPressed, text);
+        self.pointer = pointer;
+        match action {
+            Action::None => otlyra_platform::Cursor::Default,
+            _ => otlyra_platform::Cursor::Pointer,
+        }
+    }
+
+    /// Offer an event to the last frame's tree. The page holds no state of its
+    /// own, so this reports without changing anything.
+    fn offer(&mut self, event: &Event, text: &mut TextEngine) -> Action {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
         let mut cx = Cx::new(text);
         cx.pointer = self.pointer;
+        cx.focus = self.focused;
         cx.theme = self.theme.clone();
-        root.event(&Event::PointerPressed, &mut cx)
-            .unwrap_or(Action::None)
+        root.event(event, &mut cx).unwrap_or(Action::None)
     }
 
     /// Paint the page into `rect`, in window coordinates.
     pub fn build_display_list(&mut self, rect: Rect, text: &mut TextEngine, out: &mut DisplayList) {
-        let appearance = (rect, self.pointer);
+        let appearance = (rect, self.pointer, self.focused);
         if let Some((built, list)) = &self.cache
             && *built == appearance
             && self.root.is_some()
@@ -100,9 +157,11 @@ impl AboutSurface {
 
         let mut cx = Cx::new(text);
         cx.pointer = self.pointer;
+        cx.focus = self.focused;
         cx.theme = theme.clone();
 
-        let mut root = self.build(&theme);
+        self.focus.begin();
+        let mut root = self.build(&theme, &self.focus);
         root.measure(Size::new(rect.width, rect.height), &mut cx);
         root.place(rect, &mut cx);
         root.draw(&mut cx, list);
@@ -117,7 +176,7 @@ impl AboutSurface {
         self.builds
     }
 
-    fn build(&self, theme: &Theme) -> Child<Action> {
+    fn build(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
         let facts: Vec<(&str, String)> = vec![
             ("Version", VERSION.to_owned()),
             ("Engine", "Otlyra, in-house".to_owned()),
@@ -176,6 +235,7 @@ impl AboutSurface {
                     vec![
                         controls::button(
                             theme,
+                            focus,
                             Action::OpenSettings,
                             "Settings",
                             controls::Emphasis::Normal,

@@ -21,7 +21,7 @@
 use otlyra_gfx::kurbo::Affine;
 use otlyra_gfx::peniko::{Color, ImageData, ImageSampler};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_platform::{Key, Modifiers};
+use otlyra_platform::{Cursor, Key, Modifiers};
 use otlyra_text::TextEngine;
 
 pub use crate::widget::Rect;
@@ -30,8 +30,8 @@ use crate::widget::controls::{self, Elide, FieldView, TextInput};
 use crate::widget::icon;
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Button, Child, Cx, Event, Fixed, Insets, Label, Padding, Painted, Size,
-    Stack, Widget, fill_rounded,
+    Align, Background, Button, Child, Cx, Event, Fixed, Focus, FocusId, FocusKind, Insets, Label,
+    Padding, Painted, Size, Stack, Widget, fill_rounded,
 };
 
 /// Height of the tab strip, in logical pixels.
@@ -183,14 +183,15 @@ pub enum UiAction {
     /// Put the menu away without doing anything else — what a press anywhere
     /// off the panel means.
     CloseMenu,
-    /// Put the caret in the address field.
+    /// Give this control the keyboard — on the toolbar, always the address field.
     ///
     /// Never reaches the browser: [`BrowserUi::pointer_pressed`] applies it to
     /// its own state and reports [`UiAction::None`]. It is an action rather than
     /// a rectangle test in the press handler because that is what keeps the
     /// field's position known in exactly one place — the widget tree that drew
-    /// it.
-    FocusAddress,
+    /// it. The id comes from the frame that drew the field, so it names what is
+    /// on screen rather than a number chosen in advance.
+    Focus(FocusId),
 }
 
 /// A page the browser serves about itself.
@@ -305,6 +306,7 @@ struct Appearance {
     pointer_down: bool,
     address: String,
     caret: Option<usize>,
+    focus: Option<FocusId>,
     menu: Option<f64>,
 }
 
@@ -312,12 +314,18 @@ struct Appearance {
 pub struct BrowserUi {
     /// The address field.
     pub address: TextField,
-    /// Whether the address field has keyboard focus.
-    pub address_focused: bool,
     /// Whether the menu behind the cogwheel is open.
     pub menu_open: bool,
     /// Every colour and measurement the interface is drawn from.
     pub theme: Theme,
+    /// Which control has the keyboard, if any.
+    ///
+    /// One value rather than a focus id beside an `address_focused` flag: the
+    /// field shows a caret exactly when this lands on its id, so there is
+    /// nothing to keep in step.
+    focused: Option<FocusId>,
+    /// The focusable controls the last frame built, in the order it built them.
+    focus: Focus,
     pointer: (f64, f64),
     pointer_down: bool,
     /// What the last built list was built from, and the list itself.
@@ -342,7 +350,7 @@ impl std::fmt::Debug for BrowserUi {
         formatter
             .debug_struct("BrowserUi")
             .field("address", &self.address)
-            .field("address_focused", &self.address_focused)
+            .field("focused", &self.focused)
             .field("pointer", &self.pointer)
             .finish_non_exhaustive()
     }
@@ -353,9 +361,10 @@ impl BrowserUi {
     pub fn new() -> Self {
         Self {
             address: TextField::default(),
-            address_focused: false,
             menu_open: false,
             theme: Theme::light(),
+            focused: None,
+            focus: Focus::default(),
             pointer: (-1.0, -1.0),
             pointer_down: false,
             cache: None,
@@ -373,6 +382,51 @@ impl BrowserUi {
     /// geometry the last frame drew.
     pub fn pointer_moved(&mut self, x: f64, y: f64) {
         self.pointer = (x, y);
+    }
+
+    /// Whether the address field has the keyboard.
+    ///
+    /// A question about where the focus is, not a flag: the field is the one
+    /// text entry the toolbar builds, so the caret is on exactly when the focus
+    /// is on something a caret belongs in.
+    pub fn address_focused(&self) -> bool {
+        self.focus.kind(self.focused) == Some(FocusKind::Text)
+    }
+
+    /// Put the caret in the address field, for an accelerator that names it.
+    ///
+    /// Nothing happens before the first frame, because until then no field has
+    /// been drawn for the caret to be in.
+    pub fn focus_address(&mut self) {
+        if let Some(id) = self.focus.first_text() {
+            self.focused = Some(id);
+        }
+    }
+
+    /// What the pointer should look like at `x`, `y`, if the interface claims it.
+    ///
+    /// Asked of the tree that drew the frame — *what would a press here report* —
+    /// rather than worked out a second time from rectangles kept elsewhere.
+    pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Option<Cursor> {
+        let (pointer, down) = (self.pointer, self.pointer_down);
+        self.pointer = (x, y);
+        self.pointer_down = false;
+        let mut cx = self.cx(text);
+        let action = self
+            .root
+            .as_mut()
+            .and_then(|root| root.event(&Event::PointerPressed, &mut cx));
+        self.pointer = pointer;
+        self.pointer_down = down;
+
+        match action {
+            Some(UiAction::Focus(_)) => Some(Cursor::Text),
+            // The sheet behind an open menu answers everywhere, and everywhere
+            // is not a thing to point at: dismissing is what happens when you
+            // press *nothing*, so it reads as nothing.
+            Some(UiAction::CloseMenu) | None => None,
+            Some(_) => Some(Cursor::Pointer),
+        }
     }
 
     /// Whether the pointer is over the interface rather than the page.
@@ -394,7 +448,7 @@ impl BrowserUi {
             // The press belongs to the page, and it takes focus away from the
             // address field — which is what every browser does, and what makes
             // typing after clicking a page do nothing surprising.
-            self.address_focused = false;
+            self.focused = None;
             return UiAction::None;
         }
 
@@ -405,14 +459,14 @@ impl BrowserUi {
             .and_then(|root| root.event(&Event::PointerPressed, &mut cx));
 
         match action {
-            Some(UiAction::FocusAddress) => {
-                self.address_focused = true;
+            Some(UiAction::Focus(id)) => {
+                self.focused = Some(id);
                 self.menu_open = false;
                 UiAction::None
             }
             Some(UiAction::ToggleMenu) => {
                 self.menu_open = !self.menu_open;
-                self.address_focused = false;
+                self.focused = None;
                 UiAction::None
             }
             Some(UiAction::CloseMenu) => {
@@ -431,20 +485,50 @@ impl BrowserUi {
                     action,
                     UiAction::Reload | UiAction::Back | UiAction::Forward
                 ) {
-                    self.address_focused = false;
+                    self.focused = None;
                 }
                 action
             }
             None => {
-                self.address_focused = false;
+                self.focused = None;
                 self.menu_open = false;
                 UiAction::None
             }
         }
     }
 
+    /// Activate whatever holds the keyboard, through the path a press takes.
+    fn activate(&mut self, text: &mut TextEngine) -> UiAction {
+        let mut cx = self.cx(text);
+        let action = self
+            .root
+            .as_mut()
+            .and_then(|root| root.event(&Event::Activate, &mut cx));
+        match action {
+            Some(UiAction::Focus(id)) => {
+                self.focused = Some(id);
+                UiAction::None
+            }
+            Some(UiAction::ToggleMenu) => {
+                self.menu_open = !self.menu_open;
+                UiAction::None
+            }
+            Some(UiAction::OpenPage(page)) => {
+                self.menu_open = false;
+                UiAction::OpenPage(page)
+            }
+            Some(action) => action,
+            None => UiAction::None,
+        }
+    }
+
     /// Handle a key press. Returns what the browser should do about it.
-    pub fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> UiAction {
+    pub fn key_pressed(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+        text: &mut TextEngine,
+    ) -> UiAction {
         // Accelerators work whether or not the field has focus.
         // F5 reloads whatever has focus, including the address field: it is not
         // a character, so it cannot be something the user meant to type.
@@ -467,29 +551,48 @@ impl BrowserUi {
                 Key::Character(']') | Key::Right => UiAction::Forward,
                 Key::Character('t') => UiAction::NewTab,
                 Key::Character('l') => {
-                    self.address_focused = true;
+                    self.focus_address();
                     UiAction::None
                 }
                 _ => UiAction::None,
             };
         }
 
-        if !self.address_focused {
+        // Traversal, before anything a control might read the key as: Tab is
+        // never a character the address field wants.
+        if key == Key::Tab {
+            self.focused = if modifiers.shift {
+                self.focus.previous(self.focused)
+            } else {
+                self.focus.next(self.focused)
+            };
+            return UiAction::None;
+        }
+
+        if !self.address_focused() {
+            // Space and Return on anything else are what a press on it would be,
+            // reported through the same path so the two cannot diverge.
+            if matches!(key, Key::Enter | Key::Character(' ')) && self.focused.is_some() {
+                return self.activate(text);
+            }
+            if key == Key::Escape {
+                self.focused = None;
+            }
             return UiAction::None;
         }
 
         match key {
             Key::Enter => {
-                self.address_focused = false;
-                let text = self.address.text().trim().to_owned();
-                if text.is_empty() {
+                self.focused = None;
+                let typed = self.address.text().trim().to_owned();
+                if typed.is_empty() {
                     UiAction::None
                 } else {
-                    UiAction::Navigate(text)
+                    UiAction::Navigate(typed)
                 }
             }
             Key::Escape => {
-                self.address_focused = false;
+                self.focused = None;
                 UiAction::None
             }
             Key::Backspace => {
@@ -522,7 +625,7 @@ impl BrowserUi {
 
     /// Handle typed text. Returns whether the interface consumed it.
     pub fn text_input(&mut self, character: char) -> bool {
-        if !self.address_focused {
+        if !self.address_focused() {
             return false;
         }
         self.address.insert(character);
@@ -554,7 +657,8 @@ impl BrowserUi {
             pointer: self.pointer,
             pointer_down: self.pointer_down,
             address: self.address.text().to_owned(),
-            caret: self.address_focused.then(|| self.address.caret()),
+            caret: self.address_focused().then(|| self.address.caret()),
+            focus: self.focused,
             menu: self.menu_open.then_some(height),
         };
 
@@ -594,6 +698,7 @@ impl BrowserUi {
         // band: an open menu hangs below the toolbar, and both drawing and hit
         // testing have to reach it there.
         let surface = Size::new(width, height.max(UI_HEIGHT));
+        self.focus.begin();
         let mut root = self.build(width, tabs, active, history, spinner, text);
         let mut cx = self.cx(text);
         root.measure(surface, &mut cx);
@@ -625,6 +730,7 @@ impl BrowserUi {
         let mut cx = Cx::new(text);
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
+        cx.focus = self.focused;
         cx.theme = self.theme.clone();
         cx
     }
@@ -640,6 +746,7 @@ impl BrowserUi {
         text: &mut TextEngine,
     ) -> Child<UiAction> {
         let theme = self.theme.clone();
+        let focus = self.focus.clone();
         let mut cx = self.cx(text);
         // A column with an empty flexible tail rather than an aligner: an
         // aligner would shrink the interface to what it measured, and what the
@@ -654,11 +761,11 @@ impl BrowserUi {
                         vec![
                             Box::new(Fixed::height(
                                 TAB_STRIP_HEIGHT,
-                                tab_strip(&theme, &mut cx, width, tabs, active, spinner),
+                                tab_strip(&theme, &focus, &mut cx, width, tabs, active, spinner),
                             )),
                             Box::new(Fixed::height(
                                 TOOLBAR_HEIGHT,
-                                toolbar(&theme, self, history, spinner),
+                                toolbar(&theme, &focus, self, history, spinner),
                             )),
                         ],
                     )),
@@ -684,7 +791,7 @@ impl BrowserUi {
             Box::new(crate::widget::Anchored::from_right(
                 theme.inset,
                 UI_HEIGHT - 2.0,
-                menu(&theme),
+                menu(&theme, &focus),
             )),
         ]))
     }
@@ -693,6 +800,7 @@ impl BrowserUi {
 /// The strip of tabs, and the button that opens another.
 fn tab_strip(
     theme: &Theme,
+    focus: &Focus,
     cx: &mut Cx,
     width: f64,
     tabs: &[TabLabel],
@@ -714,7 +822,16 @@ fn tab_strip(
 
     let mut children: Vec<Child<UiAction>> = Vec::with_capacity(tabs.len() * 2 + 2);
     for (index, label) in tabs.iter().enumerate() {
-        children.push(tab(theme, cx, label, index, index == active, each, spinner));
+        children.push(tab(
+            theme,
+            focus,
+            cx,
+            label,
+            index,
+            index == active,
+            each,
+            spinner,
+        ));
         // A hairline between two tabs that are both in the background, so a run
         // of them reads as several rather than as one wide empty area. Beside
         // the active tab there is nothing to separate: its own edge does that.
@@ -726,6 +843,7 @@ fn tab_strip(
 
     children.push(controls::icon_button(
         theme,
+        focus,
         UiAction::NewTab,
         true,
         icon::plus,
@@ -749,7 +867,7 @@ fn tab_strip(
 
 /// The menu behind the cogwheel: everything the browser is, as opposed to
 /// everything a page is.
-fn menu(theme: &Theme) -> Child<UiAction> {
+fn menu(theme: &Theme, focus: &Focus) -> Child<UiAction> {
     use SystemPage::{About, Bookmarks, Downloads, History, Settings};
 
     let row = |page: SystemPage,
@@ -757,6 +875,7 @@ fn menu(theme: &Theme) -> Child<UiAction> {
                shortcut: Option<&str>| {
         controls::menu_item(
             theme,
+            focus,
             UiAction::OpenPage(page),
             page.available(),
             mark,
@@ -803,8 +922,10 @@ fn separator(theme: &Theme) -> Child<UiAction> {
 }
 
 /// One tab: a mark, a title, and a cross.
+#[allow(clippy::too_many_arguments)]
 fn tab(
     theme: &Theme,
+    focus: &Focus,
     cx: &mut Cx,
     label: &TabLabel,
     index: usize,
@@ -812,6 +933,9 @@ fn tab(
     width: f64,
     spinner: Option<f32>,
 ) -> Child<UiAction> {
+    // The tab itself before the cross inside it, so Tab reaches a tab and then
+    // the way to close it, which is the order they are read in.
+    let id = focus.claim(true);
     let face = if active { theme.raised } else { Theme::CLEAR };
     let ink = if active { theme.ink } else { theme.ink_dim };
 
@@ -834,7 +958,7 @@ fn tab(
     let room = width - 14.0 - 18.0 - theme.gap * 3.0 - theme.inset;
     let title = controls::elide(cx, &label.title, room, Elide::End);
 
-    let close = controls::icon_button(theme, UiAction::CloseTab(index), true, icon::cross);
+    let close = controls::icon_button(theme, focus, UiAction::CloseTab(index), true, icon::cross);
     let close = Box::new(Fixed::new(18.0, 18.0, Box::new(Align::centre(close))));
 
     let row = Stack::row(
@@ -869,41 +993,53 @@ fn tab(
 
     Box::new(Fixed::width(
         width,
-        Box::new(Button::new(
-            UiAction::SelectTab(index),
-            Box::new(background),
-        )),
+        Box::new(Button::new(UiAction::SelectTab(index), Box::new(background)).focus(id)),
     ))
 }
 
 /// The row under the tabs: where you have been, and where you are.
 fn toolbar(
     theme: &Theme,
+    focus: &Focus,
     ui: &BrowserUi,
     history: (bool, bool),
     spinner: Option<f32>,
 ) -> Child<UiAction> {
     let (can_go_back, can_go_forward) = history;
 
-    let back = controls::icon_button(theme, UiAction::Back, can_go_back, |list, rect, color| {
-        icon::chevron(list, rect, icon::Direction::Left, color);
-    });
+    let back = controls::icon_button(
+        theme,
+        focus,
+        UiAction::Back,
+        can_go_back,
+        |list, rect, color| {
+            icon::chevron(list, rect, icon::Direction::Left, color);
+        },
+    );
     let forward = controls::icon_button(
         theme,
+        focus,
         UiAction::Forward,
         can_go_forward,
         |list, rect, color| icon::chevron(list, rect, icon::Direction::Right, color),
     );
-    let reload = controls::icon_button(theme, UiAction::Reload, true, move |list, rect, color| {
-        icon::reload(list, rect, spinner, color);
-    });
+    let reload = controls::icon_button(
+        theme,
+        focus,
+        UiAction::Reload,
+        true,
+        move |list, rect, color| {
+            icon::reload(list, rect, spinner, color);
+        },
+    );
 
     // The scheme decides the mark, and only a transport that was authenticated
     // gets the padlock. Everything else gets a page, which claims nothing.
     let secure = ui.address.text().starts_with("https://");
+    let address_id = focus.claim_text(true);
     let field = TextInput::new(FieldView {
         text: ui.address.text().to_owned(),
-        caret: ui.address_focused.then(|| ui.address.caret()),
+        caret: (ui.focused == Some(address_id)).then(|| ui.address.caret()),
         placeholder: "Search or enter address".to_owned(),
     })
     .leading(move |list, rect, color| {
@@ -916,7 +1052,7 @@ fn toolbar(
     .face(theme.surface)
     .into_widget(theme);
 
-    let field = Box::new(Button::new(UiAction::FocusAddress, field));
+    let field = Box::new(Button::new(UiAction::Focus(address_id), field).focus(address_id));
 
     Box::new(Padding::new(
         Insets::symmetric(theme.inset, (TOOLBAR_HEIGHT - theme.control_height) / 2.0),
@@ -929,7 +1065,7 @@ fn toolbar(
                 controls::gap(theme.gap * 0.5),
                 field,
                 controls::gap(theme.gap * 0.5),
-                controls::icon_button(theme, UiAction::ToggleMenu, true, icon::gear),
+                controls::icon_button(theme, focus, UiAction::ToggleMenu, true, icon::gear),
             ],
         )),
     ))
@@ -1177,27 +1313,76 @@ mod tests {
 
         let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
         assert_eq!(press(&mut ui, &mut text, 500.0, middle), UiAction::None);
-        assert!(ui.address_focused, "a press in the field focuses it");
+        assert!(ui.address_focused(), "a press in the field focuses it");
 
         assert_eq!(
             press(&mut ui, &mut text, 400.0, UI_HEIGHT + 100.0),
             UiAction::None
         );
-        assert!(!ui.address_focused, "clicking the page takes focus away");
+        assert!(!ui.address_focused(), "clicking the page takes focus away");
     }
 
     #[test]
     fn a_press_on_empty_strip_focuses_nothing_and_does_nothing() {
         let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        ui.address_focused = true;
         frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
 
         assert_eq!(
             press(&mut ui, &mut text, 900.0, TAB_STRIP_HEIGHT / 2.0),
             UiAction::None
         );
-        assert!(!ui.address_focused);
+        assert!(!ui.address_focused());
+    }
+
+    #[test]
+    fn traversal_skips_a_control_that_is_drawn_but_does_nothing() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        // Nowhere to go back or forward to, so both of those are drawn dimmed
+        // and neither answers a press.
+        let mut list = DisplayList::default();
+        ui.build_display_list(
+            1000.0,
+            600.0,
+            &labels(1),
+            0,
+            (false, false),
+            None,
+            &mut text,
+            &mut list,
+        );
+
+        // The tab, its cross, the button that opens another, and then — past
+        // both dimmed arrows without stopping on either — reload.
+        for _ in 0..4 {
+            ui.key_pressed(Key::Tab, Modifiers::default(), &mut text);
+        }
+        assert_eq!(
+            ui.key_pressed(Key::Enter, Modifiers::default(), &mut text),
+            UiAction::Reload,
+            "a control that cannot be pressed is not a place the keyboard stops"
+        );
+    }
+
+    #[test]
+    fn activating_by_key_reports_what_a_press_reports() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
+
+        // The first thing Tab reaches is the first tab, which is what a press
+        // on it reports too — one path, so the two cannot drift apart.
+        ui.key_pressed(Key::Tab, Modifiers::default(), &mut text);
+        assert_eq!(
+            ui.key_pressed(Key::Character(' '), Modifiers::default(), &mut text),
+            UiAction::SelectTab(0)
+        );
+        assert_eq!(
+            press(&mut ui, &mut text, 40.0, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::SelectTab(0)
+        );
     }
 
     #[test]
@@ -1209,11 +1394,14 @@ mod tests {
 
     #[test]
     fn typing_goes_to_the_address_bar_only_when_it_has_focus() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
+
         assert!(!ui.text_input('a'));
         assert_eq!(ui.address.text(), "");
 
-        ui.address_focused = true;
+        ui.focus_address();
         assert!(ui.text_input('a'));
         assert!(ui.text_input('b'));
         assert_eq!(ui.address.text(), "ab");
@@ -1221,23 +1409,27 @@ mod tests {
 
     #[test]
     fn enter_navigates_to_what_was_typed_and_drops_focus() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        ui.address_focused = true;
+        frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
         for character in "example.com".chars() {
             ui.text_input(character);
         }
 
-        let action = ui.key_pressed(Key::Enter, Modifiers::default());
+        let action = ui.key_pressed(Key::Enter, Modifiers::default(), &mut text);
         assert_eq!(action, UiAction::Navigate("example.com".to_owned()));
-        assert!(!ui.address_focused);
+        assert!(!ui.address_focused());
     }
 
     #[test]
     fn an_empty_address_navigates_nowhere() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        ui.address_focused = true;
+        frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
         assert_eq!(
-            ui.key_pressed(Key::Enter, Modifiers::default()),
+            ui.key_pressed(Key::Enter, Modifiers::default(), &mut text),
             UiAction::None
         );
     }
@@ -1275,21 +1467,23 @@ mod tests {
 
     #[test]
     fn the_accelerator_opens_a_tab_whatever_has_focus() {
+        let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
         let accelerator = Modifiers {
             command: cfg!(target_os = "macos"),
             control: !cfg!(target_os = "macos"),
             ..Modifiers::default()
         };
         assert_eq!(
-            ui.key_pressed(Key::Character('t'), accelerator),
+            ui.key_pressed(Key::Character('t'), accelerator, &mut text),
             UiAction::NewTab
         );
         assert_eq!(
-            ui.key_pressed(Key::Character('l'), accelerator),
+            ui.key_pressed(Key::Character('l'), accelerator, &mut text),
             UiAction::None
         );
-        assert!(ui.address_focused, "cmd-L focuses the address bar");
+        assert!(ui.address_focused(), "cmd-L focuses the address bar");
     }
 
     /// Tabs shrink to share the width, down to a floor. Past the floor they run

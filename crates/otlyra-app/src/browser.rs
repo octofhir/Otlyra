@@ -285,6 +285,8 @@ pub struct Browser {
     mark: Option<otlyra_gfx::peniko::ImageData>,
     /// Where the pointer is, in window logical pixels.
     pointer: (f64, f64),
+    /// What the pointer should look like where it last was.
+    cursor: Cursor,
     /// The preferences.
     ///
     /// One surface for the whole browser rather than one per tab: a preference
@@ -315,6 +317,7 @@ impl Browser {
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
             pointer: (0.0, 0.0),
+            cursor: Cursor::Default,
             settings: SettingsSurface::new(),
             about: AboutSurface::new(),
         }
@@ -992,7 +995,7 @@ impl Browser {
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
         self.ui.address.clear();
-        self.ui.address_focused = true;
+        self.ui.focus_address();
     }
 
     /// Close a tab. The last one is never closed; it is emptied instead, because a
@@ -1053,7 +1056,7 @@ impl Browser {
             // Focus and the menu belong to the interface and are settled there:
             // the press handler applies them and reports `None`, so these arms
             // are only here to keep the match honest about the whole enum.
-            UiAction::FocusAddress | UiAction::ToggleMenu | UiAction::CloseMenu => {}
+            UiAction::Focus(_) | UiAction::ToggleMenu | UiAction::CloseMenu => {}
             // Chosen from the menu, a browser page opens beside what you were
             // reading rather than over it: the menu is reached *while* looking
             // at something, and losing that to check a preference is the whole
@@ -1068,6 +1071,30 @@ impl Browser {
             UiAction::SelectTab(index) => self.select_tab(index),
             UiAction::Reload => self.reload(),
         }
+    }
+
+    /// Work out what the pointer should look like where it now is.
+    ///
+    /// Computed when the pointer moves rather than when the loop asks, because
+    /// the loop asks through `&self` and the answer comes from offering the
+    /// interface's own tree a press it never applies — which needs the tree.
+    /// Asking the tree is what keeps the cursor and the click agreeing: they are
+    /// the same question put to the same rectangles.
+    fn update_cursor(&mut self, x: f64, y: f64) {
+        self.cursor = if let Some(interface) = self.ui.cursor_at(x, y, &mut self.text) {
+            interface
+        } else if y < UI_HEIGHT || self.ui.menu_open {
+            // Over the interface but over nothing in it.
+            Cursor::Default
+        } else {
+            match self.tabs[self.active].system {
+                Some(SystemPage::Settings) => self.settings.cursor_at(x, y),
+                Some(SystemPage::About) => self.about.cursor_at(x, y, &mut self.text),
+                Some(_) => Cursor::Default,
+                None if self.link_under_pointer().is_some() => Cursor::Pointer,
+                None => Cursor::Default,
+            }
+        };
     }
 
     /// The link under the pointer, resolved against the tab's own address.
@@ -1122,6 +1149,7 @@ impl Painter for Browser {
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
                 self.ui.pointer_moved(x, y);
+                self.update_cursor(x, y);
 
                 // A scrollbar being dragged keeps the pointer until it is let go,
                 // wherever the pointer wanders.
@@ -1207,15 +1235,30 @@ impl Painter for Browser {
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
-                if self.tabs[self.active].system == Some(SystemPage::Settings) {
-                    let action = self.settings.settings.key_pressed(key, modifiers);
-                    self.close_settings_if(&action);
-                    if action != settings::Action::None {
-                        return;
+                // A browser page shown in the tab gets the key first: it is what
+                // the reader is looking at, and Tab on it walks its own controls
+                // rather than the toolbar's.
+                match self.tabs[self.active].system {
+                    Some(SystemPage::Settings) => {
+                        if let Some(action) = self.settings.key_pressed(key, modifiers) {
+                            self.close_settings_if(&action);
+                            return;
+                        }
                     }
+                    Some(SystemPage::About) => {
+                        match self.about.key_pressed(key, modifiers, &mut self.text) {
+                            Some(about::Action::OpenSettings) => {
+                                self.open_system(SystemPage::Settings);
+                                return;
+                            }
+                            Some(_) => return,
+                            None => {}
+                        }
+                    }
+                    _ => {}
                 }
-                let action = self.ui.key_pressed(key, modifiers);
-                if action == UiAction::None && !self.ui.address_focused {
+                let action = self.ui.key_pressed(key, modifiers, &mut self.text);
+                if action == UiAction::None && !self.ui.address_focused() {
                     self.scroll_by_key(key);
                 }
                 self.apply(action);
@@ -1223,7 +1266,7 @@ impl Painter for Browser {
 
             PlatformEvent::TextInput(character) => {
                 if self.tabs[self.active].system == Some(SystemPage::Settings)
-                    && self.settings.settings.text_input(character)
+                    && self.settings.text_input(character)
                 {
                     return;
                 }
@@ -1278,11 +1321,7 @@ impl Painter for Browser {
     }
 
     fn cursor(&self) -> Cursor {
-        if self.link_under_pointer().is_some() {
-            Cursor::Pointer
-        } else {
-            Cursor::Default
-        }
+        self.cursor
     }
 
     fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
@@ -1706,7 +1745,12 @@ mod tests {
     }
 
     fn type_url(browser: &mut Browser, url: &str) {
-        browser.ui.address_focused = true;
+        // A frame first: the address field's focus id is its place in the order
+        // a frame built, so until one has been drawn there is no field to put a
+        // caret in. This is the same rule presses follow.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        browser.ui.focus_address();
         for character in url.chars() {
             browser.on_event(PlatformEvent::TextInput(character));
         }
@@ -1857,9 +1901,21 @@ mod tests {
         browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
         assert_eq!(browser.cursor(), Cursor::Default);
 
-        // And over the interface, where the page's links cannot reach.
-        browser.on_event(PlatformEvent::PointerMoved { x: 100.0, y: 10.0 });
+        // Over the empty end of the tab strip, where nothing responds.
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 10.0 });
         assert_eq!(browser.cursor(), Cursor::Default);
+
+        // Over a tab, which does: the hand is a promise that pressing does
+        // something, and it is owed by the interface as much as by a link.
+        browser.on_event(PlatformEvent::PointerMoved { x: 100.0, y: 10.0 });
+        assert_eq!(browser.cursor(), Cursor::Pointer);
+
+        // And over the address field, where text goes.
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: 400.0,
+            y: UI_HEIGHT - 20.0,
+        });
+        assert_eq!(browser.cursor(), Cursor::Text);
     }
 
     #[test]

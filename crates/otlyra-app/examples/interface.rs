@@ -17,7 +17,7 @@ use otlyra_app::ui::{BrowserUi, TabLabel, UI_HEIGHT};
 use otlyra_gfx::DisplayList;
 use otlyra_gfx::PaintTarget;
 use otlyra_gfx::kurbo::Affine;
-use otlyra_platform::{Painter, PlatformEvent, Viewport, render_offscreen};
+use otlyra_platform::{Key, Modifiers, Painter, PlatformEvent, Viewport, render_offscreen};
 use otlyra_text::TextEngine;
 
 /// One frame of the interface, in a state worth looking at.
@@ -28,7 +28,34 @@ struct Frame {
     active: usize,
     history: (bool, bool),
     spinner: Option<f32>,
+    /// Put the caret in the address field before the frame that is written.
+    ///
+    /// Which needs a frame drawn first: a focus id is a control's place in the
+    /// order a frame built, so until one has been built there is no field to
+    /// focus. Every state here is therefore drawn twice and the second one kept.
+    focus_address: bool,
+    /// How many times Tab is pressed before the frame that is written.
+    tabs_pressed: usize,
     text: TextEngine,
+}
+
+impl Frame {
+    /// The state as it should be looked at, given a frame has already been drawn.
+    ///
+    /// Written to be worth running twice: every scale settles from the same
+    /// start, or the second one would be a different number of Tabs along than
+    /// the first and the two shots would not be of one state.
+    fn settle(&mut self) {
+        self.ui
+            .key_pressed(Key::Escape, Modifiers::default(), &mut self.text);
+        if self.focus_address {
+            self.ui.focus_address();
+        }
+        for _ in 0..self.tabs_pressed {
+            self.ui
+                .key_pressed(Key::Tab, Modifiers::default(), &mut self.text);
+        }
+    }
 }
 
 impl Painter for Frame {
@@ -65,7 +92,33 @@ impl Painter for Frame {
 struct SettingsFrame {
     ui: BrowserUi,
     surface: otlyra_app::settings::SettingsSurface,
+    /// How far to scroll before the frame that is written.
+    scroll: f64,
+    /// How many times Tab is pressed before it, for the frame that shows a
+    /// control holding the keyboard.
+    tabs_pressed: usize,
     text: TextEngine,
+}
+
+impl SettingsFrame {
+    fn new() -> Self {
+        Self {
+            ui: BrowserUi::new(),
+            surface: otlyra_app::settings::SettingsSurface::new(),
+            scroll: 0.0,
+            tabs_pressed: 0,
+            text: TextEngine::new(),
+        }
+    }
+
+    fn settle(&mut self) {
+        self.surface.settings.scroll = 0.0;
+        self.surface.settings.focus = None;
+        self.surface.scroll_by(self.scroll);
+        for _ in 0..self.tabs_pressed {
+            self.surface.key_pressed(Key::Tab, Modifiers::default());
+        }
+    }
 }
 
 impl Painter for SettingsFrame {
@@ -104,6 +157,22 @@ fn tabs(titles: &[(&str, bool)]) -> Vec<TabLabel> {
         .collect()
 }
 
+/// A viewport of `width` by `height` logical pixels at `scale`.
+///
+/// Device pixels, so a 2× shot of a 1100pt-wide window is 2200 across.
+fn viewport(width: f64, height: f64, scale: f64) -> Viewport {
+    Viewport {
+        width: (width * scale) as u32,
+        height: (height * scale) as u32,
+        scale_factor: scale,
+    }
+}
+
+/// Both scales, always. The one interface bug that got furthest was invisible at
+/// 1× and doubled everything inside a scrolling panel at 2×, so a state written
+/// at only one of them is a state half looked at.
+const SCALES: [f64; 2] = [1.0, 2.0];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory: PathBuf = std::env::args()
         .nth(1)
@@ -111,147 +180,150 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into();
     std::fs::create_dir_all(&directory)?;
 
-    // Device pixels, so a 2× shot of a 1100pt-wide window is 2200 across.
-    let scale = 2.0;
-    let viewport = Viewport {
-        width: (1100.0 * scale) as u32,
-        height: ((UI_HEIGHT + 240.0) * scale) as u32,
-        scale_factor: scale,
+    let toolbar = |name, tabs, active, history, spinner| Frame {
+        name,
+        ui: BrowserUi::new(),
+        tabs,
+        active,
+        history,
+        spinner,
+        focus_address: false,
+        tabs_pressed: 0,
+        text: TextEngine::new(),
     };
 
     let mut frames = Vec::new();
 
     // One tab, nowhere to go back to: what the browser looks like on the first
     // frame after it opens.
-    let mut fresh = Frame {
-        name: "empty",
-        ui: BrowserUi::new(),
-        tabs: tabs(&[("New tab", false)]),
-        active: 0,
-        history: (false, false),
-        spinner: None,
-        text: TextEngine::new(),
-    };
+    let mut fresh = toolbar(
+        "empty",
+        tabs(&[("New tab", false)]),
+        0,
+        (false, false),
+        None,
+    );
     fresh.ui.address.clear();
     frames.push(fresh);
 
     // Several tabs, one of them still loading, and history in both directions.
-    let mut busy = Frame {
-        name: "tabs",
-        ui: BrowserUi::new(),
-        tabs: tabs(&[
+    let mut busy = toolbar(
+        "tabs",
+        tabs(&[
             ("CSS support — Otlyra", false),
             ("A title long enough that it has to be cut short", true),
             ("Otlyra", false),
         ]),
-        active: 0,
-        history: (true, true),
-        spinner: Some(1.2),
-        text: TextEngine::new(),
-    };
+        0,
+        (true, true),
+        Some(1.2),
+    );
     busy.ui.address.set_text("https://example.com/some/path");
     frames.push(busy);
 
     // The address field with the caret in it, which is the state every other
     // control has to keep out of the way of.
-    let mut focused = Frame {
-        name: "focused",
-        ui: BrowserUi::new(),
-        tabs: tabs(&[("Otlyra", false), ("Second", false)]),
-        active: 1,
-        history: (true, false),
-        spinner: None,
-        text: TextEngine::new(),
-    };
+    let mut focused = toolbar(
+        "focused",
+        tabs(&[("Otlyra", false), ("Second", false)]),
+        1,
+        (true, false),
+        None,
+    );
     focused
         .ui
         .address
         .set_text("https://example.com/search?q=widgets");
-    focused.ui.address_focused = true;
+    focused.focus_address = true;
     frames.push(focused);
+
+    // The keyboard on the first tab, which is where the focus ring has to be
+    // legible against the strip it is drawn on.
+    let mut traversed = toolbar(
+        "keyboard",
+        tabs(&[("Otlyra", false), ("Second", false)]),
+        0,
+        (true, true),
+        None,
+    );
+    traversed.ui.address.set_text("https://example.com/");
+    traversed.tabs_pressed = 1;
+    frames.push(traversed);
 
     // The menu behind the cogwheel, open, which is the one state that reaches
     // past the interface and over the page.
-    let mut menu = Frame {
-        name: "menu",
-        ui: BrowserUi::new(),
-        tabs: tabs(&[("Otlyra", false)]),
-        active: 0,
-        history: (true, false),
-        spinner: None,
-        text: TextEngine::new(),
-    };
+    let mut menu = toolbar("menu", tabs(&[("Otlyra", false)]), 0, (true, false), None);
     menu.ui.address.set_text("https://example.com/");
     menu.ui.menu_open = true;
     frames.push(menu);
 
     // The pointer resting on the reload button, so the hover wash is visible.
-    let mut hovered = Frame {
-        name: "hover",
-        ui: BrowserUi::new(),
-        tabs: tabs(&[("Otlyra", false), ("Second", false)]),
-        active: 0,
-        history: (true, true),
-        spinner: None,
-        text: TextEngine::new(),
-    };
+    let mut hovered = toolbar(
+        "hover",
+        tabs(&[("Otlyra", false), ("Second", false)]),
+        0,
+        (true, true),
+        None,
+    );
     hovered.ui.address.set_text("https://example.com/");
     hovered.ui.pointer_moved(80.0, UI_HEIGHT - 20.0);
     frames.push(hovered);
 
-    // The settings, which are twice as tall as anything else here because they
-    // scroll.
-    let mut settings = SettingsFrame {
-        ui: BrowserUi::new(),
-        surface: otlyra_app::settings::SettingsSurface::new(),
-        text: TextEngine::new(),
-    };
-    settings.ui.address.set_text("Settings");
-    let tall = Viewport {
-        width: (1100.0 * scale) as u32,
-        height: (760.0 * scale) as u32,
-        scale_factor: scale,
-    };
-    let png = render_offscreen(&mut settings, tall)?;
-    let path = directory.join("settings.png");
-    std::fs::write(&path, &png)?;
-    println!("{}", path.display());
-
-    // A short window, scrolled to the end: the state where a panel that gets
-    // its own height wrong shows it.
-    for (name, width, height, scroll) in [
-        ("settings-short", 900.0, 420.0, 0.0),
-        ("settings-scrolled", 900.0, 420.0, 100_000.0),
-        ("settings-narrow", 620.0, 700.0, 0.0),
+    // The settings: the whole page, then the states a tall window cannot show —
+    // a short one, one scrolled to the end, a narrow one, and one with the
+    // keyboard several controls in.
+    for (name, width, height, scroll, tabs_pressed) in [
+        ("settings", 1100.0, 760.0, 0.0, 0),
+        ("settings-short", 900.0, 420.0, 0.0, 0),
+        ("settings-scrolled", 900.0, 420.0, 100_000.0, 0),
+        ("settings-narrow", 620.0, 700.0, 0.0, 0),
+        ("settings-keyboard", 900.0, 700.0, 0.0, 5),
     ] {
-        let mut frame = SettingsFrame {
-            ui: BrowserUi::new(),
-            surface: otlyra_app::settings::SettingsSurface::new(),
-            text: TextEngine::new(),
-        };
+        let mut frame = SettingsFrame::new();
         frame.ui.address.set_text("about:settings");
-        let viewport = Viewport {
-            width: (width * scale) as u32,
-            height: (height * scale) as u32,
-            scale_factor: scale,
-        };
-        // One frame to measure against, then the scroll, then the frame that is
-        // written: how far a panel can go is only known once it has been drawn.
-        let _ = render_offscreen(&mut frame, viewport)?;
-        frame.surface.scroll_by(scroll);
-        let png = render_offscreen(&mut frame, viewport)?;
-        let path = directory.join(format!("{name}.png"));
-        std::fs::write(&path, &png)?;
-        println!("{}", path.display());
+        frame.scroll = scroll;
+        frame.tabs_pressed = tabs_pressed;
+        write_states(&directory, name, &mut frame, width, height, |frame| {
+            frame.settle();
+        })?;
     }
 
     for mut frame in frames {
         let name = frame.name;
-        let png = render_offscreen(&mut frame, viewport)?;
-        let path = directory.join(format!("{name}.png"));
+        write_states(
+            &directory,
+            name,
+            &mut frame,
+            1100.0,
+            UI_HEIGHT + 240.0,
+            |frame| frame.settle(),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Write one state at every scale.
+///
+/// Two frames per scale, and the second is the one kept: focus ids and how far a
+/// panel can scroll are both things a frame only reports once it has been built,
+/// so a state that depends on either has to be drawn before it can be set up.
+fn write_states<P: Painter>(
+    directory: &std::path::Path,
+    name: &str,
+    frame: &mut P,
+    width: f64,
+    height: f64,
+    settle: impl Fn(&mut P),
+) -> Result<(), Box<dyn std::error::Error>> {
+    for scale in SCALES {
+        let viewport = viewport(width, height, scale);
+        let _ = render_offscreen(frame, viewport)?;
+        settle(frame);
+        let png = render_offscreen(frame, viewport)?;
+        let path = directory.join(format!("{name}@{scale}x.png"));
         std::fs::write(&path, &png)?;
         println!("{}", path.display());
     }
-
     Ok(())
 }

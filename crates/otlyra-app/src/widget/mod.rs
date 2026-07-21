@@ -58,7 +58,7 @@ pub mod controls;
 pub mod icon;
 pub mod theme;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use otlyra_gfx::kurbo::{Affine, BezPath, RoundedRect, RoundedRectRadii, Shape};
@@ -213,14 +213,208 @@ pub enum Event {
     /// The surface's keyboard focus was activated — the space or return key on
     /// whatever [`Cx::focus`] names.
     Activate,
+    /// An arrow key on whatever holds the focus, as a step of `-1` or `1`.
+    ///
+    /// What a control with a range does with a keyboard. Moving *between*
+    /// controls is the surface's business and never arrives as an event; this is
+    /// only for a control that has somewhere to go inside itself.
+    Adjust(i32),
+}
+
+impl Event {
+    /// Whether this event is aimed by the pointer.
+    ///
+    /// The difference matters to anything that decides by position who may hear
+    /// an event: a press outside a panel is not the panel's, but a key is aimed
+    /// by the focus and reaches what holds it wherever the pointer happens to be
+    /// resting — which is usually nowhere near.
+    pub fn from_pointer(&self) -> bool {
+        matches!(
+            self,
+            Self::PointerMoved | Self::PointerPressed | Self::PointerReleased
+        )
+    }
 }
 
 /// Which control on a surface has the keyboard.
 ///
-/// A number the surface assigns and understands; the layer only compares it. A
-/// surface that has no keyboard traversal — the toolbar, where every control is
-/// a click target and the one field is focused by name — never sets it.
+/// A control's position in the order its surface built this frame — see
+/// [`Focus`] — rather than a number anybody chose. The layer only compares them.
 pub type FocusId = u32;
+
+/// What a focusable control is, as far as the keyboard and the cursor care.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FocusKind {
+    /// Something that does one thing when it is activated.
+    Press,
+    /// A field that text is typed into.
+    Text,
+}
+
+/// One focusable control, as its surface recorded it.
+#[derive(Copy, Clone, Debug)]
+struct Entry {
+    enabled: bool,
+    kind: FocusKind,
+    group: Option<u32>,
+}
+
+/// The focusable controls a surface built this frame, in the order it built them.
+///
+/// The same shape as [`Overflow`], and for the same reason: what the traversal
+/// order *is* only becomes known while a frame is built, so the frame reports it
+/// and the surface reads it back. An id is a control's position in this list
+/// rather than a number anybody assigned, which makes *traversal order is
+/// drawing order* true by construction. A list of named constants beside the
+/// tree would be a second answer to the same question, and the two would
+/// disagree the first time a row moved.
+///
+/// Which id *holds* the keyboard is deliberately not here. That is one value the
+/// surface owns and is drawn from, and keeping it out of a shared cell is what
+/// lets a surface notice the focus moving: a clone of the surface's state shares
+/// this cell, so anything kept in it compares equal to itself however far the
+/// focus travelled — and the ring would never be redrawn.
+#[derive(Clone, Default)]
+pub struct Focus {
+    entries: Rc<RefCell<Vec<Entry>>>,
+    groups: Rc<Cell<u32>>,
+}
+
+impl Focus {
+    /// Forget the last frame's order, before building the next one.
+    pub fn begin(&self) {
+        self.entries.borrow_mut().clear();
+        self.groups.set(0);
+    }
+
+    /// Claim the next id for something that is pressed.
+    pub fn claim(&self, enabled: bool) -> FocusId {
+        self.push(enabled, FocusKind::Press, None)
+    }
+
+    /// Claim the next id for a field that text is typed into.
+    pub fn claim_text(&self, enabled: bool) -> FocusId {
+        self.push(enabled, FocusKind::Text, None)
+    }
+
+    /// Claim the next id for one of a set of exclusive choices.
+    ///
+    /// Members of a group are reached from each other by the arrow keys, which
+    /// is what a radio set and a segmented control are expected to do.
+    pub fn claim_in(&self, group: u32, enabled: bool) -> FocusId {
+        self.push(enabled, FocusKind::Press, Some(group))
+    }
+
+    /// A group number no other group on this surface has.
+    pub fn group(&self) -> u32 {
+        let next = self.groups.get();
+        self.groups.set(next + 1);
+        next
+    }
+
+    fn push(&self, enabled: bool, kind: FocusKind, group: Option<u32>) -> FocusId {
+        let mut entries = self.entries.borrow_mut();
+        entries.push(Entry {
+            enabled,
+            kind,
+            group,
+        });
+        (entries.len() - 1) as FocusId
+    }
+
+    /// How many focusable controls the last frame built.
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    /// Whether the last frame built none at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What kind of control `id` names, if it names one.
+    pub fn kind(&self, id: Option<FocusId>) -> Option<FocusKind> {
+        let id = id?;
+        self.entries
+            .borrow()
+            .get(id as usize)
+            .map(|entry| entry.kind)
+    }
+
+    /// Whether `id` names a control that is drawn but does nothing.
+    pub fn is_enabled(&self, id: FocusId) -> bool {
+        self.entries
+            .borrow()
+            .get(id as usize)
+            .is_some_and(|entry| entry.enabled)
+    }
+
+    /// The first field on the surface, for an accelerator that names one.
+    pub fn first_text(&self) -> Option<FocusId> {
+        self.entries
+            .borrow()
+            .iter()
+            .position(|entry| entry.kind == FocusKind::Text && entry.enabled)
+            .map(|index| index as FocusId)
+    }
+
+    /// What Tab moves to from `from`, wrapping past the end.
+    pub fn next(&self, from: Option<FocusId>) -> Option<FocusId> {
+        self.step(from, 1)
+    }
+
+    /// What shift-Tab moves to, wrapping past the start.
+    pub fn previous(&self, from: Option<FocusId>) -> Option<FocusId> {
+        self.step(from, -1)
+    }
+
+    /// The next member of `from`'s group, wrapping within it.
+    ///
+    /// `None` when `from` is in no group, which is how the surface knows to
+    /// offer the arrow key to the control itself instead.
+    pub fn step_in_group(&self, from: FocusId, forward: bool) -> Option<FocusId> {
+        let entries = self.entries.borrow();
+        let group = entries.get(from as usize)?.group?;
+        let members: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.group == Some(group) && entry.enabled)
+            .map(|(index, _)| index)
+            .collect();
+        let at = members.iter().position(|index| *index == from as usize)?;
+        let step = if forward { 1 } else { members.len() - 1 };
+        Some(members[(at + step) % members.len()] as FocusId)
+    }
+
+    /// Traversal, in either direction, skipping anything disabled.
+    fn step(&self, from: Option<FocusId>, by: isize) -> Option<FocusId> {
+        let entries = self.entries.borrow();
+        let count = entries.len() as isize;
+        if count == 0 {
+            return None;
+        }
+        // With nothing focused, forward starts before the first and backward
+        // starts after the last, so one step lands on the end being entered.
+        let start = match from {
+            Some(id) if (id as isize) < count => id as isize,
+            _ if by > 0 => -1,
+            _ => count,
+        };
+        (1..=count)
+            .map(|step| (start + by * step).rem_euclid(count))
+            .find(|index| entries[*index as usize].enabled)
+            .map(|index| index as FocusId)
+    }
+}
+
+impl std::fmt::Debug for Focus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Focus")
+            .field("controls", &self.len())
+            .finish()
+    }
+}
 
 /// What a widget needs while it works.
 ///
@@ -914,8 +1108,10 @@ impl<A> Widget<A> for Clip<A> {
 
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         // A press outside the clip never reaches the child, however far the
-        // child was placed: what is not drawn cannot be clicked.
-        if !cx.hovered(self.rect) {
+        // child was placed: what is not drawn cannot be clicked. A key is not
+        // aimed with the pointer, so it passes through regardless — a control
+        // reached by Tab answers wherever the pointer is resting.
+        if event.from_pointer() && !cx.hovered(self.rect) {
             return None;
         }
         self.child.event(event, cx)
@@ -1016,7 +1212,10 @@ impl<A> Widget<A> for Scroll<A> {
     }
 
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
-        if !cx.hovered(self.rect) {
+        // The wheel and a press belong to whatever the pointer is over; a key
+        // belongs to whatever holds the focus, which may be scrolled out of
+        // sight and is still the thing that answers.
+        if event.from_pointer() && !cx.hovered(self.rect) {
             return None;
         }
         self.child.event(event, cx)
