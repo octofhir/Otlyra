@@ -1813,7 +1813,7 @@ impl<'a> Flow<'a> {
         if spans.is_empty() && replaced.is_empty() {
             return 0.0;
         }
-        self.level_line_heights(parent, &mut spans, &sources);
+        self.level_line_heights(parent, &mut spans, &sources, &replaced);
 
         // Where each span landed in the concatenated text, computed the same way
         // `shape_spans` concatenates it. This is what turns a shaped run back into
@@ -1906,7 +1906,7 @@ impl<'a> Flow<'a> {
             let height = shaped
                 .lines
                 .get(index + 1)
-                .map_or(line.height, |next| next.top - line.top);
+                .map_or(line.bottom - line.top, |next| next.top - line.top);
             let line_y = y + line.top - paragraph_top;
             // Alignment moves the whole line, glyphs and all: the shaper laid it
             // out from the start edge, and where that edge is is the block's
@@ -2110,7 +2110,13 @@ impl<'a> Flow<'a> {
     /// floor is the answer CSS gives anyway. What it gets wrong is the opposite
     /// case: a paragraph with one larger inline in it is tall on every line rather
     /// than on the line that holds it.
-    fn level_line_heights(&mut self, parent: BoxId, spans: &mut [TextSpan<'_>], sources: &[BoxId]) {
+    fn level_line_heights(
+        &mut self,
+        parent: BoxId,
+        spans: &mut [TextSpan<'_>],
+        sources: &[BoxId],
+        replaced: &[ReplacedBox],
+    ) {
         let style = Arc::clone(&self.tree.node(parent).style);
         let stack = self.font_stack(&style);
         // The strut: the line the block would have with no text in it at all.
@@ -2140,6 +2146,13 @@ impl<'a> Flow<'a> {
                 above = above.max(asked - strut.descent);
             }
         }
+
+        // A picture is deliberately *not* folded in. It sits with its bottom edge on
+        // the baseline, so all of it is above — and one large picture would make
+        // every line of the paragraph as tall as itself, which for a picture beside
+        // a sentence is far more wrong than the pixel it saves. The shaper reserves
+        // the room for it within the line it is actually on.
+        let _ = replaced;
 
         let height = above + below + strut.leading;
         if height.is_finite() && height > 0.0 {

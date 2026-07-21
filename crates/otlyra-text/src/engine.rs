@@ -130,8 +130,15 @@ pub struct LineMetrics {
     pub top: f32,
     /// Distance from the paragraph top to this line's baseline.
     pub baseline: f32,
-    /// The line's height.
+    /// The line's height: the space the shaper stacks the next line by.
     pub height: f32,
+    /// Distance from the paragraph top to the lowest thing on this line.
+    ///
+    /// Not always `top + height`. A picture in a line sits with its bottom on the
+    /// baseline and the text's descenders hang below that, so the line reaches
+    /// further down than the height it is stacked by — and a paragraph that is one
+    /// such line is that much taller than the shaper reports.
+    pub bottom: f32,
     /// The line's advance width.
     pub width: f32,
 }
@@ -674,6 +681,7 @@ fn collect(layout: &parley::Layout<Brush>, text_len: usize) -> ShapedText {
             top: metrics.block_min_coord,
             baseline: metrics.baseline,
             height: metrics.line_height,
+            bottom: metrics.block_max_coord,
             width: metrics.advance,
         });
 
@@ -747,10 +755,17 @@ fn collect(layout: &parley::Layout<Brush>, text_len: usize) -> ShapedText {
         }
     }
 
+    // The paragraph reaches from the top of its first line to the bottom of its
+    // last, which is not the sum of the heights they are stacked by.
+    let height = match (lines.first(), lines.last()) {
+        (Some(first), Some(last)) => (last.bottom - first.top).max(layout.height()),
+        _ => layout.height(),
+    };
+
     ShapedText {
         metrics: TextMetrics {
             width: layout.width(),
-            height: layout.height(),
+            height,
             first_baseline,
             line_count: layout.len(),
         },
@@ -1121,6 +1136,41 @@ mod tests {
             placed[1].1, marked.metrics.width,
             "and the end of the text is the end of the line"
         );
+    }
+
+    /// A spacer sits with its bottom on the baseline, so the line reaches further
+    /// down than the height the shaper stacks the next line by — and a paragraph
+    /// that is one such line is that much taller than the sum of its line heights.
+    #[test]
+    fn a_paragraph_is_as_tall_as_it_reaches() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("before ", 16.0, brush), span(" after", 16.0, brush)];
+        let plain = engine.shape_spans(&spans, &[], None);
+        let with_box = engine.shape_spans(
+            &spans,
+            &[Spacer {
+                id: 1,
+                at: 1,
+                width: 32.0,
+                height: 32.0,
+            }],
+            None,
+        );
+
+        let line = with_box.lines.first().expect("one line");
+        assert!(
+            line.bottom > line.top + line.height,
+            "the line reaches below the height it is stacked by: {line:?}"
+        );
+        assert!(
+            (with_box.metrics.height - (line.bottom - line.top)).abs() < 0.01,
+            "and the paragraph is as tall as its one line reaches: {} against {}",
+            with_box.metrics.height,
+            line.bottom - line.top
+        );
+        assert!(with_box.metrics.height > 32.0, "which is past the picture");
+        assert!(with_box.metrics.height > plain.metrics.height);
     }
 
     /// A spacer with a width is how an inline element's border and padding take
