@@ -1373,7 +1373,14 @@ impl Browser {
                     .content_of(to_rect(rect))
                     .width
             });
-        let edges = crate::inspector::BoxEdges::of(style, containing);
+        // What layout actually gave it, and only failing that what the style
+        // says. The used values are the ones a box model is asking about: a
+        // computed `margin: auto` is not a number, and the number it came out as
+        // is known to layout alone.
+        let edges = page
+            .used_edges(id)
+            .map(crate::inspector::BoxEdges::used)
+            .unwrap_or_else(|| crate::inspector::BoxEdges::of(style, containing));
 
         // A container whose children were laid out into tracks gets the dashed
         // overlay: the lines a stylesheet names are invisible until they are

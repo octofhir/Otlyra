@@ -50,6 +50,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
     let height = engine.layout_children(root, viewport.width, 0.0, 0.0, &mut children);
 
     let root_fragment = Fragment {
+        used: None,
         box_id: Some(root),
         rect: Rect::new(0.0, 0.0, viewport.width, height.max(viewport.height)),
         kind: FragmentKind::Box,
@@ -194,6 +195,23 @@ struct FlexItem {
 
 impl FlexItem {
     /// The margins that take room along the main axis.
+    /// Which of this item's main-axis margins are `auto`, leading then trailing.
+    fn auto_margin_sides(&self, row: bool) -> (bool, bool) {
+        use otlyra_css::LengthOrAuto::Auto;
+        let margin = &self.style.margin;
+        if row {
+            (margin.left == Auto, margin.right == Auto)
+        } else {
+            (margin.top == Auto, margin.bottom == Auto)
+        }
+    }
+
+    /// How many of them there are, which is what the free space is split between.
+    fn auto_margins_main(&self, row: bool) -> usize {
+        let (lead, trail) = self.auto_margin_sides(row);
+        usize::from(lead) + usize::from(trail)
+    }
+
     fn margin_main(&self, row: bool) -> f32 {
         if row {
             self.margin.left + self.margin.right
@@ -409,6 +427,7 @@ fn replaced_fragment(
     height: f32,
 ) -> Fragment {
     Fragment {
+        used: None,
         box_id: Some(id),
         rect: Rect::new(x, y, width, height),
         kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
@@ -844,6 +863,7 @@ impl<'a> Flow<'a> {
         );
 
         Fragment {
+            used: None,
             box_id: Some(id),
             rect: Rect::new(
                 x,
@@ -1043,6 +1063,7 @@ impl<'a> Flow<'a> {
             let image = content.image.clone();
             let margin = resolve_margin(&style, containing_width);
             return Fragment {
+                used: None,
                 box_id: Some(id),
                 rect: Rect::new(x + margin.left, y, width, height),
                 kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
@@ -1130,6 +1151,11 @@ impl<'a> Flow<'a> {
         }
 
         Fragment {
+            used: Some(crate::UsedEdges {
+                margin,
+                border,
+                padding,
+            }),
             box_id: Some(id),
             // The border box: the rectangle a background paints and a border is
             // drawn on the inside edge of.
@@ -1261,6 +1287,7 @@ impl<'a> Flow<'a> {
             }
 
             fragments.push(Fragment {
+                used: None,
                 box_id: Some(*row),
                 rect: Rect::new(x + spacing_x, cursor, table_width - spacing_x * 2.0, height),
                 kind: FragmentKind::Box,
@@ -1779,6 +1806,22 @@ impl<'a> Flow<'a> {
         } else {
             0.0
         };
+        // Auto margins eat the free space before `justify-content` sees any.
+        // That is what `margin-right: auto` on one item in a row is for — it is
+        // how a brand is pushed left and a nav right — and a container that
+        // handed the leftover to `justify-content` instead would leave both of
+        // them bunched at the start, which is what it did.
+        let autos: usize = items[line.clone()]
+            .iter()
+            .map(|item| item.auto_margins_main(row))
+            .sum();
+        let per_auto = if autos > 0 && leftover > 0.0 {
+            leftover / autos as f32
+        } else {
+            0.0
+        };
+        let leftover = if autos > 0 { 0.0 } else { leftover };
+
         let count = count as f32;
         let (leading, between) = match style.justify_content {
             JustifyContent::Start => (0.0, 0.0),
@@ -1814,9 +1857,15 @@ impl<'a> Flow<'a> {
                     _ => 0.0,
                 };
 
+            // An `auto` margin on the leading side pushes this item along; one on
+            // the trailing side pushes everything after it.
+            let (lead_auto, trail_auto) = item.auto_margin_sides(row);
+            let lead = if lead_auto { per_auto } else { 0.0 };
+            let trail = if trail_auto { per_auto } else { 0.0 };
+
             let (item_x, item_y, item_width, item_height) = if row {
                 (
-                    x + cursor + item.margin.left,
+                    x + cursor + item.margin.left + lead,
                     y + cross_offset + item.margin.top,
                     item.main,
                     cross_size,
@@ -1824,14 +1873,14 @@ impl<'a> Flow<'a> {
             } else {
                 (
                     x + cross_offset + item.margin.left,
-                    y + cursor + item.margin.top,
+                    y + cursor + item.margin.top + lead,
                     cross_size,
                     item.main,
                 )
             };
 
             let id = item.id;
-            let advance = item.main + item.margin_main(row);
+            let advance = item.main + item.margin_main(row) + lead + trail;
             let fragment = self.layout_item(id, item_x, item_y, item_width, item_height);
             out.push(fragment);
             cursor += advance + gap + between;
@@ -2064,6 +2113,11 @@ impl<'a> Flow<'a> {
         };
 
         Fragment {
+            used: Some(crate::UsedEdges {
+                margin: resolve_margin(&style, width),
+                border,
+                padding,
+            }),
             box_id: Some(id),
             rect: Rect::new(x, y, width, outer_height),
             kind: FragmentKind::Box,
@@ -2270,6 +2324,7 @@ impl<'a> Flow<'a> {
                         .unwrap_or_else(|| baseline_shift(&inline.style, &style));
 
                     Some(Fragment {
+                        used: None,
                         box_id: Some(inline.id),
                         // Vertical padding and a horizontal border spill outside
                         // the line box without making it taller: an inline box does
@@ -2332,6 +2387,7 @@ impl<'a> Flow<'a> {
                     // everything twice as far as it was asked to go.
 
                     Fragment {
+                        used: None,
                         box_id,
                         // The fragment moves with its glyphs. Shifting only the
                         // glyphs left the background, the underline and the
@@ -2364,6 +2420,7 @@ impl<'a> Flow<'a> {
                 }
                 let image = box_.image.clone()?;
                 Some(Fragment {
+                    used: None,
                     box_id: Some(box_.id),
                     rect: Rect::new(
                         line_x + spacer.x,
@@ -2383,6 +2440,7 @@ impl<'a> Flow<'a> {
             }));
 
             out.push(Fragment {
+                used: None,
                 box_id: Some(parent),
                 rect: Rect::new(line_x, line_y, line.width, height),
                 kind: FragmentKind::Line,
@@ -2607,6 +2665,7 @@ impl<'a> Flow<'a> {
         }
 
         Some(Fragment {
+            used: None,
             box_id: None,
             rect: Rect::new(left, y, room, line.height),
             kind: FragmentKind::Text(run),
@@ -3035,6 +3094,69 @@ mod tests {
             nav.x,
             brand.x + brand.width
         );
+    }
+
+    /// An `auto` margin on a flex item eats the free space before
+    /// `justify-content` sees any — which is how a brand is pushed to one end and
+    /// a nav to the other, and how a lone item is centred.
+    #[test]
+    fn an_auto_margin_takes_the_free_space_first() {
+        let (tree, boxes) = laid_out(
+            "<body><div style=\"display:flex;width:400px\">\
+             <a style=\"margin-right:auto;width:50px\">.</a>\
+             <b style=\"width:50px\">.</b></div>",
+            800.0,
+        );
+        // Offsets are relative to the container, whose own position carries the
+        // body's default margin; what is being asserted is the gap the auto
+        // margin opened, not where the page starts.
+        let brand = rect_of(&tree, &boxes, "a");
+        let end = rect_of(&tree, &boxes, "b");
+        assert_eq!(
+            end.x - brand.x,
+            350.0,
+            "pushed to the far end, not left beside the first"
+        );
+
+        // Both sides `auto` centres it, the same rule seen twice.
+        let (tree, boxes) = laid_out(
+            "<body><div style=\"display:flex;width:400px\">\
+             <a style=\"margin:0 auto;width:100px\">.</a></div>",
+            800.0,
+        );
+        let container = rect_of(&tree, &boxes, "div");
+        let centred = rect_of(&tree, &boxes, "a");
+        assert_eq!(centred.x - container.x, 150.0);
+    }
+
+    /// Layout knows what `auto` came out as and a computed style does not, so the
+    /// edges a box actually got are reported on the fragment for the panel that
+    /// asks.
+    #[test]
+    fn a_fragment_carries_the_edges_it_was_given() {
+        let (tree, boxes) = laid_out(
+            "<body><div id=x style=\"width:100px;margin:0 auto;padding:5px;border:2px solid\">.</div>",
+            400.0,
+        );
+        let used = tree
+            .iter()
+            .find(|fragment| {
+                fragment
+                    .box_id
+                    .and_then(|id| boxes.get(id))
+                    .and_then(|node| node.tag.as_ref())
+                    .is_some_and(|tag| tag.as_ref() == "div")
+            })
+            .and_then(|fragment| fragment.used)
+            .expect("a div was laid out with edges");
+
+        assert_eq!(used.padding.left, 5.0);
+        assert_eq!(used.border.left, 2.0);
+        // A margin the style spells `auto` is a number here, which is the whole
+        // reason the panel reads this rather than the computed style. Both sides
+        // came out equal and neither is nothing, which is what centring is.
+        assert!(used.margin.left > 0.0, "an auto margin resolved to nothing");
+        assert!((used.margin.left - used.margin.right).abs() < 0.5);
     }
 
     /// Under `nowrap` the whole run is one unbreakable thing, so a flex item may

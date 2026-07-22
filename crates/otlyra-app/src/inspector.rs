@@ -2863,6 +2863,24 @@ pub struct BoxEdges {
 }
 
 impl BoxEdges {
+    /// The edges layout actually used, which is the better answer whenever
+    /// there is one: `auto` is resolved and percentages are already numbers.
+    pub fn used(used: otlyra_layout::UsedEdges) -> Self {
+        let sides = |sides: otlyra_css::Sides<f32>| {
+            (
+                f64::from(sides.left),
+                f64::from(sides.top),
+                f64::from(sides.right),
+                f64::from(sides.bottom),
+            )
+        };
+        Self {
+            margin: sides(used.margin),
+            border: sides(used.border),
+            padding: sides(used.padding),
+        }
+    }
+
     /// What `style` says the edges are, given how wide the containing block is.
     ///
     /// A percentage is a fraction of the containing block's *width* on every

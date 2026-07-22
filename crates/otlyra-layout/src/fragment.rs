@@ -87,9 +87,29 @@ pub enum FragmentKind {
     Text(ShapedRun),
 }
 
+/// The edges a box actually got, once layout had resolved them.
+///
+/// The *used* values, which is what an inspector's box model is asking for and
+/// what a computed style cannot always answer: `margin: auto` computes to `auto`
+/// and only layout knows what it came out as. Percentages are resolved here too,
+/// so the panel reads numbers rather than re-deriving them against a containing
+/// block it would have to find for itself.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct UsedEdges {
+    /// The used margins.
+    pub margin: otlyra_css::Sides<f32>,
+    /// The used border widths.
+    pub border: otlyra_css::Sides<f32>,
+    /// The used padding.
+    pub padding: otlyra_css::Sides<f32>,
+}
+
 /// One fragment.
 #[derive(Clone, Debug)]
 pub struct Fragment {
+    /// The edges layout resolved for this box, for a panel that asks what it
+    /// actually got. Absent for the fragments that are not boxes.
+    pub used: Option<UsedEdges>,
     /// The box this came from, absent only for the page itself.
     pub box_id: Option<BoxId>,
     /// Where it is and how big, in logical pixels, in page coordinates.

@@ -364,6 +364,21 @@ impl PageScene {
             })
     }
 
+    /// The edges layout actually gave a box, if it laid one out.
+    ///
+    /// The used values. A computed style says `auto` for a margin and only
+    /// layout knows what `auto` came out as, so a panel that resolved the
+    /// computed style itself would be right about everything except the one
+    /// case it was opened to look at.
+    pub fn used_edges(&self, id: BoxId) -> Option<otlyra_layout::UsedEdges> {
+        self.layout
+            .as_ref()?
+            .1
+            .iter()
+            .find(|fragment| fragment.box_id == Some(id))
+            .and_then(|fragment| fragment.used)
+    }
+
     /// The `href` of a box, if it is a link with one.
     pub fn href_of(&self, id: BoxId) -> Option<String> {
         let node = self.boxes.get(id)?;

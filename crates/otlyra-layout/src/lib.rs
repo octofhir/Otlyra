@@ -44,7 +44,7 @@ pub use damage::Damage;
 // Re-exported because a fragment carries a style and anything reading one needs
 // the vocabulary that style is written in.
 pub use flow::{Viewport, layout};
-pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect};
+pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect, UsedEdges};
 pub use otlyra_css::{ComputedStyle, Display};
 
 #[cfg(test)]
