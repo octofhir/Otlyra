@@ -22,9 +22,22 @@
 //!
 //! `script.evaluate` needs M12's script engine. Stock Playwright leans on it for
 //! almost everything, so it will connect and then fail; that is stated rather
-//! than worked around. Everything that does not need a page script — navigating,
-//! finding nodes by selector, input, screenshots, the log, the network — does
-//! not wait for it, and is enough for an agent to do real work.
+//! than worked around. Everything that does not need a page script — tabs,
+//! navigation and history, viewports, finding nodes by selector, input,
+//! screenshots, the log, the network — does not wait for it, and is enough for
+//! an agent to do real work.
+//!
+//! Nor is there a cookie jar or a second user context, so `storage.*` and
+//! `browser.createUserContext` answer *unknown command* rather than answering
+//! emptily: a client told there are no cookies would believe it.
+//!
+//! # A context is a tab
+//!
+//! Every tab is a browsing context a driver can name, and naming one is what
+//! makes the browser act on it — commands act on the active tab, so naming and
+//! switching are the same act. A frame would be a context of its own in BiDi
+//! and this engine has no frames, so every context is reported with no parent
+//! and no children rather than with a tree that is not there.
 //!
 //! # Shape
 //!
@@ -183,6 +196,12 @@ pub struct Session {
     /// place in either stream.
     announced: std::collections::HashSet<u64>,
     completed: std::collections::HashSet<u64>,
+    /// Which tabs this client has been told about, and where each was.
+    ///
+    /// Both halves in one map, because the two questions a lifecycle event
+    /// answers — is this tab new, and has it been anywhere — are asked of the
+    /// same list at the same moment.
+    known: std::collections::HashMap<crate::browser::TabId, String>,
 }
 
 /// The context id the one tab is known by.
@@ -191,6 +210,21 @@ pub struct Session {
 /// protocol is a later stage, and inventing ids for tabs a client cannot yet
 /// address would be inventing a vocabulary nobody speaks.
 pub const CONTEXT: &str = "otlyra-context-1";
+
+/// What a tab is called on the wire.
+///
+/// A context name is a string to a client, and a tab's identity is a number, so
+/// this is the one place the two are spelled against each other.
+fn context_name(id: crate::browser::TabId) -> String {
+    format!("otlyra-context-{}", id.0)
+}
+
+/// The tab a context name refers to, if it names one at all.
+fn context_id(name: &str) -> Option<crate::browser::TabId> {
+    name.strip_prefix("otlyra-context-")
+        .and_then(|rest| rest.parse().ok())
+        .map(crate::browser::TabId)
+}
 
 impl Session {
     /// A session over `browser`, drawing at `viewport` logical pixels.
@@ -212,6 +246,7 @@ impl Session {
             log_cursor: crate::observability::journal().cursor(),
             announced: std::collections::HashSet::new(),
             completed: std::collections::HashSet::new(),
+            known: std::collections::HashMap::new(),
         }
     }
 
@@ -280,10 +315,105 @@ impl Session {
                 Ok(json!({}))
             }
 
+            // --- browser ---------------------------------------------------
+            "browser.close" => {
+                // The session goes with it. There is no window to shut from
+                // here — the shell owns that — so what this can honestly do is
+                // end the session, which is what a client is asking for when it
+                // says it is finished.
+                self.open = false;
+                self.events.clear();
+                Ok(json!({}))
+            }
+            "browser.getUserContexts" => Ok(json!({
+                // One profile, and no way to make another: user contexts are
+                // separate cookie jars and storage, and there is neither yet.
+                "userContexts": [{ "userContext": "default" }],
+            })),
+
             // --- browsingContext -------------------------------------------
             "browsingContext.getTree" => Ok(json!({
-                "contexts": [self.context()],
+                "contexts": (0..self.browser.tabs().len())
+                    .map(|index| self.context_of(index))
+                    .collect::<Vec<_>>(),
             })),
+            "browsingContext.create" => {
+                let id = self.browser.open_tab();
+                // `background` decides whether the reader ends up looking at it.
+                // A driver that omits it gets the tab it just made, which is
+                // what every other command it sends will assume.
+                let background = command
+                    .params
+                    .get("background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !background && let Some(index) = self.browser.tab_index(id) {
+                    self.browser.select_tab(index);
+                }
+                Ok(json!({ "context": context_name(id) }))
+            }
+            "browsingContext.close" => {
+                let index = self.target(command)?;
+                self.browser.close_tab(index);
+                Ok(json!({}))
+            }
+            "browsingContext.activate" => {
+                // `target` already switched to it, which is the whole command.
+                self.target(command)?;
+                Ok(json!({}))
+            }
+            "browsingContext.setViewport" => {
+                self.check_context(command)?;
+                if let Some(viewport) = command.params.get("viewport") {
+                    let number = |key: &str| {
+                        viewport
+                            .get(key)
+                            .and_then(Value::as_u64)
+                            .map(|value| value as u32)
+                    };
+                    match (number("width"), number("height")) {
+                        (Some(width), Some(height)) if width > 0 && height > 0 => {
+                            self.viewport = (width, height);
+                        }
+                        _ => {
+                            return Err(Error::invalid(
+                                "setViewport needs a width and a height above zero",
+                            ));
+                        }
+                    }
+                }
+                // Drawn at the new size before answering, so the next question
+                // is asked of a page laid out for it.
+                self.browser.prepare_frame(self.viewport(), LOAD_TIMEOUT);
+                Ok(json!({}))
+            }
+            "browsingContext.traverseHistory" => {
+                self.check_context(command)?;
+                let delta = command
+                    .params
+                    .get("delta")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::invalid("traverseHistory needs a delta"))?;
+                // One step at a time, and it stops where the history does: a
+                // delta past either end is as far as it goes rather than an
+                // error, which is what going back twice from one entry means.
+                for _ in 0..delta.unsigned_abs() {
+                    if delta > 0 {
+                        if !self.browser.can_go_forward() {
+                            break;
+                        }
+                        self.browser.go_forward();
+                    } else {
+                        if !self.browser.can_go_back() {
+                            break;
+                        }
+                        self.browser.go_back();
+                    }
+                    self.browser.wait_for_load(LOAD_TIMEOUT);
+                }
+                self.browser.prepare_frame(self.viewport(), LOAD_TIMEOUT);
+                Ok(json!({}))
+            }
             "browsingContext.navigate" => {
                 let url = command.string("url")?.to_owned();
                 self.check_context(command)?;
@@ -392,6 +522,7 @@ impl Session {
         {
             events.extend(self.network_events());
         }
+        events.extend(self.context_events());
         events
     }
 
@@ -399,20 +530,87 @@ impl Session {
     fn network_events(&mut self) -> Vec<Value> {
         use crate::fetcher::Status;
 
+        // The fetcher is the browser's, not a tab's: it records what was asked
+        // for and not which tab asked. So an event names the context that is
+        // active, which is the tab a driver is working in and is right whenever
+        // one tab is being driven at a time — and is stated here rather than
+        // implied, because it is the one thing in these events that is a guess.
+        let context = context_name(self.browser.active_id());
         let exchanges: Vec<crate::fetcher::Exchange> = self.browser.exchanges().to_vec();
         let mut events = Vec::new();
         for exchange in exchanges {
             if self.announced.insert(exchange.id) && self.subscribed("network.beforeRequestSent") {
-                events.push(request_event(&exchange));
+                events.push(request_event(&context, &exchange));
             }
             let finished = !matches!(exchange.status, Status::Pending);
             if finished
                 && self.completed.insert(exchange.id)
                 && self.subscribed("network.responseCompleted")
             {
-                events.push(response_event(&exchange));
+                events.push(response_event(&context, &exchange));
             }
         }
+        events
+    }
+
+    /// Tabs that have opened or closed since this client was last told.
+    ///
+    /// Diffed rather than pushed, for the reason every other event here is: the
+    /// browser is driven from one thread and what it has is readable, so the
+    /// protocol stays at the edge instead of reaching into `new_tab`.
+    fn context_events(&mut self) -> Vec<Value> {
+        let open: Vec<(crate::browser::TabId, String)> = self
+            .browser
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, tab.url.clone()))
+            .collect();
+        let mut events = Vec::new();
+
+        if self.subscribed("browsingContext.contextCreated") {
+            for (index, (id, _)) in open.iter().enumerate() {
+                if !self.known.contains_key(id) {
+                    events.push(event(
+                        "browsingContext.contextCreated",
+                        self.context_of(index),
+                    ));
+                }
+            }
+        }
+        if self.subscribed("browsingContext.contextDestroyed") {
+            for id in self.known.keys() {
+                if !open.iter().any(|(open, _)| open == id) {
+                    events.push(event(
+                        "browsingContext.contextDestroyed",
+                        json!({
+                            "context": context_name(*id),
+                            "url": "",
+                            "children": [],
+                            "parent": Value::Null,
+                            "userContext": "default",
+                        }),
+                    ));
+                }
+            }
+        }
+        // A tab whose address changed has been somewhere. There is one signal
+        // for arriving and none for the document being ready before its
+        // subresources are, so `load` is what is reported and
+        // `domContentLoaded` is not — a client waiting on an event that never
+        // comes is worse served than one told the event does not exist.
+        if self.subscribed("browsingContext.load") {
+            for (index, (id, url)) in open.iter().enumerate() {
+                let moved = self.known.get(id).is_some_and(|last| last != url);
+                if moved && !url.is_empty() {
+                    let mut payload = self.context_of(index);
+                    payload["navigation"] = Value::Null;
+                    payload["timestamp"] = json!(now());
+                    events.push(event("browsingContext.load", payload));
+                }
+            }
+        }
+
+        self.known = open.into_iter().collect();
         events
     }
 
@@ -688,23 +886,54 @@ impl Session {
         })
     }
 
-    /// The one browsing context, as the protocol describes one.
-    fn context(&self) -> Value {
+    /// One tab, as the protocol describes a browsing context.
+    ///
+    /// No children and no parent: a frame is a context of its own in BiDi and
+    /// this engine has no frames, so saying otherwise would describe a tree that
+    /// is not there.
+    fn context_of(&self, index: usize) -> Value {
+        let tabs = self.browser.tabs();
+        let tab = &tabs[index];
         json!({
-            "context": CONTEXT,
-            "url": self.browser.url(),
+            "context": context_name(tab.id),
+            "url": tab.url,
             "children": [],
             "parent": Value::Null,
             "userContext": "default",
         })
     }
 
-    /// Refuse a command aimed at a context that is not ours.
-    fn check_context(&self, command: &Command) -> Result<(), Error> {
-        match command.params.get("context").and_then(Value::as_str) {
-            None | Some(CONTEXT) => Ok(()),
-            Some(other) => Err(Error::no_such_context(other)),
+    /// Which tab a command is aimed at, made active so the browser acts on it.
+    ///
+    /// Commands name a context and the browser acts on whichever tab is active,
+    /// so *naming* one and *switching to* it are the same act here. That is not
+    /// a shortcut: a driver that navigates a background tab expects the
+    /// navigation to happen, and the alternative is a second navigation path
+    /// that only the protocol uses.
+    fn target(&mut self, command: &Command) -> Result<usize, Error> {
+        let Some(name) = command.params.get("context").and_then(Value::as_str) else {
+            return Ok(self.browser.active());
+        };
+        // A real tab first. The name the session answered to before it had more
+        // than one — `CONTEXT` — is also the name the *first* tab has, so
+        // checking it first would turn every command aimed at that tab into a
+        // command aimed at whichever tab happened to be active. It is a
+        // fallback for a client that hardcoded the constant against a browser
+        // whose first tab is gone, and nothing more.
+        let index = match context_id(name).and_then(|id| self.browser.tab_index(id)) {
+            Some(index) => index,
+            None if name == CONTEXT => self.browser.active(),
+            None => return Err(Error::no_such_context(name)),
+        };
+        if index != self.browser.active() {
+            self.browser.select_tab(index);
         }
+        Ok(index)
+    }
+
+    /// Refuse a command aimed at a context that is not ours.
+    fn check_context(&mut self, command: &Command) -> Result<(), Error> {
+        self.target(command).map(|_| ())
     }
 
     fn viewport(&self) -> otlyra_platform::Viewport {
@@ -761,25 +990,38 @@ fn log_entry(record: crate::observability::Record) -> Value {
     )
 }
 
+/// Headers as the protocol spells them: a name and a value that says it is
+/// text, which is the only kind this browser has to report.
+fn headers_json(headers: &[(String, String)]) -> Vec<Value> {
+    headers
+        .iter()
+        .map(|(name, value)| json!({ "name": name, "value": { "type": "string", "value": value } }))
+        .collect()
+}
+
+/// The request half of both network events, which is the same object in each.
+fn request_json(exchange: &crate::fetcher::Exchange) -> Value {
+    json!({
+        "request": exchange.id.to_string(),
+        "url": exchange.url,
+        "method": exchange.method,
+        "headers": headers_json(&exchange.request_headers),
+        // No cookie jar, so there are none to report rather than none to have.
+        "cookies": [],
+    })
+}
+
 /// A request the browser made, as a `network.beforeRequestSent`.
-fn request_event(exchange: &crate::fetcher::Exchange) -> Value {
+fn request_event(context: &str, exchange: &crate::fetcher::Exchange) -> Value {
     event(
         "network.beforeRequestSent",
         json!({
-            "context": CONTEXT,
+            "context": context,
             "isRedirect": false,
             "navigation": Value::Null,
             "redirectCount": 0,
             "timestamp": now(),
-            "request": {
-                "request": exchange.id.to_string(),
-                "url": exchange.url,
-                // Every fetch this browser makes is a GET. When it makes another
-                // kind this will say so, rather than saying so early.
-                "method": "GET",
-                "headers": [],
-                "cookies": [],
-            },
+            "request": request_json(exchange),
             "otlyra:kind": format!("{:?}", exchange.kind).to_lowercase(),
         }),
     )
@@ -790,36 +1032,34 @@ fn request_event(exchange: &crate::fetcher::Exchange) -> Value {
 /// A failure is reported here too, with its reason, rather than through
 /// `fetchError`: the browser knows the request ended and why, and a client
 /// waiting on one event for both outcomes is a client that cannot hang.
-fn response_event(exchange: &crate::fetcher::Exchange) -> Value {
+fn response_event(context: &str, exchange: &crate::fetcher::Exchange) -> Value {
     use crate::fetcher::Status;
+    // The status a server actually answered with. It used to be a hardcoded
+    // `200` for anything the transport returned, which made a 404 with an error
+    // page indistinguishable from the page asked for — the same thing the
+    // network pane was wrong about until the code was threaded up to it.
     let (status, text, bytes) = match &exchange.status {
-        Status::Ok(bytes) => (200, String::new(), *bytes),
+        Status::Ok(bytes) => (exchange.code.unwrap_or(200), String::new(), *bytes),
         Status::Failed(error) => (0, error.clone(), 0),
         Status::Pending => (0, "still out".to_owned(), 0),
     };
     event(
         "network.responseCompleted",
         json!({
-            "context": CONTEXT,
+            "context": context,
             "isRedirect": false,
             "navigation": Value::Null,
             "redirectCount": 0,
             "timestamp": now(),
-            "request": {
-                "request": exchange.id.to_string(),
-                "url": exchange.url,
-                "method": "GET",
-                "headers": [],
-                "cookies": [],
-            },
+            "request": request_json(exchange),
             "response": {
                 "url": exchange.url,
                 "status": status,
                 "statusText": text,
                 "bytesReceived": bytes,
                 "fromCache": false,
-                "headers": [],
-                "mimeType": Value::Null,
+                "headers": headers_json(&exchange.response_headers),
+                "mimeType": exchange.content_type.clone().map_or(Value::Null, Value::from),
                 "protocol": Value::Null,
                 "content": { "size": bytes },
             },
@@ -1006,6 +1246,280 @@ mod tests {
         }
     }
 
+    /// A tab is a browsing context, and a driver reaches every one of them by
+    /// name. Its position is not its name: closing a tab shifts every tab after
+    /// it, and a client holding an index would then be holding a different tab.
+    #[test]
+    fn every_tab_is_a_context_a_driver_can_name() {
+        let mut session = session();
+        let first = session
+            .dispatch(&command(1, "browsingContext.getTree", json!({})))
+            .unwrap();
+        let first = first["contexts"][0]["context"].as_str().unwrap().to_owned();
+
+        let second = session
+            .dispatch(&command(
+                2,
+                "browsingContext.create",
+                json!({ "type": "tab" }),
+            ))
+            .unwrap()["context"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(first, second);
+
+        let tree = session
+            .dispatch(&command(3, "browsingContext.getTree", json!({})))
+            .unwrap();
+        assert_eq!(tree["contexts"].as_array().unwrap().len(), 2);
+
+        // Each is navigable by its own name, and naming one is what makes the
+        // browser act on it.
+        session
+            .dispatch(&command(
+                4,
+                "browsingContext.navigate",
+                json!({ "context": first, "url": "https://one.example/" }),
+            ))
+            .unwrap();
+        session
+            .dispatch(&command(
+                5,
+                "browsingContext.navigate",
+                json!({ "context": second, "url": "https://two.example/" }),
+            ))
+            .unwrap();
+
+        let tree = session
+            .dispatch(&command(6, "browsingContext.getTree", json!({})))
+            .unwrap();
+        let url_of = |name: &str| {
+            tree["contexts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|context| context["context"] == name)
+                .map(|context| context["url"].as_str().unwrap().to_owned())
+                .unwrap()
+        };
+        assert!(url_of(&first).contains("one.example"));
+        assert!(url_of(&second).contains("two.example"));
+
+        // Closing the first shifts the second's index and not its name.
+        session
+            .dispatch(&command(
+                7,
+                "browsingContext.close",
+                json!({ "context": first }),
+            ))
+            .unwrap();
+        let tree = session
+            .dispatch(&command(8, "browsingContext.getTree", json!({})))
+            .unwrap();
+        assert_eq!(tree["contexts"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["contexts"][0]["context"], second.as_str());
+
+        // And a name that no longer names anything is refused rather than
+        // quietly answered by whatever is active.
+        assert_eq!(
+            session
+                .dispatch(&command(
+                    9,
+                    "browsingContext.navigate",
+                    json!({ "context": first, "url": "https://three.example/" }),
+                ))
+                .unwrap_err()
+                .code,
+            "no such frame"
+        );
+    }
+
+    /// A real name always wins over the compatibility one.
+    ///
+    /// `CONTEXT` is what the session answered to before it had more than one
+    /// tab, and it is *also* what a tab called `1` would be called. Resolved in
+    /// the wrong order, naming that tab meant "whatever is active", so
+    /// navigating the first tab navigated the second. A live browser found it
+    /// and the unit tests could not, because tab names come from a counter the
+    /// test binary shares and never start at one — so the ordering is asserted
+    /// here directly rather than through a name that happens to collide.
+    #[test]
+    fn a_name_that_is_a_tab_beats_the_name_that_is_a_fallback() {
+        let mut session = session();
+        let first = context_name(session.browser.tabs()[0].id);
+        let opened = session.browser.open_tab();
+        let second = session.browser.tab_index(opened).unwrap();
+        session.browser.select_tab(second);
+
+        // The first tab is named while the second is active: the command must
+        // land on the one it named.
+        let target = session
+            .target(&command(1, "x", json!({ "context": first })))
+            .unwrap();
+        assert_eq!(target, 0);
+        assert_eq!(session.browser.active(), 0);
+
+        // And the fallback still answers for a client that hardcoded it, since
+        // no tab here is called that.
+        session.browser.select_tab(second);
+        assert_eq!(
+            session
+                .target(&command(2, "x", json!({ "context": CONTEXT })))
+                .unwrap(),
+            second,
+            "the compatibility name means whatever is active, and only when it names no tab"
+        );
+    }
+
+    /// Back and forward, which the browser has had per tab since W1 and the
+    /// protocol had no way to ask for.
+    #[test]
+    fn traverse_history_walks_a_tab_and_stops_at_its_ends() {
+        let mut session = session();
+        for (id, url) in [(1, "https://one.example/"), (2, "https://two.example/")] {
+            session
+                .dispatch(&command(
+                    id,
+                    "browsingContext.navigate",
+                    json!({ "url": url }),
+                ))
+                .unwrap();
+        }
+
+        let here = |session: &mut Session| {
+            session
+                .dispatch(&command(99, "browsingContext.getTree", json!({})))
+                .unwrap()["contexts"][0]["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(here(&mut session).contains("two.example"));
+
+        session
+            .dispatch(&command(
+                3,
+                "browsingContext.traverseHistory",
+                json!({ "delta": -1 }),
+            ))
+            .unwrap();
+        assert!(here(&mut session).contains("one.example"));
+
+        // Past the end is as far as it goes rather than an error: going back
+        // twice from one entry means going back once.
+        session
+            .dispatch(&command(
+                4,
+                "browsingContext.traverseHistory",
+                json!({ "delta": -5 }),
+            ))
+            .unwrap();
+        assert!(here(&mut session).contains("one.example"));
+
+        session
+            .dispatch(&command(
+                5,
+                "browsingContext.traverseHistory",
+                json!({ "delta": 1 }),
+            ))
+            .unwrap();
+        assert!(here(&mut session).contains("two.example"));
+    }
+
+    /// The viewport is what a screenshot and a layout are made at, so setting it
+    /// has to reach both.
+    #[test]
+    fn set_viewport_changes_what_the_page_is_laid_out_at() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "browsingContext.navigate",
+                json!({ "url": "https://one.example/" }),
+            ))
+            .unwrap();
+        session
+            .dispatch(&command(
+                2,
+                "browsingContext.setViewport",
+                json!({ "viewport": { "width": 400, "height": 300 } }),
+            ))
+            .unwrap();
+        assert_eq!(session.viewport, (400, 300));
+
+        // A viewport with no room in it is refused rather than laid out against.
+        assert_eq!(
+            session
+                .dispatch(&command(
+                    3,
+                    "browsingContext.setViewport",
+                    json!({ "viewport": { "width": 0, "height": 300 } }),
+                ))
+                .unwrap_err()
+                .code,
+            "invalid argument"
+        );
+    }
+
+    /// Opening and closing a tab is something a client can watch for.
+    #[test]
+    fn a_client_is_told_when_a_context_opens_and_closes() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({ "events": ["browsingContext"] }),
+            ))
+            .unwrap();
+        // The tab that was already open is announced once, and then not again.
+        assert_eq!(session.drain_events().len(), 1);
+        assert!(session.drain_events().is_empty());
+
+        let opened = session
+            .dispatch(&command(2, "browsingContext.create", json!({})))
+            .unwrap()["context"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let events = session.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "browsingContext.contextCreated");
+        assert_eq!(events[0]["params"]["context"], opened.as_str());
+
+        session
+            .dispatch(&command(
+                3,
+                "browsingContext.close",
+                json!({ "context": opened }),
+            ))
+            .unwrap();
+        let events = session.drain_events();
+        assert_eq!(events[0]["method"], "browsingContext.contextDestroyed");
+        assert_eq!(events[0]["params"]["context"], opened.as_str());
+    }
+
+    /// A `404` that returned a body is not a `200`. The event used to say it was.
+    #[test]
+    fn a_network_event_carries_the_status_the_server_answered_with() {
+        use crate::fetcher::{Exchange, ResourceKind, Status};
+        let mut missing =
+            Exchange::for_test(7, ResourceKind::Document, "https://x/gone", Status::Ok(18));
+        missing.code = Some(404);
+        missing.response_headers = vec![("content-type".to_owned(), "text/html".to_owned())];
+        missing.content_type = Some("text/html".to_owned());
+
+        let value = response_event("otlyra-context-1", &missing);
+        assert_eq!(value["params"]["response"]["status"], 404);
+        assert_eq!(value["params"]["response"]["mimeType"], "text/html");
+        assert_eq!(
+            value["params"]["response"]["headers"][0]["name"],
+            "content-type"
+        );
+        assert_eq!(value["params"]["request"]["method"], "GET");
+    }
+
     #[test]
     fn a_command_needs_an_id_and_a_method() {
         assert!(Command::parse(r#"{"id":1,"method":"session.status"}"#).is_ok());
@@ -1085,7 +1599,20 @@ mod tests {
             .dispatch(&command(2, "browsingContext.getTree", json!({})))
             .expect("a tree");
         assert_eq!(tree["contexts"][0]["url"], json!("https://driven.example/"));
-        assert_eq!(tree["contexts"][0]["context"], json!(CONTEXT));
+        // A context is named after the tab it is, so the name is whatever that
+        // tab was called rather than a constant — but it is a name, and the
+        // session answers to it.
+        let name = tree["contexts"][0]["context"].as_str().expect("a name");
+        assert!(name.starts_with("otlyra-context-"));
+        assert!(
+            session
+                .dispatch(&command(
+                    3,
+                    "browsingContext.captureScreenshot",
+                    json!({ "context": name }),
+                ))
+                .is_ok()
+        );
     }
 
     #[test]

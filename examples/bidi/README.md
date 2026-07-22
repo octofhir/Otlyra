@@ -42,14 +42,23 @@ Working now:
 | `session.new` / `session.end` | Open and close a session |
 | `session.subscribe` / `unsubscribe` | Which events you want |
 | `browsingContext.getTree` | What contexts exist, and where they are |
+| `browsingContext.create` | Open a tab, and say what it is called |
+| `browsingContext.close` | Close one |
+| `browsingContext.activate` | Bring one to the front |
 | `browsingContext.navigate` | Go somewhere, and wait for it |
 | `browsingContext.reload` | Again |
+| `browsingContext.traverseHistory` | Back and forward, by a delta |
+| `browsingContext.setViewport` | Lay out and screenshot at a new size |
 | `browsingContext.captureScreenshot` | A PNG of what is on screen |
 | `browsingContext.locateNodes` | Find nodes by CSS selector |
+| `browser.getUserContexts` | The one profile there is |
+| `browser.close` | End the session |
 | `input.performActions` | Move, click, scroll, type |
 | `log.entryAdded` | What the browser said, as it says it |
 | `network.beforeRequestSent` | Every request, as it goes out |
-| `network.responseCompleted` | What came back, with sizes and timings |
+| `network.responseCompleted` | What came back, with status, headers and timings |
+| `browsingContext.contextCreated` / `Destroyed` | A tab opened or closed |
+| `browsingContext.load` | A tab arrived somewhere |
 
 Waiting on other work, and saying so when asked:
 

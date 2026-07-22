@@ -70,6 +70,13 @@ pub struct HistoryEntry {
 
 /// One tab.
 pub struct Tab {
+    /// What this tab is, for as long as it is open.
+    ///
+    /// A number nobody reuses, handed out on creation. Its position in the strip
+    /// is not an identity: closing a tab shifts every tab after it, and anything
+    /// holding an index would then be holding a different tab without being told
+    /// — which is exactly what a driver does between one command and the next.
+    pub id: TabId,
     /// What the address bar shows for it.
     pub url: String,
     /// Its title, or the URL until it has one.
@@ -96,10 +103,26 @@ pub struct Tab {
     position: usize,
 }
 
+/// What names a tab for as long as it is open.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TabId(pub u64);
+
+/// The next identity to hand out.
+///
+/// A process-wide counter rather than one per browser: two browsers in one test
+/// binary handing out the same names would be two tabs a driver cannot tell
+/// apart, and the numbers are cheap.
+fn next_tab_id() -> TabId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    TabId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 impl Tab {
     /// A blank tab.
     pub fn blank() -> Self {
         Self {
+            id: next_tab_id(),
             url: String::new(),
             title: "New tab".to_owned(),
             page: None,
@@ -1086,6 +1109,26 @@ impl Browser {
         self.active = self.tabs.len() - 1;
         self.ui.address.clear();
         self.ui.focus_address();
+    }
+
+    /// Open a tab and say what it is called, without making it active.
+    ///
+    /// What a driver asks for: it creates a context and then sends commands to
+    /// it by name, and whether the person watching is looking at it is a
+    /// separate question with its own command.
+    pub fn open_tab(&mut self) -> TabId {
+        self.tabs.push(Tab::blank());
+        self.tabs[self.tabs.len() - 1].id
+    }
+
+    /// Where a tab named `id` sits right now, if it is still open.
+    pub fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// What the active tab is called.
+    pub fn active_id(&self) -> TabId {
+        self.tabs[self.active].id
     }
 
     /// Close a tab. The last one is never closed; it is emptied instead, because a
