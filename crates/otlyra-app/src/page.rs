@@ -54,6 +54,8 @@ pub struct PageScene {
     styled_document: Option<otlyra_css::cascade::StyledDocument>,
     /// The reader's default font size, as a multiple of the specification's.
     text_scale: f32,
+    /// The palette the environment is asking pages for.
+    color_scheme: otlyra_css::cascade::ColorScheme,
     /// How far down the page the reader is, in logical pixels.
     scroll: f32,
     /// The scrollbar the pointer is holding, if it is holding one.
@@ -74,6 +76,11 @@ pub struct PageScene {
     /// The last frame's content height, so a scroll can be clamped without waiting
     /// for the next one.
     viewport_height: f32,
+    /// What the reader has selected, if anything.
+    ///
+    /// A place in the text rather than a rectangle on the screen: the same
+    /// rectangle means different words once the page has been laid out again.
+    selection: Option<otlyra_layout::Selection>,
     /// What the next frame has to redo.
     damage: Damage,
     /// The last list built, and what it was built from.
@@ -103,6 +110,7 @@ struct Painted {
     scrollbars: bool,
     pictures: usize,
     ports: Vec<(BoxId, f32)>,
+    selection: Option<otlyra_layout::Selection>,
 }
 
 impl std::fmt::Debug for PageScene {
@@ -134,12 +142,14 @@ impl PageScene {
             styled: false,
             styled_document: None,
             text_scale: 1.0,
+            color_scheme: otlyra_css::cascade::ColorScheme::Light,
             scroll: 0.0,
             port_scroll: std::collections::HashMap::new(),
             drag: None,
             scrollbars: true,
             background_pictures: std::collections::HashMap::new(),
             viewport_height: 0.0,
+            selection: None,
             damage: Damage::STYLE,
             painted: None,
             builds: 0,
@@ -203,6 +213,7 @@ impl PageScene {
             height,
             scale: 1.0,
             text_scale: self.text_scale,
+            color_scheme: self.color_scheme,
         };
 
         let stale = match self.styler.as_mut() {
@@ -259,6 +270,7 @@ impl PageScene {
             scrollbars: self.scrollbars,
             pictures: self.background_pictures.len(),
             ports,
+            selection: self.selection,
         };
         // Nothing has been reported changed and nothing it is drawn from has
         // moved, so the last list is this frame's list. The hit-test targets go
@@ -278,7 +290,11 @@ impl PageScene {
         let ports = self.port_scroll.clone();
         let pictures = self.background_pictures.clone();
         let scrollbars = self.scrollbars;
+        let selected = self.selection;
         let fragments = self.fragments(text, width, height);
+        let highlight = selected
+            .map(|selection| otlyra_layout::selection::rects(fragments, selection))
+            .unwrap_or_default();
         let mut list = otlyra_paint::build_display_list_with(
             fragments,
             &otlyra_paint::Frame {
@@ -287,6 +303,7 @@ impl PageScene {
                 port_offset: Some(&|id| ports.get(&id).copied().unwrap_or(0.0)),
                 background: Some(&|url: &str| pictures.get(url).cloned()),
                 scrollbars,
+                selection: &highlight,
             },
         );
         if top != 0.0 {
@@ -364,6 +381,21 @@ impl PageScene {
         }
         self.text_scale = scale;
         self.styled = false;
+        self.damage.add(otlyra_layout::Damage::LAYOUT);
+    }
+
+    /// Which palette `prefers-color-scheme` answers with.
+    ///
+    /// The frame is rebuilt, but a restyle happens only if the page asked: the
+    /// cascade is told the new scheme and says whether any rule now evaluates
+    /// differently, so a page with no `prefers-color-scheme` query keeps every
+    /// style it had. The damage is what gets the question asked at all — a
+    /// frame with nothing reported changed is served from the last one.
+    pub fn set_color_scheme(&mut self, scheme: otlyra_css::cascade::ColorScheme) {
+        if self.color_scheme == scheme {
+            return;
+        }
+        self.color_scheme = scheme;
         self.damage.add(otlyra_layout::Damage::LAYOUT);
     }
 
@@ -491,6 +523,165 @@ impl PageScene {
             }
         }
         wanted
+    }
+
+    /// The `@font-face` rules the page's stylesheets declare.
+    ///
+    /// Empty until the page has been styled once, which is where the sheets are
+    /// parsed: a rule nobody has read yet names no font.
+    pub fn wanted_fonts(&self) -> Vec<otlyra_css::cascade::FontFace> {
+        self.styler
+            .as_ref()
+            .map(|styler| styler.font_faces().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Begin a selection at a point in the window, and answer whether there is
+    /// any text there to select.
+    ///
+    /// The page coordinates are the window's plus wherever the reader has scrolled
+    /// to, which is the one conversion between what a pointer reports and what a
+    /// page is laid out in.
+    pub fn select_from(&mut self, x: f32, y: f32, top: f32) -> bool {
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return false;
+        };
+        let point = (x, y - top + self.scroll);
+        match otlyra_layout::selection::position_at(tree, point.0, point.1) {
+            Some(position) => {
+                self.set_selection(Some(otlyra_layout::Selection::at(position)));
+                true
+            }
+            None => {
+                self.set_selection(None);
+                false
+            }
+        }
+    }
+
+    /// Take the selection to a point: what a drag does after the press.
+    pub fn select_to(&mut self, x: f32, y: f32, top: f32) {
+        let Some(mut selection) = self.selection else {
+            return;
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return;
+        };
+        let point = (x, y - top + self.scroll);
+        if let Some(position) = otlyra_layout::selection::position_at(tree, point.0, point.1) {
+            selection.focus = position;
+            self.set_selection(Some(selection));
+        }
+    }
+
+    /// Take the word under a point, which is what a second click means.
+    pub fn select_word_at(&mut self, x: f32, y: f32, top: f32) -> bool {
+        self.select_expanded(x, y, top, otlyra_layout::selection::word_at)
+    }
+
+    /// And the block it is in, which is what a third means.
+    pub fn select_paragraph_at(&mut self, x: f32, y: f32, top: f32) -> bool {
+        self.select_expanded(x, y, top, otlyra_layout::selection::paragraph_at)
+    }
+
+    fn select_expanded(
+        &mut self,
+        x: f32,
+        y: f32,
+        top: f32,
+        expand: fn(&FragmentTree, otlyra_layout::TextPosition) -> otlyra_layout::Selection,
+    ) -> bool {
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return false;
+        };
+        let point = (x, y - top + self.scroll);
+        match otlyra_layout::selection::position_at(tree, point.0, point.1) {
+            Some(position) => {
+                let selection = expand(tree, position);
+                self.set_selection(Some(selection));
+                !selection.is_empty()
+            }
+            None => {
+                self.set_selection(None);
+                false
+            }
+        }
+    }
+
+    /// Select the whole page.
+    pub fn select_all(&mut self) -> bool {
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return false;
+        };
+        match otlyra_layout::selection::all(tree) {
+            Some(selection) if !selection.is_empty() => {
+                self.set_selection(Some(selection));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Move the far end of the selection one step, and answer whether anything
+    /// moved.
+    ///
+    /// Extending keeps where it started and moves where it is going; not
+    /// extending takes both ends to the same place, which is a caret rather than
+    /// a selection and is what an arrow key means with nothing held down.
+    pub fn move_selection(&mut self, motion: otlyra_layout::Motion, extend: bool) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return false;
+        };
+        let focus = otlyra_layout::selection::moved(tree, selection.focus, motion);
+        let moved = otlyra_layout::Selection {
+            anchor: if extend { selection.anchor } else { focus },
+            focus,
+        };
+        if moved == selection {
+            return false;
+        }
+        self.set_selection(Some(moved));
+        true
+    }
+
+    /// Drop the selection, which is what a press somewhere else means.
+    pub fn clear_selection(&mut self) {
+        self.set_selection(None);
+    }
+
+    /// What is selected, as text, or `None` when nothing is.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.filter(|selection| !selection.is_empty())?;
+        let (_, tree) = self.layout.as_ref()?;
+        let text = otlyra_layout::selection::text(tree, selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Whether anything is selected.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .is_some_and(|selection| !selection.is_empty())
+    }
+
+    fn set_selection(&mut self, selection: Option<otlyra_layout::Selection>) {
+        if self.selection == selection {
+            return;
+        }
+        self.selection = selection;
+        self.damage.add(otlyra_layout::Damage::PAINT);
+    }
+
+    /// A font the page asked for has arrived and been registered.
+    ///
+    /// Nothing here holds the font — the shaper does — so what this is for is the
+    /// frame: every line was measured in whatever family the stack fell back to,
+    /// and none of those measurements hold any more.
+    pub fn font_arrived(&mut self) {
+        self.layout = None;
+        self.damage.add(otlyra_layout::Damage::LAYOUT);
     }
 
     /// Hand over a picture the page asked for.

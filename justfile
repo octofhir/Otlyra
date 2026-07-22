@@ -45,21 +45,47 @@ reference page width="820" height="900":
     out="{{screenshot_dir}}/reference"
     mkdir -p "$out"
     name="$(basename {{page}} .html)"
+    url="file://$(cd "$(dirname {{page}})" && pwd)/$(basename {{page}})"
     # Without our own interface: the page has to start at the top of the picture,
     # or every comparison is a comparison of two toolbars.
     cargo run --quiet -- --file {{page}} --no-interface --screenshot "$out/$name.ours.png" \
         --width {{width}} --height {{height}} --scale-factor 1
-    if [ -z "${OTLYRA_REFERENCE:-}" ]; then
-        echo "set OTLYRA_REFERENCE to a browser binary for the other half"
+    if [ -z "${OTLYRA_REFERENCE:-}" ] && [ -z "${OTLYRA_REFERENCE_ALT:-}" ]; then
+        echo "set OTLYRA_REFERENCE (and OTLYRA_REFERENCE_ALT) to browser binaries for the other half"
         exit 0
     fi
-    "$OTLYRA_REFERENCE" --headless --disable-gpu --hide-scrollbars \
-        --window-size={{width}},{{height}} \
-        --screenshot="$out/$name.reference.png" "file://$(cd "$(dirname {{page}})" && pwd)/$(basename {{page}})" \
-        >/dev/null 2>&1
-    cargo run --quiet -p otlyra-gfx --example compare -- \
-        "$out/$name.ours.png" "$out/$name.reference.png" "$out/$name.difference.png" || true
-    echo "wrote $out/$name.{ours,reference,difference}.png"
+    if [ -n "${OTLYRA_REFERENCE:-}" ]; then
+        # One device pixel to one CSS pixel, said out loud: on a dense screen the
+        # reference answers a page's questions about density with the screen's
+        # while writing the picture at one, so a page that chooses by density
+        # chooses differently in each half of the comparison.
+        "$OTLYRA_REFERENCE" --headless --disable-gpu --hide-scrollbars \
+            --force-device-scale-factor=1 \
+            --window-size={{width}},{{height}} \
+            --screenshot="$out/$name.reference.png" "$url" >/dev/null 2>&1
+        printf 'chrome  '
+        cargo run --quiet -p otlyra-gfx --example compare -- \
+            "$out/$name.ours.png" "$out/$name.reference.png" "$out/$name.difference.png" || true
+    fi
+    # The second reference is not a second opinion to average with the first. Where
+    # the two disagree, neither is the answer and the specification is; where they
+    # agree and we do not, the page is ours to fix.
+    if [ -n "${OTLYRA_REFERENCE_ALT:-}" ]; then
+        # An absolute path: this one resolves a relative one against somewhere of
+        # its own choosing and writes the picture where nobody is looking.
+        "$OTLYRA_REFERENCE_ALT" --headless --window-size={{width}},{{height}} \
+            --screenshot "$(pwd)/$out/$name.alternate.png" "$url" >/dev/null 2>&1
+        printf 'firefox '
+        cargo run --quiet -p otlyra-gfx --example compare -- \
+            "$out/$name.ours.png" "$out/$name.alternate.png" "$out/$name.difference-alt.png" || true
+        if [ -n "${OTLYRA_REFERENCE:-}" ]; then
+            printf 'between '
+            cargo run --quiet -p otlyra-gfx --example compare -- \
+                "$out/$name.reference.png" "$out/$name.alternate.png" \
+                "$out/$name.difference-between.png" || true
+        fi
+    fi
+    echo "wrote $out/$name.*.png"
 
 # Open the image test page: intrinsic sizes, ratios, and pictures in a line.
 images:
@@ -70,6 +96,52 @@ images-shot path=(screenshot_dir / "images.png"):
     @mkdir -p "$(dirname {{path}})"
     cargo run --quiet -- --file tests/pages/images.html --screenshot {{path}} --width 820 --height 2000 --scale-factor 1
     @echo "wrote {{path}}"
+
+# Open the table test page: columns sized from their contents, and cells that
+# reach across columns and down rows.
+tables:
+    cargo run -- --file tests/pages/tables.html
+
+# Open the font test page: a family the page brings with it, one that never
+# arrives, and the platform's own beside them.
+fonts:
+    cargo run -- --file tests/pages/fonts.html
+
+# Open the stacking test page: which box paints over which, and where a
+# `z-index` is compared against its siblings rather than against the page.
+stacking:
+    cargo run -- --file tests/pages/stacking.html
+
+# Open the opacity test page: what a group is composited as, and what is in one.
+opacity:
+    cargo run -- --file tests/pages/opacity.html
+
+# Open the transform test page: what a box is drawn through once it is moved,
+# turned or scaled, and what goes with it.
+transform:
+    cargo run -- --file tests/pages/transform.html
+
+# Open the inline-block test page: boxes that take their place in a line.
+inline-block:
+    cargo run -- --file tests/pages/inline-block.html
+
+# Open the picture-choosing test page: which of the files an element offers is
+# the one fetched, and what size it is then drawn at.
+srcset:
+    cargo run -- --file tests/pages/srcset.html
+
+# Open the object-fit test page: a picture in a box that is not its shape.
+object-fit:
+    cargo run -- --file tests/pages/object-fit.html
+
+# Open the white-space test page: what happens to the spaces between things.
+white-space:
+    cargo run -- --file tests/pages/white-space.html
+
+# Open the colour scheme test page: what a page draws when the reader has asked
+# for the dark palette, and what does not move either way.
+color-scheme:
+    cargo run -- --file tests/pages/color-scheme.html
 
 # Open the CSS test page: which selectors match, and what the cascade will do
 # with them once it exists.

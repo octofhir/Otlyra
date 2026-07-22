@@ -251,6 +251,22 @@ impl Loader {
     }
 
     async fn fetch(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
+        // A `data:` URL is not a request at all: the resource is written into the
+        // address, and reading it is decoding rather than fetching. Answered here
+        // so that everything upstream — a picture, a stylesheet, a font — takes one
+        // route to its bytes.
+        if let Some((kind, body)) = crate::read_data_url(&request.url) {
+            return Ok(LoadedResource {
+                final_url: request.url.to_string(),
+                status: 200,
+                content_type: Some(kind),
+                nosniff: false,
+                request_headers: Vec::new(),
+                response_headers: Vec::new(),
+                body,
+            });
+        }
+
         if !crate::is_fetchable(&request.url) {
             return Err(NetError::UnsupportedScheme {
                 scheme: request.url.scheme().to_owned(),

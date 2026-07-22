@@ -331,7 +331,18 @@ impl DisplayList {
     /// device pixels. Baking the scale into coordinates instead would make every
     /// number in the list depend on which display it was built for.
     pub fn transform(&mut self, transform: Affine) {
-        for item in &mut self.items {
+        self.transform_from(0, transform);
+    }
+
+    /// The same, for the items pushed since `from`.
+    ///
+    /// What a `transform` on one box needs: everything drawn for it and for what is
+    /// inside it, and nothing drawn before it. The items of a subtree are
+    /// contiguous, so the index it started at is the whole of what has to be
+    /// remembered.
+    pub fn transform_from(&mut self, from: usize, transform: Affine) {
+        let from = from.min(self.items.len());
+        for item in &mut self.items[from..] {
             match item {
                 DisplayItem::PushLayer { transform: t, .. }
                 | DisplayItem::Blurred { transform: t, .. }

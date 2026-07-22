@@ -14,6 +14,54 @@ const NAVIGABLE: [&str; 3] = ["http", "https", "file"];
 /// Schemes this crate will fetch over the network.
 const FETCHABLE: [&str; 2] = ["http", "https"];
 
+/// The bytes a `data:` URL carries, and what it says they are.
+///
+/// A resource written into the page rather than fetched — an icon inside a
+/// stylesheet, a tiny image inside the markup — and one of the most common things
+/// on the web that is not a request. The shape is
+/// `data:[<type>][;charset=…][;base64],<payload>`: the payload is percent-encoded
+/// text unless `;base64` says otherwise, and an absent type means `text/plain`.
+///
+/// `None` when the URL is not a `data:` one or is malformed, which is what a
+/// browser treats as a resource that failed to load.
+pub fn read_data_url(url: &Url) -> Option<(String, Vec<u8>)> {
+    if url.scheme() != "data" {
+        return None;
+    }
+
+    // `Url` keeps everything after the scheme as the path for an opaque scheme,
+    // and the payload may itself contain commas — so the *first* comma is the one
+    // that separates the two.
+    let rest = url.path();
+    let (meta, payload) = rest.split_once(',')?;
+
+    let base64 = meta
+        .rsplit(';')
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("base64"));
+    let kind = meta.split(';').next().unwrap_or_default();
+    let kind = if kind.is_empty() {
+        "text/plain".to_owned()
+    } else {
+        kind.to_ascii_lowercase()
+    };
+
+    let bytes = if base64 {
+        use base64::Engine as _;
+        // Whitespace is legal in a base64 payload written across lines, and the
+        // padding is optional in the wild.
+        let payload: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(&payload)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&payload))
+            .ok()?
+    } else {
+        percent_encoding::percent_decode_str(payload).collect()
+    };
+
+    Some((kind, bytes))
+}
+
 /// Resolve user input to an absolute URL.
 ///
 /// A bare `google.com` becomes `https://google.com/`, never `http://`: guessing
@@ -95,6 +143,38 @@ pub fn may_navigate(from: Option<&str>, to: &Url) -> bool {
 pub fn resolve(base: &str, href: &str) -> Option<String> {
     let base = Url::parse(base).ok()?;
     base.join(href).ok().map(|url| url.to_string())
+}
+
+#[cfg(test)]
+mod data_url_tests {
+    use super::*;
+
+    /// A `data:` URL is read rather than fetched, base64 or not, and says what its
+    /// bytes are.
+    #[test]
+    fn a_data_url_carries_its_own_bytes() {
+        let plain = Url::parse("data:text/plain,hello%20there").expect("parses");
+        let (kind, bytes) = read_data_url(&plain).expect("a data url");
+        assert_eq!(kind, "text/plain");
+        assert_eq!(bytes, b"hello there");
+
+        let packed = Url::parse("data:image/png;base64,aGVsbG8=").expect("parses");
+        let (kind, bytes) = read_data_url(&packed).expect("a data url");
+        assert_eq!(kind, "image/png");
+        assert_eq!(bytes, b"hello");
+
+        // A payload with commas in it: the *first* comma is the separator.
+        let commas =
+            Url::parse("data:image/svg+xml;charset=utf8,%3Csvg%20a='1,2'%3E").expect("parses");
+        let (kind, bytes) = read_data_url(&commas).expect("a data url");
+        assert_eq!(kind, "image/svg+xml");
+        assert_eq!(String::from_utf8_lossy(&bytes), "<svg a='1,2'>");
+
+        // No type at all is text, and something that is not a data URL is nothing.
+        let bare = Url::parse("data:,x").expect("parses");
+        assert_eq!(read_data_url(&bare).expect("a data url").0, "text/plain");
+        assert!(read_data_url(&Url::parse("https://x.test/").expect("parses")).is_none());
+    }
 }
 
 #[cfg(test)]

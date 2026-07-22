@@ -2,13 +2,11 @@
 
 use std::sync::Arc;
 
-use otlyra_css::cascade::StyledDocument;
-use otlyra_css::{
-    ComputedStyle, Display, WhiteSpace, has_renderable_children, initial_style, ua_style,
-};
+use otlyra_css::cascade::{StyledDocument, Viewport};
+use otlyra_css::{ComputedStyle, Display, has_renderable_children, initial_style, ua_style};
 use otlyra_dom::{Document, NodeData, NodeId};
 
-use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree};
+use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree, CellSpan};
 
 /// Build the box tree for `document` from the built-in element styles alone.
 ///
@@ -38,10 +36,31 @@ pub fn build_box_tree_with_images(
 }
 
 /// The decoded pictures of a document, by the element that asked for each.
-pub type Images = std::collections::HashMap<NodeId, otlyra_gfx::peniko::ImageData>;
+pub type Images = std::collections::HashMap<NodeId, Picture>;
+
+/// A decoded picture, and how many of its own pixels go to one CSS pixel.
+///
+/// The density comes from the candidate that was chosen rather than from the
+/// file: the same bytes are a picture of one size when a page asked for them at
+/// `1x` and half that when it asked at `2x`.
+#[derive(Clone, Debug)]
+pub struct Picture {
+    /// The pixels.
+    pub data: otlyra_gfx::peniko::ImageData,
+    /// The chosen candidate's density. Never zero.
+    pub density: f32,
+}
+
+impl Picture {
+    /// A picture at one device pixel per CSS pixel, which is what a plain `src`
+    /// asks for.
+    pub fn new(data: otlyra_gfx::peniko::ImageData) -> Self {
+        Self { data, density: 1.0 }
+    }
+}
 
 /// A picture a document asks for but does not contain.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImageSource {
     /// The `<img>` element, which is how the decoded picture finds its way back to
     /// the box it belongs to.
@@ -49,24 +68,31 @@ pub struct ImageSource {
     /// The address, exactly as the attribute spells it: resolving it needs the
     /// document's own address, which this crate does not know.
     pub src: String,
+    /// The density the chosen candidate is for, which is what the file's own
+    /// size is divided by to get the picture's.
+    pub density: f32,
 }
 
-/// Every `<img src>` in the document, in tree order.
-pub fn image_sources(document: &Document) -> Vec<ImageSource> {
+/// Every picture the document asks for, in tree order.
+///
+/// One per `<img>`, and which file that is depends on the window: an element
+/// offering several is asked here, before anything is fetched, because a browser
+/// fetches the one it chose and not all of them.
+pub fn image_sources(document: &Document, viewport: Viewport) -> Vec<ImageSource> {
     let mut sources = Vec::new();
     let mut stack = vec![document.root()];
 
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element())
             && element.name.local.as_ref() == "img"
-            && let Some(src) = element
-                .attrs
-                .iter()
-                .find(|attr| attr.name.local.as_ref() == "src")
-                .map(|attr| attr.value.trim().to_owned())
-            && !src.is_empty()
+            && let Some(chosen) = crate::srcset::chosen(document, id, viewport)
+            && !chosen.url.is_empty()
         {
-            sources.push(ImageSource { node: id, src });
+            sources.push(ImageSource {
+                node: id,
+                src: chosen.url,
+                density: chosen.density,
+            });
         }
         stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
     }
@@ -93,6 +119,10 @@ fn build(document: &Document, styles: Option<&StyledDocument>, images: &Images) 
 
     let mut tree = builder.tree;
     fix_anonymous_boxes(&mut tree, root);
+    // After the anonymous boxes, because what a space collapses to depends on
+    // what is beside it in its *formatting context*, and until the fixup has run
+    // a run of inline content and the blocks around it are still one child list.
+    collapse_white_space(&mut tree, root);
     tracing::debug!(boxes = tree.len(), "box tree built");
     tree
 }
@@ -119,7 +149,9 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
     let children = tree.node(id).children.clone();
     let is_space = |tree: &BoxTree, child: BoxId| {
         let node = tree.node(child);
-        node.node.is_some() && matches!(&node.kind, BoxKind::Text(text) if text.trim().is_empty())
+        node.node.is_some()
+            && node.style.white_space.collapses_spaces()
+            && matches!(&node.kind, BoxKind::Text(text) if text.trim().is_empty())
     };
     let inline_neighbour = |tree: &BoxTree, child: Option<&BoxId>| {
         child.is_some_and(|&child| tree.node(child).is_inline_level() && !is_space(tree, child))
@@ -143,21 +175,215 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
     }
 }
 
-pub(crate) fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_space = false;
-    for character in text.chars() {
-        if character.is_whitespace() {
-            if !in_space {
-                out.push(' ');
-                in_space = true;
+/// CSS white-space processing, over a whole inline formatting context at a time.
+///
+/// The unit is the context and not the text node, which is the whole of why this
+/// is a pass rather than a line in the walk: `<span>a </span> <span>b</span>` is
+/// three text nodes and one space, and no one of them can know that on its own.
+/// Within a context, in document order:
+///
+/// - a run of collapsible spaces, tabs and line endings becomes one space;
+/// - a collapsible space at the start of the context, or straight after a forced
+///   break, is dropped, and so is one at its very end;
+/// - a line ending is a space where `white-space` collapses them and a break
+///   where it preserves them;
+/// - preserved white space is emitted as it stands, and does not collapse what
+///   comes after it.
+///
+/// What is left of a text box that came to nothing is nothing: the box goes,
+/// rather than staying as an empty run for the shaper to be given.
+fn collapse_white_space(tree: &mut BoxTree, id: BoxId) {
+    let node = tree.node(id);
+    // The context belongs to the *block container* whose lines these are. An
+    // inline box inside it is walked through rather than treated as one of its
+    // own — collapsing a `<span>` on its own would trim the space that joins it
+    // to the span beside it, which is the one space the whole pass exists for.
+    let contains_lines = matches!(node.kind, BoxKind::Block)
+        && !node.children.is_empty()
+        && node
+            .children
+            .iter()
+            .all(|&child| tree.node(child).is_inline_level());
+
+    if contains_lines {
+        collapse_context(tree, id);
+    }
+
+    // Down either way: an `inline-block` inside a context is a context of its
+    // own, and so is every block below a block.
+    for child in tree.node(id).children.clone() {
+        collapse_white_space(tree, child);
+    }
+}
+
+/// One inline formatting context, collapsed.
+fn collapse_context(tree: &mut BoxTree, root: BoxId) {
+    let items = inline_items(tree, root);
+    let mut state = Run::default();
+    let mut written: Vec<(BoxId, String)> = Vec::new();
+    // How far back a trim may reach. Anything before this is not at the end of
+    // anything: something that is not text came after it, and the space in
+    // `</button> <button>` is the gap between two controls rather than white
+    // space trailing off the end of a line.
+    let mut sealed = 0usize;
+
+    for item in &items {
+        match *item {
+            Item::Text(id) => {
+                let node = tree.node(id);
+                let BoxKind::Text(text) = &node.kind else {
+                    continue;
+                };
+                let collapsed = state.take(text, node.style.white_space);
+                written.push((id, collapsed));
             }
+            // A picture, an inline-block or a bordered inline is content: what
+            // follows it is a word gap rather than the start of the context, and
+            // what came before it is not trailing white space.
+            Item::Content => {
+                state.after_content();
+                sealed = written.len();
+            }
+            Item::Break => {
+                // Every browser drops the space in front of a forced break as
+                // well as the one after it. Neither is ink, and a line that ends
+                // in one is a line that ends where the words do.
+                trim_trailing(&mut written[sealed..]);
+                state.after_break();
+                sealed = written.len();
+            }
+        }
+    }
+
+    // The end of the context is the end of the last line, so a space there is
+    // trailing white space like any other.
+    trim_trailing(&mut written[sealed..]);
+
+    for (id, text) in written {
+        if text.is_empty() {
+            tree.detach(id);
         } else {
-            out.push(character);
-            in_space = false;
+            tree.set_text(id, text.into());
+        }
+    }
+}
+
+/// Drop a collapsible space from the end of what has been written so far.
+fn trim_trailing(written: &mut [(BoxId, String)]) {
+    for (_, text) in written.iter_mut().rev() {
+        if text.is_empty() {
+            continue;
+        }
+        if text.ends_with(' ') {
+            text.pop();
+        }
+        return;
+    }
+}
+
+/// What a context holds, in the order the shaper will see it.
+enum Item {
+    /// A run of text.
+    Text(BoxId),
+    /// Something that is not text and takes room: a picture, an inline-block.
+    Content,
+    /// A `<br>`.
+    Break,
+}
+
+/// The contents of one context, flattened.
+///
+/// Inline boxes are walked through — a `<span>` is the style on the text inside
+/// it and not a thing of its own — and anything that establishes a context of its
+/// own is one item, whatever is inside it.
+fn inline_items(tree: &BoxTree, root: BoxId) -> Vec<Item> {
+    let mut out = Vec::new();
+    for &child in &tree.node(root).children {
+        let node = tree.node(child);
+        match &node.kind {
+            BoxKind::Text(_) => out.push(Item::Text(child)),
+            BoxKind::Replaced(_) => out.push(Item::Content),
+            BoxKind::Block => out.push(Item::Content),
+            BoxKind::Inline if node.tag.as_deref() == Some("br") => out.push(Item::Break),
+            BoxKind::Inline => {
+                let inside = inline_items(tree, child);
+                if inside.is_empty() {
+                    // An empty inline still has borders and padding, which take
+                    // room and separate what is either side of them.
+                    out.push(Item::Content);
+                } else {
+                    out.extend(inside);
+                }
+            }
         }
     }
     out
+}
+
+/// How far through a context the collapsing has got.
+struct Run {
+    /// Nothing has been emitted on this line yet, so a space would be leading.
+    at_line_start: bool,
+    /// The last thing emitted was a collapsible space, so another would be a
+    /// second one.
+    after_space: bool,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+            after_space: false,
+        }
+    }
+}
+
+impl Run {
+    /// Collapse one text box's characters, and carry the state on past it.
+    fn take(&mut self, text: &str, white_space: otlyra_css::WhiteSpace) -> String {
+        let mut out = String::with_capacity(text.len());
+        for character in text.chars() {
+            match character {
+                '\n' if white_space.preserves_breaks() => {
+                    // A break ends the line, so the spaces in front of it are
+                    // trailing white space and go.
+                    while out.ends_with(' ') && white_space.collapses_spaces() {
+                        out.pop();
+                    }
+                    out.push('\n');
+                    self.at_line_start = true;
+                    self.after_space = false;
+                }
+                ' ' | '\t' | '\n' | '\r' if white_space.collapses_spaces() => {
+                    if self.at_line_start || self.after_space {
+                        continue;
+                    }
+                    out.push(' ');
+                    self.after_space = true;
+                }
+                character => {
+                    out.push(character);
+                    // Preserved white space is white space that is *not*
+                    // collapsible, so it neither starts a run nor continues one.
+                    self.after_space = false;
+                    self.at_line_start = false;
+                }
+            }
+        }
+        out
+    }
+
+    /// Something that is not text took room here.
+    fn after_content(&mut self) {
+        self.at_line_start = false;
+        self.after_space = false;
+    }
+
+    /// A forced break: the next line starts empty.
+    fn after_break(&mut self) {
+        self.at_line_start = true;
+        self.after_space = false;
+    }
 }
 
 /// The marker text for one item, given the counter its list uses and its place in
@@ -329,7 +555,7 @@ impl Builder<'_> {
         if name != "img" {
             return None;
         }
-        let image = self.images.get(&node)?.clone();
+        let picture = self.images.get(&node)?.clone();
 
         // A `width` or `height` attribute is a presentational hint: it acts as
         // the lowest-priority rule setting that property, so a stylesheet
@@ -350,10 +576,17 @@ impl Builder<'_> {
         };
 
         let hint = (attribute("width"), attribute("height"));
-        let intrinsic = (image.width as f32, image.height as f32);
+        // The file's own size divided by the density it was chosen for: a
+        // picture picked at two device pixels per CSS pixel is drawn at half its
+        // width, which is the whole point of asking for a denser one.
+        let density = picture.density.max(f32::MIN_POSITIVE);
+        let intrinsic = (
+            picture.data.width as f32 / density,
+            picture.data.height as f32 / density,
+        );
 
         Some(crate::box_tree::Replaced {
-            image: Some(image),
+            image: Some(picture.data),
             intrinsic: Some(intrinsic),
             hint,
         })
@@ -402,6 +635,32 @@ impl Builder<'_> {
         match selected {
             Some(&chosen) => chosen == option,
             None => options.first() == Some(&option),
+        }
+    }
+
+    /// How far a `<td>` or `<th>` reaches, from its `colspan` and `rowspan`.
+    ///
+    /// HTML's own limits: a column span is between one and a thousand, a row span
+    /// at most 65534, and anything that is not a number at all is one. A row span
+    /// of zero is the exception that means something — every row left in the table
+    /// — and is carried through as zero for layout to resolve.
+    fn span_of(&self, node: NodeId) -> CellSpan {
+        let attribute = |key: &str| -> Option<usize> {
+            self.document
+                .get(node)?
+                .element()?
+                .attrs
+                .iter()
+                .find(|attr| attr.name.local.as_ref() == key)?
+                .value
+                .trim()
+                .parse::<usize>()
+                .ok()
+        };
+
+        CellSpan {
+            columns: attribute("colspan").unwrap_or(1).clamp(1, 1000),
+            rows: attribute("rowspan").unwrap_or(1).min(65534),
         }
     }
 
@@ -497,6 +756,15 @@ impl Builder<'_> {
                     self.tree.set_marker(id, marker);
                 }
 
+                // How far a cell reaches is markup rather than style: there is no
+                // property for it, so layout has to be told here or not at all.
+                if matches!(name, "td" | "th") {
+                    let span = self.span_of(node);
+                    if span != CellSpan::default() {
+                        self.tree.set_span(id, span);
+                    }
+                }
+
                 if has_renderable_children(name) {
                     for child in self.document.children(node) {
                         self.walk(child, id, &style);
@@ -505,41 +773,15 @@ impl Builder<'_> {
             }
 
             NodeData::Text(text) => {
-                // Whitespace-only text is kept here and removed later, once the
-                // boxes either side of it are known: the space between two blocks
-                // generates nothing, and the space between `<button>` and
-                // `<button>` is the gap between two controls.
-                if text.trim().is_empty() && parent_style.white_space != WhiteSpace::Pre {
-                    self.tree.push(
-                        parent_box,
-                        BoxNode {
-                            kind: BoxKind::Text(" ".into()),
-                            style: Arc::clone(parent_style),
-                            // The text node it came from, which is what tells the
-                            // fixup pass this space is markup rather than content a
-                            // control generated for itself.
-                            node: Some(node),
-                            tag: None,
-                            anonymous: true,
-                            children: Vec::new(),
-                            parent: None,
-                        },
-                    );
-                    return;
-                }
-
-                // Collapsed here, once per load, rather than in layout, which runs
-                // again on every resize. The result cannot change between them: it
-                // is a function of the text and of `white-space`, and neither is.
-                let text = match parent_style.white_space {
-                    otlyra_css::WhiteSpace::Pre => text.clone(),
-                    otlyra_css::WhiteSpace::Normal => collapse_whitespace(text).into(),
-                };
-
+                // The text exactly as it was written. What its spaces come to is
+                // decided once the whole tree is built, because collapsing is a
+                // fact about the run a space is in and not about the node it came
+                // from: the space between `</span>` and `<span>` is the same
+                // space as the one that ends the first of them.
                 self.tree.push(
                     parent_box,
                     BoxNode {
-                        kind: BoxKind::Text(text),
+                        kind: BoxKind::Text(text.clone()),
                         style: Arc::clone(parent_style),
                         node: Some(node),
                         tag: None,
@@ -691,6 +933,112 @@ mod tests {
     fn a_style_attribute_reaches_the_box_tree() {
         let tree = styled("<p style=\"font-size: 21px\">text");
         assert_eq!(style_of(&tree, "p").font_size, 21.0);
+    }
+
+    /// The text of a tree, run by run, which is what white-space processing is
+    /// judged on: what the shaper is handed and nothing else.
+    fn runs_of(html: &str) -> Vec<String> {
+        let tree = styled(html);
+        tree.descendants(tree.root())
+            .into_iter()
+            .filter_map(|id| match &tree.node(id).kind {
+                BoxKind::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the runs come to once they are joined, which is the line the reader
+    /// sees.
+    fn text_of(html: &str) -> String {
+        runs_of(html).concat()
+    }
+
+    /// Collapsing is a fact about the formatting context, not about the text
+    /// node: every case here is one the node on its own cannot answer.
+    #[test]
+    fn white_space_collapses_across_the_whole_context() {
+        assert_eq!(
+            text_of("<p><span>a </span><span>b</span>"),
+            "a b",
+            "a space ending one run is the space before the next"
+        );
+        assert_eq!(
+            text_of("<p><span>a </span> <span>b</span>"),
+            "a b",
+            "and the space between the two elements is the same space"
+        );
+        assert_eq!(
+            text_of("<p>   leading and trailing   "),
+            "leading and trailing",
+            "the ends of a context are not spaces"
+        );
+        assert_eq!(
+            text_of("<p>a\nb"),
+            "a b",
+            "a line ending in the source is one more space"
+        );
+        assert_eq!(
+            text_of("<p><span>x</span>\n<span>y</span>"),
+            "x y",
+            "including the one that indents the markup"
+        );
+        assert_eq!(
+            text_of("<p>a<br> b"),
+            "ab",
+            "a space after a forced break is the start of a line, and goes"
+        );
+        assert_eq!(
+            text_of("<p>a <br>b"),
+            "ab",
+            "and one in front of it is the end of one"
+        );
+    }
+
+    /// The other three modes, which differ in what survives.
+    #[test]
+    fn preserved_white_space_is_kept_exactly() {
+        assert_eq!(
+            text_of("<p style=\"white-space: pre\">  two   spaces\nsecond"),
+            "  two   spaces\nsecond",
+            "`pre` keeps every one of them"
+        );
+        assert_eq!(
+            text_of("<p style=\"white-space: pre-wrap\">  two   spaces\nsecond"),
+            "  two   spaces\nsecond",
+            "and so does `pre-wrap`"
+        );
+        assert_eq!(
+            text_of("<p style=\"white-space: pre-line\">  two   spaces\nsecond"),
+            "two spaces\nsecond",
+            "`pre-line` keeps the break and collapses the rest"
+        );
+        assert_eq!(
+            text_of("<p style=\"white-space: break-spaces\">  two   spaces"),
+            "  two   spaces",
+            "`break-spaces` keeps them and lets a line break inside them"
+        );
+    }
+
+    /// A space beside something that is not text is not trailing white space:
+    /// there is something after it.
+    #[test]
+    fn a_space_beside_a_picture_is_a_word_gap() {
+        assert_eq!(
+            text_of("<p>word <img src=x.png>"),
+            "word ",
+            "the space in front of a picture is the gap between them"
+        );
+        assert_eq!(
+            text_of("<p><img src=x.png> word"),
+            " word",
+            "and so is the one after it"
+        );
+        assert_eq!(
+            text_of("<p>\n  <img src=x.png>\n  <img src=x.png>\n"),
+            " ",
+            "but the markup around them is one gap and nothing at either end"
+        );
     }
 
     /// The space between two blocks is not a word gap; the space between two

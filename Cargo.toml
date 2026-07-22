@@ -61,7 +61,15 @@ raw-window-handle = "=0.6.2"
 # one-off ~79 ms on the first glyph — but rust-skia publishes prebuilt binaries per
 # feature permutation, and that one is not among them, so the saving costs a
 # from-source Skia build on every machine. Revisit if the permutation appears.
-skia-safe = "=0.99.0"
+# `svg` is the module that parses and draws SVG. A page's logo and its icons are
+# vector, and a rasterizer that refuses them draws the most recognisable thing on
+# a page as nothing at all — so this is the same rasterizer doing one more job
+# rather than a second one beside it.
+# `webp` comes with it because the published binaries are built per feature set
+# and this is the set that exists — which is no loss: the web serves WebP
+# everywhere, and a rasterizer that cannot decode it draws those pictures as
+# nothing too.
+skia-safe = { version = "=0.99.0", features = ["svg", "webp"] }
 
 # Font enumeration, CSS family matching, shaping and line breaking.
 parley = "=0.11.0"
@@ -72,6 +80,21 @@ parley = "=0.11.0"
 # face's vertical metrics *before* a paragraph is shaped, which is what decides how
 # tall a line with `line-height: normal` is.
 skrifa = "=0.43.2"
+
+# Unpacking the fonts a page brings with it. A `@font-face` on the web names a
+# WOFF or a WOFF2, which is an OpenType font in a compressed container, and every
+# font library in this tree reads OpenType and nothing else — so a page that ships
+# its typeface was silently set in whatever the stack fell back to. Pure Rust, and
+# its three dependencies (`brotli-decompressor`, `flate2`, `bytes`) are all already
+# in the tree, so it is one package rather than a subtree.
+wuff = "=0.2.8"
+
+# Reading a `data:` URL, which is a resource written into the page rather than
+# fetched: the payload is percent-encoded, and often base64 on top of that. Both
+# crates are already in the tree — `url` brings the first and the TLS stack the
+# second — so these are two lines in a manifest rather than two packages.
+base64 = "=0.22.1"
+percent-encoding = "=2.3.2"
 
 # Geometry and brush vocabulary shared by every PaintTarget backend.
 kurbo = "=0.13.1"

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tables</title>
+<style>
+  body { margin: 8px; font: 16px/1.2 Times; }
+  table { border-spacing: 2px; }
+</style>
+</head>
+<body>
+
+<h2>A cell across two columns</h2>
+<table border="1">
+  <tr><td colspan="2">wide wide wide</td><td>c</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h2>A cell down two rows</h2>
+<table border="1">
+  <tr><td rowspan="2">tall</td><td>b1</td><td>c1</td></tr>
+  <tr><td>b2</td><td>c2</td></tr>
+  <tr><td>a3</td><td>b3</td><td>c3</td></tr>
+</table>
+
+<h2>Both at once</h2>
+<table border="1">
+  <tr><td rowspan="3">R</td><td colspan="2">CC</td></tr>
+  <tr><td>x</td><td>y</td></tr>
+  <tr><td colspan="2">wide bottom row here</td></tr>
+</table>
+
+<h2>A span wider than anything under it</h2>
+<table border="1">
+  <tr><td colspan="3">one very long cell that spans everything in this table</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h2>A cell taller than the rows it covers</h2>
+<table border="1">
+  <tr><td rowspan="2" style="height: 120px">tall cell</td><td>b1</td></tr>
+  <tr><td>b2</td></tr>
+</table>
+
+<h2>A header, a body and a caption</h2>
+<table border="1">
+  <caption>Sales by quarter</caption>
+  <thead>
+    <tr><th>Region</th><th colspan="2">First half</th><th colspan="2">Second half</th></tr>
+    <tr><th></th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="2">North</td><td>10</td><td>12</td><td>14</td><td>16</td></tr>
+    <tr><td>11</td><td>13</td><td>15</td><td>17</td></tr>
+    <tr><td>South</td><td colspan="4">no figures reported this year</td></tr>
+  </tbody>
+</table>
+
+<h2>A row span running past the last row</h2>
+<table border="1">
+  <tr><td rowspan="9">clamped</td><td>b1</td></tr>
+  <tr><td>b2</td></tr>
+</table>
+
+<h2>Collapsed borders</h2>
+<table style="border-collapse: collapse">
+  <tr><td style="border: 1px solid">a</td><td style="border: 1px solid">b</td></tr>
+  <tr><td style="border: 1px solid">c</td><td style="border: 1px solid">d</td></tr>
+</table>
+
+<h2>Collapsed, where the wider border wins</h2>
+<table style="border-collapse: collapse; border: 5px solid navy">
+  <tr><td style="border: 1px solid">a</td><td style="border: 3px solid crimson">b</td></tr>
+  <tr><td style="border: 1px solid">c</td><td style="border: 1px solid">d</td></tr>
+</table>
+
+<h2>Collapsed, with spans and a spacing that no longer counts</h2>
+<table style="border-collapse: collapse; border-spacing: 10px; border: 2px solid">
+  <caption>Collapsed</caption>
+  <tr><td rowspan="2" style="border: 1px solid">R</td><td colspan="2" style="border: 4px solid">CC</td></tr>
+  <tr><td style="border: 1px solid">x</td><td style="border: 1px solid">y</td></tr>
+</table>
+
+</body>
+</html>

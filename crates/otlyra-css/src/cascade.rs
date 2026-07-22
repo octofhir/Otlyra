@@ -55,6 +55,20 @@ impl StyledDocument {
     }
 }
 
+/// Which of the two palettes the environment is asking a page for.
+///
+/// A preference of the reader's, not a property of the document: what
+/// `prefers-color-scheme` answers, and nothing more. A page that does not ask
+/// looks the same either way.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ColorScheme {
+    /// Dark text on a light background.
+    #[default]
+    Light,
+    /// Light text on a dark background.
+    Dark,
+}
+
 /// The viewport a document is styled against.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Viewport {
@@ -72,6 +86,8 @@ pub struct Viewport {
     /// override any other default. Scaling the used sizes afterwards instead
     /// would enlarge a `1px` hairline along with the prose.
     pub text_scale: f32,
+    /// The palette the environment is asking for.
+    pub color_scheme: ColorScheme,
 }
 
 impl Default for Viewport {
@@ -81,6 +97,7 @@ impl Default for Viewport {
             height: 768.0,
             scale: 1.0,
             text_scale: 1.0,
+            color_scheme: ColorScheme::Light,
         }
     }
 }
@@ -132,6 +149,28 @@ pub struct Styler {
     /// sheets are parsed, and looked up by the identity of the block itself. It
     /// is the one thing an inspector needs that the resolution does not carry.
     selectors: HashMap<usize, RuleSource>,
+    /// The `@font-face` rules the page's sheets declare, in the order they were
+    /// parsed. A page cannot be shown in a font it has not fetched, and nothing
+    /// else on the way through knows the rules are there.
+    font_faces: Vec<FontFace>,
+}
+
+/// A `@font-face` rule: a family the page brings with it, and where from.
+///
+/// The addresses are as the rule spells them and in the order it lists them,
+/// which is the order they are to be tried in. Resolving one needs the address of
+/// the sheet it was written in, which this crate does not know — so which sheet
+/// that was is carried instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFace {
+    /// The family name the rule defines, as written.
+    pub family: String,
+    /// Every `url()` in its `src`, in order. A `local()` source names an installed
+    /// family and is not an address, so it is not one of these.
+    pub sources: Vec<String>,
+    /// The `<link>` whose sheet this rule was in, or `None` for a `<style>` in the
+    /// document itself.
+    pub sheet: Option<NodeId>,
 }
 
 /// Where a declaration block was written.
@@ -199,7 +238,8 @@ impl Styler {
         index_selectors(&ua, Origin::UserAgent, &lock, &mut selectors);
         stylist.append_stylesheet(DocumentStyleSheet(ua), &lock.read());
 
-        for source in author_stylesheets(document, external) {
+        let mut font_faces = Vec::new();
+        for (node, source) in author_stylesheets(document, external) {
             let sheet = Arc::new(parse_sheet(
                 &source,
                 Origin::Author,
@@ -208,6 +248,7 @@ impl Styler {
                 quirks_mode,
             ));
             index_selectors(&sheet, Origin::Author, &lock, &mut selectors);
+            collect_font_faces(&sheet, &lock, node, &mut font_faces);
             stylist.append_stylesheet(DocumentStyleSheet(sheet), &lock.read());
         }
 
@@ -217,7 +258,13 @@ impl Styler {
             quirks_mode,
             viewport,
             selectors,
+            font_faces,
         }
+    }
+
+    /// The `@font-face` rules the page declares.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.font_faces
     }
 
     /// The rules that produced a computed style, strongest last.
@@ -421,7 +468,10 @@ fn device_for(viewport: Viewport, quirks_mode: QuirksMode) -> Device {
         // here, and everything that names one overrides it, which is what makes
         // the preference a default rather than an override.
         ComputedValues::initial_values_with_font_override(scaled_font(viewport.text_scale)),
-        style::queries::values::PrefersColorScheme::Light,
+        match viewport.color_scheme {
+            ColorScheme::Light => style::queries::values::PrefersColorScheme::Light,
+            ColorScheme::Dark => style::queries::values::PrefersColorScheme::Dark,
+        },
         style::servo::media_features::PointerCapabilities::FINE,
         style::servo::media_features::PointerCapabilities::FINE,
     )
@@ -499,7 +549,10 @@ fn resolve<'a>(
 /// which sheet came last, so a `<style>` after a `<link>` has to be appended after
 /// it — which means both kinds are collected by one walk rather than one list
 /// after another.
-fn author_stylesheets(document: &Document, external: &ExternalSheets) -> Vec<String> {
+fn author_stylesheets(
+    document: &Document,
+    external: &ExternalSheets,
+) -> Vec<(Option<NodeId>, String)> {
     let mut sheets = Vec::new();
     let mut stack = vec![document.root()];
 
@@ -516,7 +569,7 @@ fn author_stylesheets(document: &Document, external: &ExternalSheets) -> Vec<Str
                         }
                     }
                     if !source.trim().is_empty() {
-                        sheets.push(source);
+                        sheets.push((None, source));
                     }
                 }
                 "link" => {
@@ -526,8 +579,10 @@ fn author_stylesheets(document: &Document, external: &ExternalSheets) -> Vec<Str
                         // inside are then evaluated against the same device as
                         // every other one.
                         match attribute(document, id, "media").filter(|q| !q.trim().is_empty()) {
-                            Some(query) => sheets.push(format!("@media {query} {{\n{source}\n}}")),
-                            None => sheets.push(source.clone()),
+                            Some(query) => {
+                                sheets.push((Some(id), format!("@media {query} {{\n{source}\n}}")));
+                            }
+                            None => sheets.push((Some(id), source.clone())),
                         }
                     }
                 }
@@ -597,6 +652,44 @@ fn attribute(document: &Document, node: NodeId, name: &str) -> Option<String> {
         .iter()
         .find(|attribute| attribute.name.local.as_ref() == name)
         .map(|attribute| attribute.value.to_string())
+}
+
+/// Whether a media condition written outside a stylesheet matches `viewport`.
+///
+/// `<source media>` and the conditions in an `<img sizes>` are media queries in
+/// an attribute rather than in a sheet, and they have to be answered the same way
+/// `@media` is or a page gets one answer in its CSS and another in its markup.
+/// The engine's own parser and device do it; nothing here re-implements matching.
+pub fn media_condition_matches(condition: &str, viewport: Viewport) -> bool {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return true;
+    }
+
+    enable_features();
+    let url = base_url();
+    let context = style::parser::ParserContext::new(
+        Origin::Author,
+        &url,
+        None,
+        style_traits::ParsingMode::DEFAULT,
+        QuirksMode::NoQuirks,
+        Default::default(),
+        None,
+        None,
+        Default::default(),
+    );
+    let mut input = cssparser::ParserInput::new(condition);
+    let list = MediaList::parse(&context, &mut cssparser::Parser::new(&mut input));
+
+    let device = device_for(viewport, QuirksMode::NoQuirks);
+    list.evaluate(
+        &device,
+        QuirksMode::NoQuirks,
+        // A `@custom-media` name is defined in a stylesheet, and this condition
+        // is not in one.
+        &mut style::stylesheets::CustomMediaEvaluator::none(),
+    )
 }
 
 /// Parse one stylesheet.
@@ -721,6 +814,129 @@ fn index_selectors(
     }
 }
 
+/// Collect the `@font-face` rules in one sheet.
+///
+/// Nested in the same way style rules are: a rule inside a media query counts, and
+/// counts whether or not the query matches — which sheet it came in gates that,
+/// and a rule that turns out not to apply costs a fetch nobody uses rather than a
+/// page set in the wrong font.
+fn collect_font_faces(
+    sheet: &Stylesheet,
+    lock: &SharedRwLock,
+    node: Option<NodeId>,
+    out: &mut Vec<FontFace>,
+) {
+    use style::stylesheets::CssRule;
+
+    let guard = lock.read();
+    let mut stack: Vec<Arc<style::shared_lock::Locked<style::stylesheets::CssRules>>> =
+        vec![sheet.contents.read_with(&guard).rules.clone()];
+
+    while let Some(rules) = stack.pop() {
+        for rule in &rules.read_with(&guard).0 {
+            match rule {
+                CssRule::FontFace(rule) => {
+                    let descriptors = &rule.read_with(&guard).descriptors;
+                    let (Some(family), Some(sources)) =
+                        (descriptors.font_family.as_ref(), descriptors.src.as_ref())
+                    else {
+                        continue;
+                    };
+                    let sources: Vec<String> = sources
+                        .0
+                        .iter()
+                        .filter_map(|source| match source {
+                            style::font_face::Source::Url(url) => {
+                                readable(url).then(|| specified_url(&url.url))?
+                            }
+                            style::font_face::Source::Local(_) => None,
+                        })
+                        .collect();
+                    if sources.is_empty() {
+                        continue;
+                    }
+                    out.push(FontFace {
+                        family: family.name.to_string(),
+                        sources,
+                        sheet: node,
+                    });
+                }
+                CssRule::Media(rule) => stack.push(rule.rules.clone()),
+                CssRule::Supports(rule) => stack.push(rule.rules.clone()),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Whether a `src` entry names a format worth fetching.
+///
+/// A page that still supports browsers from before the web had a font format
+/// lists several: an EOT for one of them, an SVG font for another, and a WOFF2
+/// for everything since. Taking the first of those fetches a file nothing can
+/// read; every browser picks by the `format()` hint, and by the address when the
+/// page did not write one.
+fn readable(source: &style::font_face::UrlSource) -> bool {
+    use style::font_face::{FontFaceSourceFormat, FontFaceSourceFormatKeyword as Keyword};
+
+    if let Some(hint) = source.format_hint.as_ref() {
+        return match hint {
+            FontFaceSourceFormat::Keyword(keyword) => !matches!(
+                keyword,
+                Keyword::EmbeddedOpentype | Keyword::Svg | Keyword::None
+            ),
+            FontFaceSourceFormat::String(name) => {
+                let name = name.to_ascii_lowercase();
+                !(name.contains("embedded-opentype") || name.contains("svg"))
+            }
+        };
+    }
+
+    // No hint: the address is what is left to go on, and the two formats worth
+    // refusing are the two nothing here can read.
+    let address = specified_url(&source.url).unwrap_or_default();
+    let path = address
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&address)
+        .to_ascii_lowercase();
+    !(path.ends_with(".eot") || path.ends_with(".svg"))
+}
+
+/// The address a `url()` names, as written.
+///
+/// A sheet is parsed against a base that resolves nothing, so an absolute address
+/// comes back resolved and a relative one comes back only as the text it was
+/// written as — which is what the caller wants anyway, since it is the caller that
+/// knows what to resolve it against.
+fn specified_url(url: &style::values::specified::url::SpecifiedUrl) -> Option<String> {
+    use style_traits::values::ToCss as _;
+
+    if let Some(resolved) = url.url() {
+        return Some(resolved.as_str().to_owned());
+    }
+
+    // `url("…")`, with the address serialized as a CSS string. Reading it back is
+    // stripping the function and unescaping the string, and there is no shorter
+    // route to the text: the engine keeps it private.
+    let text = url.to_css_string();
+    let inner = text.strip_prefix("url(")?.strip_suffix(')')?;
+    let quote = inner.chars().next()?;
+    let inner = inner
+        .strip_prefix(quote)
+        .and_then(|rest| rest.strip_suffix(quote))?;
+
+    let mut out = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => out.extend(characters.next()),
+            _ => out.push(character),
+        }
+    }
+    Some(out).filter(|address| !address.is_empty())
+}
+
 /// The base every sheet is parsed against.
 ///
 /// Relative `url()` in a stylesheet resolves against the document it came from,
@@ -837,6 +1053,158 @@ mod tests {
         styled.style_of(node).expect("a styled element").clone()
     }
 
+    /// The rules that decide whether an element renders like itself, checked
+    /// against the reference's own answers for the ones that were wrong.
+    #[test]
+    fn the_built_in_sheet_says_what_a_browser_says() {
+        use crate::Display;
+
+        let display = |markup: &str, selector: &str| {
+            let document = otlyra_html::parse(markup.as_bytes(), Some("utf-8")).document;
+            let styled = style_document(&document, Viewport::default());
+            let node = crate::stylo_dom::select(&document, selector)
+                .expect("the selector parses")
+                .into_iter()
+                .next()
+                .expect("something matches");
+            styled
+                .style_of(node)
+                .map(|values| crate::computed::to_layout_style(values).display)
+        };
+
+        // Not shown at all: the attribute that says so, a field that is not one,
+        // a list of suggestions, and the parenthesis a browser with ruby hides.
+        for (markup, selector) in [
+            ("<p hidden>x", "p"),
+            ("<input type=hidden>", "input"),
+            ("<datalist><option>x</option></datalist>", "datalist"),
+            ("<ruby>x<rp>(</rp></ruby>", "rp"),
+            ("<dialog>x</dialog>", "dialog"),
+        ] {
+            assert_eq!(
+                display(markup, selector),
+                Some(Display::None),
+                "{selector} in {markup:?} should not be rendered"
+            );
+        }
+
+        // Shown, against what a browser does: the content of `noscript` is what a
+        // page shows when scripts do not run, and here they do not.
+        assert_eq!(
+            display("<noscript>x</noscript>", "noscript"),
+            Some(Display::Inline)
+        );
+
+        // A control is inline outside and a block inside.
+        for selector in ["input", "button", "select", "textarea", "progress"] {
+            let markup = format!("<{selector}>x</{selector}>");
+            assert_eq!(
+                display(&markup, selector),
+                Some(Display::InlineBlock),
+                "{selector} is inline-block"
+            );
+        }
+
+        // A closed disclosure shows its summary and nothing else; an open one
+        // shows both.
+        assert_eq!(
+            display("<details><summary>s</summary><p>body</p></details>", "p"),
+            Some(Display::None)
+        );
+        assert_eq!(
+            display(
+                "<details open><summary>s</summary><p>body</p></details>",
+                "p"
+            ),
+            Some(Display::Block)
+        );
+
+        // An anchor without an address is a name for a place, not a link.
+        let styled_link = |markup: &str| {
+            let document = otlyra_html::parse(markup.as_bytes(), Some("utf-8")).document;
+            let styled = style_document(&document, Viewport::default());
+            let node = crate::stylo_dom::select(&document, "a")
+                .expect("parses")
+                .into_iter()
+                .next()
+                .expect("an anchor");
+            crate::computed::to_layout_style(styled.style_of(node).expect("styled"))
+                .text_decoration
+                .underline
+        };
+        assert!(styled_link("<a href=/x>x</a>"), "a link is underlined");
+        assert!(!styled_link("<a name=x>x</a>"), "an anchor is not");
+    }
+
+    /// A `@font-face` rule names a family and the addresses it may be fetched
+    /// from, including the ones inside a media query — and a `local()` source is
+    /// an installed family rather than an address.
+    #[test]
+    fn font_face_rules_are_collected() {
+        let document = otlyra_html::parse(
+            br#"<style>
+              @font-face { font-family: "Brought"; src: url(a.woff2) format("woff2"), url(a.ttf); }
+              @media (min-width: 1px) {
+                @font-face { font-family: Queried; src: local("Helvetica"), url("q.otf"); }
+              }
+              @font-face { font-family: Nowhere; src: local("Helvetica"); }
+            </style>"#,
+            Some("utf-8"),
+        )
+        .document;
+
+        let styler = Styler::new(&document, Viewport::default(), &ExternalSheets::new());
+        let faces = styler.font_faces();
+
+        assert_eq!(
+            faces.len(),
+            2,
+            "a rule with no address names no font: {faces:?}"
+        );
+        let brought = faces
+            .iter()
+            .find(|face| face.family == "Brought")
+            .expect("the first rule");
+        assert_eq!(
+            brought.sources,
+            ["a.woff2", "a.ttf"],
+            "in the order written"
+        );
+        assert_eq!(brought.sheet, None, "written in the document itself");
+
+        let queried = faces
+            .iter()
+            .find(|face| face.family == "Queried")
+            .expect("the rule inside the query");
+        assert_eq!(queried.sources, ["q.otf"]);
+    }
+
+    /// A rule in a fetched sheet is carried with the link it came through, which
+    /// is what lets its addresses be resolved against that sheet rather than
+    /// against the page.
+    #[test]
+    fn a_font_face_remembers_which_sheet_it_was_in() {
+        let document =
+            otlyra_html::parse(b"<link rel=stylesheet href=of/its/own.css>", Some("utf-8"))
+                .document;
+        let links = stylesheet_links(&document);
+        let external: ExternalSheets = links
+            .iter()
+            .map(|link| {
+                (
+                    link.node,
+                    "@font-face { font-family: Far; src: url(../fonts/far.woff2) }".to_owned(),
+                )
+            })
+            .collect();
+
+        let styler = Styler::new(&document, Viewport::default(), &external);
+        let face = styler.font_faces().first().expect("the rule");
+        assert_eq!(face.family, "Far");
+        assert_eq!(face.sources, ["../fonts/far.woff2"]);
+        assert_eq!(face.sheet, Some(links[0].node));
+    }
+
     /// A resize that no rule reads changes nothing, and the caller is told so:
     /// this is what turns a window drag into a relayout rather than a re-cascade of
     /// the whole document.
@@ -868,6 +1236,69 @@ mod tests {
                 ..Viewport::default()
             }),
             "the query stopped matching"
+        );
+    }
+
+    /// The one preference of the reader's that half the web reads.
+    #[test]
+    fn prefers_color_scheme_answers_the_environment() {
+        const PAGE: &str = "<style>\
+             p { color: rgb(0, 0, 0) }\
+             @media (prefers-color-scheme: dark) { p { color: rgb(255, 255, 255) } }\
+             </style><p>x";
+
+        let document = otlyra_html::parse(PAGE.as_bytes(), Some("utf-8")).document;
+        let node = crate::stylo_dom::select(&document, "p")
+            .expect("the selector should parse")
+            .into_iter()
+            .next()
+            .expect("a paragraph");
+
+        let light = style_document(&document, Viewport::default());
+        assert_eq!(colour(light.style_of(node).expect("a style")), (0, 0, 0));
+
+        let dark = style_document(
+            &document,
+            Viewport {
+                color_scheme: ColorScheme::Dark,
+                ..Viewport::default()
+            },
+        );
+        assert_eq!(
+            colour(dark.style_of(node).expect("a style")),
+            (255, 255, 255)
+        );
+    }
+
+    /// The scheme goes to the sheets the same way a new width does, so a page
+    /// that never asks keeps every style it computed.
+    #[test]
+    fn a_new_scheme_restyles_only_a_page_that_asked() {
+        let plain =
+            otlyra_html::parse(b"<style>p { color: red }</style><p>x", Some("utf-8")).document;
+        let mut styler = Styler::new(&plain, Viewport::default(), &ExternalSheets::new());
+        styler.style(&plain);
+        assert!(
+            !styler.resize(Viewport {
+                color_scheme: ColorScheme::Dark,
+                ..Viewport::default()
+            }),
+            "nothing in this document reads the scheme"
+        );
+
+        let queried = otlyra_html::parse(
+            b"<style>@media (prefers-color-scheme: dark) { p { color: red } }</style><p>x",
+            Some("utf-8"),
+        )
+        .document;
+        let mut styler = Styler::new(&queried, Viewport::default(), &ExternalSheets::new());
+        styler.style(&queried);
+        assert!(
+            styler.resize(Viewport {
+                color_scheme: ColorScheme::Dark,
+                ..Viewport::default()
+            }),
+            "the query started matching"
         );
     }
 

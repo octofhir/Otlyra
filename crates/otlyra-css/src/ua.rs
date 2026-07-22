@@ -115,7 +115,7 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
         "pre" => {
             style.display = Display::Block;
             style.font_family = Arc::from("monospace");
-            style.white_space = WhiteSpace::Pre;
+            style.white_space = WhiteSpace::Preserve;
             style.margin = Sides::axes(em(parent, 1.0), LengthOrAuto::Px(0.0));
         }
 
@@ -189,13 +189,13 @@ pub fn ua_style(element: &str, parent: &ComputedStyle) -> ComputedStyle {
             style.font_size = parent.font_size * 0.95;
             // A field keeps its spacing: an empty one is sized by the space it
             // reserves, and collapsing that away leaves a field a pixel wide.
-            style.white_space = WhiteSpace::Pre;
+            style.white_space = WhiteSpace::Preserve;
         }
         "textarea" => {
             style.display = Display::Block;
             style.background_color = Color::from_rgb8(0xf4, 0xf4, 0xf6);
             style.font_family = Arc::from("monospace");
-            style.white_space = WhiteSpace::Pre;
+            style.white_space = WhiteSpace::Preserve;
         }
         // Present in the standard's stylesheet and cheap to be right about.
         "details" | "summary" | "dialog" | "figure" | "hgroup" | "search" => {

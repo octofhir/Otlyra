@@ -100,6 +100,13 @@ pub struct ShapedRun {
     pub offset_x: f32,
     /// How far the run advances.
     pub advance: f32,
+    /// The characters this run drew.
+    ///
+    /// Carried rather than recovered: a glyph identifier is a place in a font and
+    /// says nothing about the character it was chosen for, and everything that
+    /// reads text back off the page — a selection, a copy, a screen reader — needs
+    /// the characters rather than the shapes.
+    pub text: std::sync::Arc<str>,
     /// The byte range of the shaped text this run covers.
     ///
     /// Opaque here — this crate has no idea what the text came from — and the one
@@ -139,8 +146,14 @@ pub struct LineMetrics {
     /// further down than the height it is stacked by — and a paragraph that is one
     /// such line is that much taller than the shaper reports.
     pub bottom: f32,
-    /// The line's advance width.
+    /// The line's advance width, trailing whitespace and all.
     pub width: f32,
+    /// How much of that width is the whitespace at the end of the line.
+    ///
+    /// A space at a line break is not part of the line as far as anything measuring
+    /// it is concerned: what a paragraph needs at its narrowest is its longest word,
+    /// not that word and the space that follows it.
+    pub trailing_space: f32,
 }
 
 /// A span of text with one style, for shaping a paragraph made of several.
@@ -461,12 +474,20 @@ impl TextEngine {
             let info = match family {
                 crate::Family::Named(name) => self.fonts.collection.family_by_name(name),
                 crate::Family::Generic(generic) => {
-                    let id = self
+                    // A generic nothing is registered for is a family that is not
+                    // there, and the next one in the stack answers instead. Giving
+                    // up on the whole stack here is what left a page set in
+                    // `system-ui` with no metrics at all, and so with none of the
+                    // rules a line height is made of.
+                    let first = self
                         .fonts
                         .collection
                         .generic_families(generic.to_parley())
-                        .next()?;
-                    self.fonts.collection.family(id)
+                        .next();
+                    match first {
+                        Some(id) => self.fonts.collection.family(id),
+                        None => continue,
+                    }
                 }
             };
             let Some(info) = info else { continue };
@@ -529,7 +550,7 @@ impl TextEngine {
 
         let mut builder = self
             .layout
-            .ranged_builder(&mut self.fonts, &text, 1.0, true);
+            .ranged_builder(&mut self.fonts, &text, 1.0, false);
         builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
 
         // The first span's font, as the default under the ranged ones. A range is
@@ -605,12 +626,60 @@ impl TextEngine {
         let mut layout = builder.build(&text);
         break_lines(&mut layout, line_width);
         layout.align(Alignment::Start, AlignmentOptions::default());
-        collect(&layout, text.len())
+        let mut shaped = collect(&layout, &text);
+
+        // A tab is not a character of a width: it is a jump to the next tab stop,
+        // and where that is depends on how far along the line the tab sits. The
+        // shaper has no idea of one, so the glyphs after a tab are moved here,
+        // once the line they landed on is known.
+        if text.contains('\t') {
+            let stop = self.tab_stop(spans.first());
+            expand_tabs(&mut shaped, stop);
+        }
+        shaped
+    }
+
+    /// How far apart the tab stops are: eight spaces of the paragraph's own font,
+    /// which is `tab-size`'s initial value and the only one read.
+    fn tab_stop(&mut self, span: Option<&TextSpan<'_>>) -> f32 {
+        const TAB_SIZE: f32 = 8.0;
+
+        let Some(span) = span else {
+            return 0.0;
+        };
+        // The *advance* of a space rather than the width of the line it makes:
+        // a line of nothing but white space is a line of no width, because
+        // trailing white space is not part of what a paragraph measures.
+        let space = self
+            .shape(" ", &span.font_stack, span.font_size, None)
+            .lines
+            .first()
+            .map_or(0.0, |line| line.width);
+        space * TAB_SIZE
     }
 
     /// Measure without keeping the glyphs.
     pub fn measure(&mut self, text: &str, stack: &FontStack, font_size: f32) -> TextMetrics {
         self.shape(text, stack, font_size, None).metrics
+    }
+
+    /// Add a font the page brought with it, under the family name its rule gives.
+    ///
+    /// The name is the rule's rather than the file's, which is the whole of what
+    /// `@font-face` does: a page may call a face anything it likes and then ask for
+    /// it by that name, and what is baked into the file is not what the cascade
+    /// will be asking about. Returns whether the bytes were a font.
+    pub fn add_font(&mut self, family: &str, bytes: Vec<u8>) -> bool {
+        let blob = parley::fontique::Blob::new(std::sync::Arc::new(unpack(bytes)));
+        let registered = self.fonts.collection.register_fonts(
+            blob,
+            Some(parley::fontique::FontInfoOverride {
+                family_name: Some(family),
+                ..Default::default()
+            }),
+        );
+
+        !registered.is_empty()
     }
 
     /// Whether a family name resolves to anything in the collection.
@@ -658,30 +727,153 @@ fn break_lines(
 /// so a caret in it has a height — and that cluster is past the end of the text it
 /// claims to be part of. It is dropped here rather than handed on as a glyph nobody
 /// asked to draw.
-fn collect(layout: &parley::Layout<Brush>, text_len: usize) -> ShapedText {
+/// Move what follows each tab to the next tab stop.
+///
+/// A tab in CSS is a jump and not a character: what it advances by is however far
+/// it is to the next stop, so it can only be settled once the glyphs before it on
+/// the line have been placed. The shaper knows nothing of stops — it gives the
+/// tab whatever advance the font has for it — so the glyphs after one are moved
+/// along here, and the line grows by what they moved.
+///
+/// Left to right, because where each tab lands depends on the ones before it. A
+/// line that was *broken* with the tab at its font width was broken a little
+/// early, which shows only where a paragraph both preserves tabs and wraps.
+fn expand_tabs(shaped: &mut ShapedText, stop: f32) {
+    if stop <= 0.0 {
+        return;
+    }
+
+    for line in 0..shaped.lines.len() {
+        for (run_index, glyph_index) in tabs_on(shaped, line) {
+            let run = &shaped.runs[run_index];
+            let at = run.glyphs[glyph_index].x;
+            let after = run
+                .glyphs
+                .get(glyph_index + 1)
+                .map_or(run.offset_x + run.advance, |glyph| glyph.x);
+            // The next stop strictly past where the tab starts: a tab that lands
+            // exactly on one still goes to the following one, which is what makes
+            // a tab always take room.
+            let target = ((at / stop).floor() + 1.0) * stop;
+            let delta = target - after;
+            if delta.abs() < 0.01 {
+                continue;
+            }
+            shift_after(shaped, line, run_index, glyph_index, delta);
+        }
+    }
+}
+
+/// Where the tabs on one line are, as a run and a glyph in it, left to right.
+///
+/// Taken before anything moves and read back as things do: shifting a glyph does
+/// not change which glyph it is, and each tab's own position is read again when
+/// its turn comes.
+fn tabs_on(shaped: &ShapedText, line: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (run_index, run) in shaped.runs.iter().enumerate() {
+        if run.line != line {
+            continue;
+        }
+        // The glyphs are in visual order and the characters in logical order,
+        // which for the direction this draws is the same order — the assumption
+        // every other reading of a run back into its text makes here.
+        for (glyph_index, (_, character)) in run.text.char_indices().enumerate() {
+            if character == '\t' && glyph_index < run.glyphs.len() {
+                out.push((run_index, glyph_index));
+            }
+        }
+    }
+    out
+}
+
+/// Move everything after one glyph on a line along by `delta`.
+fn shift_after(
+    shaped: &mut ShapedText,
+    line: usize,
+    run_index: usize,
+    glyph_index: usize,
+    delta: f32,
+) {
+    let from = shaped.runs[run_index].offset_x;
+
+    for (index, run) in shaped.runs.iter_mut().enumerate() {
+        if run.line != line || index < run_index {
+            continue;
+        }
+        if index == run_index {
+            for glyph in run.glyphs.iter_mut().skip(glyph_index + 1) {
+                glyph.x += delta;
+            }
+            run.advance += delta;
+        } else {
+            run.offset_x += delta;
+            for glyph in &mut run.glyphs {
+                glyph.x += delta;
+            }
+        }
+    }
+
+    for spacer in &mut shaped.spacers {
+        if spacer.line == line && spacer.x >= from {
+            spacer.x += delta;
+        }
+    }
+
+    if let Some(metrics) = shaped.lines.get_mut(line) {
+        metrics.width += delta;
+        shaped.metrics.width = shaped.metrics.width.max(metrics.width);
+    }
+}
+
+fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
+    let text_len = text.len();
     let mut runs = Vec::new();
     let mut lines = Vec::new();
     let mut spacers = Vec::new();
+    // How far the ink of each line actually reached, which is not the line box: it
+    // is only asked about where something in the line is not part of the box the
+    // shaper measured. See the spacer pass below.
+    let mut reached: Vec<(f32, f32)> = Vec::new();
     let mut first_baseline = 0.0;
 
-    // How many of each parley run's clusters have already been handed out. A run
-    // spans line breaks and style changes, so the glyph runs that come back are
-    // slices of it, in order — and the byte range of a slice is only recoverable by
-    // walking the clusters alongside them. parley reports a range for the whole run,
-    // which is not the same thing and is what a naive reading gets wrong: with one
-    // font and one size, a paragraph of differently coloured links is *one* run.
+    // How many of each run's clusters have already been handed out. One run is
+    // split into several glyph runs where the style changes along it — with one
+    // font and one size, a paragraph of differently coloured links is *one* run —
+    // and the byte range of each slice is only recoverable by walking the
+    // clusters alongside them, because the range parley reports is the whole
+    // run's.
+    //
+    // Counted per line and reset with each one. A run's clusters are the clusters
+    // of the line it is on, so carrying the count across a line break makes every
+    // line after the first take its text from further along than it drew: the
+    // second line of a paragraph came back holding the tail of its own text and
+    // the third came back holding none, which is what a selection dragged down a
+    // wrapped paragraph then copied.
     let mut consumed: Vec<usize> = Vec::new();
 
     for (index, line) in layout.lines().enumerate() {
+        consumed.clear();
         let metrics = line.metrics();
         if index == 0 {
             first_baseline = metrics.baseline;
         }
+        // The line *box*, not the ink. CSS stacks lines by the line box, and the
+        // glyphs of a face whose ascent is taller than the leading allows hang out
+        // of it — measuring the box from where the ink reached makes every line as
+        // tall as its tallest letter and a page's rhythm a function of what is
+        // written on it. The box is centred on the baseline the shaper placed the
+        // glyphs on: half of what is left over after the font's own ascent and
+        // descent goes above and half below, which is what half-leading is.
+        let half_leading = (metrics.line_height - metrics.ascent - metrics.descent) / 2.0;
+        let top = metrics.baseline - metrics.ascent - half_leading;
+        reached.push((metrics.block_min_coord, metrics.block_max_coord));
         lines.push(LineMetrics {
-            top: metrics.block_min_coord,
+            top,
             baseline: metrics.baseline,
             height: metrics.line_height,
-            bottom: metrics.block_max_coord,
+            trailing_space: metrics.trailing_whitespace,
+            bottom: top + metrics.line_height,
             width: metrics.advance,
         });
 
@@ -749,16 +941,44 @@ fn collect(layout: &parley::Layout<Brush>, text_len: usize) -> ShapedText {
                 line: index,
                 offset_x: glyph_run.offset(),
                 advance: glyph_run.advance(),
+                // The characters the run drew, kept with it: a run is what a
+                // selection is measured in, and glyph identifiers cannot be read
+                // back into the text they came from.
+                text: text.get(text_range.clone()).unwrap_or_default().into(),
                 text_range,
                 glyphs,
             });
         }
     }
 
+    // A picture in a line sits with its bottom edge on the baseline, and the text
+    // beside it hangs below that: the line reaches further down than the box it is
+    // stacked by, and a paragraph that is one such line is that much taller. That is
+    // what `bottom` is for, and it is the one place ink beats the line box.
+    // The shaper stacks a line holding a picture by the picture's own height and
+    // puts the picture's bottom edge on the baseline, so the text's descenders hang
+    // below the box it reports. On those lines — and only there — the ink is the
+    // answer.
+    for spacer in &spacers {
+        if let (Some(line), Some(&(above, below))) =
+            (lines.get_mut(spacer.line), reached.get(spacer.line))
+        {
+            // A picture is taller than the text beside it and sits on the baseline:
+            // the box reaches up to hold it and down to hold the descenders, and
+            // neither end is where the font alone would have put it.
+            line.top = line.top.min(above).min(spacer.y);
+            line.bottom = line
+                .bottom
+                .max(below)
+                .max(spacer.y + spacer.height)
+                .max(line.top + line.height);
+        }
+    }
+
     // The paragraph reaches from the top of its first line to the bottom of its
     // last, which is not the sum of the heights they are stacked by.
     let height = match (lines.first(), lines.last()) {
-        (Some(first), Some(last)) => (last.bottom - first.top).max(layout.height()),
+        (Some(first), Some(last)) => last.bottom - first.top,
         _ => layout.height(),
     };
 
@@ -866,6 +1086,29 @@ fn prefer_browser_families(fonts: &mut FontContext) {
     }
 }
 
+/// An OpenType font, out of whatever container the page shipped it in.
+///
+/// What a `@font-face` on the web names is almost never a bare font: it is a WOFF
+/// or a WOFF2, which is the same tables packed and compressed for the wire, and
+/// every font library here reads the bare thing. The container says which it is in
+/// its first four bytes; anything else is handed on untouched, because a font this
+/// cannot unpack may still be a font the shaper can read.
+fn unpack(bytes: Vec<u8>) -> Vec<u8> {
+    let unpacked = match bytes.get(..4) {
+        Some(b"wOF2") => wuff::decompress_woff2(&bytes),
+        Some(b"wOFF") => wuff::decompress_woff1(&bytes),
+        _ => return bytes,
+    };
+
+    match unpacked {
+        Ok(font) => font,
+        Err(error) => {
+            tracing::warn!(%error, "a packed font could not be unpacked");
+            bytes
+        }
+    }
+}
+
 /// Register the vendored font under [`TEST_FAMILY`], overriding whatever family
 /// name is baked into the file, so the name is ours and cannot collide with a
 /// system font that happens to be called Roboto.
@@ -896,6 +1139,113 @@ mod tests {
 
     fn test_stack() -> FontStack {
         FontStack::named(TEST_FAMILY)
+    }
+
+    /// A run carries the characters it drew, and on the second line of a
+    /// paragraph those are the second line's characters.
+    ///
+    /// The clusters a glyph run has handed out are counted per line: carrying the
+    /// count across a break made every line after the first report text from
+    /// further along than it drew, which is what a selection reads back and what
+    /// a copy puts on the clipboard.
+    #[test]
+    fn every_line_of_a_paragraph_carries_its_own_text() {
+        let mut engine = engine();
+        let shaped = engine.shape("first line\nsecond line\nthird", &test_stack(), 16.0, None);
+
+        let text_of = |line: usize| {
+            shaped
+                .runs
+                .iter()
+                .filter(|run| run.line == line)
+                .map(|run| run.text.to_string())
+                .collect::<String>()
+        };
+
+        assert_eq!(shaped.lines.len(), 3);
+        assert_eq!(text_of(0), "first line");
+        assert_eq!(text_of(1), "second line");
+        assert_eq!(text_of(2), "third");
+
+        // Every line drew something, and none of them drew more than the line
+        // holds. (Not one glyph per character: a face that ligates draws `fi`
+        // with one, which is why a run carries its text rather than being read
+        // back out of its glyphs.)
+        for run in &shaped.runs {
+            assert!(
+                !run.glyphs.is_empty() && run.glyphs.len() <= run.text.chars().count(),
+                "a run of {:?} drew {} glyphs",
+                run.text,
+                run.glyphs.len()
+            );
+        }
+    }
+
+    /// A tab is a jump to the next stop and not a character of its own width, so
+    /// where it lands depends on how far along the line it sits.
+    #[test]
+    fn a_tab_reaches_the_next_stop() {
+        let mut engine = engine();
+        let stack = test_stack();
+        let stop = engine
+            .shape(" ", &stack, 16.0, None)
+            .lines
+            .first()
+            .map_or(0.0, |line| line.width)
+            * 8.0;
+        assert!(stop > 0.0);
+
+        let mut width = |text: &str| {
+            engine
+                .shape(text, &stack, 16.0, None)
+                .lines
+                .first()
+                .map_or(0.0, |line| line.width)
+        };
+
+        let alone = width("\t");
+        assert!(
+            (alone - stop).abs() < 0.5,
+            "a tab at the start of a line reaches the first stop: {alone} of {stop}"
+        );
+
+        let letter = width("a");
+        let after = width("a\ta");
+        assert!(
+            (after - (stop + letter)).abs() < 0.5,
+            "and one after a letter reaches the same stop: {after}"
+        );
+
+        // Past a stop, it goes to the one after — a tab always takes room.
+        let long = "aaaaaaaaaa";
+        let ten = width(long);
+        let jumped = width(&format!("{long}\ta"));
+        let expected = ((ten / stop).floor() + 1.0) * stop + letter;
+        assert!(
+            (jumped - expected).abs() < 0.5,
+            "{jumped} rather than {expected}"
+        );
+    }
+
+    /// A page's own font arrives packed — a WOFF or a WOFF2, which is what the web
+    /// ships — and the container is unpacked before the shaper is handed anything.
+    /// A bare font goes through untouched, and a container that will not unpack is
+    /// refused rather than fatal.
+    #[test]
+    fn a_font_is_unpacked_before_it_is_registered() {
+        let mut engine = TextEngine::isolated();
+        assert!(
+            engine.add_font("Bare Along", TEST_FONT.to_vec()),
+            "a font that is already a font registers"
+        );
+        assert!(engine.has_family("Bare Along"));
+
+        // Packed, and not a font at all: unpacking fails, and what is handed on is
+        // refused by the collection rather than taken as a face.
+        let mut packed = b"wOF2".to_vec();
+        packed.extend_from_slice(&[0u8; 64]);
+        assert!(!engine.add_font("Broken Along", packed));
+        assert!(!engine.has_family("Broken Along"));
     }
 
     #[test]

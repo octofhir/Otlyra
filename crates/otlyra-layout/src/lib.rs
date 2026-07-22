@@ -31,14 +31,16 @@ pub mod damage;
 pub mod dump;
 pub mod flow;
 pub mod fragment;
+pub mod selection;
+pub mod srcset;
 
 pub use box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, InvalidationReason, box_id_from_u64, box_id_to_u64,
     first_box_with_mixed_children,
 };
 pub use builder::{
-    ImageSource, Images, build_box_tree, build_box_tree_with_images, build_styled_box_tree,
-    image_sources,
+    ImageSource, Images, Picture, build_box_tree, build_box_tree_with_images,
+    build_styled_box_tree, image_sources,
 };
 pub use damage::Damage;
 // Re-exported because a fragment carries a style and anything reading one needs
@@ -46,6 +48,8 @@ pub use damage::Damage;
 pub use flow::{Viewport, layout};
 pub use fragment::{Fragment, FragmentKind, FragmentTree, Rect, UsedEdges};
 pub use otlyra_css::{ComputedStyle, Display};
+pub use selection::{Motion, Selection, TextPosition};
+pub use srcset::Chosen;
 
 #[cfg(test)]
 mod tests {

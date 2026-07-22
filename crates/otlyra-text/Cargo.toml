@@ -12,6 +12,7 @@ repository.workspace = true
 otlyra-gfx.workspace = true
 parley.workspace = true
 skrifa.workspace = true
+wuff.workspace = true
 tracing.workspace = true
 
 [lints]

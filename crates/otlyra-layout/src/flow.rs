@@ -44,6 +44,11 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         scroll_ports: Vec::new(),
         pending_marker: None,
         table_width: None,
+        collapsed: slotmap::SecondaryMap::new(),
+        collapsed_lines: slotmap::SecondaryMap::new(),
+        measured: std::collections::HashMap::new(),
+        containing_height: None,
+        line_reach: (0.0, 0.0),
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -62,6 +67,12 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         layer: Layer::default(),
         children,
     };
+
+    let mut root_fragment = root_fragment;
+    // Where every box sits in the painting order, which is a question about its
+    // ancestors as much as about itself and so cannot be answered until they are
+    // all here.
+    crate::fragment::assign_paint_order(&mut root_fragment);
 
     tracing::debug!(height, "laid out");
     FragmentTree {
@@ -113,6 +124,52 @@ struct Flow<'a> {
     /// the block that holds the table has already committed to one. So it is
     /// reported back here and the block narrows itself to it.
     table_width: Option<f32>,
+    /// What a box's contents needed at their narrowest and at their widest, by the
+    /// box and the width it was asked about.
+    ///
+    /// Both answers cost a shaping pass over every word in the box, and both are
+    /// asked for repeatedly: a flex line measures its items, then lays them out; a
+    /// table measures every cell twice per column pass. On a page of four hundred
+    /// cards that was four thousand eight hundred shaping passes, of which most
+    /// were the same question asked again — measured, and it was five sixths of the
+    /// time layout took.
+    ///
+    /// Keyed by the width because the answer depends on it: a percentage inside the
+    /// box resolves against it. Cleared with the layout it belongs to, since a box
+    /// tree lives no longer than that.
+    measured: std::collections::HashMap<(BoxId, u32, Wanted), f32>,
+    /// The height of the containing block, when it has one of its own.
+    ///
+    /// A percentage height is a percentage of the *height* of what holds the box,
+    /// and only means anything when that height is settled without looking at the
+    /// contents. Where it is not — which is most of the web, where a column is as
+    /// tall as what is in it — CSS says the percentage computes to `auto`, and the
+    /// box is as tall as its own contents.
+    containing_height: Option<f32>,
+    /// How far the paragraph being laid out reaches above and below its baseline,
+    /// as its own struts and inline blocks settled it.
+    ///
+    /// The shaper is told how tall a line is but decides for itself where inside it
+    /// the baseline sits, by centring the font. CSS does not: a line reaches as far
+    /// above its baseline as its tallest thing does, and as far below as its
+    /// deepest. So the line boxes are rebuilt around the baselines the shaper
+    /// placed the glyphs on, which moves the boxes and leaves the text where it is.
+    line_reach: (f32, f32),
+    /// The lines of each collapsed table's grid, for the table to draw.
+    ///
+    /// A collapsed border belongs to the edge rather than to a cell, so it is
+    /// drawn once, by the table, rather than half by each of the two cells that
+    /// meet on it: two halves are two strokes, and where the cells disagree about
+    /// the colour they would be two colours.
+    collapsed_lines: slotmap::SecondaryMap<BoxId, TableLines>,
+    /// The style a box is laid out and painted with when its table collapses its
+    /// borders, for the tables and cells that have one.
+    ///
+    /// A collapsed border belongs to the edge between two cells rather than to
+    /// either of them: how wide it is is decided by both, and each of them draws
+    /// half. That is a used value with no property behind it, so it is carried as a
+    /// style of its own rather than read back out of the box tree.
+    collapsed: slotmap::SecondaryMap<BoxId, Arc<ComputedStyle>>,
 }
 
 /// A list item's marker, waiting for the item's first line.
@@ -240,6 +297,17 @@ struct ReplacedBox {
     at: usize,
     width: f32,
     height: f32,
+    /// An `inline-block`, already laid out, waiting to be told where its line put
+    /// it. A picture has nothing here: its content is the picture.
+    content: Option<Box<Fragment>>,
+    /// How far below its own top the box's baseline sits.
+    ///
+    /// An `inline-block` sits on the line by the baseline of its *last line*, which
+    /// is what makes two buttons of different heights read as one row of words
+    /// rather than two boxes hung from a shelf. A picture has no baseline of its
+    /// own and sits with its bottom edge on the line's, which is what this is when
+    /// it is the whole height.
+    baseline: f32,
 }
 
 /// The spacer identifiers for the two edges of the `index`th inline box.
@@ -255,6 +323,48 @@ fn trailing_spacer(index: usize) -> u64 {
 /// that it cannot collide with an inline box's two edges.
 fn replaced_spacer(index: usize) -> u64 {
     (1 << 62) | index as u64
+}
+
+/// The room the things in a paragraph that are not text take up.
+///
+/// Each inline box asks for two spacers, one at each edge, carrying the border
+/// and padding on that side; they reserve the room the text has to move over by,
+/// and where they land is where the box starts and ends — which the shaper is
+/// the only thing that knows, since it decided the lines. A replaced box asks
+/// for one, the width of the box itself.
+///
+/// The same list is used to measure a paragraph and to lay it out, because a
+/// measurement taken without them is a measurement of a different paragraph.
+fn inline_spacers(inlines: &[InlineBox], replaced: &[ReplacedBox]) -> Vec<Spacer> {
+    inlines
+        .iter()
+        .enumerate()
+        .flat_map(|(index, inline)| {
+            [
+                Spacer {
+                    id: leading_spacer(index),
+                    at: inline.first_span,
+                    width: inline.border.left + inline.padding.left,
+                    height: 0.0,
+                },
+                Spacer {
+                    id: trailing_spacer(index),
+                    at: inline.last_span,
+                    width: inline.border.right + inline.padding.right,
+                    height: 0.0,
+                },
+            ]
+        })
+        // The shaper puts a spacer's bottom edge on the baseline, so what is
+        // reserved is the part of the box *above* its own baseline; what hangs
+        // below is added to the line's descent when the line is levelled.
+        .chain(replaced.iter().enumerate().map(|(index, box_)| Spacer {
+            id: replaced_spacer(index),
+            at: box_.at,
+            width: box_.width,
+            height: box_.baseline,
+        }))
+        .collect()
 }
 
 /// The size a replaced box is drawn at.
@@ -391,21 +501,12 @@ fn set_container(fragment: &mut Fragment, container: Rect) {
     }
 }
 
-/// Put a fragment and everything inside it on one painting layer.
+/// Note that this box is positioned, and at what index.
 ///
-/// The whole subtree, because a positioned box takes its contents with it: text
-/// inside a box that paints above its neighbours paints above them too.
-fn mark_layer(fragment: &mut Fragment, layer: Layer) {
-    fragment.layer = layer;
-    for child in &mut fragment.children {
-        // A positioned descendant has a place of its own in the order and keeps it:
-        // an absolutely positioned box with a negative `z-index` inside a relative
-        // one still paints below the flow, not with its parent.
-        if child.layer.positioned {
-            continue;
-        }
-        mark_layer(child, layer);
-    }
+/// The box alone: where it lands in the painting order is a question about its
+/// ancestors as well as itself, and that is settled once the tree is built.
+fn mark_layer(fragment: &mut Fragment, index: i32) {
+    fragment.layer = Layer::positioned(index);
 }
 
 /// Mark a fragment and everything inside it as not moving with the page.
@@ -551,6 +652,136 @@ fn share_out(minimums: &[f32], maximums: &[f32], available: f32) -> Vec<f32> {
         .collect()
 }
 
+/// The resolved lines of a collapsed table's grid.
+///
+/// One down each side of every column, one along the top and bottom of every row
+/// — the width and colour that won the contest on each, which is what is actually
+/// drawn.
+struct TableLines {
+    /// One per square down each side, row-major: `(columns + 1)` per row.
+    vertical: Vec<otlyra_css::Border>,
+    /// One per square along the top and bottom, row-major: `columns` per band.
+    horizontal: Vec<otlyra_css::Border>,
+    columns: usize,
+    rows: usize,
+}
+
+/// One drawn line of a collapsed table's grid, as a fragment of its own.
+///
+/// A rectangle with the line's colour behind it and no border of its own: what is
+/// drawn is a line, and a line with a border on it would be two.
+fn line_fragment(border: otlyra_css::Border, rect: Rect) -> Option<Fragment> {
+    if !border.is_visible() || rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    // Snapped to whole pixels. A collapsed line is centred on the boundary between
+    // two cells, and a boundary lands wherever the columns put it — so a line one
+    // pixel wide falls across two of them and is drawn as two grey ones rather than
+    // one black one. Every engine snaps these, and a table of hairlines is where it
+    // shows.
+    let snap = |from: f32, size: f32| {
+        let start = from.round();
+        (start, (from + size).round() - start)
+    };
+    let (x, width) = snap(rect.x, rect.width);
+    let (y, height) = snap(rect.y, rect.height);
+    let rect = Rect::new(x, y, width.max(1.0), height.max(1.0));
+    let style = ComputedStyle {
+        background_color: border.color,
+        border: Sides::all(otlyra_css::Border::NONE),
+        ..ComputedStyle::default()
+    };
+    Some(Fragment {
+        used: None,
+        box_id: None,
+        rect,
+        kind: FragmentKind::Box,
+        style: Arc::new(style),
+        fixed: false,
+        scroll_port: None,
+        clip: None,
+        sticky: None,
+        layer: Layer::default(),
+        children: Vec::new(),
+    })
+}
+
+/// How far below a box's top its last baseline sits, if it has one.
+///
+/// The last line of text in it, wherever that is: a box whose last child is a
+/// paragraph sits on that paragraph's last line, which is what `inline-block`
+/// alignment is defined as. `None` when there is no text in it at all.
+fn baseline_of(fragment: &Fragment) -> Option<f32> {
+    let mut last = None;
+    let mut stack = vec![(fragment, 0.0f32)];
+    while let Some((current, _)) = stack.pop() {
+        if let FragmentKind::Text(run) = &current.kind
+            && let Some(glyph) = run.glyphs.first()
+        {
+            let at = current.rect.y + glyph.y - fragment.rect.y;
+            last = Some(last.map_or(at, |previous: f32| previous.max(at)));
+        }
+        for child in &current.children {
+            stack.push((child, 0.0));
+        }
+    }
+    last
+}
+
+/// Which question was asked of a box's contents, so that two of them cannot be
+/// mistaken for one another in the answers already worked out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum Wanted {
+    /// How wide it would be if nothing wrapped.
+    Widest,
+    /// How narrow it can be without spilling.
+    Narrowest,
+    /// The same, ignoring a width it declared — which is a flex item's automatic
+    /// minimum size and a different number.
+    NarrowestOfContent,
+}
+
+/// A table cell, and where in the grid it landed.
+///
+/// Which column a cell is in is not which child of its row it is: a cell reaching
+/// down from an earlier row holds a place in this one, and the cells beside it
+/// start after it.
+struct Cell {
+    id: BoxId,
+    column: usize,
+    columns: usize,
+    /// Rows, resolved: never zero and never past the last row of the table.
+    rows: usize,
+}
+
+/// Raise `values` until they add up to `wanted`, keeping their proportions.
+///
+/// What a cell reaching across several of them asks: not that any one is that
+/// wide or that tall, but that between them they cover it. What they cannot cover
+/// is shared out in proportion to what each already holds, so a column that was
+/// wider stays the wider of the two — and evenly when none of them holds anything,
+/// which is the only sensible reading of a proportion of nothing.
+fn spread(values: &mut [f32], wanted: f32) {
+    if values.is_empty() {
+        return;
+    }
+    let have: f32 = values.iter().sum();
+    let excess = wanted - have;
+    if excess <= 0.0 {
+        return;
+    }
+    if have > 0.0 {
+        for value in values.iter_mut() {
+            *value += excess * *value / have;
+        }
+    } else {
+        let share = excess / values.len() as f32;
+        for value in values.iter_mut() {
+            *value += share;
+        }
+    }
+}
+
 fn any_side(sides: Sides<f32>) -> bool {
     sides.top > 0.0 || sides.right > 0.0 || sides.bottom > 0.0 || sides.left > 0.0
 }
@@ -669,13 +900,7 @@ impl<'a> Flow<'a> {
             if style.position == otlyra_css::Position::Relative {
                 let (dx, dy) = relative_offset(&style, width);
                 offset(&mut fragment, dx, dy);
-                mark_layer(
-                    &mut fragment,
-                    Layer {
-                        index: style.z_index.unwrap_or(0),
-                        positioned: true,
-                    },
-                );
+                mark_layer(&mut fragment, style.z_index.unwrap_or(0));
             }
 
             let bottom = if index == last && bottom_open {
@@ -787,7 +1012,14 @@ impl<'a> Flow<'a> {
         // The width: what it asks for, what its two insets leave between them, or
         // what its content wants.
         let width = match (style.width.resolve(area.width), left, right) {
-            (Some(width), _, _) => width,
+            // `width` is the *content* box, and what is laid out is the border box:
+            // a positioned box with padding on it is that much wider than the number
+            // it was given, exactly as one in the flow is.
+            (Some(width), _, _) => {
+                let padding = resolve_padding(&style, area.width);
+                let border = resolve_border(&style);
+                width + padding.left + padding.right + border.left + border.right
+            }
             (None, Some(left), Some(right)) => (area.width - left - right).max(0.0),
             _ => self
                 .max_content_width(id, area.width)
@@ -818,13 +1050,7 @@ impl<'a> Flow<'a> {
         if style.position == otlyra_css::Position::Fixed {
             mark_fixed(&mut fragment);
         }
-        mark_layer(
-            &mut fragment,
-            Layer {
-                index: style.z_index.unwrap_or(0),
-                positioned: true,
-            },
-        );
+        mark_layer(&mut fragment, style.z_index.unwrap_or(0));
         fragment
     }
 
@@ -849,14 +1075,19 @@ impl<'a> Flow<'a> {
         let content_y = y + border.top + padding.top;
         let mut children = Vec::new();
         self.table_width = None;
+        // What the box's own contents resolve a percentage height against: its
+        // height, when it has one to give.
+        let outer_height = self.containing_height;
+        self.containing_height = self.inner_height(&style, padding);
         let content_height =
             self.layout_inside(id, content_width, content_x, content_y, &mut children);
+        self.containing_height = outer_height;
         // A box laid out at a width the caller chose keeps it, table or not — a
         // flex item is as wide as its line gave it. Taken rather than left, so a
         // table inside one does not report its width to the block outside.
         self.table_width = None;
         let content_height = clamp(
-            style.height.resolve(width).unwrap_or(content_height),
+            self.asked_height(&style).unwrap_or(content_height),
             style.min_height,
             style.max_height,
             width,
@@ -1050,7 +1281,8 @@ impl<'a> Flow<'a> {
     /// One block-level box: margins, borders, padding, a width, and whatever it
     /// contains.
     fn layout_block(&mut self, id: BoxId, containing_width: f32, x: f32, y: f32) -> Fragment {
-        let style = Arc::clone(&self.tree.node(id).style);
+        self.ensure_collapsed(id);
+        let style = self.style_of(id);
         // A box that cuts its contents off is a formatting context of its own: the
         // floats outside it do not shorten the lines inside it, and its own do not
         // reach out. This is the rule `overflow: hidden` is best known for.
@@ -1088,8 +1320,13 @@ impl<'a> Flow<'a> {
 
         let mut children = Vec::new();
         self.table_width = None;
+        // What this box's contents resolve a percentage height against: its own
+        // height, when it has one to give them.
+        let outer_height = self.containing_height;
+        self.containing_height = self.inner_height(&style, padding);
         let content_height =
             self.layout_inside(id, content_width, content_x, content_y, &mut children);
+        self.containing_height = outer_height;
         // A table with no width of its own is only as wide as its columns turned
         // out to need. One that names a width keeps it, and its columns were
         // stretched to fill it instead.
@@ -1099,10 +1336,7 @@ impl<'a> Flow<'a> {
             None => shrunk.unwrap_or(content_width),
         };
         let content_height = clamp(
-            style
-                .height
-                .resolve(containing_width)
-                .unwrap_or(content_height),
+            self.asked_height(&style).unwrap_or(content_height),
             style.min_height,
             style.max_height,
             containing_width,
@@ -1201,27 +1435,24 @@ impl<'a> Flow<'a> {
         out: &mut Vec<Fragment>,
     ) -> Option<f32> {
         let style = Arc::clone(&self.tree.node(parent).style);
-        let (spacing_x, spacing_y) = style.border_spacing;
+        // Collapsed, the cells meet on a line rather than sitting apart on their
+        // own edges, and `border-spacing` says nothing at all.
+        let (spacing_x, spacing_y) = match style.border_collapse {
+            otlyra_css::BorderCollapse::Collapse => (0.0, 0.0),
+            otlyra_css::BorderCollapse::Separate => style.border_spacing,
+        };
 
         let mut captions = Vec::new();
         let mut rows: Vec<BoxId> = Vec::new();
         self.collect_rows(parent, &mut captions, &mut rows);
-        let cells: Vec<Vec<BoxId>> = rows
-            .iter()
-            .map(|&row| {
-                self.tree
-                    .node(row)
-                    .children
-                    .iter()
-                    .copied()
-                    .filter(|&cell| {
-                        self.tree.node(cell).style.display == otlyra_css::Display::TableCell
-                    })
-                    .collect()
-            })
-            .collect();
+        let cells = self.place_cells(&rows);
 
-        let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+        let columns = cells
+            .iter()
+            .flatten()
+            .map(|cell| cell.column + cell.columns)
+            .max()
+            .unwrap_or(0);
         if columns == 0 {
             return None;
         }
@@ -1232,11 +1463,40 @@ impl<'a> Flow<'a> {
 
         let mut minimums = vec![0.0f32; columns];
         let mut maximums = vec![0.0f32; columns];
-        for row in &cells {
-            for (column, &cell) in row.iter().enumerate() {
-                minimums[column] =
-                    minimums[column].max(self.min_content_width(cell, available, false));
-                maximums[column] = maximums[column].max(self.max_content_width(cell, available));
+        for cell in cells.iter().flatten().filter(|cell| cell.columns == 1) {
+            let column = cell.column;
+            minimums[column] =
+                minimums[column].max(self.min_content_width(cell.id, available, false));
+            maximums[column] = maximums[column].max(self.max_content_width(cell.id, available));
+        }
+
+        // A cell across several columns asks nothing of any one of them: it asks
+        // that they add up, and only what they cannot cover between them is shared
+        // out. The narrower spans go first, so a wide one sees what the spans
+        // inside it have already asked for.
+        let mut spanning: Vec<&Cell> = cells
+            .iter()
+            .flatten()
+            .filter(|cell| cell.columns > 1)
+            .collect();
+        spanning.sort_by_key(|cell| cell.columns);
+        let spanning: Vec<(std::ops::Range<usize>, f32, f32)> = spanning
+            .iter()
+            .map(|cell| {
+                let covered = cell.column..cell.column + cell.columns;
+                let between = spacing_x * (cell.columns - 1) as f32;
+                (
+                    covered,
+                    self.min_content_width(cell.id, available, false) - between,
+                    self.max_content_width(cell.id, available) - between,
+                )
+            })
+            .collect();
+        for (covered, wanted_min, wanted_max) in spanning {
+            spread(&mut minimums[covered.clone()], wanted_min);
+            spread(&mut maximums[covered.clone()], wanted_max);
+            for column in covered {
+                maximums[column] = maximums[column].max(minimums[column]);
             }
         }
 
@@ -1253,6 +1513,27 @@ impl<'a> Flow<'a> {
                 }
             }
         }
+        // A caption cannot be narrower than its longest word, and the table cannot
+        // be narrower than its caption: a two-letter table under a one-word caption
+        // is as wide as the word, with its columns stretched to fill. The floor is
+        // on the table's border box, so its own edges come off it first.
+        let frame = {
+            let style = self.style_of(parent);
+            style.border.left.width + style.border.right.width
+        };
+        let caption_floor = captions
+            .iter()
+            .map(|&caption| self.min_content_width(caption, available, false))
+            .fold(0.0f32, f32::max)
+            - frame;
+        let taken: f32 = widths.iter().sum();
+        if taken > 0.0 && caption_floor - gaps > taken {
+            let scale = (caption_floor - gaps) / taken;
+            for column in &mut widths {
+                *column *= scale;
+            }
+        }
+
         let table_width = widths.iter().sum::<f32>() + gaps;
 
         let mut cursor = y;
@@ -1266,30 +1547,82 @@ impl<'a> Flow<'a> {
             fragments.push(fragment);
         }
 
-        for (index, row) in rows.iter().enumerate() {
-            cursor += spacing_y;
-            let row_style = Arc::clone(&self.tree.node(*row).style);
-            let mut placed = Vec::new();
-            let mut column_x = x + spacing_x;
-            let mut height = 0.0f32;
+        // Where each column starts.
+        let mut offsets = Vec::with_capacity(columns);
+        let mut at = x + spacing_x;
+        for column in &widths {
+            offsets.push(at);
+            at += column + spacing_x;
+        }
 
-            for (column, &cell) in cells[index].iter().enumerate() {
-                let fragment = self.layout_block(cell, widths[column], column_x, cursor);
-                height = height.max(fragment.rect.height);
-                column_x += widths[column] + spacing_x;
-                placed.push(fragment);
+        // The cells are laid out before the rows have anywhere to be: how tall a
+        // row is depends on what is in it, and a cell reaching into the rows below
+        // depends on all of them. So they are laid out at the top and moved down
+        // once the bands are known.
+        let mut placed: Vec<Vec<Fragment>> = Vec::with_capacity(rows.len());
+        for row in &cells {
+            let mut laid = Vec::with_capacity(row.len());
+            for cell in row {
+                let covered = cell.column..cell.column + cell.columns;
+                let cell_width =
+                    widths[covered].iter().sum::<f32>() + spacing_x * (cell.columns - 1) as f32;
+                laid.push(self.layout_block(cell.id, cell_width, offsets[cell.column], 0.0));
             }
+            placed.push(laid);
+        }
 
-            // Every cell is as tall as the tallest of them: a row is one band, and
-            // a cell that stopped short would leave a hole in its background.
-            for fragment in &mut placed {
-                fragment.rect.height = height;
+        // A row is as tall as the tallest cell that ends in it; a cell reaching
+        // further down asks only that the rows it covers add up, the way a cell
+        // across several columns asks it of them.
+        let mut heights = vec![0.0f32; rows.len()];
+        let mut reaching: Vec<(std::ops::Range<usize>, f32)> = Vec::new();
+        for (index, row) in cells.iter().enumerate() {
+            for (cell, fragment) in row.iter().zip(&placed[index]) {
+                if cell.rows == 1 {
+                    heights[index] = heights[index].max(fragment.rect.height);
+                } else {
+                    reaching.push((
+                        index..index + cell.rows,
+                        fragment.rect.height - spacing_y * (cell.rows - 1) as f32,
+                    ));
+                }
+            }
+        }
+        reaching.sort_by_key(|(covered, _)| covered.len());
+        for (covered, wanted) in reaching {
+            spread(&mut heights[covered], wanted);
+        }
+
+        let mut tops = Vec::with_capacity(rows.len());
+        for height in &heights {
+            cursor += spacing_y;
+            tops.push(cursor);
+            cursor += height;
+        }
+        cursor += spacing_y;
+
+        for (index, row) in rows.iter().enumerate() {
+            let row_style = self.style_of(*row);
+            let mut laid = std::mem::take(&mut placed[index]);
+
+            for (cell, fragment) in cells[index].iter().zip(&mut laid) {
+                offset(fragment, 0.0, tops[index]);
+                // Every cell fills the band it covers: one that stopped short
+                // would leave a hole in its own background.
+                let covered = index..index + cell.rows;
+                fragment.rect.height =
+                    heights[covered].iter().sum::<f32>() + spacing_y * (cell.rows - 1) as f32;
             }
 
             fragments.push(Fragment {
                 used: None,
                 box_id: Some(*row),
-                rect: Rect::new(x + spacing_x, cursor, table_width - spacing_x * 2.0, height),
+                rect: Rect::new(
+                    x + spacing_x,
+                    tops[index],
+                    table_width - spacing_x * 2.0,
+                    heights[index],
+                ),
                 kind: FragmentKind::Box,
                 style: row_style,
                 fixed: false,
@@ -1297,15 +1630,439 @@ impl<'a> Flow<'a> {
                 clip: None,
                 sticky: None,
                 layer: Layer::default(),
-                children: placed,
+                children: laid,
             });
-            cursor += height;
         }
-        cursor += spacing_y;
+
+        // The grid, drawn once and last: a collapsed border is the edge between two
+        // cells rather than either cell's own, and the cells left room for it
+        // without drawing it.
+        fragments.extend(self.collapsed_grid(parent, &widths, &tops, &heights, &cells, x));
 
         out.extend(fragments);
         self.table_width = Some(table_width);
         Some(cursor - y)
+    }
+
+    /// The height a box asks for, if it asks for one that means anything here.
+    ///
+    /// A length is itself. A percentage is of the containing block's height, which
+    /// most blocks on the web do not have — they are as tall as what is in them —
+    /// and against one of those CSS says the percentage is `auto`. Resolving it
+    /// against the width instead, which is what the same call does for every
+    /// horizontal property, makes a box as tall as its parent is wide.
+    fn asked_height(&self, style: &ComputedStyle) -> Option<f32> {
+        let declared = match style.height {
+            LengthOrAuto::Px(px) => Some(px),
+            LengthOrAuto::Percent(fraction) => {
+                self.containing_height.map(|height| fraction * height)
+            }
+            LengthOrAuto::Auto => None,
+        }?;
+
+        // Whatever the number was measured across, what layout wants is the content
+        // box. A percentage is of the containing block's *content* height, so the
+        // subtraction is the same either way.
+        let padding = resolve_padding(style, 0.0);
+        Some(content_height_from(
+            declared,
+            style,
+            padding,
+            resolve_border(style),
+        ))
+    }
+
+    /// The height to resolve the percentages *inside* a box against.
+    ///
+    /// Its own, when it has one; otherwise nothing, because a box that is as tall
+    /// as its contents cannot answer a question its contents are asking.
+    fn inner_height(&self, style: &ComputedStyle, padding: Sides<f32>) -> Option<f32> {
+        self.asked_height(style)
+            .map(|height| (height - padding.top - padding.bottom).max(0.0))
+    }
+
+    /// The style a box is laid out with: the one it computed, or the one its table
+    /// gave it when it collapsed its borders.
+    fn style_of(&self, id: BoxId) -> Arc<ComputedStyle> {
+        match self.collapsed.get(id) {
+            Some(style) => Arc::clone(style),
+            None => Arc::clone(&self.tree.node(id).style),
+        }
+    }
+
+    /// Settle a collapsed table's borders before anything reads them, once.
+    ///
+    /// A table's own edge is one of the borders in the contest, so its box cannot
+    /// be measured or placed until the contest has been held — which is why this
+    /// sits at the front of everything that asks a table how wide it is.
+    fn ensure_collapsed(&mut self, id: BoxId) {
+        let style = &self.tree.node(id).style;
+        if style.display == otlyra_css::Display::Table
+            && style.border_collapse == otlyra_css::BorderCollapse::Collapse
+            && !self.collapsed.contains_key(id)
+        {
+            self.collapse_borders(id);
+        }
+    }
+
+    /// Work out a collapsed table's borders: which line is drawn on every edge of
+    /// the grid, and how much room each cell has to leave for the ones it meets.
+    ///
+    /// With `border-collapse: collapse` a border is no longer a property of a box.
+    /// It belongs to the edge between two cells: how wide it is, and what colour,
+    /// is settled between the two of them — the wider wins, with the row's and the
+    /// table's own edges in the running at the ends — and the line is then drawn
+    /// once, by the table. Each of the two cells leaves half of it, so the two
+    /// halves meet on the edge and add up to its width.
+    ///
+    /// Edge by edge rather than line by line: the boundary under one cell may be
+    /// three pixels of one colour and one pixel of another under the cell beside
+    /// it, and a table drawn a line at a time paints the loudest of them the whole
+    /// way across. What a cell leaves room for is the widest edge along that side
+    /// of it, so a line never needs more room than the cells gave it.
+    ///
+    /// The width is the whole of the contest here. CSS breaks a tie by border
+    /// style and then by who owns the edge; ties are left to the first of the two,
+    /// and `<col>`, which is one of the owners, generates no box for us to ask.
+    fn collapse_borders(&mut self, table: BoxId) {
+        let mut captions = Vec::new();
+        let mut rows: Vec<BoxId> = Vec::new();
+        self.collect_rows(table, &mut captions, &mut rows);
+        let cells = self.place_cells(&rows);
+        let columns = cells
+            .iter()
+            .flatten()
+            .map(|cell| cell.column + cell.columns)
+            .max()
+            .unwrap_or(0);
+        if columns == 0 || rows.is_empty() {
+            return;
+        }
+
+        // Which cell holds each square of the grid, so that the two boxes meeting
+        // on an edge can be asked what they wanted of it.
+        let mut owner: Vec<Option<BoxId>> = vec![None; rows.len() * columns];
+        for (index, row) in cells.iter().enumerate() {
+            for cell in row {
+                for band in index..index + cell.rows {
+                    for column in cell.column..cell.column + cell.columns {
+                        owner[band * columns + column] = Some(cell.id);
+                    }
+                }
+            }
+        }
+
+        let own = Arc::clone(&self.tree.node(table).style);
+        let widest = |line: &mut otlyra_css::Border, edge: otlyra_css::Border| {
+            if edge.width > line.width {
+                *line = edge;
+            }
+        };
+        let border_of = |id: Option<BoxId>| id.map(|id| &self.tree.node(id).style.border);
+
+        // Every edge of the grid: one down each side of every square, one along the
+        // top and bottom of each.
+        let mut vertical = vec![otlyra_css::Border::NONE; (columns + 1) * rows.len()];
+        let mut horizontal = vec![otlyra_css::Border::NONE; columns * (rows.len() + 1)];
+
+        for band in 0..rows.len() {
+            let row_style = Arc::clone(&self.tree.node(rows[band]).style);
+            for column in 0..=columns {
+                let edge = &mut vertical[band * (columns + 1) + column];
+                if column > 0
+                    && let Some(border) = border_of(owner[band * columns + column - 1])
+                {
+                    widest(edge, border.right);
+                }
+                if column < columns
+                    && let Some(border) = border_of(owner[band * columns + column])
+                {
+                    widest(edge, border.left);
+                }
+                if column == 0 {
+                    widest(edge, row_style.border.left);
+                    widest(edge, own.border.left);
+                }
+                if column == columns {
+                    widest(edge, row_style.border.right);
+                    widest(edge, own.border.right);
+                }
+            }
+        }
+
+        for band in 0..=rows.len() {
+            for column in 0..columns {
+                let edge = &mut horizontal[band * columns + column];
+                if band > 0 {
+                    if let Some(border) = border_of(owner[(band - 1) * columns + column]) {
+                        widest(edge, border.bottom);
+                    }
+                    widest(edge, self.tree.node(rows[band - 1]).style.border.bottom);
+                }
+                if band < rows.len() {
+                    if let Some(border) = border_of(owner[band * columns + column]) {
+                        widest(edge, border.top);
+                    }
+                    widest(edge, self.tree.node(rows[band]).style.border.top);
+                }
+                if band == 0 {
+                    widest(edge, own.border.top);
+                }
+                if band == rows.len() {
+                    widest(edge, own.border.bottom);
+                }
+            }
+        }
+
+        // What a box leaves room for on one of its sides: half of the widest edge
+        // along it, which is what makes the halves on either side of every edge add
+        // up to the line drawn on it.
+        let widest_vertical = |column: usize, bands: std::ops::Range<usize>| -> f32 {
+            bands
+                .map(|band| vertical[band * (columns + 1) + column].width)
+                .fold(0.0, f32::max)
+                / 2.0
+        };
+        let widest_horizontal = |band: usize, span: std::ops::Range<usize>| -> f32 {
+            span.map(|column| horizontal[band * columns + column].width)
+                .fold(0.0, f32::max)
+                / 2.0
+        };
+        let room = |width: f32| otlyra_css::Border {
+            width,
+            // The line is drawn by the table, once. What is left on a box is the
+            // room for it and nothing to see.
+            color: otlyra_gfx::peniko::Color::TRANSPARENT,
+        };
+
+        for (index, row) in cells.iter().enumerate() {
+            for cell in row {
+                let bands = index..index + cell.rows;
+                let span = cell.column..cell.column + cell.columns;
+                let mut style = (*self.tree.node(cell.id).style).clone();
+                style.border = Sides {
+                    top: room(widest_horizontal(index, span.clone())),
+                    right: room(widest_vertical(cell.column + cell.columns, bands.clone())),
+                    bottom: room(widest_horizontal(index + cell.rows, span)),
+                    left: room(widest_vertical(cell.column, bands)),
+                };
+                self.collapsed.insert(cell.id, Arc::new(style));
+            }
+        }
+
+        let mut style = (*own).clone();
+        style.border = Sides {
+            top: room(widest_horizontal(0, 0..columns)),
+            right: room(widest_vertical(columns, 0..rows.len())),
+            bottom: room(widest_horizontal(rows.len(), 0..columns)),
+            left: room(widest_vertical(0, 0..rows.len())),
+        };
+        self.collapsed.insert(table, Arc::new(style));
+
+        // A row's own border went into the edges above and below it and is drawn
+        // there; drawn again on the row it would be drawn twice.
+        for &row in &rows {
+            let mut style = (*self.tree.node(row).style).clone();
+            style.border = Sides::all(otlyra_css::Border::NONE);
+            self.collapsed.insert(row, Arc::new(style));
+        }
+
+        self.collapsed_lines.insert(
+            table,
+            TableLines {
+                vertical,
+                horizontal,
+                columns,
+                rows: rows.len(),
+            },
+        );
+    }
+
+    /// The lines of a collapsed table, as fragments the table draws itself.
+    ///
+    /// Edge by edge, because a cell that reaches across a boundary is not divided
+    /// by it — the line inside a `colspan` is not drawn, and neither is the one
+    /// inside a `rowspan` — and because two edges of one boundary may have been
+    /// won by different borders. Neighbouring edges that agree become one
+    /// rectangle, so an ordinary table is a handful of fragments rather than one
+    /// per cell edge.
+    ///
+    /// Each line is centred on the boundary, which is where the cells left half of
+    /// it on either side; the ends reach half of the crossing line, so the corners
+    /// are filled rather than notched.
+    fn collapsed_grid(
+        &self,
+        table: BoxId,
+        widths: &[f32],
+        tops: &[f32],
+        heights: &[f32],
+        cells: &[Vec<Cell>],
+        x: f32,
+    ) -> Vec<Fragment> {
+        let Some(lines) = self.collapsed_lines.get(table) else {
+            return Vec::new();
+        };
+        let (columns, rows) = (lines.columns, lines.rows);
+        if rows == 0 || widths.len() < columns || heights.len() < rows {
+            return Vec::new();
+        }
+
+        // Which boundaries a cell reaches across, and so which are not drawn.
+        let mut crossed_vertical = vec![false; (columns + 1) * rows];
+        let mut crossed_horizontal = vec![false; columns * (rows + 1)];
+        for (index, row) in cells.iter().enumerate() {
+            for cell in row {
+                for column in cell.column + 1..cell.column + cell.columns {
+                    for band in index..index + cell.rows {
+                        crossed_vertical[band * (columns + 1) + column] = true;
+                    }
+                }
+                for band in index + 1..index + cell.rows {
+                    for column in cell.column..cell.column + cell.columns {
+                        crossed_horizontal[band * columns + column] = true;
+                    }
+                }
+            }
+        }
+
+        // Where each boundary sits: the cells tile without gaps, so a column
+        // boundary is where the previous column ended.
+        let mut down = Vec::with_capacity(columns + 1);
+        let mut at = x;
+        for width in widths.iter().take(columns) {
+            down.push(at);
+            at += width;
+        }
+        down.push(at);
+
+        let mut across: Vec<f32> = tops.iter().take(rows).copied().collect();
+        across.push(tops[rows - 1] + heights[rows - 1]);
+
+        // Half of the widest edge on a crossing boundary, which is how far a line
+        // reaches past the square it belongs to.
+        let vertical_reach = |band: usize| -> f32 {
+            (0..=columns)
+                .map(|column| lines.vertical[band.min(rows - 1) * (columns + 1) + column].width)
+                .fold(0.0, f32::max)
+                / 2.0
+        };
+        let horizontal_reach = |column: usize| -> f32 {
+            (0..=rows)
+                .map(|band| lines.horizontal[band * columns + column.min(columns - 1)].width)
+                .fold(0.0, f32::max)
+                / 2.0
+        };
+
+        let mut out = Vec::new();
+
+        for column in 0..=columns {
+            let mut band = 0;
+            while band < rows {
+                let edge = lines.vertical[band * (columns + 1) + column];
+                if crossed_vertical[band * (columns + 1) + column] || !edge.is_visible() {
+                    band += 1;
+                    continue;
+                }
+                let start = band;
+                while band < rows
+                    && !crossed_vertical[band * (columns + 1) + column]
+                    && lines.vertical[band * (columns + 1) + column] == edge
+                {
+                    band += 1;
+                }
+                let top = across[start] - horizontal_reach(column);
+                let bottom = across[band] + horizontal_reach(column);
+                out.extend(line_fragment(
+                    edge,
+                    Rect::new(
+                        down[column] - edge.width / 2.0,
+                        top,
+                        edge.width,
+                        bottom - top,
+                    ),
+                ));
+            }
+        }
+
+        for band in 0..=rows {
+            let mut column = 0;
+            while column < columns {
+                let edge = lines.horizontal[band * columns + column];
+                if crossed_horizontal[band * columns + column] || !edge.is_visible() {
+                    column += 1;
+                    continue;
+                }
+                let start = column;
+                while column < columns
+                    && !crossed_horizontal[band * columns + column]
+                    && lines.horizontal[band * columns + column] == edge
+                {
+                    column += 1;
+                }
+                let left = down[start] - vertical_reach(band);
+                let right = down[column] + vertical_reach(band);
+                out.extend(line_fragment(
+                    edge,
+                    Rect::new(
+                        left,
+                        across[band] - edge.width / 2.0,
+                        right - left,
+                        edge.width,
+                    ),
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// Put every cell somewhere in the table's grid, row by row.
+    ///
+    /// A cell goes in the first column its row has left, which is what makes a
+    /// cell reaching down from an earlier row push the ones beside it along: the
+    /// cells it covers are spoken for before this row is read. A `rowspan` of zero
+    /// is HTML's "the rest of them", which is only knowable here.
+    fn place_cells(&self, rows: &[BoxId]) -> Vec<Vec<Cell>> {
+        let mut taken: Vec<Vec<bool>> = vec![Vec::new(); rows.len()];
+        let mut placed = Vec::with_capacity(rows.len());
+
+        for (index, &row) in rows.iter().enumerate() {
+            let mut cells = Vec::new();
+            let mut column = 0;
+
+            for &id in &self.tree.node(row).children {
+                if self.tree.node(id).style.display != otlyra_css::Display::TableCell {
+                    continue;
+                }
+                while taken[index].get(column).copied().unwrap_or(false) {
+                    column += 1;
+                }
+
+                let span = self.tree.span(id);
+                let down = match span.rows {
+                    0 => rows.len() - index,
+                    wanted => wanted.min(rows.len() - index),
+                };
+                for band in &mut taken[index..index + down] {
+                    if band.len() < column + span.columns {
+                        band.resize(column + span.columns, false);
+                    }
+                    band[column..column + span.columns].fill(true);
+                }
+
+                cells.push(Cell {
+                    id,
+                    column,
+                    columns: span.columns,
+                    rows: down,
+                });
+                column += span.columns;
+            }
+
+            placed.push(cells);
+        }
+
+        placed
     }
 
     /// Walk a table's children for its captions and its rows, through whatever row
@@ -1662,9 +2419,8 @@ impl<'a> Flow<'a> {
         // A container with a height of its own has a definite cross size when it
         // is a row and a definite main size when it is a column: either way it is
         // the size the items are fitted into rather than one they add up to.
-        let definite_height = style
-            .height
-            .resolve(width)
+        let definite_height = self
+            .asked_height(&style)
             .map(|height| clamp(height, style.min_height, style.max_height, width));
         let inner = if row {
             width
@@ -1901,8 +2657,19 @@ impl<'a> Flow<'a> {
     /// line, not three equal columns. Measured by asking the shaper for the
     /// paragraph's own width and by walking blocks for the widest of them.
     fn max_content_width(&mut self, id: BoxId, containing_width: f32) -> f32 {
+        let key = (id, containing_width.to_bits(), Wanted::Widest);
+        if let Some(&answer) = self.measured.get(&key) {
+            return answer;
+        }
+        let answer = self.max_content_width_uncached(id, containing_width);
+        self.measured.insert(key, answer);
+        answer
+    }
+
+    fn max_content_width_uncached(&mut self, id: BoxId, containing_width: f32) -> f32 {
+        self.ensure_collapsed(id);
         let node = self.tree.node(id);
-        let style = Arc::clone(&node.style);
+        let style = self.style_of(id);
         let padding = resolve_padding(&style, containing_width);
         let border = resolve_border(&style);
         let extra = padding.left + padding.right + border.left + border.right;
@@ -1953,13 +2720,20 @@ impl<'a> Flow<'a> {
                     &mut inlines,
                     &mut replaced,
                 );
-                let text = if spans.is_empty() {
+                // Shaped with the spacers rather than measured without them and
+                // added on afterwards: the width of a run of text is not the sum
+                // of its pieces once something that is not text sits in it. A
+                // space between two pictures is trailing white space at the end
+                // of the *text* and no space at all at the end of the run, and a
+                // paragraph measured the other way came back narrower than the
+                // one line it holds — which put the second picture on a line of
+                // its own.
+                let spacers = inline_spacers(&inlines, &replaced);
+                if spans.is_empty() && spacers.is_empty() {
                     0.0
                 } else {
-                    self.text.shape_spans(&spans, &[], None).metrics.width
-                };
-                let pictures: f32 = replaced.iter().map(|box_| box_.width).sum();
-                text + pictures
+                    self.text.shape_spans(&spans, &spacers, None).metrics.width
+                }
             }
             _ => {
                 let children = node.children.clone();
@@ -1986,8 +2760,32 @@ impl<'a> Flow<'a> {
     /// declared, which is what a flex item's automatic minimum size is: a box that
     /// says `width: 300px` may still be shrunk, just not past its longest word.
     fn min_content_width(&mut self, id: BoxId, containing_width: f32, from_content: bool) -> f32 {
+        let key = (
+            id,
+            containing_width.to_bits(),
+            if from_content {
+                Wanted::NarrowestOfContent
+            } else {
+                Wanted::Narrowest
+            },
+        );
+        if let Some(&answer) = self.measured.get(&key) {
+            return answer;
+        }
+        let answer = self.min_content_width_uncached(id, containing_width, from_content);
+        self.measured.insert(key, answer);
+        answer
+    }
+
+    fn min_content_width_uncached(
+        &mut self,
+        id: BoxId,
+        containing_width: f32,
+        from_content: bool,
+    ) -> f32 {
+        self.ensure_collapsed(id);
         let node = self.tree.node(id);
-        let style = Arc::clone(&node.style);
+        let style = self.style_of(id);
         let padding = resolve_padding(&style, containing_width);
         let border = resolve_border(&style);
         let extra = padding.left + padding.right + border.left + border.right;
@@ -2056,7 +2854,7 @@ impl<'a> Flow<'a> {
                         .shape_spans(&spans, &[], wrap_at)
                         .lines
                         .iter()
-                        .map(|line| line.width)
+                        .map(|line| line.width - line.trailing_space)
                         .fold(0.0, f32::max)
                 };
                 let pictures = replaced.iter().map(|box_| box_.width).fold(0.0, f32::max);
@@ -2106,7 +2904,7 @@ impl<'a> Flow<'a> {
         // that overflows the size it asked for is what CSS says happens. Without
         // one, the container's figure is a floor rather than the answer: it is
         // where `stretch` put it, and content taller than that still fits.
-        let outer_height = match style.height.resolve(width) {
+        let outer_height = match self.asked_height(&style) {
             Some(_) => height,
             None => height
                 .max(content_height + padding.top + padding.bottom + border.top + border.bottom),
@@ -2133,6 +2931,9 @@ impl<'a> Flow<'a> {
 
     /// An inline formatting context: everything inside becomes one paragraph, and
     /// the paragraph becomes line boxes.
+    ///
+    /// See [`Layout::inline_spacers`] for the room the things that are not text
+    /// take in it.
     ///
     /// The whole context is shaped in one pass rather than element by element,
     /// because a line break belongs to the paragraph: `<b>bold</b> text` has to
@@ -2172,37 +2973,7 @@ impl<'a> Flow<'a> {
             offset += span.text.len();
         }
 
-        // Each inline box asks for two spacers: one at each edge, carrying the
-        // border and padding on that side. They reserve the room the text has to
-        // move over by, and where they land is where the box starts and ends —
-        // which the shaper is the only thing that knows, since it decided the
-        // lines.
-        let spacers: Vec<Spacer> = inlines
-            .iter()
-            .enumerate()
-            .flat_map(|(index, inline)| {
-                [
-                    Spacer {
-                        id: leading_spacer(index),
-                        at: inline.first_span,
-                        width: inline.border.left + inline.padding.left,
-                        height: 0.0,
-                    },
-                    Spacer {
-                        id: trailing_spacer(index),
-                        at: inline.last_span,
-                        width: inline.border.right + inline.padding.right,
-                        height: 0.0,
-                    },
-                ]
-            })
-            .chain(replaced.iter().enumerate().map(|(index, box_)| Spacer {
-                id: replaced_spacer(index),
-                at: box_.at,
-                width: box_.width,
-                height: box_.height,
-            }))
-            .collect();
+        let spacers = inline_spacers(&inlines, &replaced);
 
         // Each line asks how much room the floats have left it at the height it
         // landed at, and where that room starts; the width goes to the shaper and
@@ -2213,7 +2984,7 @@ impl<'a> Flow<'a> {
         // line and lets it overflow, which is what the property asks for.
         let wraps = self.tree.node(parent).style.text_wrap != otlyra_css::TextWrap::NoWrap;
         let mut bands: Vec<(f32, f32)> = Vec::new();
-        let shaped = {
+        let mut shaped = {
             let floats = &self.floats;
             let mut collect_band = |index: usize, top: f32| {
                 let (from, to) = band_of(floats, y + top, 1.0, x, x + width);
@@ -2228,6 +2999,41 @@ impl<'a> Flow<'a> {
                 .shape_spans_wrapping(&spans, &spacers, &mut collect_band)
         };
         let style = Arc::clone(&self.tree.node(parent).style);
+
+        // The line boxes, put where CSS puts them: as far above each baseline as the
+        // paragraph reaches and as far below. The shaper centres the font inside the
+        // height it was given instead, which is the same thing for a line of plain
+        // text and is not for one holding a box taller than the words beside it.
+        let (above, below) = self.line_reach;
+        // Only where the shaper's own answer is wrong: it centres the font inside
+        // the height it was given, which is where CSS puts the baseline for a line
+        // of plain text and is not where it puts it for a line holding a box taller
+        // than the words beside it. So a paragraph with an inline block in it is
+        // rebuilt around its baselines and every other paragraph is left alone.
+        let has_inline_block = replaced.iter().any(|box_| box_.content.is_some());
+        if has_inline_block && above + below > 0.0 {
+            // A picture reaches above the baseline by its whole height — it sits
+            // with its bottom edge on it — and only on the line it is on. That is
+            // the one thing the paragraph's own reach does not cover, because
+            // folding it in would make every line of the paragraph as tall as the
+            // picture.
+            let mut stretched = vec![0.0f32; shaped.lines.len()];
+            for spacer in &shaped.spacers {
+                let picture = replaced.iter().enumerate().any(|(index, box_)| {
+                    replaced_spacer(index) == spacer.id && box_.content.is_none()
+                });
+                if picture && let Some(reach) = stretched.get_mut(spacer.line) {
+                    *reach = reach.max(spacer.height);
+                }
+            }
+
+            for (index, line) in shaped.lines.iter_mut().enumerate() {
+                let reach = above.max(stretched.get(index).copied().unwrap_or(0.0));
+                line.top = line.baseline - reach;
+                line.height = reach + below;
+                line.bottom = line.top + line.height;
+            }
+        }
 
         // parley measures line tops from the text origin, and the first line's top
         // can sit above it by the half-leading. The paragraph's box starts where its
@@ -2412,22 +3218,31 @@ impl<'a> Flow<'a> {
                 .collect();
             children.extend(runs);
 
-            // The pictures that landed on this line, where the shaper put them.
+            // The pictures and the inline blocks that landed on this line, where
+            // the shaper put them.
             children.extend(replaced.iter().enumerate().filter_map(|(number, box_)| {
                 let spacer = placed.get(&replaced_spacer(number))?;
                 if spacer.line != index {
                     return None;
                 }
+                let at = (line_x + spacer.x, y + spacer.y - paragraph_top);
+                // An inline block was laid out at the origin, contents and all, and
+                // is moved to where its line put it — everything inside it goes
+                // with it, which is what makes it one thing in the line. It sits on
+                // the line's baseline by its *own* last baseline, which is what
+                // makes two buttons of different heights read as a row of words.
+                if let Some(content) = box_.content.as_deref() {
+                    let mut fragment = content.clone();
+                    let top = y + line.baseline - paragraph_top - box_.baseline;
+                    let (dx, dy) = (at.0 - fragment.rect.x, top - fragment.rect.y);
+                    crate::flow::offset(&mut fragment, dx, dy);
+                    return Some(fragment);
+                }
                 let image = box_.image.clone()?;
                 Some(Fragment {
                     used: None,
                     box_id: Some(box_.id),
-                    rect: Rect::new(
-                        line_x + spacer.x,
-                        y + spacer.y - paragraph_top,
-                        spacer.width,
-                        spacer.height,
-                    ),
+                    rect: Rect::new(at.0, at.1, spacer.width, spacer.height),
                     kind: FragmentKind::Image(image),
                     style: Arc::clone(&box_.style),
                     fixed: false,
@@ -2582,8 +3397,16 @@ impl<'a> Flow<'a> {
         // every line of the paragraph as tall as itself, which for a picture beside
         // a sentence is far more wrong than the pixel it saves. The shaper reserves
         // the room for it within the line it is actually on.
-        let _ = replaced;
+        //
+        // An inline block *is* folded in, both ends of it: it is a box in the line
+        // like a tall word, sitting on its own last baseline, and CSS grows the
+        // line to hold it above and below rather than letting it hang out.
+        for box_ in replaced.iter().filter(|box_| box_.content.is_some()) {
+            above = above.max(box_.baseline);
+            below = below.max(box_.height - box_.baseline);
+        }
 
+        self.line_reach = (above, below + strut.leading);
         let height = above + below + strut.leading;
         if height.is_finite() && height > 0.0 {
             for span in spans {
@@ -2728,6 +3551,8 @@ impl<'a> Flow<'a> {
                         at: spans.len(),
                         width,
                         height,
+                        content: None,
+                        baseline: height,
                     });
                 }
                 BoxKind::Text(text) => {
@@ -2776,6 +3601,40 @@ impl<'a> Flow<'a> {
                     if let Some(slot) = slot {
                         inlines[slot].last_span = spans.len();
                     }
+                }
+                BoxKind::Block if node.style.display == otlyra_css::Display::InlineBlock => {
+                    // Laid out here and now, as the block container it is, at the
+                    // width it shrinks to: what the line has to make room for is
+                    // its finished size, and nothing about the line changes it.
+                    // Where it *goes* is the shaper's answer, so it is laid out at
+                    // the origin and moved once the line is broken.
+                    let style = Arc::clone(&node.style);
+                    let width = match style.width.resolve(containing_width) {
+                        Some(width) => {
+                            let padding = resolve_padding(&style, containing_width);
+                            let border = resolve_border(&style);
+                            width + padding.left + padding.right + border.left + border.right
+                        }
+                        None => self
+                            .max_content_width(child, containing_width)
+                            .min(containing_width),
+                    };
+                    let fragment = self.layout_sized(child, 0.0, 0.0, width);
+                    let height = fragment.rect.height;
+                    // Its own last baseline, or its bottom edge when it has no line
+                    // of text in it at all — which is what CSS says an empty one
+                    // and one that hides its overflow both sit on.
+                    let baseline = baseline_of(&fragment).unwrap_or(height);
+                    replaced.push(ReplacedBox {
+                        id: child,
+                        style,
+                        image: None,
+                        at: spans.len(),
+                        width: fragment.rect.width,
+                        height,
+                        content: Some(Box::new(fragment)),
+                        baseline,
+                    });
                 }
                 BoxKind::Block => {
                     // A block inside an inline context. Real CSS splits the inline
@@ -2834,6 +3693,37 @@ fn resolve_margin(style: &ComputedStyle, containing: f32) -> Sides<f32> {
 /// shared out between the ones that are — both of them for centring, one of them
 /// for pushing a box to an edge. With `width: auto` there is nothing left over by
 /// definition, and CSS makes an `auto` margin zero.
+/// The content width a declared `width` comes to.
+///
+/// `box-sizing: border-box` — which most of the web sets on everything before it
+/// writes a single width — measures the number across the border box, so the
+/// padding and the border come *out* of it rather than being added outside it. A
+/// box laid out the other way is that much wider than the page asked for, and a
+/// row of them is that much wider than the row.
+fn content_from(width: f32, style: &ComputedStyle, padding: Sides<f32>, border: Sides<f32>) -> f32 {
+    match style.box_sizing {
+        otlyra_css::BoxSizing::Content => width,
+        otlyra_css::BoxSizing::Border => {
+            (width - padding.left - padding.right - border.left - border.right).max(0.0)
+        }
+    }
+}
+
+/// The same down the block axis.
+fn content_height_from(
+    height: f32,
+    style: &ComputedStyle,
+    padding: Sides<f32>,
+    border: Sides<f32>,
+) -> f32 {
+    match style.box_sizing {
+        otlyra_css::BoxSizing::Content => height,
+        otlyra_css::BoxSizing::Border => {
+            (height - padding.top - padding.bottom - border.top - border.bottom).max(0.0)
+        }
+    }
+}
+
 fn resolve_horizontal(
     style: &ComputedStyle,
     containing: f32,
@@ -2848,7 +3738,12 @@ fn resolve_horizontal(
     // which is what makes `max-width` centre a column that `margin: 0 auto` would
     // otherwise leave full width.
     let width = match style.width.resolve(containing) {
-        Some(width) => Some(clamp(width, style.min_width, style.max_width, containing)),
+        Some(width) => Some(content_from(
+            clamp(width, style.min_width, style.max_width, containing),
+            style,
+            padding,
+            border,
+        )),
         None => {
             let available = (containing - margin.left - margin.right - extra).max(0.0);
             let constrained = clamp(available, style.min_width, style.max_width, containing);
@@ -2946,6 +3841,7 @@ mod tests {
                 height: 600.0,
                 scale: 1.0,
                 text_scale: 1.0,
+                color_scheme: Default::default(),
             },
         );
         let boxes = build_styled_box_tree(&document, &styles);
@@ -3424,11 +4320,12 @@ mod tests {
                 height: 600.0,
                 scale: 1.0,
                 text_scale: 1.0,
+                color_scheme: Default::default(),
             },
         );
-        let images: crate::Images = crate::image_sources(&document)
+        let images: crate::Images = crate::image_sources(&document, StyleViewport::default())
             .into_iter()
-            .map(|source| (source.node, image.clone()))
+            .map(|source| (source.node, crate::Picture::new(image.clone())))
             .collect();
         let boxes = crate::build_box_tree_with_images(&document, Some(&styles), &images);
         let mut text = otlyra_text::TextEngine::isolated();

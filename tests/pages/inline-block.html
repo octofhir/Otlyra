@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Inline blocks</title>
+<style>
+  body { margin: 8px; font: 14px/1.4 Times; }
+  .chip { display: inline-block; padding: 6px 10px; background: #eee; border: 1px solid #999; }
+  .tall { display: inline-block; width: 90px; height: 70px; padding: 6px; background: crimson; color: #fff; }
+  .short { display: inline-block; width: 90px; height: 30px; padding: 6px; background: navy; color: #fff; }
+  .sized { display: inline-block; width: 120px; background: #cfe; }
+</style>
+</head>
+<body>
+
+<h2>Sitting on one baseline</h2>
+<p><span class="tall">tall</span> <span class="short">short</span> <span class="chip">a chip</span> and words after them.</p>
+
+<h2>Shrinking to what is in it</h2>
+<p><span class="chip">one</span> <span class="chip">a longer one</span> <span class="chip">x</span></p>
+
+<h2>A width of its own, wrapping inside</h2>
+<p><span class="sized">a box with a width of its own, whose text wraps inside it</span> beside a sentence that keeps going past it.</p>
+
+<h2>In a line of text</h2>
+<p>before <span class="tall">between</span> after — and enough words to push the line over the edge of the page so that it has to break somewhere sensible.</p>
+
+</body>
+</html>

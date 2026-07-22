@@ -9,7 +9,9 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 encoding_rs.workspace = true
+percent-encoding.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 thiserror.workspace = true

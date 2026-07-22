@@ -169,15 +169,151 @@ pub struct Sticky {
 
 /// A place in the painting order.
 ///
-/// Ordered by `z-index` first and by whether the box is positioned second, so a
-/// positioned box with `z-index: auto` paints over its in-flow neighbours, and one
-/// with a negative `z-index` paints under them.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+/// `z-index` is not a number the whole page is sorted by. It orders a box against
+/// its *siblings* inside the nearest box that makes a stacking context, and that
+/// box is ordered against its own siblings in the same way — so a box with
+/// `z-index: 100` inside a `z-index: 1` box stays below everything the `1` is
+/// below, however large its own number is.
+///
+/// That is what the path here is: one step per context down from the page, and a
+/// last step for the box itself. Each step is *which level* — negative for a
+/// `z-index` below the flow, zero for the flow, above it for a positioned box —
+/// and *where in the document* the box was, which is what settles two boxes on the
+/// same level and is what keeps a box's contents between it and its next sibling.
+/// Comparing two paths is comparing them at the first step where they part.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layer {
-    /// `z-index`, with `auto` counting as zero.
+    /// `z-index`, with `auto` counting as zero. Meaningless unless positioned.
     pub index: i32,
-    /// Whether the box is positioned at all.
+    /// Whether the box is positioned at all, which is what lifts it off the flow's
+    /// level and makes a context of it.
     pub positioned: bool,
+    /// One step per level, outermost first.
+    ///
+    /// Filled in once the tree is built, because a box's place in the order is its
+    /// ancestors' places first — and a fragment is finished before the box holding
+    /// it is.
+    order: std::sync::Arc<[(i64, u32)]>,
+    /// Where this fragment starts in document order, and where its subtree ends.
+    ///
+    /// What a group needs and the order alone cannot say: `opacity` applies to an
+    /// element and its contents *once*, so painting has to know where the contents
+    /// stop. Two numbers rather than a second walk of the tree, and they answer the
+    /// only question asked of them — whether one fragment is inside another.
+    pub enter: u32,
+    /// One past the last fragment of this one's subtree.
+    pub exit: u32,
+}
+
+/// Two fragments are compared by where they sit in the order and by nothing else:
+/// the index and the flag are what the order was *computed* from.
+impl Ord for Layer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
+impl PartialOrd for Layer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Default for Layer {
+    /// The flow: the level everything unpositioned sits on.
+    fn default() -> Self {
+        Self::flow()
+    }
+}
+
+impl Layer {
+    /// Which level a box is on: the flow's, or however far a `z-index` moves it.
+    ///
+    /// One number, and the arithmetic is the ordering: a positioned box at index
+    /// zero sits above the flow, and a negative index sits below it.
+    fn level(index: i32, positioned: bool) -> i64 {
+        if positioned {
+            i64::from(index) * 2 + 1
+        } else {
+            0
+        }
+    }
+
+    /// The level in-flow content sits on, before the tree knows where it is.
+    pub fn flow() -> Self {
+        Self {
+            index: 0,
+            positioned: false,
+            order: std::sync::Arc::from(Vec::new()),
+            enter: 0,
+            exit: 0,
+        }
+    }
+
+    /// The level of a positioned box, before the tree knows where it sits.
+    pub fn positioned(index: i32) -> Self {
+        Self {
+            index,
+            positioned: true,
+            ..Self::flow()
+        }
+    }
+
+    /// Whether `other` is this fragment or inside it.
+    pub fn contains(&self, other: &Self) -> bool {
+        other.enter >= self.enter && other.enter < self.exit
+    }
+
+    /// This path with one more step on the end.
+    fn descend(&self, level: i64, at: u32) -> std::sync::Arc<[(i64, u32)]> {
+        let mut order = Vec::with_capacity(self.order.len() + 1);
+        order.extend_from_slice(&self.order);
+        order.push((level, at));
+        std::sync::Arc::from(order)
+    }
+}
+
+/// Where every fragment sits in the painting order, and where its subtree ends.
+///
+/// A box that makes a stacking context takes its contents with it: what is inside
+/// a box that paints above its neighbours paints above them too, and what is
+/// inside a box that is *not* one is ordered against that box's siblings directly.
+/// So the path is handed down and extended only where a context is made.
+pub(crate) fn assign_paint_order(fragment: &mut Fragment) {
+    let root = Layer::flow();
+    let mut next = 0;
+    assign(fragment, &root, &mut next);
+}
+
+fn assign(fragment: &mut Fragment, context: &Layer, next: &mut u32) {
+    let enter = *next;
+    *next += 1;
+
+    let positioned = fragment.layer.positioned;
+    let index = fragment.layer.index;
+    let own = Layer {
+        index,
+        positioned,
+        order: context.descend(Layer::level(index, positioned), enter),
+        enter,
+        exit: enter,
+    };
+
+    // A positioned box makes a context of its own. So does a half-transparent one —
+    // it is composited once, contents and all, and something inside it that painted
+    // somewhere else could not be part of that — and so does a transformed one, for
+    // the same reason: what is inside it is drawn in its space. Only a box; a line
+    // and a run of glyphs carry the style of the block they are in, and a context
+    // per line of a faded paragraph would be a context per line of it.
+    let grouped = matches!(fragment.kind, FragmentKind::Box)
+        && (fragment.style.opacity < 1.0 || !fragment.style.transform.is_empty());
+    let context = if positioned || grouped { &own } else { context };
+
+    for child in &mut fragment.children {
+        assign(child, context, next);
+    }
+
+    fragment.layer = Layer { exit: *next, ..own };
 }
 
 /// A box that cuts its contents off and has more of them than it can show.

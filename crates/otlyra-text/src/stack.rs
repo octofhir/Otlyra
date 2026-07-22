@@ -59,7 +59,7 @@ impl GenericFamily {
 }
 
 /// One entry in a font stack.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     /// A family named explicitly, matched case-insensitively against the collection.
     Named(String),
@@ -78,7 +78,7 @@ const STANDARD: GenericFamily = GenericFamily::Serif;
 /// This is the value of CSS `font-family`. It is always non-empty: a stack with no
 /// usable entry would leave the shaper with nothing to fall back to, so
 /// [`FontStack::new`] appends the standard font when the caller supplies no generic.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FontStack {
     families: Vec<Family>,
 }

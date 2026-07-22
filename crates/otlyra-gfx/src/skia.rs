@@ -934,6 +934,29 @@ impl PaintTarget for SkiaPainter {
         let canvas = self.canvas();
         canvas.save();
         canvas.concat(&to_skia_matrix(transform));
+        // The baseline lands on a whole device pixel. A line box may sit at a
+        // fraction of one — that is what keeps a page's rhythm right — but a
+        // baseline between two rows of pixels blurs every horizontal stem in the
+        // run, and a face is drawn to be read on a whole row. Across the line
+        // there is no row to land on, so nothing there is moved. Rounded here,
+        // where the scale is known: rounding in CSS pixels would snap to every
+        // second device pixel on a screen that has two of them per pixel.
+        let matrix = canvas.local_to_device_as_3x3();
+        let (scale, offset) = (matrix.scale_y(), matrix.translate_y());
+        let positions: Vec<sk::Point> = if scale.abs() > f32::EPSILON {
+            positions
+                .into_iter()
+                .map(|point| {
+                    sk::Point::new(
+                        point.x,
+                        ((point.y * scale + offset).round() - offset) / scale,
+                    )
+                })
+                .collect()
+        } else {
+            positions
+        };
+
         canvas.draw_glyphs_at(
             &ids,
             positions.as_slice(),
@@ -1037,11 +1060,93 @@ fn to_skia_sampling(quality: peniko::ImageQuality) -> sk::SamplingOptions {
     }
 }
 
+/// Whether the bytes are an SVG document.
+///
+/// By the markup rather than by what the server called it: a picture written into
+/// a page carries whatever type the page felt like writing, and the first tag is
+/// the thing that cannot be wrong. An XML declaration, a doctype or a comment may
+/// come first, so the whole of a short prefix is searched rather than the start.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    const PREFIX: usize = 1024;
+    let head = &bytes[..bytes.len().min(PREFIX)];
+    let head = String::from_utf8_lossy(head).to_ascii_lowercase();
+    head.contains("<svg")
+}
+
+/// Draw an SVG at the size it declares.
+///
+/// The size is the document's own — its `width` and `height`, or the extent of its
+/// `viewBox` — and a document that declares neither is drawn at a modest square,
+/// because something has to be picked and a picture nobody sized is an icon often
+/// enough.
+fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
+    /// What an SVG with no size of its own is drawn at.
+    const UNSIZED: f32 = 150.0;
+    /// As large as one will be drawn, so that a document declaring a page-sized
+    /// picture cannot ask for a surface measured in gigabytes.
+    const LARGEST: f32 = 4096.0;
+
+    let fonts = sk::FontMgr::new();
+    let dom = sk::svg::Dom::from_bytes(bytes, fonts).map_err(|_| SkiaError::ImageDecode)?;
+
+    let declared = dom.root().intrinsic_size();
+    let size = |value: f32| {
+        if value.is_finite() && value >= 1.0 {
+            value.min(LARGEST)
+        } else {
+            UNSIZED
+        }
+    };
+    let (width, height) = (size(declared.width), size(declared.height));
+
+    let mut surface = sk::surfaces::raster_n32_premul((width as i32, height as i32))
+        .ok_or(SkiaError::ImageDecode)?;
+    let mut dom = dom;
+    dom.set_container_size((width, height));
+    dom.render(surface.canvas());
+
+    let image = surface.image_snapshot();
+    let info = sk::ImageInfo::new(
+        (image.width(), image.height()),
+        sk::ColorType::RGBA8888,
+        sk::AlphaType::Premul,
+        None,
+    );
+    let row_bytes = image.width() as usize * 4;
+    let mut pixels = vec![0u8; row_bytes * image.height() as usize];
+    if !image.read_pixels(
+        &info,
+        &mut pixels,
+        row_bytes,
+        (0, 0),
+        sk::image::CachingHint::Allow,
+    ) {
+        return Err(SkiaError::ImageDecode);
+    }
+
+    Ok(peniko::ImageData {
+        data: peniko::Blob::new(std::sync::Arc::new(pixels)),
+        format: peniko::ImageFormat::Rgba8,
+        alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+        width: image.width() as u32,
+        height: image.height() as u32,
+    })
+}
+
 /// Decode an encoded image (PNG, JPEG, …) into pixels the display list can carry.
 ///
 /// Skia is already a dependency and already contains decoders, so this costs no new
 /// crate. When resource loading exists this moves out of the renderer.
 pub fn decode_image(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
+    // A vector picture is not decoded, it is *drawn*: there are no pixels in the
+    // file, only instructions for making some. Drawn at the size it says it is,
+    // which is what everything downstream reads as its intrinsic size — a rule
+    // that names a size of its own then scales these pixels, which is what a
+    // vector picture is for and is the one place it shows.
+    if looks_like_svg(bytes) {
+        return draw_svg(bytes);
+    }
+
     let data = sk::Data::new_copy(bytes);
     let image = sk::Image::from_encoded(data).ok_or(SkiaError::ImageDecode)?;
 
@@ -1371,6 +1476,28 @@ mod collection_tests {
 
 #[cfg(test)]
 mod variation_tests {
+    /// A vector picture is drawn rather than decoded, at the size it declares.
+    #[test]
+    fn an_svg_is_drawn_at_the_size_it_declares() {
+        use crate::decode_image;
+
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+             <rect width="40" height="20" fill="#ff0000"/></svg>"##;
+        let drawn = decode_image(svg).expect("a vector picture draws");
+        assert_eq!((drawn.width, drawn.height), (40, 20));
+
+        // And it is actually painted: the middle of it is the colour it asked for.
+        let at = ((10 * 40 + 20) * 4) as usize;
+        let pixel = &drawn.data.as_ref()[at..at + 3];
+        assert!(
+            pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60,
+            "the rectangle was drawn: {pixel:?}"
+        );
+
+        // Something that is not a picture at all is still refused.
+        assert!(decode_image(b"not a picture").is_err());
+    }
+
     use super::{SegmentMap, axis_segment_maps, unmap_axis};
 
     /// A font of one table: an `avar` with the given per-axis maps.

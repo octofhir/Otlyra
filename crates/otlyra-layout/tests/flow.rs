@@ -19,6 +19,7 @@ fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
             height: 600.0,
             scale: 1.0,
             text_scale: 1.0,
+            color_scheme: Default::default(),
         },
     );
     let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
@@ -430,6 +431,558 @@ fn a_table_sizes_its_columns_from_their_contents() {
         table.rect.width
     );
     assert!(table.rect.width > cells[0].rect.width + cells[1].rect.width);
+}
+
+/// Every cell of a table, in the order the markup writes them.
+fn cells_of(tree: &FragmentTree) -> Vec<&Fragment> {
+    boxes_of(tree)
+        .into_iter()
+        .filter(|f| f.style.display == otlyra_layout::Display::TableCell)
+        .collect()
+}
+
+/// A cell across two columns covers both of them and the gap between them, and
+/// the cells below it keep their own columns.
+#[test]
+fn a_cell_spans_columns() {
+    let tree = lay_out(
+        "<body><table><tr><td colspan=2>wide</td><td>c</td></tr>\
+         <tr><td>a</td><td>b</td><td>c</td></tr></table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    assert_eq!(cells.len(), 5);
+    let (spanning, third) = (cells[0], cells[1]);
+    let (first, second) = (cells[2], cells[3]);
+
+    assert_eq!(
+        spanning.rect.x, first.rect.x,
+        "a span starts where it would"
+    );
+    assert!(
+        spanning.rect.right() >= second.rect.right() - 0.01
+            && spanning.rect.right() <= third.rect.x,
+        "a span across two columns reaches the end of the second: {:?}",
+        (spanning.rect.right(), second.rect.right(), third.rect.x),
+    );
+    assert_eq!(
+        third.rect.x, cells[4].rect.x,
+        "the third column is untouched"
+    );
+}
+
+/// A cell down two rows reaches into the next one, and the cells of that row
+/// start after it rather than under it.
+#[test]
+fn a_cell_spans_rows() {
+    let tree = lay_out(
+        "<body><table><tr><td rowspan=2>tall</td><td>b1</td></tr>\
+         <tr><td>b2</td></tr>\
+         <tr><td>a3</td><td>b3</td></tr></table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    assert_eq!(cells.len(), 5);
+    let (tall, first) = (cells[0], cells[1]);
+    let (second, third) = (cells[2], cells[3]);
+
+    assert!(
+        tall.rect.height > first.rect.height * 1.9,
+        "a cell down two rows is as tall as both of them: {} against {}",
+        tall.rect.height,
+        first.rect.height
+    );
+    assert!(
+        tall.rect.bottom() >= second.rect.bottom() - 0.01,
+        "and reaches the bottom of the second row"
+    );
+    assert_eq!(
+        second.rect.x, first.rect.x,
+        "the second row's cell is pushed past the one reaching into it"
+    );
+    assert_eq!(
+        third.rect.x, tall.rect.x,
+        "and the row below both is back in the first column"
+    );
+}
+
+/// A row span past the last row is clamped to the rows there are, and a span of
+/// zero is every row that is left.
+#[test]
+fn a_row_span_stops_at_the_last_row() {
+    for markup in [
+        "<body><table><tr><td rowspan=9>tall</td><td>b1</td></tr><tr><td>b2</td></tr></table>",
+        "<body><table><tr><td rowspan=0>tall</td><td>b1</td></tr><tr><td>b2</td></tr></table>",
+    ] {
+        let tree = lay_out(markup, 800.0);
+        let cells = cells_of(&tree);
+        let (tall, last) = (cells[0], cells[2]);
+        assert!(
+            (tall.rect.bottom() - last.rect.bottom()).abs() < 0.01,
+            "a span past the end stops at the last row: {} against {}",
+            tall.rect.bottom(),
+            last.rect.bottom()
+        );
+    }
+}
+
+/// A cell wider than the columns under it widens them between them, in proportion
+/// to what each already asked for.
+#[test]
+fn a_span_wider_than_its_columns_shares_the_difference_out() {
+    let tree = lay_out(
+        "<body><table><tr><td colspan=2>a sentence far wider than either column below it</td></tr>\
+         <tr><td>a</td><td>bbbb</td></tr></table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    let (spanning, narrow, wide) = (cells[0], cells[1], cells[2]);
+    // The two columns and the spacing between them: exactly what the span covers.
+    assert!(
+        (wide.rect.right() - narrow.rect.x - spanning.rect.width).abs() < 0.01,
+        "the two columns add up to the span: {:?}",
+        (narrow.rect.width, wide.rect.width, spanning.rect.width)
+    );
+    assert!(
+        wide.rect.width > narrow.rect.width,
+        "and the column that wanted more still has more"
+    );
+}
+
+/// Collapsed, two cells meet on one edge: the spacing is ignored and neither
+/// cell has a gap beside it.
+#[test]
+fn collapsed_cells_share_an_edge() {
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse; border-spacing: 10px'>\
+         <tr><td style='border: 1px solid'>a</td><td style='border: 1px solid'>b</td></tr>\
+         </table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    assert_eq!(cells.len(), 2);
+    assert!(
+        (cells[1].rect.x - cells[0].rect.right()).abs() < 0.01,
+        "collapsed cells meet: {} against {}",
+        cells[1].rect.x,
+        cells[0].rect.right()
+    );
+
+    // Each of them draws half of the one-pixel line between them.
+    let edges = cells[0].used.as_ref().expect("a cell has used edges");
+    assert!(
+        (edges.border.right - 0.5).abs() < 0.01,
+        "{:?}",
+        edges.border
+    );
+}
+
+/// The wider of two neighbouring borders is the one that is drawn, and both cells
+/// draw half of it.
+#[test]
+fn the_wider_collapsed_border_wins() {
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse'>\
+         <tr><td style='border: 1px solid'>a</td><td style='border: 4px solid'>b</td></tr>\
+         </table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    let left = cells[0].used.as_ref().expect("used edges");
+    let right = cells[1].used.as_ref().expect("used edges");
+    assert!(
+        (left.border.right - 2.0).abs() < 0.01 && (right.border.left - 2.0).abs() < 0.01,
+        "the shared edge is four wide and halved: {:?} {:?}",
+        left.border,
+        right.border
+    );
+    assert!(
+        (left.border.left - 0.5).abs() < 0.01,
+        "the edge nobody contested is the cell's own: {:?}",
+        left.border
+    );
+}
+
+/// A table is at least as wide as its caption's longest word, with its columns
+/// stretched to fill.
+#[test]
+fn a_caption_widens_the_table_under_it() {
+    let narrow = lay_out("<body><table><tr><td>a</td><td>b</td></tr></table>", 800.0);
+    let captioned = lay_out(
+        "<body><table><caption>Incomprehensible</caption><tr><td>a</td><td>b</td></tr></table>",
+        800.0,
+    );
+
+    let width = |tree: &FragmentTree| {
+        boxes_of(tree)
+            .into_iter()
+            .find(|f| f.style.display == otlyra_layout::Display::Table)
+            .expect("a table")
+            .rect
+            .width
+    };
+    assert!(
+        width(&captioned) > width(&narrow) * 2.0,
+        "a one-word caption widens the table: {} against {}",
+        width(&captioned),
+        width(&narrow)
+    );
+
+    let cells = cells_of(&captioned);
+    assert!(
+        (cells[1].rect.right() - cells[0].rect.x - width(&captioned)).abs() < 4.1,
+        "and the columns are stretched to fill it: {:?}",
+        (cells[0].rect.x, cells[1].rect.right(), width(&captioned))
+    );
+}
+
+/// A positioned box with a width and padding is that much wider than the width,
+/// exactly as a box in the flow is: `width` is the content box.
+#[test]
+fn a_positioned_box_adds_its_padding_to_its_width() {
+    let tree = lay_out_styled(
+        "<body><div style='position: relative; height: 100px'>\
+         <div id=box style='position: absolute; left: 0; top: 0; width: 160px; \
+         height: 90px; padding: 4px'>x</div></div>",
+        800.0,
+    );
+
+    let positioned = boxes_of(&tree)
+        .into_iter()
+        .find(|fragment| fragment.style.position == otlyra_css::Position::Absolute)
+        .expect("the positioned box");
+    assert!(
+        (positioned.rect.width - 168.0).abs() < 0.01
+            && (positioned.rect.height - 98.0).abs() < 0.01,
+        "the border box is the width plus the padding: {:?}",
+        positioned.rect
+    );
+}
+
+/// `box-sizing: border-box` takes the padding and the border out of the width
+/// rather than adding them outside it.
+#[test]
+fn a_border_box_measures_across_its_edges() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'>\
+         <div id=a style='box-sizing: border-box; width: 200px; height: 100px; \
+         padding: 20px; border: 5px solid'>a</div>\
+         <div id=b style='width: 200px; height: 100px; padding: 20px; border: 5px solid'>b</div>",
+        800.0,
+    );
+
+    let boxes: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| fragment.style.padding.top != otlyra_css::Length::ZERO)
+        .collect();
+    assert_eq!(boxes.len(), 2);
+    assert!(
+        (boxes[0].rect.width - 200.0).abs() < 0.01 && (boxes[0].rect.height - 100.0).abs() < 0.01,
+        "a border box is the size it says: {:?}",
+        boxes[0].rect
+    );
+    assert!(
+        (boxes[1].rect.width - 250.0).abs() < 0.01 && (boxes[1].rect.height - 150.0).abs() < 0.01,
+        "a content box is that size plus its edges: {:?}",
+        boxes[1].rect
+    );
+}
+
+/// A flexible item takes what is left along its container's *main* axis, which
+/// down a column is the height rather than the width.
+#[test]
+fn a_column_shares_out_its_height() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'><div style='width: 400px; height: 300px'>\
+         <div style='display: flex; flex-direction: column; height: 100%'>\
+         <div style='height: 40px'>head</div>\
+         <div style='flex: 1'>rest</div></div></div>",
+        800.0,
+    );
+
+    let rest = boxes_of(&tree)
+        .into_iter()
+        .find(|fragment| fragment.style.flex_grow > 0.0)
+        .expect("the flexible item");
+    assert!(
+        (rest.rect.height - 260.0).abs() < 0.01,
+        "what is left of three hundred after forty: {:?}",
+        rest.rect
+    );
+}
+
+/// A percentage height is a percentage of the containing block's *height*, and
+/// means nothing at all against one that is as tall as its own contents.
+#[test]
+fn a_percentage_height_is_of_a_height() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'>\
+         <div style='width: 300px'><div id=a style='height: 100%'>x</div></div>\
+         <div style='width: 300px; height: 200px'><div id=b style='height: 50%'>x</div></div>",
+        800.0,
+    );
+
+    let boxes: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| {
+            fragment.style.height != otlyra_css::LengthOrAuto::Auto
+                && matches!(fragment.style.height, otlyra_css::LengthOrAuto::Percent(_))
+        })
+        .collect();
+    assert_eq!(boxes.len(), 2, "both boxes ask for a percentage");
+    assert!(
+        boxes[0].rect.height < 30.0,
+        "against a box as tall as its contents it is `auto`, not the width: {:?}",
+        boxes[0].rect
+    );
+    assert!(
+        (boxes[1].rect.height - 100.0).abs() < 0.01,
+        "against a box two hundred tall it is one hundred: {:?}",
+        boxes[1].rect
+    );
+}
+
+/// A second click takes a word, a third takes the block it is in, and neither
+/// stops at the edge of a run.
+#[test]
+fn a_word_and_a_paragraph_are_what_the_second_and_third_click_take() {
+    use otlyra_layout::selection;
+
+    let tree = lay_out_styled(
+        "<body><p>one two-part <b>thr</b>ee</p><p>four five</p>",
+        800.0,
+    );
+
+    let word = |x: f32, y: f32| {
+        let at = selection::position_at(&tree, x, y).expect("a position");
+        selection::text(&tree, selection::word_at(&tree, at))
+    };
+
+    assert_eq!(word(4.0, 20.0), "one", "the word the click landed in");
+    // A hyphen is not a letter, so it is its own word — which is what a second
+    // click on one selects everywhere else.
+    let across = word(60.0, 20.0);
+    assert!(
+        across == "two" || across == "-" || across == "part",
+        "one part of the hyphenated word rather than all of it: {across:?}"
+    );
+
+    // `thr` and `ee` are two runs and one word, and the join is a join because
+    // they meet on the same line with nothing between them.
+    let split = selection::position_at(&tree, 800.0, 20.0).expect("the end of the line");
+    let joined = selection::text(&tree, selection::word_at(&tree, split));
+    assert_eq!(joined, "three", "a word half in bold is still a word");
+
+    let at = selection::position_at(&tree, 4.0, 20.0).expect("a position");
+    let paragraph = selection::text(&tree, selection::paragraph_at(&tree, at));
+    assert_eq!(
+        paragraph, "one two-part three",
+        "the block it is in, and not the one after it"
+    );
+
+    let everything = selection::text(&tree, selection::all(&tree).expect("a page with text"));
+    assert!(
+        everything.contains("one two-part three") && everything.contains("four five"),
+        "and everything is everything: {everything:?}"
+    );
+}
+
+/// A point on the page resolves to a place in its text, and the text between two
+/// such places comes back as the characters that were drawn there.
+#[test]
+fn a_selection_reads_the_words_it_covers() {
+    use otlyra_layout::selection;
+
+    let tree = lay_out("<body><p>one two three</p><p>four five</p>", 800.0);
+
+    let first = selection::position_at(&tree, 0.0, 20.0).expect("a position on the first line");
+    let last = selection::position_at(&tree, 800.0, 60.0).expect("a position on the last");
+    let all = otlyra_layout::Selection {
+        anchor: first,
+        focus: last,
+    };
+
+    let text = selection::text(&tree, all);
+    assert!(
+        text.contains("one two three") && text.contains("four five"),
+        "a selection across both paragraphs reads both: {text:?}"
+    );
+    assert!(
+        text.contains('\n'),
+        "and the line between them is a line: {text:?}"
+    );
+
+    // A selection of nothing reads nothing, and covers nothing.
+    let empty = otlyra_layout::Selection::at(first);
+    assert!(selection::text(&tree, empty).is_empty());
+    assert!(selection::rects(&tree, empty).is_empty());
+
+    // Part of one line is a rectangle inside that line rather than the whole of it.
+    let line = otlyra_layout::Selection {
+        anchor: first,
+        focus: otlyra_layout::TextPosition {
+            run: first.run,
+            offset: 3,
+        },
+    };
+    let rects = selection::rects(&tree, line);
+    assert_eq!(rects.len(), 1, "one line, one rectangle: {rects:?}");
+    let lines: Vec<&Fragment> = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .collect();
+    assert!(
+        rects[0].width > 0.0 && rects[0].width < lines[0].rect.width,
+        "part of the line rather than all of it: {:?} of {:?}",
+        rects[0],
+        lines[0].rect
+    );
+}
+
+/// An `inline-block` takes its place in a line rather than a line of its own, at
+/// the size it was given, and what is in it is laid out as a block.
+#[test]
+fn inline_blocks_sit_in_one_line() {
+    let tree = lay_out_styled(
+        "<body><p><span id=a style='display: inline-block; width: 90px; height: 70px'>a</span>\
+         <span id=b style='display: inline-block; width: 60px; height: 30px'>b</span></p>",
+        800.0,
+    );
+
+    let boxes: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| fragment.style.display == otlyra_layout::Display::InlineBlock)
+        .collect();
+    assert_eq!(boxes.len(), 2, "both are boxes of their own");
+    assert!(
+        boxes[1].rect.x >= boxes[0].rect.right() - 0.01
+            && (boxes[1].rect.y - boxes[0].rect.y).abs() < 20.0,
+        "the second sits after the first rather than under it: {:?}",
+        (boxes[0].rect, boxes[1].rect)
+    );
+    assert!(
+        (boxes[0].rect.width - 90.0).abs() < 0.01 && (boxes[0].rect.height - 70.0).abs() < 0.01,
+        "a width and a height are honoured, which is what makes it not an inline: {:?}",
+        boxes[0].rect
+    );
+}
+
+/// Two of them of different heights sit on one baseline: their *own* last
+/// baselines line up, which is what makes a row of buttons read as a row of words.
+#[test]
+fn inline_blocks_share_a_baseline() {
+    let tree = lay_out_styled(
+        "<body><p><span style='display: inline-block; padding: 20px 4px'>tall</span>\
+         <span style='display: inline-block; padding: 4px'>short</span></p>",
+        800.0,
+    );
+
+    let baselines: Vec<f32> = tree
+        .iter()
+        .filter_map(|fragment| match &fragment.kind {
+            FragmentKind::Text(run) => Some(fragment.rect.y + run.glyphs.first()?.y),
+            _ => None,
+        })
+        .collect();
+    assert!(baselines.len() >= 2, "both have text in them");
+    for baseline in &baselines {
+        assert!(
+            (baseline - baselines[0]).abs() < 0.01,
+            "they sit on one baseline: {baselines:?}"
+        );
+    }
+}
+
+/// A collapsed table draws its grid itself, once: the cells leave room for the
+/// lines and paint none of them, and the line that is drawn is the one that won
+/// the edge.
+#[test]
+fn a_collapsed_table_draws_the_line_that_won() {
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse'>\
+         <tr><td style='border: 1px solid rgb(0,0,0)'>a</td>\
+         <td style='border: 4px solid rgb(255,0,0)'>b</td></tr></table>",
+        800.0,
+    );
+
+    for cell in cells_of(&tree) {
+        for side in [
+            cell.style.border.top,
+            cell.style.border.right,
+            cell.style.border.bottom,
+            cell.style.border.left,
+        ] {
+            assert!(
+                !side.is_visible(),
+                "a cell leaves room for the line and draws none of it: {side:?}"
+            );
+        }
+    }
+
+    // The four-pixel red edge between the two cells, drawn once and whole.
+    let red = otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0);
+    let lines: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| fragment.style.background_color == red)
+        .collect();
+    let shared = cells_of(&tree)[0].rect.right();
+    assert!(
+        lines.iter().any(|line| {
+            (line.rect.width - 4.0).abs() < 0.01
+                && (line.rect.x + line.rect.width / 2.0 - shared).abs() < 1.0
+        }),
+        "the wider border is drawn whole, on the edge the cells meet at: {:?}",
+        lines.iter().map(|line| line.rect).collect::<Vec<_>>()
+    );
+}
+
+/// A cell that reaches across a boundary is not divided by it: no line is drawn
+/// inside a `colspan`.
+#[test]
+fn a_collapsed_line_is_not_drawn_through_a_span() {
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse'>\
+         <tr><td colspan=2 style='border: 1px solid rgb(0,0,0)'>wide</td></tr>\
+         <tr><td style='border: 1px solid rgb(0,0,0)'>a</td>\
+         <td style='border: 1px solid rgb(0,0,0)'>b</td></tr></table>",
+        800.0,
+    );
+
+    let cells = cells_of(&tree);
+    let (spanning, first) = (cells[0], cells[1]);
+    let boundary = first.rect.right();
+    let black = otlyra_gfx::peniko::Color::from_rgb8(0, 0, 0);
+
+    let through: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| {
+            fragment.style.background_color == black
+                && fragment.rect.width <= 2.0
+                && (fragment.rect.x - boundary).abs() < 2.0
+                && fragment.rect.y < spanning.rect.bottom() - 1.0
+        })
+        .collect();
+    assert!(
+        through.is_empty(),
+        "a line was drawn through the span: {:?}",
+        through.iter().map(|line| line.rect).collect::<Vec<_>>()
+    );
+
+    // And it *is* drawn between the two cells below it.
+    let between: Vec<&Fragment> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| {
+            fragment.style.background_color == black
+                && fragment.rect.width <= 2.0
+                && (fragment.rect.x - boundary).abs() < 2.0
+        })
+        .collect();
+    assert!(!between.is_empty(), "the boundary below the span is drawn");
 }
 
 /// A table told how wide to be fills that width rather than sitting narrow in it.

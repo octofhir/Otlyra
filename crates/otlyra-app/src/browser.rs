@@ -4,7 +4,7 @@
 //! its scroll position; the interface owns what is typed and what is focused; this
 //! type owns the two of them and the one thing they share, the font engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::NodeId;
@@ -43,8 +43,9 @@ struct PendingLoad {
 enum PendingResource {
     /// The `<link>` whose stylesheet this is.
     Stylesheet(NodeId),
-    /// The `<img>` whose picture this is.
-    Image(NodeId),
+    /// The `<img>` whose picture this is, and the density of the candidate it
+    /// settled on — which is what the file's own size is divided by.
+    Image(NodeId, f32),
 }
 
 /// Note in the log when a document asked for more than the limit allows.
@@ -169,6 +170,12 @@ const STYLESHEET_LIMIT: usize = 32;
 
 /// How many pictures one document may pull in, for the same reason.
 const IMAGE_LIMIT: usize = 64;
+
+/// How many fonts one document may bring with it.
+///
+/// A page that ships a family ships a handful of faces of it; one that names
+/// dozens is asking for a megabyte of typefaces before its first line is set.
+const FONT_LIMIT: usize = 16;
 
 /// How many bytes of decoded pictures are kept between loads.
 ///
@@ -298,11 +305,27 @@ pub struct Browser {
     background_requests: HashMap<String, usize>,
     /// Background fetches in flight, by request number.
     background_fetches: HashMap<u64, (usize, String)>,
+    /// The fonts pages have asked for, by family and address, so none is asked
+    /// for twice — a page that names its family in ten rules names one file, and
+    /// two families out of one file are two fonts.
+    font_requests: HashSet<(String, String)>,
+    /// Font fetches in flight, by request number, with the family each one is to
+    /// be registered under.
+    font_fetches: HashMap<u64, String>,
+    /// Whether the pointer is taking a selection across the page.
+    ///
+    /// A press on the text starts one and the release ends it, so that a drag that
+    /// wanders into the toolbar or off the window keeps selecting rather than
+    /// stopping where it left.
+    selecting: bool,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
     /// And its height, which is what a page key scrolls by.
     last_height: f64,
+    /// And how many device pixels went to one of them. A page choosing between
+    /// the pictures it offers is choosing by this number.
+    last_scale: f64,
     /// The mark shown on an empty tab. `None` if it failed to decode, which is a
     /// cosmetic problem and not a reason to refuse to draw a frame.
     mark: Option<otlyra_gfx::peniko::ImageData>,
@@ -360,8 +383,12 @@ impl Browser {
             images: ImageCache::default(),
             background_requests: HashMap::new(),
             background_fetches: HashMap::new(),
+            selecting: false,
+            font_requests: HashSet::new(),
+            font_fetches: HashMap::new(),
             last_width: 1024.0,
             last_height: 768.0,
+            last_scale: 1.0,
             mark: otlyra_gfx::decode_image(crate::MARK)
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
@@ -383,15 +410,10 @@ impl Browser {
     /// The palette the appearance preference and the platform agree on, applied
     /// to every surface. Cheap when nothing changed: each surface compares.
     fn apply_theme(&mut self) {
-        use crate::settings::Appearance;
         use crate::widget::theme::Theme;
-        let theme = match self.settings.settings.appearance {
-            Appearance::Light => Theme::light(),
-            Appearance::Dark => Theme::dark(),
-            Appearance::System => match self.scheme {
-                otlyra_platform::ColorScheme::Light => Theme::light(),
-                otlyra_platform::ColorScheme::Dark => Theme::dark(),
-            },
+        let theme = match self.effective_scheme() {
+            otlyra_platform::ColorScheme::Light => Theme::light(),
+            otlyra_platform::ColorScheme::Dark => Theme::dark(),
         };
         self.theme = theme.clone();
         self.ui.set_theme(theme.clone());
@@ -399,6 +421,101 @@ impl Browser {
         self.inspector.set_theme(theme.clone());
         self.history_page.set_theme(theme.clone());
         self.about.set_theme(theme);
+    }
+
+    /// The keys that take a selection on the page, or move the one there is.
+    ///
+    /// `true` means the key was one of them and the page has answered it.
+    fn page_selection_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        use otlyra_layout::Motion;
+
+        if key == Key::Character('a') && modifiers.command {
+            return self.tabs[self.active]
+                .page
+                .as_mut()
+                .is_some_and(PageScene::select_all);
+        }
+
+        // Only with shift held. An arrow on a page nobody is editing scrolls it,
+        // in every browser and here — turning that into a caret the moment
+        // something is selected would take the page's scrolling away for as long
+        // as a selection is on screen.
+        if !modifiers.shift
+            || !self.tabs[self.active]
+                .page
+                .as_ref()
+                .is_some_and(PageScene::has_selection)
+        {
+            return false;
+        }
+
+        // The command key turns a step into a jump: ⇧⌘← reaches the start of the
+        // line and ⇧⌘↑ the start of the page.
+        let motion = match (key, modifiers.command) {
+            (Key::Left, false) => Motion::Back,
+            (Key::Right, false) => Motion::Forward,
+            (Key::Up, false) => Motion::Up,
+            (Key::Down, false) => Motion::Down,
+            (Key::Left, true) | (Key::Home, _) => Motion::LineStart,
+            (Key::Right, true) | (Key::End, _) => Motion::LineEnd,
+            (Key::Up, true) => Motion::Start,
+            (Key::Down, true) => Motion::End,
+            _ => return false,
+        };
+
+        let Some(page) = self.tabs[self.active].page.as_mut() else {
+            return false;
+        };
+        page.move_selection(motion, true);
+        true
+    }
+
+    /// Tell the browser how big the window is going to be, before it has drawn
+    /// one.
+    ///
+    /// A page chooses between the pictures it offers while it is loading, and a
+    /// load can finish before the first frame — so a screenshot would otherwise
+    /// choose against the size a browser starts out assuming rather than the one
+    /// it was asked for. A frame overwrites this with what it actually drew.
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.last_width = viewport.logical_width();
+        self.last_height = viewport.logical_height();
+        self.last_scale = viewport.scale_factor;
+    }
+
+    /// The window as a picture chooses against it: how wide it is, and how many
+    /// device pixels go to one CSS pixel.
+    ///
+    /// The last frame's, because the choice is made when a page loads and the
+    /// last frame is the best evidence of what the next one will be.
+    fn picture_viewport(&self) -> otlyra_css::cascade::Viewport {
+        otlyra_css::cascade::Viewport {
+            width: self.last_width as f32,
+            height: (self.last_height - if self.interface { UI_HEIGHT } else { 0.0 }).max(0.0)
+                as f32,
+            scale: self.last_scale as f32,
+            text_scale: (self.settings.settings.text_scale / 100.0) as f32,
+            color_scheme: match self.effective_scheme() {
+                otlyra_platform::ColorScheme::Light => otlyra_css::cascade::ColorScheme::Light,
+                otlyra_platform::ColorScheme::Dark => otlyra_css::cascade::ColorScheme::Dark,
+            },
+        }
+    }
+
+    /// The palette in force: the appearance preference, or what the platform
+    /// says when that preference is to follow it.
+    ///
+    /// One answer for two readers — the interface's own theme and the
+    /// `prefers-color-scheme` a page is styled against — because a browser
+    /// whose toolbar is dark and whose pages are told `light` is answering two
+    /// different questions about the same preference.
+    fn effective_scheme(&self) -> otlyra_platform::ColorScheme {
+        use crate::settings::Appearance;
+        match self.settings.settings.appearance {
+            Appearance::Light => otlyra_platform::ColorScheme::Light,
+            Appearance::Dark => otlyra_platform::ColorScheme::Dark,
+            Appearance::System => self.scheme,
+        }
     }
 
     /// Cut, copy and paste against `clipboard` instead of the default memory.
@@ -677,16 +794,21 @@ impl Browser {
         self.paint(&mut discarded, viewport);
 
         let deadline = std::time::Instant::now() + timeout;
-        while !self.background_fetches.is_empty() {
+        while !self.background_fetches.is_empty() || !self.font_fetches.is_empty() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                tracing::warn!("gave up waiting for a background picture");
+                tracing::warn!("gave up waiting for a background picture or a font");
                 return;
             }
             for fetched in self.fetcher.wait(remaining.min(FETCH_POLL)) {
                 self.receive(fetched);
             }
         }
+
+        // The font landed after the frame that asked for it: every line was
+        // measured in whatever the stack fell back to, so the frame the caller is
+        // about to take has to be laid out again.
+        self.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
     }
 
     /// Wait for the tab to finish loading, for callers with no event loop.
@@ -749,8 +871,94 @@ impl Browser {
         }
     }
 
+    /// Ask for the fonts the pages' own stylesheets bring with them.
+    ///
+    /// A `@font-face` rule is only known once the sheet holding it has been parsed,
+    /// which is a page's first restyle — so this is asked after a frame rather than
+    /// with the pictures the markup names, exactly as a background picture is.
+    ///
+    /// The address is resolved against the sheet the rule was written in, not
+    /// against the page: a sheet in a directory of its own names its fonts beside
+    /// itself.
+    fn fetch_fonts(&mut self) {
+        for index in 0..self.tabs.len() {
+            let Some(page) = self.tabs[index].page.as_ref() else {
+                continue;
+            };
+            let base = self.tabs[index].url.clone();
+            let sheets: HashMap<otlyra_dom::NodeId, String> =
+                otlyra_css::cascade::stylesheet_links(page.document())
+                    .into_iter()
+                    .filter_map(|link| Some((link.node, Self::subresource_url(&base, &link.href)?)))
+                    .collect();
+
+            for face in page.wanted_fonts().into_iter().take(FONT_LIMIT) {
+                // The first address that resolves, which is as far as the order in
+                // the rule is honoured: what the rest of the list is for is formats
+                // this cannot read, and there is no telling which those are until
+                // the bytes are here.
+                let sheet_base = face
+                    .sheet
+                    .and_then(|node| sheets.get(&node))
+                    .unwrap_or(&base);
+                let Some(target) = face
+                    .sources
+                    .iter()
+                    .find_map(|source| Self::subresource_url(sheet_base, source))
+                else {
+                    continue;
+                };
+                if !self
+                    .font_requests
+                    .insert((face.family.clone(), target.clone()))
+                {
+                    continue;
+                }
+                let id = self.fetcher.request(&target, ResourceKind::Stylesheet);
+                self.font_fetches.insert(id, face.family);
+            }
+        }
+    }
+
+    /// Put what is selected on the page on the clipboard.
+    ///
+    /// Returns whether there was anything to copy, which is what decides whether
+    /// the key belonged to the page or to whatever else wanted it.
+    fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.tabs[self.active]
+            .page
+            .as_ref()
+            .and_then(PageScene::selected_text)
+        else {
+            return false;
+        };
+        tracing::debug!(characters = text.len(), "copied the selection");
+        self.clipboard.write(text);
+        true
+    }
+
     /// One finished fetch. Returns whether it changed anything on screen.
     fn receive(&mut self, fetched: Fetched) -> bool {
+        // A font belongs to the shaper rather than to a page: once it is in, every
+        // page that names the family is set in it.
+        if let Some(family) = self.font_fetches.remove(&fetched.id) {
+            let Ok(loaded) = fetched.result else {
+                tracing::warn!(%family, url = %fetched.url, "font failed to load");
+                return false;
+            };
+            if !self.text.add_font(&family, loaded.bytes) {
+                tracing::warn!(%family, url = %fetched.url, "font failed to register");
+                return false;
+            }
+            tracing::debug!(%family, url = %fetched.url, "font registered");
+            for tab in &mut self.tabs {
+                if let Some(page) = tab.page.as_mut() {
+                    page.font_arrived();
+                }
+            }
+            return true;
+        }
+
         // A background picture belongs to a page rather than to a load, and may
         // arrive long after the page it is for.
         if let Some((index, url)) = self.background_fetches.remove(&fetched.id) {
@@ -851,7 +1059,11 @@ impl Browser {
                 )
             }),
         );
-        let pictures = otlyra_layout::image_sources(&parsed.document);
+        // Which of the pictures an element offers is a question about the
+        // window: how wide it is and how many device pixels it has to a CSS
+        // pixel. Asked here, before the fetch, because a browser fetches the
+        // one it chose rather than all of them.
+        let pictures = otlyra_layout::image_sources(&parsed.document, self.picture_viewport());
         let wanted: Vec<_> = pictures
             .iter()
             .take(IMAGE_LIMIT)
@@ -862,7 +1074,13 @@ impl Browser {
                 };
                 match self.images.get(&url) {
                     Some(image) => {
-                        ready.insert(source.node, image);
+                        ready.insert(
+                            source.node,
+                            otlyra_layout::Picture {
+                                data: image,
+                                density: source.density,
+                            },
+                        );
                         false
                     }
                     None => true,
@@ -871,7 +1089,7 @@ impl Browser {
             .map(|source| {
                 (
                     source.src.clone(),
-                    PendingResource::Image(source.node),
+                    PendingResource::Image(source.node, source.density),
                     ResourceKind::Image,
                 )
             })
@@ -954,7 +1172,7 @@ impl Browser {
                 // Decoded once, however many elements asked for it.
                 let decoded = wanted
                     .iter()
-                    .any(|resource| matches!(resource, PendingResource::Image(_)))
+                    .any(|resource| matches!(resource, PendingResource::Image(..)))
                     .then(|| {
                         otlyra_gfx::decode_image(&loaded.bytes)
                             .inspect_err(
@@ -974,9 +1192,15 @@ impl Browser {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
                             pending.sheets.insert(node, source);
                         }
-                        PendingResource::Image(node) => match decoded.as_ref() {
+                        PendingResource::Image(node, density) => match decoded.as_ref() {
                             Some(image) => {
-                                pending.images.insert(node, image.clone());
+                                pending.images.insert(
+                                    node,
+                                    otlyra_layout::Picture {
+                                        data: image.clone(),
+                                        density,
+                                    },
+                                );
                             }
                             None => {
                                 tracing::warn!(url = %fetched.url, "image failed to decode");
@@ -1636,6 +1860,17 @@ impl Painter for Browser {
                     return;
                 }
 
+                // A selection being made keeps the pointer the same way a scrollbar
+                // does: what is between where the press landed and where the
+                // pointer is now is what is selected, wherever it wanders.
+                if self.selecting {
+                    let top = UI_HEIGHT as f32;
+                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                        page.select_to(x as f32, y as f32, top);
+                        return;
+                    }
+                }
+
                 // A scrollbar being dragged keeps the pointer until it is let go,
                 // wherever the pointer wanders.
                 let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
@@ -1681,7 +1916,7 @@ impl Painter for Browser {
                 }
                 // A press on a scrollbar belongs to it rather than to the page
                 // behind it.
-                if self.pointer.1 >= UI_HEIGHT && self.tabs[self.active].system.is_none() {
+                if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
                     let (x, y) = self.pointer;
                     let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
                     if let Some(page) = self.tabs[self.active].page.as_mut()
@@ -1725,10 +1960,42 @@ impl Painter for Browser {
                     }
                 }
                 // A link takes the press before the interface sees it, because the
-                // interface has nothing in the page area to claim it.
-                if let Some(url) = self.link_under_pointer() {
+                // interface has nothing in the page area to claim it — except an
+                // open menu, which is drawn over the page and owns every press
+                // that lands on it.
+                if !self.ui.owns_pointer()
+                    && let Some(url) = self.link_under_pointer()
+                {
                     self.navigate_from(&url, false);
                     return;
+                }
+                // A press on the page starts a selection where it landed, and takes
+                // away whatever was selected before — which is what a press on a
+                // page means everywhere else.
+                if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
+                    let (x, y) = self.pointer;
+                    let top = UI_HEIGHT as f32;
+                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                        let (x, y) = (x as f32, y as f32);
+                        // A second click takes the word and a third the block it
+                        // is in; a fourth starts over, which is what the count
+                        // running past three means.
+                        match clicks % 3 {
+                            2 => {
+                                page.select_word_at(x, y, top);
+                            }
+                            0 if clicks > 0 => {
+                                page.select_paragraph_at(x, y, top);
+                            }
+                            _ => {
+                                page.select_from(x, y, top);
+                            }
+                        }
+                        // A drag after a second or third click extends what that
+                        // click took, from wherever it put the far end.
+                        self.selecting = true;
+                        return;
+                    }
                 }
                 // The press is tested against the geometry of the last frame —
                 // which is the frame the user was looking at when they pressed.
@@ -1737,6 +2004,7 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerReleased => {
+                self.selecting = false;
                 if let Some(page) = self.tabs[self.active].page.as_mut() {
                     page.release_scrollbar();
                 }
@@ -1813,6 +2081,28 @@ impl Painter for Browser {
                     }
                     _ => {}
                 }
+                // Copying what is selected on the page, before the interface reads
+                // the key: the address bar takes ⌘C for its own text only while it
+                // holds the caret, and the page's selection is the one on screen.
+                if key == Key::Character('c')
+                    && modifiers.command
+                    && !self.ui.address_focused()
+                    && self.copy_selection()
+                {
+                    return;
+                }
+
+                // Selecting the page, and moving what is selected. Both go to the
+                // page only while the interface does not hold the caret, for the
+                // same reason ⌘C does: the address bar's own text is a selection
+                // too, and there is one keyboard between them.
+                if !self.ui.address_focused()
+                    && self.tabs[self.active].system.is_none()
+                    && self.page_selection_key(key, modifiers)
+                {
+                    return;
+                }
+
                 let action =
                     self.ui
                         .key_pressed(key, modifiers, &mut self.text, self.clipboard.as_mut());
@@ -2016,6 +2306,7 @@ impl Painter for Browser {
         let height = viewport.logical_height();
         self.last_width = width;
         self.last_height = height;
+        self.last_scale = viewport.scale_factor;
 
         let scale = otlyra_gfx::kurbo::Affine::scale(viewport.scale_factor);
         // Where the page starts: under the interface, or at the top of the window
@@ -2028,6 +2319,10 @@ impl Painter for Browser {
         let dock = self.dock_height(height - top);
         let content_height = (height - top - dock).max(0.0);
         let text_scale = (self.settings.settings.text_scale / 100.0) as f32;
+        let page_scheme = match self.effective_scheme() {
+            otlyra_platform::ColorScheme::Light => otlyra_css::cascade::ColorScheme::Light,
+            otlyra_platform::ColorScheme::Dark => otlyra_css::cascade::ColorScheme::Dark,
+        };
 
         // The page first, then the interface over it. The page is inset by the
         // interface's height and culled to what is visible, so it cannot paint
@@ -2063,6 +2358,10 @@ impl Painter for Browser {
             // computes to and every element that inherited a size inherited
             // that. Setting it to what it already is costs nothing.
             page.set_text_scale(text_scale);
+            // And which palette the page may ask for. A page with no
+            // `prefers-color-scheme` rule is unmoved by it; one with such a rule
+            // is restyled, which is what the preference is for.
+            page.set_color_scheme(page_scheme);
             let mut list = page.build_display_list(
                 &mut self.text,
                 width as f32,
@@ -2103,6 +2402,7 @@ impl Painter for Browser {
             // Still after the page, because the pictures a rule names are only known
             // once the rule has been computed on the way to a frame.
             self.fetch_backgrounds();
+            self.fetch_fonts();
             return;
         }
 
@@ -2136,6 +2436,7 @@ impl Painter for Browser {
         // After the frame, because a rule that names a picture is only computed on
         // the way to one.
         self.fetch_backgrounds();
+        self.fetch_fonts();
     }
 }
 
@@ -2899,6 +3200,264 @@ mod tests {
         assert_eq!(browser.tabs[0].url, "https://start.example/");
     }
 
+    /// A drag across the page selects the words the pointer passed, and ⌘C puts
+    /// them on the clipboard.
+    #[test]
+    fn dragging_across_the_page_selects_text_and_copies_it() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        // Across the first line of the page, which is the paragraph the loader
+        // serves. The pointer is moved first, because a press lands where the
+        // pointer last was.
+        let line = browser.tabs[0]
+            .page
+            .as_ref()
+            .expect("a page")
+            .rect_of(
+                browser.tabs[0]
+                    .page
+                    .as_ref()
+                    .expect("a page")
+                    .box_at(30.0, UI_HEIGHT + 20.0)
+                    .expect("something under the pointer"),
+            )
+            .expect("it was drawn");
+
+        let y = f64::from(line.y) + UI_HEIGHT + 6.0;
+        browser.on_event(PlatformEvent::PointerMoved { x: 9.0, y });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        browser.on_event(PlatformEvent::PointerMoved { x: 400.0, y });
+        browser.on_event(PlatformEvent::PointerReleased);
+
+        let selected = browser.tabs[0]
+            .page
+            .as_ref()
+            .expect("a page")
+            .selected_text()
+            .expect("a drag across the words selected some of them");
+        assert!(
+            selected.contains("go on") || selected.contains("go"),
+            "the words the pointer passed: {selected:?}"
+        );
+
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Character('c'),
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        });
+        assert_eq!(
+            browser.clipboard.read().as_deref(),
+            Some(selected.as_str()),
+            "what was selected is what was copied"
+        );
+    }
+
+    /// An open menu is drawn over the page and owns every press that lands on
+    /// it — including the second of a double click, which would otherwise
+    /// select a word behind the menu instead of choosing the item under the
+    /// pointer.
+    #[test]
+    fn a_press_on_an_open_menu_never_reaches_the_page_behind_it() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        browser.ui.menu_open = true;
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: 700.0,
+            y: UI_HEIGHT + 40.0,
+        });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+
+        assert!(
+            !browser.selecting,
+            "the page took a press that belonged to the menu"
+        );
+        assert!(
+            !browser.tabs[0]
+                .page
+                .as_ref()
+                .expect("a page")
+                .has_selection(),
+            "and started selecting behind it"
+        );
+        assert!(
+            !browser.ui.menu_open,
+            "the interface got the press, and a press outside an open menu \
+             closes it"
+        );
+    }
+
+    /// The second rank of selecting: a word, the block it is in, the whole page,
+    /// and the far end moved by the keyboard.
+    #[test]
+    fn a_second_click_takes_a_word_and_a_third_takes_the_block() {
+        /// Two paragraphs of ordinary words, so a word and a block are
+        /// different amounts of text.
+        struct Prose;
+        impl Loader for Prose {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><p>alpha beta gamma</p><p>delta epsilon</p>".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Prose);
+        go(&mut browser, "prose.example");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+
+        let selected = |browser: &Browser| {
+            browser.tabs[0]
+                .page
+                .as_ref()
+                .expect("a page")
+                .selected_text()
+                .unwrap_or_default()
+        };
+
+        // Into the first word of the first paragraph.
+        let y = UI_HEIGHT + 14.0;
+        browser.on_event(PlatformEvent::PointerMoved { x: 12.0, y });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 2 });
+        browser.on_event(PlatformEvent::PointerReleased);
+        assert_eq!(selected(&browser), "alpha", "a second click takes the word");
+
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 3 });
+        browser.on_event(PlatformEvent::PointerReleased);
+        assert_eq!(
+            selected(&browser),
+            "alpha beta gamma",
+            "a third takes the block it is in and stops there"
+        );
+
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Character('a'),
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        });
+        let everything = selected(&browser);
+        assert!(
+            everything.contains("alpha beta gamma") && everything.contains("delta epsilon"),
+            "and ⌘A takes the page: {everything:?}"
+        );
+
+        // Back to one word, then one character further with the keyboard.
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 2 });
+        browser.on_event(PlatformEvent::PointerReleased);
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Right,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        });
+        assert_eq!(
+            selected(&browser),
+            "alpha ",
+            "shift and an arrow move the far end and keep the near one"
+        );
+
+        // An arrow with nothing held down is still the page scrolling, which is
+        // what it means on a page nobody is editing.
+        let before = selected(&browser);
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Right,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(selected(&browser), before, "and a bare arrow moves nothing");
+    }
+
+    /// A loader whose page brings a font with it, from a stylesheet in a
+    /// directory of its own — so the address is only right if it is resolved
+    /// against the sheet rather than against the page.
+    struct FontLoader;
+
+    impl Loader for FontLoader {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            let page = |bytes: Vec<u8>, kind: &str| {
+                Ok(Loaded {
+                    content_type: Some(kind.to_owned()),
+                    bytes,
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            };
+            match url {
+                "https://type.example/" => page(
+                    b"<link rel=stylesheet href=/style/page.css><p>set in it".to_vec(),
+                    "text/html",
+                ),
+                "https://type.example/style/page.css" => page(
+                    b"@font-face { font-family: Brought; src: url(../fonts/brought.ttf) }\n\
+                      p { font-family: Brought }"
+                        .to_vec(),
+                    "text/css",
+                ),
+                "https://type.example/fonts/brought.ttf" => {
+                    page(otlyra_text::TEST_FONT.to_vec(), "font/ttf")
+                }
+                other => Err(format!("404 {other}")),
+            }
+        }
+    }
+
+    /// A page that brings its own typeface gets it: the rule is found in the
+    /// fetched sheet, the address is resolved against that sheet, and the family
+    /// is one the shaper can answer for afterwards.
+    #[test]
+    fn a_page_brings_its_own_font() {
+        let mut browser = Browser::new(FontLoader);
+        assert!(
+            !browser.text.has_family("Brought"),
+            "the family cannot exist before the page that defines it"
+        );
+
+        go(&mut browser, "https://type.example/");
+        // A frame: a `@font-face` rule is only known once the sheet holding it has
+        // been parsed, which is the page's first restyle.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+        settle(&mut browser);
+        browser.prepare_frame(
+            Viewport::new(800, 600, 1.0),
+            std::time::Duration::from_secs(5),
+        );
+
+        assert!(
+            browser.text.has_family("Brought"),
+            "the family the page defined is the shaper's now"
+        );
+        assert!(
+            browser
+                .fetcher
+                .exchanges()
+                .iter()
+                .any(|exchange| exchange.url == "https://type.example/fonts/brought.ttf"),
+            "the address is resolved against the sheet, not the page: {:?}",
+            browser
+                .fetcher
+                .exchanges()
+                .iter()
+                .map(|exchange| exchange.url.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// A loader whose pages contain one link, so the click path has something to
     /// land on.
     struct LinkLoader;
@@ -3487,6 +4046,61 @@ mod tests {
         assert!(
             (paragraph(&mut browser) - 15.0).abs() < 0.01,
             "a page that names its own size keeps it"
+        );
+    }
+
+    #[test]
+    fn the_appearance_preference_is_what_a_page_asks_for() {
+        /// A page that draws itself differently in the dark.
+        struct Themed;
+        impl Loader for Themed {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<style>\
+                             p { background: rgb(255, 255, 255) }\
+                             @media (prefers-color-scheme: dark) { \
+                               p { background: rgb(0, 0, 0) } }\
+                             </style><body><p>text"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        /// What the one paragraph is painted behind, after a frame.
+        fn background(browser: &mut Browser) -> [u8; 4] {
+            let mut painter = otlyra_gfx::RecordingPainter::new();
+            browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+            let page = browser.active_page().expect("a page");
+            let boxes = page.boxes();
+            let colour = boxes
+                .descendants(boxes.root())
+                .into_iter()
+                .filter_map(|id| boxes.get(id))
+                .find(|node| node.tag.as_ref().is_some_and(|tag| tag.as_ref() == "p"))
+                .expect("a paragraph")
+                .style
+                .background_color;
+            colour.to_rgba8().to_u8_array()
+        }
+
+        let mut browser = Browser::new(Themed);
+        browser.navigate("https://themed.example/");
+        settle(&mut browser);
+        assert_eq!(
+            background(&mut browser),
+            [255, 255, 255, 255],
+            "the preference starts at light"
+        );
+
+        browser.settings.settings.appearance = crate::settings::Appearance::Dark;
+        assert_eq!(
+            background(&mut browser),
+            [0, 0, 0, 255],
+            "and the page follows it"
         );
     }
 

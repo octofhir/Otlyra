@@ -81,8 +81,12 @@ pub struct BoxNode {
 
 impl BoxNode {
     /// Whether this box is block-level.
+    ///
+    /// An `inline-block` is not: it is a block container, which is what is *inside*
+    /// it, and it takes its place in a line like a word.
     pub fn is_block_level(&self) -> bool {
         matches!(self.kind, BoxKind::Block)
+            && self.style.display != otlyra_css::Display::InlineBlock
     }
 
     /// Whether this box is inline-level.
@@ -92,7 +96,9 @@ impl BoxNode {
             // A replaced box takes the level its style gives it: an image is
             // inline by default and a block when a rule says so.
             BoxKind::Replaced(_) => self.style.display != otlyra_css::Display::Block,
-            BoxKind::Block => false,
+            // `inline-block` is the one box that is both: a block container that
+            // takes its place in a line rather than a line of its own.
+            BoxKind::Block => self.style.display == otlyra_css::Display::InlineBlock,
         }
     }
 }
@@ -111,6 +117,30 @@ pub struct Marker {
     pub bullet: bool,
 }
 
+/// How many cells of the grid a table cell covers.
+///
+/// A cell is one column and one row unless it says otherwise, and one that says
+/// otherwise stops being a cell of a column: a cell across two columns gives its
+/// width to neither of them on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellSpan {
+    /// Columns, at least one.
+    pub columns: usize,
+    /// Rows, or zero for "every row left in the table" — which is what HTML's
+    /// `rowspan="0"` means and what layout resolves once it knows how many there
+    /// are.
+    pub rows: usize,
+}
+
+impl Default for CellSpan {
+    fn default() -> Self {
+        Self {
+            columns: 1,
+            rows: 1,
+        }
+    }
+}
+
 /// An arena of boxes with one root.
 #[derive(Debug)]
 pub struct BoxTree {
@@ -127,6 +157,9 @@ pub struct BoxTree {
     /// it one — a marker sits outside its item's content, and a box inside the
     /// content cannot.
     markers: SecondaryMap<BoxId, Marker>,
+    /// How far each table cell reaches, for the few that reach past one cell.
+    /// Sparse for the same reason `markers` is.
+    spans: SecondaryMap<BoxId, CellSpan>,
 }
 
 impl BoxTree {
@@ -147,7 +180,18 @@ impl BoxTree {
             root,
             by_node: SecondaryMap::new(),
             markers: SecondaryMap::new(),
+            spans: SecondaryMap::new(),
         }
+    }
+
+    /// Record how far a table cell reaches.
+    pub fn set_span(&mut self, id: BoxId, span: CellSpan) {
+        self.spans.insert(id, span);
+    }
+
+    /// How far a table cell reaches: one column and one row unless it said so.
+    pub fn span(&self, id: BoxId) -> CellSpan {
+        self.spans.get(id).copied().unwrap_or_default()
     }
 
     /// Give a list item the marker it shows.
@@ -215,6 +259,28 @@ impl BoxTree {
             self.boxes[child].parent = Some(parent);
         }
         self.boxes[parent].children = children;
+    }
+
+    /// Replace the text a text box carries, or drop the box if what is left of
+    /// it is nothing.
+    ///
+    /// White-space processing is the one thing that rewrites text after the tree
+    /// is built, because what a space collapses to is a fact about the *run* it
+    /// is in rather than about the node it came from.
+    pub(crate) fn set_text(&mut self, id: BoxId, text: StrTendril) {
+        if let BoxKind::Text(existing) = &mut self.boxes[id].kind {
+            *existing = text;
+        }
+    }
+
+    /// Remove `id` from its parent's children. The box itself stays in the arena
+    /// with nothing pointing at it, which is what the rest of this tree does with
+    /// a box it has replaced.
+    pub(crate) fn detach(&mut self, id: BoxId) {
+        let Some(parent) = self.boxes[id].parent else {
+            return;
+        };
+        self.boxes[parent].children.retain(|&child| child != id);
     }
 
     /// Turn an inline-level box into a block-level one.

@@ -22,7 +22,7 @@
 //!    page.
 
 use otlyra_gfx::kurbo::{Affine, BezPath, Rect as KurboRect, Shape};
-use otlyra_gfx::peniko::{Brush, Color, Fill};
+use otlyra_gfx::peniko::{BlendMode, Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList, HitTestId};
 use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 
@@ -103,6 +103,78 @@ fn paint_scrollbar(list: &mut DisplayList, area: Rect, content_height: f32, scro
     });
 }
 
+/// The colour a selection is drawn in.
+///
+/// The platform's own highlight is a preference this cannot read yet; this is the
+/// blue every browser falls back to, and it is opaque because the text is drawn
+/// over it rather than through it.
+const SELECTION: Color = Color::from_rgb8(0xB4, 0xD5, 0xFE);
+
+/// A box that draws its contents as a group: composited once, moved as one, or
+/// both.
+struct Group<'a> {
+    fragment: &'a Fragment,
+    /// Whether a compositing layer was opened for it, which has to be closed.
+    layer: bool,
+    /// What to move everything it drew by, if it is transformed.
+    transform: Option<Affine>,
+    /// The first item drawn inside it.
+    from: usize,
+}
+
+/// Finish a group: move what it drew, then close the layer it opened.
+///
+/// In that order. The layer is a compositing step around the drawing, and the
+/// transform is a property of the drawing itself — applied after the layer was
+/// closed it would move the boundary rather than the contents.
+fn close(group: Group<'_>, list: &mut DisplayList) {
+    if let Some(transform) = group.transform {
+        list.transform_from(group.from, transform);
+    }
+    if group.layer {
+        list.push(DisplayItem::PopLayer);
+    }
+}
+
+/// The matrix a box's `transform` comes to, about its own origin.
+///
+/// `None` when the box is not transformed, which is nearly every box on nearly
+/// every page. The origin is a point in the box's *border* box — the middle of it
+/// unless `transform-origin` says otherwise — so the steps are applied there and
+/// the box put back afterwards, which is what makes `rotate()` turn a card about
+/// its middle rather than swing it about the corner of the page.
+fn transform_of(fragment: &Fragment, scroll_y: f32) -> Option<Affine> {
+    let steps = &fragment.style.transform;
+    if steps.is_empty() {
+        return None;
+    }
+
+    let rect = fragment.rect;
+    let mut matrix = Affine::IDENTITY;
+    for step in steps.iter() {
+        matrix *= match *step {
+            otlyra_css::TransformOp::Translate(x, y) => Affine::translate((
+                f64::from(x.resolve(rect.width)),
+                f64::from(y.resolve(rect.height)),
+            )),
+            otlyra_css::TransformOp::Scale(x, y) => Affine::scale_non_uniform(x.into(), y.into()),
+            otlyra_css::TransformOp::Rotate(radians) => Affine::rotate(radians.into()),
+            otlyra_css::TransformOp::Skew(x, y) => {
+                Affine::new([1.0, f64::from(y).tan(), f64::from(x).tan(), 1.0, 0.0, 0.0])
+            }
+            otlyra_css::TransformOp::Matrix([a, b, c, d, e, f]) => {
+                Affine::new([a.into(), b.into(), c.into(), d.into(), e.into(), f.into()])
+            }
+        };
+    }
+
+    let origin = (
+        f64::from(rect.x + fragment.style.transform_origin.x.resolve(rect.width)),
+        f64::from(rect.y - scroll_y + fragment.style.transform_origin.y.resolve(rect.height)),
+    );
+    Some(Affine::translate(origin) * matrix * Affine::translate((-origin.0, -origin.1)))
+}
+
 /// Build the display list for `tree`, showing the part of the page under
 /// `scroll_y`, at `viewport` logical size.
 pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f32) -> DisplayList {
@@ -138,6 +210,12 @@ pub struct Frame<'a> {
     /// Whether scrollbars are drawn. Off for a picture that is going to be compared
     /// with one from elsewhere: a scrollbar is the browser's, not the page's.
     pub scrollbars: bool,
+    /// What the reader has selected, in page coordinates.
+    ///
+    /// Drawn behind the text rather than over it, which is what makes the letters
+    /// still readable: a highlight over them would tint them, and inverting them
+    /// instead is a different tradition that this platform is not in.
+    pub selection: &'a [Rect],
 }
 
 impl Default for Frame<'_> {
@@ -148,6 +226,7 @@ impl Default for Frame<'_> {
             port_offset: None,
             background: None,
             scrollbars: true,
+            selection: &[],
         }
     }
 }
@@ -223,9 +302,50 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
     // then whatever a `position` and a `z-index` lifted above it or pushed below.
     // A stable sort, so that within one layer document order still decides.
     let mut visible: Vec<&Fragment> = tree.visible(&scrolled, &screen).collect();
-    visible.sort_by_key(|fragment| fragment.layer);
+    visible.sort_by(|one, other| one.layer.cmp(&other.layer));
+
+    // The groups a box opens over its own contents. A half-transparent element and
+    // everything in it is composited once, as a group: applied to each box on its
+    // own instead, a box over another inside it would show the one underneath
+    // through it, and the two of them together would be darker than either. A
+    // transformed element is the same shape of thing — what is inside it is drawn
+    // in its space — and is applied to the items rather than through a layer, so
+    // that hit testing, which already undoes an item's transform, follows without
+    // being told.
+    let mut groups: Vec<Group<'_>> = Vec::new();
 
     for fragment in visible {
+        while groups
+            .last()
+            .is_some_and(|open| !open.fragment.layer.contains(&fragment.layer))
+        {
+            close(groups.pop().expect("just looked"), &mut list);
+        }
+        if matches!(fragment.kind, FragmentKind::Box) {
+            let faded = fragment.style.opacity < 1.0;
+            let moved = transform_of(fragment, scroll_y);
+            if faded || moved.is_some() {
+                if faded {
+                    list.push(DisplayItem::PushLayer {
+                        blend: BlendMode::default(),
+                        alpha: fragment.style.opacity,
+                        transform: Affine::IDENTITY,
+                        // The whole viewport: a group is a compositing step, not a
+                        // clip, and a box whose contents reach outside it still
+                        // shows them.
+                        clip: KurboRect::new(0.0, 0.0, f64::from(width), f64::from(height))
+                            .to_path(PATH_TOLERANCE),
+                    });
+                }
+                groups.push(Group {
+                    fragment,
+                    layer: faded,
+                    transform: moved,
+                    from: list.len(),
+                });
+            }
+        }
+
         // The initial containing block was painted as the canvas above; painting it
         // again would put a second full-viewport fill in every frame.
         if std::ptr::eq(fragment, &tree.root) {
@@ -236,6 +356,39 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         let is_root_element = canvas_from.is_some_and(|from| std::ptr::eq(fragment, from))
             || root_element.is_some_and(|root| std::ptr::eq(fragment, root));
         let inside = fragment.scroll_port.map_or(0.0, &port_offset);
+        // The highlight goes under the run it covers, so the letters are drawn over
+        // it rather than through it.
+        if matches!(fragment.kind, FragmentKind::Text(_)) {
+            for rect in frame.selection {
+                let covered = rect.intersection(&fragment.rect);
+                if covered.width <= 0.0 || covered.height <= 0.0 {
+                    continue;
+                }
+                let moved = if fragment.fixed {
+                    covered
+                } else {
+                    Rect::new(
+                        covered.x,
+                        covered.y - scroll_y - inside,
+                        covered.width,
+                        covered.height,
+                    )
+                };
+                list.push(DisplayItem::Fill {
+                    style: Fill::NonZero,
+                    transform: Affine::IDENTITY,
+                    brush: Brush::Solid(SELECTION),
+                    brush_transform: None,
+                    shape: KurboRect::new(
+                        f64::from(moved.x),
+                        f64::from(moved.y),
+                        f64::from(moved.right()),
+                        f64::from(moved.bottom()),
+                    )
+                    .to_path(PATH_TOLERANCE),
+                });
+            }
+        }
         paint(
             fragment,
             scroll_y + inside,
@@ -245,6 +398,10 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
             frame.background,
             &mut list,
         );
+    }
+
+    while let Some(group) = groups.pop() {
+        close(group, &mut list);
     }
 
     // Scrollbars last, over everything: the page's, and one for each port that has
@@ -454,21 +611,38 @@ fn paint(
             if rect.width > 0.0 && rect.height > 0.0 && image.width > 0 && image.height > 0 =>
         {
             // The image carries its own pixel size, so the transform is what makes
-            // it the size the page asked for: a scale to the fragment, then a move
-            // to where the fragment is.
+            // it the size the page asked for: a scale to where `object-fit` put
+            // it inside the fragment, then a move to where the fragment is.
+            let placed = object_fit_rect(&fragment.style, rect.width, rect.height, image);
             let scale = Affine::scale_non_uniform(
-                f64::from(rect.width) / f64::from(image.width),
-                f64::from(rect.height) / f64::from(image.height),
+                f64::from(placed.width) / f64::from(image.width),
+                f64::from(placed.height) / f64::from(image.height),
             );
+            let offset = Affine::translate((f64::from(placed.x), f64::from(placed.y)));
+            // A picture larger than its box is cut off at the box, which is what
+            // `cover` is for. The rectangle a clip takes is in the *image's* own
+            // space, after the transform, so the box is expressed there — in
+            // pixels of the file rather than pixels of the page.
+            let clip_rect = (placed.x < 0.0
+                || placed.y < 0.0
+                || placed.width > rect.width
+                || placed.height > rect.height)
+                .then(|| {
+                    let per_x = f64::from(image.width) / f64::from(placed.width.max(f32::EPSILON));
+                    let per_y =
+                        f64::from(image.height) / f64::from(placed.height.max(f32::EPSILON));
+                    otlyra_gfx::kurbo::Rect::new(
+                        f64::from(-placed.x) * per_x,
+                        f64::from(-placed.y) * per_y,
+                        f64::from(rect.width - placed.x) * per_x,
+                        f64::from(rect.height - placed.y) * per_y,
+                    )
+                });
             list.push(DisplayItem::Image {
                 image: otlyra_gfx::ImageResource::from(image.clone()),
                 sampler: otlyra_gfx::peniko::ImageSampler::default(),
-                transform: origin * scale,
-                // No clip: the transform already lands the picture exactly on the
-                // fragment, and the rectangle a clip takes is in the transformed
-                // space rather than the page's, so a page-space rectangle here
-                // would cut the picture down by whatever it was scaled by.
-                clip_rect: None,
+                transform: origin * offset * scale,
+                clip_rect,
             });
         }
 
@@ -740,6 +914,54 @@ fn gradient_brush(
 /// One radius per corner rather than an ellipse's two, and the radii are scaled
 /// down together if they overlap — which is the rule CSS gives for a box asked for
 /// rounder corners than it has room for.
+/// Where inside its box a replaced element's picture is drawn.
+///
+/// The box is layout's answer and is not changed here: `object-fit` decides what
+/// happens to the picture *inside* it, and a picture that comes out larger is cut
+/// off by the box rather than making it bigger. The offsets come from
+/// `object-position`, which is the same arithmetic as a background's and starts
+/// in the middle rather than the corner.
+fn object_fit_rect(
+    style: &otlyra_css::ComputedStyle,
+    box_width: f32,
+    box_height: f32,
+    image: &otlyra_gfx::peniko::ImageData,
+) -> Placed {
+    use otlyra_css::ObjectFit;
+
+    let own = (image.width as f32, image.height as f32);
+    let contain = (box_width / own.0).min(box_height / own.1);
+    let (width, height) = match style.object_fit {
+        ObjectFit::Fill => (box_width, box_height),
+        ObjectFit::Contain => (own.0 * contain, own.1 * contain),
+        ObjectFit::Cover => {
+            let cover = (box_width / own.0).max(box_height / own.1);
+            (own.0 * cover, own.1 * cover)
+        }
+        ObjectFit::None => own,
+        ObjectFit::ScaleDown => {
+            let scale = contain.min(1.0);
+            (own.0 * scale, own.1 * scale)
+        }
+    };
+
+    let position = style.object_position;
+    Placed {
+        x: position.x.resolve(box_width - width),
+        y: position.y.resolve(box_height - height),
+        width,
+        height,
+    }
+}
+
+/// A picture's place inside its box, relative to the box's own corner.
+struct Placed {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
 fn box_shape(rect: Rect, scroll_y: f32, style: &otlyra_css::ComputedStyle) -> BezPath {
     shape_with_radii(rect, scroll_y, style, 0.0)
 }
@@ -937,12 +1159,16 @@ mod tests {
                 height: 600.0,
                 scale: 1.0,
                 text_scale: 1.0,
+                color_scheme: Default::default(),
             },
         );
-        let images: otlyra_layout::Images = otlyra_layout::image_sources(&parsed.document)
-            .into_iter()
-            .map(|source| (source.node, image.clone()))
-            .collect();
+        let images: otlyra_layout::Images = otlyra_layout::image_sources(
+            &parsed.document,
+            otlyra_css::cascade::Viewport::default(),
+        )
+        .into_iter()
+        .map(|source| (source.node, otlyra_layout::Picture::new(image.clone())))
+        .collect();
         let boxes =
             otlyra_layout::build_box_tree_with_images(&parsed.document, Some(&styles), &images);
         let mut text = TextEngine::isolated();
@@ -967,6 +1193,7 @@ mod tests {
                 height: 600.0,
                 scale: 1.0,
                 text_scale: 1.0,
+                color_scheme: Default::default(),
             },
         );
         let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
@@ -1026,6 +1253,283 @@ mod tests {
             under.iter().position(|colour| *colour == red)
                 < under.iter().position(|colour| *colour == blue),
             "a negative z-index must paint below the flow"
+        );
+    }
+
+    /// `z-index` orders a box against its siblings, not against the page.
+    ///
+    /// A box with a large index inside a box with a small one stays under
+    /// everything the small one is under: the large number is compared only with
+    /// the numbers written inside the same positioned ancestor.
+    #[test]
+    fn a_large_index_inside_a_small_one_stays_inside_it() {
+        let order = fill_order(&styled_page(
+            "<style>body { margin: 0 } .box { position: absolute; width: 100px; height: 60px } \
+             .outer { left: 0; top: 0; z-index: 1; background: rgb(255, 0, 0) } \
+             .inner { left: 20px; top: 20px; z-index: 100; background: rgb(0, 0, 255) } \
+             .beside { left: 40px; top: 10px; z-index: 2; background: rgb(0, 255, 0) }</style> \
+             <div class='box outer'><div class='box inner'></div></div> \
+             <div class='box beside'></div>",
+            0.0,
+        ));
+
+        let at = |colour: Color| order.iter().position(|painted| *painted == colour);
+        let (outer, inner, beside) = (
+            at(Color::from_rgb8(255, 0, 0)),
+            at(Color::from_rgb8(0, 0, 255)),
+            at(Color::from_rgb8(0, 255, 0)),
+        );
+        assert!(
+            outer < inner,
+            "a box paints under what is inside it: {order:?}"
+        );
+        assert!(
+            inner < beside,
+            "an index of 100 inside a 1 is still under a 2: {order:?}"
+        );
+    }
+
+    /// A selection is drawn behind the text it covers: the highlight is pushed
+    /// before the glyphs of the run it belongs to, so the letters are drawn over it.
+    #[test]
+    fn a_selection_is_drawn_under_the_text() {
+        let parsed = otlyra_html::parse(b"<body><p>one two three</p>", Some("utf-8"));
+        let styles = otlyra_css::cascade::style_document(
+            &parsed.document,
+            otlyra_css::cascade::Viewport {
+                width: 800.0,
+                height: 600.0,
+                scale: 1.0,
+                text_scale: 1.0,
+                color_scheme: Default::default(),
+            },
+        );
+        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+
+        let start = otlyra_layout::selection::position_at(&fragments, 0.0, 20.0).expect("a place");
+        let end = otlyra_layout::selection::position_at(&fragments, 60.0, 20.0).expect("another");
+        let highlight = otlyra_layout::selection::rects(
+            &fragments,
+            otlyra_layout::Selection {
+                anchor: start,
+                focus: end,
+            },
+        );
+        assert!(!highlight.is_empty(), "something is selected");
+
+        let list = build_display_list_with(
+            &fragments,
+            &Frame {
+                viewport: (800.0, 600.0),
+                selection: &highlight,
+                ..Frame::default()
+            },
+        );
+
+        let mut painted = None;
+        for item in list.items() {
+            match item {
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    shape,
+                    ..
+                } if *colour == SELECTION => painted = Some(shape.bounding_box()),
+                DisplayItem::Glyphs { .. } => {
+                    assert!(
+                        painted.is_some(),
+                        "the glyphs were drawn before the highlight under them"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let painted = painted.expect("the highlight was drawn");
+        assert!(
+            painted.width() > 0.0 && painted.width() < 200.0,
+            "it covers the words it was asked for and no more: {painted:?}"
+        );
+    }
+
+    /// A transformed box draws where its transform puts it, and so does everything
+    /// inside it — including the region a click is tested against, which is the
+    /// same item with the same transform on it.
+    #[test]
+    fn a_transform_moves_the_drawing_and_what_is_tested_against_it() {
+        let list = styled_page(
+            "<style>body { margin: 0 } .card { width: 100px; height: 50px; \
+             background: rgb(255, 0, 0) } .moved { transform: translate(200px, 100px) }</style> \
+             <div class='card moved'><a href='/somewhere'>a link inside it</a></div>",
+            0.0,
+        );
+
+        let red = list
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    transform,
+                    shape,
+                    ..
+                } if *colour == Color::from_rgb8(255, 0, 0) => {
+                    Some(transform.transform_rect_bbox(shape.bounding_box()))
+                }
+                _ => None,
+            })
+            .expect("the card");
+        assert!(
+            (red.x0 - 200.0).abs() < 0.01 && (red.y0 - 100.0).abs() < 0.01,
+            "the box is drawn where the transform puts it: {red:?}"
+        );
+
+        // The link inside it is hit where it is drawn, not where it was laid out:
+        // the two points land on different things, and the near one on the link.
+        let drawn = otlyra_gfx::hit_test(&list, (210.0, 110.0)).expect("something is drawn there");
+        let empty = otlyra_gfx::hit_test(&list, (10.0, 10.0));
+        assert!(
+            empty.is_none_or(|hit| hit.id != drawn.id),
+            "the link is still where it was laid out rather than where it is drawn"
+        );
+    }
+
+    /// The steps of a transform apply in the order they were written, and about
+    /// the box's own middle unless it says otherwise.
+    #[test]
+    fn transform_steps_apply_in_order_and_about_the_origin() {
+        let corner = |css: &str| {
+            let list = styled_page(
+                &format!(
+                    "<style>body {{ margin: 0 }} .card {{ width: 100px; height: 100px; \
+                     background: rgb(255, 0, 0); {css} }}</style><div class=card></div>"
+                ),
+                0.0,
+            );
+            list.items()
+                .iter()
+                .find_map(|item| match item {
+                    DisplayItem::Fill {
+                        brush: Brush::Solid(colour),
+                        transform,
+                        shape,
+                        ..
+                    } if *colour == Color::from_rgb8(255, 0, 0) => {
+                        Some(transform.transform_rect_bbox(shape.bounding_box()))
+                    }
+                    _ => None,
+                })
+                .expect("the card")
+        };
+
+        // Turned about its middle, a square keeps its middle and grows its box.
+        let turned = corner("transform: rotate(45deg)");
+        assert!(
+            (turned.center().x - 50.0).abs() < 0.01 && (turned.center().y - 50.0).abs() < 0.01,
+            "a box turns about its own middle: {turned:?}"
+        );
+        assert!(turned.width() > 140.0, "and its bounds grow: {turned:?}");
+
+        // About the corner instead, the middle moves.
+        let cornered = corner("transform: rotate(45deg); transform-origin: 0 0");
+        assert!(
+            (cornered.y0 - 0.0).abs() < 0.01 && cornered.center().y > 60.0,
+            "an origin of its own turns it about that corner: {cornered:?}"
+        );
+
+        // Order matters: moving then turning is not turning then moving.
+        let first = corner("transform: translate(50px, 0) rotate(30deg)");
+        let second = corner("transform: rotate(30deg) translate(50px, 0)");
+        assert!(
+            (first.center().x - second.center().x).abs() > 1.0
+                || (first.center().y - second.center().y).abs() > 1.0,
+            "the steps are applied in the order written: {first:?} against {second:?}"
+        );
+    }
+
+    /// A half-transparent box and everything in it is composited once: one layer
+    /// opened before the box and closed after the last thing inside it.
+    #[test]
+    fn opacity_composites_a_box_and_its_contents_as_one_group() {
+        let list = styled_page(
+            "<style>body { margin: 0 } .plate { width: 100px; height: 50px; \
+             background: rgb(255, 0, 0) } .half { opacity: 0.5 } \
+             .over { position: absolute; left: 10px; top: 10px; width: 20px; height: 20px; \
+             background: rgb(0, 0, 255) }</style> \
+             <div class='plate half'><div class=over></div></div><div class=plate></div>",
+            0.0,
+        );
+
+        let mut depth = 0i32;
+        let mut inside = Vec::new();
+        let mut outside = Vec::new();
+        let mut alpha = None;
+        for item in list.items() {
+            match item {
+                DisplayItem::PushLayer { alpha: value, .. } => {
+                    depth += 1;
+                    alpha = Some(*value);
+                }
+                DisplayItem::PopLayer => depth -= 1,
+                DisplayItem::Fill {
+                    brush: Brush::Solid(colour),
+                    ..
+                } => {
+                    if depth > 0 {
+                        inside.push(*colour);
+                    } else {
+                        outside.push(*colour);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(depth, 0, "every layer opened was closed");
+        assert_eq!(alpha, Some(0.5), "the group carries the box's opacity");
+        assert!(
+            inside.contains(&Color::from_rgb8(255, 0, 0))
+                && inside.contains(&Color::from_rgb8(0, 0, 255)),
+            "the box and the positioned box inside it are both in the group: {inside:?}"
+        );
+        assert!(
+            outside.contains(&Color::from_rgb8(255, 0, 0)),
+            "the opaque box after it is not: {outside:?}"
+        );
+    }
+
+    /// A negative index inside a positioned box paints over that box's background
+    /// and under its content, rather than dropping below the page's flow.
+    #[test]
+    fn a_negative_index_inside_a_positioned_box_stays_inside_it() {
+        let order = fill_order(&styled_page(
+            "<style>body { margin: 0 } .flow { height: 80px; background: rgb(0, 255, 0) } \
+             .parent { position: absolute; left: 0; top: 0; width: 200px; height: 120px; \
+             background: rgb(255, 0, 0) } \
+             .under { position: absolute; left: 20px; top: 20px; width: 100px; height: 60px; \
+             background: rgb(0, 0, 255); z-index: -1 }</style> \
+             <div class=flow></div><div class=parent><div class=under></div></div>",
+            0.0,
+        ));
+
+        let at = |colour: Color| order.iter().position(|painted| *painted == colour);
+        let (flow, parent, under) = (
+            at(Color::from_rgb8(0, 255, 0)),
+            at(Color::from_rgb8(255, 0, 0)),
+            at(Color::from_rgb8(0, 0, 255)),
+        );
+        assert!(
+            flow < parent && parent < under,
+            "a negative index inside a positioned box paints over that box, \
+             not under the page: {order:?}"
         );
     }
 
@@ -1348,6 +1852,7 @@ mod tests {
                 height: 600.0,
                 scale: 1.0,
                 text_scale: 1.0,
+                color_scheme: Default::default(),
             },
         );
         let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
@@ -1585,6 +2090,81 @@ mod tests {
         let origin = transform * otlyra_gfx::kurbo::Point::new(0.0, 0.0);
         let far = transform * otlyra_gfx::kurbo::Point::new(f64::from(width), f64::from(height));
         (origin.x, origin.y, far.x - origin.x, far.y - origin.y)
+    }
+
+    /// `object-fit` decides what happens to the picture inside the box layout
+    /// gave it, and never what that box is.
+    #[test]
+    fn object_fit_places_the_picture_inside_its_box() {
+        // A box twice as tall as it is wide, and a picture twice as wide as it
+        // is tall, so every value has something to do.
+        let page = |fit: &str| {
+            page_with_image(
+                &format!("img {{ width: 100px; height: 200px; object-fit: {fit} }}"),
+                (200, 100),
+            )
+        };
+
+        assert_eq!(
+            image_rect(&page("fill")),
+            (0.0, 0.0, 100.0, 200.0),
+            "stretched to the box, ratio abandoned"
+        );
+        assert_eq!(
+            image_rect(&page("contain")),
+            (0.0, 75.0, 100.0, 50.0),
+            "as large as fits, centred in what is left"
+        );
+        assert_eq!(
+            image_rect(&page("cover")),
+            (-150.0, 0.0, 400.0, 200.0),
+            "large enough to cover, and cut off by the box"
+        );
+        assert_eq!(
+            image_rect(&page("none")),
+            (-50.0, 50.0, 200.0, 100.0),
+            "its own size, centred"
+        );
+        assert_eq!(
+            image_rect(&page("scale-down")),
+            (0.0, 75.0, 100.0, 50.0),
+            "which here is `contain`, because its own size does not fit"
+        );
+    }
+
+    /// A picture larger than its box is cut off at the box rather than spilling
+    /// over whatever is drawn next — and the rectangle that does the cutting is
+    /// in the picture's own pixels, because that is the space the clip is
+    /// applied in.
+    #[test]
+    fn a_picture_that_overflows_its_box_is_clipped_to_it() {
+        let list = page_with_image(
+            "img { width: 100px; height: 100px; object-fit: none }",
+            (200, 100),
+        );
+        let clip = list
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image { clip_rect, .. } => *clip_rect,
+                _ => None,
+            })
+            .expect("a clip");
+        assert_eq!((clip.x0, clip.x1), (50.0, 150.0), "the middle hundred");
+        assert_eq!((clip.y0, clip.y1), (0.0, 100.0), "and all of the height");
+    }
+
+    /// `object-position` moves what is left of the picture inside the box, with
+    /// the same arithmetic a background's position uses.
+    #[test]
+    fn object_position_moves_the_picture_in_its_box() {
+        let (x, y, width, height) = image_rect(&page_with_image(
+            "img { width: 100px; height: 200px; object-fit: contain; \
+             object-position: 0 100% }",
+            (200, 100),
+        ));
+        assert_eq!((x, y), (0.0, 150.0), "at the bottom rather than the middle");
+        assert_eq!((width, height), (100.0, 50.0));
     }
 
     /// A picture asked for at a size is drawn at that size, whatever size its file

@@ -17,6 +17,9 @@ pub enum Display {
     Block,
     /// Inline-level: flows in a line box.
     Inline,
+    /// Inline-level outside, a block container inside: it flows in a line as one
+    /// unbreakable thing, and what is in it is laid out as a block.
+    InlineBlock,
     /// A flex container: block-level outside, and its children are flex items
     /// rather than a block or inline formatting context.
     Flex,
@@ -224,6 +227,65 @@ impl Border {
     }
 }
 
+/// `box-sizing`: what a `width` and a `height` are measured across.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BoxSizing {
+    /// The content box: the padding and the border are added outside it, which is
+    /// what CSS starts from.
+    Content,
+    /// The border box: the padding and the border come out of the number, which is
+    /// what most of the web sets on everything and then writes its widths against.
+    Border,
+}
+
+/// `border-collapse`: whether a table's cells each draw their own edge or share
+/// one between them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BorderCollapse {
+    /// Each cell has its own border, with `border-spacing` between them.
+    Separate,
+    /// Neighbouring cells share one edge, drawn once, and the spacing is ignored.
+    Collapse,
+}
+
+/// One step of a `transform`, in the two dimensions this draws in.
+///
+/// Kept as the steps rather than multiplied into one matrix, because a percentage
+/// in a `translate()` is of the box's own size and the box is not measured until
+/// layout has run. The rasterizer resolves them against the box it is drawing.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TransformOp {
+    /// Move, each axis a length or a fraction of the box's own size.
+    Translate(Length, Length),
+    /// Multiply, around the origin.
+    Scale(f32, f32),
+    /// Turn, in radians, clockwise.
+    Rotate(f32),
+    /// Slant, in radians.
+    Skew(f32, f32),
+    /// The six numbers of a 2D matrix, in CSS order.
+    Matrix([f32; 6]),
+}
+
+/// Where a `transform` is applied from: the point the box turns and grows about.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TransformOrigin {
+    /// Across the box.
+    pub x: Length,
+    /// Down it.
+    pub y: Length,
+}
+
+impl Default for TransformOrigin {
+    /// The middle of the box, which is what CSS starts from.
+    fn default() -> Self {
+        Self {
+            x: Length::Percent(0.5),
+            y: Length::Percent(0.5),
+        }
+    }
+}
+
 /// `text-align`, in the values a block formatting context can honour.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TextAlign {
@@ -408,6 +470,39 @@ impl BackgroundPosition {
         x: Anchor::START,
         y: Anchor::START,
     };
+
+    /// The middle of the box, which is where `object-position` starts.
+    pub const CENTER: Self = Self {
+        x: Anchor {
+            fraction: 0.5,
+            offset: 0.0,
+        },
+        y: Anchor {
+            fraction: 0.5,
+            offset: 0.0,
+        },
+    };
+}
+
+/// `object-fit`: how a replaced element's own picture is fitted into the box the
+/// page gave it.
+///
+/// The box is decided by layout and this decides what happens inside it. The
+/// default is `Fill`, which stretches — the behaviour every picture had before
+/// the property existed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ObjectFit {
+    /// Stretched to the box, ratio abandoned.
+    #[default]
+    Fill,
+    /// As large as fits with the ratio kept: the box may show through.
+    Contain,
+    /// Small enough to cover the box with the ratio kept: the picture is cut off.
+    Cover,
+    /// Its own size, whatever the box is.
+    None,
+    /// `None`, unless that overflows, in which case `Contain`.
+    ScaleDown,
 }
 
 /// One `box-shadow`.
@@ -580,10 +675,29 @@ pub enum Clear {
 /// cannot say: collapse the spaces *and* do not wrap.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WhiteSpace {
-    /// Runs of whitespace collapse to one space.
-    Normal,
-    /// Whitespace and newlines are kept exactly.
-    Pre,
+    /// Runs of white space collapse to one space, and a line ending in the
+    /// source is one more piece of white space.
+    Collapse,
+    /// Every space, tab and line ending is kept, and a line ending breaks the
+    /// line.
+    Preserve,
+    /// Spaces and tabs collapse; a line ending is still a break. `pre-line`.
+    PreserveBreaks,
+    /// Everything is kept, and a line may break inside a run of spaces rather
+    /// than only between words. `break-spaces`.
+    BreakSpaces,
+}
+
+impl WhiteSpace {
+    /// Whether a run of spaces and tabs collapses to one space.
+    pub fn collapses_spaces(self) -> bool {
+        matches!(self, Self::Collapse | Self::PreserveBreaks)
+    }
+
+    /// Whether a line ending in the source breaks the line.
+    pub fn preserves_breaks(self) -> bool {
+        !matches!(self, Self::Collapse)
+    }
 }
 
 /// `text-wrap-mode`: whether a line may be broken at all.
@@ -694,6 +808,11 @@ pub struct ComputedStyle {
     pub background_repeat: BackgroundRepeat,
     /// Where a background picture sits in the box it is behind.
     pub background_position: BackgroundPosition,
+    /// How a replaced element's picture is fitted into its box.
+    pub object_fit: ObjectFit,
+    /// And where inside the box what is left of it sits. Its initial value is
+    /// the middle, which is not `background-position`'s corner.
+    pub object_position: BackgroundPosition,
     /// `background-image`, when it is a gradient. A picture behind a box is not
     /// read yet; a gradient is, because it is what a page uses it for.
     pub background_gradient: Option<Gradient>,
@@ -729,6 +848,23 @@ pub struct ComputedStyle {
     /// `border-spacing`, horizontal and vertical, in CSS pixels. Inherited, which
     /// is what lets it be written on the table and read by the cells.
     pub border_spacing: (f32, f32),
+    /// `border-collapse`. Inherited, and read on the table: it decides whether the
+    /// cells each draw their own edge inside the spacing or share one between them.
+    pub border_collapse: BorderCollapse,
+    /// `box-sizing`.
+    pub box_sizing: BoxSizing,
+    /// `opacity`, 0 to 1. Not inherited, and not a property of the text either: it
+    /// applies to the element and everything in it *once*, as a group, which is why
+    /// a half-transparent box with overlapping children does not show the overlap
+    /// through itself.
+    pub opacity: f32,
+    /// `transform`, in the order the steps were written. Empty for `none`.
+    ///
+    /// Shared: a page that transforms a hundred cards writes one list and every
+    /// one of them points at it.
+    pub transform: Arc<[TransformOp]>,
+    /// `transform-origin`.
+    pub transform_origin: TransformOrigin,
     /// `margin`.
     pub margin: Sides<LengthOrAuto>,
     /// `padding`.
@@ -823,6 +959,8 @@ impl Default for ComputedStyle {
             background_size: BackgroundSize::Auto,
             background_repeat: BackgroundRepeat::REPEAT,
             background_position: BackgroundPosition::START,
+            object_fit: ObjectFit::Fill,
+            object_position: BackgroundPosition::CENTER,
             shadows: Vec::new(),
             text_shadows: Vec::new(),
             font_family: Arc::from("serif"),
@@ -838,7 +976,12 @@ impl Default for ComputedStyle {
             list_style: ListStyle::Disc,
             vertical_align: VerticalAlign::Baseline,
             border_spacing: (0.0, 0.0),
-            white_space: WhiteSpace::Normal,
+            border_collapse: BorderCollapse::Separate,
+            box_sizing: BoxSizing::Content,
+            opacity: 1.0,
+            transform: Arc::from(Vec::new()),
+            transform_origin: TransformOrigin::default(),
+            white_space: WhiteSpace::Collapse,
             text_wrap: TextWrap::Wrap,
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
@@ -899,6 +1042,7 @@ impl ComputedStyle {
             line_height: parent.line_height,
             list_style: parent.list_style,
             border_spacing: parent.border_spacing,
+            border_collapse: parent.border_collapse,
             white_space: parent.white_space,
             text_wrap: parent.text_wrap,
             text_decoration: parent.text_decoration,

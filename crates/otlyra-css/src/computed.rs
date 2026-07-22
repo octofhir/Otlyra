@@ -12,10 +12,11 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border, Clear,
-    ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient,
-    GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow, Placement, Position,
-    Repeat, Shadow, Sides, TextAlign, TextDecoration, TextWrap, Track, WhiteSpace,
+    AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border,
+    BorderCollapse, BoxSizing, Clear, ComputedStyle, Corners, Display, FlexDirection, FlexWrap,
+    Float, FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight,
+    ObjectFit, Overflow, Placement, Position, Repeat, Shadow, Sides, TextAlign, TextDecoration,
+    TextWrap, Track, TransformOp, TransformOrigin, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -63,6 +64,17 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
                 spacing.vertical().to_f32_px(),
             )
         },
+        border_collapse: match values.get_inherited_table().border_collapse {
+            style::computed_values::border_collapse::T::Collapse => BorderCollapse::Collapse,
+            style::computed_values::border_collapse::T::Separate => BorderCollapse::Separate,
+        },
+        box_sizing: match values.get_position().box_sizing {
+            style::computed_values::box_sizing::T::BorderBox => BoxSizing::Border,
+            style::computed_values::box_sizing::T::ContentBox => BoxSizing::Content,
+        },
+        opacity: values.get_effects().opacity.clamp(0.0, 1.0),
+        transform: transform(values),
+        transform_origin: transform_origin(values),
         white_space: white_space(values),
         text_wrap: text_wrap(values),
         text_decoration: text_decoration(values),
@@ -106,6 +118,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         background_size: background_size(values),
         background_repeat: background_repeat(values),
         background_position: background_position(values),
+        object_fit: object_fit(values),
+        object_position: object_position(values),
         shadows: shadows(values),
         text_shadows: text_shadows(values),
         grid_columns: tracks(&values.get_position().grid_template_columns),
@@ -161,7 +175,15 @@ fn display_of(values: &ComputedValues) -> Display {
         return part;
     }
     if display.outside() == DisplayOutside::Inline {
-        Display::Inline
+        // `inline-block` is a block container that sits in a line: inline outside,
+        // a formatting context of its own inside. The difference from `inline` is
+        // the whole of what a page uses it for — a width, a height and a padding
+        // that push the line around rather than being ignored.
+        if display.inside() == DisplayInside::FlowRoot {
+            Display::InlineBlock
+        } else {
+            Display::Inline
+        }
     } else {
         Display::Block
     }
@@ -256,10 +278,13 @@ fn white_space(values: &ComputedValues) -> WhiteSpace {
     use style::properties::longhands::white_space_collapse::computed_value::T as WhiteSpaceCollapse;
 
     match values.clone_white_space_collapse() {
-        WhiteSpaceCollapse::Collapse => WhiteSpace::Normal,
-        // Preserve, PreserveBreaks, PreserveSpaces and BreakSpaces all keep more
-        // than `normal` does; layout has one bit for that today.
-        _ => WhiteSpace::Pre,
+        WhiteSpaceCollapse::Collapse => WhiteSpace::Collapse,
+        WhiteSpaceCollapse::PreserveBreaks => WhiteSpace::PreserveBreaks,
+        WhiteSpaceCollapse::BreakSpaces => WhiteSpace::BreakSpaces,
+        // `preserve` and `preserve-spaces`, which differ only in what they do
+        // with a line ending — and `preserve-spaces` is not a value any of
+        // `white-space`'s own shorthands produce.
+        _ => WhiteSpace::Preserve,
     }
 }
 
@@ -354,6 +379,57 @@ fn background_image(values: &ComputedValues) -> Option<Arc<str>> {
         style::url::ComputedUrl::Valid(resolved) => Arc::from(resolved.as_str()),
         style::url::ComputedUrl::Invalid(specified) => Arc::from(specified.as_str()),
     })
+}
+
+/// `transform`, narrowed to the steps this draws in.
+///
+/// Two dimensions. A page that turns a card in three is drawing something this
+/// cannot draw, and the flat part of it — which is what a `rotate3d` about the z
+/// axis or a `translate3d` along x and y is — is taken and the rest dropped,
+/// rather than the whole rule being ignored.
+fn transform(values: &ComputedValues) -> Arc<[TransformOp]> {
+    use style::values::computed::transform::TransformOperation as Op;
+
+    let operations = &values.get_box().transform.0;
+    if operations.is_empty() {
+        return Arc::from(Vec::new());
+    }
+
+    let radians = |angle: &style::values::computed::Angle| angle.radians();
+    let steps: Vec<TransformOp> = operations
+        .iter()
+        .filter_map(|operation| {
+            Some(match operation {
+                Op::Matrix(matrix) => TransformOp::Matrix([
+                    matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f,
+                ]),
+                Op::Translate(x, y) => TransformOp::Translate(length(x), length(y)),
+                Op::TranslateX(x) => TransformOp::Translate(length(x), Length::ZERO),
+                Op::TranslateY(y) => TransformOp::Translate(Length::ZERO, length(y)),
+                Op::Translate3D(x, y, _) => TransformOp::Translate(length(x), length(y)),
+                Op::Scale(x, y) => TransformOp::Scale(*x, *y),
+                Op::ScaleX(x) => TransformOp::Scale(*x, 1.0),
+                Op::ScaleY(y) => TransformOp::Scale(1.0, *y),
+                Op::Scale3D(x, y, _) => TransformOp::Scale(*x, *y),
+                Op::Rotate(angle) | Op::RotateZ(angle) => TransformOp::Rotate(radians(angle)),
+                Op::Skew(x, y) => TransformOp::Skew(radians(x), radians(y)),
+                Op::SkewX(x) => TransformOp::Skew(radians(x), 0.0),
+                Op::SkewY(y) => TransformOp::Skew(0.0, radians(y)),
+                _ => return None,
+            })
+        })
+        .collect();
+
+    Arc::from(steps)
+}
+
+/// `transform-origin`, in the two axes that matter here.
+fn transform_origin(values: &ComputedValues) -> TransformOrigin {
+    let origin = &values.get_box().transform_origin;
+    TransformOrigin {
+        x: length(&origin.horizontal),
+        y: length(&origin.vertical),
+    }
 }
 
 /// `background-size` for that layer.
@@ -522,6 +598,37 @@ fn background_position(values: &ComputedValues) -> BackgroundPosition {
     BackgroundPosition {
         x: anchor(background.background_position_x.0.first()),
         y: anchor(background.background_position_y.0.first()),
+    }
+}
+
+/// `object-fit`, as the box tree spells it.
+fn object_fit(values: &ComputedValues) -> ObjectFit {
+    match values.get_position().object_fit {
+        style::computed_values::object_fit::T::Fill => ObjectFit::Fill,
+        style::computed_values::object_fit::T::Contain => ObjectFit::Contain,
+        style::computed_values::object_fit::T::Cover => ObjectFit::Cover,
+        style::computed_values::object_fit::T::None => ObjectFit::None,
+        style::computed_values::object_fit::T::ScaleDown => ObjectFit::ScaleDown,
+    }
+}
+
+/// `object-position`, which is `background-position`'s arithmetic with a
+/// different starting value.
+fn object_position(values: &ComputedValues) -> BackgroundPosition {
+    use style::values::computed::Length;
+
+    let position = &values.get_position().object_position;
+    let anchor = |value: &style::values::computed::LengthPercentage| {
+        let offset = value.resolve(Length::new(0.0)).px();
+        Anchor {
+            fraction: value.resolve(Length::new(1.0)).px() - offset,
+            offset,
+        }
+    };
+
+    BackgroundPosition {
+        x: anchor(&position.horizontal),
+        y: anchor(&position.vertical),
     }
 }
 
@@ -1236,6 +1343,38 @@ mod tests {
     /// the ones that compute to a `calc()`, which is what makes the two-probe
     /// reading worth having.
     #[test]
+    fn object_fit_and_position_are_read() {
+        let style = |declarations: &str| {
+            layout_style(
+                &format!("<style>img {{ {declarations} }}</style><img src=x.png>"),
+                "img",
+            )
+        };
+
+        assert_eq!(style("").object_fit, ObjectFit::Fill, "the initial value");
+        assert_eq!(
+            style("").object_position,
+            BackgroundPosition::CENTER,
+            "which starts in the middle rather than the corner"
+        );
+        assert_eq!(style("object-fit: cover").object_fit, ObjectFit::Cover);
+        assert_eq!(
+            style("object-fit: scale-down").object_fit,
+            ObjectFit::ScaleDown
+        );
+        assert_eq!(
+            style("object-position: left bottom").object_position,
+            BackgroundPosition {
+                x: Anchor::START,
+                y: Anchor {
+                    fraction: 1.0,
+                    offset: 0.0
+                },
+            }
+        );
+    }
+
+    #[test]
     fn background_position_reads_both_halves_of_a_calc() {
         let position = |source: &str| {
             layout_style(
@@ -1303,7 +1442,7 @@ mod tests {
         );
         assert_eq!(
             layout_style("<style>p { display: inline-block }</style><p>x", "p").display,
-            Display::Inline
+            Display::InlineBlock
         );
     }
 
@@ -1438,12 +1577,29 @@ mod tests {
         assert_eq!(align("justify"), TextAlign::Start);
     }
 
+    /// The four ways a box can treat the white space in it, which is more than
+    /// the two `white-space` looks like it has.
     #[test]
-    fn preserved_whitespace_survives_as_a_flag() {
+    fn every_way_of_treating_white_space_arrives_as_itself() {
+        let mode = |value: &str| {
+            layout_style(
+                &format!("<style>p {{ white-space: {value} }}</style><p>x"),
+                "p",
+            )
+            .white_space
+        };
+
+        assert_eq!(mode("normal"), WhiteSpace::Collapse);
         assert_eq!(
-            layout_style("<style>p { white-space: pre }</style><p>x", "p").white_space,
-            WhiteSpace::Pre
+            mode("nowrap"),
+            WhiteSpace::Collapse,
+            "which wraps is a
+             different question, and is `text-wrap-mode`"
         );
-        assert_eq!(layout_style("<p>x", "p").white_space, WhiteSpace::Normal);
+        assert_eq!(mode("pre"), WhiteSpace::Preserve);
+        assert_eq!(mode("pre-wrap"), WhiteSpace::Preserve);
+        assert_eq!(mode("pre-line"), WhiteSpace::PreserveBreaks);
+        assert_eq!(mode("break-spaces"), WhiteSpace::BreakSpaces);
+        assert_eq!(layout_style("<p>x", "p").white_space, WhiteSpace::Collapse);
     }
 }

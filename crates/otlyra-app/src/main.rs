@@ -54,6 +54,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Renderer::Skia)]
     renderer: Renderer,
 
+    /// Which palette to answer `prefers-color-scheme` with.
+    ///
+    /// A window follows the system and needs no flag; a screenshot has no window
+    /// to be told by one, and a reference browser rendering the same page follows
+    /// the system it is on — so a comparison has to be able to name the palette.
+    #[arg(long, value_enum, value_name = "SCHEME")]
+    color_scheme: Option<Palette>,
+
     /// Fetch this URL and show the page in a window.
     ///
     /// A bare host is assumed to be `https`. With `--dump-dom` or `--dump-source`
@@ -132,6 +140,19 @@ struct Cli {
 }
 
 impl Cli {
+    /// The preferences to start from: what is saved, with what the command line
+    /// overrides applied on top.
+    fn settings(&self) -> otlyra_app::settings::Settings {
+        let mut settings = otlyra_app::preferences::load();
+        if let Some(palette) = self.color_scheme {
+            settings.appearance = match palette {
+                Palette::Light => otlyra_app::settings::Appearance::Light,
+                Palette::Dark => otlyra_app::settings::Appearance::Dark,
+            };
+        }
+        settings
+    }
+
     /// The viewport `--screenshot` and `--dump-display-list` render at.
     fn viewport(&self) -> Viewport {
         Viewport::new(
@@ -140,6 +161,15 @@ impl Cli {
             self.scale_factor,
         )
     }
+}
+
+/// The palette `--color-scheme` names.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Palette {
+    /// Dark on light.
+    Light,
+    /// Light on dark.
+    Dark,
 }
 
 /// The rasterizer backends the `PaintTarget` seam offers.
@@ -165,7 +195,7 @@ fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::io::Write::flush(&mut std::io::stdout())?;
     tracing::info!(address = %server.address(), "answering WebDriver BiDi");
 
-    let browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+    let browser = Browser::with_settings(NetLoader::default(), cli.settings());
     let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
     loop {
         server.serve_one(&mut session)?;
@@ -182,8 +212,7 @@ fn main() -> ExitCode {
     // Nothing was named on the command line, so what happens is what the
     // preferences say happens.
     if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
-        let mut browser =
-            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
         let start = browser.settings_on_start();
         if start == otlyra_app::settings::OnStart::Home {
             browser.go_home();
@@ -212,7 +241,7 @@ fn main() -> ExitCode {
     if cli.mcp {
         // stdout is the wire from here on. Everything this program says about
         // itself already goes to stderr, which is what makes that safe.
-        let browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+        let browser = Browser::with_settings(NetLoader::default(), cli.settings());
         let mut session = otlyra_app::bidi::Session::new(browser, (cli.width, cli.height));
         let input = std::io::BufReader::new(std::io::stdin().lock());
         return match otlyra_app::mcp::serve(&mut session, input, std::io::stdout().lock()) {
@@ -290,8 +319,7 @@ fn main() -> ExitCode {
         // is ours, with no system font and no network in it.
         Some(path) => write_screenshot(&mut scene, viewport, path),
         None => {
-            let mut browser =
-                Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+            let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
             run_windowed(&cli, &mut browser)
         }
     };
@@ -332,8 +360,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     if let Source::Url(input) = &source
         && let Some(page) = otlyra_app::ui::SystemPage::from_url(input)
     {
-        let mut browser =
-            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
             Some(path) => Ok(write_screenshot(&mut browser, cli.viewport(), path)?),
@@ -350,11 +377,13 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         || cli.dump_fragments
         || cli.dump_selectors.is_some();
     if !wants_bytes {
-        let mut browser =
-            Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
         if cli.no_interface {
             browser.hide_interface();
         }
+        // Before the navigation, because a page picks between the pictures it
+        // offers while it loads and the load can finish before the first frame.
+        browser.set_viewport(cli.viewport());
         browser.navigate(&match &source {
             Source::Url(url) => url.clone(),
             Source::File(path) => path.display().to_string(),
@@ -442,7 +471,8 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
 
     // A document was named on the command line, and nothing asked for a dump: open
     // the browser with it already loaded.
-    let mut browser = Browser::with_settings(NetLoader::default(), otlyra_app::preferences::load());
+    let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+    browser.set_viewport(cli.viewport());
     browser.navigate(&match &source {
         Source::Url(url) => url.clone(),
         Source::File(path) => path.display().to_string(),
@@ -584,6 +614,7 @@ fn styled_boxes(
             height: height as f32,
             scale: 1.0,
             text_scale: 1.0,
+            color_scheme: otlyra_css::cascade::ColorScheme::Light,
         },
     );
     otlyra_layout::build_styled_box_tree(document, &styles)
@@ -654,7 +685,14 @@ impl otlyra_app::fetcher::Loader for NetLoader {
         }
 
         otlyra_net::install_crypto_provider();
-        let url = otlyra_net::normalize(input).map_err(|error| error.to_string())?;
+        // A `data:` URL carries its own bytes, so it is read rather than resolved:
+        // normalizing it would refuse it, because it is not an address anything can
+        // be navigated to and the two rules are deliberately not the same one.
+        let url = if input.trim_start().starts_with("data:") {
+            url::Url::parse(input.trim()).map_err(|error| error.to_string())?
+        } else {
+            otlyra_net::normalize(input).map_err(|error| error.to_string())?
+        };
         // Built once, on whichever thread asks first; the rest wait for it and then
         // share it.
         if self.loader.get().is_none() {

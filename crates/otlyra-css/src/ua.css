@@ -8,10 +8,35 @@
 
 html, body, div, center, section, article, aside, header, footer, main, nav,
 figcaption, form, dl, dt, dd,
-li, details, summary, dialog, figure, hgroup, search, address, hr, p, pre,
-blockquote, ul, ol, fieldset, textarea { display: block; }
+li, details, summary, figure, hgroup, search, address, hr, p, pre,
+blockquote, ul, ol, menu, fieldset, optgroup, option, legend { display: block; }
+/* Inline outside, a box inside: a control takes its place in a line of text and
+   is laid out as a block within its own edges. */
+input, button, select, textarea, progress, meter, marquee { display: inline-block; }
 
-head, title, meta, link, style, script, base, template, noscript { display: none; }
+head, title, meta, link, style, script, base, template { display: none; }
+/* `datalist` is a list of suggestions for a field rather than something to show,
+   and `audio` without controls shows nothing either. `rp` is the parenthesis a
+   browser *without* ruby support would show, so a browser that has ruby hides it —
+   and one that lays ruby out as ordinary text, as this does, hides it too rather
+   than printing brackets around every reading. */
+datalist, audio, rp { display: none; }
+/* The content of `noscript` is what a page shows when scripts do not run, and
+   here they do not. */
+noscript { display: inline; }
+/* The attribute that says "not yet, or not any more". It is a rule rather than a
+   special case in the box tree, so a page that overrides it in its own stylesheet
+   still wins — which is what the attribute is defined to allow. */
+[hidden] { display: none; }
+input[type="hidden"] { display: none; }
+/* A closed disclosure shows its summary and nothing else. What opens one is a
+   click, which needs script or a control of our own; until then a page that ships
+   one closed reads as it would anywhere else. */
+details:not([open]) > *:not(summary) { display: none; }
+/* A dialog is not shown until it is opened. Nothing opens one yet — that takes
+   script — so this is the whole of it, and the padding and border are what one
+   would have. */
+dialog { display: none; margin: auto; padding: 1em; border: solid; }
 
 /* A table is a formatting context of its own: rows and cells are placed into a
    grid whose columns are sized by what is in them, not stacked as blocks. */
@@ -65,6 +90,8 @@ ul ul ul, ul ul menu, ul menu ul, ul menu menu,
 ul ol ul, ul ol menu, menu ul ul, menu ul menu,
 ol ul ul, ol ul menu, ol ol ul, ol ol menu { list-style-type: square; }
 dd { margin-left: 40px; }
+dl { margin: 1em 0; }
+figure { margin: 1em 40px; }
 pre { font-family: monospace; white-space: pre; margin: 1em 0; }
 /* A rule is a border, not a filled strip: `border-style: inset` renders as one
    flat grey line here, which is what an inset one-pixel border looks like. */
@@ -74,20 +101,34 @@ b, strong { font-weight: bold; }
 i, em, cite, var, dfn, address { font-style: italic; }
 code, kbd, samp, tt { font-family: monospace; }
 small, sub, sup { font-size: 0.83em; }
+big { font-size: 1.2em; }
 sub { vertical-align: sub; }
 sup { vertical-align: super; }
 mark { background-color: yellow; }
 u, ins { text-decoration: underline; }
 s, strike, del { text-decoration: line-through; }
-a { color: #0000ee; text-decoration: underline; }
+/* An anchor without an address is not a link: it is a name for a place in the
+   page, and it is not blue and not underlined anywhere else either. */
+a[href] { color: #0000ee; text-decoration: underline; }
 
-button, select { background-color: #e6e6e8; font-size: 0.95em;
+/* A control's text is smaller than the prose around it, and the size is a length
+   rather than a fraction: it does not inherit the size of whatever the control
+   happens to sit in, which is what keeps a field in a heading from being set at
+   heading size. */
+button, select { background-color: #e6e6e8; font-size: 13.3333px;
                  border: 1px solid #8f8f9d; padding: 1px 6px; }
-input { background-color: #f4f4f6; font-size: 0.95em; white-space: pre;
+input { background-color: #f4f4f6; font-size: 13.3333px;
         border: 1px solid #8f8f9d; padding: 1px 2px; }
-textarea { background-color: #f4f4f6; font-family: monospace; white-space: pre;
-           border: 1px solid #8f8f9d; padding: 2px; }
-fieldset { padding: 8px; margin: 0 2px; border: 2px groove #c0c0c0; }
+textarea { background-color: #f4f4f6; font-family: monospace; font-size: 13.3333px;
+           white-space: pre-wrap; border: 1px solid #8f8f9d; padding: 2px; }
+fieldset { padding: 0.35em 0.75em 0.625em; margin: 0 2px;
+           border: 2px groove #c0c0c0; }
+legend { padding: 0 2px; }
+optgroup { font-weight: bold; }
+option { padding-left: 2px; }
+/* A frame is a document of its own, which this cannot show — but the space it
+   takes and the edge around it are what a page is laid out against either way. */
+iframe { border: 2px inset; }
 
 center, caption { text-align: center; }
 th { font-weight: bold; text-align: center; }
