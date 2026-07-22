@@ -1866,6 +1866,29 @@ impl<'a> Flow<'a> {
         let inner = match &node.kind {
             BoxKind::Replaced(content) => replaced_size(&style, content, containing_width).0,
             _ if node.children.is_empty() => 0.0,
+            // A row of flex items is as wide as its items laid side by side, plus
+            // the gaps. The block branch below takes the widest of them, which is
+            // right for boxes that stack and wrong for boxes that sit in a row —
+            // and a flex item is blockified, so it never reaches the inline branch
+            // that would have summed it. A logo beside a wordmark came out as wide
+            // as the wordmark alone, and the wordmark was drawn over what came next.
+            _ if style.display == otlyra_css::Display::Flex
+                && style.flex_direction.is_row()
+                && style.flex_wrap == otlyra_css::FlexWrap::NoWrap =>
+            {
+                let children = node.children.clone();
+                let gaps =
+                    style.gap.1.resolve(containing_width) * children.len().saturating_sub(1) as f32;
+                children
+                    .into_iter()
+                    .map(|child| {
+                        let child_style = &self.tree.node(child).style;
+                        let margin = resolve_margin(child_style, containing_width);
+                        self.max_content_width(child, containing_width) + margin.left + margin.right
+                    })
+                    .sum::<f32>()
+                    + gaps
+            }
             _ if self.tree.node(node.children[0]).is_inline_level() => {
                 // One line, however long: the shaper is asked for the paragraph
                 // with nothing to break it.
@@ -1927,6 +1950,33 @@ impl<'a> Flow<'a> {
         let inner = match &node.kind {
             BoxKind::Replaced(content) => replaced_size(&style, content, containing_width).0,
             _ if node.children.is_empty() => 0.0,
+            // A row of flex items is one unbreakable run: the items sit beside
+            // each other and no shrinking moves one below another, so what the
+            // row needs at its narrowest is the sum of what its items need plus
+            // the gaps between them. Falling through to the inline branch below
+            // takes the *widest* item instead, which for a mark beside a word is
+            // the wider of the two rather than the two of them — and the item is
+            // then floored at a width its own contents overflow. That is what cut
+            // the site's wordmark off beside its logo.
+            _ if style.display == otlyra_css::Display::Flex
+                && style.flex_direction.is_row()
+                && style.flex_wrap == otlyra_css::FlexWrap::NoWrap =>
+            {
+                let children = node.children.clone();
+                let gaps =
+                    style.gap.1.resolve(containing_width) * children.len().saturating_sub(1) as f32;
+                children
+                    .into_iter()
+                    .map(|child| {
+                        let child_style = &self.tree.node(child).style;
+                        let margin = resolve_margin(child_style, containing_width);
+                        self.min_content_width(child, containing_width, false)
+                            + margin.left
+                            + margin.right
+                    })
+                    .sum::<f32>()
+                    + gaps
+            }
             _ if self.tree.node(node.children[0]).is_inline_level() => {
                 // Broken as hard as it will break: the widest line that comes back
                 // is the widest word.
@@ -1942,11 +1992,19 @@ impl<'a> Flow<'a> {
                     &mut inlines,
                     &mut replaced,
                 );
+                // Broken as hard as it will break — unless it may not break at
+                // all. Under `text-wrap-mode: nowrap` the whole run is one
+                // unbreakable thing, so its min-content size is its full width;
+                // asking for the longest word instead would let a flex item
+                // shrink to that word while the text it draws stays full length,
+                // and the item beside it would be laid over the overflow. That is
+                // what folded and then overlapped the site's own header.
+                let wrap_at = (style.text_wrap != otlyra_css::TextWrap::NoWrap).then_some(0.0);
                 let text = if spans.is_empty() {
                     0.0
                 } else {
                     self.text
-                        .shape_spans(&spans, &[], Some(0.0))
+                        .shape_spans(&spans, &[], wrap_at)
                         .lines
                         .iter()
                         .map(|line| line.width)
@@ -2945,6 +3003,60 @@ mod tests {
             800.0,
         );
         assert_eq!(line_count(&tree), 1);
+    }
+
+    /// A row of flex items is as wide as its items side by side. Both intrinsic
+    /// widths took the *widest* item instead: right for boxes that stack, wrong
+    /// for boxes that sit in a row — and a flex item is blockified, so it never
+    /// reached the inline branch that would have summed it. The site's brand came
+    /// out as wide as its wordmark alone, and the wordmark was drawn over the nav
+    /// beside it.
+    #[test]
+    fn a_flex_row_is_as_wide_as_its_items_side_by_side() {
+        let (tree, boxes) = laid_out(
+            "<body><div style=\"display:flex;width:600px\">\
+             <a id=brand style=\"display:flex;gap:10px\">\
+             <span style=\"display:block;width:30px\">.</span>\
+             <span style=\"display:block;width:40px\">.</span></a>\
+             <nav style=\"display:flex\"><a style=\"display:block;width:50px\">.</a></nav>\
+             </div>",
+            800.0,
+        );
+
+        // Thirty and forty with ten between them: eighty, not the forty that the
+        // wider of the two would have given.
+        let brand = rect_of(&tree, &boxes, "a");
+        assert_eq!(brand.width, 80.0);
+        // And what comes after it starts where it ends, rather than over it.
+        let nav = rect_of(&tree, &boxes, "nav");
+        assert!(
+            nav.x >= brand.x + brand.width,
+            "the nav at {} runs into the brand ending at {}",
+            nav.x,
+            brand.x + brand.width
+        );
+    }
+
+    /// Under `nowrap` the whole run is one unbreakable thing, so a flex item may
+    /// not be shrunk to its longest word — the text it draws would spill over the
+    /// item beside it, which is what overlapped the site's nav links.
+    #[test]
+    fn a_nowrap_item_is_not_shrunk_to_its_longest_word() {
+        let (tree, boxes) = laid_out(
+            "<body><nav style=\"display:flex;width:60px\">\
+             <a style=\"white-space:nowrap\">The name</a>\
+             <b style=\"white-space:nowrap\">For agents</b></nav>",
+            800.0,
+        );
+        let first = rect_of(&tree, &boxes, "a");
+        let second = rect_of(&tree, &boxes, "b");
+        assert!(
+            second.x >= first.x + first.width,
+            "the items overlap: one is {}..{} and the next starts at {}",
+            first.x,
+            first.x + first.width,
+            second.x
+        );
     }
 
     /// The first box fragment whose element is `tag`.
