@@ -1062,13 +1062,23 @@ impl<A> Widget<A> for Fixed<A> {
         // parent offered. Otherwise a paragraph counts its lines at one width
         // and is drawn at another, and the difference is the number of lines
         // that end up over whatever was placed underneath it.
+        //
+        // And the size *reported* is that same clamped one, not the raw pin. A
+        // pin wider than the room going is honoured by neither `place` — which
+        // clamps the same way — nor by anything the child then draws, so
+        // reporting the pin would tell the parent to hand out a width nobody
+        // ever uses. That is the same measure/place mismatch seen from the other
+        // side: the paragraph counted its lines at the narrow width it was
+        // measured at and was drawn at the wide one it was not, leaving a hole
+        // under it exactly as tall as the lines that turned out not to be there.
+        let width = self.width.map(|width| width.min(available.width));
         let inner = Size::new(
-            self.width.unwrap_or(available.width).min(available.width),
+            width.unwrap_or(available.width),
             self.height.unwrap_or(available.height),
         );
         let child = self.child.measure(inner, cx);
         Size::new(
-            self.width.unwrap_or(child.width),
+            width.unwrap_or(child.width),
             self.height.unwrap_or(child.height),
         )
     }
@@ -1995,6 +2005,66 @@ pub fn ring(list: &mut DisplayList, rect: Rect, color: Color, radius: f64, width
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// A pin wider than the room going is not a width anybody honours: `place`
+    /// clamps it, so `measure` reporting the raw pin would tell the parent to
+    /// hand out a width nothing is ever drawn at. That is the measure/place
+    /// mismatch that left a hole under the about page's first paragraph — as
+    /// tall as the lines that turned out not to be there once it was drawn at a
+    /// width it had not been counted at.
+    #[test]
+    fn a_pin_wider_than_the_room_reports_the_room() {
+        let mut text = otlyra_text::TextEngine::new();
+        let mut cx = Cx::new(&mut text);
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+
+        let mut wide: Fixed<Act> = Fixed::width(560.0, Box::new(Fake::new(0, 10.0, 10.0, &log)));
+        // Room enough: the pin is the answer.
+        assert_eq!(
+            Widget::<Act>::measure(&mut wide, Size::new(900.0, 100.0), &mut cx).width,
+            560.0
+        );
+        // Not enough room: the answer is what there is, which is also what
+        // `place` will give the child.
+        assert_eq!(
+            Widget::<Act>::measure(&mut wide, Size::new(228.0, 100.0), &mut cx).width,
+            228.0
+        );
+    }
+
+    /// The consequence, end to end: a paragraph draws the number of lines it
+    /// was measured for, whatever the pin around it asked for.
+    #[test]
+    fn a_paragraph_is_drawn_at_the_width_it_was_counted_at() {
+        let mut text = otlyra_text::TextEngine::new();
+        let mut cx = Cx::new(&mut text);
+        let words = "A browser engine written from the parser up: its own DOM, \
+                     its own box tree, its own display list.";
+
+        for room in [900.0_f64, 400.0, 250.0] {
+            let mut pinned: Fixed<Act> =
+                Fixed::width(560.0, Box::new(Paragraph::new(words, 14.0, Color::BLACK)));
+            let measured = Widget::<Act>::measure(&mut pinned, Size::new(room, 800.0), &mut cx);
+            Widget::<Act>::place(
+                &mut pinned,
+                Rect::new(0.0, 0.0, measured.width, measured.height),
+                &mut cx,
+            );
+            let mut list = DisplayList::new();
+            Widget::<Act>::draw(&mut pinned, &mut cx, &mut list);
+
+            let lines = list
+                .items()
+                .iter()
+                .filter(|item| matches!(item, DisplayItem::Glyphs { .. }))
+                .count();
+            let counted = (measured.height / cx.line_height(14.0)).round() as usize;
+            assert_eq!(
+                lines, counted,
+                "at {room} wide the paragraph was counted for {counted} lines and drew {lines}"
+            );
+        }
+    }
 
     /// What the widgets under test report. Any type will do, which is the point
     /// of the layer being generic: it has never heard of the browser's actions.

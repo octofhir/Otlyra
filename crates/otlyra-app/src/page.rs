@@ -70,6 +70,33 @@ pub struct PageScene {
     viewport_height: f32,
     /// What the next frame has to redo.
     damage: Damage,
+    /// The last list built, and what it was built from.
+    ///
+    /// The page's half of W10, and the thing `Damage` was written for: every
+    /// mutation on this type already records at least `PAINT`, and until now
+    /// `build_display_list` took that damage and threw it away. It is read now.
+    painted: Option<(Painted, DisplayList)>,
+    /// How many lists have been built rather than reused.
+    builds: u64,
+}
+
+/// Everything a page's display list is a function of, besides the document.
+///
+/// A value key beside the damage rather than the damage alone. Damage is a
+/// claim every mutation has to remember to make, and a claim that is forgotten
+/// once shows a stale frame with no way to notice; the things most likely to be
+/// forgotten — where the reader has scrolled to, inside the page and inside a
+/// panel — are cheap to compare outright. The two together fail safe: either the
+/// damage or the key catches a change.
+#[derive(Clone, Debug, PartialEq)]
+struct Painted {
+    width: f32,
+    height: f32,
+    top: f32,
+    scroll: f32,
+    scrollbars: bool,
+    pictures: usize,
+    ports: Vec<(BoxId, f32)>,
 }
 
 impl PageScene {
@@ -97,6 +124,8 @@ impl PageScene {
             background_pictures: std::collections::HashMap::new(),
             viewport_height: 0.0,
             damage: Damage::STYLE,
+            painted: None,
+            builds: 0,
         }
     }
 
@@ -199,7 +228,32 @@ impl PageScene {
         top: f32,
     ) -> DisplayList {
         self.viewport_height = height;
-        self.damage.take();
+        let damage = self.damage.take();
+
+        let mut ports: Vec<(BoxId, f32)> =
+            self.port_scroll.iter().map(|(id, at)| (*id, *at)).collect();
+        ports.sort_by_key(|(id, _)| otlyra_layout::box_id_to_u64(*id));
+        let key = Painted {
+            width,
+            height,
+            top,
+            scroll: self.scroll,
+            scrollbars: self.scrollbars,
+            pictures: self.background_pictures.len(),
+            ports,
+        };
+        // Nothing has been reported changed and nothing it is drawn from has
+        // moved, so the last list is this frame's list. The hit-test targets go
+        // with it untouched — they were taken from this very list, so a press
+        // still meets what is on screen.
+        if damage.is_none()
+            && let Some((built, list)) = &self.painted
+            && *built == key
+        {
+            return list.clone();
+        }
+
+        self.builds += 1;
         let scroll = self.scroll;
         // Taken before the layout is borrowed: the offsets are a handful of floats,
         // and the alternative is holding a borrow of the page across the walk.
@@ -237,7 +291,17 @@ impl PageScene {
             })
             .collect();
 
+        // Laying out and cascading are part of building *this* list, and both
+        // report damage as they go. Clearing after rather than before is what
+        // keeps that from being read as a reason to build the next one again.
+        self.damage = Damage::NONE;
+        self.painted = Some((key, list.clone()));
         list
+    }
+
+    /// How many display lists this page has built rather than reused.
+    pub fn builds(&self) -> u64 {
+        self.builds
     }
 
     /// The topmost box at `point`, in window logical coordinates.
@@ -562,6 +626,57 @@ mod tests {
     fn scene(html: &str) -> (PageScene, TextEngine) {
         let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
         (PageScene::new(parsed.document), TextEngine::isolated())
+    }
+
+    /// W10's page half: an idle page with a still reader does no work. Every
+    /// mutation records damage and the frame reads it, which is what `Damage`
+    /// was written for and what nothing did until now.
+    #[test]
+    fn an_unchanged_page_is_not_painted_a_second_time() {
+        let (mut page, mut text) = scene("<body><h1>Title</h1><p>Some text to lay out.</p>");
+        let first = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 1);
+
+        let again = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 1, "nothing about it moved");
+        assert_eq!(first, again, "and the frame is the same frame");
+
+        // Scrolling is a repaint, and a repaint is what it asks for.
+        page.set_scroll(40.0);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 2);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 2, "and then it is still again");
+
+        // A resize is a relayout, and a different band of the window to draw in
+        // is a different frame even when nothing else moved.
+        page.build_display_list(&mut text, 700.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 3);
+        page.build_display_list(&mut text, 700.0, 600.0, 12.0);
+        assert_eq!(page.builds(), 4, "the page moved down the window");
+    }
+
+    /// A press still lands on what is on screen when the frame was reused: the
+    /// targets came out of that very list, so they describe it exactly.
+    #[test]
+    fn a_reused_frame_is_still_the_frame_a_press_is_tested_against() {
+        let (mut page, mut text) = scene("<body><p><a href=\"/next\">go</a></p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let before = page.boxes().root();
+        let _ = before;
+        let hit = (0..600)
+            .step_by(4)
+            .find_map(|y| page.box_at(20.0, f64::from(y)));
+
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), 1, "the frame was reused");
+        assert_eq!(
+            hit,
+            (0..600)
+                .step_by(4)
+                .find_map(|y| page.box_at(20.0, f64::from(y))),
+            "and it still answers where things are"
+        );
     }
 
     fn glyph_ys(list: &DisplayList) -> Vec<f64> {
