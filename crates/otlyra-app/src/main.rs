@@ -470,10 +470,12 @@ fn open_inspector(browser: &mut Browser, cli: &Cli) {
         // naming one on the command line chooses the pane *and* the sidebar.
         let (pane, sidebar) = match pane {
             InspectorPane::Elements => (Pane::Elements, Sidebar::Node),
+            InspectorPane::Rules => (Pane::Elements, Sidebar::Rules),
             InspectorPane::Styles => (Pane::Elements, Sidebar::Styles),
             InspectorPane::Layout => (Pane::Elements, Sidebar::Layout),
             InspectorPane::Console => (Pane::Console, Sidebar::Node),
             InspectorPane::Network => (Pane::Network, Sidebar::Node),
+            InspectorPane::Accessibility => (Pane::Accessibility, Sidebar::Node),
         };
         browser.inspector_mut().pane = pane;
         browser.inspector_mut().sidebar = sidebar;
@@ -488,10 +490,12 @@ fn open_inspector(browser: &mut Browser, cli: &Cli) {
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 enum InspectorPane {
     Elements,
+    Rules,
     Styles,
     Layout,
     Console,
     Network,
+    Accessibility,
 }
 
 /// Write one screenshot, having settled whatever the command line asked to see.

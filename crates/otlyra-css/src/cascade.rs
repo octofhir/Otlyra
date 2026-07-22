@@ -30,6 +30,7 @@ use crate::stylo_dom::{NodeRef, StyleData, Tree, TreeScope};
 pub const UA_STYLESHEET: &str = include_str!("ua.css");
 
 /// A computed style per element, and the sheets that produced them.
+#[allow(missing_debug_implementations)]
 pub struct StyledDocument {
     /// The engine's per-element state, which owns the computed values.
     pub style_data: StyleData,
@@ -123,6 +124,44 @@ pub struct Styler {
     stylist: Stylist,
     quirks_mode: QuirksMode,
     viewport: Viewport,
+    /// Which rule each declaration block came from, by the block's address.
+    ///
+    /// The cascade hands back *what* applied — a chain of declaration blocks in
+    /// the order they won — and never *what it was written as*, because a block
+    /// does not know its own selector. So the selector is recorded here as the
+    /// sheets are parsed, and looked up by the identity of the block itself. It
+    /// is the one thing an inspector needs that the resolution does not carry.
+    selectors: HashMap<usize, RuleSource>,
+}
+
+/// Where a declaration block was written.
+#[derive(Clone, Debug)]
+struct RuleSource {
+    selector: String,
+    origin: Origin,
+}
+
+/// One rule that applied to an element, as the inspector shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchedRule {
+    /// The selector it was written with, or a stand-in for a block that has no
+    /// selector — a `style` attribute has none.
+    pub selector: String,
+    /// Which sheet it came from: the browser's own, or the page's.
+    pub origin: &'static str,
+    /// The declarations in the block, in the order they were written.
+    pub declarations: Vec<Declaration>,
+}
+
+/// One declaration inside a rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    /// The property's name, as CSS spells it.
+    pub name: String,
+    /// Its value, as CSS spells it.
+    pub value: String,
+    /// Whether it carries `!important`.
+    pub important: bool,
 }
 
 impl std::fmt::Debug for Styler {
@@ -148,28 +187,28 @@ impl Styler {
         };
 
         let mut stylist = Stylist::new(device_for(viewport, quirks_mode), quirks_mode);
-        stylist.append_stylesheet(
-            DocumentStyleSheet(Arc::new(parse_sheet(
-                UA_STYLESHEET,
-                Origin::UserAgent,
+        let mut selectors = HashMap::new();
+
+        let ua = Arc::new(parse_sheet(
+            UA_STYLESHEET,
+            Origin::UserAgent,
+            &lock,
+            &url,
+            quirks_mode,
+        ));
+        index_selectors(&ua, Origin::UserAgent, &lock, &mut selectors);
+        stylist.append_stylesheet(DocumentStyleSheet(ua), &lock.read());
+
+        for source in author_stylesheets(document, external) {
+            let sheet = Arc::new(parse_sheet(
+                &source,
+                Origin::Author,
                 &lock,
                 &url,
                 quirks_mode,
-            ))),
-            &lock.read(),
-        );
-
-        for source in author_stylesheets(document, external) {
-            stylist.append_stylesheet(
-                DocumentStyleSheet(Arc::new(parse_sheet(
-                    &source,
-                    Origin::Author,
-                    &lock,
-                    &url,
-                    quirks_mode,
-                ))),
-                &lock.read(),
-            );
+            ));
+            index_selectors(&sheet, Origin::Author, &lock, &mut selectors);
+            stylist.append_stylesheet(DocumentStyleSheet(sheet), &lock.read());
         }
 
         Self {
@@ -177,7 +216,61 @@ impl Styler {
             stylist,
             quirks_mode,
             viewport,
+            selectors,
         }
+    }
+
+    /// The rules that produced a computed style, strongest last.
+    ///
+    /// Read off the rule node the cascade already built rather than by matching
+    /// the selectors a second time: the chain hanging from a computed style *is*
+    /// the list of declaration blocks that applied, in the order they won. A
+    /// second matching pass would be a second answer to which rules apply, and
+    /// the first time the two disagreed the pane would be the one lying.
+    pub fn rules_for(&self, style: &ComputedValues) -> Vec<MatchedRule> {
+        let guard = self.lock.read();
+        let mut out = Vec::new();
+
+        for node in style.rules().self_and_ancestors() {
+            let Some(source) = node.style_source() else {
+                continue;
+            };
+            let key = source.get().raw_ptr().as_ptr() as usize;
+            let mut text = String::new();
+            if source.read(&guard).to_css(&mut text).is_err() {
+                continue;
+            }
+            // A block reaches the chain once for its normal declarations and
+            // again for its important ones, because the cascade sorts those into
+            // different levels. Each entry shows only the half it is: listing the
+            // whole block twice would show a rule that is not there.
+            let important = node.importance().important();
+            let declarations: Vec<Declaration> = split_declarations(&text)
+                .into_iter()
+                .filter(|declaration| declaration.important == important)
+                .collect();
+            if declarations.is_empty() {
+                continue;
+            }
+
+            // A block with no selector is one that was not written as a rule:
+            // a `style` attribute, or a presentational hint standing in for one.
+            let (selector, origin) = match self.selectors.get(&key) {
+                Some(source) => (source.selector.clone(), origin_name(source.origin)),
+                None => ("element.style".to_owned(), "attribute"),
+            };
+            out.push(MatchedRule {
+                selector,
+                origin,
+                declarations,
+            });
+        }
+
+        // `self_and_ancestors` walks from the winning end back; a stylesheet is
+        // read the other way, weakest first, which is the order the cascade
+        // resolved them in and the order a person expects to read them.
+        out.reverse();
+        out
     }
 
     /// The viewport the last cascade ran against.
@@ -525,6 +618,107 @@ fn parse_sheet(
         quirks_mode,
         AllowImportRules::No,
     )
+}
+
+/// One serialized declaration block, taken apart into its declarations.
+///
+/// The engine serializes a block the way CSSOM says to — `name: value` joined by
+/// `; ` — and offers no way to ask for one declaration at a time that does not
+/// want a `Stylist` and a block of its own. So the block is spelled once and cut
+/// here, at the semicolons that are not inside brackets or quotes: a `url(a;b)`
+/// or a `content: ";"` is one value and not two declarations.
+fn split_declarations(text: &str) -> Vec<Declaration> {
+    let mut out = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None::<char>, 0usize);
+
+    let mut push = |piece: &str| {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            return;
+        }
+        let Some((name, value)) = piece.split_once(':') else {
+            return;
+        };
+        let value = value.trim();
+        let (value, important) = match value.strip_suffix("!important") {
+            Some(rest) => (rest.trim_end(), true),
+            None => (value, false),
+        };
+        out.push(Declaration {
+            name: name.trim().to_owned(),
+            value: value.to_owned(),
+            important,
+        });
+    };
+
+    for (at, character) in text.char_indices() {
+        match (quote, character) {
+            (Some(open), _) if character == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(character),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            (None, ';') if depth == 0 => {
+                push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&text[start..]);
+    out
+}
+
+/// What an origin is called where a person reads it.
+fn origin_name(origin: Origin) -> &'static str {
+    match origin {
+        Origin::UserAgent => "browser",
+        Origin::User => "user",
+        Origin::Author => "page",
+    }
+}
+
+/// Record the selector every style rule in `sheet` was written with.
+///
+/// Keyed by the address of the declaration block, because that is the only thing
+/// the cascade hands back later. Nested rules are walked too, so a declaration
+/// inside a media query or a nesting block is named by the selector it was
+/// actually written under rather than dropped for having no top-level one.
+fn index_selectors(
+    sheet: &Stylesheet,
+    origin: Origin,
+    lock: &SharedRwLock,
+    out: &mut HashMap<usize, RuleSource>,
+) {
+    use style::stylesheets::CssRule;
+
+    let guard = lock.read();
+    let mut stack: Vec<Arc<style::shared_lock::Locked<style::stylesheets::CssRules>>> =
+        vec![sheet.contents.read_with(&guard).rules.clone()];
+
+    while let Some(rules) = stack.pop() {
+        for rule in &rules.read_with(&guard).0 {
+            match rule {
+                CssRule::Style(rule) => {
+                    let rule = rule.read_with(&guard);
+                    let key = rule.block.raw_ptr().as_ptr() as usize;
+                    out.entry(key).or_insert_with(|| RuleSource {
+                        selector: {
+                            use cssparser::ToCss as _;
+                            rule.selectors.to_css_string()
+                        },
+                        origin,
+                    });
+                    if let Some(nested) = rule.rules.as_ref() {
+                        stack.push(nested.clone());
+                    }
+                }
+                CssRule::Media(rule) => stack.push(rule.rules.clone()),
+                CssRule::Supports(rule) => stack.push(rule.rules.clone()),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The base every sheet is parsed against.

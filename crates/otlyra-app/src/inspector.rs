@@ -92,6 +92,8 @@ impl Pane {
 pub enum Sidebar {
     /// What the node is, and what it carries.
     Node,
+    /// Which rules set the values, and what each of them said.
+    Rules,
     /// What the cascade computed for it.
     Styles,
     /// What the layout made of it, in numbers.
@@ -99,13 +101,14 @@ pub enum Sidebar {
 }
 
 impl Sidebar {
-    /// The three of them, in the order they are offered.
-    pub const ALL: [Self; 3] = [Self::Node, Self::Styles, Self::Layout];
+    /// The four of them, in the order they are offered.
+    pub const ALL: [Self; 4] = [Self::Node, Self::Rules, Self::Styles, Self::Layout];
 
     /// What this is called on the sidebar.
     pub fn label(self) -> &'static str {
         match self {
             Self::Node => "Node",
+            Self::Rules => "Rules",
             Self::Styles => "Styles",
             Self::Layout => "Layout",
         }
@@ -255,6 +258,8 @@ pub struct Facts<'a> {
     pub page: Option<&'a crate::page::PageScene>,
     /// What the cascade computed for the chosen node, if it has a box.
     pub style: Option<&'a otlyra_css::ComputedStyle>,
+    /// Which rules produced it, weakest first.
+    pub rules: &'a [otlyra_css::cascade::MatchedRule],
     /// Where its border box was drawn, in window coordinates.
     pub rect: Option<Rect>,
     /// How wide the containing block is, for resolving a percentage.
@@ -304,6 +309,8 @@ pub enum Action {
     ShowKind(KindFilter),
     /// Show this side of the chosen request.
     ShowNetTab(NetTab),
+    /// Choose the computed property on this row.
+    SelectProperty(usize),
     /// Put the panel away.
     Close,
 }
@@ -369,6 +376,7 @@ struct Appearance {
     exchange: Option<u64>,
     kind_filter: KindFilter,
     net_tab: NetTab,
+    property: Option<usize>,
     pointer: (f64, f64),
     pointer_down: bool,
     focus: Option<crate::widget::FocusId>,
@@ -400,6 +408,8 @@ pub struct Inspector {
     pub kind_filter: KindFilter,
     /// Which side of the chosen request is showing.
     pub net_tab: NetTab,
+    /// Which row of the styles table is chosen, so its value can be copied.
+    pub property: Option<usize>,
     /// How much of the content area the panel takes.
     pub height: f64,
     /// Every colour and measurement it is drawn from.
@@ -427,6 +437,9 @@ pub struct Inspector {
     /// put away. The other way round, the pane opens saying nothing.
     accessible: Vec<AccessibleRow>,
     a11y_collapsed: HashSet<u64>,
+    /// The computed rows the last frame drew, so a copy takes what is on screen
+    /// rather than recomputing a value that may have moved since.
+    styles: Vec<(String, String)>,
     focus: Focus,
     focused: Option<crate::widget::FocusId>,
     pointer: (f64, f64),
@@ -458,6 +471,7 @@ impl Inspector {
             exchange: None,
             kind_filter: KindFilter::All,
             net_tab: NetTab::Headers,
+            property: None,
             height: DEFAULT_HEIGHT,
             theme: Theme::light(),
             expanded: HashSet::new(),
@@ -470,6 +484,7 @@ impl Inspector {
             rows: Vec::new(),
             accessible: Vec::new(),
             a11y_collapsed: HashSet::new(),
+            styles: Vec::new(),
             focus: Focus::default(),
             focused: None,
             pointer: (-1.0, -1.0),
@@ -593,6 +608,7 @@ impl Inspector {
                 }
                 self.kind_filter = filter;
             }
+            Action::SelectProperty(index) => self.property = Some(index),
             Action::ShowNetTab(tab) => {
                 if tab != self.net_tab {
                     self.pane_scroll = 0.0;
@@ -730,6 +746,18 @@ impl Inspector {
             // The field's own accelerators — select all, cut, copy, paste —
             // while it holds the keyboard, before the tree's ⌘C is considered.
             if self.searching() && self.search.edit(key, modifiers, clipboard) {
+                return Some(Action::None);
+            }
+            // ⌘C over the styles pane copies the chosen declaration, spelled the
+            // way a stylesheet spells it, so it can be pasted back into one. The
+            // pane being open is what decides: a copy is about what is being
+            // looked at, and what is being looked at is a property.
+            if key == Key::Character('c')
+                && self.pane == Pane::Elements
+                && self.sidebar == Sidebar::Styles
+                && let Some((name, value)) = self.property.and_then(|index| self.styles.get(index))
+            {
+                clipboard.write(format!("{name}: {value};"));
                 return Some(Action::None);
             }
             // ⌘C with an element chosen copies the row as the tree shows it:
@@ -1153,6 +1181,16 @@ impl Inspector {
             (Pane::Accessibility, Some(page)) => self.flatten_accessible(page),
             _ => Vec::new(),
         };
+        // Kept whether or not a frame is built, for the same reason the rows are:
+        // a copy reads what is on screen, and a frame served from the cache is
+        // still a frame that is on screen.
+        self.styles = match facts.style {
+            Some(style) => describe(style)
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+            None => Vec::new(),
+        };
         let appearance = Appearance {
             rect,
             nodes: rows.len(),
@@ -1183,6 +1221,7 @@ impl Inspector {
             exchange: self.exchange,
             kind_filter: self.kind_filter,
             net_tab: self.net_tab,
+            property: self.property,
             pointer: self.pointer,
             pointer_down: self.pointer_down,
             focus: self.focused,
@@ -1442,6 +1481,7 @@ impl Inspector {
         } else {
             match self.sidebar {
                 Sidebar::Node => self.elements_pane(theme, facts),
+                Sidebar::Rules => self.rules_pane(theme, facts),
                 Sidebar::Styles => self.styles_pane(theme, facts),
                 Sidebar::Layout => self.layout_pane(theme, facts),
             }
@@ -1597,6 +1637,79 @@ impl Inspector {
         Box::new(Stack::column(theme.gap, rows))
     }
 
+    /// Which rules set the values on the chosen node, and what each said.
+    ///
+    /// Weakest first, which is the order a stylesheet is read in and the order
+    /// the cascade resolved them: the last thing said about a property is the
+    /// thing that holds. What is shown is read off the chain of declarations the
+    /// cascade already built, so it cannot disagree with the computed pane
+    /// beside it — the two are the same answer at two removes.
+    fn rules_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+        if facts.rules.is_empty() {
+            return Box::new(Align::centre(Box::new(Label::new(
+                "No rule reached this node, so nothing was computed for it.",
+                theme.font_size_small,
+                theme.ink_dim,
+            ))));
+        }
+
+        let mut rows: Vec<Child<Action>> = Vec::new();
+        for rule in facts.rules {
+            rows.push(Box::new(Fixed::height(
+                theme.row_height,
+                Box::new(Stack::row(
+                    theme.gap,
+                    vec![
+                        Box::new(Align::left(Box::new(
+                            Mono::new(rule.selector.clone(), theme.code_tag)
+                                .size(theme.font_size_small),
+                        ))),
+                        Box::new(Flex::new(1.0, Box::new(Gap::new(0.0, 0.0)))),
+                        // Which sheet it came from, because the browser's own
+                        // rules and the page's are the same shape on screen and
+                        // are answerable to different people.
+                        Box::new(Align::right(Box::new(Label::new(
+                            rule.origin,
+                            theme.font_size_small,
+                            theme.ink_dim,
+                        )))),
+                    ],
+                )),
+            )));
+            for declaration in &rule.declarations {
+                rows.push(Box::new(Fixed::height(
+                    theme.row_height,
+                    Box::new(Padding::new(
+                        Insets::symmetric(theme.inset, 0.0),
+                        Box::new(Align::left(Box::new(
+                            Mono::new(
+                                format!(
+                                    "{}: {}{}",
+                                    declaration.name,
+                                    declaration.value,
+                                    if declaration.important {
+                                        " !important"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                theme.code_value,
+                            )
+                            .size(theme.font_size_small),
+                        ))),
+                    )),
+                )));
+            }
+            rows.push(Box::new(Gap::new(0.0, theme.gap * 0.5)));
+        }
+
+        Box::new(crate::widget::Scroll::new(
+            self.pane_scroll,
+            std::rc::Rc::clone(&self.pane_overflow),
+            Box::new(Stack::column(0.0, rows)),
+        ))
+    }
+
     /// What the cascade computed for the chosen node.
     fn styles_pane(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
         let Some(style) = facts.style else {
@@ -1612,12 +1725,15 @@ impl Inspector {
             .into_iter()
             .map(|(name, value)| vec![name.to_owned(), value])
             .collect();
-        Box::new(Table::new(
-            vec!["property".to_owned(), "computed".to_owned()],
-            rows,
-            self.pane_scroll,
-            std::rc::Rc::clone(&self.pane_overflow),
-        ))
+        Box::new(
+            Table::new(
+                vec!["property".to_owned(), "computed".to_owned()],
+                rows,
+                self.pane_scroll,
+                std::rc::Rc::clone(&self.pane_overflow),
+            )
+            .selectable(self.property, Action::SelectProperty),
+        )
     }
 
     /// What the browser said while it worked, newest last.
@@ -3168,6 +3284,7 @@ mod tests {
             document: Some(document),
             page: None,
             style: Some(&style),
+            rules: &[],
             rect: Some(Rect::new(0.0, 0.0, 100.0, 40.0)),
             containing: Some(400.0),
             exchanges: &[],
@@ -3189,6 +3306,7 @@ mod tests {
             document: Some(document),
             page: None,
             style: None,
+            rules: &[],
             rect: None,
             containing: None,
             exchanges: &[],
@@ -3199,6 +3317,113 @@ mod tests {
             &mut text,
             &mut list,
         );
+    }
+
+    /// The last of the three things the plan had been carrying: a value on the
+    /// clipboard, spelled the way a stylesheet spells it so it can be pasted
+    /// back into one.
+    #[test]
+    fn copy_over_the_styles_pane_takes_the_chosen_declaration() {
+        let document = document();
+        let mut inspector = panel();
+        inspector.apply(Action::ShowSidebar(Sidebar::Styles));
+        inspector.selected = Some(document.root());
+        frame_with_style(&mut inspector, &document);
+
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        let mut clipboard = crate::clipboard::InMemory::default();
+
+        // Nothing chosen in the table: the key is not the pane's, and the tree's
+        // own copy answers instead.
+        inspector.apply(Action::SelectProperty(0));
+        assert_eq!(
+            inspector.key_pressed(
+                Key::Character('c'),
+                accelerator,
+                Some(&document),
+                &mut clipboard
+            ),
+            Some(Action::None)
+        );
+        let copied = clipboard.read().expect("the declaration was copied");
+        let (name, value) = &inspector.styles[0];
+        assert_eq!(copied, format!("{name}: {value};"));
+        assert!(
+            copied.ends_with(';'),
+            "it is spelled to be pasted back into a stylesheet: {copied}"
+        );
+    }
+
+    /// The pane the plan had written off as needing a seam that did not exist.
+    /// It existed: the chain of declarations that won hangs off the computed
+    /// style the cascade already built, and reading it is not matching a second
+    /// time — so what this shows cannot disagree with the computed pane.
+    #[test]
+    fn the_rules_pane_says_which_rule_set_the_value() {
+        let parsed = otlyra_html::parse(
+            b"<style>p { color: red; margin: 4px } .x { color: blue !important }</style>\
+              <body><p class=x style=\"font-size:20px\">hi</p>",
+            Some("utf-8"),
+        );
+        let mut page = crate::page::PageScene::new(parsed.document);
+        let mut text = TextEngine::isolated();
+        let _ = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        let paragraph = {
+            let document = page.document();
+            let mut stack = vec![document.root()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                stack.extend(document.children(node));
+                if matches!(document.get(node).map(|n| &n.data),
+                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                {
+                    found = Some(node);
+                }
+            }
+            found.expect("the document has a p")
+        };
+
+        let rules = page.rules_for(paragraph);
+        let said: Vec<String> = rules
+            .iter()
+            .map(|rule| format!("[{}] {}", rule.origin, rule.selector))
+            .collect();
+
+        // The browser's own sheet is in there, and the page's, and the attribute
+        // that has no selector at all.
+        assert!(
+            said.iter().any(|line| line.starts_with("[browser]")),
+            "the user-agent sheet reaches a paragraph: {said:?}"
+        );
+        assert!(said.iter().any(|line| line == "[page] p"));
+        assert!(said.iter().any(|line| line == "[attribute] element.style"));
+
+        // Weakest first, so the last thing said about a property is the thing
+        // that holds — and an important author rule is said after the style
+        // attribute, which is what makes it beat it.
+        let important = said
+            .iter()
+            .position(|line| line == "[page] .x")
+            .expect("the important rule applied");
+        let attribute = said
+            .iter()
+            .position(|line| line == "[attribute] element.style")
+            .expect("the style attribute applied");
+        assert!(
+            important > attribute,
+            "an !important rule outranks a style attribute: {said:?}"
+        );
+
+        // A block reaches the chain once per cascade level, and each entry shows
+        // only the half it is rather than the whole block twice.
+        let strongest = &rules[important];
+        assert!(strongest.declarations.iter().all(|d| d.important));
+        assert_eq!(strongest.declarations[0].name, "color");
     }
 
     /// A laid-out page, which is what the accessibility pane is a view of.
@@ -3218,6 +3443,7 @@ mod tests {
             document: Some(page.document()),
             page: Some(page),
             style: None,
+            rules: &[],
             rect: None,
             containing: None,
             exchanges: &[],
@@ -3238,6 +3464,7 @@ mod tests {
             document: None,
             page: None,
             style: None,
+            rules: &[],
             rect: None,
             containing: None,
             exchanges,
@@ -3939,7 +4166,7 @@ mod tests {
         // pane that has a tree to choose from.
         assert_eq!(
             Sidebar::ALL.map(Sidebar::label),
-            ["Node", "Styles", "Layout"]
+            ["Node", "Rules", "Styles", "Layout"]
         );
     }
 

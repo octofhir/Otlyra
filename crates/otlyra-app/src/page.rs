@@ -16,7 +16,6 @@ use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images, build_box_tree
 use otlyra_text::TextEngine;
 
 /// A parsed document, laid out and painted.
-#[derive(Debug)]
 pub struct PageScene {
     /// The stylesheets the document's `<link>` elements asked for, already
     /// fetched. Kept because a restyle needs them again and a restyle must not
@@ -46,6 +45,13 @@ pub struct PageScene {
     styler: Option<otlyra_css::cascade::Styler>,
     /// Whether the styles the box tree was built from still hold.
     styled: bool,
+    /// What the cascade produced, kept past the box tree it built.
+    ///
+    /// The box tree carries our own `ComputedStyle`, which is the values and not
+    /// where they came from. Answering *which rule set this* needs the engine's
+    /// own computed values, because the chain of declarations that won hangs off
+    /// them — so they are kept rather than dropped once the boxes exist.
+    styled_document: Option<otlyra_css::cascade::StyledDocument>,
     /// The reader's default font size, as a multiple of the specification's.
     text_scale: f32,
     /// How far down the page the reader is, in logical pixels.
@@ -99,6 +105,16 @@ struct Painted {
     ports: Vec<(BoxId, f32)>,
 }
 
+impl std::fmt::Debug for PageScene {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PageScene")
+            .field("scroll", &self.scroll)
+            .field("builds", &self.builds)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PageScene {
     /// A scene showing `document`, with nothing fetched for it.
     pub fn new(document: Document) -> Self {
@@ -116,6 +132,7 @@ impl PageScene {
             layout: None,
             styler: None,
             styled: false,
+            styled_document: None,
             text_scale: 1.0,
             scroll: 0.0,
             port_scroll: std::collections::HashMap::new(),
@@ -211,6 +228,7 @@ impl PageScene {
             .style(&self.document);
         self.boxes =
             otlyra_layout::build_box_tree_with_images(&self.document, Some(&styles), &self.images);
+        self.styled_document = Some(styles);
         self.styled = true;
         self.layout = None;
         self.damage.add(Damage::of(
@@ -362,6 +380,22 @@ impl PageScene {
                     rect.height() as f32,
                 )
             })
+    }
+
+    /// Which rules set the values on a node, weakest first.
+    ///
+    /// Empty for a node the cascade was never asked about — a text node, or an
+    /// element under `display: none` — which is the same answer the computed
+    /// pane gives for one, and for the same reason.
+    pub fn rules_for(&self, node: NodeId) -> Vec<otlyra_css::cascade::MatchedRule> {
+        let Some(styler) = self.styler.as_ref() else {
+            return Vec::new();
+        };
+        self.styled_document
+            .as_ref()
+            .and_then(|styled| styled.style_of(node))
+            .map(|style| styler.rules_for(style))
+            .unwrap_or_default()
     }
 
     /// The edges layout actually gave a box, if it laid one out.

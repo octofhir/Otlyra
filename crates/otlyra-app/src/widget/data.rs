@@ -381,16 +381,18 @@ impl<A> Widget<A> for Tree<A> {
 ///
 /// The same shape as [`Tree`]: cells are strings, rows are a fixed height, and
 /// only what is on screen is drawn.
-pub struct Table {
+pub struct Table<A> {
     header: Vec<String>,
     rows: Vec<Vec<String>>,
     widths: Vec<f64>,
     offset: f64,
     overflow: crate::widget::Overflow,
+    selected: Option<usize>,
+    on_select: Option<Box<dyn Fn(usize) -> A>>,
     rect: Rect,
 }
 
-impl Table {
+impl<A> Table<A> {
     /// A table of `rows` under `header`, scrolled down by `offset`.
     pub fn new(
         header: Vec<String>,
@@ -404,8 +406,35 @@ impl Table {
             rows,
             offset,
             overflow,
+            selected: None,
+            on_select: None,
             rect: Rect::ZERO,
         }
+    }
+
+    /// Report `on_select` when a row is pressed, and draw `selected` as chosen.
+    ///
+    /// Optional because most tables here are a list to read rather than a list
+    /// to pick from, and a row that highlights under the pointer while nothing
+    /// can be done with it is a row that promises something.
+    pub fn selectable(
+        mut self,
+        selected: Option<usize>,
+        on_select: impl Fn(usize) -> A + 'static,
+    ) -> Self {
+        self.selected = selected;
+        self.on_select = Some(Box::new(on_select));
+        self
+    }
+
+    /// Which row a point falls in, if it falls in one. The header is not a row.
+    fn row_at(&self, y: f64, row_height: f64) -> Option<usize> {
+        let body_top = self.rect.y + row_height;
+        if y < body_top || y >= self.rect.y + self.rect.height || row_height <= 0.0 {
+            return None;
+        }
+        let index = ((y - body_top + self.offset) / row_height) as usize;
+        (index < self.rows.len()).then_some(index)
     }
 
     /// How tall the header and all the rows are together.
@@ -439,7 +468,7 @@ impl Table {
     }
 }
 
-impl<A> Widget<A> for Table {
+impl<A> Widget<A> for Table<A> {
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         self.measure_columns(cx);
         self.overflow
@@ -511,10 +540,26 @@ impl<A> Widget<A> for Table {
                 body.width,
                 row_height,
             );
+            if self.on_select.is_some() {
+                if self.selected == Some(index) {
+                    fill_rounded(list, rect, theme.selection, 0.0);
+                } else if cx.hovered(rect) && cx.hovered(body) {
+                    fill_rounded(list, rect, theme.hover, 0.0);
+                }
+            }
             draw_cells(cx, list, &self.rows[index], &self.widths, rect, theme.ink);
         }
 
         list.push(otlyra_gfx::DisplayItem::PopLayer);
+    }
+
+    fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
+        let on_select = self.on_select.as_ref()?;
+        if *event != Event::PointerPressed || !cx.hovered(self.rect) {
+            return None;
+        }
+        let index = self.row_at(cx.pointer.1, cx.theme.row_height)?;
+        Some(on_select(index))
     }
 
     fn flex(&self) -> f64 {

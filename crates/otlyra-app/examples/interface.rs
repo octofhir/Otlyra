@@ -432,6 +432,7 @@ impl Painter for InspectorFrame {
             document: Some(&self.document),
             page: self.page.as_ref(),
             style: None,
+            rules: &[],
             rect: None,
             containing: None,
             exchanges: &self.exchanges,

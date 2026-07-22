@@ -1281,10 +1281,17 @@ impl Browser {
         // Assembled whether or not the tab has a document: a load that failed
         // has a network list saying why, and hiding the panel behind a page
         // would hide the pane that explains the missing page.
+        // Only for the pane that shows them: walking the rule chain for a node
+        // nobody is looking at is work for a pane that is not open.
+        let rules = match (self.inspector.sidebar, page, self.inspector.selected) {
+            (crate::inspector::Sidebar::Rules, Some(page), Some(node)) => page.rules_for(node),
+            _ => Vec::new(),
+        };
         let facts = crate::inspector::Facts {
             document: page.map(PageScene::document),
             page,
             style,
+            rules: &rules,
             rect: chosen.as_ref().map(|chosen| chosen.border),
             containing: chosen.as_ref().and_then(|chosen| chosen.containing),
             exchanges: self.fetcher.exchanges(),
