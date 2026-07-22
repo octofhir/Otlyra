@@ -18,12 +18,14 @@
 //! toolbar can use them the day they want them. That is less work than the
 //! integration, and it leaves one stack instead of two.
 //!
-//! # It reads and never writes
+//! # It reports, and the browser writes
 //!
-//! The document is borrowed to be walked and nothing here can change it.
-//! Editing a style or an attribute from the panel needs mutation to run through
-//! `DocumentMutator` *and* an invalidation path that does not exist yet, so the
-//! panel that would pretend to offer it does not.
+//! The document is borrowed to be walked, and nothing here changes it. Editing
+//! an attribute travels out as an action naming what to set; `Browser` holds the
+//! document and is what applies it, through `PageScene::edit` — which restyles,
+//! rebuilds the box tree and relays out, so the next frame is the page as
+//! edited. Keeping that direction is why this panel could be written against a
+//! page it only reads, and it is worth keeping now that the page can change.
 
 use std::collections::HashSet;
 

@@ -43,6 +43,10 @@ just ci        # fmt, clippy, test, deny, audit, screenshot
 just metrics   # cold build time, binary size, package count
 ```
 
+`docs/interface.md` holds what binds a change to the interface and the
+inspector: the five invariants of the widget layer, the checks to run before a
+commit, and the mistakes that cost a stage to find.
+
 Supply-chain gates need `just install-tools` once.
 
 ## Licence
