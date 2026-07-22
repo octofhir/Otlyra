@@ -572,13 +572,33 @@ pub enum Clear {
     Both,
 }
 
-/// `white-space`, in the two values that matter before CSS parsing exists.
+/// `white-space-collapse`: what happens to runs of spaces and to newlines.
+///
+/// Only the collapsing half of the old `white-space` shorthand. Whether a line
+/// may break is [`TextWrap`], because CSS models the two as independent
+/// longhands and `white-space: nowrap` is exactly the pair that this enum alone
+/// cannot say: collapse the spaces *and* do not wrap.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WhiteSpace {
-    /// Runs of whitespace collapse to one space and lines wrap.
+    /// Runs of whitespace collapse to one space.
     Normal,
-    /// Whitespace and newlines are kept exactly, and lines do not wrap.
+    /// Whitespace and newlines are kept exactly.
     Pre,
+}
+
+/// `text-wrap-mode`: whether a line may be broken at all.
+///
+/// The other half of `white-space`. Kept apart from [`WhiteSpace`] because the
+/// four combinations are all real — `normal`, `pre`, `nowrap` and `pre-wrap` are
+/// the two bits in their four arrangements — and one enum of two values could
+/// only ever spell two of them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextWrap {
+    /// Lines break where they have to.
+    #[default]
+    Wrap,
+    /// Lines do not break, whatever the box is wide.
+    NoWrap,
 }
 
 /// `text-decoration-line`, as the flags it is.
@@ -717,8 +737,10 @@ pub struct ComputedStyle {
     pub border: Sides<Border>,
     /// `text-align`. Inherited.
     pub text_align: TextAlign,
-    /// `white-space`. Inherited.
+    /// `white-space-collapse`. Inherited.
     pub white_space: WhiteSpace,
+    /// `text-wrap-mode`. Inherited.
+    pub text_wrap: TextWrap,
     /// `text-decoration-line`.
     ///
     /// Not inherited in CSS — it *propagates*, which is a different thing: a
@@ -817,6 +839,7 @@ impl Default for ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             border_spacing: (0.0, 0.0),
             white_space: WhiteSpace::Normal,
+            text_wrap: TextWrap::Wrap,
             text_decoration: TextDecoration::NONE,
             margin: Sides::all(LengthOrAuto::Px(0.0)),
             padding: Sides::all(Length::ZERO),
@@ -877,6 +900,7 @@ impl ComputedStyle {
             list_style: parent.list_style,
             border_spacing: parent.border_spacing,
             white_space: parent.white_space,
+            text_wrap: parent.text_wrap,
             text_decoration: parent.text_decoration,
             text_align: parent.text_align,
             ..Self::default()

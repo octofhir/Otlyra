@@ -32,6 +32,6 @@ pub use style::{
     AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border, Clear,
     ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient,
     GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, ListStyle, Overflow, Position,
-    Repeat, Shadow, Sides, TextAlign, TextDecoration, Track, VerticalAlign, WhiteSpace,
+    Repeat, Shadow, Sides, TextAlign, TextDecoration, TextWrap, Track, VerticalAlign, WhiteSpace,
 };
 pub use ua::{has_renderable_children, initial_style, ua_style};

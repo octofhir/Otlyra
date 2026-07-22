@@ -43,7 +43,20 @@ pub struct Replaced {
     /// way a browser leaves room for a picture it has not got.
     pub image: Option<ImageData>,
     /// The size the content itself has, if it has one.
+    ///
+    /// The picture's own pixels, and nothing else. It is what the aspect ratio
+    /// is taken from, so anything written into it that is not the content's own
+    /// size changes the shape the picture is drawn at.
     pub intrinsic: Option<(f32, f32)>,
+    /// What a `width` or `height` attribute asked for, if either did.
+    ///
+    /// A *presentational hint*, which is what HTML says these are: they act as
+    /// if a rule of the lowest priority had set `width` and `height`, so a
+    /// stylesheet overrides them and a missing one leaves the other to the
+    /// aspect ratio. Kept beside the intrinsic size rather than folded into it —
+    /// folded in, `width="40"` on a 4×2 picture makes the intrinsic size 40×2
+    /// and the ratio twenty, and the picture is drawn two pixels tall.
+    pub hint: (Option<f32>, Option<f32>),
 }
 
 /// One box.

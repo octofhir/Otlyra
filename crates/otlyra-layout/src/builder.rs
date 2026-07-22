@@ -331,9 +331,11 @@ impl Builder<'_> {
         }
         let image = self.images.get(&node)?.clone();
 
-        // A `width` or `height` attribute is the size the document asked for before
-        // any CSS is written, so it stands in for the picture's own size rather
-        // than overriding what a rule says.
+        // A `width` or `height` attribute is a presentational hint: it acts as
+        // the lowest-priority rule setting that property, so a stylesheet
+        // overrides it and naming only one leaves the other to the aspect ratio.
+        // It is *not* the picture's own size, and writing it there would make
+        // `width="40"` on a 4×2 picture a picture forty by two.
         let attribute = |key: &str| -> Option<f32> {
             self.document
                 .get(node)?
@@ -347,14 +349,13 @@ impl Builder<'_> {
                 .ok()
         };
 
-        let intrinsic = (
-            attribute("width").unwrap_or(image.width as f32),
-            attribute("height").unwrap_or(image.height as f32),
-        );
+        let hint = (attribute("width"), attribute("height"));
+        let intrinsic = (image.width as f32, image.height as f32);
 
         Some(crate::box_tree::Replaced {
             image: Some(image),
             intrinsic: Some(intrinsic),
+            hint,
         })
     }
 

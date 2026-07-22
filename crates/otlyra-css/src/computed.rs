@@ -15,7 +15,7 @@ use crate::style::{
     AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border, Clear,
     ComputedStyle, Corners, Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient,
     GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight, Overflow, Placement, Position,
-    Repeat, Shadow, Sides, TextAlign, TextDecoration, Track, WhiteSpace,
+    Repeat, Shadow, Sides, TextAlign, TextDecoration, TextWrap, Track, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -64,6 +64,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             )
         },
         white_space: white_space(values),
+        text_wrap: text_wrap(values),
         text_decoration: text_decoration(values),
         margin: Sides {
             top: length_or_auto(&values.get_margin().margin_top),
@@ -259,6 +260,20 @@ fn white_space(values: &ComputedValues) -> WhiteSpace {
         // Preserve, PreserveBreaks, PreserveSpaces and BreakSpaces all keep more
         // than `normal` does; layout has one bit for that today.
         _ => WhiteSpace::Pre,
+    }
+}
+
+/// Whether a line may be broken at all.
+///
+/// The half of `white-space` that `white-space-collapse` cannot say. Without it
+/// `nowrap` collapses like `normal` — which it does — and then wraps like
+/// `normal` too, which is the whole of what it was written to prevent.
+fn text_wrap(values: &ComputedValues) -> TextWrap {
+    use style::properties::longhands::text_wrap_mode::computed_value::T as Mode;
+
+    match values.clone_text_wrap_mode() {
+        Mode::Wrap => TextWrap::Wrap,
+        Mode::Nowrap => TextWrap::NoWrap,
     }
 }
 

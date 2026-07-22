@@ -252,8 +252,11 @@ fn replaced_size(
     let intrinsic = content.intrinsic;
     let ratio = intrinsic.and_then(|(width, height)| (height > 0.0).then(|| width / height));
 
-    let width = style.width.resolve(containing);
-    let height = style.height.resolve(containing);
+    // A stylesheet first, then the attribute that stands in for one. Either way
+    // a dimension that is given takes the other from the ratio below, so naming
+    // one never squashes the picture.
+    let width = style.width.resolve(containing).or(content.hint.0);
+    let height = style.height.resolve(containing).or(content.hint.1);
 
     let (width, height) = match (width, height) {
         (Some(width), Some(height)) => (width, height),
@@ -2092,6 +2095,11 @@ impl<'a> Flow<'a> {
         // Each line asks how much room the floats have left it at the height it
         // landed at, and where that room starts; the width goes to the shaper and
         // the offset is kept for placing the line.
+        // `text-wrap-mode: nowrap` — which is half of what `white-space: nowrap`
+        // means — is a line that may not be broken however narrow the box is. No
+        // width offered to the shaper is exactly that: it lays the run out on one
+        // line and lets it overflow, which is what the property asks for.
+        let wraps = self.tree.node(parent).style.text_wrap != otlyra_css::TextWrap::NoWrap;
         let mut bands: Vec<(f32, f32)> = Vec::new();
         let shaped = {
             let floats = &self.floats;
@@ -2102,7 +2110,7 @@ impl<'a> Flow<'a> {
                     bands.resize(index + 1, (0.0, width));
                 }
                 bands[index] = (from - x, available);
-                Some(available)
+                wraps.then_some(available)
             };
             self.text
                 .shape_spans_wrapping(&spans, &spacers, &mut collect_band)
@@ -2834,6 +2842,109 @@ mod tests {
             },
         );
         (tree, boxes)
+    }
+
+    /// A picture's size, given what a stylesheet and the attributes asked for.
+    fn drawn_at(style: &ComputedStyle, hint: (Option<f32>, Option<f32>)) -> (f32, f32) {
+        replaced_size(
+            style,
+            &crate::box_tree::Replaced {
+                image: None,
+                // Four wide and two tall: a ratio of two, so a wrong height is
+                // obvious rather than a rounding difference.
+                intrinsic: Some((4.0, 2.0)),
+                hint,
+            },
+            800.0,
+        )
+    }
+
+    /// `width` and `height` on an `<img>` are presentational hints — the lowest
+    /// priority rule setting those properties — and not a new intrinsic size.
+    /// Written into the intrinsic size they took the aspect ratio with them, so
+    /// `width="40"` drew a four-by-two picture forty wide and still two tall:
+    /// squashed on one axis, which on a photograph is a wall of vertical
+    /// streaks and was reported as exactly that.
+    #[test]
+    fn a_width_attribute_is_a_hint_and_not_a_new_intrinsic_size() {
+        let plain = ComputedStyle::default();
+
+        assert_eq!(drawn_at(&plain, (None, None)), (4.0, 2.0), "nothing asked");
+        assert_eq!(
+            drawn_at(&plain, (Some(40.0), None)),
+            (40.0, 20.0),
+            "one dimension takes the other from the ratio"
+        );
+        assert_eq!(
+            drawn_at(&plain, (None, Some(20.0))),
+            (40.0, 20.0),
+            "from either side"
+        );
+        assert_eq!(
+            drawn_at(&plain, (Some(40.0), Some(5.0))),
+            (40.0, 5.0),
+            "and both given is both honoured, ratio or not"
+        );
+        // Downscaling is the same rule and the case the site showed.
+        assert_eq!(drawn_at(&plain, (Some(2.0), None)), (2.0, 1.0));
+
+        // A stylesheet outranks the hint, which is what makes it a hint.
+        let styled = ComputedStyle {
+            width: otlyra_css::LengthOrAuto::Px(80.0),
+            ..ComputedStyle::default()
+        };
+        assert_eq!(drawn_at(&styled, (Some(40.0), None)), (80.0, 40.0));
+    }
+
+    /// How many lines of text a document laid out to.
+    fn line_count(tree: &FragmentTree) -> usize {
+        fn walk(fragment: &Fragment, tops: &mut Vec<i64>) {
+            if matches!(fragment.kind, FragmentKind::Text(_)) {
+                tops.push((f64::from(fragment.rect.y) * 10.0) as i64);
+            }
+            for child in &fragment.children {
+                walk(child, tops);
+            }
+        }
+        let mut tops = Vec::new();
+        walk(&tree.root, &mut tops);
+        tops.sort_unstable();
+        tops.dedup();
+        tops.len()
+    }
+
+    /// `white-space` is two independent bits, and until now the layout had only
+    /// one of them: whether spaces collapse. Whether a line may break was never
+    /// asked, so `nowrap` wrapped — which folded the site's own header onto a
+    /// second line — and so did `pre`.
+    #[test]
+    fn whether_a_line_breaks_is_its_own_property() {
+        let narrow = |style: &str| {
+            let html =
+                format!("<body><div style=\"width:60px;{style}\">one two three four five</div>");
+            let (tree, _) = laid_out(&html, 800.0);
+            line_count(&tree)
+        };
+
+        // The four arrangements of the two bits, and each is a real value of the
+        // shorthand: collapse-and-wrap, collapse-and-not, keep-and-not, keep-and-wrap.
+        assert!(narrow("") > 1, "normal wraps");
+        assert_eq!(narrow("white-space:nowrap"), 1, "nowrap does not");
+        assert_eq!(narrow("white-space:pre"), 1, "nor does pre");
+        assert!(narrow("white-space:pre-wrap") > 1, "but pre-wrap does");
+    }
+
+    /// The site's header, in the shape that folded it: links told not to break,
+    /// in a row told not to wrap.
+    #[test]
+    fn a_nav_told_not_to_wrap_stays_on_one_line() {
+        let (tree, _) = laid_out(
+            "<body><nav style=\"display:flex;flex-wrap:nowrap;width:80px\">\
+             <a style=\"white-space:nowrap\">Home page</a>\
+             <a style=\"white-space:nowrap\">About us</a></nav>",
+            800.0,
+        );
+        assert_eq!(line_count(&tree), 1);
     }
 
     /// The first box fragment whose element is `tag`.
