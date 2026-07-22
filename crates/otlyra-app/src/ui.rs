@@ -36,7 +36,7 @@ use crate::widget::{
 };
 
 /// Height of the tab strip, in logical pixels.
-const TAB_STRIP_HEIGHT: f64 = 36.0;
+pub const TAB_STRIP_HEIGHT: f64 = 36.0;
 /// Height of the toolbar under it.
 const TOOLBAR_HEIGHT: f64 = 42.0;
 /// Total height the interface takes from the top of the window.
@@ -50,6 +50,8 @@ const TAB_MIN_WIDTH: f64 = 92.0;
 const TAB_GAP: f64 = 2.0;
 /// The side of the button that opens a tab.
 const NEW_TAB_SIZE: f64 = 28.0;
+/// How wide each end's chevron is, when the strip has more than it can show.
+const CHEVRON_SIZE: f64 = 22.0;
 
 /// An editable single-line text field.
 ///
@@ -380,6 +382,11 @@ pub enum UiAction {
     /// Never reaches the browser: the menu is the interface's own state, like
     /// the caret in the address field.
     ToggleMenu,
+    /// Slide the tab strip by a screenful in this direction.
+    ///
+    /// Never reaches the browser either: where the strip is scrolled to is the
+    /// interface's own, in the same way the menu being open is.
+    ScrollTabs(bool),
     /// Put the menu away without doing anything else — what a press anywhere
     /// off the panel means.
     CloseMenu,
@@ -513,6 +520,7 @@ struct Appearance {
     selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
     menu: Option<f64>,
+    tab_scroll: f64,
 }
 
 /// The interface's own state: what is focused, where the pointer is, what is typed.
@@ -531,6 +539,23 @@ pub struct BrowserUi {
     focused: Option<FocusId>,
     /// The focusable controls the last frame built, in the order it built them.
     focus: Focus,
+    /// How far the tab strip is slid along, and how far it could be.
+    ///
+    /// The strip's own, like the menu being open: which tabs are on screen is a
+    /// fact about the interface and not about the browser.
+    tab_scroll: f64,
+    tab_overflow: crate::widget::Overflow,
+    /// Where the active tab was placed, reported by the frame that placed it.
+    ///
+    /// Written during `place` and read afterwards to bring the tab into view.
+    /// Derived from the geometry that was actually used rather than worked out a
+    /// second time from the tab count — the strip has separators between some
+    /// pairs of tabs and not others, and a second sum would have to know that
+    /// and would be wrong the first time it changed.
+    active_tab: crate::widget::Placed,
+    /// And where the window that shows the strip was placed, so the two can be
+    /// compared without either being worked out a second time.
+    tab_window: crate::widget::Placed,
     pointer: (f64, f64),
     pointer_down: bool,
     /// Where the pointer went down, while it is still down. What lets a drag
@@ -575,6 +600,10 @@ impl BrowserUi {
             theme: Theme::light(),
             focused: None,
             focus: Focus::default(),
+            tab_scroll: 0.0,
+            tab_overflow: crate::widget::Overflow::default(),
+            active_tab: std::rc::Rc::new(std::cell::Cell::new(crate::widget::Rect::ZERO)),
+            tab_window: std::rc::Rc::new(std::cell::Cell::new(crate::widget::Rect::ZERO)),
             pointer: (-1.0, -1.0),
             pointer_down: false,
             press_origin: None,
@@ -751,6 +780,12 @@ impl BrowserUi {
                 self.focused = None;
                 UiAction::None
             }
+            // Where the strip is slid to is the interface's own, so the press
+            // is answered here and the browser never hears about it.
+            Some(UiAction::ScrollTabs(forward)) => {
+                self.scroll_tabs_page(forward);
+                UiAction::None
+            }
             Some(UiAction::CloseMenu) => {
                 self.menu_open = false;
                 UiAction::None
@@ -823,6 +858,10 @@ impl BrowserUi {
             }
             Some(UiAction::ToggleMenu) => {
                 self.menu_open = !self.menu_open;
+                UiAction::None
+            }
+            Some(UiAction::ScrollTabs(forward)) => {
+                self.scroll_tabs_page(forward);
                 UiAction::None
             }
             Some(UiAction::OpenPage(page)) => {
@@ -934,6 +973,64 @@ impl BrowserUi {
         true
     }
 
+    /// How far the tab strip is slid along.
+    pub fn tab_scroll(&self) -> f64 {
+        self.tab_scroll
+    }
+
+    /// Slide the strip by `delta` logical pixels, stopping at the ends.
+    pub fn scroll_tabs_by(&mut self, delta: f64) {
+        self.tab_scroll = (self.tab_scroll + delta).clamp(0.0, self.tab_overflow.get());
+    }
+
+    /// Slide it by most of a screenful, which is what a chevron means.
+    ///
+    /// Most rather than all: a page that moved exactly its own width would put
+    /// the tab that was at the edge just past the other edge, and a person
+    /// following a run of tabs would lose their place at every press.
+    fn scroll_tabs_page(&mut self, forward: bool) {
+        let window = self.tab_window.get().width;
+        let step = (window * 0.8).max(TAB_MIN_WIDTH);
+        self.scroll_tabs_by(if forward { step } else { -step });
+    }
+
+    /// Bring the active tab back onto the strip if it has gone off an end.
+    ///
+    /// Against the rectangle the last frame placed it at, which is the only
+    /// account of where it is. A tab off the left is brought to the left edge
+    /// and one off the right to the right edge, so the strip moves as little as
+    /// it can — a tab that jumped to the middle would take every other tab with
+    /// it for no reason the person pressing could see.
+    fn reveal_active_tab(&mut self) {
+        let travel = self.tab_overflow.get();
+        if travel <= 0.0 {
+            // Nothing to slide, and anything left over from when there was
+            // would be a strip scrolled past a strip that now fits.
+            self.tab_scroll = 0.0;
+            return;
+        }
+        let tab = self.active_tab.get();
+        if tab.width <= 0.0 {
+            return;
+        }
+        // The window the strip shows, in the same coordinates the tab was placed
+        // in: it was placed inside the scroll, so it has already had the offset
+        // taken off it.
+        let window = self.tab_window.get();
+        if window.width <= 0.0 {
+            return;
+        }
+        let (left, right) = (window.x, window.x + window.width);
+        let shift = if tab.x < left {
+            tab.x - left
+        } else if tab.x + tab.width > right {
+            tab.x + tab.width - right
+        } else {
+            return;
+        };
+        self.tab_scroll = (self.tab_scroll + shift).clamp(0.0, travel);
+    }
+
     /// Paint the interface across `width` logical pixels.
     #[allow(clippy::too_many_arguments)]
     pub fn build_display_list(
@@ -947,6 +1044,11 @@ impl BrowserUi {
         text: &mut TextEngine,
         out: &mut DisplayList,
     ) {
+        // Before the key is taken, so a frame that has to slide is the frame
+        // that is built rather than the one after it. What it reads is the last
+        // frame's geometry, which is the rule every hit test here already keeps.
+        self.reveal_active_tab();
+
         let appearance = Appearance {
             width,
             tabs: tabs
@@ -966,6 +1068,7 @@ impl BrowserUi {
                 .flatten(),
             focus: self.focused,
             menu: self.menu_open.then_some(height),
+            tab_scroll: self.tab_scroll,
         };
 
         // Nothing it is drawn from has moved, so last frame's list is this
@@ -1069,7 +1172,21 @@ impl BrowserUi {
                         vec![
                             Box::new(Fixed::height(
                                 TAB_STRIP_HEIGHT,
-                                tab_strip(&theme, &focus, &mut cx, width, tabs, active, spinner),
+                                tab_strip(
+                                    &theme,
+                                    &focus,
+                                    &mut cx,
+                                    width,
+                                    tabs,
+                                    active,
+                                    spinner,
+                                    &Sliding {
+                                        scroll: self.tab_scroll,
+                                        overflow: &self.tab_overflow,
+                                        active_tab: &self.active_tab,
+                                        window: &self.tab_window,
+                                    },
+                                ),
                             )),
                             Box::new(Fixed::height(
                                 TOOLBAR_HEIGHT,
@@ -1106,6 +1223,12 @@ impl BrowserUi {
 }
 
 /// The strip of tabs, and the button that opens another.
+///
+/// Tabs shrink to share the strip, down to a floor. Past that floor they no
+/// longer shrink — a tab narrower than its own close cross is a tab that cannot
+/// be read or shut — and the strip slides instead, with a chevron at whichever
+/// end still has tabs beyond it. A tab you have opened is a tab you can reach.
+#[allow(clippy::too_many_arguments)]
 fn tab_strip(
     theme: &Theme,
     focus: &Focus,
@@ -1114,23 +1237,45 @@ fn tab_strip(
     tabs: &[TabLabel],
     active: usize,
     spinner: Option<f32>,
+    sliding: &Sliding<'_>,
 ) -> Child<UiAction> {
+    let Sliding {
+        scroll,
+        overflow,
+        active_tab,
+        window,
+    } = *sliding;
     let inset = theme.inset * 0.75;
-    // Tabs shrink to share the strip rather than overflowing it: a tab you
-    // cannot see is a tab you cannot close. Past the floor they do overflow,
-    // which is a stated gap rather than a surprise.
-    let available = (width - inset * 2.0 - NEW_TAB_SIZE - theme.gap).max(0.0);
+    let fixed = inset * 2.0 + NEW_TAB_SIZE + theme.gap;
+    // What the tabs may share before anything scrolls. The chevrons take their
+    // room from the same total, and only when they are there — a strip that
+    // reserved space for them would be narrower than it needs to be in the
+    // ordinary case of a few tabs.
+    let plain = (width - fixed).max(0.0);
     let each = if tabs.is_empty() {
         TAB_MAX_WIDTH
     } else {
         TAB_MAX_WIDTH
-            .min(available / tabs.len() as f64 - TAB_GAP)
+            .min(plain / tabs.len() as f64 - TAB_GAP)
             .max(TAB_MIN_WIDTH)
     };
+    // Whether the tabs at that width need more room than there is. The strip's
+    // own arithmetic rather than the placed overflow, because what is being
+    // decided here is whether to build the chevrons at all, and that has to be
+    // known before anything is measured.
+    let wanted = tabs.len() as f64 * (each + TAB_GAP);
+    let scrolls = wanted > plain;
+    let available = if scrolls {
+        (plain - CHEVRON_SIZE * 2.0 - theme.gap * 2.0).max(0.0)
+    } else {
+        plain
+    };
+    let travel = (wanted - available).max(0.0);
+    let scroll = scroll.clamp(0.0, travel);
 
     let mut children: Vec<Child<UiAction>> = Vec::with_capacity(tabs.len() * 2 + 2);
     for (index, label) in tabs.iter().enumerate() {
-        children.push(tab(
+        let one = tab(
             theme,
             focus,
             cx,
@@ -1139,7 +1284,17 @@ fn tab_strip(
             index == active,
             each,
             spinner,
-        ));
+        );
+        // The active one reports where it landed, so the strip can be slid to
+        // bring it back when it has gone off an end.
+        children.push(if index == active {
+            Box::new(crate::widget::Report::new(
+                std::rc::Rc::clone(active_tab),
+                one,
+            ))
+        } else {
+            one
+        });
         // A hairline between two tabs that are both in the background, so a run
         // of them reads as several rather than as one wide empty area. Beside
         // the active tab there is nothing to separate: its own edge does that.
@@ -1148,29 +1303,105 @@ fn tab_strip(
             children.push(separator(theme));
         }
     }
+    let new_tab = |focus: &Focus| {
+        controls::icon_button(theme, focus, UiAction::NewTab, true, "New tab", icon::plus)
+    };
+    let pad = |row: Child<UiAction>| -> Child<UiAction> {
+        Box::new(Padding::new(
+            Insets {
+                left: inset,
+                top: 4.0,
+                right: inset,
+                bottom: 0.0,
+            },
+            row,
+        ))
+    };
 
-    children.push(controls::icon_button(
-        theme,
-        focus,
-        UiAction::NewTab,
-        true,
-        "New tab",
-        icon::plus,
-    ));
-    // Everything is pushed to the left; whatever is left over is empty strip.
+    // While they fit, nothing scrolls and nothing is pinned: the button that
+    // opens a tab sits directly after the last one, which is where it is
+    // reached for, and the leftover is empty strip.
+    if !scrolls {
+        children.push(new_tab(focus));
+        children.push(Box::new(crate::widget::Flex::new(
+            1.0,
+            Box::new(crate::widget::Gap::new(0.0, 0.0)),
+        )));
+        overflow.set(0.0);
+        window.set(crate::widget::Rect::ZERO);
+        return pad(Box::new(Stack::row(TAB_GAP, children)));
+    }
+
+    // Past the floor the tabs no longer shrink, so the strip slides instead. The
+    // button that opens a tab is pinned outside the sliding part — a new tab has
+    // to be openable whatever the strip is scrolled to.
     children.push(Box::new(crate::widget::Flex::new(
         1.0,
         Box::new(crate::widget::Gap::new(0.0, 0.0)),
     )));
+    let strip: Child<UiAction> = Box::new(Stack::row(TAB_GAP, children));
 
-    Box::new(Padding::new(
-        Insets {
-            left: inset,
-            top: 4.0,
-            right: inset,
-            bottom: 0.0,
-        },
-        Box::new(Stack::row(TAB_GAP, children)),
+    // Dimmed at the end it can go no further in, rather than taken away: a
+    // control that came and went would move everything beside it, and a strip
+    // whose tabs shifted under the pointer as it scrolled is one that is hard to
+    // aim at.
+    pad(Box::new(Stack::row(
+        theme.gap,
+        vec![
+            chevron_button(theme, focus, false, scroll > 0.5),
+            Box::new(crate::widget::Flex::new(
+                1.0,
+                Box::new(crate::widget::Report::new(
+                    std::rc::Rc::clone(window),
+                    Box::new(
+                        crate::widget::Scroll::row(scroll, std::rc::Rc::clone(overflow), strip)
+                            .bar(false),
+                    ),
+                )),
+            )),
+            chevron_button(theme, focus, true, scroll < travel - 0.5),
+            new_tab(focus),
+        ],
+    )))
+}
+
+/// Everything about a strip that has more tabs than it can show at once.
+///
+/// One parameter rather than four, because they are one thing: where the strip
+/// is slid to, how far it may slide, and the two rectangles that answer whether
+/// the tab being read is on screen.
+struct Sliding<'a> {
+    /// How far along the strip is.
+    scroll: f64,
+    /// How far it could be, written by the frame that places it.
+    overflow: &'a crate::widget::Overflow,
+    /// Where the active tab landed.
+    active_tab: &'a crate::widget::Placed,
+    /// And the window it has to land inside.
+    window: &'a crate::widget::Placed,
+}
+
+/// One end of the strip: a chevron that slides it a screenful that way.
+fn chevron_button(theme: &Theme, focus: &Focus, forward: bool, enabled: bool) -> Child<UiAction> {
+    let direction = if forward {
+        icon::Direction::Right
+    } else {
+        icon::Direction::Left
+    };
+    Box::new(crate::widget::Fixed::width(
+        CHEVRON_SIZE,
+        controls::icon_button(
+            theme,
+            focus,
+            UiAction::ScrollTabs(forward),
+            enabled,
+            if forward {
+                "Later tabs"
+            } else {
+                "Earlier tabs"
+            },
+            move |list, rect, color| icon::chevron(list, rect, direction, color),
+        ),
     ))
 }
 
@@ -2268,7 +2499,7 @@ mod tests {
 
     /// Tabs shrink to share the width, down to a floor. Past the floor they run
     /// off the edge, which is a stated gap: a scrolling or collapsing tab strip
-    /// is interface work this milestone does not do.
+    /// is what W9 closed.
     #[test]
     fn many_tabs_shrink_to_share_the_strip_and_stop_at_a_floor() {
         let mut text = TextEngine::new();
@@ -2276,23 +2507,147 @@ mod tests {
         frame(&mut ui, &mut text, 1000.0, 20);
 
         // Twenty tabs across a 1000px strip would be 47px each if they kept
-        // dividing, and a 47px tab holds no title. They stop at the floor
-        // instead, so the right end of the strip is the tenth of them and the
-        // rest have run off the edge — visible in that the press lands on a tab
-        // in the middle of the run rather than on the last of them.
-        let strip_end = press(&mut ui, &mut text, 990.0, TAB_STRIP_HEIGHT / 2.0);
-        assert_eq!(strip_end, UiAction::SelectTab(10));
+        // dividing, and a 47px tab holds no title. They stop at the floor and
+        // the strip slides instead — which is the difference between a tab that
+        // is off screen and a tab that is lost.
+        let strip = on_the_strip(&mut ui, &mut text, 1000.0);
+        assert!(
+            strip.len() < 20,
+            "twenty tabs do not fit a 1000px strip: {strip:?}"
+        );
+        assert!(
+            ui.tab_overflow.get() > 0.0,
+            "so the strip has somewhere to slide to"
+        );
+        // The floor holds: two neighbouring tabs are a floor apart, not the 47px
+        // they would be if they had kept dividing.
+        let width = TAB_MIN_WIDTH + TAB_GAP;
+        assert!(width > 47.0);
+    }
 
-        // And the floor is the floor: the tab before that one starts a full
-        // tab-width earlier.
+    /// The whole of W9: a tab you have opened is a tab you can reach.
+    #[test]
+    fn every_tab_can_be_reached_by_scrolling() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 20);
+
+        // Every one of them, one at a time: the tab being read is the tab that
+        // has to be on the strip, and a browser reaches a tab by selecting it.
+        // Twice per step, because how far the strip can slide and where the tab
+        // landed are both things only a drawn frame reports.
+        let missing: Vec<usize> = (0..20)
+            .filter(|active| {
+                frame_active(&mut ui, &mut text, 1000.0, 20, *active);
+                frame_active(&mut ui, &mut text, 1000.0, 20, *active);
+                !on_the_strip(&mut ui, &mut text, 1000.0).contains(active)
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these tabs cannot be reached: {missing:?}"
+        );
+
+        // And by hand from either end, without a selection moving anything: the
+        // wheel and the chevrons reach the first and the last.
+        ui.scroll_tabs_by(-10_000.0);
+        frame_active(&mut ui, &mut text, 1000.0, 20, 0);
+        assert!(on_the_strip(&mut ui, &mut text, 1000.0).contains(&0));
+        ui.scroll_tabs_by(10_000.0);
+        frame_active(&mut ui, &mut text, 1000.0, 20, 19);
+        assert!(on_the_strip(&mut ui, &mut text, 1000.0).contains(&19));
+    }
+
+    /// And the one you are reading is on screen without being looked for.
+    #[test]
+    fn the_active_tab_is_brought_into_view() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        for active in [19, 0, 12] {
+            // Twice: how far the strip can slide, and where the active tab
+            // landed, are both things only a drawn frame reports — so the frame
+            // that slides is the one after the frame that placed it.
+            for _ in 0..2 {
+                frame_active(&mut ui, &mut text, 1000.0, 20, active);
+            }
+            assert!(
+                on_the_strip(&mut ui, &mut text, 1000.0).contains(&active),
+                "tab {active} is the one being read and is not on the strip"
+            );
+        }
+    }
+
+    /// A strip that fits does not slide, and does not keep an offset from when
+    /// it did — a strip scrolled past a strip that now fits shows empty space
+    /// where its first tabs are.
+    #[test]
+    fn closing_tabs_until_they_fit_puts_the_strip_back() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 20);
+        ui.scroll_tabs_by(10_000.0);
+        assert!(ui.tab_scroll() > 0.0);
+
+        frame(&mut ui, &mut text, 1000.0, 2);
+        frame(&mut ui, &mut text, 1000.0, 2);
+        assert_eq!(ui.tab_scroll(), 0.0);
+        assert_eq!(on_the_strip(&mut ui, &mut text, 1000.0), vec![0, 1]);
+    }
+
+    /// The chevrons slide the strip and never reach the browser: where a strip
+    /// is scrolled to is the interface's own, like the menu being open.
+    #[test]
+    fn a_chevron_slides_the_strip_and_the_browser_never_hears_of_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 20);
+
+        // The right-hand chevron sits just before the button that opens a tab.
+        let x = 1000.0 - 6.0 - NEW_TAB_SIZE - CHEVRON_SIZE / 2.0 - 6.0;
+        let was = ui.tab_scroll();
         assert_eq!(
-            press(
-                &mut ui,
-                &mut text,
-                990.0 - TAB_MIN_WIDTH - TAB_GAP,
-                TAB_STRIP_HEIGHT / 2.0
-            ),
-            UiAction::SelectTab(9)
+            press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
+            UiAction::None,
+            "the strip is the interface's own business"
+        );
+        assert!(ui.tab_scroll() > was, "and it moved");
+    }
+
+    /// Which tabs can be pressed on the strip as it is drawn right now.
+    fn on_the_strip(ui: &mut BrowserUi, text: &mut TextEngine, width: f64) -> Vec<usize> {
+        let mut seen = Vec::new();
+        let mut x = 0.0;
+        while x < width {
+            if let Some(UiAction::SelectTab(index)) = ui.action_at(x, TAB_STRIP_HEIGHT / 2.0, text)
+                && !seen.contains(&index)
+            {
+                seen.push(index);
+            }
+            x += 4.0;
+        }
+        seen.sort_unstable();
+        seen
+    }
+
+    /// One frame with `active` the tab being read.
+    fn frame_active(
+        ui: &mut BrowserUi,
+        text: &mut TextEngine,
+        width: f64,
+        tabs: usize,
+        active: usize,
+    ) {
+        let mut list = DisplayList::default();
+        ui.build_display_list(
+            width,
+            600.0,
+            &labels(tabs),
+            active,
+            (true, true),
+            None,
+            text,
+            &mut list,
         );
     }
 }

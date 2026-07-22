@@ -1200,7 +1200,8 @@ impl Browser {
             UiAction::Focus(_)
             | UiAction::AddressHit(_)
             | UiAction::ToggleMenu
-            | UiAction::CloseMenu => {}
+            | UiAction::CloseMenu
+            | UiAction::ScrollTabs(_) => {}
             UiAction::ToggleInspector => self.inspector.toggle(),
             // Chosen from the menu, a browser page opens beside what you were
             // reading rather than over it: the menu is reached *while* looking
@@ -1771,8 +1772,18 @@ impl Painter for Browser {
             // negates it. The event already says which way the reader went, and
             // a consumer that decided that for itself is how the settings came
             // to scroll the opposite way from a document.
-            PlatformEvent::Scroll { y, .. } => {
+            PlatformEvent::Scroll { x, y, .. } => {
                 if self.ui.owns_pointer() {
+                    // The tab strip is a thing under the pointer like any other,
+                    // and a strip with more tabs than it can show is a strip the
+                    // wheel should move. Whichever axis the wheel reported the
+                    // more of: a mouse with one wheel says `y` and a trackpad
+                    // swiped sideways says `x`, and both mean the same thing to a
+                    // strip that only runs one way.
+                    if self.pointer.1 < crate::ui::TAB_STRIP_HEIGHT && !self.ui.menu_open {
+                        let delta = if x.abs() > y.abs() { x } else { y };
+                        self.ui.scroll_tabs_by(delta);
+                    }
                     return;
                 }
                 // The wheel goes to whatever is under the pointer, and the panel

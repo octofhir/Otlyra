@@ -535,6 +535,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     busy.ui.address.set_text("https://example.com/some/path");
     frames.push(busy);
 
+    // More tabs than the strip can hold, with the one being read near the far
+    // end: the strip has slid to bring it into view and there is a chevron at
+    // each end saying there are more that way. Before W9 these ran off the right
+    // edge, where they could be neither selected nor closed.
+    let mut crowded = toolbar(
+        "tabs-overflowing",
+        // Titles that differ at the front, because at the floor a tab shows
+        // only its first few characters and a run of them that all began the
+        // same way would say nothing about how narrow they had become.
+        [
+            "Otlyra",
+            "CSS grid",
+            "Flexbox",
+            "Rust docs",
+            "winit",
+            "Skia",
+            "Unicode",
+            "HTML spec",
+            "Fonts",
+            "Networking",
+            "Painting",
+            "Inspector",
+            "Wikipedia",
+            "Mail",
+        ]
+        .iter()
+        .map(|title| TabLabel {
+            title: (*title).to_owned(),
+            loading: false,
+        })
+        .collect(),
+        11,
+        (true, true),
+        None,
+    );
+    crowded.ui.address.set_text("https://example.com/eleven");
+    frames.push(crowded);
+
     // The address field with the caret in it, which is the state every other
     // control has to keep out of the way of.
     let mut focused = toolbar(

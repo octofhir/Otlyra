@@ -1314,12 +1314,67 @@ impl<A> Widget<A> for Clip<A> {
 /// two copies of.
 pub type Overflow = Rc<Cell<f64>>;
 
-/// A panel that shows a window onto a taller child.
+/// Where a widget was placed, reported back to whoever needs to know.
+///
+/// The counterpart to [`Overflow`], and for the same reason: a caller that wants
+/// to scroll something into view has to know where that something ended up, and
+/// where it ended up is decided by the frame. Working it out a second time from
+/// the caller's own arithmetic would be a second answer to *where is this*, which
+/// is the one thing this layer keeps to a single place.
+pub type Placed = Rc<Cell<Rect>>;
+
+/// A child that records the rectangle it was placed into.
+pub struct Report<A> {
+    child: Child<A>,
+    into: Placed,
+}
+
+impl<A> Report<A> {
+    /// Wrap `child` so its placed rectangle lands in `into`.
+    pub fn new(into: Placed, child: Child<A>) -> Self {
+        Self { child, into }
+    }
+}
+
+impl<A> Widget<A> for Report<A> {
+    fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
+        self.child.measure(available, cx)
+    }
+
+    fn place(&mut self, rect: Rect, cx: &mut Cx) {
+        self.into.set(rect);
+        self.child.place(rect, cx);
+    }
+
+    fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
+        self.child.draw(cx, list);
+    }
+
+    fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
+        self.child.event(event, cx)
+    }
+
+    fn flex(&self) -> f64 {
+        self.child.flex()
+    }
+
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
+}
+
+/// A panel that shows a window onto a child bigger than itself.
 pub struct Scroll<A> {
     child: Child<A>,
+    axis: Axis,
     offset: f64,
     overflow: Overflow,
     content: f64,
+    bar: bool,
     rect: Rect,
 }
 
@@ -1329,33 +1384,69 @@ impl<A> Scroll<A> {
     pub fn new(offset: f64, overflow: Overflow, child: Child<A>) -> Self {
         Self {
             child,
+            axis: Axis::Vertical,
             offset,
             overflow,
             content: 0.0,
+            bar: true,
             rect: Rect::ZERO,
+        }
+    }
+
+    /// The same, sideways: a window onto a child wider than itself.
+    ///
+    /// An axis on the one scrolling panel rather than a second panel that
+    /// scrolls the other way. What differs between them is which of two numbers
+    /// is the long one, and a second widget would be a second answer to *how far
+    /// can this go* to keep agreeing with the first.
+    pub fn row(offset: f64, overflow: Overflow, child: Child<A>) -> Self {
+        Self {
+            axis: Axis::Horizontal,
+            ..Self::new(offset, overflow, child)
+        }
+    }
+
+    /// Whether to draw the bar that says how far along the content is.
+    ///
+    /// Off for a strip whose own chevrons already say there is more in that
+    /// direction: two things saying one thing is one of them to keep in step.
+    pub fn bar(mut self, bar: bool) -> Self {
+        self.bar = bar;
+        self
+    }
+
+    /// The long side of `size` — the one the content may exceed.
+    fn long(&self, size: Size) -> f64 {
+        match self.axis {
+            Axis::Horizontal => size.width,
+            Axis::Vertical => size.height,
         }
     }
 }
 
 impl<A> Widget<A> for Scroll<A> {
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
-        // The child is measured against unbounded height — the whole point is
-        // that it may be taller than what it is shown in.
-        self.content = self
-            .child
-            .measure(Size::new(available.width, f64::INFINITY), cx)
-            .height;
-        Size::new(available.width, available.height)
+        // The child is measured against an unbounded long side — the whole point
+        // is that it may be bigger than what it is shown in.
+        let room = match self.axis {
+            Axis::Horizontal => Size::new(f64::INFINITY, available.height),
+            Axis::Vertical => Size::new(available.width, f64::INFINITY),
+        };
+        let measured = self.child.measure(room, cx);
+        self.content = self.long(measured);
+        available
     }
 
     fn place(&mut self, rect: Rect, cx: &mut Cx) {
         self.rect = rect;
-        self.overflow.set((self.content - rect.height).max(0.0));
+        self.overflow
+            .set((self.content - self.long(Size::new(rect.width, rect.height))).max(0.0));
         let offset = self.offset.clamp(0.0, self.overflow.get());
-        self.child.place(
-            Rect::new(rect.x, rect.y - offset, rect.width, self.content),
-            cx,
-        );
+        let child = match self.axis {
+            Axis::Horizontal => Rect::new(rect.x - offset, rect.y, self.content, rect.height),
+            Axis::Vertical => Rect::new(rect.x, rect.y - offset, rect.width, self.content),
+        };
+        self.child.place(child, cx);
     }
 
     fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
@@ -1372,23 +1463,27 @@ impl<A> Widget<A> for Scroll<A> {
         // rather than beside it: a bar that took width would reflow the panel
         // the moment its content grew past the bottom.
         let overflow = self.overflow.get();
-        if overflow > 0.0 {
+        if self.bar && overflow > 0.0 {
             let theme = cx.theme.clone();
-            let track = self.rect.height;
+            let track = self.long(Size::new(self.rect.width, self.rect.height));
             let thumb = (track * (track / self.content)).max(24.0);
             let travel = track - thumb;
-            let offset = self.offset.clamp(0.0, overflow);
-            fill_rounded(
-                list,
-                Rect::new(
+            let along = travel * (self.offset.clamp(0.0, overflow) / overflow);
+            let bar = match self.axis {
+                Axis::Horizontal => Rect::new(
+                    self.rect.x + along,
+                    self.rect.y + self.rect.height - 7.0,
+                    thumb,
+                    4.0,
+                ),
+                Axis::Vertical => Rect::new(
                     self.rect.x + self.rect.width - 7.0,
-                    self.rect.y + travel * (offset / overflow),
+                    self.rect.y + along,
                     4.0,
                     thumb,
                 ),
-                theme.ink_disabled,
-                2.0,
-            );
+            };
+            fill_rounded(list, bar, theme.ink_disabled, 2.0);
         }
     }
 
