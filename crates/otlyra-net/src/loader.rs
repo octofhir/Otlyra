@@ -38,6 +38,13 @@ pub struct LoadedResource {
     /// Whether the server sent `X-Content-Type-Options: nosniff`, which is it
     /// saying that what it declared is what it means.
     pub nosniff: bool,
+    /// The headers actually put on the request, name and value, in the order the
+    /// client wrote them. What an inspector shows under *Request*: the ones we
+    /// sent, not a plausible list of ones we might have.
+    pub request_headers: Vec<(String, String)>,
+    /// Every header the response carried, name and value, in the order it sent
+    /// them. A header seen twice is listed twice, because that is what arrived.
+    pub response_headers: Vec<(String, String)>,
     /// The body, decompressed but otherwise untouched.
     pub body: Vec<u8>,
 }
@@ -63,6 +70,26 @@ impl LoadedResource {
         let (text, _actual, _had_errors) = encoding.decode(&self.body);
         text.into_owned()
     }
+}
+
+/// A header map as name/value pairs a person can read.
+///
+/// A value that is not valid UTF-8 — which a header may be — is shown as the
+/// bytes it is rather than dropped: an inspector that hid a header because it
+/// could not spell it would be hiding exactly the odd one worth seeing.
+fn headers_to_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned()),
+            )
+        })
+        .collect()
 }
 
 /// Extract the `charset` parameter from a `Content-Type` header value.
@@ -233,14 +260,24 @@ impl Loader {
         let url = request.url.to_string();
         let limit = self.limits.max_body_bytes;
 
-        let response = self
+        // Built rather than sent in one call, so the headers the client is about
+        // to write can be read back and shown: an inspector's *Request* pane is
+        // the headers we actually sent, and this is where they become knowable.
+        let built = self
             .client
             .get(request.url)
-            .send()
+            .build()
+            .map_err(|error| self.classify(error, &url))?;
+        let request_headers = headers_to_pairs(built.headers());
+
+        let response = self
+            .client
+            .execute(built)
             .await
             .map_err(|error| self.classify(error, &url))?;
 
         let status = response.status().as_u16();
+        let response_headers = headers_to_pairs(response.headers());
         let final_url = response.url().to_string();
         let content_type = response
             .headers()
@@ -283,6 +320,8 @@ impl Loader {
             status,
             content_type,
             nosniff,
+            request_headers,
+            response_headers,
             body,
         })
     }
@@ -316,6 +355,8 @@ mod tests {
             status: 200,
             content_type: content_type.map(str::to_owned),
             nosniff: false,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
             body: body.to_vec(),
         }
     }

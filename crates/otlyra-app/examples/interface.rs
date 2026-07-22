@@ -243,49 +243,138 @@ struct InspectorFrame {
     ui: BrowserUi,
     inspector: otlyra_app::inspector::Inspector,
     document: otlyra_dom::Document,
+    /// A laid-out copy, for the accessibility pane, which reads boxes.
+    page: Option<otlyra_app::page::PageScene>,
+    /// A canned network list, for the network pane.
+    exchanges: Vec<otlyra_app::fetcher::Exchange>,
+    /// Which pane the written frame shows.
+    pane: otlyra_app::inspector::Pane,
     /// How many times Down is pressed before the frame that is written.
     steps: usize,
     text: TextEngine,
 }
 
+/// The document every inspector state here inspects.
+const INSPECTOR_HTML: &[u8] = b"<html><head><title>A page</title></head><body>\
+      <header class=\"top\"><h1 id=\"title\">A heading</h1></header>\
+      <main><p class=\"lead\">A paragraph of text.</p>\
+      <ul><li>one</li><li>two</li></ul></main></body></html>";
+
 impl InspectorFrame {
     fn new(steps: usize) -> Self {
-        let document = otlyra_html::parse(
-            b"<html><head><title>A page</title></head><body>\
-              <header class=\"top\"><h1 id=\"title\">A heading</h1></header>\
-              <main><p class=\"lead\">A paragraph of text.</p>\
-              <ul><li>one</li><li>two</li></ul></main></body></html>",
-            Some("utf-8"),
-        )
-        .document;
+        let document = otlyra_html::parse(INSPECTOR_HTML, Some("utf-8")).document;
         let mut inspector = otlyra_app::inspector::Inspector::new();
         inspector.open = true;
         Self {
             ui: BrowserUi::new(),
             inspector,
             document,
+            page: None,
+            exchanges: Vec::new(),
+            pane: otlyra_app::inspector::Pane::Elements,
             steps,
             text: TextEngine::new(),
         }
     }
 
+    /// A frame showing `pane`, with a laid-out page and a canned network list
+    /// behind it so the panes that read those have something to draw.
+    fn on_pane(pane: otlyra_app::inspector::Pane) -> Self {
+        let mut frame = Self::new(1);
+        frame.pane = pane;
+        let parsed = otlyra_html::parse(INSPECTOR_HTML, Some("utf-8"));
+        let mut page = otlyra_app::page::PageScene::new(parsed.document);
+        let mut text = TextEngine::isolated();
+        let _ = page.build_display_list(&mut text, 1000.0, 500.0, 0.0);
+        frame.page = Some(page);
+        frame.exchanges = canned_exchanges();
+        frame
+    }
+
     fn settle(&mut self) {
+        self.inspector
+            .apply(otlyra_app::inspector::Action::Show(self.pane));
         self.inspector.selected = None;
         for _ in 0..self.steps {
             self.inspector.key_pressed(
                 Key::Down,
                 Modifiers::default(),
-                &self.document,
+                Some(&self.document),
                 &mut InMemory::default(),
             );
             self.inspector.key_pressed(
                 Key::Right,
                 Modifiers::default(),
-                &self.document,
+                Some(&self.document),
                 &mut InMemory::default(),
             );
         }
+        // On the network pane, choose a request so the detail side is drawn too.
+        if self.pane == otlyra_app::inspector::Pane::Network
+            && let Some(first) = self.exchanges.first()
+        {
+            self.inspector
+                .apply(otlyra_app::inspector::Action::SelectExchange(first.id));
+        }
     }
+}
+
+/// A network list built by really running a fetch, so the panel is drawn over
+/// the same data the browser produces rather than a hand-made imitation.
+fn canned_exchanges() -> Vec<otlyra_app::fetcher::Exchange> {
+    use otlyra_app::fetcher::{Fetcher, Loaded, Loader, ResourceKind};
+
+    struct Canned;
+    impl Loader for Canned {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            let (content_type, bytes, status) = if url.ends_with(".css") {
+                (
+                    "text/css",
+                    b"body { color: #222; }\nh1 { font-size: 2rem; }".to_vec(),
+                    200,
+                )
+            } else if url.ends_with(".png") {
+                // A missing picture: a 404 with a short HTML body, which is the
+                // case the old flat list called "ok".
+                ("text/html", b"<h1>Not found</h1>".to_vec(), 404)
+            } else {
+                ("text/html", INSPECTOR_HTML.to_vec(), 200)
+            };
+            Ok(Loaded {
+                bytes,
+                content_type: Some(content_type.to_owned()),
+                status: Some(status),
+                request_headers: vec![
+                    ("user-agent".to_owned(), "Otlyra".to_owned()),
+                    ("accept".to_owned(), "*/*".to_owned()),
+                ],
+                response_headers: vec![
+                    ("content-type".to_owned(), content_type.to_owned()),
+                    ("content-length".to_owned(), "42".to_owned()),
+                ],
+                final_url: url.to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    let mut fetcher = Fetcher::spawn(Canned);
+    for (url, kind) in [
+        ("https://otlyra.example/", ResourceKind::Document),
+        ("https://otlyra.example/style.css", ResourceKind::Stylesheet),
+        ("https://otlyra.example/logo.png", ResourceKind::Image),
+    ] {
+        fetcher.request(url, kind);
+    }
+    let mut settled = 0;
+    while settled < 3 {
+        let batch = fetcher.wait(std::time::Duration::from_secs(5));
+        if batch.is_empty() {
+            break;
+        }
+        settled += batch.len();
+    }
+    fetcher.exchanges().to_vec()
 }
 
 impl Painter for InspectorFrame {
@@ -306,10 +395,11 @@ impl Painter for InspectorFrame {
         );
         let facts = otlyra_app::inspector::Facts {
             document: Some(&self.document),
+            page: self.page.as_ref(),
             style: None,
             rect: None,
             containing: None,
-            exchanges: &[],
+            exchanges: &self.exchanges,
         };
         self.inspector.build_display_list(
             otlyra_app::ui::Rect::new(0.0, UI_HEIGHT + content - dock, width, dock),
@@ -510,6 +600,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The inspector, closed on the document and opened several levels into it.
     for (name, steps) in [("inspector", 1), ("inspector-deep", 4)] {
         let mut frame = InspectorFrame::new(steps);
+        write_states(&directory, name, &mut frame, 1000.0, 700.0, |frame| {
+            frame.settle();
+        })?;
+    }
+
+    // The panes that read a page and a network list: the accessibility tree and
+    // the network waterfall, each with its detail side open.
+    for (name, pane) in [
+        ("inspector-a11y", otlyra_app::inspector::Pane::Accessibility),
+        ("inspector-network", otlyra_app::inspector::Pane::Network),
+    ] {
+        let mut frame = InspectorFrame::on_pane(pane);
         write_states(&directory, name, &mut frame, 1000.0, 700.0, |frame| {
             frame.settle();
         })?;

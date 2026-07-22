@@ -42,6 +42,17 @@ pub struct Loaded {
     pub content_type: Option<String>,
     /// Whether the transport said not to sniff.
     pub nosniff: bool,
+    /// The HTTP status the server answered with, when the fetch was over HTTP.
+    ///
+    /// `None` for a `file:` load, which has no status — and drawn as such rather
+    /// than as an invented `200`. A `404` arrives here beside a body, because a
+    /// transport that returned bytes *succeeded*; whether those bytes are the
+    /// page asked for is what the status says and the `Ok`/`Failed` split cannot.
+    pub status: Option<u16>,
+    /// The headers put on the request.
+    pub request_headers: Vec<(String, String)>,
+    /// The headers the response carried.
+    pub response_headers: Vec<(String, String)>,
     /// The address it actually came from, after redirects.
     pub final_url: String,
 }
@@ -77,6 +88,15 @@ pub enum Status {
     Failed(String),
 }
 
+/// The most of a response body the fetcher keeps for the inspector to show.
+///
+/// A body is shown, not the whole of one: a page's own bytes have already been
+/// parsed and drawn, and a second full copy of every resource for a pane that
+/// might be opened would be the page's memory twice over. A quarter-megabyte is
+/// enough to read a stylesheet or preview a small picture, and a truncated body
+/// says as much in the pane rather than pretending to be whole.
+const BODY_KEPT: usize = 256 * 1024;
+
 /// One request the browser made, and what became of it.
 ///
 /// Kept by the fetcher because the fetcher is what knows: it has the number, the
@@ -88,16 +108,56 @@ pub struct Exchange {
     /// What it was for, which is the nearest thing to *what asked for it* the
     /// browser currently records — the element that named it is not tracked.
     pub kind: ResourceKind,
+    /// The method it was made with. `GET` for everything the browser fetches
+    /// today; a field rather than a constant so the day a form posts, the pane
+    /// already has somewhere to say so.
+    pub method: &'static str,
     /// The address.
     pub url: String,
     /// How it ended.
     pub status: Status,
+    /// The HTTP status code, when the fetch reached a server that answered one.
+    pub code: Option<u16>,
+    /// What the transport said the body is.
+    pub content_type: Option<String>,
+    /// The headers put on the request.
+    pub request_headers: Vec<(String, String)>,
+    /// The headers the response carried.
+    pub response_headers: Vec<(String, String)>,
+    /// As much of the body as is kept, and whether that is all of it.
+    pub body: Vec<u8>,
+    /// Whether `body` is the whole of what arrived.
+    pub body_complete: bool,
     /// How long the transport took, once it ended.
     pub took: Option<std::time::Duration>,
     /// How long from the ask to the browser noticing, which includes the wait
     /// for a free fetch thread.
     pub waited: Option<std::time::Duration>,
     asked_at: std::time::Instant,
+}
+
+impl Exchange {
+    /// A finished exchange, for a test that needs a network list without a
+    /// socket. Everything the panel reads is a public field to be set after.
+    #[cfg(test)]
+    pub fn for_test(id: u64, kind: ResourceKind, url: &str, status: Status) -> Self {
+        Self {
+            id,
+            kind,
+            method: "GET",
+            url: url.to_owned(),
+            status,
+            code: None,
+            content_type: None,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            body: Vec::new(),
+            body_complete: true,
+            took: None,
+            waited: None,
+            asked_at: std::time::Instant::now(),
+        }
+    }
 }
 
 /// How many requests the list keeps before the oldest goes.
@@ -232,8 +292,15 @@ impl Fetcher {
         self.exchanges.push(Exchange {
             id,
             kind,
+            method: "GET",
             url: url.to_owned(),
             status: Status::Pending,
+            code: None,
+            content_type: None,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            body: Vec::new(),
+            body_complete: false,
             took: None,
             waited: None,
             asked_at: std::time::Instant::now(),
@@ -278,6 +345,17 @@ impl Fetcher {
             Ok(loaded) => Status::Ok(loaded.bytes.len()),
             Err(error) => Status::Failed(error.clone()),
         };
+        // The parts the panel's detail side shows, cloned here — the last place
+        // the bytes are still in hand before the browser moves them out of the
+        // result to parse them.
+        if let Ok(loaded) = &fetched.result {
+            exchange.code = loaded.status;
+            exchange.content_type = loaded.content_type.clone();
+            exchange.request_headers = loaded.request_headers.clone();
+            exchange.response_headers = loaded.response_headers.clone();
+            exchange.body_complete = loaded.bytes.len() <= BODY_KEPT;
+            exchange.body = loaded.bytes[..loaded.bytes.len().min(BODY_KEPT)].to_vec();
+        }
         exchange.took = Some(fetched.took);
         exchange.waited = Some(exchange.asked_at.elapsed());
     }

@@ -33,13 +33,12 @@ const INTERFACE_BASE: u64 = u64::MAX / 2;
 
 /// Build the tree for `page`, titled `title`.
 pub fn tree_for(page: &PageScene, title: &str) -> TreeUpdate {
-    let boxes = page.boxes();
     let mut nodes = Vec::new();
 
     let mut root = Node::new(Role::Document);
     root.set_label(title.to_owned());
 
-    let children = collect(page, boxes, boxes.root(), &mut nodes);
+    let children = to_nodes(&describe_page(page), &mut nodes);
     root.set_children(children);
     nodes.push((ROOT, root));
 
@@ -49,6 +48,129 @@ pub fn tree_for(page: &PageScene, title: &str) -> TreeUpdate {
         tree_id: TreeId::ROOT,
         focus: ROOT,
     }
+}
+
+/// One accessible thing on the page, before it is anything a platform knows.
+///
+/// The middle of the walk, split out so the panel that *shows* the tree and the
+/// adapter that *hands it to a reader* are two views of one answer. A panel that
+/// walked the boxes itself would be a second account of what a page exposes, and
+/// the first bug in it would be the two disagreeing.
+#[derive(Clone, Debug)]
+pub struct Accessible {
+    /// The box it came from, which is also its identity in the platform tree.
+    pub box_id: BoxId,
+    /// The DOM node behind that box, absent for an anonymous one.
+    pub node: Option<otlyra_dom::NodeId>,
+    /// What it is.
+    pub role: Role,
+    /// What it says, for the leaves that are text.
+    pub value: Option<String>,
+    /// A heading's level.
+    pub level: Option<usize>,
+    /// Where a link goes.
+    pub url: Option<String>,
+    /// Where it was drawn, in page coordinates.
+    pub bounds: Option<Rect>,
+    /// What it contains.
+    pub children: Vec<Accessible>,
+}
+
+impl Accessible {
+    /// What a screen reader says when the cursor lands here.
+    ///
+    /// The role first and the words second, which is the order every reader
+    /// announces in: *what is this* and only then *what does it say*. Written
+    /// out rather than left to the panel, because "what would be read" is a fact
+    /// about the tree and not about the panel showing it.
+    pub fn spoken(&self) -> String {
+        let mut out = role_word(self.role).to_owned();
+        if let Some(level) = self.level {
+            out.push_str(&format!(" level {level}"));
+        }
+        if let Some(value) = self.value.as_deref().filter(|value| !value.is_empty()) {
+            out.push_str(&format!(", \u{201c}{value}\u{201d}"));
+        }
+        if let Some(url) = self.url.as_deref() {
+            out.push_str(&format!(", {url}"));
+        }
+        out
+    }
+}
+
+/// What a reader calls a role, in the words it uses out loud.
+///
+/// `Debug` would say `ListItem`, which is a Rust identifier and not a word
+/// anybody hears.
+pub fn role_word(role: Role) -> &'static str {
+    match role {
+        Role::Heading => "heading",
+        Role::Link => "link",
+        Role::Paragraph => "paragraph",
+        Role::List => "list",
+        Role::ListItem => "list item",
+        Role::Table => "table",
+        Role::Row => "row",
+        Role::Cell => "cell",
+        Role::Button => "button",
+        Role::Image => "image",
+        Role::Navigation => "navigation",
+        Role::Header => "banner",
+        Role::Footer => "content info",
+        Role::Main => "main",
+        Role::Article => "article",
+        Role::Section => "section",
+        Role::Blockquote => "quote",
+        Role::Code => "code",
+        Role::Strong => "strong",
+        Role::Emphasis => "emphasis",
+        Role::Label => "text",
+        Role::Document => "document",
+        Role::Window => "window",
+        Role::CheckBox => "checkbox",
+        Role::RadioButton => "radio button",
+        Role::Switch => "switch",
+        Role::TextInput => "text field",
+        Role::Slider => "slider",
+        Role::Tab => "tab",
+        Role::MenuItem => "menu item",
+        _ => "group",
+    }
+}
+
+/// What `page` exposes, as the tree a reader would walk.
+///
+/// The children of the document root: the root itself is the page, and what it
+/// is called is the title, which is the caller's to supply.
+pub fn describe_page(page: &PageScene) -> Vec<Accessible> {
+    let boxes = page.boxes();
+    collect(page, boxes, boxes.root())
+}
+
+/// One accessible node, and the ones under it, as platform nodes.
+fn to_nodes(items: &[Accessible], nodes: &mut Vec<(NodeId, Node)>) -> Vec<NodeId> {
+    let mut ids = Vec::new();
+    for item in items {
+        let grandchildren = to_nodes(&item.children, nodes);
+        let mut node = Node::new(item.role);
+        node.set_children(grandchildren);
+        if let Some(value) = &item.value {
+            node.set_value(value.clone());
+        }
+        if let Some(bounds) = item.bounds {
+            node.set_bounds(bounds);
+        }
+        if let Some(url) = &item.url {
+            node.set_url(url.clone());
+        }
+        if let Some(level) = item.level {
+            node.set_level(level);
+        }
+        let id = identifier(item.box_id);
+        nodes.push((id, node));
+        ids.push(id);
+    }
+    ids
 }
 
 /// The whole window: the interface, and the document under it.
@@ -179,14 +301,9 @@ pub fn empty_tree(label: &str) -> TreeUpdate {
     }
 }
 
-/// Walk a box's children, appending the nodes they produce, and return their ids.
-fn collect(
-    page: &PageScene,
-    boxes: &BoxTree,
-    id: BoxId,
-    nodes: &mut Vec<(NodeId, Node)>,
-) -> Vec<NodeId> {
-    let mut ids = Vec::new();
+/// Walk a box's children and say what each of them is.
+fn collect(page: &PageScene, boxes: &BoxTree, id: BoxId) -> Vec<Accessible> {
+    let mut out = Vec::new();
 
     for &child in &boxes.node(id).children {
         let node = boxes.node(child);
@@ -198,48 +315,48 @@ fn collect(
             if trimmed.is_empty() {
                 continue;
             }
-            let mut label = Node::new(Role::Label);
-            label.set_value(trimmed.to_owned());
-            let node_id = identifier(child);
-            nodes.push((node_id, label));
-            ids.push(node_id);
+            out.push(Accessible {
+                box_id: child,
+                node: node.node,
+                role: Role::Label,
+                value: Some(trimmed.to_owned()),
+                level: None,
+                url: None,
+                bounds: None,
+                children: Vec::new(),
+            });
             continue;
         }
 
-        let grandchildren = collect(page, boxes, child, nodes);
+        let grandchildren = collect(page, boxes, child);
         let Some(role) = role_of(node.tag.as_ref().map(|tag| tag.as_ref())) else {
             // A box with no role of its own — an anonymous wrapper, a plain `<div>`
             // — contributes its children rather than a level of nesting nobody
             // would want read out.
-            ids.extend(grandchildren);
+            out.extend(grandchildren);
             continue;
         };
 
-        let mut accessible = Node::new(role);
-        accessible.set_children(grandchildren);
-        if let Some(rect) = page.rect_of(child) {
-            accessible.set_bounds(Rect::new(
-                f64::from(rect.x),
-                f64::from(rect.y),
-                f64::from(rect.right()),
-                f64::from(rect.bottom()),
-            ));
-        }
-        if role == Role::Link
-            && let Some(href) = page.href_of(child)
-        {
-            accessible.set_url(href);
-        }
-        if let Some(level) = heading_level(node.tag.as_ref().map(|tag| tag.as_ref())) {
-            accessible.set_level(level);
-        }
-
-        let node_id = identifier(child);
-        nodes.push((node_id, accessible));
-        ids.push(node_id);
+        out.push(Accessible {
+            box_id: child,
+            node: node.node,
+            role,
+            value: None,
+            level: heading_level(node.tag.as_ref().map(|tag| tag.as_ref())),
+            url: (role == Role::Link).then(|| page.href_of(child)).flatten(),
+            bounds: page.rect_of(child).map(|rect| {
+                Rect::new(
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom()),
+                )
+            }),
+            children: grandchildren,
+        });
     }
 
-    ids
+    out
 }
 
 /// A box's identifier in the tree.

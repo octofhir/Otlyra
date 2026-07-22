@@ -668,6 +668,9 @@ impl otlyra_app::fetcher::Loader for NetLoader {
             charset,
             content_type: resource.content_type,
             nosniff: resource.nosniff,
+            status: Some(resource.status),
+            request_headers: resource.request_headers,
+            response_headers: resource.response_headers,
             final_url: resource.final_url,
         })
     }

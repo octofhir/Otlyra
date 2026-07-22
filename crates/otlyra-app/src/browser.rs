@@ -1282,6 +1282,7 @@ impl Browser {
         // would hide the pane that explains the missing page.
         let facts = crate::inspector::Facts {
             document: page.map(PageScene::document),
+            page,
             style,
             rect: chosen.as_ref().map(|chosen| chosen.border),
             containing: chosen.as_ref().and_then(|chosen| chosen.containing),
@@ -1673,12 +1674,23 @@ impl Painter for Browser {
                 // The panel takes the keys that walk its tree, but only while it
                 // is the thing being looked at — and a caret in the address
                 // field means the field is, however open the panel may be.
+                //
+                // With or without a document: a tab whose load failed still has
+                // a console to filter and clear, and gating the panel's keys on
+                // a page would take them away exactly when they are wanted.
                 if self.inspector.open
                     && !self.ui.address_focused()
-                    && let Some(page) = self.tabs[self.active].page.as_ref()
                     && self
                         .inspector
-                        .key_pressed(key, modifiers, page.document(), self.clipboard.as_mut())
+                        .key_pressed(
+                            key,
+                            modifiers,
+                            self.tabs[self.active]
+                                .page
+                                .as_ref()
+                                .map(PageScene::document),
+                            self.clipboard.as_mut(),
+                        )
                         .is_some()
                 {
                     return;
@@ -1729,6 +1741,12 @@ impl Painter for Browser {
             }
 
             PlatformEvent::TextInput(character) => {
+                // The panel's search field, while it holds the caret. Before the
+                // pages below, because the panel is drawn over them and a caret
+                // is where the typing goes.
+                if self.inspector.text_input(character) {
+                    return;
+                }
                 if self.tabs[self.active].system == Some(SystemPage::History)
                     && self.history_page.text_input(character)
                 {
