@@ -206,6 +206,64 @@ impl<'a> DocumentMutator<'a> {
         }
     }
 
+    /// Set one attribute, replacing whatever was there.
+    ///
+    /// The parser never needs this — it only ever adds what is missing, which is
+    /// what the tree construction algorithm says — but everything that edits a
+    /// document afterwards does. Returns whether it landed on an element.
+    ///
+    /// An empty value is still a value: `hidden=""` is set, not absent, and the
+    /// two mean different things to a selector.
+    pub fn set_attr(&mut self, target: NodeId, name: &str, value: &str) -> bool {
+        let limit = self.document.limits().max_attrs_per_element;
+        let mut refused = false;
+        let set = if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
+            let at = element
+                .attrs
+                .iter()
+                .position(|attr| attr.name.local.as_ref() == name);
+            match at {
+                Some(at) => {
+                    element.attrs[at].value = value.into();
+                    true
+                }
+                None if element.attrs.len() >= limit => {
+                    refused = true;
+                    false
+                }
+                None => {
+                    element.attrs.push(Attribute {
+                        name: html5ever::QualName::new(
+                            None,
+                            html5ever::ns!(),
+                            html5ever::LocalName::from(name),
+                        ),
+                        value: value.into(),
+                    });
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if refused {
+            self.document.refuse();
+        }
+        set
+    }
+
+    /// Remove one attribute. Returns whether it was there to remove.
+    pub fn remove_attr(&mut self, target: NodeId, name: &str) -> bool {
+        if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
+            let before = element.attrs.len();
+            element
+                .attrs
+                .retain(|attr| attr.name.local.as_ref() != name);
+            return element.attrs.len() != before;
+        }
+        false
+    }
+
     /// Add each attribute that the element does not already have.
     pub fn add_attrs_if_missing(&mut self, target: NodeId, attrs: Vec<Attribute>) {
         let limit = self.document.limits().max_attrs_per_element;

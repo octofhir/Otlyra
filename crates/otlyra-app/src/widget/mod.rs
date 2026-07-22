@@ -359,6 +359,15 @@ impl Focus {
             .map(|index| index as FocusId)
     }
 
+    /// The last field on the surface, for a panel with more than one.
+    pub fn last_text(&self) -> Option<FocusId> {
+        self.entries
+            .borrow()
+            .iter()
+            .rposition(|entry| entry.kind == FocusKind::Text && entry.enabled)
+            .map(|index| index as FocusId)
+    }
+
     /// What Tab moves to from `from`, wrapping past the end.
     pub fn next(&self, from: Option<FocusId>) -> Option<FocusId> {
         self.step(from, 1)

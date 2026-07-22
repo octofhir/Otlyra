@@ -251,6 +251,8 @@ struct InspectorFrame {
     pane: otlyra_app::inspector::Pane,
     /// Scroll the detail side to its end before the frame that is written.
     scroll_to_end: bool,
+    /// Choose an attribute, which is what puts the edit field on screen.
+    edit_attribute: bool,
     /// How many times Down is pressed before the frame that is written.
     steps: usize,
     text: TextEngine,
@@ -275,6 +277,7 @@ impl InspectorFrame {
             exchanges: Vec::new(),
             pane: otlyra_app::inspector::Pane::Elements,
             scroll_to_end: false,
+            edit_attribute: false,
             steps,
             text: TextEngine::new(),
         }
@@ -331,6 +334,28 @@ impl InspectorFrame {
         {
             self.inspector
                 .apply(otlyra_app::inspector::Action::SelectExchange(first.id));
+        }
+        if self.edit_attribute {
+            // A node that actually carries one, found rather than counted to:
+            // the walk above lands wherever the tree happens to put it.
+            let mut stack = vec![self.document.root()];
+            let mut wanted = None;
+            while let Some(node) = stack.pop() {
+                stack.extend(self.document.children(node));
+                if self
+                    .document
+                    .get(node)
+                    .and_then(|node| node.element())
+                    .is_some_and(|element| !element.attrs.is_empty())
+                {
+                    wanted = Some(node);
+                }
+            }
+            if let Some(node) = wanted {
+                self.inspector.reveal(&self.document, node);
+            }
+            self.inspector
+                .apply(otlyra_app::inspector::Action::SelectAttribute(0));
         }
         if self.scroll_to_end {
             // Over the detail side, and further than it can go, which is how a
@@ -689,6 +714,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_states(&directory, name, &mut frame, 1000.0, 700.0, |frame| {
             frame.settle();
         })?;
+    }
+
+    // An attribute chosen, which is what puts the field that edits it on
+    // screen: the inspector reads a page until something says otherwise, and
+    // this is the one thing that says otherwise.
+    {
+        let mut frame = InspectorFrame::new(6);
+        frame.edit_attribute = true;
+        write_states(
+            &directory,
+            "inspector-editing",
+            &mut frame,
+            1000.0,
+            700.0,
+            |frame| frame.settle(),
+        )?;
     }
 
     // A table scrolled to its end, which is where rows used to be eaten: a

@@ -311,6 +311,21 @@ pub enum Action {
     ShowNetTab(NetTab),
     /// Choose the computed property on this row.
     SelectProperty(usize),
+    /// Choose the attribute on this row, and put its value in the field.
+    SelectAttribute(usize),
+    /// The pointer landed in the attribute field, at this offset in its text.
+    AttributeHit(controls::FieldHit),
+    /// Set this attribute on the chosen node to this value.
+    ///
+    /// The one thing the panel reports that changes the page. It travels as a
+    /// name and a value rather than as a mutation, because the panel does not
+    /// hold the document — the browser does, and applying it is the browser's.
+    SetAttribute {
+        /// The attribute's name.
+        name: String,
+        /// What to set it to.
+        value: String,
+    },
     /// Put the panel away.
     Close,
 }
@@ -377,6 +392,8 @@ struct Appearance {
     kind_filter: KindFilter,
     net_tab: NetTab,
     property: Option<usize>,
+    attribute: Option<usize>,
+    attribute_value: String,
     pointer: (f64, f64),
     pointer_down: bool,
     focus: Option<crate::widget::FocusId>,
@@ -410,6 +427,10 @@ pub struct Inspector {
     pub net_tab: NetTab,
     /// Which row of the styles table is chosen, so its value can be copied.
     pub property: Option<usize>,
+    /// Which attribute row is chosen, and what is being typed for it.
+    pub attribute: Option<usize>,
+    /// The value being edited, which is the field's own text until it is applied.
+    pub attribute_value: crate::ui::TextField,
     /// How much of the content area the panel takes.
     pub height: f64,
     /// Every colour and measurement it is drawn from.
@@ -440,6 +461,8 @@ pub struct Inspector {
     /// The computed rows the last frame drew, so a copy takes what is on screen
     /// rather than recomputing a value that may have moved since.
     styles: Vec<(String, String)>,
+    /// And the attribute rows, for the same reason.
+    attributes: Vec<(String, String)>,
     focus: Focus,
     focused: Option<crate::widget::FocusId>,
     pointer: (f64, f64),
@@ -472,6 +495,8 @@ impl Inspector {
             kind_filter: KindFilter::All,
             net_tab: NetTab::Headers,
             property: None,
+            attribute: None,
+            attribute_value: crate::ui::TextField::default(),
             height: DEFAULT_HEIGHT,
             theme: Theme::light(),
             expanded: HashSet::new(),
@@ -485,6 +510,7 @@ impl Inspector {
             accessible: Vec::new(),
             a11y_collapsed: HashSet::new(),
             styles: Vec::new(),
+            attributes: Vec::new(),
             focus: Focus::default(),
             focused: None,
             pointer: (-1.0, -1.0),
@@ -609,6 +635,21 @@ impl Inspector {
                 self.kind_filter = filter;
             }
             Action::SelectProperty(index) => self.property = Some(index),
+            // Choosing a row loads its value, so the field starts from what is
+            // there rather than from what was left in it for another attribute.
+            // Here rather than on the press path, because `apply` is the one
+            // thing that changes this panel's state and a second place to do it
+            // is a second answer that can fall behind.
+            Action::SelectAttribute(index) => {
+                self.attribute = Some(index);
+                if let Some(value) = self.attribute_row_value(index) {
+                    self.attribute_value.set_text(value);
+                }
+            }
+            // The field's own state moves where the focus is known, in `deliver`.
+            Action::AttributeHit(_) => {}
+            // Applied by the browser, which is what holds the document.
+            Action::SetAttribute { .. } => {}
             Action::ShowNetTab(tab) => {
                 if tab != self.net_tab {
                     self.pane_scroll = 0.0;
@@ -745,6 +786,9 @@ impl Inspector {
             }
             // The field's own accelerators — select all, cut, copy, paste —
             // while it holds the keyboard, before the tree's ⌘C is considered.
+            if self.editing_attribute() && self.attribute_value.edit(key, modifiers, clipboard) {
+                return Some(Action::None);
+            }
             if self.searching() && self.search.edit(key, modifiers, clipboard) {
                 return Some(Action::None);
             }
@@ -775,6 +819,32 @@ impl Inspector {
             }
             return None;
         }
+        // The attribute field first, because it is a field like the search one
+        // and Enter over it means *apply* rather than *stop searching*.
+        if self.editing_attribute() {
+            match key {
+                Key::Enter => {
+                    let applied =
+                        self.attribute
+                            .and_then(|at| self.attributes.get(at))
+                            .map(|(name, _)| Action::SetAttribute {
+                                name: name.clone(),
+                                value: self.attribute_value.text().to_owned(),
+                            });
+                    self.focused = None;
+                    return Some(applied.unwrap_or(Action::None));
+                }
+                Key::Escape => {
+                    self.focused = None;
+                    return Some(Action::None);
+                }
+                _ if self.attribute_value.edit(key, modifiers, clipboard) => {
+                    return Some(Action::None);
+                }
+                _ => {}
+            }
+        }
+
         // While the field has the keyboard it gets the keys: an arrow moves the
         // caret rather than the selection, and Escape gives the tree back.
         if self.searching() {
@@ -920,11 +990,31 @@ impl Inspector {
 
     /// Handle typed text. Returns whether the panel consumed it.
     pub fn text_input(&mut self, character: char) -> bool {
-        if !self.open || !self.searching() {
+        if !self.open {
             return false;
         }
-        self.search.insert(character);
+        match self.editing_attribute() {
+            true => self.attribute_value.insert(character),
+            false if self.searching() => self.search.insert(character),
+            false => return false,
+        }
         true
+    }
+
+    /// Whether the attribute field holds the keyboard, rather than the search.
+    fn editing_attribute(&self) -> bool {
+        self.focus.kind(self.focused) == Some(crate::widget::FocusKind::Text)
+            && self.focused == self.focus.last_text()
+            && self.focus.first_text() != self.focus.last_text()
+    }
+
+    /// The value shown on one row of the attribute table.
+    ///
+    /// Read from what the last frame drew rather than from the document, so the
+    /// field is seeded with the row that was pressed even if the document has
+    /// moved on since — the same rule every other hit here follows.
+    fn attribute_row_value(&self, index: usize) -> Option<String> {
+        self.attributes.get(index).map(|(_, value)| value.clone())
     }
 
     /// Offer an event to the last frame's tree and apply what comes back.
@@ -937,6 +1027,20 @@ impl Inspector {
             Action::SearchHit(hit) => {
                 self.focused = self.focus.first_text();
                 self.search.hit(*hit);
+            }
+            Action::AttributeHit(hit) => {
+                // The attribute field is the *last* text control a frame built,
+                // not the first: the search field above the tree is the first,
+                // and taking that one would put the caret in the wrong box.
+                self.focused = self.focus.last_text();
+                self.attribute_value.hit(*hit);
+            }
+            // Choosing a row loads its value, so the field starts from what is
+            // there rather than from what was left in it for another attribute.
+            Action::SelectAttribute(index) => {
+                if let Some(value) = self.attribute_row_value(*index) {
+                    self.attribute_value.set_text(value);
+                }
             }
             // A press anywhere else lets the field go, or typing would keep
             // landing in a field nobody is looking at.
@@ -1184,6 +1288,20 @@ impl Inspector {
         // Kept whether or not a frame is built, for the same reason the rows are:
         // a copy reads what is on screen, and a frame served from the cache is
         // still a frame that is on screen.
+        self.attributes = facts
+            .document
+            .and_then(|document| self.selected.and_then(|node| document.get(node)))
+            .and_then(|node| match &node.data {
+                NodeData::Element(element) => Some(
+                    element
+                        .attrs
+                        .iter()
+                        .map(|attr| (attr.name.local.as_ref().to_owned(), attr.value.to_string()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
         self.styles = match facts.style {
             Some(style) => describe(style)
                 .into_iter()
@@ -1222,6 +1340,8 @@ impl Inspector {
             kind_filter: self.kind_filter,
             net_tab: self.net_tab,
             property: self.property,
+            attribute: self.attribute,
+            attribute_value: self.attribute_value.text().to_owned(),
             pointer: self.pointer,
             pointer_down: self.pointer_down,
             focus: self.focused,
@@ -1605,15 +1725,63 @@ impl Inspector {
                         theme.ink_dim,
                     )));
                 } else {
+                    let chosen = self.attribute.filter(|at| *at < attributes.len());
                     rows.push(Box::new(Flex::new(
                         1.0,
-                        Box::new(Table::new(
-                            vec!["attribute".to_owned(), "value".to_owned()],
-                            attributes,
-                            self.pane_scroll,
-                            std::rc::Rc::clone(&self.pane_overflow),
-                        )),
+                        Box::new(
+                            Table::new(
+                                vec!["attribute".to_owned(), "value".to_owned()],
+                                attributes.clone(),
+                                self.pane_scroll,
+                                std::rc::Rc::clone(&self.pane_overflow),
+                            )
+                            .selectable(chosen, Action::SelectAttribute),
+                        ),
                     )));
+                    // The one thing the panel does that changes the page. The
+                    // field carries what is being typed and the button reports
+                    // it; the browser is what owns the document and applies it.
+                    if let Some(at) = chosen {
+                        let name = attributes[at][0].clone();
+                        let id = self.focus.claim_text(true);
+                        let focused = self.focused == Some(id);
+                        rows.push(Box::new(Stack::row(
+                            theme.gap,
+                            vec![
+                                Box::new(Align::centre(Box::new(
+                                    Mono::new(format!("{name} ="), theme.code_name)
+                                        .size(theme.font_size_small),
+                                ))),
+                                Box::new(Flex::new(
+                                    1.0,
+                                    controls::TextInput::new(
+                                        controls::FieldView {
+                                            text: self.attribute_value.text().to_owned(),
+                                            caret: focused.then(|| self.attribute_value.caret()),
+                                            selection: focused
+                                                .then(|| self.attribute_value.selection())
+                                                .flatten(),
+                                            placeholder: "value".to_owned(),
+                                        },
+                                        Action::AttributeHit,
+                                    )
+                                    .face(theme.surface_sunken)
+                                    .into_widget(theme),
+                                )),
+                                Box::new(Align::centre(controls::button(
+                                    theme,
+                                    &self.focus,
+                                    Action::SetAttribute {
+                                        name,
+                                        value: self.attribute_value.text().to_owned(),
+                                    },
+                                    "Apply",
+                                    controls::Emphasis::Primary,
+                                    true,
+                                ))),
+                            ],
+                        )));
+                    }
                 }
             }
             NodeData::Text(text) => {
@@ -3355,6 +3523,68 @@ mod tests {
         assert!(
             copied.ends_with(';'),
             "it is spelled to be pasted back into a stylesheet: {copied}"
+        );
+    }
+
+    /// The panel reports what to set and never sets it: it does not hold the
+    /// document, and the direction of that dependency is the whole reason the
+    /// inspector could be written against a page it only reads.
+    #[test]
+    fn editing_an_attribute_is_reported_rather_than_done() {
+        let document =
+            otlyra_html::parse(b"<body><p id=one class=two>text</p>", Some("utf-8")).document;
+        let paragraph = {
+            let mut stack = vec![document.root()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                stack.extend(document.children(node));
+                if matches!(document.get(node).map(|n| &n.data),
+                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                {
+                    found = Some(node);
+                }
+            }
+            found.expect("the document has a p")
+        };
+
+        let mut inspector = panel();
+        inspector.selected = Some(paragraph);
+        frame(&mut inspector, &document);
+
+        // Choosing a row loads what is there, so the field starts from the value
+        // rather than from whatever was left in it for another attribute.
+        assert_eq!(inspector.attributes[0], ("id".to_owned(), "one".to_owned()));
+        inspector.apply(Action::SelectAttribute(0));
+        assert_eq!(inspector.attribute_value.text(), "one");
+
+        // The field exists only once a frame has built it, which is the same
+        // rule every press here follows: draw, then act.
+        frame(&mut inspector, &document);
+        inspector.attribute_value.set_text("three");
+        let accelerator = Modifiers::default();
+        // Enter over the field reports the edit, naming the attribute and the
+        // value; nothing about the document has changed here.
+        inspector.focused = inspector.focus.last_text();
+        let reported = inspector.key_pressed(
+            Key::Enter,
+            accelerator,
+            Some(&document),
+            &mut crate::clipboard::InMemory::default(),
+        );
+        assert_eq!(
+            reported,
+            Some(Action::SetAttribute {
+                name: "id".to_owned(),
+                value: "three".to_owned(),
+            })
+        );
+        assert_eq!(
+            document
+                .get(paragraph)
+                .and_then(|node| node.element())
+                .and_then(|element| element.attr("id")),
+            Some("one"),
+            "the panel reads; setting it is the browser's"
         );
     }
 

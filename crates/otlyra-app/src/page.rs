@@ -382,6 +382,30 @@ impl PageScene {
             })
     }
 
+    /// Change the document, and let the next frame notice.
+    ///
+    /// The whole of the invalidation an edit needs: the DOM is handed to `edit`,
+    /// and whatever it did is followed by a restyle, a fresh box tree and a
+    /// relayout. Coarse on purpose — `Damage::STYLE` is the honest answer to *an
+    /// attribute changed and we do not know which rules cared*, and a narrower
+    /// one would be a claim this cannot yet support. It is the seam that was
+    /// missing, not the optimisation.
+    ///
+    /// Returns whatever `edit` returned, so a caller can say what it did.
+    pub fn edit<T>(&mut self, edit: impl FnOnce(&mut otlyra_dom::DocumentMutator<'_>) -> T) -> T {
+        let out = edit(&mut otlyra_dom::DocumentMutator::new(&mut self.document));
+        // The sheets have not changed, so the styler is kept; what has to go is
+        // everything downstream of the document, which is everything else.
+        self.styled = false;
+        self.styled_document = None;
+        self.layout = None;
+        self.painted = None;
+        self.damage.add(Damage::of(
+            otlyra_layout::InvalidationReason::AttributeChanged,
+        ));
+        out
+    }
+
     /// Which rules set the values on a node, weakest first.
     ///
     /// Empty for a node the cascade was never asked about — a text node, or an
@@ -675,6 +699,59 @@ mod tests {
     fn scene(html: &str) -> (PageScene, TextEngine) {
         let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
         (PageScene::new(parsed.document), TextEngine::isolated())
+    }
+
+    /// The seam the inspector was reading-only for want of: an edit goes in and
+    /// the next frame is the page as edited, restyled, relaid and repainted.
+    #[test]
+    fn an_edit_restyles_the_page_and_the_next_frame_shows_it() {
+        let (mut page, mut text) =
+            scene("<style>p { color: red } .big { font-size: 40px }</style><body><p>text");
+        let before = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let builds = page.builds();
+
+        let paragraph = {
+            let document = page.document();
+            let mut stack = vec![document.root()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                stack.extend(document.children(node));
+                if matches!(document.get(node).map(|n| &n.data),
+                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                {
+                    found = Some(node);
+                }
+            }
+            found.expect("the document has a p")
+        };
+
+        // A class that a rule in the page is waiting for.
+        assert!(page.edit(|document| document.set_attr(paragraph, "class", "big")));
+        let after = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        assert!(page.builds() > builds, "an edit is a frame to build again");
+        assert_ne!(before, after, "and the page is drawn differently for it");
+
+        // The cascade really ran: the rule the class selects took effect.
+        let glyph_height = |list: &DisplayList| {
+            list.items()
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::Glyphs { font_size, .. } => Some(*font_size),
+                    _ => None,
+                })
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(
+            glyph_height(&after) > glyph_height(&before),
+            "the class brought a bigger font size with it"
+        );
+
+        // And it settles again: an edited page with a still reader is as idle as
+        // any other.
+        let builds = page.builds();
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), builds);
     }
 
     /// W10's page half: an idle page with a still reader does no work. Every

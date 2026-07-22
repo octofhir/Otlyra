@@ -1191,6 +1191,29 @@ impl Browser {
         }
     }
 
+    /// Apply what the inspector reported that the browser has to do about.
+    ///
+    /// Almost nothing: the panel settles its own state and reports `None` for
+    /// it. Editing is the exception, because the panel does not hold the
+    /// document — it says what to set and this is what sets it.
+    fn apply_inspector(&mut self, action: crate::inspector::Action) {
+        let crate::inspector::Action::SetAttribute { name, value } = action else {
+            return;
+        };
+        let Some(node) = self.inspector.selected else {
+            return;
+        };
+        let Some(page) = self.tabs[self.active].page.as_mut() else {
+            return;
+        };
+        // The edit, and then everything downstream of the document: a restyle, a
+        // fresh box tree, a relayout. The selection is a node id and the node is
+        // still the same node, so what was being looked at is still what is.
+        if page.edit(|document| document.set_attr(node, &name, &value)) {
+            tracing::info!(%name, "attribute set from the inspector");
+        }
+    }
+
     fn apply(&mut self, action: UiAction) {
         match action {
             UiAction::None => {}
@@ -1599,7 +1622,8 @@ impl Painter for Browser {
             PlatformEvent::PointerPressed { clicks } => {
                 // The panel owns everything below its own top edge.
                 if self.pointer.1 >= self.dock_top() && !self.ui.menu_open {
-                    self.inspector.pointer_pressed();
+                    let action = self.inspector.pointer_pressed();
+                    self.apply_inspector(action);
                     return;
                 }
                 // Armed, a press on the page chooses an element instead of
@@ -1756,7 +1780,7 @@ impl Painter for Browser {
             }
 
             PlatformEvent::TextInput(character) => {
-                // The panel's search field, while it holds the caret. Before the
+                // The panel's own fields, while one holds the caret. Before the
                 // pages below, because the panel is drawn over them and a caret
                 // is where the typing goes.
                 if self.inspector.text_input(character) {
