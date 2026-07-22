@@ -249,6 +249,8 @@ struct InspectorFrame {
     exchanges: Vec<otlyra_app::fetcher::Exchange>,
     /// Which pane the written frame shows.
     pane: otlyra_app::inspector::Pane,
+    /// Scroll the detail side to its end before the frame that is written.
+    scroll_to_end: bool,
     /// How many times Down is pressed before the frame that is written.
     steps: usize,
     text: TextEngine,
@@ -272,6 +274,7 @@ impl InspectorFrame {
             page: None,
             exchanges: Vec::new(),
             pane: otlyra_app::inspector::Pane::Elements,
+            scroll_to_end: false,
             steps,
             text: TextEngine::new(),
         }
@@ -288,6 +291,19 @@ impl InspectorFrame {
         let _ = page.build_display_list(&mut text, 1000.0, 500.0, 0.0);
         frame.page = Some(page);
         frame.exchanges = canned_exchanges();
+        // Chosen here rather than only in `settle`, so the very first frame
+        // drawn is already the one being looked at. How far a list can travel is
+        // something only a drawn frame reports, and a state that scrolls has to
+        // have had the list on screen before it can ask it to move — the same
+        // rule that makes a press be tested against the last frame.
+        frame
+            .inspector
+            .apply(otlyra_app::inspector::Action::Show(pane));
+        if let Some(first) = frame.exchanges.first() {
+            frame
+                .inspector
+                .apply(otlyra_app::inspector::Action::SelectExchange(first.id));
+        }
         frame
     }
 
@@ -315,6 +331,13 @@ impl InspectorFrame {
         {
             self.inspector
                 .apply(otlyra_app::inspector::Action::SelectExchange(first.id));
+        }
+        if self.scroll_to_end {
+            // Over the detail side, and further than it can go, which is how a
+            // list is asked for its last row: the scroll clamps to whatever the
+            // last frame said the travel was.
+            self.inspector.pointer_moved(900.0, 600.0);
+            self.inspector.scroll_by(10_000.0);
         }
     }
 }
@@ -348,9 +371,21 @@ fn canned_exchanges() -> Vec<otlyra_app::fetcher::Exchange> {
                     ("user-agent".to_owned(), "Otlyra".to_owned()),
                     ("accept".to_owned(), "*/*".to_owned()),
                 ],
+                // Enough of them to overflow the detail pane, which is the case
+                // that has to be looked at: a table scrolled to its end is where
+                // rows were being eaten by the panel's own bottom edge.
                 response_headers: vec![
                     ("content-type".to_owned(), content_type.to_owned()),
                     ("content-length".to_owned(), "42".to_owned()),
+                    ("cache-control".to_owned(), "max-age=0".to_owned()),
+                    (
+                        "date".to_owned(),
+                        "Wed, 22 Jul 2026 09:00:00 GMT".to_owned(),
+                    ),
+                    ("etag".to_owned(), "\"a1b2c3\"".to_owned()),
+                    ("server".to_owned(), "otlyra-example".to_owned()),
+                    ("vary".to_owned(), "accept-encoding".to_owned()),
+                    ("x-frame-options".to_owned(), "SAMEORIGIN".to_owned()),
                 ],
                 final_url: url.to_owned(),
                 ..Default::default()
@@ -615,6 +650,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_states(&directory, name, &mut frame, 1000.0, 700.0, |frame| {
             frame.settle();
         })?;
+    }
+
+    // A table scrolled to its end, which is where rows used to be eaten: a
+    // column measures every child against the whole of itself before handing
+    // out the shares, so a list that kept the measure's answer for how far it
+    // could travel came up short by the difference.
+    {
+        let mut frame = InspectorFrame::on_pane(otlyra_app::inspector::Pane::Network);
+        frame.scroll_to_end = true;
+        write_states(
+            &directory,
+            "inspector-scrolled",
+            &mut frame,
+            1000.0,
+            700.0,
+            |frame| frame.settle(),
+        )?;
     }
 
     for mut frame in frames {

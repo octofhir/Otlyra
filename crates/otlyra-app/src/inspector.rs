@@ -1790,6 +1790,9 @@ impl Inspector {
                 net_row(theme, Some(exchange), scale, chosen),
             )));
         }
+        // Air under the last request, so the end of the list reads as the end
+        // rather than as a row cut off by the panel's edge.
+        rows.push(Box::new(Gap::new(0.0, theme.gap)));
 
         let list: Child<Action> = Box::new(Stack::column(
             0.0,
@@ -1950,6 +1953,8 @@ impl Inspector {
         for line in text.lines().take(2000) {
             lines.push(Box::new(Mono::new(cut(line, 400), theme.code_value)));
         }
+        // The same air under the last line as under the last request.
+        lines.push(Box::new(Gap::new(0.0, theme.gap)));
         Box::new(crate::widget::Scroll::new(
             self.pane_scroll,
             std::rc::Rc::clone(&self.pane_overflow),

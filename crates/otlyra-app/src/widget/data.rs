@@ -181,6 +181,24 @@ const INDENT: f64 = 13.0;
 /// The width the twisty is given at the front of a row.
 const TWISTY: f64 = 13.0;
 
+/// How far past its last row a list may be scrolled.
+///
+/// Half a row of air under the end of a list, for two reasons. A pane whose
+/// height is not a whole number of rows ends mid-row, and a list that could be
+/// scrolled only to `content - height` leaves that last row sliced by the panel's
+/// own edge — read as the list having lost a row rather than as it having run
+/// out. And a row flush against an edge reads as a row that continues past it,
+/// which is the same doubt in a pane that happens to divide evenly.
+const TAIL: f64 = 9.0;
+
+/// How far a list of `content` logical pixels can scroll inside `height`.
+///
+/// One definition for the tree and the table both, so the two cannot come to
+/// disagree about where the end of a list is.
+fn travel(content: f64, height: f64) -> f64 {
+    (content + TAIL - height).max(0.0)
+}
+
 impl<A> Tree<A> {
     /// A tree showing `rows`, scrolled down by `offset` logical pixels.
     pub fn new(
@@ -247,14 +265,19 @@ impl<A> Widget<A> for Tree<A> {
         // As tall as it is given: a tree is a window onto its rows, and how many
         // of them there are is not a reason to be taller than the pane.
         self.overflow
-            .set((self.content_height(cx) - available.height).max(0.0));
+            .set(travel(self.content_height(cx), available.height));
         available
     }
 
     fn place(&mut self, rect: Rect, cx: &mut Cx) {
         self.rect = rect;
+        // Recomputed against the height actually given, which is the one that
+        // counts: a column measures every child against the whole of itself and
+        // only then hands out the shares, so the height a list was measured at
+        // is bigger than the height it gets and an overflow left over from the
+        // measure is an overflow too small to reach the last rows.
         self.overflow
-            .set((self.content_height(cx) - rect.height).max(0.0));
+            .set(travel(self.content_height(cx), rect.height));
         self.offset = self.offset.clamp(0.0, self.overflow.get());
     }
 
@@ -385,6 +408,11 @@ impl Table {
         }
     }
 
+    /// How tall the header and all the rows are together.
+    fn content_height(&self, cx: &Cx) -> f64 {
+        (self.rows.len() + 1) as f64 * cx.theme.row_height
+    }
+
     /// The widest each column has to be to show what is in it.
     ///
     /// Measured with the engine that will draw it, over every row rather than
@@ -414,9 +442,8 @@ impl Table {
 impl<A> Widget<A> for Table {
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         self.measure_columns(cx);
-        let rows = self.rows.len() as f64 * cx.theme.row_height;
         self.overflow
-            .set((rows + cx.theme.row_height - available.height).max(0.0));
+            .set(travel(self.content_height(cx), available.height));
         available
     }
 
@@ -425,6 +452,14 @@ impl<A> Widget<A> for Table {
         if self.widths.len() != self.header.len() {
             self.measure_columns(cx);
         }
+        // The same recomputation the tree does, and it was missing here — which
+        // is what ate the last rows of every table in the panel. A column
+        // measures its children against the whole of itself before it hands out
+        // the shares, so the height a table is measured at is taller than the
+        // height it is placed at; an overflow kept from the measure is short by
+        // exactly the difference, and those rows cannot be scrolled to.
+        self.overflow
+            .set(travel(self.content_height(cx), rect.height));
         self.offset = self.offset.clamp(0.0, self.overflow.get());
     }
 
@@ -829,7 +864,72 @@ mod tests {
         Widget::<Act>::measure(&mut tree, Size::new(200.0, 100.0), &mut cx);
         Widget::<Act>::place(&mut tree, Rect::new(0.0, 0.0, 200.0, 100.0), &mut cx);
 
-        assert_eq!(overflow.get(), 100.0 * cx.theme.row_height - 100.0);
+        assert_eq!(overflow.get(), 100.0 * cx.theme.row_height + TAIL - 100.0);
+    }
+
+    /// The bug that ate the bottom of every table in the inspector: a column
+    /// measures each child against the whole of itself and only then hands out
+    /// the shares, so the height a list is *measured* at is taller than the one
+    /// it is *placed* at. A list that kept the measure's answer could not be
+    /// scrolled to its last rows.
+    #[test]
+    fn a_list_can_be_scrolled_to_its_last_row_however_it_was_measured() {
+        let mut text = TextEngine::new();
+        let mut cx = Cx::new(&mut text);
+        let row = cx.theme.row_height;
+
+        let reachable = |overflow: &Overflow, content: f64, height: f64| {
+            // The furthest the list can go has to put the last row's bottom
+            // edge inside the box it is drawn in.
+            content - overflow.get() <= height
+        };
+
+        // Measured against 400 — the whole panel — and placed into 100.
+        let overflow = Overflow::default();
+        let mut table = Table::new(
+            vec!["a".to_owned()],
+            (0..40).map(|n| vec![n.to_string()]).collect(),
+            0.0,
+            std::rc::Rc::clone(&overflow),
+        );
+        Widget::<Act>::measure(&mut table, Size::new(200.0, 400.0), &mut cx);
+        Widget::<Act>::place(&mut table, Rect::new(0.0, 0.0, 200.0, 100.0), &mut cx);
+        // Forty rows and a header.
+        assert!(
+            reachable(&overflow, 41.0 * row, 100.0),
+            "the last row is out of reach: {} of {}",
+            overflow.get(),
+            41.0 * row - 100.0
+        );
+
+        let overflow = Overflow::default();
+        let mut tree = Tree::new(
+            rows(40),
+            0.0,
+            std::rc::Rc::clone(&overflow),
+            Act::Select,
+            Act::Toggle,
+        );
+        Widget::<Act>::measure(&mut tree, Size::new(200.0, 400.0), &mut cx);
+        Widget::<Act>::place(&mut tree, Rect::new(0.0, 0.0, 200.0, 100.0), &mut cx);
+        assert!(reachable(&overflow, 40.0 * row, 100.0));
+    }
+
+    /// A list that fits needs no travel at all, tail or no tail.
+    #[test]
+    fn a_list_that_fits_does_not_scroll() {
+        let mut text = TextEngine::new();
+        let mut cx = Cx::new(&mut text);
+        let overflow = Overflow::default();
+        let mut table = Table::new(
+            vec!["a".to_owned()],
+            vec![vec!["one".to_owned()], vec!["two".to_owned()]],
+            0.0,
+            std::rc::Rc::clone(&overflow),
+        );
+        Widget::<Act>::measure(&mut table, Size::new(200.0, 400.0), &mut cx);
+        Widget::<Act>::place(&mut table, Rect::new(0.0, 0.0, 200.0, 400.0), &mut cx);
+        assert_eq!(overflow.get(), 0.0);
     }
 
     #[test]
