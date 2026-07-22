@@ -1,9 +1,11 @@
 # <img src="assets/logo/logo-circle.png" alt="" width="36" valign="middle"> Otlyra
 
 An experimental web browser, written from scratch in Rust: its own DOM, its own
-cascade, its own layout, its own painting, and its own interface. Everything
-except a script engine — there is none, and a page is rendered the way a browser
-with scripting switched off renders it.
+cascade, its own layout, its own painting, and its own interface. Scripting is
+not wired up yet, so a page is rendered the way a browser with scripting switched
+off renders it — and when it is, the engine running it will be ours too:
+[octofhir/otter](https://github.com/octofhir/otter), a TypeScript and JavaScript
+runtime on a bytecode VM of its own, in Rust, built alongside this.
 
 It opens pages, follows links, keeps tabs and history, and can be driven by
 WebDriver BiDi or by the Model Context Protocol. Around seven hundred tests, a
@@ -55,7 +57,11 @@ all built on a widget layer that paints into the same display list the page does
 Selection by drag, word, paragraph and select-all, with ⌘C. A native menu bar and
 a Dock icon on macOS.
 
-No scripting. A `<script>` is parsed, counted, and not run.
+**Scripting, when it comes.** A `<script>` is parsed, counted, and not run. The
+engine that will run it is [otter](https://github.com/octofhir/otter) — an
+embeddable TypeScript and JavaScript runtime on its own bytecode VM and garbage
+collector, ours and in Rust, so the whole browser stays one thing rather than a
+renderer wrapped around somebody else's virtual machine.
 
 ## Requirements
 
