@@ -125,6 +125,7 @@ mod tests {
                 id: 1,
                 x: 0.0,
                 y: 0.0,
+                text_offset: 0,
             }],
         );
 

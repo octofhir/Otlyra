@@ -769,17 +769,22 @@ fn expand_tabs(shaped: &mut ShapedText, stop: f32) {
 /// Taken before anything moves and read back as things do: shifting a glyph does
 /// not change which glyph it is, and each tab's own position is read again when
 /// its turn comes.
+///
+/// Each glyph is asked which character it drew rather than counted against the
+/// text: a tab is never part of a ligature, but anything ligated in front of one
+/// on the same line would otherwise put the jump on the wrong glyph.
 fn tabs_on(shaped: &ShapedText, line: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (run_index, run) in shaped.runs.iter().enumerate() {
         if run.line != line {
             continue;
         }
-        // The glyphs are in visual order and the characters in logical order,
-        // which for the direction this draws is the same order — the assumption
-        // every other reading of a run back into its text makes here.
-        for (glyph_index, (_, character)) in run.text.char_indices().enumerate() {
-            if character == '\t' && glyph_index < run.glyphs.len() {
+        for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
+            if run
+                .text
+                .get(glyph.text_offset as usize..)
+                .is_some_and(|rest| rest.starts_with('\t'))
+            {
                 out.push((run_index, glyph_index));
             }
         }
@@ -913,17 +918,27 @@ fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
             if consumed.len() <= run_index {
                 consumed.resize(run_index + 1, 0);
             }
-            let text_range = consume_clusters(run, &mut consumed[run_index], glyph_run.advance());
+            let (text_range, starts) =
+                consume_clusters(run, &mut consumed[run_index], glyph_run.advance());
             if text_range.start >= text_len {
                 continue;
             }
 
+            // Each glyph is told where in the run's text its cluster began. A
+            // cluster is one glyph often enough that this looks like counting, but
+            // where it is not — a ligature, a letter and its mark — it is the whole
+            // difference between a selection that lands on a letter and one that
+            // lands a letter along.
+            let mut starts = starts.iter();
             let glyphs: Vec<Glyph> = glyph_run
                 .positioned_glyphs()
                 .map(|glyph| Glyph {
                     id: glyph.id,
                     x: glyph.x,
                     y: glyph.y,
+                    text_offset: starts
+                        .next()
+                        .map_or(0, |start| start.saturating_sub(text_range.start) as u32),
                 })
                 .collect();
 
@@ -995,8 +1010,12 @@ fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
     }
 }
 
-/// Take clusters from `run`, starting at `from`, until they add up to `advance`,
-/// and report the byte range they cover.
+/// Take clusters from `run`, starting at `from`, until they add up to `advance`.
+///
+/// Reports the byte range they cover and, per glyph they drew, where in the text
+/// that glyph's cluster began — one entry per glyph, in the order the glyphs come
+/// back, so a cluster of two glyphs contributes its start twice and a cluster of
+/// none contributes nothing.
 ///
 /// Advances are floats and a slice of them will not sum exactly, so the comparison
 /// carries a half-pixel of slack; overshooting by one cluster would attribute a
@@ -1005,10 +1024,11 @@ fn consume_clusters(
     run: &parley::Run<'_, Brush>,
     from: &mut usize,
     advance: f32,
-) -> std::ops::Range<usize> {
+) -> (std::ops::Range<usize>, Vec<usize>) {
     let mut taken = 0.0;
     let mut start = None;
     let mut end = *from;
+    let mut starts = Vec::new();
 
     for cluster in run.clusters().skip(*from) {
         if taken > 0.0 && taken + cluster.advance() > advance + 0.5 {
@@ -1017,6 +1037,7 @@ fn consume_clusters(
         let range = cluster.text_range();
         start.get_or_insert(range.start);
         end = range.end;
+        starts.extend(cluster.glyphs().map(|_| range.start));
         taken += cluster.advance();
         *from += 1;
         if taken >= advance - 0.5 {
@@ -1024,7 +1045,7 @@ fn consume_clusters(
         }
     }
 
-    start.unwrap_or(end)..end
+    (start.unwrap_or(end)..end, starts)
 }
 
 /// Which family each CSS generic resolves to, in preference order.
@@ -1179,6 +1200,46 @@ mod tests {
                 run.glyphs.len()
             );
         }
+    }
+
+    /// A glyph says which characters it drew, and where a face ligates that is
+    /// not where the glyph sits among the others.
+    ///
+    /// The offsets go up, never past the text, and every one of them is a
+    /// character boundary — which is what the readers of a run slice on. Where a
+    /// pair is drawn as one shape the count of glyphs is short of the count of
+    /// characters and the offsets step by two.
+    #[test]
+    fn a_glyph_knows_which_characters_it_drew() {
+        let mut engine = engine();
+        let text = "difficult offices";
+        let shaped = engine.shape(text, &test_stack(), 16.0, None);
+
+        let mut ligated = false;
+        for run in &shaped.runs {
+            let mut previous = None;
+            for glyph in &run.glyphs {
+                let at = glyph.text_offset as usize;
+                assert!(at < run.text.len(), "{at} is past {:?}", run.text);
+                assert!(
+                    run.text.is_char_boundary(at),
+                    "{at} splits a character of {:?}",
+                    run.text
+                );
+                if let Some(previous) = previous {
+                    assert!(at >= previous, "offsets went backwards in {:?}", run.text);
+                    ligated |= at > previous + 1;
+                }
+                previous = Some(at);
+            }
+            assert_eq!(run.glyphs.first().map(|glyph| glyph.text_offset), Some(0));
+            ligated |= run.glyphs.len() < run.text.chars().count();
+        }
+
+        assert!(
+            ligated,
+            "the test face draws every pair separately, so this proves nothing"
+        );
     }
 
     /// A tab is a jump to the next stop and not a character of its own width, so

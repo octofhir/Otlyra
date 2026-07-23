@@ -122,15 +122,13 @@ fn offset_at(fragment: &Fragment, x: f32) -> usize {
         return 0;
     }
 
-    // The glyphs are in visual order and the text is in logical order; for the
-    // writing direction this draws they are the same order, and a cluster is one
-    // character often enough that stepping the two together is the answer.
+    // Each glyph says which characters it drew, so a boundary is a place a glyph
+    // starts and the text it started on. Two glyphs of one cluster give the same
+    // boundary twice, which costs an entry and changes no answer: there is no
+    // place to put a caret inside a ligature.
     let mut boundaries: Vec<(f32, usize)> = Vec::with_capacity(run.glyphs.len() + 1);
-    let mut characters = run.text.char_indices().map(|(at, _)| at);
     for glyph in &run.glyphs {
-        if let Some(at) = characters.next() {
-            boundaries.push((fragment.rect.x + glyph.x, at));
-        }
+        boundaries.push((fragment.rect.x + glyph.x, glyph.text_offset as usize));
     }
     boundaries.push((fragment.rect.right(), run.text.len()));
 
@@ -531,12 +529,12 @@ fn edge(fragment: &Fragment, offset: usize) -> f32 {
         return fragment.rect.right();
     }
 
-    let mut characters = run.text.char_indices().map(|(at, _)| at);
+    // The first glyph that starts at or past the offset, which for an offset
+    // inside a ligature is the glyph *after* it: a selection cannot end half way
+    // through one shape, so it takes the whole of it.
     for glyph in &run.glyphs {
-        match characters.next() {
-            Some(at) if at >= offset => return fragment.rect.x + glyph.x,
-            Some(_) => {}
-            None => break,
+        if glyph.text_offset as usize >= offset {
+            return fragment.rect.x + glyph.x;
         }
     }
     fragment.rect.right()

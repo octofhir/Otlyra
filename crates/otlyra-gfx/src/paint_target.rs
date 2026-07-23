@@ -15,6 +15,14 @@ pub struct Glyph {
     pub x: f32,
     /// Vertical offset from the run origin (baseline-relative), in px.
     pub y: f32,
+    /// Where in the run's text the characters this glyph drew begin, in bytes.
+    ///
+    /// A glyph is not a character: a face that ligates draws `fi` with one, and a
+    /// mark and its letter are one cluster of two. Everything that reads a run back
+    /// into its text — where a selection starts, what a copy takes, which character
+    /// a point is on — needs the text this glyph came from rather than its position
+    /// among the others. Every glyph of one cluster carries the cluster's start.
+    pub text_offset: u32,
 }
 
 /// Geometry passed across the seam, in a form that can go through a vtable.

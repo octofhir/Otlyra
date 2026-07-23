@@ -329,11 +329,13 @@ mod tests {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
+                text_offset: 0,
             },
             Glyph {
                 id: 9,
                 x: 12.5,
                 y: 0.0,
+                text_offset: 0,
             },
         ];
 
