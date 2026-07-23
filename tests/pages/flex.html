@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A row of boxes, and what is left over</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  h2 { font-size: 14px; font-weight: normal; color: #555; margin: 12px 0 4px; }
+  .box { display: flex; width: 320px; height: 180px; background: #f0f0f0; gap: 6px;
+         flex-wrap: wrap; margin-bottom: 8px; }
+  .box > div { width: 100px; height: 40px; background: #9cf; font: 13px/40px monospace;
+               text-align: center; }
+  .side { display: flex; gap: 16px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<h1>align-content: where the lines of a wrapped container go</h1>
+
+<div class="side">
+  <div><h2>stretch — the initial value</h2>
+    <div class="box" style="align-content: stretch"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+  <div><h2>flex-start</h2>
+    <div class="box" style="align-content: flex-start"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+  <div><h2>center</h2>
+    <div class="box" style="align-content: center"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+</div>
+
+<div class="side">
+  <div><h2>flex-end</h2>
+    <div class="box" style="align-content: flex-end"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+  <div><h2>space-between</h2>
+    <div class="box" style="align-content: space-between"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+  <div><h2>space-around</h2>
+    <div class="box" style="align-content: space-around"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></div></div>
+</div>
+
+<h1>order: which sibling an item is laid out among</h1>
+
+<div class="box" style="height: 50px; align-content: flex-start">
+  <div style="order: 3">written 1st</div>
+  <div style="order: 1">written 2nd</div>
+  <div>written 3rd</div>
+</div>
+
+<h1>inline-flex: a container that takes its place in a line</h1>
+
+<div style="width: 520px">
+  A paragraph with
+  <span style="display: inline-flex; gap: 4px; background: #eef; padding: 3px">
+    <span style="background: #9cf; padding: 1px 6px">one</span><span
+          style="background: #9cf; padding: 1px 6px">two</span></span>
+  set into it, and enough words after to carry the line past the box and show
+  where the next one starts.
+</div>
+
+</body>
+</html>

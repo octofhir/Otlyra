@@ -49,6 +49,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         measured: std::collections::HashMap::new(),
         containing_height: None,
         line_reach: (0.0, 0.0),
+        span_reach: Vec::new(),
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -155,6 +156,15 @@ struct Flow<'a> {
     /// deepest. So the line boxes are rebuilt around the baselines the shaper
     /// placed the glyphs on, which moves the boxes and leaves the text where it is.
     line_reach: (f32, f32),
+    /// How far each span of the paragraph being laid out reaches above and below
+    /// the baseline, in step with the spans themselves.
+    ///
+    /// The shaper carries a line height per *run* of glyphs and opens a run when
+    /// the font changes, so it cannot be told that one span of the same font wants
+    /// a taller line; and even where it can, what it is told is a height rather
+    /// than where inside it the baseline goes. Both are settled here, per line,
+    /// once the shaper has said which span landed on which.
+    span_reach: Vec<(f32, f32)>,
     /// The lines of each collapsed table's grid, for the table to draw.
     ///
     /// A collapsed border belongs to the edge rather than to a cell, so it is
@@ -367,11 +377,18 @@ fn inline_spacers(inlines: &[InlineBox], replaced: &[ReplacedBox]) -> Vec<Spacer
         .collect()
 }
 
-/// The size a replaced box is drawn at.
+/// The size a replaced box is drawn at: its *content* box, which is the picture
+/// and not the frame around it.
 ///
 /// CSS first, then whatever the content itself says, and a single given dimension
 /// takes the other from the intrinsic ratio — which is what makes `width: 100%` on
 /// a photograph keep its shape instead of squashing it.
+///
+/// `box-sizing: border-box` takes the frame out of the number the page wrote, and
+/// the ratio is applied to what is left: a hundred-pixel box with a ten-pixel
+/// border holds eighty pixels of picture, and a two-to-one picture is forty tall
+/// rather than fifty. The presentational `width` attribute goes through the same
+/// door, because it is a rule setting `width` and nothing more.
 fn replaced_size(
     style: &ComputedStyle,
     content: &crate::box_tree::Replaced,
@@ -379,12 +396,22 @@ fn replaced_size(
 ) -> (f32, f32) {
     let intrinsic = content.intrinsic;
     let ratio = intrinsic.and_then(|(width, height)| (height > 0.0).then(|| width / height));
+    let padding = resolve_padding(style, containing);
+    let border = resolve_border(style);
 
     // A stylesheet first, then the attribute that stands in for one. Either way
     // a dimension that is given takes the other from the ratio below, so naming
     // one never squashes the picture.
-    let width = style.width.resolve(containing).or(content.hint.0);
-    let height = style.height.resolve(containing).or(content.hint.1);
+    let width = style
+        .width
+        .resolve(containing)
+        .or(content.hint.0)
+        .map(|width| content_from(width, style, padding, border));
+    let height = style
+        .height
+        .resolve(containing)
+        .or(content.hint.1)
+        .map(|height| content_height_from(height, style, padding, border));
 
     let (width, height) = match (width, height) {
         (Some(width), Some(height)) => (width, height),
@@ -396,6 +423,16 @@ fn replaced_size(
     (
         clamp(width, style.min_width, style.max_width, containing),
         clamp(height, style.min_height, style.max_height, containing),
+    )
+}
+
+/// How much wider and taller a replaced element's border box is than its picture.
+fn replaced_edges(style: &ComputedStyle, containing: f32) -> (f32, f32) {
+    let padding = resolve_padding(style, containing);
+    let border = resolve_border(style);
+    (
+        padding.left + padding.right + border.left + border.right,
+        padding.top + padding.bottom + border.top + border.bottom,
     )
 }
 
@@ -517,21 +554,41 @@ fn mark_fixed(fragment: &mut Fragment) {
     }
 }
 
-/// The fragment a replaced box becomes: its content, at the size it was given.
+/// The fragment a replaced box becomes: a box the size of its border box, with
+/// the picture inside it at its content box.
+///
+/// Two fragments rather than one, because a replaced element has a background and
+/// a border of its own like any other box, and the picture is what fills the room
+/// left inside them. Drawn as a single fragment the frame is neither painted nor
+/// given room, which is why a page that wants one puts the picture inside
+/// something else.
+///
+/// `x` and `y` are the border box's top left, and `width`/`height` its content.
 fn replaced_fragment(
     id: BoxId,
     style: &Arc<ComputedStyle>,
     image: Option<otlyra_gfx::peniko::ImageData>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    origin: (f32, f32),
+    content: (f32, f32),
+    containing: f32,
 ) -> Fragment {
-    Fragment {
+    let ((x, y), (width, height)) = (origin, content);
+    let padding = resolve_padding(style, containing);
+    let border = resolve_border(style);
+    let (extra_x, extra_y) = replaced_edges(style, containing);
+
+    let picture = image.map(|image| Fragment {
         used: None,
-        box_id: Some(id),
-        rect: Rect::new(x, y, width, height),
-        kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
+        // The element's own box carries the hit test; a second one over the
+        // picture would put two of them on the same element.
+        box_id: None,
+        rect: Rect::new(
+            x + border.left + padding.left,
+            y + border.top + padding.top,
+            width,
+            height,
+        ),
+        kind: FragmentKind::Image(image),
         style: Arc::clone(style),
         fixed: false,
         scroll_port: None,
@@ -539,6 +596,20 @@ fn replaced_fragment(
         sticky: None,
         layer: Layer::default(),
         children: Vec::new(),
+    });
+
+    Fragment {
+        used: None,
+        box_id: Some(id),
+        rect: Rect::new(x, y, width + extra_x, height + extra_y),
+        kind: FragmentKind::Box,
+        style: Arc::clone(style),
+        fixed: false,
+        scroll_port: None,
+        clip: None,
+        sticky: None,
+        layer: Layer::default(),
+        children: picture.into_iter().collect(),
     }
 }
 
@@ -650,6 +721,69 @@ fn share_out(minimums: &[f32], maximums: &[f32], available: f32) -> Vec<f32> {
         .zip(maximums)
         .map(|(min, max)| min + surplus * (max - min).max(0.0) / room)
         .collect()
+}
+
+/// How a wrapped container's `align-content` shares `leftover` between `count`
+/// lines: how much goes before the first, how much between each pair, and how much
+/// each line grows by.
+///
+/// Only `stretch` — the initial value, and the reason a wrapped container's lines
+/// fill it — grows the lines; the rest move them and leave them the size they are.
+fn share_across(align: otlyra_css::AlignContent, leftover: f32, count: usize) -> (f32, f32, f32) {
+    use otlyra_css::AlignContent;
+
+    let lines = count.max(1) as f32;
+    match align {
+        AlignContent::Stretch => (0.0, 0.0, leftover / lines),
+        AlignContent::Start => (0.0, 0.0, 0.0),
+        AlignContent::End => (leftover, 0.0, 0.0),
+        AlignContent::Center => (leftover / 2.0, 0.0, 0.0),
+        // Nothing at the ends, and nothing to share where there is one line.
+        AlignContent::SpaceBetween if count > 1 => (0.0, leftover / (lines - 1.0), 0.0),
+        AlignContent::SpaceBetween => (0.0, 0.0, 0.0),
+        AlignContent::SpaceAround => (leftover / (lines * 2.0), leftover / lines, 0.0),
+        AlignContent::SpaceEvenly => (leftover / (lines + 1.0), leftover / (lines + 1.0), 0.0),
+    }
+}
+
+/// Whether `edge` takes a collapsed boundary from `line`.
+///
+/// The contest CSS describes, in its order: `hidden` silences the boundary and
+/// nothing can put a line back on it; a border that draws nothing loses to one
+/// that draws something; then the wider wins; and a tie on width goes to the more
+/// insistent line, which is what puts `double` over `solid` and `solid` over a
+/// line with gaps in it. A tie on both is left to whoever asked first, and the
+/// edges are offered cell before row before table — which is the ownership order
+/// CSS finishes with.
+fn wins(edge: otlyra_css::Border, line: otlyra_css::Border) -> bool {
+    use otlyra_css::BorderStyle;
+
+    /// How loud a style is, for a tie on width.
+    fn rank(style: BorderStyle) -> u8 {
+        match style {
+            BorderStyle::Double => 7,
+            BorderStyle::Solid => 6,
+            BorderStyle::Dashed => 5,
+            BorderStyle::Dotted => 4,
+            BorderStyle::Ridge => 3,
+            BorderStyle::Outset => 2,
+            BorderStyle::Groove => 1,
+            BorderStyle::Inset | BorderStyle::None | BorderStyle::Hidden => 0,
+        }
+    }
+
+    if line.style == BorderStyle::Hidden {
+        return false;
+    }
+    if edge.style == BorderStyle::Hidden {
+        return true;
+    }
+    match (edge.style.draws(), line.style.draws()) {
+        (false, _) => false,
+        (true, false) => true,
+        (true, true) if edge.width != line.width => edge.width > line.width,
+        (true, true) => rank(edge.style) > rank(line.style),
+    }
 }
 
 /// The resolved lines of a collapsed table's grid.
@@ -819,7 +953,9 @@ impl<'a> Flow<'a> {
         }
 
         match self.tree.node(parent).style.display {
-            otlyra_css::Display::Flex => return self.layout_flex(parent, width, x, y, out),
+            otlyra_css::Display::Flex | otlyra_css::Display::InlineFlex => {
+                return self.layout_flex(parent, width, x, y, out);
+            }
             otlyra_css::Display::Grid => return self.layout_grid(parent, width, x, y, out),
             // A table with no rows in it is not a table; it falls through and its
             // children are stacked, which at least shows what is in them.
@@ -1062,8 +1198,18 @@ impl<'a> Flow<'a> {
         // A picture is its own content: it has no children to lay out and its
         // height comes from its own proportions rather than from anything inside it.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
+            // The caller decided the *outer* width, so what is left for the
+            // picture is that less the frame around it.
+            let (extra_x, _) = replaced_edges(&style, width);
             let (_, height) = replaced_size(&style, content, width);
-            return replaced_fragment(id, &style, content.image.clone(), x, y, width, height);
+            return replaced_fragment(
+                id,
+                &style,
+                content.image.clone(),
+                (x, y),
+                ((width - extra_x).max(0.0), height),
+                width,
+            );
         }
 
         let padding = resolve_padding(&style, width);
@@ -1241,6 +1387,38 @@ impl<'a> Flow<'a> {
         }
 
         let style = &node.style;
+        // A box that establishes a formatting context of its own keeps what is
+        // inside it inside it: a margin does not collapse out through the edge of a
+        // flex item, a float, a cell, or anything that clips. Without this a
+        // heading at the top of a flex item pushes the *container* down and leaves
+        // a gap above the item rather than inside it.
+        let establishes = style.overflow != otlyra_css::Overflow::Visible
+            || style.float != otlyra_css::Float::None
+            || matches!(
+                style.position,
+                otlyra_css::Position::Absolute | otlyra_css::Position::Fixed
+            )
+            || matches!(
+                style.display,
+                otlyra_css::Display::Flex
+                    | otlyra_css::Display::InlineFlex
+                    | otlyra_css::Display::Grid
+                    | otlyra_css::Display::InlineBlock
+                    | otlyra_css::Display::Table
+                    | otlyra_css::Display::TableCell
+            )
+            || node.parent.is_some_and(|parent| {
+                matches!(
+                    self.tree.node(parent).style.display,
+                    otlyra_css::Display::Flex
+                        | otlyra_css::Display::InlineFlex
+                        | otlyra_css::Display::Grid
+                )
+            });
+        if establishes {
+            return (false, false);
+        }
+
         let border = resolve_border(style);
         let padding = resolve_padding(style, containing_width);
         // A height of its own stops a margin at the bottom edge: the box ends where
@@ -1294,19 +1472,14 @@ impl<'a> Flow<'a> {
             let (width, height) = replaced_size(&style, content, containing_width);
             let image = content.image.clone();
             let margin = resolve_margin(&style, containing_width);
-            return Fragment {
-                used: None,
-                box_id: Some(id),
-                rect: Rect::new(x + margin.left, y, width, height),
-                kind: image.map_or(FragmentKind::Box, FragmentKind::Image),
-                style,
-                fixed: false,
-                scroll_port: None,
-                clip: None,
-                sticky: None,
-                layer: Layer::default(),
-                children: Vec::new(),
-            };
+            return replaced_fragment(
+                id,
+                &style,
+                image,
+                (x + margin.left, y),
+                (width, height),
+                containing_width,
+            );
         }
 
         let padding = resolve_padding(&style, containing_width);
@@ -1500,6 +1673,21 @@ impl<'a> Flow<'a> {
             }
         }
 
+        // A `<col>` says how wide its column *wants* to be, which is what a cell's
+        // own width says: the column is drawn at that width where the content fits
+        // in it, and at whatever the content cannot go below where it does not. So
+        // the number replaces what the content wanted rather than being taken
+        // alongside it, and the content's own floor still wins. Measured against a
+        // reference on both halves — a column told forty wraps its text to forty,
+        // and one told sixty holding a sixty-two-pixel word is sixty-two.
+        let declared = self.tree.columns(parent).to_vec();
+        for (column, style) in declared.iter().enumerate().take(columns) {
+            let Some(asked) = style.width.resolve(available) else {
+                continue;
+            };
+            maximums[column] = asked.max(minimums[column]);
+        }
+
         let mut widths = share_out(&minimums, &maximums, available);
         // A table told how wide to be fills that width: the columns keep their
         // proportions and share out what is left over, rather than sitting narrow
@@ -1600,6 +1788,39 @@ impl<'a> Flow<'a> {
             cursor += height;
         }
         cursor += spacing_y;
+
+        // A column's own background, behind the cells that sit in it and in front
+        // of the table's. A column is not a box — nothing is laid out in it — so
+        // this is the whole of what one draws.
+        if let (Some(&first), Some((&last, &height))) =
+            (tops.first(), tops.last().zip(heights.last()))
+        {
+            for (column, style) in declared.iter().enumerate().take(columns) {
+                let paints = style.background_color.components[3] > 0.0
+                    || style.backgrounds.iter().any(|layer| layer.draws());
+                if !paints {
+                    continue;
+                }
+                fragments.push(Fragment {
+                    used: None,
+                    box_id: None,
+                    rect: Rect::new(
+                        offsets[column],
+                        first,
+                        widths[column],
+                        last + height - first,
+                    ),
+                    kind: FragmentKind::Box,
+                    style: Arc::clone(style),
+                    fixed: false,
+                    scroll_port: None,
+                    clip: None,
+                    sticky: None,
+                    layer: Layer::default(),
+                    children: Vec::new(),
+                });
+            }
+        }
 
         for (index, row) in rows.iter().enumerate() {
             let row_style = self.style_of(*row);
@@ -1754,7 +1975,7 @@ impl<'a> Flow<'a> {
 
         let own = Arc::clone(&self.tree.node(table).style);
         let widest = |line: &mut otlyra_css::Border, edge: otlyra_css::Border| {
-            if edge.width > line.width {
+            if wins(edge, *line) {
                 *line = edge;
             }
         };
@@ -1833,6 +2054,7 @@ impl<'a> Flow<'a> {
             // The line is drawn by the table, once. What is left on a box is the
             // room for it and nothing to see.
             color: otlyra_gfx::peniko::Color::TRANSPARENT,
+            style: otlyra_css::BorderStyle::Solid,
         };
 
         for (index, row) in cells.iter().enumerate() {
@@ -2416,6 +2638,15 @@ impl<'a> Flow<'a> {
             return 0.0;
         }
 
+        // `order` reorders the items and nothing else: it is a visual arrangement,
+        // and the document order is what a screen reader and a copy still read. A
+        // stable sort, so items that name the same order keep the order they were
+        // written in — which is what CSS says and is the whole difference between
+        // `order` and a shuffle.
+        if items.iter().any(|item| item.style.order != 0) {
+            items.sort_by_key(|item| item.style.order);
+        }
+
         // A container with a height of its own has a definite cross size when it
         // is a row and a definite main size when it is a column: either way it is
         // the size the items are fitted into rather than one they add up to.
@@ -2451,18 +2682,38 @@ impl<'a> Flow<'a> {
                 lines
             };
 
-        // A single line fills a container that has a cross size of its own — which
-        // is what makes `align-items: center` centre against the container rather
-        // than against the tallest item. Several lines share the container out by
-        // taking what they need, which is `align-content: flex-start`.
-        let line_cross_floor = match (row, definite_height, lines.len()) {
-            (true, Some(height), 1) => Some(height),
-            _ => None,
+        let line_count = lines.len();
+        let cross_gap = if row { style.gap.0.resolve(width) } else { gap };
+        // The cross size the container has to give out, and what the lines want of
+        // it. A row's is its own height, where it has one; a column's is always its
+        // width.
+        let container_cross = if row { definite_height } else { Some(width) };
+        let wanted: Vec<f32> = lines
+            .iter()
+            .map(|line| {
+                items[line.clone()]
+                    .iter()
+                    .map(|item| item.cross + item.margin_cross(row))
+                    .fold(0.0f32, f32::max)
+            })
+            .collect();
+        let leftover = container_cross.map_or(0.0, |cross| {
+            (cross - wanted.iter().sum::<f32>() - cross_gap * (line_count - 1) as f32).max(0.0)
+        });
+
+        // A container that cannot wrap has one line, and that line fills whatever
+        // cross size the container has — which is what makes `align-items: center`
+        // centre against the container rather than against the tallest item.
+        // `align-content` says nothing about such a container, so it is not asked.
+        let unwrapped = style.flex_wrap == FlexWrap::NoWrap;
+        let (lead, between, stretch) = if unwrapped {
+            (0.0, 0.0, leftover)
+        } else {
+            share_across(style.align_content, leftover, line_count)
         };
 
-        let mut cross_cursor = 0.0f32;
+        let mut cross_cursor = lead;
         let mut main_extent = 0.0f32;
-        let line_count = lines.len();
         for (number, line) in lines.into_iter().enumerate() {
             let placed = self.layout_flex_line(
                 &mut items,
@@ -2473,7 +2724,7 @@ impl<'a> Flow<'a> {
                     gap,
                     inner,
                     cross_start: cross_cursor,
-                    cross_floor: line_cross_floor,
+                    cross_floor: (container_cross.is_some()).then(|| wanted[number] + stretch),
                 },
                 (x, y),
                 out,
@@ -2481,8 +2732,12 @@ impl<'a> Flow<'a> {
             cross_cursor += placed.cross;
             main_extent = main_extent.max(placed.main);
             if number + 1 < line_count {
-                cross_cursor += if row { style.gap.0.resolve(width) } else { gap };
+                cross_cursor += cross_gap + between;
             }
+        }
+        // The room the lines were told to leave after them is still room they take.
+        if container_cross.is_some() {
+            cross_cursor += lead;
         }
 
         self.floats = outer_floats;
@@ -2599,8 +2854,19 @@ impl<'a> Flow<'a> {
         for index in order {
             let item = &items[index];
             let align = item.style.align_self.unwrap_or(style.align_items);
+            // `stretch` fills the line with an item that has no size of its own
+            // across it. An item that named one keeps it: `align-items: stretch`
+            // is the initial value, so stretching over a declared height would
+            // make every `height` in a flex container a suggestion.
+            let definite = if row {
+                self.asked_height(&item.style).is_some()
+            } else {
+                item.style.width.resolve(inner).is_some()
+            };
             let cross_size = match align {
-                AlignItems::Stretch => (line_cross - item.margin_cross(row)).max(item.cross),
+                AlignItems::Stretch if !definite => {
+                    (line_cross - item.margin_cross(row)).max(item.cross)
+                }
                 _ => item.cross,
             };
             let cross_offset = cross_start
@@ -2688,8 +2954,10 @@ impl<'a> Flow<'a> {
             // and a flex item is blockified, so it never reaches the inline branch
             // that would have summed it. A logo beside a wordmark came out as wide
             // as the wordmark alone, and the wordmark was drawn over what came next.
-            _ if style.display == otlyra_css::Display::Flex
-                && style.flex_direction.is_row()
+            _ if matches!(
+                style.display,
+                otlyra_css::Display::Flex | otlyra_css::Display::InlineFlex
+            ) && style.flex_direction.is_row()
                 && style.flex_wrap == otlyra_css::FlexWrap::NoWrap =>
             {
                 let children = node.children.clone();
@@ -2805,8 +3073,10 @@ impl<'a> Flow<'a> {
             // the wider of the two rather than the two of them — and the item is
             // then floored at a width its own contents overflow. That is what cut
             // the site's wordmark off beside its logo.
-            _ if style.display == otlyra_css::Display::Flex
-                && style.flex_direction.is_row()
+            _ if matches!(
+                style.display,
+                otlyra_css::Display::Flex | otlyra_css::Display::InlineFlex
+            ) && style.flex_direction.is_row()
                 && style.flex_wrap == otlyra_css::FlexWrap::NoWrap =>
             {
                 let children = node.children.clone();
@@ -2885,7 +3155,16 @@ impl<'a> Flow<'a> {
         // A picture is its own content: the container decided its size, and there is
         // nothing inside it to lay out.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
-            return replaced_fragment(id, &style, content.image.clone(), x, y, width, height);
+            // The container decided the outer size; the frame comes out of it.
+            let (extra_x, extra_y) = replaced_edges(&style, width);
+            return replaced_fragment(
+                id,
+                &style,
+                content.image.clone(),
+                (x, y),
+                ((width - extra_x).max(0.0), (height - extra_y).max(0.0)),
+                width,
+            );
         }
 
         let padding = resolve_padding(&style, width);
@@ -3004,35 +3283,130 @@ impl<'a> Flow<'a> {
         // paragraph reaches and as far below. The shaper centres the font inside the
         // height it was given instead, which is the same thing for a line of plain
         // text and is not for one holding a box taller than the words beside it.
-        let (above, below) = self.line_reach;
-        // Only where the shaper's own answer is wrong: it centres the font inside
-        // the height it was given, which is where CSS puts the baseline for a line
-        // of plain text and is not where it puts it for a line holding a box taller
-        // than the words beside it. So a paragraph with an inline block in it is
-        // rebuilt around its baselines and every other paragraph is left alone.
-        let has_inline_block = replaced.iter().any(|box_| box_.content.is_some());
-        if has_inline_block && above + below > 0.0 {
-            // A picture reaches above the baseline by its whole height — it sits
-            // with its bottom edge on it — and only on the line it is on. That is
-            // the one thing the paragraph's own reach does not cover, because
-            // folding it in would make every line of the paragraph as tall as the
-            // picture.
-            let mut stretched = vec![0.0f32; shaped.lines.len()];
+        // The line boxes, put where CSS puts them: as tall as what is *on* each
+        // line, with the baseline as far down as the tallest thing on it reaches.
+        //
+        // The shaper answers neither question. It carries a line height per run of
+        // glyphs and opens a run when the font changes, so a span that wants a
+        // taller line without changing font cannot be told to it at all; and where
+        // it can, it centres the font inside the height rather than putting the
+        // baseline where the tallest thing on the line needs it. So the paragraph
+        // is restacked here, from what actually landed on each line.
+        let strut = self.line_reach;
+        // What the shaper made of each line, kept before anything is moved: it is
+        // the answer for a line holding a picture, whose ink reaches past the box
+        // the font would have given it.
+        let shaper: Vec<(f32, f32)> = shaped
+            .lines
+            .iter()
+            .map(|line| (line.baseline - line.top, line.bottom - line.baseline))
+            .collect();
+        // A line holding a picture is the shaper's to measure: a picture stands on
+        // the baseline with all of its height above, the text beside it hangs
+        // below, and the shaper has already put the box around both. Every other
+        // line starts at the block's own strut.
+        let mut reach: Vec<(f32, f32)> = {
+            let mut holds_picture = vec![false; shaped.lines.len()];
             for spacer in &shaped.spacers {
                 let picture = replaced.iter().enumerate().any(|(index, box_)| {
                     replaced_spacer(index) == spacer.id && box_.content.is_none()
                 });
-                if picture && let Some(reach) = stretched.get_mut(spacer.line) {
-                    *reach = reach.max(spacer.height);
+                if picture && let Some(slot) = holds_picture.get_mut(spacer.line) {
+                    *slot = true;
+                }
+            }
+            holds_picture
+                .into_iter()
+                .enumerate()
+                .map(|(index, picture)| {
+                    if picture {
+                        shaper.get(index).copied().unwrap_or(strut)
+                    } else {
+                        strut
+                    }
+                })
+                .collect()
+        };
+        {
+            // Which bytes of the shaped text each span covers. The shaper lays the
+            // spans end to end, so this is a running total of their lengths.
+            let mut starts = Vec::with_capacity(spans.len() + 1);
+            let mut at = 0usize;
+            for span in &spans {
+                starts.push(at);
+                at += span.text.len();
+            }
+            starts.push(at);
+
+            for run in &shaped.runs {
+                let Some(line) = reach.get_mut(run.line) else {
+                    continue;
+                };
+                for (index, window) in starts.windows(2).enumerate() {
+                    // A span is on this line if any of its bytes were drawn there.
+                    if window[1] <= run.text_range.start || window[0] >= run.text_range.end {
+                        continue;
+                    }
+                    let Some(&(above, below)) = self.span_reach.get(index) else {
+                        continue;
+                    };
+                    line.0 = line.0.max(above);
+                    line.1 = line.1.max(below);
                 }
             }
 
-            for (index, line) in shaped.lines.iter_mut().enumerate() {
-                let reach = above.max(stretched.get(index).copied().unwrap_or(0.0));
-                line.top = line.baseline - reach;
-                line.height = reach + below;
-                line.bottom = line.top + line.height;
+            // And the boxes in the line, which the shaper placed but did not stack.
+            // A picture sits with its bottom edge on the baseline, so all of it is
+            // above; an inline block sits on its own last baseline and is held
+            // above and below that.
+            for spacer in &shaped.spacers {
+                let Some(line) = reach.get_mut(spacer.line) else {
+                    continue;
+                };
+                let box_ = replaced
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| replaced_spacer(*index) == spacer.id)
+                    .map(|(_, box_)| box_);
+                match box_ {
+                    Some(box_) if box_.content.is_some() => {
+                        line.0 = line.0.max(box_.baseline);
+                        line.1 = line.1.max(box_.height - box_.baseline);
+                    }
+                    Some(_) => line.0 = line.0.max(spacer.height),
+                    None => {}
+                }
             }
+        }
+
+        // Restack: every line ends where the next begins, and the glyphs on it move
+        // with the baseline they sit on.
+        let mut cursor = shaped.lines.first().map_or(0.0, |line| line.top);
+        let mut shifts: Vec<f32> = Vec::with_capacity(shaped.lines.len());
+        for (index, line) in shaped.lines.iter_mut().enumerate() {
+            let (above, below) = reach.get(index).copied().unwrap_or(strut);
+            let baseline = cursor + above;
+            shifts.push(baseline - line.baseline);
+            line.top = cursor;
+            line.baseline = baseline;
+            line.height = above + below;
+            line.bottom = cursor + line.height;
+            cursor = line.bottom;
+        }
+        for run in &mut shaped.runs {
+            let shift = shifts.get(run.line).copied().unwrap_or(0.0);
+            for glyph in &mut run.glyphs {
+                glyph.y += shift;
+            }
+        }
+        for spacer in &mut shaped.spacers {
+            spacer.y += shifts.get(spacer.line).copied().unwrap_or(0.0);
+        }
+        shaped.metrics.first_baseline = shaped.lines.first().map_or(0.0, |line| line.baseline);
+        // The paragraph reaches from the top of its first line to the bottom of
+        // its last, which is what its own box is.
+        if let (Some(first), Some(last)) = (shaped.lines.first(), shaped.lines.last()) {
+            shaped.metrics.height = last.bottom - first.top;
         }
 
         // parley measures line tops from the text origin, and the first line's top
@@ -3239,19 +3613,20 @@ impl<'a> Flow<'a> {
                     return Some(fragment);
                 }
                 let image = box_.image.clone()?;
-                Some(Fragment {
-                    used: None,
-                    box_id: Some(box_.id),
-                    rect: Rect::new(at.0, at.1, spacer.width, spacer.height),
-                    kind: FragmentKind::Image(image),
-                    style: Arc::clone(&box_.style),
-                    fixed: false,
-                    scroll_port: None,
-                    clip: None,
-                    sticky: None,
-                    layer: Layer::default(),
-                    children: Vec::new(),
-                })
+                // The spacer reserved the whole box; the picture fills what the
+                // frame leaves inside it.
+                let (extra_x, extra_y) = replaced_edges(&box_.style, width);
+                Some(replaced_fragment(
+                    box_.id,
+                    &box_.style,
+                    Some(image),
+                    at,
+                    (
+                        (spacer.width - extra_x).max(0.0),
+                        (spacer.height - extra_y).max(0.0),
+                    ),
+                    width,
+                ))
             }));
 
             out.push(Fragment {
@@ -3319,6 +3694,17 @@ impl<'a> Flow<'a> {
         // below. A box on the baseline is already inside the strut wherever the
         // block's font is the larger, which is the ordinary case.
         let (mut above, mut below) = (strut.ascent, strut.descent);
+        // The same reach with the *unshifted* spans left out.
+        //
+        // Every line of the paragraph is at least this tall, and no line is made
+        // tall by a span that is not on it. A span sitting on the baseline needs
+        // nothing from the paragraph — the shaper knows its own height and which
+        // line it landed on — but one that has been raised, lowered or hung off
+        // the line box does: how far it moved is worked out here, and the shaper
+        // never hears about it.
+        let (mut floor_above, mut floor_below) = (strut.ascent, strut.descent);
+        self.span_reach.clear();
+        self.span_reach.resize(spans.len(), (0.0, 0.0));
         // Kept from the first pass so the second does not shape anything twice:
         // a strut is a font lookup, and the line-relative boxes need theirs
         // again once the line is known.
@@ -3350,6 +3736,9 @@ impl<'a> Flow<'a> {
                 // depend on that, but how tall the line is does.
                 above = above.max(own.ascent);
                 below = below.max(own.descent);
+                floor_above = floor_above.max(own.ascent);
+                floor_below = floor_below.max(own.descent);
+                self.span_reach[index] = (own.ascent, own.descent);
                 line_relative.push((*source, span_style.vertical_align, own));
                 continue;
             }
@@ -3375,9 +3764,28 @@ impl<'a> Flow<'a> {
             }
             above = above.max(shift + own.ascent);
             below = below.max(own.descent - shift);
+            self.span_reach[index] = (shift + own.ascent, own.descent - shift);
+            // A span that has been moved is one the shaper cannot place: it knows
+            // the span's own height and nothing of the shift, so the room a shift
+            // needs comes from the paragraph. A span sitting where the shaper put
+            // it asks nothing of the floor and is left to its own line.
+            if shift != 0.0 {
+                floor_above = floor_above.max(shift + own.ascent);
+                floor_below = floor_below.max(own.descent - shift);
+            }
             // An explicit `line-height` on a span still asks for its own room.
             if let Some(asked) = span.line_height {
                 above = above.max(asked - strut.descent);
+                // And where the shaper cannot carry it, the paragraph must. A line
+                // height belongs to a *run* of glyphs, and a run is opened when the
+                // font changes — so a span that differs from the text around it
+                // only in `line-height` shares their run and its own height is lost
+                // on the way through. Those, and only those, are folded into the
+                // floor: folding in the rest would make a paragraph with one larger
+                // word in it that tall on every line.
+                let (reach_above, reach_below) = &mut self.span_reach[index];
+                *reach_above = reach_above.max(asked - own.descent);
+                *reach_below = reach_below.max(own.descent);
             }
         }
 
@@ -3404,13 +3812,24 @@ impl<'a> Flow<'a> {
         for box_ in replaced.iter().filter(|box_| box_.content.is_some()) {
             above = above.max(box_.baseline);
             below = below.max(box_.height - box_.baseline);
+            floor_above = floor_above.max(box_.baseline);
+            floor_below = floor_below.max(box_.height - box_.baseline);
         }
 
-        self.line_reach = (above, below + strut.leading);
-        let height = above + below + strut.leading;
-        if height.is_finite() && height > 0.0 {
+        // What *every* line of the paragraph is at least, and no more than that:
+        // the block's own strut, which is the line it would have with nothing in
+        // it. Everything else — a taller span, a raised one, a box — belongs to the
+        // line it is actually on and is folded in there.
+        let _ = (above, below, floor_above, floor_below);
+        self.line_reach = (strut.ascent, strut.descent + strut.leading);
+
+        // The shaper is still told a height per span, because that is what it
+        // measures a line by while it is breaking one. Where each line's box ends
+        // up is settled afterwards, from what landed on it.
+        let floor = strut.height();
+        if floor.is_finite() && floor > 0.0 {
             for span in spans {
-                span.line_height = Some(height);
+                span.line_height = Some(span.line_height.map_or(floor, |own| own.max(floor)));
             }
         }
     }
@@ -3542,8 +3961,12 @@ impl<'a> Flow<'a> {
                 BoxKind::Replaced(content) => {
                     // A picture in a line is a box the shaper has to make room for,
                     // horizontally and vertically both: the line it sits in is at
-                    // least as tall as it is.
+                    // least as tall as it is — and as tall as the border and
+                    // padding around it, which take room in a line like any other
+                    // part of the box.
                     let (width, height) = replaced_size(&node.style, content, containing_width);
+                    let (extra_x, extra_y) = replaced_edges(&node.style, containing_width);
+                    let (width, height) = (width + extra_x, height + extra_y);
                     replaced.push(ReplacedBox {
                         id: child,
                         style: Arc::clone(&node.style),
@@ -3602,7 +4025,12 @@ impl<'a> Flow<'a> {
                         inlines[slot].last_span = spans.len();
                     }
                 }
-                BoxKind::Block if node.style.display == otlyra_css::Display::InlineBlock => {
+                BoxKind::Block
+                    if matches!(
+                        node.style.display,
+                        otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+                    ) =>
+                {
                     // Laid out here and now, as the block container it is, at the
                     // width it shrinks to: what the line has to make room for is
                     // its finished size, and nothing about the line changes it.
@@ -4373,6 +4801,102 @@ mod tests {
         assert_eq!((rect.width, rect.height), (200.0, 100.0));
     }
 
+    /// The box a replaced element makes, and the picture inside it.
+    fn boxed_image(tree: &FragmentTree) -> (Rect, Rect) {
+        let outer = tree
+            .iter()
+            .find(|fragment| {
+                fragment
+                    .children
+                    .iter()
+                    .any(|child| matches!(child.kind, FragmentKind::Image(_)))
+            })
+            .expect("a box holding a picture");
+        (outer.rect, image_rect(tree))
+    }
+
+    /// A replaced element has a border and a background of its own, and both take
+    /// room: the box is the picture plus the frame around it.
+    ///
+    /// Every number here was measured against a reference browser on the same
+    /// page. A hundred-by-fifty picture, a ten-pixel border and five of padding.
+    #[test]
+    fn a_picture_has_a_frame_and_the_frame_takes_room() {
+        let laid_out = |rule: &str| {
+            laid_out_with_image(
+                &format!(
+                    "<style>body {{ margin: 0 }} img {{ display: block; border: 10px solid red; \
+                     padding: 5px; {rule} }}</style><img src=a.png>"
+                ),
+                820.0,
+                picture(100, 50),
+            )
+            .0
+        };
+
+        let size = |tree: &FragmentTree| {
+            let (outer, inner) = boxed_image(tree);
+            (
+                (outer.width, outer.height),
+                (inner.width, inner.height),
+                (inner.x - outer.x, inner.y - outer.y),
+            )
+        };
+
+        // Nothing asked: the picture's own size, and the frame outside it.
+        assert_eq!(
+            size(&laid_out("")),
+            ((130.0, 80.0), (100.0, 50.0), (15.0, 15.0))
+        );
+        // A width is the picture's width, and the frame is still outside it.
+        assert_eq!(
+            size(&laid_out("width: 100px")),
+            ((130.0, 80.0), (100.0, 50.0), (15.0, 15.0))
+        );
+        // `border-box` measures across the frame instead, and the ratio is
+        // applied to what is left over rather than to the number the page wrote.
+        assert_eq!(
+            size(&laid_out("width: 100px; box-sizing: border-box")),
+            ((100.0, 65.0), (70.0, 35.0), (15.0, 15.0))
+        );
+        assert_eq!(
+            size(&laid_out(
+                "width: 100px; height: 40px; box-sizing: border-box"
+            )),
+            ((100.0, 40.0), (70.0, 10.0), (15.0, 15.0))
+        );
+        // A percentage width is a percentage of the containing block, and the
+        // frame is added to it — which is what makes `width: 100%` overflow.
+        assert_eq!(
+            size(&laid_out("width: 100%")),
+            ((850.0, 440.0), (820.0, 410.0), (15.0, 15.0))
+        );
+    }
+
+    /// A picture in a line reserves its frame there too, and its background and
+    /// border are painted like any other box's.
+    #[test]
+    fn an_inline_picture_reserves_its_frame_in_the_line() {
+        let (tree, _) = laid_out_with_image(
+            "<style>body { margin: 0 } img { border: 10px solid red; padding: 5px }\
+             </style><p>x <img src=a.png> y</p>",
+            820.0,
+            picture(100, 50),
+        );
+
+        let (outer, inner) = boxed_image(&tree);
+        assert_eq!((outer.width, outer.height), (130.0, 80.0));
+        assert_eq!((inner.width, inner.height), (100.0, 50.0));
+        assert_eq!((inner.x - outer.x, inner.y - outer.y), (15.0, 15.0));
+
+        let line = first_line(&tree);
+        assert!(
+            line.height >= 80.0,
+            "the line holds the whole box: {}",
+            line.height
+        );
+    }
+
     /// An image in a line takes room in it: the text after it starts further along
     /// and the line is at least as tall as the picture.
     #[test]
@@ -4520,6 +5044,134 @@ mod tests {
         assert_eq!(items[2].rect.x, 100.0);
         assert_eq!(items[2].rect.width, 60.0);
         assert_eq!(items[1].rect.y, items[2].rect.y, "they share a line");
+    }
+
+    /// `order` decides which of its siblings an item is laid out among, and
+    /// nothing else: the document order is still what the text reads as.
+    ///
+    /// A stable sort, so items that name the same order keep the order they were
+    /// written in. Measured against a reference.
+    #[test]
+    fn order_rearranges_the_items_and_leaves_the_document_alone() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: flex } \
+             div > div { width: 100px }</style>\
+             <div class=flex><div style='order:3'>a</div><div style='order:1'>b</div>\
+             <div>c</div><div style='order:-1'>d</div></div>",
+            400.0,
+        );
+        let items = boxes_of(&tree, &boxes, "div");
+        // The container first, then its four items as they were laid out.
+        let placed: Vec<(f32, i32)> = items[1..]
+            .iter()
+            .map(|item| (item.rect.x, item.style.order))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(0.0, -1), (100.0, 0), (200.0, 1), (300.0, 3)],
+            "`order` ascending, and the two that agree keep the order they were written in"
+        );
+    }
+
+    /// A margin does not escape a box that establishes a formatting context of
+    /// its own — a flex item, a float, a cell, anything that clips.
+    ///
+    /// Found by putting a heading above a flex container inside a flex item and
+    /// comparing with a reference: the heading's own top margin was collapsing
+    /// out through the item and pushing the whole row down, which left a gap
+    /// above the item rather than inside it. On a page of such rows the error
+    /// added up down the page.
+    #[test]
+    fn a_margin_does_not_escape_a_formatting_context() {
+        let inside = |row: &str, item: &str| {
+            let (tree, boxes) = laid_out(
+                &format!(
+                    "<style>body {{ margin: 0 }} .row {{ {row} }} \
+                     .item {{ width: 200px; {item} }} h2 {{ margin: 20px 0 0 }}</style>\
+                     <div class=row><div class=item><h2>a</h2></div></div>"
+                ),
+                400.0,
+            );
+            let item = boxes_of(&tree, &boxes, "div")[1].rect;
+            let heading = boxes_of(&tree, &boxes, "h2")[0].rect;
+            (item.y, heading.y - item.y)
+        };
+
+        // A flex item keeps its child's margin inside itself.
+        assert_eq!(
+            inside("display: flex", ""),
+            (0.0, 20.0),
+            "the item starts at the top and the margin is inside it"
+        );
+        // So does anything that clips, and anything that floats.
+        assert_eq!(inside("display: block", "overflow: hidden"), (0.0, 20.0));
+        assert_eq!(inside("display: block", "float: left"), (0.0, 20.0));
+        // An ordinary block does not: the margin comes out through it and lands
+        // above it, which is what collapsing is.
+        assert_eq!(inside("display: block", ""), (20.0, 0.0));
+    }
+
+    /// `align-content` shares out the room a wrapped container's lines leave
+    /// across it. Every number here was measured against a reference.
+    #[test]
+    fn align_content_places_the_lines_of_a_wrapped_container() {
+        let tops = |align: &str| {
+            let (tree, boxes) = laid_out(
+                &format!(
+                    "<style>body {{ margin: 0 }} .flex {{ display: flex; flex-wrap: wrap; \
+                     width: 300px; height: 200px; align-content: {align} }} \
+                     div > div {{ width: 120px; height: 40px }}</style>\
+                     <div class=flex><div>1</div><div>2</div><div>3</div><div>4</div>\
+                     <div>5</div></div>"
+                ),
+                400.0,
+            );
+            let items = boxes_of(&tree, &boxes, "div");
+            // The tops of the three lines: items one, three and five.
+            (items[1].rect.y, items[3].rect.y, items[5].rect.y)
+        };
+
+        // Three lines of forty in two hundred: eighty over, and `stretch` — the
+        // initial value — gives each line a third of it.
+        assert_eq!(tops("stretch"), (0.0, 200.0 / 3.0, 400.0 / 3.0));
+        assert_eq!(tops("flex-start"), (0.0, 40.0, 80.0));
+        assert_eq!(tops("center"), (40.0, 80.0, 120.0));
+        assert_eq!(tops("flex-end"), (80.0, 120.0, 160.0));
+        assert_eq!(tops("space-between"), (0.0, 80.0, 160.0));
+        // Half a share at each end and a whole one between: the share is eighty
+        // over three, so the first line starts at half of it and each one after
+        // begins forty and a share further down.
+        let around = tops("space-around");
+        let share = 80.0 / 3.0;
+        assert!(
+            (around.0 - share / 2.0).abs() < 0.01
+                && (around.1 - (share / 2.0 + 40.0 + share)).abs() < 0.01
+                && (around.2 - (share / 2.0 + 80.0 + share * 2.0)).abs() < 0.01,
+            "{around:?}"
+        );
+    }
+
+    /// `inline-flex` is a flex container that takes its place in a line, which is
+    /// where an `inline-block` goes: inline outside, flex inside.
+    #[test]
+    fn an_inline_flex_container_sits_in_the_line() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } .flex { display: inline-flex } \
+             .flex > span { width: 40px; height: 20px }</style>\
+             <div>before <span class=flex><span>a</span><span>b</span></span> after</div>",
+            400.0,
+        );
+        let placed = boxes_of(&tree, &boxes, "span");
+        let container = &placed[0];
+        assert_eq!(
+            container.rect.width, 80.0,
+            "as wide as its items side by side, not as wide as the line"
+        );
+        assert!(
+            container.rect.x > 0.0,
+            "and it starts after the text before it: {:?}",
+            container.rect
+        );
     }
 
     /// `flex-grow` shares out what is left over; `flex-shrink` takes back what is

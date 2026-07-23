@@ -23,6 +23,9 @@ pub enum Display {
     /// A flex container: block-level outside, and its children are flex items
     /// rather than a block or inline formatting context.
     Flex,
+    /// A flex container that is inline-level outside: it takes its place in a line
+    /// the way an `inline-block` does, and inside it is the same flex container.
+    InlineFlex,
     /// A grid container: its children are placed into rows and columns.
     Grid,
     /// A table: its rows and cells are placed into a grid of its own, with the
@@ -107,6 +110,28 @@ pub enum AlignItems {
     Stretch,
     /// On their first baselines. Not implemented, and laid out as `start`.
     Baseline,
+}
+
+/// `align-content`: how a wrapped container's lines share what is left across it.
+///
+/// The same shape as `justify-content` with a `stretch` on the end, which is its
+/// initial value and the reason a wrapped container's lines fill it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AlignContent {
+    /// The lines grow equally to fill the container.
+    Stretch,
+    /// All the leftover after them.
+    Start,
+    /// All of it before them.
+    End,
+    /// Half before, half after.
+    Center,
+    /// Between them, none at the ends.
+    SpaceBetween,
+    /// Between them and half as much at each end.
+    SpaceAround,
+    /// Equally between them and at the ends.
+    SpaceEvenly,
 }
 
 /// `flex-wrap`.
@@ -200,18 +225,56 @@ impl<T: Copy> Sides<T> {
     }
 }
 
-/// One border: how wide it is drawn and what colour.
+/// `border-style`: the line a border draws.
 ///
-/// `border-style` is not a field. A border is either drawn or it is not, and the
-/// styles that are not `solid` — dashed, dotted, ridge — are a painting difference
-/// this renderer does not make yet. What it must not get wrong is the arithmetic:
-/// a `none` or `hidden` border is zero wide, and that changes where content sits.
+/// `none` and `hidden` are both zero wide and differ in one place only — a
+/// collapsed table border, where `hidden` silences the edge outright and `none`
+/// merely loses to anything else in the running.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    /// Nothing, and nothing to say about it.
+    #[default]
+    None,
+    /// Nothing, and nothing may draw there.
+    Hidden,
+    /// One unbroken line.
+    Solid,
+    /// A run of dashes.
+    Dashed,
+    /// A run of round dots.
+    Dotted,
+    /// Two lines with a gap between them.
+    Double,
+    /// Carved into the page: dark on the side the light comes from.
+    Groove,
+    /// Raised off it, which is `groove` turned over.
+    Ridge,
+    /// The whole box pressed in: dark along the top and the left.
+    Inset,
+    /// The whole box standing out, which is `inset` turned over.
+    Outset,
+}
+
+impl BorderStyle {
+    /// Whether this style draws anything at all.
+    pub fn draws(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
+/// One border: how wide it is drawn, what colour, and what line.
+///
+/// The width is the *used* width, so a `none` or a `hidden` border is zero wide
+/// however wide it was declared — which is what keeps the arithmetic right for
+/// everything downstream that only wants to know where the content sits.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Border {
     /// The used width in CSS pixels — zero when the style makes the border absent.
     pub width: f32,
     /// `border-*-color`, which defaults to the element's own `color`.
     pub color: Color,
+    /// `border-*-style`.
+    pub style: BorderStyle,
 }
 
 impl Border {
@@ -219,11 +282,12 @@ impl Border {
     pub const NONE: Self = Self {
         width: 0.0,
         color: Color::TRANSPARENT,
+        style: BorderStyle::None,
     };
 
     /// Whether this border puts anything on the screen.
     pub fn is_visible(self) -> bool {
-        self.width > 0.0 && self.color.components[3] > 0.0
+        self.width > 0.0 && self.color.components[3] > 0.0 && self.style.draws()
     }
 }
 
@@ -410,6 +474,35 @@ pub enum Repeat {
     Round,
 }
 
+/// One layer of a box's background.
+///
+/// `background-image` is a list, and every property that describes a layer is a
+/// list beside it — so a page may put a pattern over a gradient, or a badge in
+/// each corner, in one rule. A layer that names neither a picture nor a gradient
+/// is `none`, which is what an empty slot in the list means and is kept so that
+/// the slots after it still line up with the sizes and positions written for them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundLayer {
+    /// The address of the picture, exactly as written. Resolving and fetching it
+    /// is the caller's, as it is for a stylesheet.
+    pub image: Option<Arc<str>>,
+    /// The gradient, where the layer is one rather than a picture.
+    pub gradient: Option<Gradient>,
+    /// How the picture is sized against its box.
+    pub size: BackgroundSize,
+    /// Whether and how it is tiled, per axis.
+    pub repeat: BackgroundRepeat,
+    /// Where it sits in the box it is behind.
+    pub position: BackgroundPosition,
+}
+
+impl BackgroundLayer {
+    /// Whether this layer would draw anything at all.
+    pub fn draws(&self) -> bool {
+        self.image.is_some() || self.gradient.is_some()
+    }
+}
+
 /// `background-repeat`, which CSS gives per axis and a page usually gives once.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundRepeat {
@@ -518,6 +611,12 @@ pub struct Shadow {
     pub spread: f32,
     /// Its colour.
     pub color: Color,
+    /// Whether it falls inside the box rather than behind it.
+    ///
+    /// An inset shadow is the shadow the box's own hole casts: it is drawn over
+    /// the background, clipped to the padding box, and grows *inwards* — so the
+    /// spread and the offset both move the lit part rather than the shadow.
+    pub inset: bool,
 }
 
 /// A colour at a point along a gradient.
@@ -799,23 +898,14 @@ pub struct ComputedStyle {
     /// `box-shadow`, outermost last — the order they are painted in, which is the
     /// reverse of the order they are written.
     pub shadows: Vec<Shadow>,
-    /// `background-image`, when it is a picture: the address, exactly as written.
-    /// Resolving and fetching it is the caller's, as it is for a stylesheet.
-    pub background_image: Option<Arc<str>>,
-    /// How a background picture is sized against its box.
-    pub background_size: BackgroundSize,
-    /// Whether and how a background picture is tiled, per axis.
-    pub background_repeat: BackgroundRepeat,
-    /// Where a background picture sits in the box it is behind.
-    pub background_position: BackgroundPosition,
+    /// The layers of `background-image`, topmost first — the order the page wrote
+    /// them, which is the reverse of the order they are painted in.
+    pub backgrounds: Vec<BackgroundLayer>,
     /// How a replaced element's picture is fitted into its box.
     pub object_fit: ObjectFit,
     /// And where inside the box what is left of it sits. Its initial value is
     /// the middle, which is not `background-position`'s corner.
     pub object_position: BackgroundPosition,
-    /// `background-image`, when it is a gradient. A picture behind a box is not
-    /// read yet; a gradient is, because it is what a page uses it for.
-    pub background_gradient: Option<Gradient>,
     /// `font-family`, as the CSS source list. Inherited.
     pub font_family: Arc<str>,
     /// `font-size` in CSS pixels. Inherited.
@@ -935,6 +1025,15 @@ pub struct ComputedStyle {
     /// `align-self`, which overrides the container's `align-items` for one item.
     /// `None` is `auto`: take the container's.
     pub align_self: Option<AlignItems>,
+    /// `align-content`: how the *lines* of a wrapped container share the room
+    /// across it. It says nothing at all about a container with one line.
+    pub align_content: AlignContent,
+    /// `order`: which of its siblings a flex item is laid out among.
+    ///
+    /// A visual reordering and nothing more — the document order is what a screen
+    /// reader and a copy still read, which is why CSS warns against using it for
+    /// anything that changes the meaning.
+    pub order: i32,
     /// `flex-grow`, read by a flex item.
     pub flex_grow: f32,
     /// `flex-shrink`.
@@ -954,11 +1053,7 @@ impl Default for ComputedStyle {
             display: Display::Inline,
             color: Color::from_rgb8(0, 0, 0),
             background_color: Color::TRANSPARENT,
-            background_gradient: None,
-            background_image: None,
-            background_size: BackgroundSize::Auto,
-            background_repeat: BackgroundRepeat::REPEAT,
-            background_position: BackgroundPosition::START,
+            backgrounds: Vec::new(),
             object_fit: ObjectFit::Fill,
             object_position: BackgroundPosition::CENTER,
             shadows: Vec::new(),
@@ -1011,6 +1106,8 @@ impl Default for ComputedStyle {
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
             align_self: None,
+            align_content: AlignContent::Stretch,
+            order: 0,
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,

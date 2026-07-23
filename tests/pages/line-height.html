@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>How tall a line is</title>
+<style>
+  body { margin: 0; padding: 24px; font: 16px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  /* A fixed width so every paragraph below breaks in the same places, and a
+     background so the line boxes are visible rather than inferred. */
+  p { width: 420px; background: #eef4ff; margin: 0 0 16px; }
+  .big { font-size: 32px; }
+  .small { font-size: 10px; }
+  .tall { line-height: 3; }
+  .box { display: inline-block; width: 40px; height: 44px; background: #9cf; }
+</style>
+</head>
+<body>
+
+<h1>A larger word makes its own line tall, and no other</h1>
+
+<p>one two three four five six seven <span class="big">BIGGER</span> eight nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+twenty-one twenty-two twenty-three twenty-four</p>
+
+<h1>A smaller one changes nothing: the strut is the floor</h1>
+
+<p>one two three four five six seven <span class="small">smaller</span> eight nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+twenty-one twenty-two twenty-three twenty-four</p>
+
+<h1>An explicit line-height on a span asks for its own room</h1>
+
+<p>one two three four five six seven <span class="tall">taller</span> eight nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+twenty-one twenty-two twenty-three twenty-four</p>
+
+<h1>A raised span grows the line it is on</h1>
+
+<p>one two three four five six seven <sup>up</sup> eight <sub>down</sub> nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+twenty-one twenty-two twenty-three twenty-four</p>
+
+<h1>A box in a line is held above and below its own baseline</h1>
+
+<p>one two three four five six <span class="box"></span> seven eight nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+twenty-one twenty-two twenty-three</p>
+
+<h1>Every size at once</h1>
+
+<p>plain <span class="big">big</span> plain <span class="small">small</span> plain
+<span class="big">big again</span> and then a long enough run of ordinary words to
+carry the paragraph over several more lines that hold nothing unusual at all,
+which is where the difference shows.</p>
+
+</body>
+</html>

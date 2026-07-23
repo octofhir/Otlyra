@@ -74,6 +74,7 @@ fn display(value: Display) -> &'static str {
         Display::Inline => "inline",
         Display::InlineBlock => "inline-block",
         Display::Flex => "flex",
+        Display::InlineFlex => "inline-flex",
         Display::Grid => "grid",
         Display::Table => "table",
         Display::TableRowGroup => "table-row-group",

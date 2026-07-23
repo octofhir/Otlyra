@@ -81,5 +81,36 @@
   <tr><td style="border: 1px solid">x</td><td style="border: 1px solid">y</td></tr>
 </table>
 
+<h2>Columns declared with &lt;col&gt; and &lt;colgroup&gt;</h2>
+<table border="1">
+  <col style="width: 200px">
+  <col>
+  <col style="width: 40px">
+  <tr><td>told two hundred</td><td>whatever it needs</td><td>told forty, and wider than that</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h2>A background a column at a time</h2>
+<table border="1">
+  <colgroup span="2" style="background: #eef6ff"></colgroup>
+  <colgroup><col style="background: #fff0f0"></colgroup>
+  <tr><td>one</td><td>two</td><td>three</td></tr>
+  <tr><td>four</td><td>five</td><td>six</td></tr>
+</table>
+
+<h2>A collapsed border settled by style rather than by width</h2>
+<table style="border-collapse: collapse">
+  <tr>
+    <td style="border: 3px solid navy">solid</td>
+    <td style="border: 3px double navy">double takes the shared edge</td>
+    <td style="border: 3px dotted navy">dotted</td>
+  </tr>
+  <tr>
+    <td style="border: 3px solid navy">solid</td>
+    <td style="border-style: hidden">hidden silences every edge it touches</td>
+    <td style="border: 3px solid navy">solid</td>
+  </tr>
+</table>
+
 </body>
 </html>

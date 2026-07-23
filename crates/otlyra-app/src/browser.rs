@@ -35,6 +35,8 @@ struct PendingLoad {
     restore_scroll: f32,
     sheets: ExternalSheets,
     images: Images,
+    /// Which file each of those pictures came from, and at what density.
+    picture_sources: HashMap<NodeId, (String, f32)>,
     /// What each outstanding request will feed once it arrives.
     outstanding: HashMap<u64, Vec<PendingResource>>,
 }
@@ -43,9 +45,10 @@ struct PendingLoad {
 enum PendingResource {
     /// The `<link>` whose stylesheet this is.
     Stylesheet(NodeId),
-    /// The `<img>` whose picture this is, and the density of the candidate it
-    /// settled on — which is what the file's own size is divided by.
-    Image(NodeId, f32),
+    /// The `<img>` whose picture this is, the address it settled on as the
+    /// markup spells it, and that candidate's density — which is what the file's
+    /// own size is divided by.
+    Image(NodeId, String, f32),
 }
 
 /// Note in the log when a document asked for more than the limit allows.
@@ -305,6 +308,15 @@ pub struct Browser {
     background_requests: HashMap<String, usize>,
     /// Background fetches in flight, by request number.
     background_fetches: HashMap<u64, (usize, String)>,
+    /// Fetches for a picture an element chose again, by request number, with the
+    /// tab, the element and the address as its markup spells it.
+    picture_fetches: HashMap<u64, (usize, NodeId, String, f32)>,
+    /// The window the pictures on screen were last chosen against.
+    ///
+    /// The choice is a question about the window, so it is put again only when
+    /// the window is a different one — which keeps a walk of every document off
+    /// the ordinary frame.
+    picture_window: Option<(f32, f32)>,
     /// The fonts pages have asked for, by family and address, so none is asked
     /// for twice — a page that names its family in ten rules names one file, and
     /// two families out of one file are two fonts.
@@ -383,6 +395,8 @@ impl Browser {
             images: ImageCache::default(),
             background_requests: HashMap::new(),
             background_fetches: HashMap::new(),
+            picture_fetches: HashMap::new(),
+            picture_window: None,
             selecting: false,
             font_requests: HashSet::new(),
             font_fetches: HashMap::new(),
@@ -725,6 +739,7 @@ impl Browser {
             restore_scroll,
             sheets: ExternalSheets::default(),
             images: Images::default(),
+            picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
         });
         self.ui.address.set_text(url);
@@ -794,7 +809,10 @@ impl Browser {
         self.paint(&mut discarded, viewport);
 
         let deadline = std::time::Instant::now() + timeout;
-        while !self.background_fetches.is_empty() || !self.font_fetches.is_empty() {
+        while !self.background_fetches.is_empty()
+            || !self.font_fetches.is_empty()
+            || !self.picture_fetches.is_empty()
+        {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 tracing::warn!("gave up waiting for a background picture or a font");
@@ -867,6 +885,69 @@ impl Browser {
                 let id = self.fetcher.request(&target, ResourceKind::Image);
                 self.background_requests.insert(url.clone(), index);
                 self.background_fetches.insert(id, (index, url));
+            }
+        }
+    }
+
+    /// Ask each element again which of the pictures it offers this window wants.
+    ///
+    /// A page chooses among the files a `srcset` lists against the window it is
+    /// loading into, and a window is widened, narrowed and dragged between screens
+    /// of different densities. So the question is put again whenever the window is
+    /// not the one the pictures on screen were chosen against — and only then,
+    /// because asking walks every document.
+    ///
+    /// Only elements whose picture has already arrived: one that never loaded is
+    /// the load's business, and re-asking for it here would fetch it a second time.
+    fn rechoose_pictures(&mut self) {
+        if !self.settings.settings.load_images {
+            return;
+        }
+        let viewport = self.picture_viewport();
+        let window = (viewport.width, viewport.scale);
+        if self.picture_window == Some(window) {
+            return;
+        }
+        self.picture_window = Some(window);
+
+        for index in 0..self.tabs.len() {
+            let Some(page) = self.tabs[index].page.as_ref() else {
+                continue;
+            };
+            let base = self.tabs[index].url.clone();
+            let changed: Vec<otlyra_layout::ImageSource> =
+                otlyra_layout::image_sources(page.document(), viewport)
+                    .into_iter()
+                    .take(IMAGE_LIMIT)
+                    .filter(|source| {
+                        page.picture_source(source.node)
+                            .is_some_and(|(src, density)| {
+                                src != source.src || density != source.density
+                            })
+                    })
+                    .collect();
+
+            for source in changed {
+                let Some(target) = Self::subresource_url(&base, &source.src) else {
+                    continue;
+                };
+                // Already decoded: no request, straight into the page.
+                if let Some(data) = self.images.get(&target)
+                    && let Some(page) = self.tabs[index].page.as_mut()
+                {
+                    page.set_image(
+                        source.node,
+                        source.src,
+                        otlyra_layout::Picture {
+                            data,
+                            density: source.density,
+                        },
+                    );
+                    continue;
+                }
+                let id = self.fetcher.request(&target, ResourceKind::Image);
+                self.picture_fetches
+                    .insert(id, (index, source.node, source.src, source.density));
             }
         }
     }
@@ -982,6 +1063,31 @@ impl Browser {
             }
         }
 
+        // A picture an element chose again after the page was built: the same
+        // element, a different file.
+        if let Some((index, node, src, density)) = self.picture_fetches.remove(&fetched.id) {
+            let Ok(loaded) = fetched.result else {
+                tracing::warn!(%src, "re-chosen picture failed to load");
+                return false;
+            };
+            match otlyra_gfx::decode_image(&loaded.bytes) {
+                Ok(data) => {
+                    self.images.insert(fetched.url.clone(), data.clone());
+                    match self.tabs.get_mut(index).and_then(|tab| tab.page.as_mut()) {
+                        Some(page) => {
+                            page.set_image(node, src, otlyra_layout::Picture { data, density })
+                        }
+                        None => tracing::warn!(%src, "no page to give the picture to"),
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(%src, %error, "re-chosen picture failed to decode");
+                    return false;
+                }
+            }
+        }
+
         let Some(index) = self.tabs.iter().position(|tab| {
             tab.pending.as_ref().is_some_and(|pending| {
                 pending.document == fetched.id || pending.outstanding.contains_key(&fetched.id)
@@ -1089,7 +1195,7 @@ impl Browser {
             .map(|source| {
                 (
                     source.src.clone(),
-                    PendingResource::Image(source.node, source.density),
+                    PendingResource::Image(source.node, source.src.clone(), source.density),
                     ResourceKind::Image,
                 )
             })
@@ -1192,7 +1298,7 @@ impl Browser {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
                             pending.sheets.insert(node, source);
                         }
-                        PendingResource::Image(node, density) => match decoded.as_ref() {
+                        PendingResource::Image(node, src, density) => match decoded.as_ref() {
                             Some(image) => {
                                 pending.images.insert(
                                     node,
@@ -1201,6 +1307,7 @@ impl Browser {
                                         density,
                                     },
                                 );
+                                pending.picture_sources.insert(node, (src, density));
                             }
                             None => {
                                 tracing::warn!(url = %fetched.url, "image failed to decode");
@@ -1240,6 +1347,7 @@ impl Browser {
                 page.into_document(),
                 pending.sheets,
                 pending.images,
+                pending.picture_sources,
             ));
         }
         if let Some(page) = tab.page.as_mut() {
@@ -2403,6 +2511,7 @@ impl Painter for Browser {
             // once the rule has been computed on the way to a frame.
             self.fetch_backgrounds();
             self.fetch_fonts();
+            self.rechoose_pictures();
             return;
         }
 
@@ -2437,6 +2546,9 @@ impl Painter for Browser {
         // the way to one.
         self.fetch_backgrounds();
         self.fetch_fonts();
+        // Last, because it is a question about the window this frame was drawn
+        // for: the answer is for the next one.
+        self.rechoose_pictures();
     }
 }
 
@@ -3750,6 +3862,112 @@ mod tests {
             1,
             "the picture was decoded again on the second visit"
         );
+    }
+
+    /// A window that grows past the file its pictures were chosen for asks again.
+    ///
+    /// The choice among the several a `srcset` offers is made against the window
+    /// the page loads into, and that window is not the one it stays in. Chosen
+    /// once and never revisited, a page opened narrow and then widened keeps the
+    /// small file and draws it stretched.
+    #[test]
+    fn a_widened_window_asks_for_a_larger_picture() {
+        struct PictureLoader {
+            requested: Requests,
+        }
+
+        impl Loader for PictureLoader {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.requested
+                    .lock()
+                    .expect("no panic on the fetch thread")
+                    .push(url.to_owned());
+                if url.ends_with(".png") {
+                    return Ok(Loaded {
+                        content_type: Some("image/png".to_owned()),
+                        bytes: ONE_PIXEL_PNG.to_vec(),
+                        final_url: url.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><img sizes=\"100vw\" \
+                             srcset=\"/narrow.png 400w, /wide.png 1600w\" src=\"/narrow.png\">"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://pictures.example/".to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let requested = Requests::default();
+        let mut browser = Browser::new(PictureLoader {
+            requested: std::sync::Arc::clone(&requested),
+        });
+
+        let narrow = Viewport::new(400, 600, 1.0);
+        browser.set_viewport(narrow);
+        go(&mut browser, "pictures.example");
+
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, narrow);
+        let asked = asked_for(&requested);
+        assert!(
+            asked.iter().any(|url| url.ends_with("/narrow.png"))
+                && !asked.iter().any(|url| url.ends_with("/wide.png")),
+            "a narrow window takes the small file: {asked:?}"
+        );
+
+        // Wider than the small file can cover, so the element now wants the
+        // large one.
+        let wide = Viewport::new(1400, 600, 1.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !asked_for(&requested)
+            .iter()
+            .any(|url| url.ends_with("/wide.png"))
+            && std::time::Instant::now() < deadline
+        {
+            browser.paint(&mut painter, wide);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            asked_for(&requested)
+                .iter()
+                .any(|url| url.ends_with("/wide.png")),
+            "the widened window never asked for the larger file: {:?}",
+            asked_for(&requested)
+        );
+
+        // And it is the picture the element now holds, rather than a fetch that
+        // went nowhere.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            browser.paint(&mut painter, wide);
+            let held = browser.tabs[0]
+                .page
+                .as_ref()
+                .and_then(|page| {
+                    let node = otlyra_layout::image_sources(
+                        page.document(),
+                        otlyra_css::cascade::Viewport::default(),
+                    )
+                    .first()?
+                    .node;
+                    Some(page.picture_source(node)?.0.to_owned())
+                })
+                .unwrap_or_default();
+            if held.ends_with("/wide.png") || std::time::Instant::now() >= deadline {
+                assert!(
+                    held.ends_with("/wide.png"),
+                    "the element still holds {held}"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// A frame takes in whatever has arrived, even when nothing woke the loop.

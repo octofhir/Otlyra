@@ -297,39 +297,115 @@ fn text_still_shapes_when_the_named_family_is_missing() {
     assert!(!run.glyphs.is_empty());
 }
 
-/// A line is as tall as the block's own font asks for, however small the things
-/// inside it are.
+/// A paragraph is as tall as its lines, and a line is as tall as what is on it.
 ///
-/// This is the strut: a paragraph of ordinary text with a smaller inline in it —
-/// a `<code>`, a `<small>` — spaces its lines by its own font, not by whichever
-/// span happens to be on a line. Getting it from the span was worth two pixels a
-/// line, every line, and the lines the small span was nowhere near.
+/// The shaper carries a line height per *run* of glyphs and opens a run when the
+/// font changes, so it can neither be told that one span of the same font wants a
+/// taller line nor asked to put the baseline where CSS puts it. So the paragraph
+/// is restacked from what actually landed on each line. Before that, one height
+/// was worked out for the paragraph and every line was given it — which on
+/// sixteen-pixel text around one thirty-two-pixel word was nearly twice the
+/// paragraph a reference draws.
+///
+/// Every height here was measured against one.
 #[test]
-fn a_smaller_inline_does_not_make_its_line_shorter() {
-    let plain = lay_out("<body><p>one<br>two", 800.0);
-    // A heading is larger than the text in it, and `<sub>` is smaller than the
-    // heading — so the second line holds something shorter than its own block.
-    let mixed = lay_out("<body><h2>one<br>two <sub>small</sub>", 800.0);
+fn only_the_line_a_tall_thing_is_on_is_tall() {
+    let paragraph = |markup: &str| {
+        let tree = lay_out_styled(
+            &format!(
+                "<body style='margin:0'><p style='width:300px;margin:0;line-height:1.5'>\
+                 one two three four five six seven {markup} eight nine ten eleven twelve \
+                 thirteen fourteen fifteen sixteen</p>"
+            ),
+            500.0,
+        );
+        let heights: Vec<f32> = lines(&tree).iter().map(|line| line.rect.height).collect();
+        let block = text_blocks(&tree)[0].rect.height;
+        (heights, block)
+    };
 
+    let (plain, plain_height) = paragraph("plain");
+    assert!(plain.len() >= 2, "several lines: {plain:?}");
+    assert!(
+        plain
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 0.01),
+        "one font, one height: {plain:?}"
+    );
+
+    // A larger word makes its own line tall and leaves the rest alone.
+    let (mixed, mixed_height) = paragraph("<span style='font-size:32px'>BIG</span>");
+    let tall = mixed
+        .iter()
+        .filter(|height| **height > plain[0] + 0.5)
+        .count();
+    assert_eq!(tall, 1, "one line grew, and one only: {mixed:?}");
+    assert!(
+        mixed_height < plain_height + plain[0] * 1.5,
+        "the paragraph grew by about one line rather than throughout: \
+         {mixed_height} against {plain_height}"
+    );
+
+    // The same for a `line-height` the shaper cannot carry at all, because the
+    // span shares its font with the text around it.
+    let (told, _) = paragraph("<span style='line-height:3'>taller</span>");
+    assert_eq!(
+        told.iter()
+            .filter(|height| **height > plain[0] + 0.5)
+            .count(),
+        1,
+        "one line grew: {told:?}"
+    );
+}
+
+/// A line is as tall as the block's own font asks for, however small the things
+/// inside it are — and as tall as what is *on* it where that is taller.
+///
+/// The strut is the floor: a paragraph of ordinary text with a smaller inline in
+/// it — a `<code>`, a `<small>` — spaces its lines by its own font, not by
+/// whichever span happens to be on a line. Getting it from the span was worth two
+/// pixels a line, every line, and the lines the small span was nowhere near.
+///
+/// The ceiling is the line's own: a span lowered below the baseline hangs out of
+/// the strut and the line grows to hold it, on that line and no other. Both halves
+/// were measured against a reference.
+#[test]
+fn a_line_is_the_strut_at_least_and_what_is_on_it_at_most() {
     let heights = |tree: &FragmentTree| -> Vec<f32> {
         lines(tree).iter().map(|line| line.rect.height).collect()
     };
-    let plain = heights(&plain);
+
+    let plain = heights(&lay_out("<body><p>one<br>two", 800.0));
     assert_eq!(plain.len(), 2);
     assert_eq!(plain[0], plain[1], "both lines of one font agree");
 
-    let mixed = heights(&mixed);
-    assert_eq!(mixed.len(), 2);
-    // Within the fraction of a pixel that separates a line measured from the next
-    // line's top from the last line, measured from its own height.
+    // A `<small>` sits on the baseline, so its line is the strut like the others.
+    let smaller = heights(&lay_out("<body><p>one<br>two <small>small</small>", 800.0));
+    assert_eq!(smaller.len(), 2);
     assert!(
-        (mixed[0] - mixed[1]).abs() < 0.5,
-        "and so do both lines of two: {mixed:?}"
+        (smaller[0] - smaller[1]).abs() < 0.5 && (smaller[0] - plain[0]).abs() < 0.5,
+        "a smaller inline on the baseline changes nothing: {smaller:?}"
+    );
+
+    // A `<sub>` is lowered, so it reaches below the strut and its line grows —
+    // the line it is on, and not the one above it.
+    let lowered = heights(&lay_out("<body><p>one<br>two <sub>small</sub>", 800.0));
+    assert_eq!(lowered.len(), 2);
+    assert!(
+        (lowered[0] - plain[0]).abs() < 0.5,
+        "the line the subscript is nowhere near is unmoved: {lowered:?}"
     );
     assert!(
-        mixed[0] > plain[0],
+        lowered[1] > lowered[0] + 0.5,
+        "and the line holding it is taller: {lowered:?}"
+    );
+
+    // A larger paragraph has taller lines throughout, which is the strut again.
+    let heading = heights(&lay_out("<body><h2>one<br>two", 800.0));
+    assert!(
+        heading[0] > plain[0],
         "a twenty-pixel paragraph has taller lines than a sixteen-pixel one: \
-         {mixed:?} against {plain:?}"
+         {heading:?} against {plain:?}"
     );
 }
 
@@ -439,6 +515,97 @@ fn cells_of(tree: &FragmentTree) -> Vec<&Fragment> {
         .into_iter()
         .filter(|f| f.style.display == otlyra_layout::Display::TableCell)
         .collect()
+}
+
+/// A `<col>` gives its column a width and a background, and a `span` gives them
+/// to as many columns as it names.
+///
+/// The width is a floor rather than a cap: a column told sixty and holding a word
+/// eighty wide comes out eighty, which is what a reference does and is the only
+/// place the rule is written plainly.
+#[test]
+fn a_column_gives_its_width_and_its_background_to_the_column() {
+    let widths = |markup: &str| {
+        let tree = lay_out_styled(
+            &format!(
+                "<body><table style='border-collapse: collapse'>{markup}\
+                 <tr><td>a</td><td>b</td><td>cccccccccccccccc</td></tr></table>"
+            ),
+            800.0,
+        );
+        cells_of(&tree)
+            .into_iter()
+            .map(|cell| cell.rect.width)
+            .collect::<Vec<_>>()
+    };
+
+    let plain = widths("");
+    let told = widths("<col style='width:200px'><col><col>");
+    assert_eq!(told[0], 200.0, "the column takes the width it was told");
+    assert_eq!(
+        (told[1], told[2]),
+        (plain[1], plain[2]),
+        "and the others are unmoved"
+    );
+
+    // One `span` describes two columns.
+    let spanned = widths("<col span=2 style='width:120px'><col>");
+    assert_eq!((spanned[0], spanned[1]), (120.0, 120.0));
+
+    // A width narrower than the longest word loses to the word: the column cannot
+    // go below what the content cannot break.
+    let narrow = widths("<col><col><col style='width:20px'>");
+    assert_eq!(narrow[2], plain[2], "one word, and it does not break");
+
+    // Where the content *can* break, the column is the width it was told and the
+    // text wraps inside it — a cap rather than a floor, which is the half a
+    // reference had to settle.
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse'><col><col style='width:60px'>         <tr><td>a</td><td>one two three four</td></tr></table>",
+        800.0,
+    );
+    let wrapped = cells_of(&tree)[1];
+    assert!(
+        (wrapped.rect.width - 60.0).abs() < 0.01,
+        "the column is the width it was told: {:?}",
+        wrapped.rect
+    );
+
+    // A `<colgroup>` with no columns in it describes as many as its own `span`.
+    let tree = lay_out_styled(
+        "<body><table style='border-collapse: collapse'>\
+         <colgroup span=2 style='background: rgb(0,255,0)'></colgroup>\
+         <colgroup><col style='background: rgb(255,0,0)'></colgroup>\
+         <tr><td>a</td><td>b</td><td>c</td></tr></table>",
+        800.0,
+    );
+    let painted: Vec<(f32, otlyra_gfx::peniko::Color)> = boxes_of(&tree)
+        .into_iter()
+        .filter(|fragment| {
+            fragment.style.background_color == otlyra_gfx::peniko::Color::from_rgb8(0, 255, 0)
+                || fragment.style.background_color
+                    == otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0)
+        })
+        .map(|fragment| (fragment.rect.x, fragment.style.background_color))
+        .collect();
+    assert_eq!(painted.len(), 3, "three columns painted: {painted:?}");
+    assert_eq!(
+        painted[0].1,
+        otlyra_gfx::peniko::Color::from_rgb8(0, 255, 0)
+    );
+    assert_eq!(
+        painted[1].1,
+        otlyra_gfx::peniko::Color::from_rgb8(0, 255, 0)
+    );
+    assert_eq!(
+        painted[2].1,
+        otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0),
+        "the group's own style does not reach the columns inside it"
+    );
+    assert!(
+        painted[0].0 < painted[1].0 && painted[1].0 < painted[2].0,
+        "one per column, in order: {painted:?}"
+    );
 }
 
 /// A cell across two columns covers both of them and the gap between them, and
@@ -792,6 +959,46 @@ fn a_word_and_a_paragraph_are_what_the_second_and_third_click_take() {
     );
 }
 
+/// A ligature is one glyph and two letters, and a click after one lands where the
+/// letters are rather than where the glyphs are.
+///
+/// The test face draws `fi` as a single shape, so this line is drawn with two
+/// glyphs fewer than it has characters. Stepping the glyphs and the characters
+/// together — which is what a run used to do — puts every offset after the first
+/// ligature a letter early, and a second click on the last word takes the one
+/// before it.
+#[test]
+fn a_click_past_a_ligature_lands_on_the_letter_it_is_over() {
+    use otlyra_layout::selection;
+
+    let tree = lay_out("<body><p>difficult offices xyz</p>", 800.0);
+
+    let fragment = tree
+        .iter()
+        .find(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
+        .expect("a run of text");
+    let FragmentKind::Text(run) = &fragment.kind else {
+        unreachable!()
+    };
+    assert!(
+        run.glyphs.len() < run.text.chars().count(),
+        "the test face draws every pair separately, so this proves nothing"
+    );
+
+    // The last three glyphs are `xyz`, which nothing ligates: the first of them
+    // is where the last word starts on the screen.
+    let last_word = run.glyphs[run.glyphs.len() - 3];
+    let x = fragment.rect.x + last_word.x + 1.0;
+    let y = fragment.rect.y + fragment.rect.height / 2.0;
+
+    let at = selection::position_at(&tree, x, y).expect("a position");
+    assert_eq!(
+        selection::text(&tree, selection::word_at(&tree, at)),
+        "xyz",
+        "the word under the pointer, two ligatures along the line"
+    );
+}
+
 /// A point on the page resolves to a place in its text, and the text between two
 /// such places comes back as the characters that were drawn there.
 #[test]
@@ -938,6 +1145,52 @@ fn a_collapsed_table_draws_the_line_that_won() {
         }),
         "the wider border is drawn whole, on the edge the cells meet at: {:?}",
         lines.iter().map(|line| line.rect).collect::<Vec<_>>()
+    );
+}
+
+/// Two collapsed borders of the same width are settled by their style, and
+/// `hidden` silences the edge outright.
+///
+/// Both were left to source order before: `double` and `solid` at the same width
+/// came down to which cell was written first, and `hidden` was a zero-width
+/// border like `none` — so a neighbour put its own line back on an edge the page
+/// had asked to be left blank.
+#[test]
+fn a_collapsed_border_is_settled_by_style_where_the_widths_agree() {
+    let colour = |css: &str| {
+        let tree = lay_out_styled(
+            &format!(
+                "<body><table style='border-collapse: collapse'>\
+                 <tr><td style='border: 3px solid rgb(0,0,255)'>a</td>\
+                 <td style='{css}'>b</td></tr></table>"
+            ),
+            800.0,
+        );
+        let shared = cells_of(&tree)[0].rect.right();
+        boxes_of(&tree)
+            .into_iter()
+            .filter(|fragment| fragment.rect.width <= 4.0 && fragment.rect.height > 4.0)
+            .find(|line| (line.rect.x + line.rect.width / 2.0 - shared).abs() < 1.0)
+            .map(|line| line.style.background_color)
+    };
+
+    // Same width, louder style: `double` beats `solid` however they were written.
+    assert_eq!(
+        colour("border: 3px double rgb(255,0,0)"),
+        Some(otlyra_gfx::peniko::Color::from_rgb8(255, 0, 0)),
+        "double takes an edge from solid at the same width"
+    );
+    // Same width, quieter style: the first one keeps it.
+    assert_eq!(
+        colour("border: 3px dotted rgb(255,0,0)"),
+        Some(otlyra_gfx::peniko::Color::from_rgb8(0, 0, 255)),
+        "solid keeps an edge from dotted at the same width"
+    );
+    // `hidden` is not a narrow border. It is a blank edge nothing may draw on.
+    assert_eq!(
+        colour("border-style: hidden"),
+        None,
+        "hidden silenced the edge, so nothing is drawn on it"
     );
 }
 

@@ -664,6 +664,74 @@ impl Builder<'_> {
         }
     }
 
+    /// The columns a table declares, in order and with every `span` spread out.
+    ///
+    /// A `<col>` inside a `<colgroup>` describes one column; a `<colgroup>` with
+    /// no `<col>` in it describes as many as its own `span` says. A group's style
+    /// is not inherited by the columns inside it — they are siblings in the
+    /// column list, not boxes inside one another — so a group with columns in it
+    /// contributes those and nothing of its own.
+    fn columns_of(&self, table: NodeId, table_style: &ComputedStyle) -> Vec<Arc<ComputedStyle>> {
+        let span_of = |node: NodeId| -> usize {
+            self.document
+                .get(node)
+                .and_then(|node| node.element())
+                .and_then(|element| {
+                    element
+                        .attrs
+                        .iter()
+                        .find(|attr| attr.name.local.as_ref() == "span")?
+                        .value
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .unwrap_or(1)
+                .clamp(1, 1000)
+        };
+
+        let spread = |node: NodeId, style: Arc<ComputedStyle>, into: &mut Vec<_>| {
+            for _ in 0..span_of(node) {
+                into.push(Arc::clone(&style));
+            }
+        };
+
+        let mut columns = Vec::new();
+        for child in self.document.children(table) {
+            match self.document.get(child).and_then(|node| node.element()) {
+                Some(element) if element.name.local.as_ref() == "col" => {
+                    let style = Arc::new(self.style_for(child, "col", table_style));
+                    spread(child, style, &mut columns);
+                }
+                Some(element) if element.name.local.as_ref() == "colgroup" => {
+                    let group = self.style_for(child, "colgroup", table_style);
+                    let inner: Vec<NodeId> = self
+                        .document
+                        .children(child)
+                        .filter(|&node| {
+                            self.document
+                                .get(node)
+                                .and_then(|node| node.element())
+                                .is_some_and(|element| element.name.local.as_ref() == "col")
+                        })
+                        .collect();
+                    if inner.is_empty() {
+                        for _ in 0..span_of(child) {
+                            columns.push(Arc::new(group.clone()));
+                        }
+                    } else {
+                        for col in inner {
+                            let style = Arc::new(self.style_for(col, "col", &group));
+                            spread(col, style, &mut columns);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        columns
+    }
+
     /// The style of one element: the cascade's answer where there is one, and the
     /// built-in element style where there is not.
     fn style_for(&self, node: NodeId, name: &str, parent: &ComputedStyle) -> ComputedStyle {
@@ -765,6 +833,17 @@ impl Builder<'_> {
                     }
                 }
 
+                // The columns a table declares. Recorded on the table because a
+                // `<col>` generates no box of its own — CSS makes it a column box,
+                // which is not part of this tree — and its style has nowhere else
+                // to go.
+                if name == "table" {
+                    let columns = self.columns_of(node, &style);
+                    if !columns.is_empty() {
+                        self.tree.set_columns(id, columns);
+                    }
+                }
+
                 if has_renderable_children(name) {
                     for child in self.document.children(node) {
                         self.walk(child, id, &style);
@@ -834,7 +913,10 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
     // Every child of a flex container is a flex item, and a run of inline content
     // between two of them is one item of its own — so a container with any inline
     // child needs the same wrapping a mixed block does.
-    let flex = matches!(tree.node(id).style.display, Display::Flex | Display::Grid);
+    let flex = matches!(
+        tree.node(id).style.display,
+        Display::Flex | Display::InlineFlex | Display::Grid
+    );
     let has_block = children
         .iter()
         .any(|&child| tree.node(child).is_block_level());

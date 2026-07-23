@@ -86,7 +86,10 @@ impl BoxNode {
     /// it, and it takes its place in a line like a word.
     pub fn is_block_level(&self) -> bool {
         matches!(self.kind, BoxKind::Block)
-            && self.style.display != otlyra_css::Display::InlineBlock
+            && !matches!(
+                self.style.display,
+                otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+            )
     }
 
     /// Whether this box is inline-level.
@@ -96,9 +99,13 @@ impl BoxNode {
             // A replaced box takes the level its style gives it: an image is
             // inline by default and a block when a rule says so.
             BoxKind::Replaced(_) => self.style.display != otlyra_css::Display::Block,
-            // `inline-block` is the one box that is both: a block container that
-            // takes its place in a line rather than a line of its own.
-            BoxKind::Block => self.style.display == otlyra_css::Display::InlineBlock,
+            // `inline-block` and `inline-flex` are the boxes that are both: a
+            // formatting context of their own that takes a place in a line rather
+            // than a line of its own.
+            BoxKind::Block => matches!(
+                self.style.display,
+                otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+            ),
         }
     }
 }
@@ -160,6 +167,14 @@ pub struct BoxTree {
     /// How far each table cell reaches, for the few that reach past one cell.
     /// Sparse for the same reason `markers` is.
     spans: SecondaryMap<BoxId, CellSpan>,
+    /// The columns a table declares, one style per column, for the few tables
+    /// that declare any.
+    ///
+    /// `<col>` and `<colgroup>` generate no box — CSS makes them column boxes,
+    /// which are not part of the box tree at all — so the style they carry has
+    /// nowhere else to live. Expanded here: a `span` is already spread out, so a
+    /// table with three columns has three entries whatever the markup wrote.
+    columns: SecondaryMap<BoxId, Vec<Arc<ComputedStyle>>>,
 }
 
 impl BoxTree {
@@ -181,6 +196,7 @@ impl BoxTree {
             by_node: SecondaryMap::new(),
             markers: SecondaryMap::new(),
             spans: SecondaryMap::new(),
+            columns: SecondaryMap::new(),
         }
     }
 
@@ -192,6 +208,16 @@ impl BoxTree {
     /// How far a table cell reaches: one column and one row unless it said so.
     pub fn span(&self, id: BoxId) -> CellSpan {
         self.spans.get(id).copied().unwrap_or_default()
+    }
+
+    /// Record the columns a table declared, in order and already expanded.
+    pub fn set_columns(&mut self, id: BoxId, columns: Vec<Arc<ComputedStyle>>) {
+        self.columns.insert(id, columns);
+    }
+
+    /// The columns a table declared. Empty for a table that declared none.
+    pub fn columns(&self, id: BoxId) -> &[Arc<ComputedStyle>] {
+        self.columns.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Give a list item the marker it shows.

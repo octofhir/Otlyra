@@ -25,6 +25,15 @@ pub struct PageScene {
     /// same reason as the sheets: rebuilding the box tree must not wait on a
     /// network either.
     images: Images,
+    /// Which file each of those pictures came from, and the density it was chosen
+    /// for.
+    ///
+    /// Which of the several an element offers is a question about the window, and
+    /// a window changes: kept so that a resize can put the question again and
+    /// find out that the answer is now a different file. Only elements whose
+    /// picture has arrived are in here — one that never loaded belongs to the
+    /// load that asked for it.
+    picture_sources: std::collections::HashMap<NodeId, (String, f32)>,
     /// The document itself, kept because a click resolves to a box, a box to a
     /// node, and a node's attributes are what say where a link goes.
     document: Document,
@@ -126,14 +135,26 @@ impl std::fmt::Debug for PageScene {
 impl PageScene {
     /// A scene showing `document`, with nothing fetched for it.
     pub fn new(document: Document) -> Self {
-        Self::with_resources(document, ExternalSheets::default(), Images::default())
+        Self::with_resources(
+            document,
+            ExternalSheets::default(),
+            Images::default(),
+            std::collections::HashMap::new(),
+        )
     }
 
-    /// A scene showing `document` with the stylesheets and pictures it asked for.
-    pub fn with_resources(document: Document, sheets: ExternalSheets, images: Images) -> Self {
+    /// A scene showing `document` with the stylesheets and pictures it asked for,
+    /// and which file each of those pictures came from.
+    pub fn with_resources(
+        document: Document,
+        sheets: ExternalSheets,
+        images: Images,
+        picture_sources: std::collections::HashMap<NodeId, (String, f32)>,
+    ) -> Self {
         Self {
             sheets,
             images,
+            picture_sources,
             boxes: build_box_tree(&document),
             document,
             targets: Vec::new(),
@@ -512,14 +533,16 @@ impl PageScene {
     pub fn wanted_pictures(&self) -> Vec<String> {
         let mut wanted: Vec<String> = Vec::new();
         for id in self.boxes.descendants(self.boxes.root()) {
-            let Some(url) = self.boxes.node(id).style.background_image.as_deref() else {
-                continue;
-            };
-            if self.background_pictures.contains_key(url) {
-                continue;
-            }
-            if !wanted.iter().any(|already| already == url) {
-                wanted.push(url.to_owned());
+            for layer in &self.boxes.node(id).style.backgrounds {
+                let Some(url) = layer.image.as_deref() else {
+                    continue;
+                };
+                if self.background_pictures.contains_key(url) {
+                    continue;
+                }
+                if !wanted.iter().any(|already| already == url) {
+                    wanted.push(url.to_owned());
+                }
             }
         }
         wanted
@@ -682,6 +705,29 @@ impl PageScene {
     pub fn font_arrived(&mut self) {
         self.layout = None;
         self.damage.add(otlyra_layout::Damage::LAYOUT);
+    }
+
+    /// Which file an element's picture came from, and the density it was chosen
+    /// for. `None` where nothing has arrived for it.
+    pub fn picture_source(&self, node: NodeId) -> Option<(&str, f32)> {
+        self.picture_sources
+            .get(&node)
+            .map(|(src, density)| (src.as_str(), *density))
+    }
+
+    /// Hand an element the picture it now asks for, in place of the one it has.
+    ///
+    /// The box tree goes with it: a picture is a box's content, and a different
+    /// file is a different intrinsic size — so the page is styled and laid out
+    /// again rather than repainted.
+    pub fn set_image(&mut self, node: NodeId, src: String, picture: otlyra_layout::Picture) {
+        self.picture_sources.insert(node, (src, picture.density));
+        self.images.insert(node, picture);
+        self.styled = false;
+        self.layout = None;
+        self.damage.add(Damage::of(
+            otlyra_layout::InvalidationReason::DocumentLoaded,
+        ));
     }
 
     /// Hand over a picture the page asked for.

@@ -735,6 +735,20 @@ fn apply_stroke(paint: &mut sk::Paint, style: &Stroke) {
         Join::Miter => sk::paint::Join::Miter,
         Join::Round => sk::paint::Join::Round,
     });
+
+    // A dashed line is a path effect here rather than a stroke setting, and it
+    // wants the intervals in pairs: an odd list means the pattern alternates on
+    // each repetition, which is not what anything asking for dashes wants.
+    if !style.dash_pattern.is_empty() {
+        let mut intervals: Vec<f32> = style.dash_pattern.iter().map(|on| *on as f32).collect();
+        if intervals.len() % 2 == 1 {
+            let repeated = intervals.clone();
+            intervals.extend(repeated);
+        }
+        if let Some(effect) = sk::PathEffect::dash(&intervals, style.dash_offset as f32) {
+            paint.set_path_effect(effect);
+        }
+    }
 }
 
 impl PaintTarget for SkiaPainter {

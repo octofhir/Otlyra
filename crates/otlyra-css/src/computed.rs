@@ -12,11 +12,11 @@ use peniko::Color;
 use style::properties::ComputedValues;
 
 use crate::style::{
-    AlignItems, Anchor, BackgroundPosition, BackgroundRepeat, BackgroundSize, Border,
-    BorderCollapse, BoxSizing, Clear, ComputedStyle, Corners, Display, FlexDirection, FlexWrap,
-    Float, FontStyle, Gradient, GradientStop, JustifyContent, Length, LengthOrAuto, LineHeight,
-    ObjectFit, Overflow, Placement, Position, Repeat, Shadow, Sides, TextAlign, TextDecoration,
-    TextWrap, Track, TransformOp, TransformOrigin, WhiteSpace,
+    AlignContent, AlignItems, Anchor, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
+    BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle, Corners,
+    Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop, JustifyContent,
+    Length, LengthOrAuto, LineHeight, ObjectFit, Overflow, Placement, Position, Repeat, Shadow,
+    Sides, TextAlign, TextDecoration, TextWrap, Track, TransformOp, TransformOrigin, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -113,11 +113,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         },
         overflow: overflow_of(values),
         radius: corners(values),
-        background_gradient: background_gradient(values),
-        background_image: background_image(values),
-        background_size: background_size(values),
-        background_repeat: background_repeat(values),
-        background_position: background_position(values),
+        backgrounds: backgrounds(values),
         object_fit: object_fit(values),
         object_position: object_position(values),
         shadows: shadows(values),
@@ -138,6 +134,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         justify_content: justify_content(values),
         align_items: align_items(values),
         align_self: align_self(values),
+        align_content: align_content(values),
+        order: values.clone_order(),
         flex_grow: values.clone_flex_grow().0,
         flex_shrink: values.clone_flex_shrink().0,
         flex_basis: flex_basis(values),
@@ -163,10 +161,13 @@ fn display_of(values: &ComputedValues) -> Display {
         return Display::None;
     }
     // A flex container is a flex container whichever way round it sits in its
-    // parent; `inline-flex` differs in how it is placed, which is a difference
-    // layout cannot express yet.
+    // parent; `inline-flex` differs only in how it is placed, which is where an
+    // `inline-block` is placed.
     if display.inside() == DisplayInside::Flex {
-        return Display::Flex;
+        return match display.outside() {
+            DisplayOutside::Inline => Display::InlineFlex,
+            _ => Display::Flex,
+        };
     }
     if display.inside() == DisplayInside::Grid {
         return Display::Grid;
@@ -302,26 +303,42 @@ fn text_wrap(values: &ComputedValues) -> TextWrap {
     }
 }
 
-/// The four borders, each as the width that is actually used and its colour.
+/// The four borders, each as the width that is actually used, its colour and the
+/// line it draws.
 ///
 /// A border whose style is `none` or `hidden` has a used width of zero however
-/// wide it was declared, which is the rule that keeps `border-style` out of the
-/// computed style this crate hands to layout.
+/// wide it was declared. The two are kept apart all the same: in a collapsed table
+/// they mean different things, and everywhere else the width already says it all.
 fn border(values: &ComputedValues) -> Sides<Border> {
-    use style::values::computed::BorderStyle;
+    use style::values::computed::BorderStyle as Declared;
 
     let border = values.get_border();
     let text = colour(values.clone_color());
-    let side =
-        |width: &style::values::computed::BorderSideWidth, style: BorderStyle, colour_value| {
-            if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
-                return Border::NONE;
-            }
-            Border {
-                width: width.0.to_f32_px(),
-                color: resolve_colour(colour_value, text),
-            }
+    let side = |width: &style::values::computed::BorderSideWidth, style: Declared, colour_value| {
+        let style = match style {
+            Declared::None => BorderStyle::None,
+            Declared::Hidden => BorderStyle::Hidden,
+            Declared::Dotted => BorderStyle::Dotted,
+            Declared::Dashed => BorderStyle::Dashed,
+            Declared::Double => BorderStyle::Double,
+            Declared::Groove => BorderStyle::Groove,
+            Declared::Ridge => BorderStyle::Ridge,
+            Declared::Inset => BorderStyle::Inset,
+            Declared::Outset => BorderStyle::Outset,
+            Declared::Solid => BorderStyle::Solid,
         };
+        if !style.draws() {
+            return Border {
+                style,
+                ..Border::NONE
+            };
+        }
+        Border {
+            width: width.0.to_f32_px(),
+            color: resolve_colour(colour_value, text),
+            style,
+        }
+    };
 
     Sides {
         top: side(
@@ -357,28 +374,6 @@ fn text_align(values: &ComputedValues) -> TextAlign {
         // edge is where a start-aligned line begins, so that is what it gets.
         _ => TextAlign::Start,
     }
-}
-
-/// `overflow`, narrowed to whether the box cuts off what does not fit.
-///
-/// `scroll` and `auto` cut off too — the part of them that layout can honour today
-/// is the clip; scrolling the box itself is a scroll port, which is more than a
-/// clip and arrives with one.
-/// `background-image`, when the topmost layer is a picture.
-fn background_image(values: &ComputedValues) -> Option<Arc<str>> {
-    use style::values::generics::image::GenericImage as Image;
-
-    let Image::Url(url) = values.get_background().background_image.0.first()? else {
-        return None;
-    };
-    // The address as written, not as resolved: stylesheets are parsed against a
-    // placeholder base, so the engine cannot resolve a relative `url()` for us.
-    // Resolving it against the page is the caller's, exactly as it is for the
-    // address in an `<img src>`.
-    Some(match url {
-        style::url::ComputedUrl::Valid(resolved) => Arc::from(resolved.as_str()),
-        style::url::ComputedUrl::Invalid(specified) => Arc::from(specified.as_str()),
-    })
 }
 
 /// `transform`, narrowed to the steps this draws in.
@@ -429,33 +424,6 @@ fn transform_origin(values: &ComputedValues) -> TransformOrigin {
     TransformOrigin {
         x: length(&origin.horizontal),
         y: length(&origin.vertical),
-    }
-}
-
-/// `background-size` for that layer.
-fn background_size(values: &ComputedValues) -> BackgroundSize {
-    use style::values::generics::background::GenericBackgroundSize as Generic;
-
-    match values.get_background().background_size.0.first() {
-        Some(Generic::Cover) => BackgroundSize::Cover,
-        Some(Generic::Contain) => BackgroundSize::Contain,
-        Some(Generic::ExplicitSize { width, height }) => {
-            let side = |value: &style::values::computed::NonNegativeLengthPercentageOrAuto| {
-                match value {
-                    style::values::generics::length::GenericLengthPercentageOrAuto::Auto => None,
-                    style::values::generics::length::GenericLengthPercentageOrAuto::LengthPercentage(
-                        value,
-                    ) => Some(length(&value.0)),
-                }
-            };
-            match (side(width), side(height)) {
-                (Some(width), Some(height)) => BackgroundSize::Fixed(width, height),
-                // One side given and the other from the picture's own ratio is
-                // sizing this does not do; its own size is the honest stand-in.
-                _ => BackgroundSize::Auto,
-            }
-        }
-        _ => BackgroundSize::Auto,
     }
 }
 
@@ -549,12 +517,94 @@ fn font_variations(values: &ComputedValues) -> Arc<[([u8; 4], f32)]> {
         .collect()
 }
 
-/// Whether the topmost background layer repeats, along each axis.
+/// Every layer of `background-image`, topmost first.
+///
+/// CSS makes each of the properties that describe a layer a list of its own, and
+/// a list shorter than the pictures repeats through itself — so `background:
+/// url(a), url(b)` with one `background-size` sizes both the same way. The layers
+/// come back in the order the page wrote them, which is the reverse of the order
+/// they are painted in; a layer that is neither a picture nor a gradient is kept
+/// as an empty one so that the sizes and positions after it still line up.
+fn backgrounds(values: &ComputedValues) -> Vec<BackgroundLayer> {
+    use style::values::generics::image::GenericImage as Image;
+
+    let background = values.get_background();
+    let images = &background.background_image.0;
+    if images.is_empty() {
+        return Vec::new();
+    }
+
+    // Each list repeats through itself to the number of pictures, which is what
+    // CSS means by the layer list being as long as `background-image`.
+    let cycled = |length: usize, index: usize| (length > 0).then(|| index % length);
+    let sizes = &background.background_size.0;
+    let repeats = &background.background_repeat.0;
+    let xs = &background.background_position_x.0;
+    let ys = &background.background_position_y.0;
+
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| BackgroundLayer {
+            // The address as written, not as resolved: stylesheets are parsed
+            // against a placeholder base, so the engine cannot resolve a relative
+            // `url()` for us. Resolving it against the page is the caller's,
+            // exactly as it is for the address in an `<img src>`.
+            image: match image {
+                Image::Url(style::url::ComputedUrl::Valid(resolved)) => {
+                    Some(Arc::from(resolved.as_str()))
+                }
+                Image::Url(style::url::ComputedUrl::Invalid(specified)) => {
+                    Some(Arc::from(specified.as_str()))
+                }
+                _ => None,
+            },
+            gradient: background_gradient(image),
+            size: cycled(sizes.len(), index)
+                .map_or(BackgroundSize::Auto, |at| background_size(&sizes[at])),
+            repeat: background_repeat(cycled(repeats.len(), index).map(|at| &repeats[at])),
+            position: background_position(
+                cycled(xs.len(), index).map(|at| &xs[at]),
+                cycled(ys.len(), index).map(|at| &ys[at]),
+            ),
+        })
+        .collect()
+}
+
+/// How one background layer is sized against the box behind it.
+fn background_size(size: &style::values::computed::BackgroundSize) -> BackgroundSize {
+    use style::values::generics::background::GenericBackgroundSize as Generic;
+
+    match size {
+        Generic::Cover => BackgroundSize::Cover,
+        Generic::Contain => BackgroundSize::Contain,
+        Generic::ExplicitSize { width, height } => {
+            let side = |value: &style::values::computed::NonNegativeLengthPercentageOrAuto| {
+                match value {
+                    style::values::generics::length::GenericLengthPercentageOrAuto::Auto => None,
+                    style::values::generics::length::GenericLengthPercentageOrAuto::LengthPercentage(
+                        value,
+                    ) => Some(length(&value.0)),
+                }
+            };
+            match (side(width), side(height)) {
+                (Some(width), Some(height)) => BackgroundSize::Fixed(width, height),
+                // One side given and the other from the picture's own ratio is
+                // sizing this does not do; its own size is the honest stand-in.
+                _ => BackgroundSize::Auto,
+            }
+        }
+    }
+}
+
+/// Whether one background layer repeats, along each axis.
 ///
 /// `space` — tiles spread apart so a whole number fits with gaps between them —
 /// is taken as `repeat`. It needs a step that is wider than the tile, which the
 /// one fill a tiled background is drawn with cannot express.
-fn background_repeat(values: &ComputedValues) -> BackgroundRepeat {
+fn background_repeat(
+    repeat: Option<&style::values::computed::background::BackgroundRepeat>,
+) -> BackgroundRepeat {
     use style::values::specified::background::BackgroundRepeatKeyword as Keyword;
 
     let axis = |keyword: Keyword| match keyword {
@@ -563,7 +613,7 @@ fn background_repeat(values: &ComputedValues) -> BackgroundRepeat {
         _ => Repeat::Repeat,
     };
 
-    match values.get_background().background_repeat.0.first() {
+    match repeat {
         Some(repeat) => BackgroundRepeat {
             x: axis(repeat.0),
             y: axis(repeat.1),
@@ -572,7 +622,7 @@ fn background_repeat(values: &ComputedValues) -> BackgroundRepeat {
     }
 }
 
-/// Where the topmost background layer sits in the box it is behind.
+/// Where one background layer sits in the box it is behind.
 ///
 /// The computed value is a length, a percentage, or the sum of both — `right 10px`
 /// is `calc(100% - 10px)` by the time it gets here — and all three are the same
@@ -580,10 +630,12 @@ fn background_repeat(values: &ComputedValues) -> BackgroundRepeat {
 /// taken apart: what it gives for no room at all is the length, and how much it
 /// moves per unit of room is the fraction. A `calc()` that clamps is not affine and
 /// is the one shape this reads wrongly; none of the keywords produce one.
-fn background_position(values: &ComputedValues) -> BackgroundPosition {
+fn background_position(
+    x: Option<&style::values::computed::LengthPercentage>,
+    y: Option<&style::values::computed::LengthPercentage>,
+) -> BackgroundPosition {
     use style::values::computed::Length;
 
-    let background = values.get_background();
     let anchor = |value: Option<&style::values::computed::LengthPercentage>| match value {
         Some(value) => {
             let offset = value.resolve(Length::new(0.0)).px();
@@ -596,8 +648,8 @@ fn background_position(values: &ComputedValues) -> BackgroundPosition {
     };
 
     BackgroundPosition {
-        x: anchor(background.background_position_x.0.first()),
-        y: anchor(background.background_position_y.0.first()),
+        x: anchor(x),
+        y: anchor(y),
     }
 }
 
@@ -645,13 +697,13 @@ fn shadows(values: &ComputedValues) -> Vec<Shadow> {
         .box_shadow
         .0
         .iter()
-        .filter(|shadow| !shadow.inset)
         .map(|shadow| Shadow {
             x: shadow.base.horizontal.px(),
             y: shadow.base.vertical.px(),
             blur: shadow.base.blur.0.px(),
             spread: shadow.spread.px(),
             color: resolve_colour(&shadow.base.color, current),
+            inset: shadow.inset,
         })
         .rev()
         .collect()
@@ -674,6 +726,8 @@ fn text_shadows(values: &ComputedValues) -> Vec<Shadow> {
             blur: shadow.blur.0.px(),
             spread: 0.0,
             color: resolve_colour(&shadow.color, current),
+            // There is no inset text shadow: the property does not have one.
+            inset: false,
         })
         .rev()
         .collect()
@@ -684,18 +738,14 @@ fn colour_of(values: &ComputedValues) -> Color {
     colour(values.clone_color())
 }
 
-/// `background-image`, when the topmost layer of it is a linear gradient.
-///
-/// One layer, because a box with several backgrounds is a box that needs the
-/// painting order for them, and the top one is what a page means when it names two.
-fn background_gradient(values: &ComputedValues) -> Option<Gradient> {
+/// One background layer, when it is a linear gradient.
+fn background_gradient(image: &style::values::computed::Image) -> Option<Gradient> {
     use style::values::computed::image::LineDirection;
     use style::values::generics::image::{
         GenericGradient, GenericGradientItem as Item, GenericImage as Image,
     };
 
-    let images = &values.get_background().background_image.0;
-    let Image::Gradient(gradient) = images.first()? else {
+    let Image::Gradient(gradient) = image else {
         return None;
     };
     let GenericGradient::Linear {
@@ -902,6 +952,11 @@ fn corners(values: &ComputedValues) -> Corners {
     }
 }
 
+/// `overflow`, narrowed to whether the box cuts off what does not fit.
+///
+/// `scroll` and `auto` cut off too — the part of them that layout can honour today
+/// is the clip; scrolling the box itself is a scroll port, which is more than a
+/// clip and arrives with one.
 fn overflow_of(values: &ComputedValues) -> Overflow {
     use style::computed_values::overflow_x::T as Computed;
 
@@ -972,6 +1027,24 @@ fn justify_content(values: &ComputedValues) -> JustifyContent {
         AlignFlags::CENTER => JustifyContent::Center,
         AlignFlags::END | AlignFlags::FLEX_END | AlignFlags::RIGHT => JustifyContent::End,
         _ => JustifyContent::Start,
+    }
+}
+
+/// `align-content`: what a wrapped container does with the room its lines leave.
+///
+/// `normal` behaves as `stretch` in a flex container, which is why it is the
+/// initial value and why an unwrapped container's one line fills it.
+fn align_content(values: &ComputedValues) -> AlignContent {
+    use style::values::specified::align::AlignFlags;
+
+    match values.clone_align_content().primary().value() {
+        AlignFlags::SPACE_BETWEEN => AlignContent::SpaceBetween,
+        AlignFlags::SPACE_AROUND => AlignContent::SpaceAround,
+        AlignFlags::SPACE_EVENLY => AlignContent::SpaceEvenly,
+        AlignFlags::CENTER => AlignContent::Center,
+        AlignFlags::END | AlignFlags::FLEX_END => AlignContent::End,
+        AlignFlags::START | AlignFlags::FLEX_START => AlignContent::Start,
+        _ => AlignContent::Stretch,
     }
 }
 
@@ -1210,7 +1283,14 @@ mod tests {
             "<style>div { background-image: url(pic.png) }</style><div>x</div>",
             "div",
         );
-        assert_eq!(style.background_image.as_deref(), Some("pic.png"));
+        assert_eq!(
+            style
+                .backgrounds
+                .first()
+                .and_then(|layer| layer.image.clone())
+                .as_deref(),
+            Some("pic.png")
+        );
     }
 
     /// A page that says nothing about its font gets the browser's standard one,
@@ -1311,7 +1391,10 @@ mod tests {
                 &format!("<style>div {{ background-repeat: {source} }}</style><div>x</div>"),
                 "div",
             )
-            .background_repeat
+            .backgrounds
+            .first()
+            .expect("a layer, even for `background-image: none`")
+            .repeat
         };
 
         assert_eq!(repeat("repeat"), BackgroundRepeat::REPEAT);
@@ -1381,7 +1464,10 @@ mod tests {
                 &format!("<style>div {{ background-position: {source} }}</style><div>x</div>"),
                 "div",
             )
-            .background_position
+            .backgrounds
+            .first()
+            .expect("a layer, even for `background-image: none`")
+            .position
         };
 
         assert_eq!(position("0 0"), BackgroundPosition::START);

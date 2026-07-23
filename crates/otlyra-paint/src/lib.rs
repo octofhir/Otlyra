@@ -515,7 +515,7 @@ fn paint(
             // Shadows first: they are behind the box that casts them, and behind
             // each other in the order CSS paints them.
             for shadow in &fragment.style.shadows {
-                if shadow.color.components[3] <= 0.0 {
+                if shadow.color.components[3] <= 0.0 || shadow.inset {
                     continue;
                 }
                 let cast = Rect::new(
@@ -544,63 +544,25 @@ fn paint(
                 });
             }
 
-            // A picture behind the box, over the colour and under the gradient —
-            // which is the order CSS layers them in, topmost written first.
-            if let Some(url) = fragment.style.background_image.as_deref()
-                && !background_on_canvas
-                && let Some(lookup) = background_picture
-                && let Some(picture) = lookup(url)
-                && picture.width > 0
-                && picture.height > 0
-                && rect.width > 0.0
-                && rect.height > 0.0
-            {
-                let tiling = background_tiling(&fragment.style, rect, &picture);
-                if tiling.covered.width > 0.0 && tiling.covered.height > 0.0 {
-                    // A background belongs to its box: `cover` is meant to overflow
-                    // and be cut off, not to spill onto whatever is drawn next. The
-                    // box's own outline is the edge, so rounded corners cut the
-                    // picture too.
-                    list.push(DisplayItem::PushLayer {
-                        blend: otlyra_gfx::peniko::BlendMode::default(),
-                        alpha: 1.0,
-                        transform: Affine::IDENTITY,
-                        clip: box_shape(rect, scroll_y, &fragment.style),
-                    });
-                    list.push(DisplayItem::Fill {
-                        style: Fill::NonZero,
-                        transform: Affine::IDENTITY,
-                        brush: Brush::Image(otlyra_gfx::peniko::ImageBrush {
-                            image: picture,
-                            sampler: tiling.sampler,
-                        }),
-                        brush_transform: Some(tiling.brush_transform(scroll_y)),
-                        shape: KurboRect::new(
-                            f64::from(tiling.covered.x),
-                            f64::from(tiling.covered.y - scroll_y),
-                            f64::from(tiling.covered.right()),
-                            f64::from(tiling.covered.bottom() - scroll_y),
-                        )
-                        .to_path(PATH_TOLERANCE),
-                    });
-                    list.push(DisplayItem::PopLayer);
+            // The layers, bottom-most first: CSS writes them topmost first and
+            // paints them in the reverse of that, over the colour.
+            if !background_on_canvas {
+                for layer in fragment.style.backgrounds.iter().rev() {
+                    paint_background_layer(
+                        list,
+                        layer,
+                        fragment,
+                        rect,
+                        scroll_y,
+                        background_picture,
+                    );
                 }
             }
 
-            // The gradient goes over the colour, which is the order CSS paints them
-            // in: a box may name both, and the colour is what shows through where
-            // the gradient is transparent.
-            if let Some(gradient) = fragment.style.background_gradient.as_ref()
-                && !background_on_canvas
-            {
-                list.push(DisplayItem::Fill {
-                    style: Fill::NonZero,
-                    transform: Affine::IDENTITY,
-                    brush: Brush::Gradient(gradient_brush(gradient, rect, scroll_y)),
-                    brush_transform: None,
-                    shape: box_shape(rect, scroll_y, &fragment.style),
-                });
-            }
+            // Over everything the box painted and under its border, which is where
+            // CSS puts an inset shadow: it belongs to the hole rather than to the
+            // box, so a background shows *through* it rather than over it.
+            paint_inset_shadows(list, fragment, rect, scroll_y);
 
             paint_borders(list, fragment, rect, scroll_y);
         }
@@ -774,6 +736,7 @@ impl Tiling {
 /// The area a picture is positioned in is the box inside its border, which is what
 /// CSS positions a background against however far the painting itself spreads.
 fn background_tiling(
+    layer: &otlyra_css::BackgroundLayer,
     style: &otlyra_css::ComputedStyle,
     rect: Rect,
     picture: &otlyra_gfx::peniko::ImageData,
@@ -790,7 +753,7 @@ fn background_tiling(
     );
 
     let own = (picture.width as f32, picture.height as f32);
-    let (mut width, mut height) = background_extent(style, area, own);
+    let (mut width, mut height) = background_extent(layer, area, own);
 
     // `round` squeezes or stretches the tile so a whole number of them fits, which
     // is the whole of what it does — everything after it is the ordinary tiling.
@@ -798,15 +761,15 @@ fn background_tiling(
         let count = (along / extent).round().max(1.0);
         along / count
     };
-    if style.background_repeat.x == Repeat::Round && width > 0.0 {
+    if layer.repeat.x == Repeat::Round && width > 0.0 {
         width = rounded(width, area.width);
     }
-    if style.background_repeat.y == Repeat::Round && height > 0.0 {
+    if layer.repeat.y == Repeat::Round && height > 0.0 {
         height = rounded(height, area.height);
     }
 
-    let x = area.x + style.background_position.x.resolve(area.width - width);
-    let y = area.y + style.background_position.y.resolve(area.height - height);
+    let x = area.x + layer.position.x.resolve(area.width - width);
+    let y = area.y + layer.position.y.resolve(area.height - height);
     let tile = Rect::new(x, y, width, height);
 
     // Along an axis that does not repeat, the picture reaches only as far as the
@@ -818,8 +781,8 @@ fn background_tiling(
             (area_start, area_size)
         }
     };
-    let (left, covered_width) = extent(style.background_repeat.x, x, width, area.x, area.width);
-    let (top, covered_height) = extent(style.background_repeat.y, y, height, area.y, area.height);
+    let (left, covered_width) = extent(layer.repeat.x, x, width, area.x, area.width);
+    let (top, covered_height) = extent(layer.repeat.y, y, height, area.y, area.height);
 
     let axis = |repeat: Repeat| match repeat {
         // Nothing is painted outside the one tile, so what the brush would put
@@ -833,8 +796,8 @@ fn background_tiling(
         own,
         covered: Rect::new(left, top, covered_width.max(0.0), covered_height.max(0.0)),
         sampler: otlyra_gfx::peniko::ImageSampler {
-            x_extend: axis(style.background_repeat.x),
-            y_extend: axis(style.background_repeat.y),
+            x_extend: axis(layer.repeat.x),
+            y_extend: axis(layer.repeat.y),
             ..Default::default()
         },
     }
@@ -844,11 +807,15 @@ fn background_tiling(
 ///
 /// `cover` and `contain` are the two that need the picture's own proportions: one
 /// fills the area and is cropped, the other fits inside it whole.
-fn background_extent(style: &otlyra_css::ComputedStyle, area: Rect, own: (f32, f32)) -> (f32, f32) {
+fn background_extent(
+    layer: &otlyra_css::BackgroundLayer,
+    area: Rect,
+    own: (f32, f32),
+) -> (f32, f32) {
     let (own_width, own_height) = own;
     let ratio = own_width / own_height.max(1.0);
 
-    match style.background_size {
+    match layer.size {
         otlyra_css::BackgroundSize::Auto => (own_width, own_height),
         otlyra_css::BackgroundSize::Fixed(width, height) => {
             (width.resolve(area.width), height.resolve(area.height))
@@ -1050,9 +1017,13 @@ fn paint_borders(
     // A rounded box's border follows its corners, which four rectangles cannot do.
     // One stroke can, as long as every side is the same — and a border that is
     // rounded and different on each side is a shape CSS defines and nobody writes.
+    // Only for a plain line: a dashed or three-dimensional rounded border falls
+    // through to the four sides below, which draws the right line in the wrong
+    // corners rather than the wrong line in the right ones.
     let uniform =
         border.top == border.right && border.right == border.bottom && border.bottom == border.left;
-    if fragment.style.radius.any() && uniform {
+    if fragment.style.radius.any() && uniform && border.top.style == otlyra_css::BorderStyle::Solid
+    {
         let side = border.top;
         if !side.is_visible() {
             return;
@@ -1071,42 +1042,427 @@ fn paint_borders(
             transform: Affine::IDENTITY,
             brush: Brush::Solid(side.color),
             brush_transform: None,
-            shape: box_shape(inset, scroll_y, &fragment.style),
+            // The radius belongs to the box's own edge, and the stroke runs half a
+            // border in from it: drawn at the radius the page wrote, the outer
+            // corner comes out half a border too round and the inner one half a
+            // border too tight. A square corner stays square, which is what keeps
+            // one rounded corner from rounding the other three.
+            shape: shape_with_radii(inset, scroll_y, &fragment.style, -side.width / 2.0),
         });
         return;
     }
 
-    let sides = [
+    // Each side is a trapezoid, not a rectangle: two borders meet at a corner on
+    // the diagonal between them, and drawn as rectangles the second one covers the
+    // first — which shows the moment two sides are different colours.
+    let quads = [
         (
             border.top,
-            [left, top, right, top + f64::from(border.top.width)],
+            Side::Top,
+            [
+                (left, top),
+                (right, top),
+                (
+                    right - f64::from(border.right.width),
+                    top + f64::from(border.top.width),
+                ),
+                (
+                    left + f64::from(border.left.width),
+                    top + f64::from(border.top.width),
+                ),
+            ],
         ),
         (
             border.right,
-            [right - f64::from(border.right.width), top, right, bottom],
+            Side::Right,
+            [
+                (right, top),
+                (right, bottom),
+                (
+                    right - f64::from(border.right.width),
+                    bottom - f64::from(border.bottom.width),
+                ),
+                (
+                    right - f64::from(border.right.width),
+                    top + f64::from(border.top.width),
+                ),
+            ],
         ),
         (
             border.bottom,
-            [left, bottom - f64::from(border.bottom.width), right, bottom],
+            Side::Bottom,
+            [
+                (right, bottom),
+                (left, bottom),
+                (
+                    left + f64::from(border.left.width),
+                    bottom - f64::from(border.bottom.width),
+                ),
+                (
+                    right - f64::from(border.right.width),
+                    bottom - f64::from(border.bottom.width),
+                ),
+            ],
         ),
         (
             border.left,
-            [left, top, left + f64::from(border.left.width), bottom],
+            Side::Left,
+            [
+                (left, bottom),
+                (left, top),
+                (
+                    left + f64::from(border.left.width),
+                    top + f64::from(border.top.width),
+                ),
+                (
+                    left + f64::from(border.left.width),
+                    bottom - f64::from(border.bottom.width),
+                ),
+            ],
         ),
     ];
 
-    for (side, [x0, y0, x1, y1]) in sides {
+    for (side, which, corners) in quads {
         if !side.is_visible() {
             continue;
         }
+        paint_border_side(list, side, which, corners);
+    }
+}
+
+/// One layer of a box's background: a picture, a gradient, or nothing.
+///
+/// Each layer is placed, sized and tiled by its own values, and they are drawn one
+/// over another in the order the page wrote them — which is why a page can put a
+/// pattern over a wash and get both.
+fn paint_background_layer(
+    list: &mut DisplayList,
+    layer: &otlyra_css::BackgroundLayer,
+    fragment: &Fragment,
+    rect: otlyra_layout::Rect,
+    scroll_y: f32,
+    background_picture: Option<BackgroundLookup<'_>>,
+) {
+    if let Some(gradient) = layer.gradient.as_ref() {
         list.push(DisplayItem::Fill {
             style: Fill::NonZero,
             transform: Affine::IDENTITY,
-            brush: Brush::Solid(side.color),
+            brush: Brush::Gradient(gradient_brush(gradient, rect, scroll_y)),
             brush_transform: None,
-            shape: KurboRect::new(x0, y0, x1, y1).to_path(PATH_TOLERANCE),
+            shape: box_shape(rect, scroll_y, &fragment.style),
+        });
+        return;
+    }
+
+    let Some(url) = layer.image.as_deref() else {
+        return;
+    };
+    let Some(picture) = background_picture.and_then(|lookup| lookup(url)) else {
+        return;
+    };
+    if picture.width == 0 || picture.height == 0 || rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
+    let tiling = background_tiling(layer, &fragment.style, rect, &picture);
+    if tiling.covered.width <= 0.0 || tiling.covered.height <= 0.0 {
+        return;
+    }
+
+    // A background belongs to its box: `cover` is meant to overflow and be cut
+    // off, not to spill onto whatever is drawn next. The box's own outline is the
+    // edge, so rounded corners cut the picture too.
+    list.push(DisplayItem::PushLayer {
+        blend: otlyra_gfx::peniko::BlendMode::default(),
+        alpha: 1.0,
+        transform: Affine::IDENTITY,
+        clip: box_shape(rect, scroll_y, &fragment.style),
+    });
+    list.push(DisplayItem::Fill {
+        style: Fill::NonZero,
+        transform: Affine::IDENTITY,
+        brush: Brush::Image(otlyra_gfx::peniko::ImageBrush {
+            image: picture,
+            sampler: tiling.sampler,
+        }),
+        brush_transform: Some(tiling.brush_transform(scroll_y)),
+        shape: KurboRect::new(
+            f64::from(tiling.covered.x),
+            f64::from(tiling.covered.y - scroll_y),
+            f64::from(tiling.covered.right()),
+            f64::from(tiling.covered.bottom() - scroll_y),
+        )
+        .to_path(PATH_TOLERANCE),
+    });
+    list.push(DisplayItem::PopLayer);
+}
+
+/// The shadows a box's own hole casts on the inside of it.
+///
+/// An inset shadow is the outset one turned inside out: what is drawn is
+/// everything the shadow's rectangle does *not* cover, clipped to the padding box,
+/// so the shadow crowds in from the edges and the offset and the spread both move
+/// the lit part rather than the dark one. Expressed as a shape with a hole in it —
+/// one enormous rectangle and the shadow's own rectangle wound the other way —
+/// because a blur is a blur of one shape, and four blurred edges laid over each
+/// other would darken where they overlap.
+fn paint_inset_shadows(
+    list: &mut DisplayList,
+    fragment: &Fragment,
+    rect: otlyra_layout::Rect,
+    scroll_y: f32,
+) {
+    let inset: Vec<&otlyra_css::Shadow> = fragment
+        .style
+        .shadows
+        .iter()
+        .filter(|shadow| shadow.inset && shadow.color.components[3] > 0.0)
+        .collect();
+    if inset.is_empty() {
+        return;
+    }
+
+    // The padding box: an inset shadow is cast on the inside of the border rather
+    // than on the inside of the box.
+    let border = fragment.style.border;
+    let hole = Rect::new(
+        rect.x + border.left.width,
+        rect.y + border.top.width,
+        (rect.width - border.left.width - border.right.width).max(0.0),
+        (rect.height - border.top.width - border.bottom.width).max(0.0),
+    );
+    if hole.width <= 0.0 || hole.height <= 0.0 {
+        return;
+    }
+
+    list.push(DisplayItem::PushLayer {
+        blend: otlyra_gfx::peniko::BlendMode::default(),
+        alpha: 1.0,
+        transform: Affine::IDENTITY,
+        clip: box_shape(hole, scroll_y, &fragment.style),
+    });
+
+    for shadow in inset {
+        // Far enough out that the blurred edge of the outer rectangle never
+        // reaches the padding box, whatever the shadow asked for.
+        let reach =
+            f64::from(shadow.blur + shadow.spread.abs() + shadow.x.abs() + shadow.y.abs()) + 8.0;
+        let lit = Rect::new(
+            hole.x + shadow.x + shadow.spread,
+            hole.y + shadow.y + shadow.spread,
+            (hole.width - shadow.spread * 2.0).max(0.0),
+            (hole.height - shadow.spread * 2.0).max(0.0),
+        );
+
+        let mut shape = KurboRect::new(
+            f64::from(hole.x) - reach,
+            f64::from(hole.y - scroll_y) - reach,
+            f64::from(hole.right()) + reach,
+            f64::from(hole.bottom() - scroll_y) + reach,
+        )
+        .to_path(PATH_TOLERANCE);
+        // Wound the other way, so the fill leaves it empty rather than covering it.
+        shape.extend(
+            shape_with_radii(lit, scroll_y, &fragment.style, -shadow.spread)
+                .reverse_subpaths()
+                .iter(),
+        );
+
+        list.push(DisplayItem::Blurred {
+            transform: Affine::IDENTITY,
+            brush: Brush::Solid(shadow.color),
+            blur: f64::from(shadow.blur),
+            shape,
         });
     }
+
+    list.push(DisplayItem::PopLayer);
+}
+
+/// Which edge of the box a border is on, which is what decides whether a
+/// three-dimensional style draws its shadow or its light there.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    /// Whether this is one of the two edges the light is taken to come from.
+    fn is_near(self) -> bool {
+        matches!(self, Self::Top | Self::Left)
+    }
+}
+
+/// One side of a border, drawn in whatever line its style asks for.
+///
+/// `corners` is the side's trapezoid: the two outer corners first, then the two
+/// inner ones, going back the way it came.
+fn paint_border_side(
+    list: &mut DisplayList,
+    border: otlyra_css::Border,
+    side: Side,
+    corners: [(f64, f64); 4],
+) {
+    use otlyra_css::BorderStyle;
+
+    let fill = |list: &mut DisplayList, colour: Color, quad: [(f64, f64); 4]| {
+        let mut path = otlyra_gfx::kurbo::BezPath::new();
+        path.move_to(quad[0]);
+        for point in &quad[1..] {
+            path.line_to(*point);
+        }
+        path.close_path();
+        list.push(DisplayItem::Fill {
+            style: Fill::NonZero,
+            transform: Affine::IDENTITY,
+            brush: Brush::Solid(colour),
+            brush_transform: None,
+            shape: path,
+        });
+    };
+
+    // A trapezoid narrowed towards its inner edge: `from` and `to` are how far
+    // across the border's own width the slice runs, as fractions.
+    let slice = |from: f64, to: f64| {
+        let across = |outer: (f64, f64), inner: (f64, f64), at: f64| {
+            (
+                outer.0 + (inner.0 - outer.0) * at,
+                outer.1 + (inner.1 - outer.1) * at,
+            )
+        };
+        [
+            across(corners[0], corners[3], from),
+            across(corners[1], corners[2], from),
+            across(corners[1], corners[2], to),
+            across(corners[0], corners[3], to),
+        ]
+    };
+
+    match border.style {
+        BorderStyle::Double => {
+            // Two lines a third of the width each and the rest between them, which
+            // is what a reference draws to the pixel — rounded rather than
+            // truncated, so an eight-pixel border is three, two, three.
+            let line = (f64::from(border.width) / 3.0).round().max(1.0);
+            let across = f64::from(border.width).max(1.0);
+            fill(list, border.color, slice(0.0, line / across));
+            fill(list, border.color, slice(1.0 - line / across, 1.0));
+        }
+        BorderStyle::Groove | BorderStyle::Ridge => {
+            // Half the width carved and half raised. `groove` is dark on the near
+            // side of the outer half and on the far side of the inner one, which
+            // is what makes the line read as a channel rather than a step.
+            let outer_dark = (border.style == BorderStyle::Groove) == side.is_near();
+            let (dark, light) = shades(border.color);
+            fill(list, if outer_dark { dark } else { light }, slice(0.0, 0.5));
+            fill(list, if outer_dark { light } else { dark }, slice(0.5, 1.0));
+        }
+        BorderStyle::Inset | BorderStyle::Outset => {
+            // The whole box pressed in or standing out: one pair of sides dark and
+            // the other light, all the way across.
+            let is_dark = (border.style == BorderStyle::Inset) == side.is_near();
+            let (dark, light) = shades(border.color);
+            fill(list, if is_dark { dark } else { light }, slice(0.0, 1.0));
+        }
+        BorderStyle::Dashed | BorderStyle::Dotted => {
+            paint_dashes(list, border, corners);
+        }
+        _ => fill(list, border.color, slice(0.0, 1.0)),
+    }
+}
+
+/// A run of dashes or dots along the middle of one side.
+///
+/// Along the side's own centre line rather than inside its trapezoid: a dash that
+/// reaches a corner is drawn to the outer corner, which is where a reference puts
+/// it, and the corner is then covered by whichever side is drawn after it.
+///
+/// The lengths are measured against a reference: a dash is twice the border's
+/// width and the gap is one, no dash shorter than three pixels and no gap shorter
+/// than two — and then the gap is stretched so that a whole number of dashes ends
+/// the side exactly as it began it. A dot is a round cap on a zero-length dash,
+/// which is a circle the width of the border every two widths.
+fn paint_dashes(list: &mut DisplayList, border: otlyra_css::Border, corners: [(f64, f64); 4]) {
+    use otlyra_css::BorderStyle;
+    use otlyra_gfx::kurbo::{BezPath, Cap, Stroke};
+
+    let width = f64::from(border.width);
+    // The centre line: half way between the outer edge and the inner one, run out
+    // to the outer corners at both ends.
+    let mid = |outer: (f64, f64), inner: (f64, f64)| {
+        (
+            outer.0 + (inner.0 - outer.0) / 2.0,
+            outer.1 + (inner.1 - outer.1) / 2.0,
+        )
+    };
+    let (start, end) = (mid(corners[0], corners[3]), mid(corners[1], corners[2]));
+    let length = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
+    if length <= 0.0 {
+        return;
+    }
+
+    let dotted = border.style == BorderStyle::Dotted;
+    let (dash, gap) = if dotted {
+        (0.0, width * 2.0)
+    } else {
+        let dash = (width * 2.0).max(3.0);
+        let gap = width.max(2.0);
+        // n dashes and n - 1 gaps fill the side, so the gap takes up whatever the
+        // dashes leave. One dash and no gaps where nothing else fits.
+        let count = (((length + gap) / (dash + gap)).round() as i64).max(1);
+        let spare = length - dash * count as f64;
+        let gaps = (count - 1).max(1) as f64;
+        (dash, (spare / gaps).max(gap))
+    };
+
+    let mut path = BezPath::new();
+    path.move_to(start);
+    path.line_to(end);
+    list.push(DisplayItem::Stroke {
+        style: Stroke::new(width)
+            .with_dashes(0.0, [dash, gap])
+            .with_caps(if dotted { Cap::Round } else { Cap::Butt }),
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(border.color),
+        brush_transform: None,
+        shape: path,
+    });
+}
+
+/// The two shades a three-dimensional border is drawn in.
+///
+/// A reference darkens the colour towards the shadow side and leaves the other
+/// side the colour it was told — unless the colour is already dark enough that
+/// darkening it makes black, where it lightens the lit side instead, so that the
+/// two halves can still be told apart. Both curves are the reference's own and
+/// were read off a ramp of colours rather than guessed.
+fn shades(colour: Color) -> (Color, Color) {
+    let [r, g, b, a] = colour.components;
+    let peak = r.max(g).max(b);
+    // A third of the way up is where a darkened colour reaches black, and below it
+    // there is nothing left to take away.
+    const FLOOR: f32 = 0.33;
+
+    let scaled = |factor: f32| Color::new([r * factor, g * factor, b * factor, a]);
+    let dark = scaled(if peak > 0.0 {
+        ((peak - FLOOR) / peak).max(0.0)
+    } else {
+        0.0
+    });
+    if peak > FLOOR {
+        return (dark, colour);
+    }
+    // Nothing to darken: the lit side is lightened instead, and a colour with no
+    // light in it at all is lightened from black to the grey a reference uses.
+    let light = if peak > 0.0 {
+        scaled((peak + FLOOR).min(1.0) / peak)
+    } else {
+        Color::new([FLOOR, FLOOR, FLOOR, a])
+    };
+    (dark, light)
 }
 
 fn brush_to_color(brush: [u8; 4]) -> Color {
@@ -2365,6 +2721,220 @@ mod border_tests {
         assert!(
             rects(&list, RED).is_empty(),
             "a border with no style was painted"
+        );
+    }
+
+    /// Every `border-style` draws its own line, and each is a different shape of
+    /// display item — a fill for the ones that are continuous, a dashed stroke
+    /// for the ones that are not.
+    ///
+    /// Every number here was read off a reference: a double border is two lines a
+    /// rounded third of the width each, a dash is twice the width and a dot is a
+    /// round cap the width across.
+    #[test]
+    fn a_border_style_decides_what_is_drawn() {
+        let fills = |css: &str| {
+            let list = list_for(&format!(
+                "<style>body {{ margin: 0 }} div {{ width: 100px; height: 20px; \
+                 border: 9px {css} red }}</style><div></div>"
+            ));
+            rects(&list, RED)
+        };
+        let strokes = |css: &str| {
+            let list = list_for(&format!(
+                "<style>body {{ margin: 0 }} div {{ width: 100px; height: 20px; \
+                 border: 9px {css} red }}</style><div></div>"
+            ));
+            list.items()
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::Stroke { style, .. } => {
+                        Some((style.width, style.dash_pattern.to_vec()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(fills("solid").len(), 4, "one shape a side");
+        // Two lines a side, each a third of the width.
+        let double = fills("double");
+        assert_eq!(double.len(), 8, "two lines a side: {double:?}");
+        assert!(
+            (double[0][3] - double[0][1] - 3.0).abs() < 0.01,
+            "a third of nine is three: {:?}",
+            double[0]
+        );
+        // Half the width each way: on a colour bright enough to darken, the lit
+        // half stays the colour the page named and the other half does not.
+        assert_eq!(fills("groove").len(), 4, "one lit half a side");
+        assert_eq!(fills("inset").len(), 2, "two sides lit, two in shadow");
+
+        let dashed = strokes("dashed");
+        assert_eq!(dashed.len(), 4, "one stroke a side: {dashed:?}");
+        assert_eq!(dashed[0].0, 9.0);
+        assert_eq!(dashed[0].1[0], 18.0, "a dash is twice the width");
+        let dotted = strokes("dotted");
+        assert_eq!(dotted[0].1[0], 0.0, "a dot is a cap on nothing");
+        assert_eq!(dotted[0].1[1], 18.0, "one every two widths");
+
+        // `hidden` is zero wide, so there is nothing to draw and nothing to stroke.
+        assert!(fills("hidden").is_empty() && strokes("hidden").is_empty());
+    }
+
+    /// A three-dimensional border darkens the side the shadow falls on and leaves
+    /// the other alone — unless the colour is already too dark to darken, where
+    /// the lit side is lightened instead so the two can still be told apart.
+    ///
+    /// The curves are a reference's, read off a ramp of colours.
+    #[test]
+    fn a_carved_border_darkens_one_side_and_lightens_the_other_only_when_it_must() {
+        let pair = |colour: Color| {
+            let (dark, light) = shades(colour);
+            (
+                dark.to_rgba8().to_u8_array(),
+                light.to_rgba8().to_u8_array(),
+            )
+        };
+        let bytes = |r, g, b| [r, g, b, 255];
+
+        assert_eq!(
+            pair(Color::from_rgb8(48, 96, 192)),
+            (bytes(27, 54, 108), bytes(48, 96, 192)),
+            "bright enough to darken, so the lit side is left alone"
+        );
+        // Too dark to darken: the shadowed side is black, so the other is lifted.
+        assert_eq!(
+            pair(Color::from_rgb8(48, 48, 48)),
+            (bytes(0, 0, 0), bytes(132, 132, 132))
+        );
+        // Black has no colour to scale at all and is lifted to a fixed grey.
+        assert_eq!(pair(Color::BLACK), (bytes(0, 0, 0), bytes(84, 84, 84)));
+    }
+
+    /// A box may have several backgrounds, each placed and sized by its own
+    /// values, and they are painted in the reverse of the order they were written
+    /// — so the first one a page names is the one on top.
+    #[test]
+    fn every_background_layer_is_drawn_in_the_order_it_was_written() {
+        let one = otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; 10 * 10 * 4])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: 10,
+            height: 10,
+        };
+        let two = otlyra_gfx::peniko::ImageData {
+            width: 20,
+            height: 20,
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; 20 * 20 * 4])),
+            ..one.clone()
+        };
+
+        let document = otlyra_html::parse(
+            b"<style>body { margin: 0 } div { width: 100px; height: 100px; \
+              background-image: url(top.png), url(bottom.png); background-repeat: no-repeat; \
+              background-position: left top, right bottom }</style><div></div>",
+            Some("utf-8"),
+        )
+        .document;
+        let styles = style_document(&document, StyleViewport::default());
+        let boxes = build_styled_box_tree(&document, &styles);
+        let mut text = TextEngine::isolated();
+        let fragments = layout(
+            &boxes,
+            &mut text,
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let list = build_display_list_with(
+            &fragments,
+            &Frame {
+                viewport: (800.0, 600.0),
+                background: Some(&|url: &str| match url {
+                    "top.png" => Some(one.clone()),
+                    "bottom.png" => Some(two.clone()),
+                    _ => None,
+                }),
+                ..Frame::default()
+            },
+        );
+
+        // The layer written second is drawn first, so the one written first ends
+        // up over it.
+        let drawn: Vec<(u32, f32, f32)> = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Fill {
+                    brush: Brush::Image(image),
+                    brush_transform: Some(transform),
+                    ..
+                } => {
+                    let coeffs = transform.as_coeffs();
+                    Some((image.image.width, coeffs[4] as f32, coeffs[5] as f32))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            drawn,
+            vec![(20, 80.0, 80.0), (10, 0.0, 0.0)],
+            "the second layer at the far corner first, then the first at the near one"
+        );
+    }
+
+    /// An inset shadow is drawn over the background and clipped to the padding
+    /// box, as a shape with the lit part cut out of it — one blur rather than one
+    /// per edge, which would darken where the edges overlap.
+    #[test]
+    fn an_inset_shadow_is_a_hole_clipped_to_the_padding_box() {
+        let list = list_for(
+            "<style>body { margin: 0 } div { width: 100px; height: 60px; \
+             border: 5px solid black; box-shadow: inset 0 0 0 10px red }</style><div></div>",
+        );
+
+        let blurred: Vec<KurboRect> = list
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Blurred { shape, brush, .. } if *brush == Brush::Solid(RED) => {
+                    Some(shape.bounding_box())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blurred.len(), 1, "one blurred shape: {blurred:?}");
+        assert!(
+            blurred[0].x0 < 5.0 && blurred[0].x1 > 105.0,
+            "the shape reaches out past the box and is clipped back to it: {:?}",
+            blurred[0]
+        );
+
+        // Clipped to the padding box, which is the border box less the border.
+        let clip = list.items().iter().find_map(|item| match item {
+            DisplayItem::PushLayer { clip, .. } => Some(clip.bounding_box()),
+            _ => None,
+        });
+        assert_eq!(
+            clip.map(|rect| (rect.x0, rect.y0, rect.x1, rect.y1)),
+            Some((5.0, 5.0, 105.0, 65.0))
+        );
+
+        // An outset shadow of the same size is not clipped at all.
+        let plain = list_for(
+            "<style>body { margin: 0 } div { width: 100px; height: 60px; \
+             box-shadow: 0 0 0 10px red }</style><div></div>",
+        );
+        assert!(
+            !plain
+                .items()
+                .iter()
+                .any(|item| matches!(item, DisplayItem::PushLayer { .. })),
+            "an outset shadow needs no clip"
         );
     }
 

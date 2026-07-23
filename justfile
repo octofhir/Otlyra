@@ -134,6 +134,30 @@ srcset:
 object-fit:
     cargo run -- --file tests/pages/object-fit.html
 
+# Open the line-height test page: how tall a line is, and what on it decides.
+line-height:
+    cargo run -- --file tests/pages/line-height.html
+
+# Open the flex test page: where the lines of a wrapped container go, which
+# sibling an item is laid out among, and a container that sits in a line.
+flex:
+    cargo run -- --file tests/pages/flex.html
+
+# Open the background test page: several layers behind one box, and the shadow a
+# box casts on the inside of itself.
+backgrounds:
+    cargo run -- --file tests/pages/backgrounds.html
+
+# Open the border test page: the lines a border style draws, and how two sides
+# that disagree meet at a corner.
+borders:
+    cargo run -- --file tests/pages/borders.html
+
+# Open the replaced-element test page: a picture's own background and border, and
+# the room they take.
+replaced:
+    cargo run -- --file tests/pages/replaced.html
+
 # Open the white-space test page: what happens to the spaces between things.
 white-space:
     cargo run -- --file tests/pages/white-space.html
