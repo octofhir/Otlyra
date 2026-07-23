@@ -56,6 +56,13 @@ pub struct Tree<'a> {
     /// from — so the one the stylesheets were parsed under is handed down here.
     /// Absent for a tree used only to match selectors, which never synthesizes any.
     pub lock: Option<&'a SharedRwLock>,
+    /// Where the state bits come from when there is no per-element state to read
+    /// them out of.
+    ///
+    /// A styled tree has them cached in each element's slot, computed once when
+    /// the slots were made. A tree built only to match a selector has no slots, and
+    /// this is what answers instead — the same computation, done per question.
+    pub states: Option<&'a crate::state::States<'a>>,
 }
 
 impl<'a> Tree<'a> {
@@ -65,6 +72,17 @@ impl<'a> Tree<'a> {
             document,
             style_data: None,
             lock: None,
+            states: None,
+        }
+    }
+
+    /// The same, with the state bits a selector may ask for.
+    pub fn matching(document: &'a Document, states: &'a crate::state::States<'a>) -> Self {
+        Self {
+            document,
+            style_data: None,
+            lock: None,
+            states: Some(states),
         }
     }
 
@@ -78,6 +96,7 @@ impl<'a> Tree<'a> {
             document,
             style_data: Some(style_data),
             lock: Some(lock),
+            states: None,
         }
     }
 
@@ -173,6 +192,21 @@ impl<'a> NodeRef<'a> {
     /// This element's slot in the style state, if it has one.
     fn slot(&self) -> Option<&'a ElementSlot> {
         self.tree().style_data?.slots.get(&self.id)
+    }
+
+    /// Every state bit this element holds.
+    ///
+    /// Cached in the slot during a restyle, because matching asks for it once per
+    /// selector that mentions a state and the answer cannot change mid-restyle.
+    fn element_state(&self) -> stylo_dom::ElementState {
+        if let Some(slot) = self.slot() {
+            return slot.state;
+        }
+        self.tree()
+            .states
+            .map_or_else(stylo_dom::ElementState::empty, |states| {
+                states.state_of(self.id)
+            })
     }
 
     /// The element data, if this node is an element.
@@ -341,12 +375,21 @@ impl SelectorsElement for NodeRef<'_> {
         pseudo_class: &NonTSPseudoClass,
         _context: &mut MatchingContext<'_, Self::Impl>,
     ) -> bool {
-        // What we can answer without a script engine, a session history or a form
-        // model. Everything else is honestly false rather than guessed: a `:hover`
-        // that is sometimes true by accident is worse than one that is never true.
+        // Nearly every one of these is a bit: the engine's own table says which,
+        // and the state was computed for this element before matching began. The
+        // few that are not — a language, a custom state — report an empty flag,
+        // and an empty flag is contained by every state, so they have to be turned
+        // away before the question is asked rather than after.
+        let flag = pseudo_class.state_flag();
+        if !flag.is_empty() {
+            return self.element_state().intersects(flag);
+        }
         match pseudo_class {
-            NonTSPseudoClass::Link | NonTSPseudoClass::AnyLink => self.is_link(),
-            NonTSPseudoClass::Visited => false,
+            NonTSPseudoClass::Lang(_) | NonTSPseudoClass::CustomState(_) => false,
+            NonTSPseudoClass::ServoNonZeroBorder => self
+                .element()
+                .and_then(|element| element.attr("border"))
+                .is_some_and(|border| border != "0"),
             _ => false,
         }
     }
@@ -546,6 +589,20 @@ fn html_dimension(value: &str) -> Option<String> {
 /// rule, exercised here on its own so that "does this selector match this element"
 /// is answerable and testable before any cascade exists.
 pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String> {
+    let form = otlyra_dom::FormState::new();
+    select_with(document, selector, &form, crate::state::Interaction::none())
+}
+
+/// The same, against controls that hold something and a pointer that is somewhere.
+///
+/// `:checked` and `:hover` are only answerable with those two, and both are
+/// arguments rather than document state for the reason given in [`crate::state`].
+pub fn select_with(
+    document: &Document,
+    selector: &str,
+    form: &otlyra_dom::FormState,
+    interaction: crate::state::Interaction,
+) -> Result<Vec<NodeId>, String> {
     use selectors::matching::{
         MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
         QuirksMode as SelectorsQuirksMode,
@@ -572,7 +629,8 @@ pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String
         MatchingForInvalidation::No,
     );
 
-    let tree = Tree::new(document);
+    let states = crate::state::States::new(document, form, interaction);
+    let tree = Tree::matching(document, &states);
     let _scope = TreeScope::enter(&tree);
     let mut matched = Vec::new();
     let mut stack = vec![document.root()];
@@ -600,6 +658,322 @@ pub fn select(document: &Document, selector: &str) -> Result<Vec<NodeId>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ids of the elements a selector matched, given what the controls hold
+    /// and where the pointer is.
+    fn matching_state(
+        html: &str,
+        selector: &str,
+        interaction: crate::state::Interaction,
+    ) -> Vec<String> {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let form = otlyra_dom::FormState::new();
+        select_with(&document, selector, &form, interaction)
+            .expect("the selector should parse")
+            .into_iter()
+            .map(|id| {
+                let element = document.node(id).element().expect("an element");
+                element
+                    .id()
+                    .map_or_else(|| element.name.local.to_string(), str::to_owned)
+            })
+            .collect()
+    }
+
+    /// The node whose `id` attribute is `id`.
+    fn node_with_id(document: &otlyra_dom::Document, id: &str) -> NodeId {
+        let mut stack = vec![document.root()];
+        while let Some(node) = stack.pop() {
+            if document
+                .get(node)
+                .and_then(|node| node.element())
+                .and_then(|element| element.id())
+                == Some(id)
+            {
+                return node;
+            }
+            stack.extend(document.children(node));
+        }
+        panic!("no element with id {id}");
+    }
+
+    #[test]
+    fn a_checkbox_is_checked_by_its_attribute_and_a_plain_one_is_not() {
+        assert_eq!(
+            matching_state(
+                "<input id=on type=checkbox checked><input id=off type=checkbox>",
+                ":checked",
+                crate::state::Interaction::none(),
+            ),
+            ["on"]
+        );
+    }
+
+    #[test]
+    fn a_selected_option_is_checked_and_so_is_the_first_one_of_a_drop_down() {
+        assert_eq!(
+            matching_state(
+                "<select><option id=a>A<option id=b selected>B</select>",
+                "option:checked",
+                crate::state::Interaction::none(),
+            ),
+            ["b"]
+        );
+        // A drop-down always shows something, so its first option is selected even
+        // though nothing in the markup says so.
+        assert_eq!(
+            matching_state(
+                "<select><option id=a>A<option id=b>B</select>",
+                "option:checked",
+                crate::state::Interaction::none(),
+            ),
+            ["a"]
+        );
+        // A list box shows no such thing.
+        assert_eq!(
+            matching_state(
+                "<select multiple><option id=a>A<option id=b>B</select>",
+                "option:checked",
+                crate::state::Interaction::none(),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_fieldset_disables_what_it_holds_but_not_its_first_legend() {
+        assert_eq!(
+            matching_state(
+                "<fieldset disabled><legend><input id=in-legend></legend>\
+                 <input id=inside></fieldset><input id=outside>",
+                "input:disabled",
+                crate::state::Interaction::none(),
+            ),
+            ["inside"]
+        );
+        assert_eq!(
+            matching_state(
+                "<fieldset disabled><legend><input id=in-legend></legend>\
+                 <input id=inside></fieldset><input id=outside>",
+                "input:enabled",
+                crate::state::Interaction::none(),
+            ),
+            ["in-legend", "outside"]
+        );
+    }
+
+    #[test]
+    fn only_a_control_is_enabled_or_disabled() {
+        assert_eq!(
+            matching_state(
+                "<div id=d></div><input id=i>",
+                ":enabled",
+                crate::state::Interaction::none(),
+            ),
+            ["i"]
+        );
+    }
+
+    #[test]
+    fn everything_that_is_not_a_live_text_control_is_read_only() {
+        assert_eq!(
+            matching_state(
+                "<div id=d></div><input id=field><input id=locked readonly>\
+                 <input id=box type=checkbox><div id=host contenteditable></div>",
+                ":read-write",
+                crate::state::Interaction::none(),
+            ),
+            ["field", "host"]
+        );
+        assert_eq!(
+            matching_state(
+                "<input id=field><input id=locked readonly>",
+                "input:read-only",
+                crate::state::Interaction::none(),
+            ),
+            ["locked"]
+        );
+    }
+
+    #[test]
+    fn required_is_only_answered_where_it_applies() {
+        assert_eq!(
+            matching_state(
+                "<input id=need required><input id=free><div id=d required></div>",
+                ":required",
+                crate::state::Interaction::none(),
+            ),
+            ["need"]
+        );
+        assert_eq!(
+            matching_state(
+                "<input id=need required><input id=free><div id=d required></div>",
+                ":optional",
+                crate::state::Interaction::none(),
+            ),
+            ["free"]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_shows_only_while_there_is_nothing_to_show_instead() {
+        assert_eq!(
+            matching_state(
+                "<input id=empty placeholder=hint><input id=full placeholder=hint value=x>\
+                 <input id=bare>",
+                ":placeholder-shown",
+                crate::state::Interaction::none(),
+            ),
+            ["empty"]
+        );
+    }
+
+    #[test]
+    fn a_radio_group_with_nothing_checked_is_indeterminate() {
+        assert_eq!(
+            matching_state(
+                "<input id=a type=radio name=g><input id=b type=radio name=g>",
+                ":indeterminate",
+                crate::state::Interaction::none(),
+            ),
+            ["a", "b"]
+        );
+        assert_eq!(
+            matching_state(
+                "<input id=a type=radio name=g checked><input id=b type=radio name=g>",
+                ":indeterminate",
+                crate::state::Interaction::none(),
+            ),
+            Vec::<String>::new()
+        );
+        // A different name is a different group, and answers for itself.
+        assert_eq!(
+            matching_state(
+                "<input id=a type=radio name=g checked><input id=b type=radio name=h>",
+                ":indeterminate",
+                crate::state::Interaction::none(),
+            ),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn hover_reaches_the_ancestors_of_what_the_pointer_is_over() {
+        let html = "<div id=outer><p id=inner><a id=link href=#>x</a></p></div><p id=other>y</p>";
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let form = otlyra_dom::FormState::new();
+        let interaction = crate::state::Interaction {
+            hover: Some(node_with_id(&document, "link")),
+            ..crate::state::Interaction::none()
+        };
+        let matched: Vec<String> = select_with(&document, ":hover", &form, interaction)
+            .expect("the selector should parse")
+            .into_iter()
+            .filter_map(|id| {
+                document
+                    .node(id)
+                    .element()
+                    .and_then(|element| element.id())
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(matched, ["outer", "inner", "link"]);
+    }
+
+    #[test]
+    fn focus_is_one_element_and_focus_within_is_the_rest_of_the_chain() {
+        let html = "<form id=f><p id=p><input id=field></p></form>";
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let form = otlyra_dom::FormState::new();
+        let field = node_with_id(&document, "field");
+        let interaction = crate::state::Interaction {
+            focus: Some(field),
+            focus_visible: true,
+            ..crate::state::Interaction::none()
+        };
+        let ids = |selector: &str| -> Vec<String> {
+            select_with(&document, selector, &form, interaction)
+                .expect("the selector should parse")
+                .into_iter()
+                .filter_map(|id| {
+                    document
+                        .node(id)
+                        .element()
+                        .and_then(|element| element.id())
+                        .map(str::to_owned)
+                })
+                .collect()
+        };
+        assert_eq!(ids(":focus"), ["field"]);
+        assert_eq!(ids(":focus-visible"), ["field"]);
+        assert_eq!(ids(":focus-within"), ["f", "p", "field"]);
+    }
+
+    #[test]
+    fn a_focus_ring_is_shown_only_when_the_reader_asked_for_one() {
+        let html = "<input id=field>";
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let form = otlyra_dom::FormState::new();
+        let interaction = crate::state::Interaction {
+            focus: Some(node_with_id(&document, "field")),
+            focus_visible: false,
+            ..crate::state::Interaction::none()
+        };
+        assert_eq!(
+            select_with(&document, ":focus", &form, interaction)
+                .expect("the selector should parse")
+                .len(),
+            1
+        );
+        assert!(
+            select_with(&document, ":focus-visible", &form, interaction)
+                .expect("the selector should parse")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn what_the_reader_did_outranks_what_the_markup_says() {
+        let html = "<input id=a type=checkbox checked><input id=b type=checkbox>";
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let mut form = otlyra_dom::FormState::new();
+        form.set_checkedness(node_with_id(&document, "a"), false);
+        form.set_checkedness(node_with_id(&document, "b"), true);
+        let matched: Vec<String> = select_with(
+            &document,
+            ":checked",
+            &form,
+            crate::state::Interaction::none(),
+        )
+        .expect("the selector should parse")
+        .into_iter()
+        .filter_map(|id| {
+            document
+                .node(id)
+                .element()
+                .and_then(|element| element.id())
+                .map(str::to_owned)
+        })
+        .collect();
+        assert_eq!(matched, ["b"]);
+        // `:default` still names what the markup nominated.
+        assert_eq!(
+            matching_state(html, ":default", crate::state::Interaction::none()),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn details_is_open_by_its_attribute() {
+        assert_eq!(
+            matching_state(
+                "<details id=a open><summary>s</summary>x</details><details id=b>y</details>",
+                ":open",
+                crate::state::Interaction::none(),
+            ),
+            ["a"]
+        );
+    }
 
     /// The tags of the elements a selector matched, in tree order.
     fn matching(html: &str, selector: &str) -> Vec<String> {
@@ -706,7 +1080,6 @@ mod tests {
 }
 
 /// One element's state, as the style engine wants it kept.
-#[derive(Default)]
 struct ElementSlot {
     /// The element's `id`, interned in the style engine's atom table rather than
     /// the DOM's: the two use different tables, and the engine compares by
@@ -730,6 +1103,27 @@ struct ElementSlot {
     children_to_process: std::sync::atomic::AtomicIsize,
     /// Selector flags the matcher asked us to remember.
     selector_flags: std::sync::atomic::AtomicUsize,
+    /// Every state bit the element holds: what the document says about it, and
+    /// where the pointer and the focus are. Computed once per restyle, because a
+    /// selector may ask for it many times and the answer cannot change while the
+    /// restyle runs.
+    state: stylo_dom::ElementState,
+}
+
+impl Default for ElementSlot {
+    fn default() -> Self {
+        Self {
+            id: None,
+            classes: Vec::new(),
+            attr_names: Vec::new(),
+            style_attribute: None,
+            data: style::data::ElementDataWrapper::default(),
+            dirty_descendants: std::sync::atomic::AtomicBool::default(),
+            children_to_process: std::sync::atomic::AtomicIsize::default(),
+            selector_flags: std::sync::atomic::AtomicUsize::default(),
+            state: stylo_dom::ElementState::empty(),
+        }
+    }
 }
 
 /// Where the style engine keeps its per-element state.
@@ -772,7 +1166,35 @@ impl StyleData {
     /// interned them into — the two compare by identity within themselves and not
     /// with each other. Interning once here is what makes matching a pointer
     /// comparison rather than a string one, thousands of times per page.
-    pub fn prepare(&mut self, document: &Document) {
+    pub fn prepare(
+        &mut self,
+        document: &Document,
+        form: &otlyra_dom::FormState,
+        interaction: crate::state::Interaction,
+    ) {
+        let mut every = Vec::new();
+        let mut stack = vec![document.root()];
+        while let Some(id) = stack.pop() {
+            every.push(id);
+            stack.extend(document.children(id));
+        }
+        self.prepare_nodes(document, &every, form, interaction);
+    }
+
+    /// The same, for a chosen few.
+    ///
+    /// Asking whether a state change is worth a restyle needs the matcher's view
+    /// of a handful of elements — the ones the pointer and the focus touched — and
+    /// nothing else. Building the whole document's slots to answer that would cost
+    /// what the restyle costs, which is the cost being avoided.
+    pub fn prepare_nodes(
+        &mut self,
+        document: &Document,
+        nodes: &[NodeId],
+        form: &otlyra_dom::FormState,
+        interaction: crate::state::Interaction,
+    ) {
+        let states = crate::state::States::new(document, form, interaction);
         let url = crate::cascade::base_url();
         let quirks_mode = match document.quirks_mode() {
             html5ever::interface::QuirksMode::Quirks => style::context::QuirksMode::Quirks,
@@ -782,15 +1204,15 @@ impl StyleData {
             html5ever::interface::QuirksMode::NoQuirks => style::context::QuirksMode::NoQuirks,
         };
 
-        let mut stack = vec![document.root()];
-        while let Some(id) = stack.pop() {
+        for &id in nodes {
             if let Some(element) = document.get(id).and_then(|node| node.element()) {
                 let style_attribute = element.attr("style").and_then(|source| {
                     if source.trim().is_empty() {
                         return None;
                     }
+                    let source = crate::appearance::rewrite_declarations(source);
                     let block = style::properties::parse_style_attribute(
-                        source,
+                        &source,
                         &url,
                         None,
                         quirks_mode,
@@ -810,12 +1232,24 @@ impl StyleData {
                             .map(|attr| style::LocalName::from(attr.name.local.as_ref()))
                             .collect(),
                         style_attribute,
+                        state: states.state_of(id),
                         ..ElementSlot::default()
                     },
                 );
             }
-            stack.extend(document.children(id));
         }
+    }
+
+    /// Every state bit an element held when the styles were computed.
+    ///
+    /// Read back rather than recomputed: it was worked out once for the matcher,
+    /// and what paints a control needs the same answer the cascade used. Two
+    /// answers to "is this checked" is how a tick ends up in a box that no rule
+    /// styled as checked.
+    pub fn state_of(&self, node: NodeId) -> stylo_dom::ElementState {
+        self.slots
+            .get(&node)
+            .map_or_else(stylo_dom::ElementState::empty, |slot| slot.state)
     }
 
     /// The lock every stylesheet and declaration block in this document shares.
@@ -1061,10 +1495,7 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
     }
 
     fn state(&self) -> stylo_dom::ElementState {
-        // Hover, focus, active, checked and the rest are states a browser knows
-        // because it routes input and runs script. Reporting none is the honest
-        // answer until it does.
-        stylo_dom::ElementState::empty()
+        self.element_state()
     }
 
     fn has_part_attr(&self) -> bool {

@@ -72,7 +72,7 @@ fn main() {
     );
 
     let started = Instant::now();
-    let boxes = build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_styled_box_tree(&parsed.document, &styles);
     println!("box tree     first {:>9.2?}", started.elapsed());
 
     let mut text = TextEngine::new();
@@ -81,11 +81,11 @@ fn main() {
         height: SIZE.1,
     };
     let started = Instant::now();
-    let fragments = layout(&boxes, &mut text, size);
+    let fragments = layout(&mut boxes, &mut text, size);
     let layout_first = started.elapsed();
     let started = Instant::now();
     for _ in 0..FRAMES {
-        std::hint::black_box(layout(&boxes, &mut text, size));
+        std::hint::black_box(layout(&mut boxes, &mut text, size));
     }
     println!(
         "layout       first {:>9.2?}   steady {:>9.2?}",

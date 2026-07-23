@@ -455,10 +455,10 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     }
 
     if cli.dump_fragments {
-        let boxes = styled_boxes(&parsed.document, cli.width, cli.height);
+        let mut boxes = styled_boxes(&parsed.document, cli.width, cli.height);
         let mut text = otlyra_text::TextEngine::new();
         let fragments = otlyra_layout::layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             otlyra_layout::Viewport {
                 width: cli.width as f32,
@@ -664,10 +664,20 @@ fn content_type_of(path: &std::path::Path) -> Option<String> {
 
 impl otlyra_app::fetcher::Loader for NetLoader {
     fn load(&self, input: &str) -> Result<otlyra_app::fetcher::Loaded, String> {
+        self.send(input, None)
+    }
+
+    fn send(
+        &self,
+        input: &str,
+        body: Option<otlyra_net::Body>,
+    ) -> Result<otlyra_app::fetcher::Loaded, String> {
         // A path typed into the address bar becomes the `file:` URL it names, so
         // that what the bar shows is an address and not a filename — and so that a
         // relative link on the page has something to resolve against.
         if let Some(url) = file_url(input) {
+            // A file has nothing to receive a body with, so a form aimed at one is
+            // read rather than refused — which is what the references do with it.
             let path = url
                 .to_file_path()
                 .map_err(|()| format!("not a path: {input}"))?;
@@ -701,8 +711,12 @@ impl otlyra_app::fetcher::Loader for NetLoader {
         }
         let loader = self.loader.get().expect("the loader was just built");
 
+        let request = match body {
+            Some(body) => otlyra_net::LoadRequest::post(url, body),
+            None => otlyra_net::LoadRequest::new(url),
+        };
         let resource = loader
-            .fetch_blocking(otlyra_net::LoadRequest::new(url))
+            .fetch_blocking(request)
             .map_err(|error| error.to_string())?;
         let charset = resource.charset();
         Ok(otlyra_app::fetcher::Loaded {

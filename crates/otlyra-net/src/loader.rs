@@ -6,6 +6,18 @@ use url::Url;
 
 use crate::limits::Limits;
 
+/// Bytes a request carries, and what it says they are.
+///
+/// Built entirely above this crate — a form's entry list is HTML's business, and
+/// nothing here knows what a form is. What arrives is bytes and a media type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Body {
+    /// The `Content-Type` to send them under.
+    pub content_type: String,
+    /// The bytes themselves.
+    pub bytes: Vec<u8>,
+}
+
 /// A request to load one resource.
 ///
 /// Owned, `Send`, and free of anything that knows what the bytes mean. When the
@@ -14,12 +26,30 @@ use crate::limits::Limits;
 pub struct LoadRequest {
     /// The absolute URL to fetch. Produce it with [`crate::normalize`].
     pub url: Url,
+    /// What to send with it, if anything. A request with a body is a `POST` and
+    /// one without is a `GET`: those are the two a page without a script can ask
+    /// for, so the body is the method rather than a second field that could
+    /// disagree with it.
+    pub body: Option<Body>,
 }
 
 impl LoadRequest {
     /// A request for `url`.
     pub fn new(url: Url) -> Self {
-        Self { url }
+        Self { url, body: None }
+    }
+
+    /// A request that sends `body` to `url`.
+    pub fn post(url: Url, body: Body) -> Self {
+        Self {
+            url,
+            body: Some(body),
+        }
+    }
+
+    /// The method this request is made with.
+    pub fn method(&self) -> &'static str {
+        if self.body.is_some() { "POST" } else { "GET" }
     }
 }
 
@@ -237,13 +267,12 @@ impl Loader {
     /// Fetch one resource, blocking the calling thread until it is complete.
     ///
     /// **This blocks, and that is why it is named so.** It exists for the shell's
-    /// one-shot `--url` mode, where there is nothing else for the thread to do.
-    /// The browser's real path is the opposite: the loader runs on its own runtime
-    /// and the event loop only ever `try_recv`s owned messages from it, because a
-    /// main loop that blocks on the network is a main loop that stops painting and
-    /// stops responding to input. That arrives with navigation, at M9; everything
-    /// crossing this signature is already owned so that it is a change of transport
-    /// and not a change of design.
+    /// one-shot `--url` mode, and for the fetch threads, which have nothing else to
+    /// do while it runs. The window's own thread must never reach it: a main loop
+    /// that blocks on the network is a main loop that has stopped painting and
+    /// stopped answering the keyboard. Everything crossing this signature is owned,
+    /// so moving the transport further away is a change of transport rather than a
+    /// change of design.
     pub fn fetch_blocking(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
         let span = tracing::info_span!("resource_load", url = %request.url);
         let _entered = span.enter();
@@ -279,11 +308,20 @@ impl Loader {
         // Built rather than sent in one call, so the headers the client is about
         // to write can be read back and shown: an inspector's *Request* pane is
         // the headers we actually sent, and this is where they become knowable.
-        let built = self
-            .client
-            .get(request.url)
-            .build()
-            .map_err(|error| self.classify(error, &url))?;
+        let built = match request.body {
+            // A body is held in memory rather than streamed, which is what lets the
+            // client replay it: a redirect that keeps the method — 307, 308 — has to
+            // send the same bytes again, and a body it could only read once would
+            // arrive empty the second time.
+            Some(body) => self
+                .client
+                .post(request.url)
+                .header(reqwest::header::CONTENT_TYPE, body.content_type)
+                .body(body.bytes),
+            None => self.client.get(request.url),
+        }
+        .build()
+        .map_err(|error| self.classify(error, &url))?;
         let request_headers = headers_to_pairs(built.headers());
 
         let response = self

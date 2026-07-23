@@ -39,7 +39,7 @@ pub use box_tree::{
     first_box_with_mixed_children,
 };
 pub use builder::{
-    ImageSource, Images, Picture, build_box_tree, build_box_tree_with_images,
+    ImageSource, Images, Picture, build_box_tree, build_box_tree_with_images, build_page_box_tree,
     build_styled_box_tree, image_sources,
 };
 pub use damage::Damage;
@@ -195,23 +195,34 @@ mod tests {
             .join("")
     }
 
-    /// An `<input>` is a void element: without generated content it lays out as
+    /// An `<input>` is a void element: without generated content a field shows
     /// nothing at all, and a form becomes a page of labels with no fields.
     #[test]
     fn a_text_field_shows_its_value_then_its_placeholder() {
         assert!(text_of(&tree_of("<input value=typed placeholder=hint>")).contains("typed"));
         assert!(text_of(&tree_of("<input placeholder=hint>")).contains("hint"));
         assert!(
-            text_of(&tree_of("<input>")).len() > 4,
-            "an empty field still reserves room to type in"
+            text_of(&tree_of("<input>")).is_empty(),
+            "an empty field shows nothing; the room to type in is its width, \
+             and a width is not text"
         );
     }
 
+    /// A checkbox shows a tick, and a tick is drawn rather than set. It used to be
+    /// the characters `[x]`, which is what a page looks like in a terminal.
     #[test]
-    fn a_checkbox_shows_whether_it_is_checked() {
-        assert!(text_of(&tree_of("<input type=checkbox checked>")).contains("[x]"));
-        assert!(text_of(&tree_of("<input type=checkbox>")).contains("[ ]"));
-        assert!(text_of(&tree_of("<input type=radio checked>")).contains("(o)"));
+    fn a_checkbox_generates_no_text_and_knows_it_is_a_checkbox() {
+        use crate::box_tree::ControlKind;
+
+        let tree = tree_of("<input type=checkbox checked>");
+        assert!(text_of(&tree).is_empty());
+        let control = tree
+            .descendants(tree.root())
+            .into_iter()
+            .find_map(|id| tree.node(id).control.clone())
+            .expect("the checkbox is a control");
+        assert_eq!(control.kind, ControlKind::Checkbox);
+        assert!(control.widget);
     }
 
     #[test]

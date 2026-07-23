@@ -118,8 +118,9 @@ antialiasing, and a number well above it is a bug. Where the two disagree
 outright, neither is the answer and the specification is.
 
 `tests/pages/` holds one page per feature, because a shared page hides a fault
-under somebody else's: `just tables`, `just fonts`, `just srcset`,
-`just white-space`, `just object-fit`, and the rest.
+under somebody else's. `just test-pages` lists them; `just test-page tables`
+opens one, `just test-page-shot tables` writes it to a PNG, and
+`just test-page-reference tables` puts it beside the references.
 
 The harness has caught what no unit test would have: a matrix left on the canvas
 that drew a scrolling panel at double size, a font collection whose bold faces

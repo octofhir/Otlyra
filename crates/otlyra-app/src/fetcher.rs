@@ -13,6 +13,7 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+pub use otlyra_net::Body;
 use otlyra_platform::Waker;
 
 /// What a fetch is for.
@@ -176,6 +177,17 @@ pub trait Loader: Send + Sync + 'static {
     /// Fetch `url`, returning the bytes and the little the transport knows about
     /// them. What they *are* is decided above this, from the bytes as well.
     fn load(&self, url: &str) -> Result<Loaded, String>;
+
+    /// Fetch `url`, sending `body` with it.
+    ///
+    /// A transport that can carry a body overrides this; the default answers a
+    /// request that has one with the bytes it answers a plain fetch with, which is
+    /// what a loader that stands in for a network wants and what no real one
+    /// should do.
+    fn send(&self, url: &str, body: Option<Body>) -> Result<Loaded, String> {
+        let _ = body;
+        self.load(url)
+    }
 }
 
 /// How many fetches may be in flight at once.
@@ -204,6 +216,7 @@ struct Request {
     id: u64,
     kind: ResourceKind,
     url: String,
+    body: Option<Body>,
 }
 
 impl std::fmt::Debug for Fetcher {
@@ -245,7 +258,7 @@ impl Fetcher {
                         queue.recv()
                     } {
                         let started = std::time::Instant::now();
-                        let result = loader.load(&request.url);
+                        let result = loader.send(&request.url, request.body);
                         let fetched = Fetched {
                             id: request.id,
                             kind: request.kind,
@@ -284,15 +297,22 @@ impl Fetcher {
 
     /// Ask for `url`. The number returned is what the result will carry.
     pub fn request(&mut self, url: &str, kind: ResourceKind) -> u64 {
+        self.send(url, kind, None)
+    }
+
+    /// Ask for `url`, sending `body` with it. The number returned is what the
+    /// result will carry.
+    pub fn send(&mut self, url: &str, kind: ResourceKind, body: Option<Body>) -> u64 {
         self.next += 1;
         let id = self.next;
+        let method = if body.is_some() { "POST" } else { "GET" };
         if self.exchanges.len() >= EXCHANGE_LIMIT {
             self.exchanges.remove(0);
         }
         self.exchanges.push(Exchange {
             id,
             kind,
-            method: "GET",
+            method,
             url: url.to_owned(),
             status: Status::Pending,
             code: None,
@@ -309,6 +329,7 @@ impl Fetcher {
             id,
             kind,
             url: url.to_owned(),
+            body,
         });
         id
     }
@@ -432,6 +453,46 @@ mod tests {
             highest.load(Ordering::SeqCst) > 1,
             "only one fetch ever ran at a time"
         );
+    }
+
+    /// A body reaches the transport, and the list says which request carried one.
+    #[test]
+    fn a_request_with_a_body_is_a_post() {
+        struct BodyLoader {
+            seen: std::sync::Arc<Mutex<Vec<Option<Body>>>>,
+        }
+
+        impl Loader for BodyLoader {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.send(url, None)
+            }
+
+            fn send(&self, url: &str, body: Option<Body>) -> Result<Loaded, String> {
+                self.seen.lock().expect("no panic").push(body);
+                Ok(Loaded {
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut fetcher = Fetcher::spawn(BodyLoader {
+            seen: Arc::clone(&seen),
+        });
+        let body = Body {
+            content_type: "text/plain".to_owned(),
+            bytes: b"who=Ada".to_vec(),
+        };
+        fetcher.send(
+            "https://example.test/save",
+            ResourceKind::Document,
+            Some(body.clone()),
+        );
+        while fetcher.wait(std::time::Duration::from_secs(5)).is_empty() {}
+
+        assert_eq!(*seen.lock().expect("no panic"), vec![Some(body)]);
+        assert_eq!(fetcher.exchanges()[0].method, "POST");
     }
 
     /// Every reply carries the number it was asked under, which is what makes an

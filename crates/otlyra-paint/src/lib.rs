@@ -9,6 +9,8 @@
 //! ## Contents
 //!
 //! - [`build_display_list`] — the whole crate.
+//! - `widget` — what a form control looks like, drawn rather than asked of the
+//!   operating system.
 //!
 //! ## Invariants
 //!
@@ -20,6 +22,8 @@
 //! 3. **Off-screen fragments produce no items at all.** Culling here is cheaper
 //!    than clipping in the rasterizer, and on a long page it removes most of the
 //!    page.
+
+mod widget;
 
 use otlyra_gfx::kurbo::{Affine, BezPath, Rect as KurboRect, Shape};
 use otlyra_gfx::peniko::{BlendMode, Brush, Color, Fill};
@@ -42,6 +46,10 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 /// The scrollbar's thumb.
 const SCROLLBAR_THUMB: Color = Color::from_rgba8(0, 0, 0, 0x59);
+
+/// The caret. The text colour rather than a colour of its own, because a caret is
+/// where the next letter goes and it should look like one.
+const CARET: Color = Color::from_rgba8(0, 0, 0, 0xff);
 
 /// Where a scrollbar's thumb is, for an area showing `content_height` scrolled to
 /// `scroll` — or `None` when the content fits and there is no scrollbar.
@@ -216,6 +224,11 @@ pub struct Frame<'a> {
     /// still readable: a highlight over them would tint them, and inverting them
     /// instead is a different tradition that this platform is not in.
     pub selection: &'a [Rect],
+    /// Where the caret is, in page coordinates, if the page has one.
+    ///
+    /// Over everything rather than under it, unlike the selection: a caret sits
+    /// between two letters and has nothing to be behind.
+    pub caret: Option<Rect>,
 }
 
 impl Default for Frame<'_> {
@@ -227,6 +240,7 @@ impl Default for Frame<'_> {
             background: None,
             scrollbars: true,
             selection: &[],
+            caret: None,
         }
     }
 }
@@ -426,6 +440,27 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         paint_scrollbar(&mut list, area, port.content_height, offset);
     }
 
+    // The caret last, so it is over everything the page drew: a caret behind a
+    // background is a caret nobody can see.
+    if let Some(caret) = frame.caret {
+        let y = caret.y - scroll_y;
+        if y + caret.height >= 0.0 && y <= height {
+            list.push(DisplayItem::Fill {
+                style: Fill::NonZero,
+                transform: Affine::IDENTITY,
+                brush: Brush::Solid(CARET),
+                brush_transform: None,
+                shape: KurboRect::new(
+                    f64::from(caret.x),
+                    f64::from(y),
+                    f64::from(caret.x + caret.width.max(1.0)),
+                    f64::from(y + caret.height),
+                )
+                .to_path(PATH_TOLERANCE),
+            });
+        }
+    }
+
     tracing::debug!(items = list.len(), "display list built");
     list
 }
@@ -532,9 +567,22 @@ fn paint(
                 });
             }
 
+            // A control that is still a widget is drawn as one, and what it draws
+            // *is* its background and its border — so the two the cascade computed
+            // are not drawn on top of it. Both references do the same, which is why
+            // a themed control ignores the user-agent border it also computes.
+            let themed = match &fragment.widget {
+                Some(control) => {
+                    let mut painted = rect;
+                    painted.y -= scroll_y;
+                    widget::paint(list, control, painted)
+                }
+                None => false,
+            };
+
             let background = fragment.style.background_color;
             // Transparent is the initial value, so most boxes paint nothing at all.
-            if background.components[3] > 0.0 && !background_on_canvas {
+            if !themed && background.components[3] > 0.0 && !background_on_canvas {
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
                     transform: Affine::IDENTITY,
@@ -546,7 +594,7 @@ fn paint(
 
             // The layers, bottom-most first: CSS writes them topmost first and
             // paints them in the reverse of that, over the colour.
-            if !background_on_canvas {
+            if !themed && !background_on_canvas {
                 for layer in fragment.style.backgrounds.iter().rev() {
                     paint_background_layer(
                         list,
@@ -564,7 +612,9 @@ fn paint(
             // box, so a background shows *through* it rather than over it.
             paint_inset_shadows(list, fragment, rect, scroll_y);
 
-            paint_borders(list, fragment, rect, scroll_y);
+            if !themed {
+                paint_borders(list, fragment, rect, scroll_y);
+            }
         }
 
         FragmentKind::Line => {}
@@ -1479,10 +1529,10 @@ mod tests {
 
     fn page(html: &str, scroll_y: f32) -> DisplayList {
         let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-        let boxes = build_box_tree(&parsed.document);
+        let mut boxes = build_box_tree(&parsed.document);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -1525,11 +1575,11 @@ mod tests {
         .into_iter()
         .map(|source| (source.node, otlyra_layout::Picture::new(image.clone())))
         .collect();
-        let boxes =
+        let mut boxes =
             otlyra_layout::build_box_tree_with_images(&parsed.document, Some(&styles), &images);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -1552,10 +1602,10 @@ mod tests {
                 color_scheme: Default::default(),
             },
         );
-        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -1660,10 +1710,10 @@ mod tests {
                 color_scheme: Default::default(),
             },
         );
-        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -2211,10 +2261,10 @@ mod tests {
                 color_scheme: Default::default(),
             },
         );
-        let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+        let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -2657,10 +2707,10 @@ mod border_tests {
     fn list_for(html: &str) -> DisplayList {
         let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
         let styles = style_document(&document, StyleViewport::default());
-        let boxes = build_styled_box_tree(&document, &styles);
+        let mut boxes = build_styled_box_tree(&document, &styles);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,
@@ -2839,10 +2889,10 @@ mod border_tests {
         )
         .document;
         let styles = style_document(&document, StyleViewport::default());
-        let boxes = build_styled_box_tree(&document, &styles);
+        let mut boxes = build_styled_box_tree(&document, &styles);
         let mut text = TextEngine::isolated();
         let fragments = layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width: 800.0,

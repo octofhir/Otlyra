@@ -30,7 +30,7 @@ pub mod mime;
 pub mod url;
 
 pub use limits::Limits;
-pub use loader::{LoadRequest, LoadedResource, Loader, NetError};
+pub use loader::{Body, LoadRequest, LoadedResource, Loader, NetError};
 pub use mime::{Sniffed, sniff};
 pub use url::{is_fetchable, may_navigate, normalize, read_data_url, resolve};
 

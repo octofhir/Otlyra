@@ -2659,6 +2659,7 @@ name = "otlyra-dom"
 version = "0.0.0"
 dependencies = [
  "html5ever",
+ "otlyra-html",
  "slotmap",
  "tracing",
 ]

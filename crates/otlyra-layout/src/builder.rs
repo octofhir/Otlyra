@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use otlyra_css::cascade::{StyledDocument, Viewport};
 use otlyra_css::{ComputedStyle, Display, has_renderable_children, initial_style, ua_style};
-use otlyra_dom::{Document, NodeData, NodeId};
+use otlyra_dom::{Document, FormState, NodeData, NodeId};
 
-use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree, CellSpan};
+use crate::box_tree::{
+    BoxId, BoxKind, BoxNode, BoxTree, CellSpan, Control, ControlKind, ControlState,
+};
 
 /// Build the box tree for `document` from the built-in element styles alone.
 ///
@@ -14,12 +16,17 @@ use crate::box_tree::{BoxId, BoxKind, BoxNode, BoxTree, CellSpan};
 /// what the parts of the browser that ask only "what boxes does this markup make"
 /// want — dumps, tests — and it is the fallback when the cascade has not run.
 pub fn build_box_tree(document: &Document) -> BoxTree {
-    build(document, None, &Images::default())
+    build(document, None, &Images::default(), &FormState::new())
 }
 
 /// Build the box tree for `document` using styles the cascade computed.
 pub fn build_styled_box_tree(document: &Document, styles: &StyledDocument) -> BoxTree {
-    build(document, Some(styles), &Images::default())
+    build(
+        document,
+        Some(styles),
+        &Images::default(),
+        &FormState::new(),
+    )
 }
 
 /// Build the box tree with the pictures the document's `<img>` elements asked for
@@ -32,7 +39,21 @@ pub fn build_box_tree_with_images(
     styles: Option<&StyledDocument>,
     images: &Images,
 ) -> BoxTree {
-    build(document, styles, images)
+    build(document, styles, images, &FormState::new())
+}
+
+/// Build the box tree knowing what the reader has typed into the page's controls.
+///
+/// A field shows its `value` attribute until somebody types into it and its own
+/// value afterwards, which is HTML's dirty flag — so the box tree cannot be built
+/// from the markup alone once the page has been used.
+pub fn build_page_box_tree(
+    document: &Document,
+    styles: Option<&StyledDocument>,
+    images: &Images,
+    form: &FormState,
+) -> BoxTree {
+    build(document, styles, images, form)
 }
 
 /// The decoded pictures of a document, by the element that asked for each.
@@ -100,7 +121,12 @@ pub fn image_sources(document: &Document, viewport: Viewport) -> Vec<ImageSource
     sources
 }
 
-fn build(document: &Document, styles: Option<&StyledDocument>, images: &Images) -> BoxTree {
+fn build(
+    document: &Document,
+    styles: Option<&StyledDocument>,
+    images: &Images,
+    form: &FormState,
+) -> BoxTree {
     let _span = tracing::info_span!("build_box_tree").entered();
 
     let root_style = Arc::new(initial_style());
@@ -111,6 +137,7 @@ fn build(document: &Document, styles: Option<&StyledDocument>, images: &Images) 
         document,
         styles,
         images,
+        form,
         tree,
     };
     for child in document.children(document.root()) {
@@ -131,6 +158,9 @@ struct Builder<'a> {
     document: &'a Document,
     styles: Option<&'a StyledDocument>,
     images: &'a Images,
+    /// What the reader has typed into the page's controls, which outranks what the
+    /// markup says a control holds.
+    form: &'a FormState,
     tree: BoxTree,
 }
 
@@ -496,7 +526,186 @@ impl Builder<'_> {
     /// The text a replaced or attribute-driven element shows.
     ///
     /// `None` for everything whose content is in the tree where it belongs.
+    /// The box an open drop-down's list goes in.
+    ///
+    /// Out of the flow and against the control's own padding box, which is what
+    /// makes opening one move nothing on the page behind it — the same way every
+    /// menu on the web is built, and for the same reason.
+    fn open_list(&mut self, select: BoxId, style: &Arc<ComputedStyle>) -> BoxId {
+        use otlyra_css::{Length, LengthOrAuto, Overflow, Position};
+
+        // The control itself becomes what the list is placed against, and stops
+        // cutting its contents off — the list is entirely outside it.
+        let mut anchor = (**style).clone();
+        anchor.position = Position::Relative;
+        anchor.overflow = Overflow::Visible;
+        self.tree.set_style(select, Arc::new(anchor));
+
+        let mut list = (**style).clone();
+        list.display = Display::Block;
+        list.position = Position::Absolute;
+        list.inset = otlyra_css::Sides {
+            top: LengthOrAuto::Percent(1.0),
+            right: LengthOrAuto::Auto,
+            bottom: LengthOrAuto::Auto,
+            left: LengthOrAuto::Px(0.0),
+        };
+        list.width = LengthOrAuto::Auto;
+        list.min_width = Length::Percent(1.0);
+        list.height = LengthOrAuto::Auto;
+        list.padding = otlyra_css::Sides::all(Length::Px(0.0));
+        list.z_index = Some(1);
+        // As tall as it needs and no taller than this: a list of two hundred
+        // countries is a list two hundred rows long, and every browser caps it and
+        // scrolls what is left. The number is a plain one for the same reason
+        // theirs are.
+        list.max_height = Some(Length::Px(300.0));
+        list.overflow = Overflow::Clip;
+
+        self.tree.push(
+            select,
+            BoxNode {
+                kind: BoxKind::Block,
+                // Not a widget — nothing is drawn for it and it is not measured
+                // like one. It is a control so that it can be found and slid, which
+                // is what a list too long to show has to do.
+                control: Some(Control {
+                    kind: ControlKind::ListBox,
+                    widget: false,
+                    size: None,
+                    cols: 0,
+                    rows: 0,
+                    state: ControlState::default(),
+                    open: true,
+                    sized: true,
+                    scroll: (0.0, 0.0),
+                }),
+                style: Arc::new(list),
+                node: None,
+                tag: None,
+                anonymous: true,
+                children: Vec::new(),
+                parent: None,
+            },
+        )
+    }
+
+    /// What control this element is, if it is one.
+    ///
+    /// The widget flag is the cascade's answer to `appearance`, and a control the
+    /// page has turned off is still a control — it is still typed into, still
+    /// checked, still submitted. What changes is that nothing is drawn for it and
+    /// that it has no size of its own, which is why the flag travels with the
+    /// What control this element is, if it is one.
+    ///
+    /// The widget flag is the cascade's answer to `appearance`, and a control the
+    /// page has turned off is still a control — it is still typed into, still
+    /// checked, still submitted. What changes is that nothing is drawn for it and
+    /// that it has no size of its own, which is why the flag travels with the
+    /// description rather than replacing it.
+    fn control_of(&self, node: NodeId) -> Option<Control> {
+        use otlyra_dom::form::{Control as Semantic, InputKind};
+
+        let semantic = Semantic::of(self.document, node)?;
+        let kind = match semantic {
+            Semantic::Input(input) => match input {
+                InputKind::Checkbox => ControlKind::Checkbox,
+                InputKind::Radio => ControlKind::Radio,
+                InputKind::Range => ControlKind::Range,
+                InputKind::Color => ControlKind::Color,
+                InputKind::File => ControlKind::File,
+                InputKind::Hidden => return None,
+                _ if input.is_button() => ControlKind::Button,
+                _ => ControlKind::Field,
+            },
+            Semantic::Button => ControlKind::Button,
+            Semantic::Textarea => ControlKind::Area,
+            Semantic::Select => {
+                if otlyra_dom::form::is_multiple(self.document, node)
+                    || otlyra_dom::form::display_size(self.document, node) > 1
+                {
+                    ControlKind::ListBox
+                } else {
+                    ControlKind::DropDown
+                }
+            }
+            Semantic::Progress => ControlKind::Progress,
+            Semantic::Meter => ControlKind::Meter,
+            Semantic::Option | Semantic::Optgroup | Semantic::Output | Semantic::Fieldset => {
+                return None;
+            }
+        };
+
+        // A widget is drawn when the cascade still says `auto` and no author rule
+        // has taken the look away. A checkbox, a radio button and a slider are
+        // never taken away: the specification calls them non-devolvable, and a page
+        // that gives a checkbox a background gets a checkbox with a background.
+        let widget = self.styles.is_none_or(|styles| {
+            let auto = styles
+                .style_of(node)
+                .is_none_or(|values| otlyra_css::appearance::of(values).is_auto());
+            let non_devolvable = matches!(
+                kind,
+                ControlKind::Checkbox | ControlKind::Radio | ControlKind::Range
+            );
+            auto && (non_devolvable || !styles.is_devolved(node))
+        });
+
+        let state = self.styles.map_or_else(ControlState::default, |styles| {
+            let bits = styles.state_of(node);
+            ControlState {
+                checked: bits.contains(otlyra_css::state::ElementState::CHECKED),
+                indeterminate: kind == ControlKind::Checkbox
+                    && bits.contains(otlyra_css::state::ElementState::INDETERMINATE),
+                disabled: bits.contains(otlyra_css::state::ElementState::DISABLED),
+                hovered: bits.contains(otlyra_css::state::ElementState::HOVER),
+                active: bits.contains(otlyra_css::state::ElementState::ACTIVE),
+                focus_ring: bits.contains(otlyra_css::state::ElementState::FOCUSRING),
+            }
+        });
+
+        let number = |key: &str| {
+            self.document
+                .get(node)
+                .and_then(|inner| inner.element())
+                .and_then(|element| element.attr(key))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|&value| value > 0)
+        };
+
+        Some(Control {
+            kind,
+            widget,
+            // Twenty characters is what a field is when nothing says otherwise —
+            // a number from the specification, not a guess at a pleasant width.
+            size: match kind {
+                ControlKind::Field => Some(number("size").unwrap_or(20)),
+                ControlKind::ListBox => Some(otlyra_dom::form::display_size(self.document, node)),
+                _ => None,
+            },
+            cols: number("cols").unwrap_or(20),
+            rows: number("rows").unwrap_or(2),
+            state,
+            open: kind == ControlKind::DropDown
+                && self.styles.is_some_and(|styles| {
+                    styles
+                        .state_of(node)
+                        .contains(otlyra_css::state::ElementState::OPEN)
+                }),
+            sized: false,
+            scroll: (0.0, 0.0),
+        })
+    }
+
+    /// The text a control shows that is not in the document.
+    ///
+    /// An `<input>` is a void element, so without this a field and a button lay
+    /// out as nothing at all. Browsers generate this content too — they just do it
+    /// inside a widget, which is why a checkbox generates none of it: what a
+    /// checkbox shows is a tick, and a tick is drawn rather than set.
     fn generated_text(&self, name: &str, node: NodeId) -> Option<String> {
+        use otlyra_dom::form::{self, InputKind};
+
         let attribute = |key: &str| {
             self.document
                 .get(node)?
@@ -509,42 +718,83 @@ impl Builder<'_> {
 
         match name {
             "input" => {
-                let kind = attribute("type").unwrap_or_else(|| "text".to_owned());
-                match kind.to_ascii_lowercase().as_str() {
-                    // A button-shaped input carries its label in `value`.
-                    "button" | "submit" | "reset" => {
-                        Some(attribute("value").unwrap_or_else(|| match kind.as_str() {
-                            "submit" => "Submit".to_owned(),
-                            "reset" => "Reset".to_owned(),
-                            _ => " ".to_owned(),
-                        }))
+                let kind =
+                    attribute("type").map_or(InputKind::Text, |value| InputKind::parse(&value));
+                match kind {
+                    // A button-shaped input carries its label in `value`. The two
+                    // that have a label without one have it because HTML says so.
+                    InputKind::Submit => {
+                        Some(attribute("value").unwrap_or_else(|| "Submit".to_owned()))
                     }
-                    // ASCII rather than the ballot-box and radio characters: those
-                    // are dingbats many system fonts have no glyph for, and a
-                    // missing glyph is a hollow box where the control should be.
-                    "checkbox" => Some(if attribute("checked").is_some() {
-                        "[x] ".to_owned()
-                    } else {
-                        "[ ] ".to_owned()
-                    }),
-                    "radio" => Some(if attribute("checked").is_some() {
-                        "(o) ".to_owned()
-                    } else {
-                        "( ) ".to_owned()
-                    }),
-                    "hidden" => None,
-                    // A text field shows its value, or its placeholder, or enough
-                    // space to look like a field rather than vanishing.
-                    _ => Some(
-                        attribute("value")
-                            .or_else(|| attribute("placeholder"))
-                            .unwrap_or_else(|| "          ".to_owned()),
-                    ),
+                    InputKind::Reset => {
+                        Some(attribute("value").unwrap_or_else(|| "Reset".to_owned()))
+                    }
+                    InputKind::Button => attribute("value"),
+                    // Drawn, not set.
+                    InputKind::Checkbox
+                    | InputKind::Radio
+                    | InputKind::Range
+                    | InputKind::Color
+                    | InputKind::Hidden
+                    | InputKind::Image => None,
+                    InputKind::File => Some("No file chosen".to_owned()),
+                    // A field shows what it holds, or the hint it was given. What
+                    // it holds is what the reader typed once the reader has typed:
+                    // the attribute is only the value until then. An empty one
+                    // shows nothing and is still as wide as it is — the width is
+                    // the widget's, not the text's.
+                    _ => {
+                        let held = self.form.value(self.document, node);
+                        if held.is_empty() {
+                            attribute("placeholder")
+                        } else {
+                            Some(held.to_owned())
+                        }
+                    }
                 }
+            }
+            // A closed drop-down shows one option, and the options themselves
+            // generate no boxes — see where the children are walked.
+            "select"
+                if !form::is_multiple(self.document, node)
+                    && form::display_size(self.document, node) <= 1 =>
+            {
+                let state = self.form;
+                let options = form::options_of(self.document, node);
+                let chosen = options
+                    .iter()
+                    .copied()
+                    .find(|&option| state.selectedness(self.document, option))
+                    .or_else(|| options.first().copied())?;
+                Some(self.text_of(chosen))
+            }
+            // A text area's value is its content, so it needs no generated text —
+            // until the reader types, after which its content is no longer what it
+            // holds and the children are skipped in favour of this.
+            "textarea" if self.form.is_dirty(node) => {
+                Some(self.form.value(self.document, node).to_owned())
             }
             "img" => attribute("alt").filter(|alt| !alt.is_empty()),
             _ => None,
         }
+    }
+
+    /// All the text under a node, run together.
+    fn text_of(&self, node: NodeId) -> String {
+        let mut out = String::new();
+        let mut stack: Vec<NodeId> = self.document.children(node).collect();
+        stack.reverse();
+        while let Some(id) = stack.pop() {
+            match self.document.get(id).map(|inner| &inner.data) {
+                Some(NodeData::Text(text)) => out.push_str(text),
+                _ => {
+                    let mut children: Vec<NodeId> = self.document.children(id).collect();
+                    children.reverse();
+                    stack.extend(children);
+                }
+            }
+        }
+        out.trim().to_owned()
     }
 
     /// The replaced content an element shows, if it has any.
@@ -590,52 +840,6 @@ impl Builder<'_> {
             intrinsic: Some(intrinsic),
             hint,
         })
-    }
-
-    /// Whether an `<option>` is the one a closed `<select>` displays.
-    ///
-    /// A select shows one option, not all of them — which is why a page full of
-    /// dropdowns does not read as a wall of every choice in each.
-    fn is_displayed_option(&self, option: NodeId) -> bool {
-        let Some(parent) = self.document.get(option).and_then(|node| node.parent) else {
-            return true;
-        };
-        let is_select = self
-            .document
-            .get(parent)
-            .and_then(|node| node.element())
-            .is_some_and(|element| element.name.local.as_ref() == "select");
-        if !is_select {
-            return true;
-        }
-
-        let options: Vec<NodeId> = self
-            .document
-            .children(parent)
-            .filter(|&child| {
-                self.document
-                    .get(child)
-                    .and_then(|node| node.element())
-                    .is_some_and(|element| element.name.local.as_ref() == "option")
-            })
-            .collect();
-
-        let selected = options.iter().find(|&&child| {
-            self.document
-                .get(child)
-                .and_then(|node| node.element())
-                .is_some_and(|element| {
-                    element
-                        .attrs
-                        .iter()
-                        .any(|attr| attr.name.local.as_ref() == "selected")
-                })
-        });
-
-        match selected {
-            Some(&chosen) => chosen == option,
-            None => options.first() == Some(&option),
-        }
     }
 
     /// How far a `<td>` or `<th>` reaches, from its `colspan` and `rowspan`.
@@ -754,12 +958,6 @@ impl Builder<'_> {
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
                 // and not hit-testable.
-                // An option the select does not display generates no box, which is
-                // `display: none` arrived at by a different route.
-                if name == "option" && !self.is_displayed_option(node) {
-                    return;
-                }
-
                 if style.display == Display::None {
                     return;
                 }
@@ -777,10 +975,12 @@ impl Builder<'_> {
                     },
                 };
 
+                let control = self.control_of(node);
                 let id = self.tree.push(
                     parent_box,
                     BoxNode {
                         kind,
+                        control,
                         style: Arc::clone(&style),
                         node: Some(node),
                         tag: Some(element.name.local.clone()),
@@ -804,6 +1004,7 @@ impl Builder<'_> {
                         id,
                         BoxNode {
                             kind: BoxKind::Text(text.into()),
+                            control: None,
                             style: Arc::clone(&style),
                             node: None,
                             tag: None,
@@ -844,7 +1045,26 @@ impl Builder<'_> {
                     }
                 }
 
-                if has_renderable_children(name) {
+                // A closed drop-down shows one option and not the list. Its
+                // options are still there and still selectable; what they are not
+                // is boxes, because a box for each of them is what a list box is.
+                let control = self.tree.node(id).control.clone();
+                let closed = control
+                    .as_ref()
+                    .is_some_and(|control| control.kind == ControlKind::DropDown)
+                    || (name == "textarea" && self.form.is_dirty(node));
+                // An open drop-down shows its list *over* the page rather than in
+                // it: the options go into a box of their own, placed against the
+                // control and out of the flow, so opening one moves nothing.
+                let popup = control
+                    .as_ref()
+                    .filter(|control| control.open)
+                    .map(|_| self.open_list(id, &style));
+                if let Some(popup) = popup {
+                    for child in self.document.children(node).collect::<Vec<_>>() {
+                        self.walk(child, popup, &style);
+                    }
+                } else if has_renderable_children(name) && !closed {
                     for child in self.document.children(node) {
                         self.walk(child, id, &style);
                     }
@@ -861,6 +1081,7 @@ impl Builder<'_> {
                     parent_box,
                     BoxNode {
                         kind: BoxKind::Text(text.clone()),
+                        control: None,
                         style: Arc::clone(parent_style),
                         node: Some(node),
                         tag: None,

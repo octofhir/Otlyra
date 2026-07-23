@@ -59,11 +59,142 @@ pub struct Replaced {
     pub hint: (Option<f32>, Option<f32>),
 }
 
+/// A form control, as a box has to know it.
+///
+/// Not a kind of box. A control is a block container that happens to be drawn
+/// with a widget behind it — a button holds its label, a field holds its value —
+/// so what is recorded here is what layout and paint need *in addition* to the
+/// box: how big the widget wants to be, and what it is.
+///
+/// The sizes are attributes rather than pixels, because pixels need the font and
+/// the box tree is built before anything has been shaped. Turning `size="20"` into
+/// a width is layout's answer, and it is the same answer HTML gives:
+/// `(size − 1) × avg + max`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Control {
+    /// What the control is, which decides what is drawn and how it is measured.
+    pub kind: ControlKind,
+    /// Whether the widget is drawn at all, or the element is an ordinary box.
+    pub widget: bool,
+    /// The `size` attribute of a text field or a `<select>`, when it has a usable
+    /// one. Twenty is the default for a field, and it is applied here rather than
+    /// carried as a `None` that every reader has to remember the default for.
+    pub size: Option<u32>,
+    /// A `<textarea>`'s `cols`, defaulting to twenty.
+    pub cols: u32,
+    /// A `<textarea>`'s `rows`, defaulting to two, and a list box's row count.
+    pub rows: u32,
+    /// What is drawn on top of the shape: a tick, a dot, a ring, a grey.
+    pub state: ControlState,
+    /// Whether a drop-down is showing its list.
+    pub open: bool,
+    /// Whether the widget's own size has already been written into the style.
+    ///
+    /// Layout runs many times over one box tree — every resize, every scroll that
+    /// needs one — and the room a drop-down leaves for its arrow is *added* to the
+    /// padding rather than replacing it. Without this it is added again on every
+    /// pass, and the control grows twenty pixels a frame.
+    pub sized: bool,
+    /// How far the text inside has been slid out of sight, left and up.
+    ///
+    /// A field is one line long however much is typed into it and a text area is
+    /// as many rows as it was asked for, so what moves is the text and not the
+    /// box. Which way it has moved is a question about where the caret is, which
+    /// only the thing holding the caret knows — so it is written in from outside
+    /// rather than worked out here.
+    pub scroll: (f32, f32),
+}
+
+/// The part of a control's state that changes what is drawn.
+///
+/// A copy of what the cascade already matched on, rather than a second answer to
+/// the same questions: two answers to "is this checked" is how a tick ends up in a
+/// box that no rule styled as checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlState {
+    /// Ticked, or the selected member of its group.
+    pub checked: bool,
+    /// Neither ticked nor not: the dash rather than the tick.
+    pub indeterminate: bool,
+    /// Greyed, and not responding to anything.
+    pub disabled: bool,
+    /// Under the pointer.
+    pub hovered: bool,
+    /// Held down.
+    pub active: bool,
+    /// Focused, and the focus is to be shown.
+    pub focus_ring: bool,
+}
+
+impl ControlKind {
+    /// Whether this control is one the reader can open.
+    #[must_use]
+    pub fn opens(self) -> bool {
+        matches!(self, Self::DropDown)
+    }
+}
+
+/// What kind of control a box is.
+///
+/// Coarser than the `type` attribute on purpose: what is listed here are the
+/// things that are *measured* or *drawn* differently. Every text-entry type is one
+/// entry, because a `tel` field and a `url` field differ in what they accept and
+/// in nothing a box can see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlKind {
+    /// A field the reader types into: one line, measured from `size`.
+    Field,
+    /// A `<textarea>`: measured from `cols` and `rows`.
+    Area,
+    /// A button, however it was spelled. Measured by its label.
+    Button,
+    /// A checkbox: a square of a fixed size, with nothing in it that came from
+    /// the document.
+    Checkbox,
+    /// A radio button: the same, drawn round.
+    Radio,
+    /// A drop-down `<select>`: as wide as its widest option, plus the arrow.
+    DropDown,
+    /// A `<select>` showing several rows at once.
+    ListBox,
+    /// A slider.
+    Range,
+    /// A colour well.
+    Color,
+    /// A file picker: a button with the chosen file's name beside it.
+    File,
+    /// A `<progress>` bar.
+    Progress,
+    /// A `<meter>`.
+    Meter,
+}
+
+impl ControlKind {
+    /// Whether the widget has a size of its own that nothing in the document can
+    /// change — a checkbox is thirteen pixels because it is a checkbox.
+    #[must_use]
+    pub fn is_fixed_size(self) -> bool {
+        matches!(self, Self::Checkbox | Self::Radio)
+    }
+
+    /// Whether the reader can type into it.
+    #[must_use]
+    pub fn is_text_entry(self) -> bool {
+        matches!(self, Self::Field | Self::Area)
+    }
+}
+
 /// One box.
 #[derive(Clone, Debug)]
 pub struct BoxNode {
     /// What it is.
     pub kind: BoxKind,
+    /// What control it is, when it is one.
+    ///
+    /// Beside the kind rather than one of them: a control is still a block
+    /// container, and every rule about how a block container is laid out applies
+    /// to it unchanged.
+    pub control: Option<Control>,
     /// Its computed style. Shared, because siblings usually agree.
     pub style: Arc<ComputedStyle>,
     /// The element or text node that generated it, absent for anonymous boxes.
@@ -183,6 +314,7 @@ impl BoxTree {
         let mut boxes = SlotMap::with_key();
         let root = boxes.insert(BoxNode {
             kind: BoxKind::Block,
+            control: None,
             style,
             node: None,
             tag: None,
@@ -324,6 +456,7 @@ impl BoxTree {
     pub(crate) fn create_anonymous(&mut self, kind: BoxKind, style: Arc<ComputedStyle>) -> BoxId {
         self.boxes.insert(BoxNode {
             kind,
+            control: None,
             style,
             node: None,
             tag: None,
@@ -331,6 +464,47 @@ impl BoxTree {
             children: Vec::new(),
             parent: None,
         })
+    }
+
+    /// Note that a control's widget size has been settled.
+    pub fn mark_sized(&mut self, id: BoxId) {
+        if let Some(node) = self.boxes.get_mut(id)
+            && let Some(control) = node.control.as_mut()
+        {
+            control.sized = true;
+        }
+    }
+
+    /// Slide the text inside a control.
+    pub fn set_control_scroll(&mut self, id: BoxId, scroll: (f32, f32)) {
+        if let Some(node) = self.boxes.get_mut(id)
+            && let Some(control) = node.control.as_mut()
+        {
+            control.scroll = scroll;
+        }
+    }
+
+    /// How far the text inside a control has been slid.
+    #[must_use]
+    pub fn control_scroll(&self, id: BoxId) -> (f32, f32) {
+        self.boxes
+            .get(id)
+            .and_then(|node| node.control.as_ref())
+            .map_or((0.0, 0.0), |control| control.scroll)
+    }
+
+    /// Replace a box's computed style.
+    ///
+    /// For the one thing style cannot answer on its own: how big a widget is. A
+    /// checkbox is thirteen pixels and a field is twenty characters wide, and both
+    /// numbers need the font, which is not known when the tree is built. Writing
+    /// them into the style is what makes every later question about the box's size
+    /// — its own, its line's, its flex container's — get the same answer without
+    /// each of them having to ask a second question first.
+    pub fn set_style(&mut self, id: BoxId, style: Arc<ComputedStyle>) {
+        if let Some(node) = self.boxes.get_mut(id) {
+            node.style = style;
+        }
     }
 
     /// Every box under `id`, depth first, `id` included.

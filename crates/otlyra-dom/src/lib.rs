@@ -9,6 +9,8 @@
 //! ## Contents
 //!
 //! - [`limits`] — what a hostile document is not allowed to cost.
+//! - [`form`] — what a form control is, and what the reader has made it hold.
+//! - [`submit`] — the pairs a form sends, and how they are spelled.
 //! - [`node`] — [`NodeId`], [`Node`], [`NodeData`].
 //! - [`tree`] — [`Document`]: the arena and its read API.
 //! - [`mutator`] — [`DocumentMutator`]: the write API.
@@ -28,16 +30,20 @@
 //!    than handing a stack overflow to the first recursive walk over it.
 
 pub mod dump;
+pub mod form;
 pub mod limits;
 pub mod mutator;
 pub mod node;
 pub mod sink;
+pub mod submit;
 pub mod tree;
 
+pub use form::{Control, FormState, InputKind};
 pub use limits::DomLimits;
 pub use mutator::DocumentMutator;
 pub use node::{ElementData, Node, NodeData, NodeId, node_id_from_u64, node_id_to_u64};
 pub use sink::DomSink;
+pub use submit::{Encoding, Method, Submission};
 pub use tree::Document;
 
 #[cfg(test)]

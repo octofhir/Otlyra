@@ -22,10 +22,10 @@ fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
             color_scheme: Default::default(),
         },
     );
-    let boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
     let mut text = isolated_engine();
     layout(
-        &boxes,
+        &mut boxes,
         &mut text,
         Viewport {
             width,
@@ -37,10 +37,10 @@ fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
 /// Lay out `html` at `width` logical pixels.
 fn lay_out(html: &str, width: f32) -> FragmentTree {
     let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-    let boxes = build_box_tree(&parsed.document);
+    let mut boxes = build_box_tree(&parsed.document);
     let mut text = isolated_engine();
     layout(
-        &boxes,
+        &mut boxes,
         &mut text,
         Viewport {
             width,
@@ -1253,5 +1253,26 @@ fn a_table_with_a_width_fills_it() {
         (table.rect.width - 400.0).abs() < 0.01,
         "table was {} wide",
         table.rect.width
+    );
+}
+
+/// An inline block is laid out at the origin and moved into its line afterwards.
+/// The rectangle it cuts its contents off at has to travel with it: left behind at
+/// the origin it cuts the box off where the box is not, which is a field whose text
+/// has disappeared.
+#[test]
+fn a_clip_travels_with_the_inline_block_it_belongs_to() {
+    let tree = lay_out_styled(
+        "<body><p>before <span style='display: inline-block; overflow: hidden; \
+         width: 60px'>inside</span>",
+        800.0,
+    );
+    let clipped = tree
+        .iter()
+        .find_map(|fragment| fragment.clip)
+        .expect("something inside the inline block is clipped");
+    assert!(
+        clipped.x > 20.0,
+        "the clip stayed at the origin: {clipped:?}"
     );
 }

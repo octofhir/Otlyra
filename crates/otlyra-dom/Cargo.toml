@@ -13,5 +13,12 @@ html5ever.workspace = true
 slotmap.workspace = true
 tracing.workspace = true
 
+# A development cycle, which Cargo allows and which is the point: the parser is
+# the only thing that builds a document the way a page does, and a test of what a
+# form sends has to be written against markup rather than against forty calls to
+# the mutator.
+[dev-dependencies]
+otlyra-html.workspace = true
+
 [lints]
 workspace = true

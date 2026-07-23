@@ -10,7 +10,10 @@
 //!
 //! - [`style`] — [`ComputedStyle`] and the value types it is made of.
 //! - [`ua`] — the user-agent stylesheet, both as CSS and as the table it replaces.
+//! - [`appearance`] — `appearance`, carried through a cascade that lacks it.
 //! - [`cascade`] — parsing stylesheets and computing a style per element.
+//! - [`state`] — the state bits `:hover`, `:checked` and their kin are matched on.
+//! - [`invalidation`] — whether a change of state can change anything at all.
 //!
 //! ## Invariants
 //!
@@ -22,8 +25,11 @@
 //! 3. **No DOM, no layout, no painting.** This crate is values; who has them is the
 //!    DOM's business and what they mean geometrically is layout's.
 
+pub mod appearance;
 pub mod cascade;
 pub mod computed;
+pub mod invalidation;
+pub mod state;
 pub mod style;
 pub mod stylo_dom;
 pub mod ua;

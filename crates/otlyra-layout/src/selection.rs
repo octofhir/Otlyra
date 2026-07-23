@@ -580,3 +580,233 @@ pub fn text(tree: &FragmentTree, selection: Selection) -> String {
 
     out
 }
+
+/// How wide a caret is drawn, in logical pixels.
+///
+/// One pixel, like everything else that draws one. Two looks like a selection of
+/// one letter and none is invisible.
+pub const CARET_WIDTH: f32 = 1.0;
+
+/// Where the caret sits for a position in the page's text.
+///
+/// The same arithmetic a selection uses for its edges, which is what keeps the two
+/// from disagreeing: a caret at the end of a selection is drawn where the
+/// selection ends, to the pixel, because both come from the same answer to "where
+/// is this byte".
+#[must_use]
+pub fn caret_rect(tree: &FragmentTree, position: TextPosition) -> Option<Rect> {
+    let runs = runs(tree);
+    let fragment = runs.get(position.run)?;
+    Some(Rect::new(
+        edge(fragment, position.offset),
+        fragment.rect.y,
+        CARET_WIDTH,
+        fragment.rect.height,
+    ))
+}
+
+/// Where the caret sits inside one box, at a byte offset into the text it shows.
+///
+/// For a field, whose text is generated rather than written and whose offset is
+/// counted in what the control holds rather than in the page. An empty field has
+/// no run at all, so the caret goes where its first letter would: at the start of
+/// its content box.
+#[must_use]
+pub fn caret_in(tree: &FragmentTree, box_id: crate::BoxId, offset: usize) -> Option<Rect> {
+    let container = find_box(&tree.root, box_id)?;
+    if let Some((run, within)) = run_at(container, offset) {
+        return Some(Rect::new(
+            edge(run, within),
+            run.rect.y,
+            CARET_WIDTH,
+            run.rect.height,
+        ));
+    }
+
+    // Nothing has been set in it, so the caret goes at the near edge of what would
+    // hold the text — inside the border and inside the padding, which is where the
+    // first letter would have started.
+    //
+    // From the style rather than from the used edges, which most fragments do not
+    // carry: a caret four pixels to the left of where the first letter goes is a
+    // caret outside the field it belongs to.
+    let style = &container.style;
+    let left = style.border.left.width + style.padding.left.resolve(0.0);
+    let top = style.border.top.width + style.padding.top.resolve(0.0);
+    let bottom = style.border.bottom.width + style.padding.bottom.resolve(0.0);
+    Some(Rect::new(
+        container.rect.x + left,
+        container.rect.y + top,
+        CARET_WIDTH,
+        (container.rect.height - top - bottom).max(1.0),
+    ))
+}
+
+/// The fragment a box generated, if it generated one.
+fn find_box(fragment: &Fragment, box_id: crate::BoxId) -> Option<&Fragment> {
+    if fragment.box_id == Some(box_id) && matches!(fragment.kind, FragmentKind::Box) {
+        return Some(fragment);
+    }
+    fragment
+        .children
+        .iter()
+        .find_map(|child| find_box(child, box_id))
+}
+
+/// Every run of glyphs under a fragment, in document order.
+fn runs_under(fragment: &Fragment) -> Vec<&Fragment> {
+    let mut out = Vec::new();
+    collect_runs(fragment, &mut out);
+    out
+}
+
+fn collect_runs<'a>(fragment: &'a Fragment, out: &mut Vec<&'a Fragment>) {
+    if matches!(fragment.kind, FragmentKind::Text(_)) {
+        out.push(fragment);
+        return;
+    }
+    for child in &fragment.children {
+        collect_runs(child, out);
+    }
+}
+
+/// The run holding a byte offset into the text a box shows, and how far into that
+/// run it is.
+///
+/// A field is one run and a text area is one per line, and an offset is counted in
+/// what the control holds rather than in either — so the runs are walked and their
+/// lengths added up. An offset past the end belongs to the last run, at its end,
+/// which is where a caret at the end of the text goes.
+fn run_at(container: &Fragment, offset: usize) -> Option<(&Fragment, usize)> {
+    let runs = runs_under(container);
+    let mut seen = 0usize;
+    let mut last = None;
+    for run in runs {
+        let FragmentKind::Text(text) = &run.kind else {
+            continue;
+        };
+        let length = text.text.len();
+        if offset <= seen + length {
+            return Some((run, offset - seen));
+        }
+        seen += length;
+        last = Some(run);
+    }
+    last.map(|run| {
+        let length = match &run.kind {
+            FragmentKind::Text(text) => text.text.len(),
+            _ => 0,
+        };
+        (run, length)
+    })
+}
+
+/// How far into the text a box shows the point `x` lands.
+///
+/// The nearest boundary between two characters, the way a click in the page picks
+/// one — so clicking in the middle of a field puts the caret between the two
+/// letters the pointer is between rather than at the end of the line.
+#[must_use]
+pub fn offset_in(tree: &FragmentTree, box_id: crate::BoxId, x: f32, y: f32) -> Option<usize> {
+    let container = find_box(&tree.root, box_id)?;
+    let runs = runs_under(container);
+    if runs.is_empty() {
+        return Some(0);
+    }
+    // The line the point is on, or the nearest one: a point below the last line
+    // belongs to its end, which is what dragging out of the bottom of a text area
+    // means.
+    let line = runs
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let distance = |run: &Fragment| {
+                if y < run.rect.y {
+                    run.rect.y - y
+                } else if y > run.rect.bottom() {
+                    y - run.rect.bottom()
+                } else {
+                    0.0
+                }
+            };
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)?;
+
+    let before: usize = runs[..line]
+        .iter()
+        .map(|run| match &run.kind {
+            FragmentKind::Text(text) => text.text.len(),
+            _ => 0,
+        })
+        .sum();
+
+    let run_fragment = runs[line];
+    let FragmentKind::Text(run) = &run_fragment.kind else {
+        return None;
+    };
+    let mut best = (f32::INFINITY, 0usize);
+    let mut consider = |at: f32, offset: usize| {
+        let distance = (at - x).abs();
+        if distance < best.0 {
+            best = (distance, offset);
+        }
+    };
+    for glyph in &run.glyphs {
+        consider(run_fragment.rect.x + glyph.x, glyph.text_offset as usize);
+    }
+    consider(run_fragment.rect.right(), run.text.len());
+    Some(before + best.1)
+}
+
+/// The content box of the box `box_id` generated, in page coordinates.
+///
+/// What is inside its border and its padding: the room a field has to show its
+/// text in, and what a caret has to stay within.
+#[must_use]
+pub fn content_box(tree: &FragmentTree, box_id: crate::BoxId) -> Option<Rect> {
+    let container = find_box(&tree.root, box_id)?;
+    let style = &container.style;
+    let left = style.border.left.width + style.padding.left.resolve(0.0);
+    let right = style.border.right.width + style.padding.right.resolve(0.0);
+    let top = style.border.top.width + style.padding.top.resolve(0.0);
+    let bottom = style.border.bottom.width + style.padding.bottom.resolve(0.0);
+    Some(Rect::new(
+        container.rect.x + left,
+        container.rect.y + top,
+        (container.rect.width - left - right).max(0.0),
+        (container.rect.height - top - bottom).max(0.0),
+    ))
+}
+
+/// The rectangle covering the bytes from `from` to `to` of the text a box shows.
+///
+/// The same two edges a caret is drawn at, so a selection inside a field and the
+/// caret that ends it agree to the pixel.
+#[must_use]
+pub fn range_in(tree: &FragmentTree, box_id: crate::BoxId, from: usize, to: usize) -> Option<Rect> {
+    if from >= to {
+        return None;
+    }
+    let container = find_box(&tree.root, box_id)?;
+    let (start_run, start_at) = run_at(container, from)?;
+    let (end_run, end_at) = run_at(container, to)?;
+    // One rectangle, so a selection across the lines of a text area covers the
+    // block between them rather than each line exactly.
+    if std::ptr::eq(start_run, end_run) {
+        let left = edge(start_run, start_at);
+        let right = edge(end_run, end_at);
+        return (right > left)
+            .then(|| Rect::new(left, start_run.rect.y, right - left, start_run.rect.height));
+    }
+    let left = start_run.rect.x.min(end_run.rect.x);
+    let right = start_run.rect.right().max(end_run.rect.right());
+    Some(Rect::new(
+        left,
+        start_run.rect.y,
+        right - left,
+        end_run.rect.bottom() - start_run.rect.y,
+    ))
+}

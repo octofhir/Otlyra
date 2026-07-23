@@ -14,7 +14,7 @@ use otlyra_platform::{Cursor, Key, Modifiers, Painter, PlatformEvent, Viewport, 
 use otlyra_text::TextEngine;
 
 use crate::about::{self, AboutSurface};
-use crate::fetcher::{Fetched, Fetcher, Loader, ResourceKind};
+use crate::fetcher::{Body, Fetched, Fetcher, Loader, ResourceKind};
 use crate::page::{PageScene, title_of};
 use crate::settings::{self, SettingsSurface};
 use crate::ui::{BrowserUi, SystemPage, TabLabel, UI_HEIGHT, UiAction};
@@ -440,6 +440,42 @@ impl Browser {
     /// The keys that take a selection on the page, or move the one there is.
     ///
     /// `true` means the key was one of them and the page has answered it.
+    /// The keys that edit a field in the page, while one has the focus.
+    ///
+    /// Answered before the keys that move a selection: an arrow belongs to the
+    /// caret while there is a caret, and to the page's selection otherwise.
+    fn page_edit_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        use crate::page::EditAction;
+
+        if modifiers.command || modifiers.alt {
+            return false;
+        }
+        // A list that is showing owns the keys that walk it, and the one that puts
+        // it away.
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            match key {
+                Key::Escape if page.is_open() => return page.close_open(),
+                Key::Enter if page.is_open() => return page.close_open(),
+                Key::Up | Key::Down if page.step_selection(key == Key::Down) => return true,
+                _ => {}
+            }
+        }
+        let extend = modifiers.shift;
+        let action = match key {
+            Key::Backspace => EditAction::Backspace,
+            Key::Delete => EditAction::Delete,
+            Key::Left => EditAction::Left,
+            Key::Right => EditAction::Right,
+            Key::Home => EditAction::Home,
+            Key::End => EditAction::End,
+            _ => return false,
+        };
+        self.tabs[self.active]
+            .page
+            .as_mut()
+            .is_some_and(|page| page.edit_text(action, extend))
+    }
+
     fn page_selection_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
         use otlyra_layout::Motion;
 
@@ -565,12 +601,11 @@ impl Browser {
         &self.ui
     }
 
-    /// Load `url` into the active tab.
+    /// Load `url` into the active tab, as the reader asking for it.
     ///
-    /// The load is synchronous, and that is temporary: the event loop must never
-    /// wait on the network, which is why the loader's method is the shape it is and
-    /// why M9 replaces this body with a channel and a pending state rather than
-    /// replacing the caller.
+    /// Nothing waits here: the request goes to the fetch thread and the answer
+    /// arrives as an event, because an event loop that waits on the network is a
+    /// window that has stopped painting.
     pub fn navigate(&mut self, url: &str) {
         self.navigate_from(url, true);
     }
@@ -687,6 +722,50 @@ impl Browser {
     /// `user_initiated` says whether the address came from the person rather than
     /// from the page: it is what decides whether a `file:` URL may be reached at
     /// all, and a page from the internet must never be able to claim it.
+    /// Go wherever a form the reader has just sent points.
+    ///
+    /// A form that submits is a form that navigates, and that is the whole of it
+    /// without a script. An action of nothing at all means the page's own address,
+    /// which is what reloads a page with its answers in the query.
+    fn follow_submission(&mut self) {
+        let Some(sent) = self.tabs[self.active]
+            .page
+            .as_mut()
+            .and_then(PageScene::take_submission)
+        else {
+            return;
+        };
+        if sent.method == otlyra_dom::Method::Dialog {
+            return;
+        }
+        // The action is spelled as the markup spells it, so an empty one is the
+        // page itself and a relative one is resolved against it.
+        let here = self.tabs[self.active].url.clone();
+        let target = if sent.url.is_empty() {
+            here.clone()
+        } else {
+            otlyra_net::url::resolve(&here, &sent.url).unwrap_or_else(|| sent.url.clone())
+        };
+        // A form is the page acting, not the reader, so the same scheme policy that
+        // holds for a link holds here: a page from the network may not aim a form
+        // at a file.
+        if sent.method == otlyra_dom::Method::Post {
+            self.remember_scroll();
+            self.start_send(
+                &target,
+                false,
+                true,
+                0.0,
+                Some(Body {
+                    content_type: sent.content_type,
+                    bytes: sent.body,
+                }),
+            );
+            return;
+        }
+        self.navigate_from(&target, false);
+    }
+
     fn navigate_from(&mut self, url: &str, user_initiated: bool) {
         self.remember_scroll();
         self.start_load(url, user_initiated, true, 0.0);
@@ -699,6 +778,22 @@ impl Browser {
     /// become a history entry, and `restore_scroll` where the reader should be put
     /// once it has.
     fn start_load(&mut self, url: &str, user_initiated: bool, record: bool, restore_scroll: f32) {
+        self.start_send(url, user_initiated, record, restore_scroll, None);
+    }
+
+    /// Ask for `url` with a body, and leave the tab waiting for it.
+    ///
+    /// The same navigation as any other in every respect but the method: the same
+    /// scheme policy, the same history entry, the same pending state. What a form
+    /// sends is bytes on the request rather than a different way of getting there.
+    fn start_send(
+        &mut self,
+        url: &str,
+        user_initiated: bool,
+        record: bool,
+        restore_scroll: f32,
+        body: Option<Body>,
+    ) {
         let _span = tracing::info_span!("navigation", url).entered();
 
         // A browser's own page is fetched from nothing and parsed from nothing:
@@ -725,7 +820,7 @@ impl Browser {
         }
 
         let previous_url = self.tabs[self.active].url.clone();
-        let id = self.fetcher.request(url, ResourceKind::Document);
+        let id = self.fetcher.send(url, ResourceKind::Document, body);
         self.load_started = std::time::Instant::now();
 
         let tab = &mut self.tabs[self.active];
@@ -1939,7 +2034,14 @@ impl Painter for Browser {
     /// A frame at the display's pace while something is loading, so the spinner
     /// turns; nothing at all when the browser is idle.
     fn animating(&self) -> bool {
+        // A caret is the one thing on a page that is otherwise still and still
+        // changes: without this the loop goes back to blocking and the caret stops
+        // half way through a blink, wherever it happened to be.
         self.tabs.iter().any(Tab::loading)
+            || self.tabs[self.active]
+                .page
+                .as_ref()
+                .is_some_and(crate::page::PageScene::caret_blinks)
     }
 
     fn on_event(&mut self, event: PlatformEvent) {
@@ -1991,6 +2093,22 @@ impl Painter for Browser {
                         height.max(0.0) as f32,
                     );
                     return;
+                }
+                // The page follows the pointer: `:hover` on what it is over, and
+                // the widget under it drawn as hovered. Nothing is repainted unless
+                // something depends on it, which for most pages is never.
+                if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
+                    let over_page = y >= UI_HEIGHT && y < self.dock_top();
+                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                        let moved = if over_page {
+                            page.pointer_moved(x, y)
+                        } else {
+                            page.pointer_left()
+                        };
+                        // Every event already asks for a frame; what `moved` says
+                        // is whether anything had to be styled again.
+                        let _ = moved;
+                    }
                 }
                 match self.tabs[self.active].system {
                     // Moves matter to a surface that has a slider on it: that is
@@ -2077,6 +2195,25 @@ impl Painter for Browser {
                     self.navigate_from(&url, false);
                     return;
                 }
+                // A control takes the press before the text under it does: pressing
+                // a checkbox is not the start of selecting the word beside it.
+                if !self.ui.owns_pointer()
+                    && self.tabs[self.active].system.is_none()
+                    && self.pointer.1 >= UI_HEIGHT
+                {
+                    let (x, y) = self.pointer;
+                    let pressed = self.tabs[self.active]
+                        .page
+                        .as_mut()
+                        .is_some_and(|page| page.control_under(x, y));
+                    if pressed {
+                        if let Some(page) = self.tabs[self.active].page.as_mut() {
+                            page.clear_selection();
+                            page.pointer_pressed_times(x, y, clicks);
+                        }
+                        return;
+                    }
+                }
                 // A press on the page starts a selection where it landed, and takes
                 // away whatever was selected before — which is what a press on a
                 // page means everywhere else.
@@ -2113,9 +2250,16 @@ impl Painter for Browser {
 
             PlatformEvent::PointerReleased => {
                 self.selecting = false;
+                let (x, y) = self.pointer;
                 if let Some(page) = self.tabs[self.active].page.as_mut() {
                     page.release_scrollbar();
+                    // A control is activated on the release and only where the
+                    // press landed: a press that wanders off the checkbox before it
+                    // is let go does not tick it, which is what every platform does
+                    // and what makes a press a thing a reader can take back.
+                    page.pointer_released(x, y);
                 }
+                self.follow_submission();
                 self.settings.pointer_released();
                 self.history_page.pointer_released();
                 self.ui.pointer_released();
@@ -2204,6 +2348,28 @@ impl Painter for Browser {
                 // page only while the interface does not hold the caret, for the
                 // same reason ⌘C does: the address bar's own text is a selection
                 // too, and there is one keyboard between them.
+                // Return in a field sends the form it is in, which is why a search
+                // box with nothing but a field in it works at all.
+                if key == Key::Enter
+                    && !self.ui.address_focused()
+                    && self.tabs[self.active].system.is_none()
+                    && self.tabs[self.active]
+                        .page
+                        .as_mut()
+                        .is_some_and(PageScene::implicit_submit)
+                {
+                    self.follow_submission();
+                    return;
+                }
+                // Editing what is in a field in the page, before the keys that
+                // move a selection: an arrow in a focused field moves the caret
+                // and not the page's selection.
+                if !self.ui.address_focused()
+                    && self.tabs[self.active].system.is_none()
+                    && self.page_edit_key(key, modifiers)
+                {
+                    return;
+                }
                 if !self.ui.address_focused()
                     && self.tabs[self.active].system.is_none()
                     && self.page_selection_key(key, modifiers)
@@ -2225,6 +2391,16 @@ impl Painter for Browser {
                 // pages below, because the panel is drawn over them and a caret
                 // is where the typing goes.
                 if self.inspector.text_input(character) {
+                    return;
+                }
+                // A field *in the page* holds the caret, and the interface's own
+                // does not. One keyboard between them, so the page only gets the
+                // letters nothing above it wanted.
+                if !self.ui.address_focused()
+                    && self.tabs[self.active].system.is_none()
+                    && let Some(page) = self.tabs[self.active].page.as_mut()
+                    && page.typed(&character.to_string())
+                {
                     return;
                 }
                 if self.tabs[self.active].system == Some(SystemPage::History)
@@ -4500,6 +4676,87 @@ mod tests {
         browser.navigate("about:settings");
         assert_eq!(browser.system_page(), Some(SystemPage::Settings));
         assert_eq!(browser.ui.address.text(), "about:settings");
+    }
+
+    /// A form that posts sends its body, and the answer becomes the page.
+    ///
+    /// Everything before the request is tested where it is built; what this holds
+    /// is the last stretch, which was the missing one: the method, the body and the
+    /// type reach the transport, and the page they come back with is the tab's.
+    #[test]
+    fn a_form_that_posts_sends_its_body() {
+        /// Every request the browser made, with whatever body it carried.
+        type Sent = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<Body>)>>>;
+
+        struct PostLoader {
+            sent: Sent,
+        }
+
+        impl Loader for PostLoader {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.send(url, None)
+            }
+
+            fn send(&self, url: &str, body: Option<Body>) -> Result<Loaded, String> {
+                self.sent
+                    .lock()
+                    .expect("no panic on the fetch thread")
+                    .push((url.to_owned(), body.clone()));
+                let bytes = if body.is_some() {
+                    b"<body><p>saved".to_vec()
+                } else {
+                    b"<body><form method=post action=/save>\
+                      <input name=who value=Ada><input type=submit value=Go></form>"
+                        .to_vec()
+                };
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes,
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let sent = Sent::default();
+        let mut browser = Browser::new(PostLoader {
+            sent: std::sync::Arc::clone(&sent),
+        });
+        go(&mut browser, "https://site.example/");
+
+        // Pressed where it was drawn, which needs a frame: the button's rectangle
+        // is the last layout's, like every other press.
+        let active = browser.active;
+        let page = browser.tabs[active].page.as_mut().expect("a page");
+        page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
+        let boxes = page.boxes();
+        let button = boxes
+            .descendants(boxes.root())
+            .into_iter()
+            .filter(|&id| boxes.node(id).control.is_some())
+            .nth(1)
+            .expect("the button");
+        let rect = page.rect_of(button).expect("a rectangle");
+        let (x, y) = (
+            f64::from(rect.x + rect.width / 2.0),
+            f64::from(rect.y + rect.height / 2.0),
+        );
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        browser.follow_submission();
+        settle(&mut browser);
+
+        let sent = sent.lock().expect("no panic on the fetch thread").clone();
+        let (url, body) = sent.last().expect("the form was sent").clone();
+        assert_eq!(url, "https://site.example/save");
+        let body = body.expect("a POST carries a body");
+        assert_eq!(body.content_type, "application/x-www-form-urlencoded");
+        assert_eq!(body.bytes, b"who=Ada");
+        assert_eq!(
+            browser.tabs[browser.active].url, "https://site.example/save",
+            "and the tab is where the form sent it"
+        );
     }
 
     /// A site whose CSS lives in a file next to the page.

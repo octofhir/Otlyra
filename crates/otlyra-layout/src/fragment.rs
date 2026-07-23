@@ -139,6 +139,13 @@ pub struct Fragment {
     pub clip: Option<Rect>,
     /// What holds this fragment in view while the page scrolls, if anything.
     pub sticky: Option<Sticky>,
+    /// The widget to draw behind this fragment's contents, when it is a control
+    /// the page has not taken the look away from.
+    ///
+    /// Carried on the fragment rather than looked up in the box tree, because
+    /// paint has the fragment tree and nothing else — and a widget that is drawn
+    /// from a second source is a widget that can disagree with the box it is in.
+    pub widget: Option<crate::box_tree::Control>,
     /// Whether scrolling the page moves it.
     ///
     /// A fixed box is placed against the viewport, and so is everything inside it;

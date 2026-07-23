@@ -36,12 +36,24 @@ pub struct StyledDocument {
     pub style_data: StyleData,
     /// The computed style of each element, by node.
     styles: HashMap<NodeId, Arc<ComputedValues>>,
+    /// The controls whose own look an author rule has taken away.
+    devolved: std::collections::HashSet<NodeId>,
 }
 
 impl StyledDocument {
     /// The computed style of one element, if it has one.
     pub fn style_of(&self, node: NodeId) -> Option<&Arc<ComputedValues>> {
         self.styles.get(&node)
+    }
+
+    /// Whether this control is drawn by the page rather than as a widget.
+    pub fn is_devolved(&self, node: NodeId) -> bool {
+        self.devolved.contains(&node)
+    }
+
+    /// Every state bit an element held when its style was computed.
+    pub fn state_of(&self, node: NodeId) -> stylo_dom::ElementState {
+        self.style_data.state_of(node)
     }
 
     /// How many elements got a style.
@@ -240,6 +252,10 @@ impl Styler {
 
         let mut font_faces = Vec::new();
         for (node, source) in author_stylesheets(document, external) {
+            // `appearance` has to survive the parser, and the parser has no such
+            // property; see the module that carries it for why the name is changed
+            // rather than the meaning.
+            let source = crate::appearance::rewrite_stylesheet(&source);
             let sheet = Arc::new(parse_sheet(
                 &source,
                 Origin::Author,
@@ -265,6 +281,82 @@ impl Styler {
     /// The `@font-face` rules the page declares.
     pub fn font_faces(&self) -> &[FontFace] {
         &self.font_faces
+    }
+
+    /// Whether an author rule has taken a widget's own look away from it.
+    ///
+    /// CSS calls the result a *devolved* widget: a control the page has given a
+    /// background, a border or a corner radius of its own is no longer drawn as a
+    /// widget at all, because the page has said what it should look like and a
+    /// theme drawn over that would be drawing over the answer. The list of
+    /// properties is the specification's, and it is a list rather than "any
+    /// declaration" — a page that sets a control's `color` still gets a widget.
+    ///
+    /// Asked once per control rather than once per element: the walk is the rule
+    /// chain the cascade already built, and a page has a handful of controls.
+    pub fn devolves(&self, style: &ComputedValues) -> bool {
+        use style::properties::LonghandId;
+
+        /// The properties that take a widget's look away. From the specification,
+        /// in its order.
+        const DISABLES: &[LonghandId] = &[
+            LonghandId::BackgroundColor,
+            LonghandId::BackgroundImage,
+            LonghandId::BackgroundAttachment,
+            LonghandId::BackgroundPositionX,
+            LonghandId::BackgroundPositionY,
+            LonghandId::BackgroundClip,
+            LonghandId::BackgroundOrigin,
+            LonghandId::BackgroundSize,
+            LonghandId::BorderTopColor,
+            LonghandId::BorderRightColor,
+            LonghandId::BorderBottomColor,
+            LonghandId::BorderLeftColor,
+            LonghandId::BorderTopStyle,
+            LonghandId::BorderRightStyle,
+            LonghandId::BorderBottomStyle,
+            LonghandId::BorderLeftStyle,
+            LonghandId::BorderTopWidth,
+            LonghandId::BorderRightWidth,
+            LonghandId::BorderBottomWidth,
+            LonghandId::BorderLeftWidth,
+            LonghandId::BorderImageSource,
+            LonghandId::BorderImageSlice,
+            LonghandId::BorderImageWidth,
+            LonghandId::BorderImageOutset,
+            LonghandId::BorderImageRepeat,
+            LonghandId::BorderTopLeftRadius,
+            LonghandId::BorderTopRightRadius,
+            LonghandId::BorderBottomRightRadius,
+            LonghandId::BorderBottomLeftRadius,
+        ];
+
+        let guard = self.lock.read();
+        for node in style.rules().self_and_ancestors() {
+            let Some(source) = node.style_source() else {
+                continue;
+            };
+            let key = source.get().raw_ptr().as_ptr() as usize;
+            // A block with no recorded selector was not written as a rule: it is a
+            // `style` attribute or a presentational hint, and both are the
+            // author's.
+            let author = self
+                .selectors
+                .get(&key)
+                .is_none_or(|source| source.origin == Origin::Author);
+            if !author {
+                continue;
+            }
+            let block = source.read(&guard);
+            for (declaration, _) in block.declaration_importance_iter() {
+                if let style::properties::PropertyDeclarationId::Longhand(id) = declaration.id()
+                    && DISABLES.contains(&id)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The rules that produced a computed style, strongest last.
@@ -361,12 +453,73 @@ impl Styler {
         used_viewport_units
     }
 
-    /// Compute a style for every element.
+    /// Whether moving the pointer or the focus from `before` to `after` can change
+    /// any element's style.
+    ///
+    /// The answer is almost always no, and no costs a handful of intersections
+    /// against an index the engine keeps anyway. Yes costs a restyle, which is what
+    /// a page that styles its links on hover has asked for.
+    pub fn interaction_changes_style(
+        &mut self,
+        document: &Document,
+        form: &otlyra_dom::FormState,
+        before: crate::state::Interaction,
+        after: crate::state::Interaction,
+    ) -> bool {
+        if before == after {
+            return false;
+        }
+        // The index is built as the sheets are flushed, so asking before the first
+        // flush would ask an empty one.
+        {
+            let guard = self.lock.read();
+            self.stylist.flush(&StylesheetGuards::same(&guard));
+        }
+
+        let before_states = crate::state::States::new(document, form, before);
+        let after_states = crate::state::States::new(document, form, after);
+        let touched = crate::state::touched_nodes(document, before, after);
+
+        // The bucket lookup reads an element's id and classes through the matcher's
+        // own atom table, which only exists in a slot — so slots are made, for the
+        // touched elements and no others.
+        let mut style_data = StyleData::with_lock(self.lock.clone());
+        style_data.prepare_nodes(document, &touched, form, after);
+        let tree = Tree::styled(document, &style_data, &self.lock);
+        let _scope = TreeScope::enter(&tree);
+        touched.into_iter().any(|id| {
+            let changed = before_states.state_of(id) ^ after_states.state_of(id);
+            crate::invalidation::document_depends_on(&self.stylist, changed)
+                && crate::invalidation::element_depends_on(&self.stylist, tree.node(id), changed)
+        })
+    }
+
+    /// Compute a style for every element, for a page nobody is pointing at.
     pub fn style(&mut self, document: &Document) -> StyledDocument {
+        self.style_with(
+            document,
+            &otlyra_dom::FormState::new(),
+            crate::state::Interaction::none(),
+        )
+    }
+
+    /// Compute a style for every element, given what the controls hold and where
+    /// the pointer and the focus are.
+    ///
+    /// The two extra arguments are what makes `:checked` and `:hover` mean
+    /// anything. They are passed rather than stored because neither belongs to the
+    /// document: the same document in two windows has two pointers and one set of
+    /// markup.
+    pub fn style_with(
+        &mut self,
+        document: &Document,
+        form: &otlyra_dom::FormState,
+        interaction: crate::state::Interaction,
+    ) -> StyledDocument {
         let _span = tracing::info_span!("recalc_style").entered();
 
         let mut style_data = StyleData::with_lock(self.lock.clone());
-        style_data.prepare(document);
+        style_data.prepare(document, form, interaction);
 
         let guard = self.lock.read();
         self.stylist.flush(&StylesheetGuards::same(&guard));
@@ -408,7 +561,22 @@ impl Styler {
         }
 
         tracing::debug!(elements = styles.len(), "styled");
-        StyledDocument { style_data, styles }
+        // Only a control can devolve, and a page has a handful of them — so the
+        // question is asked here, where the rule chain is still to hand, rather
+        // than left for whatever needs the answer to go looking for one.
+        let devolved = styles
+            .iter()
+            .filter(|(node, style)| {
+                otlyra_dom::form::Control::of(document, **node).is_some() && self.devolves(style)
+            })
+            .map(|(node, _)| *node)
+            .collect();
+
+        StyledDocument {
+            style_data,
+            styles,
+            devolved,
+        }
     }
 }
 

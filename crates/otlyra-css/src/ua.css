@@ -111,21 +111,129 @@ s, strike, del { text-decoration: line-through; }
    page, and it is not blue and not underlined anywhere else either. */
 a[href] { color: #0000ee; text-decoration: underline; }
 
-/* A control's text is smaller than the prose around it, and the size is a length
-   rather than a fraction: it does not inherit the size of whatever the control
-   happens to sit in, which is what keeps a field in a heading from being set at
-   heading size. */
-button, select { background-color: #e6e6e8; font-size: 13.3333px;
-                 border: 1px solid #8f8f9d; padding: 1px 6px; }
-input { background-color: #f4f4f6; font-size: 13.3333px;
-        border: 1px solid #8f8f9d; padding: 1px 2px; }
-textarea { background-color: #f4f4f6; font-family: monospace; font-size: 13.3333px;
-           white-space: pre-wrap; border: 1px solid #8f8f9d; padding: 2px; }
+/* Controls.
+
+   The numbers are measured from two references rather than remembered, and where
+   the two disagree the one the pictures are compared against wins. What they agree
+   on is most of it: a control's text is smaller than the prose around it and the
+   size is a length rather than a fraction, so a field in a heading is not set at
+   heading size; the family is the platform's own rather than the page's; a field
+   measures across its content and a button across its border.
+
+   What is *not* here is a checkbox's size. It is thirteen pixels because the
+   widget is thirteen pixels, not because a rule says so — which is why both
+   references shrink a checkbox to nothing when it is told to stop being a widget,
+   and why the size is layout's answer and not the cascade's.
+
+   `appearance` is the property the cascade does not have; it is carried under
+   another name, and this is where the widgets are told they are widgets. */
+@property --otlyra-appearance {
+  syntax: "*";
+  inherits: false;
+  initial-value: none;
+}
+input, button, select, textarea, meter, progress {
+  --otlyra-appearance: auto;
+}
+
+input {
+  display: inline-block;
+  box-sizing: content-box;
+  font: 400 13.3333px sans-serif;
+  padding: 1px 2px;
+  border: 2px inset #767676;
+  background-color: #ffffff;
+  color: #000000;
+  cursor: text;
+  text-align: start;
+  text-indent: 0;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-transform: none;
+  /* A field shows one line however much is in it: what is past its edge is cut
+     off rather than spilled across the page. */
+  overflow: clip;
+}
+
+button,
+input[type="button" i], input[type="submit" i], input[type="reset" i] {
+  display: inline-block;
+  box-sizing: border-box;
+  font: 400 13.3333px sans-serif;
+  padding: 1px 6px;
+  border: 2px outset #767676;
+  background-color: #efefef;
+  color: #000000;
+  text-align: center;
+  cursor: default;
+}
+
+/* A checkbox and a radio button carry no text and no edge of their own: the tick
+   and the ring are drawn, not set, so everything a box normally has is cleared
+   and the shape is put in its place. The margins are the two references' own, to
+   the pixel, and they are not the same on all four sides. */
+input[type="checkbox" i], input[type="radio" i] {
+  box-sizing: border-box;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  cursor: default;
+}
+input[type="checkbox" i] { margin: 3px 3px 3px 4px; }
+input[type="radio" i] { margin: 3px 3px 0 5px; }
+
+input[type="hidden" i] { display: none; }
+
+select {
+  display: inline-block;
+  box-sizing: border-box;
+  font: 400 13.3333px sans-serif;
+  padding: 0;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  color: #000000;
+  align-items: center;
+  white-space: pre;
+  cursor: default;
+  overflow: clip;
+}
+
+textarea {
+  display: inline-block;
+  box-sizing: content-box;
+  font: 400 13.3333px monospace;
+  padding: 2px;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  color: #000000;
+  white-space: pre-wrap;
+  cursor: text;
+  /* As many rows as it was asked for, whatever is in it: what is past the last of
+     them is cut off, and the text slides under the box to follow the caret. */
+  overflow: clip;
+}
+
+/* A bar is a widget with a size and no contents. Both references give the same
+   two, and neither takes them from the font. */
+progress { display: inline-block; box-sizing: border-box; width: 160px; height: 16px; }
+meter { display: inline-block; box-sizing: border-box; width: 80px; height: 16px; }
+
+/* A control nothing can do anything with says so in its text as well as in its
+   face: both references grey the words, and only one of the two greys the edge. */
+input:disabled, button:disabled, select:disabled, textarea:disabled,
+option:disabled, optgroup:disabled { color: #545454; }
+
 fieldset { padding: 0.35em 0.75em 0.625em; margin: 0 2px;
            border: 2px groove #c0c0c0; }
 legend { padding: 0 2px; }
 optgroup { font-weight: bold; }
-option { padding-left: 2px; }
+option { padding: 0 2px; }
+/* Only ever seen in an open list: a closed drop-down shows one option and it is
+   not one of these boxes. The chosen one is marked and the one under the pointer
+   is lit, which is what a menu does everywhere. */
+option:checked { background-color: #cce4ff; }
+option:hover { background-color: #e8f1ff; }
+option:checked:hover { background-color: #b8d8ff; }
 /* A frame is a document of its own, which this cannot show — but the space it
    takes and the edge around it are what a page is laid out against either way. */
 iframe { border: 2px inset; }

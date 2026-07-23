@@ -16,7 +16,7 @@ use otlyra_css::{
 };
 use otlyra_text::{FontStack, PlacedSpacer, Spacer, TextEngine, TextSpan};
 
-use crate::box_tree::{BoxId, BoxKind, BoxTree};
+use crate::box_tree::{BoxId, BoxKind, BoxTree, Control, ControlKind};
 use crate::fragment::{Fragment, FragmentKind, FragmentTree, Layer, Rect, ScrollPort, Sticky};
 
 /// The size of the viewport, in logical pixels.
@@ -29,10 +29,15 @@ pub struct Viewport {
 }
 
 /// Lay out `tree` into `viewport`.
-pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> FragmentTree {
+pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> FragmentTree {
     let _span = tracing::info_span!("layout", width = viewport.width).entered();
 
     let initial = Rect::new(0.0, 0.0, viewport.width, viewport.height);
+    // A widget's own size needs the font, which the box tree was built without, so
+    // it is settled here — into the tree, where every question about a box's size
+    // already looks.
+    size_widgets(tree, text);
+    let tree = &*tree;
     let mut engine = Flow {
         tree,
         text,
@@ -61,6 +66,7 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
         rect: Rect::new(0.0, 0.0, viewport.width, height.max(viewport.height)),
         kind: FragmentKind::Box,
         style: Arc::clone(&tree.node(root).style),
+        widget: None,
         fixed: false,
         scroll_port: None,
         clip: None,
@@ -76,9 +82,37 @@ pub fn layout(tree: &BoxTree, text: &mut TextEngine, viewport: Viewport) -> Frag
     crate::fragment::assign_paint_order(&mut root_fragment);
 
     tracing::debug!(height, "laid out");
-    FragmentTree {
+    let mut fragments = FragmentTree {
         root: root_fragment,
         scroll_ports: engine.scroll_ports,
+    };
+    // The widget a fragment draws, filled in one pass rather than at each of the
+    // dozen places a box fragment is made: a widget missing from one of them is a
+    // control that is a widget everywhere except in a table cell.
+    attach_widgets(&mut fragments.root, tree);
+    fragments
+}
+
+/// Move a fragment and everything under it.
+fn shift(fragment: &mut Fragment, dx: f32, dy: f32) {
+    fragment.rect.x += dx;
+    fragment.rect.y += dy;
+    for child in &mut fragment.children {
+        shift(child, dx, dy);
+    }
+}
+
+/// Give every fragment the widget its box describes.
+fn attach_widgets(fragment: &mut Fragment, tree: &BoxTree) {
+    if let Some(id) = fragment.box_id
+        && matches!(fragment.kind, FragmentKind::Box)
+        && let Some(control) = tree.node(id).control.as_ref()
+        && control.widget
+    {
+        fragment.widget = Some(control.clone());
+    }
+    for child in &mut fragment.children {
+        attach_widgets(child, tree);
     }
 }
 
@@ -590,6 +624,7 @@ fn replaced_fragment(
         ),
         kind: FragmentKind::Image(image),
         style: Arc::clone(style),
+        widget: None,
         fixed: false,
         scroll_port: None,
         clip: None,
@@ -604,6 +639,7 @@ fn replaced_fragment(
         rect: Rect::new(x, y, width + extra_x, height + extra_y),
         kind: FragmentKind::Box,
         style: Arc::clone(style),
+        widget: None,
         fixed: false,
         scroll_port: None,
         clip: None,
@@ -634,6 +670,14 @@ fn line_to_column(line: i32, count: usize) -> usize {
 fn offset(fragment: &mut Fragment, x: f32, y: f32) {
     fragment.rect.x += x;
     fragment.rect.y += y;
+    // The rectangle a fragment is cut off at is in the same space its own is, so
+    // it travels with it. An inline block is laid out at the origin and moved into
+    // its line afterwards; a clip left behind at the origin cuts the box off where
+    // the box no longer is, which is a field whose text has vanished.
+    if let Some(clip) = fragment.clip.as_mut() {
+        clip.x += x;
+        clip.y += y;
+    }
     for child in &mut fragment.children {
         offset(child, x, y);
     }
@@ -831,6 +875,7 @@ fn line_fragment(border: otlyra_css::Border, rect: Rect) -> Option<Fragment> {
         rect,
         kind: FragmentKind::Box,
         style: Arc::new(style),
+        widget: None,
         fixed: false,
         scroll_port: None,
         clip: None,
@@ -856,6 +901,13 @@ fn baseline_of(fragment: &Fragment) -> Option<f32> {
             last = Some(last.map_or(at, |previous: f32| previous.max(at)));
         }
         for child in &current.children {
+            // A box that has left the flow has left the line as well: its text is
+            // not on the line and its baseline is not the line's. Descending into
+            // one makes a drop-down's open list part of the line the drop-down sits
+            // on, and the line as tall as the list.
+            if child.style.position.is_out_of_flow() {
+                continue;
+            }
             stack.push((child, 0.0));
         }
     }
@@ -1239,6 +1291,35 @@ impl<'a> Flow<'a> {
             width,
         );
 
+        // A field is one line long however much has been typed into it, so what
+        // moves is the line and not the box. Before the clip, because what is slid
+        // out of the box is exactly what the clip is for.
+        let slid = self
+            .tree
+            .node(id)
+            .control
+            .as_ref()
+            .map_or((0.0, 0.0), |control| control.scroll);
+        if slid != (0.0, 0.0) {
+            for child in &mut children {
+                shift(child, -slid.0, -slid.1);
+            }
+        }
+        // A box that is inline outside cuts its contents off at its padding edge
+        // like any other, and until a field slid its text under itself there was
+        // nothing inside one that ever reached the edge to notice.
+        if style.overflow == otlyra_css::Overflow::Clip {
+            let padding_box = Rect::new(
+                x + border.left,
+                y + border.top,
+                content_width + padding.left + padding.right,
+                content_height + padding.top + padding.bottom,
+            );
+            for child in &mut children {
+                set_clip(child, padding_box);
+            }
+        }
+
         Fragment {
             used: None,
             box_id: Some(id),
@@ -1250,6 +1331,7 @@ impl<'a> Flow<'a> {
             ),
             kind: FragmentKind::Box,
             style,
+            widget: None,
             fixed: false,
             scroll_port: None,
             clip: None,
@@ -1524,6 +1606,21 @@ impl<'a> Flow<'a> {
             Rect::new(content_x, content_y, content_width, content_height),
         );
 
+        // A field is one line long however much has been typed into it, so what
+        // moves is the line and not the box. Before the clip, because what is slid
+        // out of the box is what the clip is for.
+        let slid = self
+            .tree
+            .node(id)
+            .control
+            .as_ref()
+            .map_or((0.0, 0.0), |control| control.scroll);
+        if slid != (0.0, 0.0) {
+            for child in &mut children {
+                shift(child, -slid.0, -slid.1);
+            }
+        }
+
         // `overflow` other than `visible` cuts its contents off at the padding
         // edge. The rectangle is handed down rather than pushed as a layer, so a
         // fragment carries the one rectangle it is cut off at however deep it is.
@@ -1574,6 +1671,7 @@ impl<'a> Flow<'a> {
             ),
             kind: FragmentKind::Box,
             style,
+            widget: None,
             fixed: false,
             scroll_port: None,
             clip: None,
@@ -1812,6 +1910,7 @@ impl<'a> Flow<'a> {
                     ),
                     kind: FragmentKind::Box,
                     style: Arc::clone(style),
+                    widget: None,
                     fixed: false,
                     scroll_port: None,
                     clip: None,
@@ -1846,6 +1945,7 @@ impl<'a> Flow<'a> {
                 ),
                 kind: FragmentKind::Box,
                 style: row_style,
+                widget: None,
                 fixed: false,
                 scroll_port: None,
                 clip: None,
@@ -1905,10 +2005,10 @@ impl<'a> Flow<'a> {
     /// The style a box is laid out with: the one it computed, or the one its table
     /// gave it when it collapsed its borders.
     fn style_of(&self, id: BoxId) -> Arc<ComputedStyle> {
-        match self.collapsed.get(id) {
-            Some(style) => Arc::clone(style),
-            None => Arc::clone(&self.tree.node(id).style),
+        if let Some(style) = self.collapsed.get(id) {
+            return Arc::clone(style);
         }
+        Arc::clone(&self.tree.node(id).style)
     }
 
     /// Settle a collapsed table's borders before anything reads them, once.
@@ -3199,6 +3299,7 @@ impl<'a> Flow<'a> {
             rect: Rect::new(x, y, width, outer_height),
             kind: FragmentKind::Box,
             style,
+            widget: None,
             fixed: false,
             scroll_port: None,
             clip: None,
@@ -3521,6 +3622,7 @@ impl<'a> Flow<'a> {
                         ),
                         kind: FragmentKind::Box,
                         style,
+                        widget: None,
                         fixed: false,
                         scroll_port: None,
                         clip: None,
@@ -3575,6 +3677,7 @@ impl<'a> Flow<'a> {
                         // `super` that moves three pixels, and unmissable on a
                         // `text-top` span set larger than the line it is in.
                         rect: Rect::new(line_x + run.offset_x, line_y - shift, run.advance, height),
+                        widget: None,
                         fixed: false,
                         scroll_port: None,
                         clip: None,
@@ -3635,6 +3738,7 @@ impl<'a> Flow<'a> {
                 rect: Rect::new(line_x, line_y, line.width, height),
                 kind: FragmentKind::Line,
                 style: Arc::clone(&style),
+                widget: None,
                 fixed: false,
                 scroll_port: None,
                 clip: None,
@@ -3912,6 +4016,7 @@ impl<'a> Flow<'a> {
             rect: Rect::new(left, y, room, line.height),
             kind: FragmentKind::Text(run),
             style: Arc::clone(&marker.style),
+            widget: None,
             fixed: false,
             scroll_port: None,
             clip: None,
@@ -4251,6 +4356,170 @@ fn collapse(a: f32, b: f32) -> f32 {
     }
 }
 
+/// Work out how big every widget on the page wants to be, once.
+///
+/// A control that is drawn as a widget has a *default preferred size*: the
+/// size it takes when nothing has said otherwise. It is not what its contents
+/// come to — an empty field is as wide as a full one — and it is not a constant
+/// either, because for everything that holds text it is counted in characters
+/// of the control's own font.
+///
+/// The counting is HTML's. A field is `(size − 1) × avg + max` wide, which is
+/// twenty characters plus the difference between an average one and the widest
+/// one; a `<textarea>` is `cols × avg` plus room for a scroll bar and `rows`
+/// lines tall. `avg` and `max` here are the advance of a digit and of a capital
+/// W, which is an approximation of what a font's own tables report and is
+/// within a pixel of it for the families a control is ever set in.
+fn size_widgets(tree: &mut BoxTree, text: &mut TextEngine) {
+    let mut stacks: std::collections::HashMap<usize, FontStack> = std::collections::HashMap::new();
+    for id in tree.descendants(tree.root()) {
+        let Some(control) = tree.node(id).control.clone() else {
+            continue;
+        };
+        if !control.widget {
+            continue;
+        }
+        // Once, and only once. Layout runs many times over one box tree, and the
+        // room a drop-down leaves for its arrow is *added* to the padding rather
+        // than replacing it — so a second pass over a control already settled
+        // grows it by the width of another arrow.
+        if control.sized {
+            continue;
+        }
+        let style = Arc::clone(&tree.node(id).style);
+        let Some((width, height)) = widget_size(&control, &style, text, &mut stacks) else {
+            continue;
+        };
+        // Only what the page has not decided. A width in a rule is the page's
+        // answer, and a preferred size is what there is in the absence of one.
+        let mut sized = (*style).clone();
+        let mut changed = false;
+        if control.kind == ControlKind::DropDown {
+            sized.padding.right =
+                otlyra_css::Length::Px(resolve_padding(&style, 0.0).right + ARROW_STRIP);
+            changed = true;
+        }
+        if let Some(width) = width
+            && sized.width == LengthOrAuto::Auto
+        {
+            sized.width = LengthOrAuto::Px(width);
+            changed = true;
+        }
+        if let Some(height) = height
+            && sized.height == LengthOrAuto::Auto
+        {
+            sized.height = LengthOrAuto::Px(height);
+            changed = true;
+        }
+        if changed {
+            tree.set_style(id, Arc::new(sized));
+        }
+        tree.mark_sized(id);
+    }
+}
+
+/// The content-box size a widget prefers, in each axis it has an opinion about.
+fn widget_size(
+    control: &Control,
+    style: &Arc<ComputedStyle>,
+    text: &mut TextEngine,
+    stacks: &mut std::collections::HashMap<usize, FontStack>,
+) -> Option<(Option<f32>, Option<f32>)> {
+    // A checkbox and a radio button, in CSS pixels. Both references agree within a
+    // pixel and neither takes it from the font: a checkbox in a heading is the same
+    // checkbox.
+    const BOX_SIDE: f32 = 13.0;
+    // What a scroll bar takes from the width a `<textarea>` asks for.
+    const SCROLLBAR: f32 = 15.0;
+
+    let (average, widest, line) = character_widths(style, text, stacks);
+    // A field is measured across its content box and a checkbox across its
+    // border box; the styles say which, and what is subtracted here is what the
+    // difference comes to.
+    let edges = |style: &ComputedStyle| {
+        let padding = resolve_padding(style, 0.0);
+        let border = resolve_border(style);
+        (
+            padding.left + padding.right + border.left + border.right,
+            padding.top + padding.bottom + border.top + border.bottom,
+        )
+    };
+    let (across, down) = edges(style);
+    let border_box = style.box_sizing == otlyra_css::BoxSizing::Border;
+    let inline = |content: f32| {
+        Some(if border_box {
+            content + across
+        } else {
+            content
+        })
+    };
+    let block = |content: f32| Some(if border_box { content + down } else { content });
+
+    match control.kind {
+        ControlKind::Checkbox | ControlKind::Radio => Some((inline(BOX_SIDE), block(BOX_SIDE))),
+        ControlKind::Field => {
+            let size = control.size.unwrap_or(20).max(1) as f32;
+            Some((inline((size - 1.0) * average + widest), block(line)))
+        }
+        ControlKind::Area => {
+            let width = control.cols.max(1) as f32 * average + SCROLLBAR;
+            let height = control.rows.max(1) as f32 * line;
+            Some((inline(width), block(height)))
+        }
+        ControlKind::ListBox => {
+            let rows = control.size.unwrap_or(4).max(1) as f32;
+            Some((None, block(rows * line)))
+        }
+        // A drop-down is as wide as the option it shows plus the arrow beside
+        // it, and the option is its contents — so only the arrow is added, by
+        // the padding rather than by a width, since a width would stop the
+        // contents from making it wider.
+        ControlKind::DropDown => Some((None, block(line))),
+        ControlKind::Range => Some((inline(129.0), block(16.0))),
+        ControlKind::Color => Some((inline(44.0), block(23.0))),
+        ControlKind::Button | ControlKind::File => None,
+        ControlKind::Progress | ControlKind::Meter => None,
+    }
+}
+
+/// The strip a drop-down leaves on its inline end for the arrow.
+///
+/// Room rather than a width: a drop-down is as wide as the option it shows, and
+/// a width would stop a long option from making it wider. Both references
+/// reserve the same twenty pixels give or take two, and both give it back when
+/// the page turns the widget off — which is the one visible thing
+/// `appearance: none` does to a `<select>`.
+const ARROW_STRIP: f32 = 20.0;
+
+/// An average character, the widest one, and the height of one line, in the font
+/// this style asks for.
+///
+/// The line is the *strut* rather than what a digit measures: a line is as tall as
+/// the font reaches above and below the baseline plus whatever `line-height` asks
+/// for, and a digit is neither. A field a digit tall is two pixels shorter than
+/// every reference, and a `<textarea>` is that twice per row.
+fn character_widths(
+    style: &Arc<ComputedStyle>,
+    text: &mut TextEngine,
+    stacks: &mut std::collections::HashMap<usize, FontStack>,
+) -> (f32, f32, f32) {
+    let key = Arc::as_ptr(&style.font_family) as *const u8 as usize;
+    let stack = stacks
+        .entry(key)
+        .or_insert_with(|| FontStack::parse_css(&style.font_family))
+        .clone();
+    let size = style.font_size;
+    let average = text.measure("0", &stack, size).width;
+    let widest = text.measure("W", &stack, size).width;
+    let line = text
+        .strut(&stack, size, style.font_weight, false)
+        .map_or(size, |strut| match style.line_height {
+            otlyra_css::LineHeight::Normal => strut.height(),
+            ref asked => asked.resolve(size, strut.height()),
+        });
+    (average, widest, line)
+}
+
 #[cfg(test)]
 mod tests {
     use otlyra_css::cascade::{Viewport as StyleViewport, style_document};
@@ -4272,10 +4541,10 @@ mod tests {
                 color_scheme: Default::default(),
             },
         );
-        let boxes = build_styled_box_tree(&document, &styles);
+        let mut boxes = build_styled_box_tree(&document, &styles);
         let mut text = otlyra_text::TextEngine::isolated();
         let tree = crate::layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width,
@@ -4755,10 +5024,10 @@ mod tests {
             .into_iter()
             .map(|source| (source.node, crate::Picture::new(image.clone())))
             .collect();
-        let boxes = crate::build_box_tree_with_images(&document, Some(&styles), &images);
+        let mut boxes = crate::build_box_tree_with_images(&document, Some(&styles), &images);
         let mut text = otlyra_text::TextEngine::isolated();
         let tree = crate::layout(
-            &boxes,
+            &mut boxes,
             &mut text,
             Viewport {
                 width,
