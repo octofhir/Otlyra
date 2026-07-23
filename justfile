@@ -218,12 +218,16 @@ bundle: release
     cp target/release/otlyra "$app/Contents/MacOS/otlyra"
     cp assets/macos/Info.plist "$app/Contents/Info.plist"
 
+    # From the thousand-and-twenty-four source, which carries the margin the
+    # platform's own icon grid leaves: the artwork is eight hundred and
+    # twenty-four of it, so this icon sits the same size in the Dock as every
+    # other one rather than a quarter larger than its neighbours.
     iconset="$(mktemp -d)/AppIcon.iconset"
     mkdir -p "$iconset"
     for size in 16 32 128 256 512; do
-      sips -z $size $size assets/logo/icon-512.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+      sips -z $size $size assets/logo/icon-1024.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
       double=$((size * 2))
-      sips -z $double $double assets/logo/icon-512.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+      sips -z $double $double assets/logo/icon-1024.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
     done
     iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 

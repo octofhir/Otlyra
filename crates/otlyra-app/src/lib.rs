@@ -30,7 +30,12 @@
 ///
 /// Carried as encoded bytes rather than a path because a `cargo run` binary has no
 /// bundle to load resources from.
-pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-512.png");
+///
+/// The thousand-and-twenty-four source, which carries the margin the platform's
+/// own icon grid leaves — the artwork is eight hundred and twenty-four of it. An
+/// icon drawn edge to edge is laid out at the same box as every other one and so
+/// comes out a quarter larger than its neighbours in the Dock.
+pub const ICON: &[u8] = include_bytes!("../../../assets/logo/icon-1024.png");
 
 /// The mark, drawn on an empty tab.
 ///
