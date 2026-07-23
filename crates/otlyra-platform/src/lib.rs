@@ -110,6 +110,15 @@ pub enum ScrollSource {
     Trackpad,
 }
 
+/// What assistive technology asked to be done.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AccessibilityAction {
+    /// Press it: the same intent a click carries.
+    Activate,
+    /// Put the keyboard on it.
+    Focus,
+}
+
 /// Something happened that the browser above may care about.
 ///
 /// Deliberately small: a variant with no consumer only makes the translation layer
@@ -177,15 +186,20 @@ pub enum PlatformEvent {
     CloseRequested,
     /// The user chose a menu item the embedder defined.
     MenuCommand(MenuId),
-    /// Assistive technology asked to press something, naming it by the identifier
-    /// the embedder gave it in the accessibility tree.
+    /// Assistive technology asked for something, naming what by the identifier the
+    /// embedder gave it in the accessibility tree.
     ///
-    /// Only *press*: the other actions a reader can ask for either need a
-    /// vocabulary this layer does not have — scroll a named node into view — or
-    /// are already the platform's job. What arrives here is the same intent a
-    /// click and the activation key carry, so it joins them rather than opening a
-    /// third way into the same code.
-    AccessibilityActivate(accesskit::NodeId),
+    /// Two of them, because two are what a page without a script can answer: press
+    /// this, and put the keyboard here. Both carry the same intent the pointer and
+    /// the keyboard already carry, so they join that route rather than opening a
+    /// third way into the same code. The rest need a vocabulary this layer does not
+    /// have — scroll a named node into view — or are already the platform's job.
+    AccessibilityRequest {
+        /// Which node the reader named.
+        node: accesskit::NodeId,
+        /// What it asked for.
+        action: AccessibilityAction,
+    },
     /// Something outside the loop asked for attention: a [`Waker`] was woken, or
     /// the painter said it was animating and this is the next tick. What that means
     /// is the painter's business; the loop only knows a frame is wanted.

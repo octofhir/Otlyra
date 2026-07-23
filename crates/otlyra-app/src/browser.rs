@@ -766,6 +766,54 @@ impl Browser {
         self.navigate_from(&target, false);
     }
 
+    /// Carry out what a screen reader asked for on a node the page owns.
+    ///
+    /// The identifiers the tree hands out for the page are its box ids, so the
+    /// node names a box, the box names an element, and the element is pressed or
+    /// focused exactly as the pointer would press or focus it — including a link,
+    /// which is followed, and a button, which sends its form.
+    fn accessibility_request_on_page(
+        &mut self,
+        node: otlyra_platform::accesskit::NodeId,
+        action: otlyra_platform::AccessibilityAction,
+    ) {
+        let Some(page) = self.tabs[self.active].page.as_mut() else {
+            return;
+        };
+        // A box for nearly everything on the page, and an element for the few
+        // things that generated none — an option of a drop-down nobody has opened.
+        let box_id = crate::a11y::box_of(node);
+        let element = match box_id {
+            Some(box_id) => page.boxes().get(box_id).and_then(|found| found.node),
+            None => crate::a11y::element_of(node),
+        };
+        let Some(element) = element else {
+            tracing::debug!(?node, "an accessibility request named nothing on the page");
+            return;
+        };
+
+        let changed = match action {
+            otlyra_platform::AccessibilityAction::Focus => page.focus_node(element),
+            otlyra_platform::AccessibilityAction::Activate => {
+                // A link is followed rather than activated: there is no control
+                // behind it, and what pressing one means is a navigation.
+                if let Some(href) = box_id.and_then(|box_id| page.href_of(box_id)) {
+                    let here = self.tabs[self.active].url.clone();
+                    let target =
+                        otlyra_net::url::resolve(&here, &href).unwrap_or_else(|| href.clone());
+                    self.navigate_from(&target, false);
+                    return;
+                }
+                let changed = page.activate_node(element);
+                self.follow_submission();
+                changed
+            }
+        };
+        // Every event asks for a frame; what `changed` says is only whether
+        // anything had to be styled again.
+        let _ = changed;
+    }
+
     fn navigate_from(&mut self, url: &str, user_initiated: bool) {
         self.remember_scroll();
         self.start_load(url, user_initiated, true, 0.0);
@@ -2474,12 +2522,13 @@ impl Painter for Browser {
                 None => tracing::warn!(?id, "menu reported an id no command claims"),
             },
 
-            PlatformEvent::AccessibilityActivate(node) => {
-                // A node the page owns, not the interface. The page has nothing
-                // that can be pressed through this path yet — links are followed
-                // by a click, and that needs a point rather than a node.
+            PlatformEvent::AccessibilityRequest { node, action } => {
+                // A node the page owns rather than the interface. It takes the
+                // route the pointer takes — the focus first and the activation
+                // behaviour after — because a reader pressing a control means what
+                // a click on it means, down to the form it sends.
                 let Some(index) = crate::a11y::described_index(node) else {
-                    tracing::debug!(?node, "accessibility press names a page node");
+                    self.accessibility_request_on_page(node, action);
                     return;
                 };
 
@@ -2889,7 +2938,10 @@ mod system_page_tests {
             })
             .expect("the images switch");
 
-        browser.on_event(PlatformEvent::AccessibilityActivate(*id));
+        browser.on_event(PlatformEvent::AccessibilityRequest {
+            node: *id,
+            action: otlyra_platform::AccessibilityAction::Activate,
+        });
         assert_ne!(
             browser.settings.settings.load_images, before,
             "the switch did not move"
@@ -4676,6 +4728,105 @@ mod tests {
         browser.navigate("about:settings");
         assert_eq!(browser.system_page(), Some(SystemPage::Settings));
         assert_eq!(browser.ui.address.text(), "about:settings");
+    }
+
+    /// A screen reader's press on the page is a press: it ticks the box, and the
+    /// tree says so afterwards.
+    #[test]
+    fn a_readers_press_ticks_a_checkbox_on_the_page() {
+        struct FormPage;
+
+        impl Loader for FormPage {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><label><input type=checkbox> Send me post</label>".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(FormPage);
+        go(&mut browser, "https://site.example/");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(1000, 700, 1.0));
+
+        let update = browser.accessibility().expect("a tree");
+        let (id, node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == otlyra_platform::accesskit::Role::CheckBox)
+            .expect("the checkbox");
+        assert_eq!(
+            node.toggled(),
+            Some(otlyra_platform::accesskit::Toggled::False)
+        );
+
+        browser.on_event(PlatformEvent::AccessibilityRequest {
+            node: *id,
+            action: otlyra_platform::AccessibilityAction::Activate,
+        });
+        browser.paint(&mut painter, Viewport::new(1000, 700, 1.0));
+
+        let update = browser.accessibility().expect("a tree");
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == otlyra_platform::accesskit::Role::CheckBox)
+            .expect("the checkbox");
+        assert_eq!(
+            node.toggled(),
+            Some(otlyra_platform::accesskit::Toggled::True),
+            "the press was swallowed"
+        );
+    }
+
+    /// And a press on a button sends the form behind it, which is the whole of
+    /// what pressing one means without a script.
+    #[test]
+    fn a_readers_press_sends_the_form() {
+        struct SearchPage;
+
+        impl Loader for SearchPage {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><form action=/search><input name=q value=cats>\
+                      <input type=submit value=Go></form>"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(SearchPage);
+        go(&mut browser, "https://site.example/");
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(1000, 700, 1.0));
+
+        let update = browser.accessibility().expect("a tree");
+        let (id, _) = update
+            .nodes
+            .iter()
+            .find(|(id, node)| {
+                crate::a11y::described_index(*id).is_none()
+                    && node.role() == otlyra_platform::accesskit::Role::Button
+            })
+            .expect("the button");
+
+        browser.on_event(PlatformEvent::AccessibilityRequest {
+            node: *id,
+            action: otlyra_platform::AccessibilityAction::Activate,
+        });
+        settle(&mut browser);
+        assert_eq!(
+            browser.tabs[browser.active].url,
+            "https://site.example/search?q=cats"
+        );
     }
 
     /// A form that posts sends its body, and the answer becomes the page.

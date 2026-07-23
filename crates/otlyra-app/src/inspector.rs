@@ -1187,7 +1187,9 @@ impl Inspector {
         out: &mut Vec<AccessibleRow>,
     ) {
         let children = std::mem::take(&mut item.children);
-        let key = otlyra_layout::box_id_to_u64(item.box_id);
+        // The tree's own name for the row, which is a box for nearly everything
+        // and an element for the few things that generated no box.
+        let key = crate::a11y::identity(&item).0;
         let expandable = !children.is_empty();
         let expanded = expandable && !self.a11y_collapsed.contains(&key);
         // Text reads as content and everything else as structure, which is the
@@ -3856,7 +3858,7 @@ mod tests {
         // reader's tree was built from.
         assert_eq!(
             page.boxes().box_for(node),
-            Some(inspector.accessible[heading].item.box_id)
+            inspector.accessible[heading].item.box_id
         );
         assert_eq!(inspector.chosen_accessible(), Some(heading));
     }

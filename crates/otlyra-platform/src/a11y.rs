@@ -42,11 +42,11 @@ impl ActivationHandler for SharedTree {
 /// follows. The loop drains this after each batch of window events and delivers
 /// what it found as an ordinary [`PlatformEvent`].
 #[derive(Clone, Default)]
-pub(crate) struct Actions(Arc<Mutex<Vec<accesskit::NodeId>>>);
+pub(crate) struct Actions(Arc<Mutex<Vec<(accesskit::NodeId, crate::AccessibilityAction)>>>);
 
 impl Actions {
     /// Take everything asked for since the last time this was called.
-    pub(crate) fn take(&self) -> Vec<accesskit::NodeId> {
+    pub(crate) fn take(&self) -> Vec<(accesskit::NodeId, crate::AccessibilityAction)> {
         match self.0.lock() {
             Ok(mut queue) => std::mem::take(&mut *queue),
             Err(_) => Vec::new(),
@@ -56,16 +56,20 @@ impl Actions {
 
 impl ActionHandler for Actions {
     fn do_action(&mut self, request: ActionRequest) {
-        // Only *click*. `Focus` is the platform telling us where it thinks focus
-        // went, which our own traversal already decides; the rest name things
-        // this browser has no node for yet. Logging the ones we drop is what
-        // makes a missing one findable rather than mysterious.
-        if request.action == accesskit::Action::Click {
-            if let Ok(mut queue) = self.0.lock() {
-                queue.push(request.target_node);
+        // The two a page can answer without a script: press this, and put the
+        // keyboard here. The rest name things this browser has no node for yet,
+        // and logging the ones dropped is what makes a missing one findable
+        // rather than mysterious.
+        let action = match request.action {
+            accesskit::Action::Click => crate::AccessibilityAction::Activate,
+            accesskit::Action::Focus => crate::AccessibilityAction::Focus,
+            other => {
+                tracing::debug!(action = ?other, "accessibility action ignored");
+                return;
             }
-        } else {
-            tracing::debug!(action = ?request.action, "accessibility action ignored");
+        };
+        if let Ok(mut queue) = self.0.lock() {
+            queue.push((request.target_node, action));
         }
     }
 }
@@ -100,7 +104,7 @@ impl Accessibility {
     }
 
     /// Everything a reader has asked to press since this was last called.
-    pub(crate) fn take_actions(&self) -> Vec<accesskit::NodeId> {
+    pub(crate) fn take_actions(&self) -> Vec<(accesskit::NodeId, crate::AccessibilityAction)> {
         self.actions.take()
     }
 

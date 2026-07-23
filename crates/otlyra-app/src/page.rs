@@ -152,6 +152,37 @@ pub struct PageScene {
 /// forgotten — where the reader has scrolled to, inside the page and inside a
 /// panel — are cheap to compare outright. The two together fail safe: either the
 /// damage or the key catches a change.
+/// What a control is, holds and is in the middle of, for whoever has to say it.
+///
+/// Built for the accessibility tree and useful to anything else that has to
+/// describe a control in words rather than in pixels. Every field is read from the
+/// document and the reader's own answers rather than from the widget that was
+/// drawn: what a reader is told and what is on screen come from one place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlFacts {
+    /// Which kind of control it is.
+    pub control: otlyra_dom::form::Control,
+    /// The words beside it, from its `<label>`.
+    pub label: Option<String>,
+    /// What it holds, where holding something is meaningful.
+    pub value: Option<String>,
+    /// Ticked, for the two that can be.
+    pub checked: Option<bool>,
+    /// Chosen, for an option in a list.
+    pub selected: Option<bool>,
+    /// Whether nothing can reach it.
+    pub disabled: bool,
+    /// Whether it has to be filled in.
+    pub required: bool,
+    /// Whether what it holds fails the constraints, once the reader has been
+    /// through it.
+    pub invalid: bool,
+    /// Whether the keyboard is on it.
+    pub focused: bool,
+    /// Whether pressing it would do anything.
+    pub actionable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Painted {
     width: f32,
@@ -1356,6 +1387,145 @@ impl PageScene {
             .iter()
             .find(|fragment| fragment.box_id == Some(id))
             .and_then(|fragment| fragment.used)
+    }
+
+    /// What a control holds and what state it is in, for a reader that is told
+    /// rather than shown.
+    ///
+    /// Answered from the same two places every other question about a control is
+    /// answered from — the markup and the side table the reader's own answers live
+    /// in — so a screen reader and the pixels can never disagree about whether a
+    /// box is ticked.
+    #[must_use]
+    pub fn control_facts(&self, node: NodeId) -> Option<ControlFacts> {
+        use otlyra_dom::form::{self, Control, InputKind};
+
+        let control = Control::of(&self.document, node)?;
+        let disabled = form::is_disabled(&self.document, node);
+        let checkable = matches!(
+            control,
+            Control::Input(InputKind::Checkbox | InputKind::Radio)
+        );
+        Some(ControlFacts {
+            control,
+            label: self.label_for(node),
+            value: match control {
+                // What a checkbox holds is its state, and the state is said as a
+                // state; saying `on` as well is a reader announcing a word nobody
+                // put on the page.
+                _ if checkable => None,
+                Control::Select => self.chosen_option_text(node),
+                _ if control.is_text_entry() => {
+                    Some(self.form.value(&self.document, node).to_owned())
+                }
+                // A button's own words are its label rather than a value, and the
+                // ones that carry them in `value` are the input-shaped ones.
+                Control::Input(kind) if kind.is_button() => {
+                    Some(self.form.value(&self.document, node).to_owned())
+                }
+                _ => None,
+            },
+            checked: checkable.then(|| self.form.checkedness(&self.document, node)),
+            selected: matches!(control, Control::Option)
+                .then(|| self.form.selectedness(&self.document, node)),
+            disabled,
+            required: form::is_required(&self.document, node),
+            // Only once the reader has been through it. A form that reads as broken
+            // the moment it loads is a form nobody can fill in.
+            invalid: self.form.has_interacted(node)
+                && form::is_validated(&self.document, node)
+                && form::validity(&self.document, &self.form, node).is_invalid(),
+            focused: self.interaction.focus == Some(node),
+            actionable: !disabled && form::is_mutable(&self.document, node),
+        })
+    }
+
+    /// The words beside a control: its `<label>`, wherever the label is.
+    fn label_for(&self, node: NodeId) -> Option<String> {
+        let root = self.document.root();
+        descendants_of(&self.document, root)
+            .into_iter()
+            .filter(|&candidate| {
+                self.document
+                    .get(candidate)
+                    .and_then(|inner| inner.element())
+                    .is_some_and(|element| element.name.local.as_ref() == "label")
+            })
+            .find(|&label| otlyra_dom::form::labeled_control(&self.document, label) == Some(node))
+            .map(|label| self.text_under(label))
+            .filter(|text| !text.is_empty())
+    }
+
+    /// What a closed drop-down is showing.
+    fn chosen_option_text(&self, select: NodeId) -> Option<String> {
+        let options = otlyra_dom::form::options_of(&self.document, select);
+        let chosen = options
+            .iter()
+            .copied()
+            .find(|&option| self.form.selectedness(&self.document, option))
+            .or_else(|| options.first().copied())?;
+        Some(self.text_under(chosen))
+    }
+
+    /// All the text under a node, run together and trimmed.
+    fn text_under(&self, node: NodeId) -> String {
+        let mut out = String::new();
+        for id in descendants_of(&self.document, node) {
+            if let Some(otlyra_dom::NodeData::Text(text)) =
+                self.document.get(id).map(|inner| &inner.data)
+            {
+                out.push_str(text);
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Put the keyboard on `node`, as a reader asking for it does.
+    ///
+    /// The same focus the pointer and the tab key move, so what a reader is told
+    /// holds the keyboard is what does. The ring is shown, because a reader who
+    /// moved the focus without touching the page is in exactly the position the
+    /// keyboard heuristic is for.
+    pub fn focus_node(&mut self, node: NodeId) -> bool {
+        if !self.is_focusable(node) {
+            return false;
+        }
+        self.keyboard = true;
+        let moved = self.set_interaction(otlyra_css::state::Interaction {
+            focus: Some(node),
+            focus_visible: true,
+            ..self.interaction
+        });
+        self.caret = self.form.value(&self.document, node).len();
+        self.field_anchor = Some(self.caret);
+        self.restart_caret();
+        moved
+    }
+
+    /// Do to `node` what a press and a release over it would do.
+    ///
+    /// The route a reader's *press* takes is the route the pointer takes, one step
+    /// further in: the focus moves first, as it does on the way down, and then the
+    /// activation behaviour runs, as it does on the way up. Anything else would be
+    /// a second account of what pressing a control means, and the first bug in it
+    /// would be the two disagreeing.
+    pub fn activate_node(&mut self, node: NodeId) -> bool {
+        // An option is chosen rather than pressed, and it is chosen through the
+        // drop-down that owns it — which is what a press on one in an open list
+        // does, and the only thing a press on one can mean.
+        if let Some(select) = otlyra_dom::form::owning_select(&self.document, node) {
+            if otlyra_dom::form::is_disabled(&self.document, node)
+                || !otlyra_dom::form::is_mutable(&self.document, select)
+            {
+                return false;
+            }
+            self.choose_option(select, node);
+            self.close_open();
+            return true;
+        }
+        let mut changed = self.focus_node(node);
+        changed |= self.activate(node);
+        changed
     }
 
     /// The `href` of a box, if it is a link with one.
