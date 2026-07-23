@@ -357,6 +357,37 @@ impl FragmentTree {
         self.root.rect.height
     }
 
+    /// Repaint one control's widget without laying anything out again.
+    ///
+    /// A pointer moving onto a button greys it and changes nothing else — not its
+    /// size, not where a single glyph sits — so the widget a fragment already
+    /// carries is edited in place rather than the whole tree rebuilt. Returns
+    /// whether the fragment was found and differed.
+    pub fn set_widget_state(
+        &mut self,
+        box_id: BoxId,
+        state: crate::box_tree::ControlState,
+    ) -> bool {
+        fn walk(
+            fragment: &mut Fragment,
+            box_id: BoxId,
+            state: crate::box_tree::ControlState,
+        ) -> bool {
+            if fragment.box_id == Some(box_id)
+                && let Some(widget) = fragment.widget.as_mut()
+                && widget.state != state
+            {
+                widget.state = state;
+                return true;
+            }
+            fragment
+                .children
+                .iter_mut()
+                .any(|child| walk(child, box_id, state))
+        }
+        walk(&mut self.root, box_id, state)
+    }
+
     /// Every fragment, depth first, parents before children — which is paint order.
     pub fn iter(&self) -> impl Iterator<Item = &Fragment> {
         let mut stack = vec![&self.root];

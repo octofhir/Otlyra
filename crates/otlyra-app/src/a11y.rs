@@ -373,7 +373,9 @@ fn collect(page: &PageScene, boxes: &BoxTree, id: BoxId) -> Vec<Accessible> {
                 level: None,
                 url: None,
                 bounds: bounds_of(page, child),
-                children: if matches!(facts.control, otlyra_dom::form::Control::Select) {
+                children: if facts.suggests
+                    || matches!(facts.control, otlyra_dom::form::Control::Select)
+                {
                     // The options a drop-down holds are what a reader moves
                     // through, open or not — so when it is closed and they have no
                     // boxes, they are described from the document instead.
@@ -384,10 +386,15 @@ fn collect(page: &PageScene, boxes: &BoxTree, id: BoxId) -> Vec<Accessible> {
                         .into_iter()
                         .filter(|item| item.control.is_some())
                         .collect();
-                    if open.is_empty() {
-                        options_of(page, dom)
-                    } else {
+                    if !open.is_empty() {
                         open
+                    } else if facts.suggests {
+                        // A field's suggestions are in a `<datalist>` somewhere
+                        // else in the document and are never boxes until the list
+                        // is showing, so a reader walks them from there.
+                        described(page, otlyra_dom::form::suggestions_of(page.document(), dom))
+                    } else {
+                        described(page, otlyra_dom::form::options_of(page.document(), dom))
                     }
                 } else {
                     Vec::new()
@@ -452,21 +459,36 @@ fn describe_control(node: &mut Node, facts: &crate::page::ControlFacts) {
     if facts.disabled {
         node.set_disabled();
     }
+    if let Some(numeric) = facts.numeric {
+        node.set_numeric_value(numeric.value);
+        node.set_min_numeric_value(numeric.min);
+        node.set_max_numeric_value(numeric.max);
+        if let Some(step) = numeric.step {
+            node.set_numeric_value_step(step);
+        }
+    }
     if facts.actionable {
         // Only what would do something. A reader offering "press this" on a
         // control that would ignore it is a reader lying about the page.
         node.add_action(Action::Click);
         node.add_action(Action::Focus);
+        // A slider is moved rather than pressed, and a reader has its own two
+        // words for that.
+        if facts.numeric.is_some() && facts.control.is_slider() {
+            node.add_action(Action::Increment);
+            node.add_action(Action::Decrement);
+        }
     }
 }
 
-/// The options of a drop-down that is showing none of them.
+/// The options a list is not showing.
 ///
 /// Taken from the document rather than from the boxes, because a closed drop-down
-/// generates no boxes for its options — and a reader that cannot walk them cannot
-/// choose one. They carry no rectangle for the same reason: nothing was drawn.
-fn options_of(page: &PageScene, select: otlyra_dom::NodeId) -> Vec<Accessible> {
-    otlyra_dom::form::options_of(page.document(), select)
+/// generates no boxes for its options and a field's suggestions are boxes only
+/// while they are on screen — and a reader that cannot walk them cannot choose
+/// one. They carry no rectangle for the same reason: nothing was drawn.
+fn described(page: &PageScene, options: Vec<otlyra_dom::NodeId>) -> Vec<Accessible> {
+    options
         .into_iter()
         .filter_map(|option| {
             let facts = page.control_facts(option)?;
@@ -505,6 +527,11 @@ fn bounds_of(page: &PageScene, id: BoxId) -> Option<Rect> {
 fn control_role(facts: &crate::page::ControlFacts) -> Role {
     use otlyra_dom::form::{Control, InputKind};
 
+    // A field with suggestions behind it is a combo box, whatever it would have
+    // been without them: that is the role its list of options belongs to.
+    if facts.suggests {
+        return Role::ComboBox;
+    }
     match facts.control {
         Control::Input(InputKind::Checkbox) => Role::CheckBox,
         Control::Input(InputKind::Radio) => Role::RadioButton,
@@ -832,6 +859,84 @@ mod tests {
             .map(|(_, node)| node.is_selected().unwrap_or(false))
             .collect();
         assert_eq!(chosen, vec![false, true]);
+    }
+
+    /// A slider says the number it holds and the range it holds it in, and offers
+    /// a reader the two words for moving it.
+    #[test]
+    fn a_slider_says_its_number_and_can_be_moved_by_a_reader() {
+        let mut page = page("<body><input type=range min=0 max=10 step=2 value=4>");
+        let update = tree_for(&page, "t");
+        let (id, slider) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Slider)
+            .map(|(id, node)| (*id, node.clone()))
+            .expect("the slider");
+        assert_eq!(slider.numeric_value(), Some(4.0));
+        assert_eq!(slider.min_numeric_value(), Some(0.0));
+        assert_eq!(slider.max_numeric_value(), Some(10.0));
+        assert_eq!(slider.numeric_value_step(), Some(2.0));
+        assert!(slider.supports_action(otlyra_platform::accesskit::Action::Increment));
+
+        let element = box_of(id)
+            .and_then(|box_id| page.boxes().get(box_id).and_then(|node| node.node))
+            .expect("the element behind it");
+        assert!(page.focus_node(element));
+        assert!(page.step_value(crate::page::SliderMotion::Up));
+        let update = tree_for(&page, "t");
+        let moved = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == Role::Slider)
+            .map(|(_, node)| node.clone())
+            .expect("the slider");
+        assert_eq!(moved.numeric_value(), Some(6.0));
+    }
+
+    /// A field with suggestions behind it is a combo box, and its suggestions are
+    /// the options of the list it shows — walked to, and taken, by name.
+    #[test]
+    fn a_field_with_suggestions_is_a_combo_box_a_reader_can_take_one_from() {
+        let mut page = page(
+            "<body><input list=cities>\
+             <datalist id=cities><option value=Amsterdam><option value=Berlin>\
+             </datalist>",
+        );
+        let update = tree_for(&page, "t");
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == Role::ComboBox),
+            "a field offering a list is a combo box"
+        );
+
+        // Closed, the suggestions are described from the document, as a closed
+        // drop-down's options are.
+        let (id, _) = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::ListBoxOption)
+            .nth(1)
+            .expect("the second suggestion");
+        let element = element_of(*id).expect("it names an element");
+
+        // Taking one is not open to a reader until the list is: a suggestion
+        // belongs to whichever field is showing it.
+        let field = {
+            let boxes = page.boxes();
+            boxes
+                .descendants(boxes.root())
+                .into_iter()
+                .find(|&id| boxes.node(id).control.is_some())
+                .and_then(|id| boxes.node(id).node)
+                .expect("the field")
+        };
+        assert!(page.focus_node(field));
+        assert!(page.step_selection(true), "the list is showing");
+        assert!(page.activate_node(element));
+        assert_eq!(page.focused_value(), Some("Berlin"));
     }
 
     /// An option of a closed drop-down is named by its element, because it has no

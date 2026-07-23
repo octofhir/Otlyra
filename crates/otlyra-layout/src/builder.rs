@@ -534,11 +534,12 @@ impl Builder<'_> {
     fn open_list(&mut self, select: BoxId, style: &Arc<ComputedStyle>) -> BoxId {
         use otlyra_css::{Length, LengthOrAuto, Overflow, Position};
 
-        // The control itself becomes what the list is placed against, and stops
-        // cutting its contents off — the list is entirely outside it.
+        // The control itself becomes what the list is placed against. It goes on
+        // cutting its own contents off at its edge — a field slides its line under
+        // itself and a long option is cut short — because the list is not among
+        // them: layout knows an open list when it sees one and leaves it alone.
         let mut anchor = (**style).clone();
         anchor.position = Position::Relative;
-        anchor.overflow = Overflow::Visible;
         self.tree.set_style(select, Arc::new(anchor));
 
         let mut list = (**style).clone();
@@ -576,6 +577,9 @@ impl Builder<'_> {
                     cols: 0,
                     rows: 0,
                     state: ControlState::default(),
+                    position: None,
+                    level: otlyra_dom::form::Level::default(),
+                    swatch: None,
                     open: true,
                     sized: true,
                     scroll: (0.0, 0.0),
@@ -679,22 +683,65 @@ impl Builder<'_> {
             // Twenty characters is what a field is when nothing says otherwise —
             // a number from the specification, not a guess at a pleasant width.
             size: match kind {
-                ControlKind::Field => Some(number("size").unwrap_or(20)),
+                // A date field is as wide as the date it shows and no wider: its
+                // width is the pattern's, not the twenty characters a text field
+                // falls back to, and `size` means nothing on one.
+                ControlKind::Field => Some(
+                    self.temporal_width(node)
+                        .unwrap_or_else(|| number("size").unwrap_or(20)),
+                ),
                 ControlKind::ListBox => Some(otlyra_dom::form::display_size(self.document, node)),
                 _ => None,
             },
             cols: number("cols").unwrap_or(20),
             rows: number("rows").unwrap_or(2),
             state,
-            open: kind == ControlKind::DropDown
+            // What the widget is filled to. Read here rather than in the painter
+            // because it is a question about the document — a `value`, a `max`, an
+            // `optimum` — and the painter is given a box and a rectangle.
+            position: match kind {
+                ControlKind::Range => {
+                    Some(otlyra_dom::form::range_position(self.document, self.form, node) as f32)
+                }
+                ControlKind::Progress => otlyra_dom::form::progress_position(self.document, node)
+                    .map(|position| position as f32),
+                ControlKind::Meter => {
+                    Some(otlyra_dom::form::meter_reading(self.document, node).0 as f32)
+                }
+                _ => None,
+            },
+            level: match kind {
+                ControlKind::Meter => otlyra_dom::form::meter_reading(self.document, node).1,
+                _ => otlyra_dom::form::Level::default(),
+            },
+            swatch: (kind == ControlKind::Color)
+                .then(|| otlyra_dom::form::color_value(self.document, self.form, node)),
+            // A field is open when it is showing suggestions, and a field with
+            // nothing to suggest is not open however hard it is pressed: an empty
+            // list is a rectangle over the page with nothing in it.
+            open: matches!(kind, ControlKind::DropDown | ControlKind::Field)
                 && self.styles.is_some_and(|styles| {
                     styles
                         .state_of(node)
                         .contains(otlyra_css::state::ElementState::OPEN)
-                }),
+                })
+                && (kind != ControlKind::Field
+                    || !otlyra_dom::form::suggestions_for(self.document, self.form, node)
+                        .is_empty()),
             sized: false,
             scroll: (0.0, 0.0),
         })
+    }
+
+    /// How many characters a date or a time field shows, if it is one.
+    fn temporal_width(&self, node: NodeId) -> Option<u32> {
+        let otlyra_dom::form::Control::Input(kind) =
+            otlyra_dom::form::Control::of(self.document, node)?
+        else {
+            return None;
+        };
+        let (pattern, _) = otlyra_dom::form::temporal_pattern(kind)?;
+        Some(pattern.chars().count() as u32)
     }
 
     /// The text a control shows that is not in the document.
@@ -737,7 +784,15 @@ impl Builder<'_> {
                     | InputKind::Color
                     | InputKind::Hidden
                     | InputKind::Image => None,
-                    InputKind::File => Some("No file chosen".to_owned()),
+                    // What it holds, or that it holds nothing. Never where the
+                    // file came from: a page is told a name and not a path.
+                    InputKind::File => Some(form::file_label(self.form, node)),
+                    // A date or a time is not one string being typed into: it
+                    // shows what has been filled in over the shape of what has
+                    // not, so that two more digits are obviously wanted.
+                    _ if form::temporal_pattern(kind).is_some() => {
+                        form::temporal_display(self.document, self.form, node)
+                    }
                     // A field shows what it holds, or the hint it was given. What
                     // it holds is what the reader typed once the reader has typed:
                     // the attribute is only the value until then. An empty one
@@ -767,6 +822,16 @@ impl Builder<'_> {
                     .find(|&option| state.selectedness(self.document, option))
                     .or_else(|| options.first().copied())?;
                 Some(self.text_of(chosen))
+            }
+            // A suggestion is written as `<option value=Berlin>` more often than
+            // not, and an option with nothing between its tags shows nothing. What
+            // it offers to put in the field is what it has to show, so an empty one
+            // shows its label or, failing that, the value itself.
+            "option"
+                if self.text_of(node).trim().is_empty()
+                    && form::is_suggestion(self.document, node) =>
+            {
+                Some(attribute("label").unwrap_or_else(|| form::option_value(self.document, node)))
             }
             // A text area's value is its content, so it needs no generated text —
             // until the reader types, after which its content is no longer what it
@@ -1056,12 +1121,25 @@ impl Builder<'_> {
                 // An open drop-down shows its list *over* the page rather than in
                 // it: the options go into a box of their own, placed against the
                 // control and out of the flow, so opening one moves nothing.
+                //
+                // A field showing suggestions shows the same kind of list, and the
+                // options in it come from a `<datalist>` somewhere else in the
+                // document — which is why the list is filled from what the control
+                // suggests rather than from what it holds.
                 let popup = control
                     .as_ref()
                     .filter(|control| control.open)
                     .map(|_| self.open_list(id, &style));
                 if let Some(popup) = popup {
-                    for child in self.document.children(node).collect::<Vec<_>>() {
+                    let contents = if control
+                        .as_ref()
+                        .is_some_and(|control| control.kind == ControlKind::Field)
+                    {
+                        otlyra_dom::form::suggestions_for(self.document, self.form, node)
+                    } else {
+                        self.document.children(node).collect::<Vec<_>>()
+                    };
+                    for child in contents {
                         self.walk(child, popup, &style);
                     }
                 } else if has_renderable_children(name) && !closed {

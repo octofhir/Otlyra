@@ -81,6 +81,52 @@ impl Method {
     }
 }
 
+/// One name-and-value pair a form holds.
+///
+/// A pair rather than a tuple because a value is not always text: a file picker
+/// contributes a file, and what a file comes to depends on the encoding — its
+/// name in an address, its contents in a multipart body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// What the control is called.
+    pub name: String,
+    /// What it holds.
+    pub value: EntryValue,
+}
+
+impl Entry {
+    /// A plain pair.
+    #[must_use]
+    pub fn text(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: EntryValue::Text(value.into()),
+        }
+    }
+
+    /// What this entry comes to where only text will do.
+    ///
+    /// A file is its name and nothing else, which is what a form sends when it is
+    /// spelled any way but multipart — the specification is explicit that the
+    /// contents are lost there rather than smuggled in.
+    #[must_use]
+    pub fn as_text(&self) -> &str {
+        match &self.value {
+            EntryValue::Text(text) => text,
+            EntryValue::File(file) => &file.name,
+        }
+    }
+}
+
+/// What one entry holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryValue {
+    /// Text, which is nearly everything.
+    Text(String),
+    /// A file the reader chose.
+    File(form::ChosenFile),
+}
+
 /// A form, ready to be sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
@@ -109,7 +155,7 @@ pub fn entry_list(
     state: &FormState,
     form: NodeId,
     submitter: Option<NodeId>,
-) -> Vec<(String, String)> {
+) -> Vec<Entry> {
     let mut entries = Vec::new();
     for field in descendants(document, document.root()) {
         if form::form_owner(document, field) != Some(form) {
@@ -128,7 +174,6 @@ pub fn entry_list(
             // unless it is the one that was pressed, an unticked box has nothing to
             // say, and a file picker has offered nothing to send.
             Control::Input(InputKind::Hidden) => {}
-            Control::Input(InputKind::File) => continue,
             Control::Input(kind)
                 if (kind.is_button() && Some(field) != submitter)
                     || (kind.is_checkable() && !state.checkedness(document, field)) =>
@@ -152,7 +197,36 @@ pub fn entry_list(
         if control == Control::Select {
             for option in form::options_of(document, field) {
                 if state.selectedness(document, option) && !form::is_disabled(document, option) {
-                    entries.push((name.clone(), form::option_value(document, option)));
+                    entries.push(Entry::text(
+                        name.clone(),
+                        form::option_value(document, option),
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // A picker holding nothing still sends one entry, and it is an empty file
+        // rather than an empty string: that is what HTML says, and a receiver that
+        // asks for a file has to be able to tell "none" from "a file called
+        // nothing".
+        if control == Control::Input(InputKind::File) {
+            let files = state.files(field);
+            if files.is_empty() {
+                entries.push(Entry {
+                    name,
+                    value: EntryValue::File(form::ChosenFile {
+                        name: String::new(),
+                        media_type: "application/octet-stream".to_owned(),
+                        bytes: Vec::new(),
+                    }),
+                });
+            } else {
+                for file in files {
+                    entries.push(Entry {
+                        name: name.clone(),
+                        value: EntryValue::File(file.clone()),
+                    });
                 }
             }
             continue;
@@ -164,9 +238,15 @@ pub fn entry_list(
             Control::Input(kind) if kind.is_checkable() => {
                 attribute(document, field, "value").unwrap_or_else(|| "on".to_owned())
             }
+            // A slider always holds a number, so one is always sent: an
+            // `<input type=range>` with no `value` submits the middle of its
+            // range rather than nothing at all.
+            Control::Input(InputKind::Range) => {
+                form::format_number(form::range_value(document, state, field))
+            }
             _ => state.value(document, field).to_owned(),
         };
-        entries.push((name, value));
+        entries.push(Entry::text(name, value));
     }
     entries
 }
@@ -233,7 +313,7 @@ const BOUNDARY: &str = "----otlyraFormBoundary8f2a1c";
 /// HTML is explicit about the replacing: a `GET` form pointed at `?page=2` does not
 /// send `?page=2&name=…`, it sends only what the form holds.
 #[must_use]
-pub fn with_query(action: &str, entries: &[(String, String)]) -> String {
+pub fn with_query(action: &str, entries: &[Entry]) -> String {
     let (before, after) = match action.split_once('#') {
         Some((before, fragment)) => (before, Some(fragment)),
         None => (action, None),
@@ -253,43 +333,66 @@ pub fn with_query(action: &str, entries: &[(String, String)]) -> String {
 
 /// `name=value&name=value`, in HTML's own spelling of it.
 #[must_use]
-pub fn urlencoded(entries: &[(String, String)]) -> String {
+pub fn urlencoded(entries: &[Entry]) -> String {
     entries
         .iter()
-        .map(|(name, value)| format!("{}={}", percent(name), percent(value)))
+        .map(|entry| format!("{}={}", percent(&entry.name), percent(entry.as_text())))
         .collect::<Vec<_>>()
         .join("&")
 }
 
 /// One part per entry, cut at the boundary.
 #[must_use]
-pub fn multipart(entries: &[(String, String)], boundary: &str) -> Vec<u8> {
-    let mut out = String::new();
-    for (name, value) in entries {
-        out.push_str("--");
-        out.push_str(boundary);
-        out.push_str("\r\n");
-        out.push_str(&format!(
-            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-            escape_quotes(name)
-        ));
-        out.push_str(value);
-        out.push_str("\r\n");
+pub fn multipart(entries: &[Entry], boundary: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for entry in entries {
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        match &entry.value {
+            EntryValue::Text(text) => {
+                out.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                        escape_quotes(&entry.name)
+                    )
+                    .as_bytes(),
+                );
+                out.extend_from_slice(text.as_bytes());
+            }
+            // A file carries two more things: what it is called and what it is.
+            // The bytes go in as they are — a multipart body is bytes, not text,
+            // which is the whole reason a form carrying a file must use it.
+            EntryValue::File(file) => {
+                out.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\
+                         Content-Type: {}\r\n\r\n",
+                        escape_quotes(&entry.name),
+                        escape_quotes(&file.name),
+                        file.media_type
+                    )
+                    .as_bytes(),
+                );
+                out.extend_from_slice(&file.bytes);
+            }
+        }
+        out.extend_from_slice(b"\r\n");
     }
-    out.push_str("--");
-    out.push_str(boundary);
-    out.push_str("--\r\n");
-    out.into_bytes()
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    out
 }
 
 /// `name=value`, one per line.
 #[must_use]
-pub fn plain(entries: &[(String, String)]) -> String {
+pub fn plain(entries: &[Entry]) -> String {
     let mut out = String::new();
-    for (name, value) in entries {
-        out.push_str(name);
+    for entry in entries {
+        out.push_str(&entry.name);
         out.push('=');
-        out.push_str(value);
+        out.push_str(entry.as_text());
         out.push_str("\r\n");
     }
     out

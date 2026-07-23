@@ -182,6 +182,37 @@ input[type="checkbox" i], input[type="radio" i] {
 input[type="checkbox" i] { margin: 3px 3px 3px 4px; }
 input[type="radio" i] { margin: 3px 3px 0 5px; }
 
+/* A slider carries no text and no edge of its own either: the track and the thumb
+   are drawn. Both references give it the same two-pixel margin all round, and
+   neither takes its size from the font. */
+input[type="range" i] {
+  box-sizing: border-box;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  margin: 2px;
+  cursor: default;
+}
+
+/* A date or a time is a row of digits in fixed places, so it is set in a fixed
+   pitch: both references do this, and a proportional font makes the parts of a
+   half-filled date jump about as it is filled in. */
+input[type="date" i], input[type="time" i], input[type="month" i],
+input[type="week" i], input[type="datetime-local" i] {
+  font-family: monospace;
+}
+
+/* A colour well is the colour it holds, drawn inside a thin frame. The numbers
+   are the reference's: a one-pixel edge rather than the two an ordinary field
+   gets, and the swatch inside the padding. */
+input[type="color" i] {
+  box-sizing: content-box;
+  padding: 1px 2px;
+  border: 1px solid #767676;
+  background-color: #efefef;
+  cursor: default;
+}
+
 input[type="hidden" i] { display: none; }
 
 select {
@@ -215,8 +246,10 @@ textarea {
 
 /* A bar is a widget with a size and no contents. Both references give the same
    two, and neither takes them from the font. */
-progress { display: inline-block; box-sizing: border-box; width: 160px; height: 16px; }
-meter { display: inline-block; box-sizing: border-box; width: 80px; height: 16px; }
+progress { display: inline-block; box-sizing: border-box; width: 160px; height: 16px;
+           vertical-align: -0.2em; }
+meter { display: inline-block; box-sizing: border-box; width: 80px; height: 16px;
+        vertical-align: -0.2em; }
 
 /* A control nothing can do anything with says so in its text as well as in its
    face: both references grey the words, and only one of the two greys the edge. */

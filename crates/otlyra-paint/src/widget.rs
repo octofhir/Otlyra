@@ -20,7 +20,7 @@
 use otlyra_gfx::kurbo::{Affine, BezPath, RoundedRect, Shape as _};
 use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_layout::box_tree::{Control, ControlKind, ControlState};
+use otlyra_layout::box_tree::{Control, ControlKind, ControlState, Level};
 use otlyra_layout::fragment::Rect;
 
 /// Flattening tolerance for the shapes a widget draws.
@@ -54,7 +54,21 @@ const BUTTON_HOVER: Color = Color::from_rgba8(0xe5, 0xe5, 0xe5, 0xff);
 /// A button held down.
 const BUTTON_ACTIVE: Color = Color::from_rgba8(0xd5, 0xd5, 0xd5, 0xff);
 /// The track of a slider and the trough of a bar.
-const TRACK: Color = Color::from_rgba8(0xd9, 0xd9, 0xd9, 0xff);
+const TRACK: Color = Color::from_rgba8(0xef, 0xef, 0xef, 0xff);
+/// The line around a slider's track and a progress bar's trough.
+const TRACK_EDGE: Color = Color::from_rgba8(0xb2, 0xb2, 0xb2, 0xff);
+/// The line around a meter's trough, which is a shade darker than the rest.
+const METER_EDGE: Color = Color::from_rgba8(0xca, 0xca, 0xca, 0xff);
+/// A meter reading in the range it calls best.
+const METER_OPTIMUM: Color = Color::from_rgba8(0x10, 0x7c, 0x10, 0xff);
+/// A meter reading outside that range but not on the far side of it.
+const METER_SUBOPTIMAL: Color = Color::from_rgba8(0xff, 0xb9, 0x00, 0xff);
+/// A meter reading on the far side of the range from the optimum.
+const METER_POOR: Color = Color::from_rgba8(0xd8, 0x3b, 0x01, 0xff);
+/// How thick a slider's track is, whatever the control's height.
+const TRACK_THICKNESS: f32 = 8.0;
+/// How wide a slider's thumb is.
+const THUMB: f32 = 14.0;
 /// The face of a control nothing can do anything with.
 ///
 /// A colour rather than a transparency, because a white field faded against a
@@ -75,7 +89,7 @@ const RING_WIDTH: f64 = 2.0;
 /// background and border are not drawn, because the widget *is* them. That is what
 /// both references do, and it is why a control that keeps its widget ignores the
 /// user-agent border it also computes.
-pub(crate) fn paint(list: &mut DisplayList, control: &Control, rect: Rect) -> bool {
+pub(crate) fn paint(list: &mut DisplayList, control: &Control, rect: Rect, inner: Rect) -> bool {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return false;
     }
@@ -89,8 +103,24 @@ pub(crate) fn paint(list: &mut DisplayList, control: &Control, rect: Rect) -> bo
             radio(list, square(rect), state);
             true
         }
-        ControlKind::Button | ControlKind::Color | ControlKind::File => {
+        ControlKind::Button | ControlKind::File => {
             button(list, rect, state);
+            true
+        }
+        // A colour well is the colour it holds, in a frame: the frame is the
+        // button's, and what is inside it is the whole of the control.
+        ControlKind::Color => {
+            button(list, rect, state);
+            if let Some([red, green, blue]) = control.swatch
+                && inner.width > 0.0
+                && inner.height > 0.0
+            {
+                fill(
+                    list,
+                    &rounded(inner, 0.0),
+                    dim(Color::from_rgba8(red, green, blue, 0xff), state),
+                );
+            }
             true
         }
         ControlKind::Field | ControlKind::Area => {
@@ -107,11 +137,24 @@ pub(crate) fn paint(list: &mut DisplayList, control: &Control, rect: Rect) -> bo
             true
         }
         ControlKind::Range => {
-            slider(list, rect, state);
+            slider(list, rect, control.position.unwrap_or(0.0), state);
             true
         }
         ControlKind::Progress | ControlKind::Meter => {
-            bar(list, rect, state);
+            let fill = match control.kind {
+                ControlKind::Meter => match control.level {
+                    Level::Optimum => METER_OPTIMUM,
+                    Level::Suboptimal => METER_SUBOPTIMAL,
+                    Level::Poor => METER_POOR,
+                },
+                _ => ACCENT,
+            };
+            let edge = if control.kind == ControlKind::Meter {
+                METER_EDGE
+            } else {
+                TRACK_EDGE
+            };
+            bar(list, rect, control.position, fill, edge, state);
             true
         }
     }
@@ -262,23 +305,37 @@ fn arrow(list: &mut DisplayList, rect: Rect, state: ControlState) {
 }
 
 /// A slider: a track across the middle and a round thumb on it.
-fn slider(list: &mut DisplayList, rect: Rect, state: ControlState) {
-    let thickness = 4.0_f32.min(rect.height);
+fn slider(list: &mut DisplayList, rect: Rect, position: f32, state: ControlState) {
+    let thickness = TRACK_THICKNESS.min(rect.height);
     let track = Rect::new(
         rect.x,
         rect.y + (rect.height - thickness) / 2.0,
         rect.width,
         thickness,
     );
-    fill(
+    let radius = f64::from(thickness) / 2.0;
+    fill(list, &rounded(track, radius), dim(TRACK, state));
+
+    // The thumb travels between the two ends rather than off them, so the filled
+    // part reaches the middle of the thumb and not the pointer.
+    let side = THUMB.min(rect.height).min(rect.width);
+    let travel = (rect.width - side).max(0.0);
+    let centre = rect.x + side / 2.0 + travel * position.clamp(0.0, 1.0);
+
+    let filled = Rect::new(rect.x, track.y, (centre - rect.x).max(0.0), thickness);
+    if filled.width > 0.0 {
+        fill(list, &rounded(filled, radius), dim(ACCENT, state));
+    }
+    stroke(
         list,
-        &rounded(track, f64::from(thickness) / 2.0),
-        dim(TRACK, state),
+        &inset(track, EDGE / 2.0),
+        radius,
+        EDGE,
+        dim(TRACK_EDGE, state),
     );
 
-    let side = rect.height.min(rect.width);
     let thumb = Rect::new(
-        rect.x + (rect.width - side) / 2.0,
+        centre - side / 2.0,
         rect.y + (rect.height - side) / 2.0,
         side,
         side,
@@ -293,11 +350,44 @@ fn slider(list: &mut DisplayList, rect: Rect, state: ControlState) {
 
 /// A progress or meter bar: a trough with a filled part in it.
 ///
-/// How full it is needs the element's numbers, which a box does not carry yet, so
-/// it is drawn empty rather than drawn wrong.
-fn bar(list: &mut DisplayList, rect: Rect, state: ControlState) {
-    let radius = f64::from(rect.height) / 2.0;
-    fill(list, &rounded(rect, radius), dim(TRACK, state));
+/// Half the height of the box and centred in it, which is what the reference does
+/// at every height it is given rather than a number that happens to be right at
+/// the default one. A bar with no position is a `<progress>` that does not know how
+/// far along it is: the trough is drawn and nothing is filled, because a bar at
+/// zero and a bar that cannot say are not the same thing.
+fn bar(
+    list: &mut DisplayList,
+    rect: Rect,
+    position: Option<f32>,
+    filling: Color,
+    edge: Color,
+    state: ControlState,
+) {
+    let thickness = rect.height / 2.0;
+    let trough = Rect::new(
+        rect.x,
+        rect.y + (rect.height - thickness) / 2.0,
+        rect.width,
+        thickness,
+    );
+    let radius = f64::from(thickness) / 2.0;
+    fill(list, &rounded(trough, radius), dim(TRACK, state));
+
+    if let Some(position) = position {
+        let width = trough.width * position.clamp(0.0, 1.0);
+        if width > 0.0 {
+            let filled = Rect::new(trough.x, trough.y, width, thickness);
+            fill(list, &rounded(filled, radius), dim(filling, state));
+        }
+    }
+
+    stroke(
+        list,
+        &inset(trough, EDGE / 2.0),
+        radius,
+        EDGE,
+        dim(edge, state),
+    );
 }
 
 /// The ring that shows where the keyboard is.

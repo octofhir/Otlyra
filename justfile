@@ -39,6 +39,13 @@ test-page-shot name width="820" height="2000":
 test-page-reference name width="820" height="900":
     @just reference tests/pages/{{name}}.html {{width}} {{height}}
 
+# Somewhere for a form on a test page to be sent, which prints what arrived.
+#
+# `tests/pages/try.html` posts a file to it. Run it in a second terminal; it is a
+# hand-checking tool and nothing in the browser or the tests needs it.
+echo-server:
+    @python3 tools/echo-server.py
+
 # What pages there are to open.
 test-pages:
     @ls tests/pages/*.html | xargs -n1 basename | sed 's/\.html$//'

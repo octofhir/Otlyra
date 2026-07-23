@@ -42,6 +42,12 @@ pub struct Interaction {
     /// the cascade like every other state, which is what makes `:open` on a
     /// drop-down mean what the specification says it means.
     pub open: Option<NodeId>,
+    /// The suggestion the reader has walked to in an open list of them.
+    ///
+    /// A suggestion is not a choice: nothing is in the field until the reader
+    /// takes it, so this cannot be the selectedness an `<option>` of a `<select>`
+    /// carries. It is where the arrows have got to and nothing more.
+    pub suggestion: Option<NodeId>,
     /// Whether the focus should be drawn — the `:focus-visible` decision, made
     /// where the input is routed rather than here, because it depends on what the
     /// reader did last rather than on what the document says.
@@ -74,6 +80,8 @@ pub struct States<'a> {
     focus: Option<NodeId>,
     /// The element the reader has opened.
     open: Option<NodeId>,
+    /// The suggestion the arrows have reached.
+    suggestion: Option<NodeId>,
     /// Whether the focus is drawn.
     focus_visible: bool,
 }
@@ -96,6 +104,7 @@ impl<'a> States<'a> {
             focus_within,
             focus: interaction.focus,
             open: interaction.open,
+            suggestion: interaction.suggestion,
             focus_visible: interaction.focus_visible,
         }
     }
@@ -192,7 +201,10 @@ impl<'a> States<'a> {
 
         let checked = match control {
             Control::Input(kind) if kind.is_checkable() => self.form.checkedness(document, id),
-            Control::Option => self.form.selectedness(document, id),
+            // A suggestion the arrows have reached is marked the way a chosen
+            // option is, because that is what it looks like to a reader — and it
+            // is not chosen, so it cannot be answered from what the form holds.
+            Control::Option => self.suggestion == Some(id) || self.form.selectedness(document, id),
             _ => false,
         };
         if checked {
@@ -248,8 +260,9 @@ impl<'a> States<'a> {
 
 /// Every element whose state can differ between two interactions.
 ///
-/// Only the six chains can: an element nobody is pointing at, pressing or focusing
-/// in either interaction holds the same bits in both, whatever else changed.
+/// Only the chains can: an element nobody is pointing at, pressing, focusing or
+/// suggesting in either interaction holds the same bits in both, whatever else
+/// changed.
 #[must_use]
 pub fn touched_nodes(document: &Document, before: Interaction, after: Interaction) -> Vec<NodeId> {
     let mut touched: Vec<NodeId> = Vec::new();
@@ -259,10 +272,12 @@ pub fn touched_nodes(document: &Document, before: Interaction, after: Interactio
         before.active,
         before.focus,
         before.open,
+        before.suggestion,
         after.hover,
         after.active,
         after.focus,
         after.open,
+        after.suggestion,
     ] {
         for id in ancestors_and_self(document, node) {
             if seen.insert(id) {

@@ -352,6 +352,12 @@ struct ReplacedBox {
     /// own and sits with its bottom edge on the line's, which is what this is when
     /// it is the whole height.
     baseline: f32,
+    /// How far a rule has raised it off that baseline, positive upwards.
+    ///
+    /// A box in a line answers `vertical-align` the way a span of text does, and a
+    /// bar is the reason it has to: both references set a `<progress>` a fifth of
+    /// an em below the baseline, and without this it sits on it.
+    shift: f32,
 }
 
 /// The spacer identifiers for the two edges of the `index`th inline box.
@@ -537,6 +543,19 @@ fn set_scroll_port(fragment: &mut Fragment, port: BoxId) {
     for child in &mut fragment.children {
         set_scroll_port(child, port);
     }
+}
+
+/// Whether this fragment is the list an open control shows over the page.
+///
+/// Hanging the list off the control is what places it against the control, and
+/// that is the whole of what it takes from it: it is not slid with the control's
+/// own text, not cut off at the control's edge, and not part of what makes the
+/// control a port with something to scroll.
+fn is_popup(tree: &crate::box_tree::BoxTree, fragment: &Fragment) -> bool {
+    fragment.box_id.is_some_and(|id| {
+        let node = tree.node(id);
+        node.anonymous && node.control.as_ref().is_some_and(|control| control.open)
+    })
 }
 
 /// Cut a fragment and everything inside it off at `clip`.
@@ -1302,7 +1321,9 @@ impl<'a> Flow<'a> {
             .map_or((0.0, 0.0), |control| control.scroll);
         if slid != (0.0, 0.0) {
             for child in &mut children {
-                shift(child, -slid.0, -slid.1);
+                if !is_popup(self.tree, child) {
+                    shift(child, -slid.0, -slid.1);
+                }
             }
         }
         // A box that is inline outside cuts its contents off at its padding edge
@@ -1316,7 +1337,9 @@ impl<'a> Flow<'a> {
                 content_height + padding.top + padding.bottom,
             );
             for child in &mut children {
-                set_clip(child, padding_box);
+                if !is_popup(self.tree, child) {
+                    set_clip(child, padding_box);
+                }
             }
         }
 
@@ -1617,7 +1640,9 @@ impl<'a> Flow<'a> {
             .map_or((0.0, 0.0), |control| control.scroll);
         if slid != (0.0, 0.0) {
             for child in &mut children {
-                shift(child, -slid.0, -slid.1);
+                if !is_popup(self.tree, child) {
+                    shift(child, -slid.0, -slid.1);
+                }
             }
         }
 
@@ -1632,13 +1657,16 @@ impl<'a> Flow<'a> {
                 content_height + padding.top + padding.bottom,
             );
             for child in &mut children {
-                set_clip(child, padding_box);
+                if !is_popup(self.tree, child) {
+                    set_clip(child, padding_box);
+                }
             }
 
             // How much there is to see: the furthest any of its contents reaches.
             // More than the box can show is what makes it a scroll port.
             let reach = children
                 .iter()
+                .filter(|child| !is_popup(self.tree, child))
                 .map(|child| child.rect.bottom())
                 .fold(content_y, f32::max);
             let inside = reach - content_y + padding.top + padding.bottom;
@@ -3470,11 +3498,22 @@ impl<'a> Flow<'a> {
                     .find(|(index, _)| replaced_spacer(*index) == spacer.id)
                     .map(|(_, box_)| box_);
                 match box_ {
+                    // The margin box asks for the room, not the border box: a
+                    // slider with two pixels above and below it makes the line it
+                    // is in four pixels taller, which is what both references do
+                    // and the difference between a row of controls sitting in
+                    // their line and sitting through it.
                     Some(box_) if box_.content.is_some() => {
-                        line.0 = line.0.max(box_.baseline);
-                        line.1 = line.1.max(box_.height - box_.baseline);
+                        let margin = resolve_margin(&box_.style, 0.0);
+                        line.0 = line.0.max(box_.baseline + box_.shift + margin.top);
+                        line.1 = line
+                            .1
+                            .max(box_.height - box_.baseline - box_.shift + margin.bottom);
                     }
-                    Some(_) => line.0 = line.0.max(spacer.height),
+                    Some(box_) => {
+                        line.0 = line.0.max(spacer.height + box_.shift);
+                        line.1 = line.1.max(-box_.shift);
+                    }
                     None => {}
                 }
             }
@@ -3702,7 +3741,7 @@ impl<'a> Flow<'a> {
                 if spacer.line != index {
                     return None;
                 }
-                let at = (line_x + spacer.x, y + spacer.y - paragraph_top);
+                let at = (line_x + spacer.x, y + spacer.y - paragraph_top - box_.shift);
                 // An inline block was laid out at the origin, contents and all, and
                 // is moved to where its line put it — everything inside it goes
                 // with it, which is what makes it one thing in the line. It sits on
@@ -3710,7 +3749,7 @@ impl<'a> Flow<'a> {
                 // makes two buttons of different heights read as a row of words.
                 if let Some(content) = box_.content.as_deref() {
                     let mut fragment = content.clone();
-                    let top = y + line.baseline - paragraph_top - box_.baseline;
+                    let top = y + line.baseline - paragraph_top - box_.baseline - box_.shift;
                     let (dx, dy) = (at.0 - fragment.rect.x, top - fragment.rect.y);
                     crate::flow::offset(&mut fragment, dx, dy);
                     return Some(fragment);
@@ -4081,6 +4120,7 @@ impl<'a> Flow<'a> {
                         height,
                         content: None,
                         baseline: height,
+                        shift: baseline_shift(&node.style, &self.tree.node(id).style),
                     });
                 }
                 BoxKind::Text(text) => {
@@ -4142,6 +4182,7 @@ impl<'a> Flow<'a> {
                     // Where it *goes* is the shaper's answer, so it is laid out at
                     // the origin and moved once the line is broken.
                     let style = Arc::clone(&node.style);
+                    let shift_of_box = baseline_shift(&style, &self.tree.node(id).style);
                     let width = match style.width.resolve(containing_width) {
                         Some(width) => {
                             let padding = resolve_padding(&style, containing_width);
@@ -4167,6 +4208,7 @@ impl<'a> Flow<'a> {
                         height,
                         content: Some(Box::new(fragment)),
                         baseline,
+                        shift: shift_of_box,
                     });
                 }
                 BoxKind::Block => {

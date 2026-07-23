@@ -114,6 +114,16 @@ accesskit = "=0.24.1"
 # advisories. Linux re-enables `accesskit_unix` per target.
 accesskit_winit = { version = "=0.33.2", default-features = false, features = ["rwh_06"] }
 
+# The system file dialogue, for `<input type=file>`. The page never opens it: it
+# asks, the shell answers, and what answers is a swappable detail — which is what
+# makes a platform this crate does not cover (a phone) a matter of answering the
+# same request another way rather than of changing the page.
+#
+# Defaults kept: on Linux they are the desktop portal and Wayland, which is what a
+# sandboxed application is supposed to use. The `gtk3` feature is *not* taken — it
+# is the same unmaintained GTK3 binding tree that is dropped from winit and muda.
+rfd = "=0.17.2"
+
 # The system clipboard, for the interface's text fields. Text only:
 # `default-features = false` drops `image-data` (which drags in the `image`
 # crate) and the Linux Wayland backend; Linux re-enables the latter per target.

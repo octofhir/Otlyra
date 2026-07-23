@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>try</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 24px; max-width: 60em; }
+  h2 { font-size: 1.05em; margin: 1.6em 0 0.3em; }
+  p.note { color: #555; font-size: 0.85em; margin: 0.2em 0 0.6em; }
+  fieldset { border: 1px solid #ccc; margin: 0 0 1em; }
+  legend { font-weight: bold; }
+  label { display: inline-block; min-width: 9em; }
+</style>
+
+<h1>Everything to press</h1>
+<p class="note">One page for trying things by hand. Each block says what should happen.</p>
+
+<h2>Suggestions</h2>
+<p class="note">Press the field: the list drops. Type <code>ber</code>: it narrows, without case and
+  anywhere in the word. Arrows walk it and mark where you are without filling the field; return
+  takes what is marked, escape leaves it. Pressing a suggestion takes it.</p>
+<p><label for="city">City</label> <input id="city" name="city" list="cities"></p>
+<p><label for="city2">Read-only</label> <input id="city2" list="cities" readonly value="Bern"></p>
+<datalist id="cities">
+  <option value="Amsterdam">
+  <option value="Ankara">
+  <option value="Berlin">
+  <option value="Bern">
+  <option value="Bratislava">
+  <option value="Brussels">
+  <option value="Budapest">
+  <option value="Copenhagen">
+  <option value="Dublin">
+  <option value="Helsinki">
+  <option value="Lisbon">
+  <option value="Ljubljana">
+  <option value="Madrid">
+  <option value="Nicosia">
+  <option value="Oslo">
+  <option value="Paris">
+  <option value="Prague">
+  <option value="Reykjavik">
+  <option value="Riga">
+  <option value="Rome">
+  <option value="Sofia">
+  <option value="Stockholm">
+  <option value="Tallinn">
+  <option value="Vienna">
+  <option value="Vilnius">
+  <option value="Warsaw">
+  <option value="Zagreb">
+</datalist>
+
+<h2>Sliders</h2>
+<p class="note">Press anywhere on a track: the thumb goes there. Drag it, wander off the track —
+  it still follows. Arrows step, page keys ten steps, home and end reach the ends. The last one
+  steps by five, so it lands on 0, 5, 10 and nothing between.</p>
+<p><label for="r1">Plain</label> <input id="r1" name="volume" type="range"></p>
+<p><label for="r2">0 to 10</label> <input id="r2" name="level" type="range" min="0" max="10" value="7"></p>
+<p><label for="r3">By fives</label> <input id="r3" name="step5" type="range" min="0" max="50" step="5"></p>
+<p><label for="r4">Disabled</label> <input id="r4" type="range" value="30" disabled></p>
+
+<h2>Bars</h2>
+<p class="note">Nothing to press. The second one has no value: it says a task is going on without
+  saying how far, so it stays empty rather than reading as zero. The meters differ only in where
+  their <code>optimum</code> sits, which is what decides the colour.</p>
+<p><progress value="0.3"></progress> <progress></progress> <progress value="60" max="100"></progress></p>
+<p><meter value="0.5"></meter>
+   <meter value="0.1" low="0.3" high="0.7" optimum="0.5"></meter>
+   <meter value="0.9" low="0.3" high="0.7" optimum="0.1"></meter>
+   <meter value="0.9" low="0.3" high="0.7" optimum="0.9"></meter></p>
+
+<h2>Dates and times</h2>
+<p class="note">Press one: it takes hold of a part. Type digits — <code>7</code> in a month is July
+  and moves on, because no month starts with a seven. Left and right walk the parts, up and down
+  step the one in hand and wrap at its ends, backspace empties it. A part missing, or the
+  thirtieth of February, means the control holds nothing — send the form and see.</p>
+<p><label for="d1">Date</label> <input id="d1" name="when" type="date"></p>
+<p><label for="d2">Filled in</label> <input id="d2" name="filled" type="date" value="2026-07-23"></p>
+<p><label for="t1">Time</label> <input id="t1" name="at" type="time"></p>
+<p><label for="m1">Month</label> <input id="m1" name="month" type="month"></p>
+<p><label for="w1">Week</label> <input id="w1" name="week" type="week"></p>
+<p><label for="dt">Both</label> <input id="dt" name="both" type="datetime-local"></p>
+
+<h2>Colour</h2>
+<p class="note">It shows what it holds. The third says nonsense, and nonsense is black.</p>
+<p><input type="color" name="c1"> <input type="color" name="c2" value="#ff8800">
+   <input type="color" value="not a colour"> <input type="color" value="#00aa55" disabled></p>
+
+<h2>Files, and a form that carries one</h2>
+<p class="note">Press one: the machine's own dialogue opens. Dismiss it and the control keeps what
+  it held. The second takes several and says how many; the third asks for text files.
+  Then send the form — it is a <code>POST</code> spelled <code>multipart/form-data</code>, so the
+  file goes with it. Start something to send it to first (see below); the answer that comes back
+  is whatever that prints.</p>
+<form method="post" enctype="multipart/form-data" action="http://127.0.0.1:8744/take">
+  <fieldset>
+    <legend>Upload</legend>
+    <p><label for="f1">One file</label> <input id="f1" name="doc" type="file"></p>
+    <p><label for="f2">Several</label> <input id="f2" name="docs" type="file" multiple></p>
+    <p><label for="f3">Text only</label> <input id="f3" name="text" type="file" accept=".txt,.md,text/plain"></p>
+    <p><label for="note">A word with it</label> <input id="note" name="note" value="hello there"></p>
+    <p><input type="submit" value="Send it"> <input type="reset" value="Put it back"></p>
+  </fieldset>
+</form>
+
+<h2>The same answers in an address</h2>
+<p class="note">A <code>GET</code>, so everything above turns into a query and the address bar
+  shows it. A slider with nothing typed into it still sends the middle of its range; a half-filled
+  date sends nothing; a file sends its name and not its contents.</p>
+<form method="get" action="">
+  <p><input name="city" list="cities" placeholder="a city">
+     <input name="volume" type="range">
+     <input name="when" type="date">
+     <input name="doc" type="file">
+     <input type="submit" value="Put it in the address"></p>
+</form>

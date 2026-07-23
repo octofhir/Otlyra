@@ -59,6 +59,10 @@ pub struct Replaced {
     pub hint: (Option<f32>, Option<f32>),
 }
 
+/// How a `<meter>` reads, carried through to whatever draws it: the painter is
+/// given a box and a rectangle and has no document to ask.
+pub use otlyra_dom::form::Level;
+
 /// A form control, as a box has to know it.
 ///
 /// Not a kind of box. A control is a block container that happens to be drawn
@@ -88,6 +92,17 @@ pub struct Control {
     pub state: ControlState,
     /// Whether a drop-down is showing its list.
     pub open: bool,
+    /// How far along a slider's thumb or a bar's fill is, from 0 to 1.
+    ///
+    /// `None` where the control has no such number at all, and for a `<progress>`
+    /// that has none — a bar that says a task is going on without saying how far,
+    /// which is a different thing from a bar at zero.
+    pub position: Option<f32>,
+    /// How a `<meter>`'s value reads against its optimum, which is what decides
+    /// the colour it is filled in.
+    pub level: Level,
+    /// The colour a colour well holds, which is the whole of what it shows.
+    pub swatch: Option<[u8; 3]>,
     /// Whether the widget's own size has already been written into the style.
     ///
     /// Layout runs many times over one box tree — every resize, every scroll that
@@ -481,6 +496,19 @@ impl BoxTree {
             && let Some(control) = node.control.as_mut()
         {
             control.scroll = scroll;
+        }
+    }
+
+    /// Write what a widget is to draw for itself.
+    ///
+    /// The one part of a control's state that a pointer moving over it changes,
+    /// and the reason it can be written rather than rebuilt: what a hover does to
+    /// a control that no rule mentions is change the picture and nothing else.
+    pub fn set_control_state(&mut self, id: BoxId, state: ControlState) {
+        if let Some(node) = self.boxes.get_mut(id)
+            && let Some(control) = node.control.as_mut()
+        {
+            control.state = state;
         }
     }
 

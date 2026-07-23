@@ -37,6 +37,12 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The file dialogue is the one thing here with no answer on every platform we may
+# want to run on, so it is taken only where it has one. Everywhere else the request
+# to choose a file simply goes unanswered, and the control says no file was chosen.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+rfd.workspace = true
+
 [dev-dependencies]
 otlyra-text.workspace = true
 insta.workspace = true

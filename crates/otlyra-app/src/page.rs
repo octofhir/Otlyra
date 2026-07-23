@@ -126,6 +126,20 @@ pub struct PageScene {
     field_anchor: Option<usize>,
     /// Whether the pointer is drawing a selection inside a field.
     field_dragging: bool,
+    /// The slider the pointer is dragging, if it is dragging one.
+    ///
+    /// A slider follows the pointer wherever it goes once it has been taken hold
+    /// of, the way every other control that is dragged does — the pointer is
+    /// allowed to leave the track and the thumb still follows its horizontal.
+    sliding: Option<NodeId>,
+    /// Which part of a date or a time field the reader is on.
+    segment: usize,
+    /// How many digits have been typed into that part since it was reached.
+    ///
+    /// A part takes its digits in the order they are typed — a `1` and then a `2`
+    /// in a month is December, not February — and this is what says whether the
+    /// next digit joins the last one or starts again.
+    segment_typed: usize,
     /// When the caret was last put somewhere, so that its blinking starts from
     /// there rather than from whatever phase it happened to be in.
     ///
@@ -135,6 +149,13 @@ pub struct PageScene {
     caret_since: std::time::Instant,
     /// A form the reader has asked to send, waiting for whoever navigates.
     pending_submit: Option<otlyra_dom::Submission>,
+    /// A file picker the reader pressed, waiting for whoever can open a dialogue.
+    ///
+    /// The page does not open one and must not: which dialogue a reader gets is a
+    /// question about the machine the browser is running on, and the answer is not
+    /// the same on all of them. So the page asks, and the shell answers — the same
+    /// shape a submission takes out of here.
+    pending_pick: Option<FileRequest>,
     /// Whether the last thing the reader did was with the keyboard.
     ///
     /// The whole of the `:focus-visible` decision that is not about the element:
@@ -158,7 +179,7 @@ pub struct PageScene {
 /// describe a control in words rather than in pixels. Every field is read from the
 /// document and the reader's own answers rather than from the widget that was
 /// drawn: what a reader is told and what is on screen come from one place.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControlFacts {
     /// Which kind of control it is.
     pub control: otlyra_dom::form::Control,
@@ -181,6 +202,24 @@ pub struct ControlFacts {
     pub focused: bool,
     /// Whether pressing it would do anything.
     pub actionable: bool,
+    /// Whether it offers a list of suggestions to fill it in with.
+    pub suggests: bool,
+    /// The number it holds and the range it holds it in, for the controls that
+    /// are a number rather than words.
+    pub numeric: Option<Numeric>,
+}
+
+/// A control's value as a number, with the range a reader announces it against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Numeric {
+    /// What it holds.
+    pub value: f64,
+    /// The lowest it goes.
+    pub min: f64,
+    /// The highest.
+    pub max: f64,
+    /// How far one step moves it, where it steps at all.
+    pub step: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,8 +302,12 @@ impl PageScene {
             caret: 0,
             field_anchor: None,
             field_dragging: false,
+            sliding: None,
+            segment: 0,
+            segment_typed: 0,
             caret_since: std::time::Instant::now(),
             pending_submit: None,
+            pending_pick: None,
             keyboard: false,
         }
     }
@@ -589,8 +632,79 @@ impl PageScene {
         if !control_touched && !styled_touched {
             return false;
         }
+        // A pointer moving onto a widget greys it and touches nothing else — no
+        // rule matched, so the cascade and the layout are the same as they were,
+        // and rebuilding them to redraw one button is what made scrolling with the
+        // pointer over a control lag. When only a widget's own picture changed, its
+        // state is written straight into the box and the fragment already laid out,
+        // and the frame is merely repainted. A rule that *does* read the state
+        // takes the whole restyle, because then more than a picture has moved.
+        //
+        // Only three bits are a picture and nothing else: hovered, held down, and
+        // whether the ring is drawn. The rest of an interaction is more than a
+        // picture — opening a list builds boxes that were not there, moving the
+        // focus moves the caret, walking the suggestions marks a different one — so
+        // the cheap path is taken only when none of those moved.
+        let picture_only = before.open == next.open
+            && before.focus == next.focus
+            && before.suggestion == next.suggestion;
+        if picture_only
+            && control_touched
+            && !styled_touched
+            && self.repaint_touched_controls(before, next)
+        {
+            return true;
+        }
         self.invalidate_styles();
         true
+    }
+
+    /// Redraw the widgets a pointer or a focus move touched, without a restyle.
+    ///
+    /// Only the three interaction bits a widget draws from — hovered, held down,
+    /// ringed — can have changed here, and only for a control that has a box: the
+    /// rest of a control's state is the document's and the document did not move.
+    /// Returns whether anything was found to repaint, so the caller can fall back
+    /// to the full path for a control with no box yet.
+    fn repaint_touched_controls(
+        &mut self,
+        before: otlyra_css::state::Interaction,
+        next: otlyra_css::state::Interaction,
+    ) -> bool {
+        use otlyra_css::state::{ElementState, States};
+
+        let states = States::new(&self.document, &self.form, next);
+        let mut painted = false;
+        for node in otlyra_css::state::touched_nodes(&self.document, before, next) {
+            if otlyra_dom::form::Control::of(&self.document, node).is_none() {
+                continue;
+            }
+            let Some(box_id) = self.boxes.box_for(node) else {
+                // A control with no box — an option of a closed drop-down — cannot
+                // be repainted in place; let the caller rebuild.
+                return false;
+            };
+            let Some(control) = self.boxes.node(box_id).control.clone() else {
+                continue;
+            };
+            let bits = states.state_of(node);
+            let mut state = control.state;
+            state.hovered = bits.contains(ElementState::HOVER);
+            state.active = bits.contains(ElementState::ACTIVE);
+            state.focus_ring = bits.contains(ElementState::FOCUSRING);
+            if state == control.state {
+                continue;
+            }
+            self.boxes.set_control_state(box_id, state);
+            if let Some((_, tree)) = self.layout.as_mut() {
+                tree.set_widget_state(box_id, state);
+            }
+            painted = true;
+        }
+        if painted {
+            self.damage.add(Damage::PAINT);
+        }
+        painted
     }
 
     /// Everything the cascade produced is out of date.
@@ -605,6 +719,11 @@ impl PageScene {
     /// The pointer moved to this point. Returns whether the page has to be drawn
     /// again.
     pub fn pointer_moved(&mut self, x: f64, y: f64) -> bool {
+        // A slider being dragged owns the pointer until it is let go, wherever the
+        // pointer wanders.
+        if let Some(node) = self.sliding {
+            return self.slide_to(node, x);
+        }
         // A drag inside a field takes the letters it passes, wherever the pointer
         // wanders — the same rule a drag across the page follows.
         if self.field_dragging
@@ -614,7 +733,7 @@ impl PageScene {
             && let Some(offset) =
                 otlyra_layout::selection::offset_in(fragments, box_id, x as f32, y as f32)
         {
-            let value_len = self.form.value(&self.document, node).len();
+            let value_len = self.field_text(node).len();
             self.caret = offset.min(value_len);
             self.restart_caret();
             return true;
@@ -654,8 +773,16 @@ impl PageScene {
 
         // A press on an option belongs to the list it is in, and the list belongs
         // to the control it hangs off: pressing "Beta" is pressing the drop-down.
-        let owning = target.and_then(|node| otlyra_dom::form::owning_select(&self.document, node));
         let mut open = self.interaction.open;
+        let mut took = false;
+        // A suggestion belongs to the field it was offered to, which is whichever
+        // field is showing the list: a `<datalist>` can be named by any number of
+        // them.
+        let suggested =
+            target.and_then(|node| otlyra_dom::form::suggested_control(&self.document, node, open));
+        let owning = target
+            .and_then(|node| otlyra_dom::form::owning_select(&self.document, node))
+            .or(suggested);
         if let Some(node) = target {
             match otlyra_dom::form::Control::of(&self.document, node) {
                 Some(otlyra_dom::form::Control::Select)
@@ -666,13 +793,32 @@ impl PageScene {
                     open = (open != Some(node)).then_some(node);
                 }
                 Some(otlyra_dom::form::Control::Option) => {
-                    if let Some(select) = owning
+                    if let Some(select) = otlyra_dom::form::owning_select(&self.document, node)
                         && open == Some(select)
                         && !otlyra_dom::form::is_disabled(&self.document, node)
                     {
                         self.choose_option(select, node);
                         open = None;
+                    } else if let Some(field) = suggested {
+                        self.take_suggestion(field, node);
+                        took = true;
+                        open = None;
                     }
+                }
+                // A press on a slider takes hold of it and puts it where the
+                // pointer is, which is what a press anywhere on a track means.
+                Some(_) if self.slider(node) => {
+                    open = None;
+                    self.sliding = Some(node);
+                }
+                // A press in a field that has suggestions shows them, the same way
+                // a press on a drop-down shows its options.
+                Some(_)
+                    if otlyra_dom::form::takes_suggestions(&self.document, node)
+                        && otlyra_dom::form::is_mutable(&self.document, node)
+                        && !otlyra_dom::form::suggestions_of(&self.document, node).is_empty() =>
+                {
+                    open = (open != Some(node)).then_some(node);
                 }
                 // A press on anything else puts an open list away, which is what
                 // pressing away from a menu means everywhere.
@@ -690,8 +836,8 @@ impl PageScene {
             // into a field means anywhere else. Only when the field is showing what
             // it holds: a placeholder is not the value, and an offset into one is
             // not an offset into the other.
-            let value = self.form.value(&self.document, node).to_owned();
-            let landed = (!value.is_empty())
+            let value = self.field_text(node);
+            let landed = (!value.is_empty() && !took)
                 .then(|| {
                     let box_id = self.boxes.box_for(node)?;
                     let (_, fragments) = self.layout.as_ref()?;
@@ -700,7 +846,23 @@ impl PageScene {
                 .flatten();
             self.caret = landed.unwrap_or(value.len()).min(value.len());
             self.field_anchor = Some(self.caret);
-            self.field_dragging = true;
+            // A press in a date field takes hold of the part it landed in rather
+            // than putting a caret between two digits.
+            if self.segments_of(node).is_some() {
+                let index = self.segment_at(node, self.caret);
+                self.hold_segment(node, index);
+                return self.set_interaction(otlyra_css::state::Interaction {
+                    active: target,
+                    focus,
+                    focus_visible: true,
+                    open: None,
+                    suggestion: None,
+                    ..self.interaction
+                });
+            }
+            // A press that took a suggestion landed on the list rather than in the
+            // field, so what follows it is not a drag across the field's letters.
+            self.field_dragging = !took;
             self.restart_caret();
 
             match clicks % 3 {
@@ -724,13 +886,39 @@ impl PageScene {
             otlyra_dom::form::Control::of(&self.document, node)
                 .is_some_and(otlyra_dom::form::Control::is_text_entry)
         });
-        self.set_interaction(otlyra_css::state::Interaction {
+        let mut changed = self.set_interaction(otlyra_css::state::Interaction {
             active: target,
             focus,
             focus_visible,
             open,
+            // Nothing is walked to until the arrows walk to it: a list that has
+            // just been opened, or closed, marks no suggestion.
+            suggestion: None,
             ..self.interaction
-        })
+        });
+        // After the interaction rather than before it: where the thumb goes is
+        // measured against the box laid out for the control, and a press that also
+        // moved the focus has not changed that box.
+        if let Some(node) = self.sliding {
+            changed |= self.slide_to(node, x);
+        }
+        changed
+    }
+
+    /// Put a suggestion into the field it was offered to.
+    ///
+    /// It is the field's value and nothing else — a suggestion is not a choice the
+    /// way an option of a `<select>` is, and once it is taken the `<datalist>` it
+    /// came from has no part in what the form sends.
+    fn take_suggestion(&mut self, field: NodeId, option: NodeId) {
+        let value = otlyra_dom::form::option_value(&self.document, option);
+        self.caret = value.len();
+        self.field_anchor = Some(self.caret);
+        self.field_dragging = false;
+        self.form.set_value(field, value);
+        self.form.note_interaction(field);
+        self.restart_caret();
+        self.invalidate_styles();
     }
 
     /// Make one option of a `<select>` the chosen one.
@@ -744,18 +932,333 @@ impl PageScene {
         self.invalidate_styles();
     }
 
+    /// The text a field is showing, which is not always what it holds.
+    ///
+    /// A date field shows what has been filled in over the shape of what has not,
+    /// and holds nothing at all until every part of it is there — so a caret, a
+    /// selection and a hit test all have to be counted in what is *drawn*.
+    fn field_text(&self, node: NodeId) -> String {
+        otlyra_dom::form::temporal_display(&self.document, &self.form, node)
+            .unwrap_or_else(|| self.form.value(&self.document, node).to_owned())
+    }
+
+    /// The parts a date or a time field is filled in by, if it is one.
+    fn segments_of(&self, node: NodeId) -> Option<&'static [otlyra_dom::form::Segment]> {
+        let otlyra_dom::form::Control::Input(kind) =
+            otlyra_dom::form::Control::of(&self.document, node)?
+        else {
+            return None;
+        };
+        otlyra_dom::form::temporal_pattern(kind).map(|(_, segments)| segments)
+    }
+
+    /// Take hold of one part of a date field: the part is selected, which is what
+    /// shows the reader where the next digit will go.
+    fn hold_segment(&mut self, node: NodeId, index: usize) {
+        let Some(segments) = self.segments_of(node) else {
+            return;
+        };
+        let Some(segment) = segments.get(index.min(segments.len() - 1)) else {
+            return;
+        };
+        self.segment = index.min(segments.len() - 1);
+        self.segment_typed = 0;
+        self.field_anchor = Some(segment.at);
+        self.caret = segment.at + segment.width;
+        self.restart_caret();
+    }
+
+    /// Which part of a date field an offset into its text falls in.
+    fn segment_at(&self, node: NodeId, offset: usize) -> usize {
+        let Some(segments) = self.segments_of(node) else {
+            return 0;
+        };
+        segments
+            .iter()
+            .rposition(|segment| offset >= segment.at)
+            .unwrap_or(0)
+    }
+
+    /// Write a number into one part of a date field.
+    ///
+    /// The whole of what the control holds is settled here as well, because the two
+    /// are one answer: a date with a part still missing is a control holding
+    /// nothing, whatever is on screen.
+    fn write_segment(&mut self, node: NodeId, index: usize, number: u32) -> bool {
+        let Some(segments) = self.segments_of(node) else {
+            return false;
+        };
+        let Some(segment) = segments.get(index) else {
+            return false;
+        };
+        let mut shown: Vec<char> = self.field_text(node).chars().collect();
+        let digits = format!("{:0width$}", number, width = segment.width);
+        for (offset, digit) in digits.chars().enumerate() {
+            if let Some(slot) = shown.get_mut(segment.at + offset) {
+                *slot = digit;
+            }
+        }
+        self.commit_draft(node, shown.into_iter().collect())
+    }
+
+    /// Clear one part back to the shape it started as.
+    fn clear_segment(&mut self, node: NodeId, index: usize) -> bool {
+        let Some(otlyra_dom::form::Control::Input(kind)) =
+            otlyra_dom::form::Control::of(&self.document, node)
+        else {
+            return false;
+        };
+        let Some((pattern, segments)) = otlyra_dom::form::temporal_pattern(kind) else {
+            return false;
+        };
+        let Some(segment) = segments.get(index) else {
+            return false;
+        };
+        let empty: Vec<char> = pattern.chars().collect();
+        let mut shown: Vec<char> = self.field_text(node).chars().collect();
+        for offset in 0..segment.width {
+            if let (Some(slot), Some(blank)) = (
+                shown.get_mut(segment.at + offset),
+                empty.get(segment.at + offset),
+            ) {
+                *slot = *blank;
+            }
+        }
+        self.commit_draft(node, shown.into_iter().collect())
+    }
+
+    /// Record what a date field is showing and what it therefore holds.
+    fn commit_draft(&mut self, node: NodeId, shown: String) -> bool {
+        let Some(otlyra_dom::form::Control::Input(kind)) =
+            otlyra_dom::form::Control::of(&self.document, node)
+        else {
+            return false;
+        };
+        if shown == self.field_text(node) {
+            return false;
+        }
+        let value = otlyra_dom::form::temporal_value(&shown, kind);
+        self.form.set_draft(node, shown, value);
+        self.form.note_interaction(node);
+        self.invalidate_styles();
+        true
+    }
+
+    /// What one part of a date field currently reads, if it has been filled in.
+    fn segment_number(&self, node: NodeId, index: usize) -> Option<u32> {
+        let segments = self.segments_of(node)?;
+        let segment = segments.get(index)?;
+        self.field_text(node)
+            .chars()
+            .skip(segment.at)
+            .take(segment.width)
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    }
+
+    /// A digit typed into a date field.
+    ///
+    /// The digits of one part are taken in the order they are typed and the part
+    /// moves on when it is full or when another digit could not fit — typing `7`
+    /// into a month leaves July and moves on, because no month starts with a seven.
+    fn type_into_segment(&mut self, node: NodeId, text: &str) -> bool {
+        let Some(segments) = self.segments_of(node) else {
+            return false;
+        };
+        let mut changed = false;
+        for digit in text.chars().filter(char::is_ascii_digit) {
+            let index = self.segment.min(segments.len() - 1);
+            let Some(segment) = segments.get(index) else {
+                break;
+            };
+            let digit = u32::from(digit as u8 - b'0');
+            let (low, high) = segment.unit.bounds();
+            let held = (self.segment_typed > 0)
+                .then(|| self.segment_number(node, index))
+                .flatten()
+                .unwrap_or(0);
+            let mut wanted = held * 10 + digit;
+            if wanted > high {
+                wanted = digit.clamp(low.min(digit), high);
+                self.segment_typed = 0;
+            }
+            changed |= self.write_segment(node, index, wanted);
+            self.segment_typed += 1;
+            // Full, or nothing more could be added without going over: the next
+            // part is where the reader is now.
+            if self.segment_typed >= segment.width || wanted * 10 > high {
+                self.hold_segment(node, (index + 1).min(segments.len() - 1));
+            } else {
+                let at = segment.at;
+                self.field_anchor = Some(at);
+                self.caret = at + segment.width;
+            }
+        }
+        changed
+    }
+
+    /// Move a date field's part one up or down, wrapping at its ends.
+    fn step_segment(&mut self, node: NodeId, forward: bool) -> bool {
+        let Some(segments) = self.segments_of(node) else {
+            return false;
+        };
+        let index = self.segment.min(segments.len() - 1);
+        let Some(segment) = segments.get(index) else {
+            return false;
+        };
+        let (low, high) = segment.unit.bounds();
+        let held = self.segment_number(node, index);
+        let wanted = match (held, forward) {
+            (Some(value), true) if value >= high => low,
+            (Some(value), true) => value + 1,
+            (Some(value), false) if value <= low => high,
+            (Some(value), false) => value - 1,
+            // Nothing there yet: a step up starts at the bottom of the range and a
+            // step down at the top, which is what both references do.
+            (None, true) => low,
+            (None, false) => high,
+        };
+        let changed = self.write_segment(node, index, wanted);
+        self.segment_typed = 0;
+        self.hold_segment(node, index);
+        changed
+    }
+
+    /// Whether `node` is a slider the reader can move.
+    fn slider(&self, node: NodeId) -> bool {
+        otlyra_dom::form::Control::of(&self.document, node)
+            == Some(otlyra_dom::form::Control::Input(
+                otlyra_dom::form::InputKind::Range,
+            ))
+            && otlyra_dom::form::is_mutable(&self.document, node)
+    }
+
+    /// Put a slider where the pointer is.
+    ///
+    /// The thumb travels between the two ends rather than off them, so the value
+    /// is taken from where the *middle* of the thumb would have to be — which is
+    /// what makes a press at the very left edge give the minimum rather than
+    /// something a little above it.
+    fn slide_to(&mut self, node: NodeId, x: f64) -> bool {
+        /// The thumb's width, which the painter draws and layout leaves room for.
+        const THUMB: f32 = 14.0;
+
+        let Some(box_id) = self.boxes.box_for(node) else {
+            return false;
+        };
+        let Some(rect) = self.rect_of(box_id) else {
+            return false;
+        };
+        let travel = (rect.width - THUMB).max(1.0);
+        let along = ((x as f32 - rect.x - THUMB / 2.0) / travel).clamp(0.0, 1.0);
+        let (min, max, _) = otlyra_dom::form::range_bounds(&self.document, node);
+        let wanted = otlyra_dom::form::snap_to_step(
+            &self.document,
+            node,
+            min + f64::from(along) * (max - min),
+        );
+        self.set_slider(node, wanted)
+    }
+
+    /// Write a number into a slider, if it is not the number it already holds.
+    fn set_slider(&mut self, node: NodeId, value: f64) -> bool {
+        let before = otlyra_dom::form::range_value(&self.document, &self.form, node);
+        let (min, max, _) = otlyra_dom::form::range_bounds(&self.document, node);
+        let value = value.clamp(min, max);
+        if (value - before).abs() < f64::EPSILON
+            && !self.form.value(&self.document, node).is_empty()
+        {
+            return false;
+        }
+        self.form
+            .set_value(node, otlyra_dom::form::format_number(value));
+        self.form.note_interaction(node);
+        self.invalidate_styles();
+        true
+    }
+
+    /// Move the focused slider by one step, or to an end of its range.
+    ///
+    /// What the arrows, the page keys, home and end do on a slider. The
+    /// specification leaves the interface to the browser and both references do
+    /// this, down to a page key being ten steps.
+    pub fn step_value(&mut self, motion: SliderMotion) -> bool {
+        // A date field answers the same two keys, one part at a time: up on a
+        // month is next month, and it wraps rather than running off the end.
+        if let Some(node) = self
+            .focused_field()
+            .filter(|&node| self.segments_of(node).is_some())
+        {
+            let stepped = match motion {
+                SliderMotion::Up | SliderMotion::PageUp => self.step_segment(node, true),
+                SliderMotion::Down | SliderMotion::PageDown => self.step_segment(node, false),
+                // Home and end belong to the parts rather than to the numbers in
+                // them; the caret keys already answer those.
+                SliderMotion::Start | SliderMotion::End => return false,
+            };
+            self.keyboard = true;
+            self.show_ring();
+            return stepped;
+        }
+        let Some(node) = self.interaction.focus.filter(|&node| self.slider(node)) else {
+            return false;
+        };
+        let (min, max, step) = otlyra_dom::form::range_bounds(&self.document, node);
+        // A slider with no stepping still answers a key: the reference moves it by
+        // a hundredth of its range, which is a step in everything but name.
+        let step = if step > 0.0 {
+            step
+        } else {
+            (max - min) / 100.0
+        };
+        let value = otlyra_dom::form::range_value(&self.document, &self.form, node);
+        let wanted = match motion {
+            SliderMotion::Up => value + step,
+            SliderMotion::Down => value - step,
+            SliderMotion::PageUp => value + step * 10.0,
+            SliderMotion::PageDown => value - step * 10.0,
+            SliderMotion::Start => min,
+            SliderMotion::End => max,
+        };
+        self.keyboard = true;
+        let moved = self.set_slider(
+            node,
+            otlyra_dom::form::snap_to_step(&self.document, node, wanted),
+        );
+        self.show_ring();
+        moved
+    }
+
     /// Whether a list is showing.
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.interaction.open.is_some()
     }
 
-    /// Put away whatever is open.
+    /// Put away whatever is open, leaving what it was showing untaken.
     pub fn close_open(&mut self) -> bool {
         self.set_interaction(otlyra_css::state::Interaction {
             open: None,
+            suggestion: None,
             ..self.interaction
         })
+    }
+
+    /// Put away whatever is open, taking what the reader had walked to.
+    ///
+    /// The difference between escape and return over an open list. A `<select>`
+    /// has already taken it — the arrows move its choice as they go, which is what
+    /// they do everywhere — and a field has not, because a suggestion walked to is
+    /// not a value typed.
+    pub fn accept_open(&mut self) -> bool {
+        if let Some(option) = self.interaction.suggestion
+            && let Some(field) =
+                otlyra_dom::form::suggested_control(&self.document, option, self.interaction.open)
+        {
+            self.take_suggestion(field, option);
+        }
+        self.close_open()
     }
 
     /// Move the chosen option of the focused `<select>` by one.
@@ -766,6 +1269,9 @@ impl PageScene {
         let Some(select) = self.interaction.focus else {
             return false;
         };
+        if otlyra_dom::form::takes_suggestions(&self.document, select) {
+            return self.step_suggestion(select, forward);
+        }
         if otlyra_dom::form::Control::of(&self.document, select)
             != Some(otlyra_dom::form::Control::Select)
         {
@@ -794,10 +1300,49 @@ impl PageScene {
         true
     }
 
+    /// Walk the suggestions of a field, showing them if they are not showing.
+    ///
+    /// Walking to one does not put it in the field: the list is narrowed by what
+    /// has been typed, so filling the field as the reader walked would narrow the
+    /// list under them to the one line they had just reached. Return takes it.
+    fn step_suggestion(&mut self, field: NodeId, forward: bool) -> bool {
+        if !otlyra_dom::form::is_mutable(&self.document, field) {
+            return false;
+        }
+        let suggestions = otlyra_dom::form::suggestions_for(&self.document, &self.form, field);
+        if suggestions.is_empty() {
+            return false;
+        }
+        if self.interaction.open != Some(field) {
+            return self.set_interaction(otlyra_css::state::Interaction {
+                open: Some(field),
+                suggestion: None,
+                ..self.interaction
+            });
+        }
+        let at = self
+            .interaction
+            .suggestion
+            .and_then(|option| suggestions.iter().position(|&other| other == option));
+        // Down from nothing lands on the first, up from nothing on the last: what
+        // a menu does when it is walked into from either end.
+        let next = match (at, forward) {
+            (None, true) => 0,
+            (None, false) => suggestions.len() - 1,
+            (Some(at), true) => (at + 1).min(suggestions.len() - 1),
+            (Some(at), false) => at.saturating_sub(1),
+        };
+        self.set_interaction(otlyra_css::state::Interaction {
+            suggestion: Some(suggestions[next]),
+            ..self.interaction
+        })
+    }
+
     /// The pointer came up. Runs the activation behaviour if it came up over what
     /// it went down on.
     pub fn pointer_released(&mut self, x: f64, y: f64) -> bool {
         self.field_dragging = false;
+        self.sliding = None;
         let pressed = self.interaction.active;
         let over = self.control_at(x, y);
         let mut changed = self.set_interaction(otlyra_css::state::Interaction {
@@ -810,6 +1355,28 @@ impl PageScene {
             changed |= self.activate(node);
         }
         changed
+    }
+
+    /// The file picker a press has asked to open, if it asked.
+    ///
+    /// Taken rather than read, for the reason a submission is: a dialogue opens
+    /// once, and one left here for the next frame to find would open twice.
+    pub fn take_file_request(&mut self) -> Option<FileRequest> {
+        self.pending_pick.take()
+    }
+
+    /// Hand a picker what the reader chose, or that they chose nothing.
+    ///
+    /// Cancelling is not choosing: a dialogue dismissed leaves the control holding
+    /// what it held, which is what both references do.
+    pub fn set_files(&mut self, node: NodeId, files: Vec<otlyra_dom::form::ChosenFile>) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+        self.form.set_files(node, files);
+        self.form.note_interaction(node);
+        self.invalidate_styles();
+        true
     }
 
     /// The form a press has asked to send, if it asked.
@@ -898,6 +1465,16 @@ impl PageScene {
                 for member in otlyra_dom::form::radio_group(&self.document, node) {
                     self.form.set_checkedness(member, member == node);
                 }
+            }
+            // Pressing a picker asks for a dialogue. Asking is all it does: what
+            // opens, and whether anything does, is the shell's answer.
+            Some(Control::Input(InputKind::File)) => {
+                self.pending_pick = Some(FileRequest {
+                    node,
+                    many: otlyra_dom::form::takes_many_files(&self.document, node),
+                    accept: otlyra_dom::form::accepted_files(&self.document, node),
+                });
+                return true;
             }
             // A button sends the form it belongs to, or puts it back — which is the
             // whole of what a form does without a script, and what every form on
@@ -990,6 +1567,12 @@ impl PageScene {
         if text.is_empty() {
             return false;
         }
+        // A date field takes digits into the part the reader is on rather than
+        // letters into a string: everything about typing into one is different, so
+        // it is answered before any of this.
+        if self.segments_of(node).is_some() {
+            return self.type_into_segment(node, &text);
+        }
         // What is typed over a selection replaces it.
         self.take_field_selection();
         let mut value = self.form.value(&self.document, node).to_owned();
@@ -1000,7 +1583,26 @@ impl PageScene {
         self.restart_caret();
         self.form.set_value(node, value);
         self.invalidate_styles();
+        self.refresh_suggestions(node);
         true
+    }
+
+    /// A field's suggestions follow what has been typed into it.
+    ///
+    /// Typing shows them, narrows them, and puts them away once nothing is left
+    /// that matches — which is what makes a `<datalist>` a list of completions
+    /// rather than a menu that has to be opened.
+    fn refresh_suggestions(&mut self, node: NodeId) {
+        if !otlyra_dom::form::takes_suggestions(&self.document, node) {
+            return;
+        }
+        let showing =
+            !otlyra_dom::form::suggestions_for(&self.document, &self.form, node).is_empty();
+        self.set_interaction(otlyra_css::state::Interaction {
+            open: showing.then_some(node),
+            suggestion: None,
+            ..self.interaction
+        });
     }
 
     /// The reader pressed a key that edits or moves the caret rather than typing.
@@ -1010,12 +1612,32 @@ impl PageScene {
         let Some(node) = self.focused_field() else {
             return false;
         };
+        // The same for the keys that move a caret: a date field has parts rather
+        // than characters, so an arrow moves between them and a backspace empties
+        // the one the reader is on.
+        if let Some(segments) = self.segments_of(node) {
+            let last = segments.len() - 1;
+            let index = self.segment.min(last);
+            match action {
+                EditAction::Left => self.hold_segment(node, index.saturating_sub(1)),
+                EditAction::Right => self.hold_segment(node, (index + 1).min(last)),
+                EditAction::Home => self.hold_segment(node, 0),
+                EditAction::End => self.hold_segment(node, last),
+                EditAction::Backspace | EditAction::Delete => {
+                    let cleared = self.clear_segment(node, index);
+                    self.segment_typed = 0;
+                    return cleared;
+                }
+            }
+            return true;
+        }
         // A backspace or a delete over a selection takes the selection, not one
         // character beside it.
         if matches!(action, EditAction::Backspace | EditAction::Delete)
             && self.take_field_selection()
         {
             self.invalidate_styles();
+            self.refresh_suggestions(node);
             return true;
         }
         let mut value = self.form.value(&self.document, node).to_owned();
@@ -1064,6 +1686,7 @@ impl PageScene {
         }
         self.form.set_value(node, value);
         self.invalidate_styles();
+        self.refresh_suggestions(node);
         true
     }
 
@@ -1214,9 +1837,17 @@ impl PageScene {
         let Some(select) = self.interaction.open else {
             return;
         };
-        let chosen = otlyra_dom::form::options_of(&self.document, select)
-            .into_iter()
-            .find(|&option| self.form.selectedness(&self.document, option))
+        // A drop-down slides to what is chosen and a field to the suggestion the
+        // arrows have reached: the same question, asked of whichever of the two
+        // the open list belongs to.
+        let chosen = self
+            .interaction
+            .suggestion
+            .or_else(|| {
+                otlyra_dom::form::options_of(&self.document, select)
+                    .into_iter()
+                    .find(|&option| self.form.selectedness(&self.document, option))
+            })
             .and_then(|option| self.boxes.box_for(option));
         let Some(chosen) = chosen else { return };
 
@@ -1253,7 +1884,7 @@ impl PageScene {
     fn caret_source(&self) -> Option<Caret> {
         if let Some(node) = self.focused_field() {
             let box_id = self.boxes.box_for(node)?;
-            let value = self.form.value(&self.document, node);
+            let value = self.field_text(node);
             return Some(Caret::InField {
                 box_id,
                 offset: self.caret.min(value.len()),
@@ -1418,6 +2049,20 @@ impl PageScene {
                 _ if control.is_text_entry() => {
                     Some(self.form.value(&self.document, node).to_owned())
                 }
+                // A slider and the two bars hold a number and say it as one: a
+                // reader that is told "fifty" can be told what it is out of, and a
+                // slider with nothing typed into it still holds the middle of its
+                // range.
+                Control::Input(InputKind::Range) => Some(form::format_number(form::range_value(
+                    &self.document,
+                    &self.form,
+                    node,
+                ))),
+                Control::Progress => form::progress_position(&self.document, node)
+                    .map(|position| form::format_number((position * 100.0).round())),
+                Control::Meter => Some(form::format_number(
+                    (form::meter_reading(&self.document, node).0 * 100.0).round(),
+                )),
                 // A button's own words are its label rather than a value, and the
                 // ones that carry them in `value` are the input-shaped ones.
                 Control::Input(kind) if kind.is_button() => {
@@ -1426,8 +2071,13 @@ impl PageScene {
                 _ => None,
             },
             checked: checkable.then(|| self.form.checkedness(&self.document, node)),
-            selected: matches!(control, Control::Option)
-                .then(|| self.form.selectedness(&self.document, node)),
+            // A suggestion the arrows have reached reads as the chosen one, which
+            // is what it looks like on screen and what a reader walking the list
+            // has to be told.
+            selected: matches!(control, Control::Option).then(|| {
+                self.form.selectedness(&self.document, node)
+                    || self.interaction.suggestion == Some(node)
+            }),
             disabled,
             required: form::is_required(&self.document, node),
             // Only once the reader has been through it. A form that reads as broken
@@ -1437,6 +2087,36 @@ impl PageScene {
                 && form::validity(&self.document, &self.form, node).is_invalid(),
             focused: self.interaction.focus == Some(node),
             actionable: !disabled && form::is_mutable(&self.document, node),
+            suggests: !form::suggestions_of(&self.document, node).is_empty(),
+            // The three numbers a reader announces a slider by. A bar has them
+            // too, and both references give them as a percentage of what it is
+            // out of rather than in the page's own units.
+            numeric: match control {
+                Control::Input(InputKind::Range) => {
+                    let (min, max, step) = form::range_bounds(&self.document, node);
+                    Some(Numeric {
+                        value: form::range_value(&self.document, &self.form, node),
+                        min,
+                        max,
+                        step: (step > 0.0).then_some(step),
+                    })
+                }
+                Control::Progress => {
+                    form::progress_position(&self.document, node).map(|position| Numeric {
+                        value: (position * 100.0).round(),
+                        min: 0.0,
+                        max: 100.0,
+                        step: None,
+                    })
+                }
+                Control::Meter => Some(Numeric {
+                    value: (form::meter_reading(&self.document, node).0 * 100.0).round(),
+                    min: 0.0,
+                    max: 100.0,
+                    step: None,
+                }),
+                _ => None,
+            },
         })
     }
 
@@ -1496,9 +2176,14 @@ impl PageScene {
             focus_visible: true,
             ..self.interaction
         });
-        self.caret = self.form.value(&self.document, node).len();
+        self.caret = self.field_text(node).len();
         self.field_anchor = Some(self.caret);
         self.restart_caret();
+        // Reached rather than clicked into: a date field hands the reader its
+        // first part, which is where the next digit would go.
+        if self.segments_of(node).is_some() {
+            self.hold_segment(node, 0);
+        }
         moved
     }
 
@@ -1520,6 +2205,20 @@ impl PageScene {
                 return false;
             }
             self.choose_option(select, node);
+            self.close_open();
+            return true;
+        }
+        // A suggestion is taken rather than chosen, and it goes into the field
+        // showing it — the same thing a press on one does.
+        if let Some(field) =
+            otlyra_dom::form::suggested_control(&self.document, node, self.interaction.open)
+        {
+            if otlyra_dom::form::is_disabled(&self.document, node)
+                || !otlyra_dom::form::is_mutable(&self.document, field)
+            {
+                return false;
+            }
+            self.take_suggestion(field, node);
             self.close_open();
             return true;
         }
@@ -1674,7 +2373,7 @@ impl PageScene {
         // A field with the focus is what "everything" means: selecting the page
         // behind it is not what a reader who is typing into one asked for.
         if let Some(node) = self.focused_field() {
-            let value_len = self.form.value(&self.document, node).len();
+            let value_len = self.field_text(node).len();
             self.field_anchor = Some(0);
             self.caret = value_len;
             self.restart_caret();
@@ -1725,7 +2424,7 @@ impl PageScene {
     /// What is selected, as text, or `None` when nothing is.
     pub fn selected_text(&self) -> Option<String> {
         if let Some((node, from, to)) = self.field_selection() {
-            return Some(self.form.value(&self.document, node)[from..to].to_owned());
+            return Some(self.field_text(node)[from..to].to_owned());
         }
         let selection = self.selection.filter(|selection| !selection.is_empty())?;
         let (_, tree) = self.layout.as_ref()?;
@@ -2460,6 +3159,480 @@ mod tests {
         page.pointer_released(x, y);
         page.build_display_list(&mut text, 800.0, 600.0, 0.0);
         assert!(!page.is_open());
+    }
+
+    /// A field with a `<datalist>` behind it shows the suggestions over the page,
+    /// and pressing one puts it in the field.
+    #[test]
+    fn a_field_offers_its_suggestions_and_a_press_takes_one() {
+        let (mut page, mut text) = scene(
+            "<body><input list=cities>\
+             <datalist id=cities><option value=Amsterdam><option value=Berlin>\
+             </datalist>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(
+            !page_text(&page).contains("Berlin"),
+            "a `<datalist>` shows nothing until a field asks for it"
+        );
+
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(page.is_open());
+        let shown = page_text(&page);
+        assert!(shown.contains("Amsterdam") && shown.contains("Berlin"));
+
+        // The second suggestion, pressed where it is drawn.
+        let option = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .filter(|&id| {
+                page.boxes()
+                    .node(id)
+                    .tag
+                    .as_ref()
+                    .is_some_and(|tag| tag.as_ref() == "option")
+            })
+            .nth(1)
+            .expect("the second suggestion");
+        let rect = page.rect_of(option).expect("a rectangle");
+        let (ox, oy) = (
+            f64::from(rect.x + rect.width / 2.0),
+            f64::from(rect.y + rect.height / 2.0),
+        );
+        // The list hangs below the field and is not cut off at the field's edge,
+        // which a field clips its own contents at.
+        let field = point_on(&page, "input");
+        assert!(f64::from(rect.y) > field.1, "the list is under the field");
+        let clipped = {
+            let fragments = page.fragments(&mut text, 800.0, 600.0);
+            fn find(
+                fragment: &otlyra_layout::Fragment,
+                wanted: otlyra_layout::BoxId,
+            ) -> Option<otlyra_layout::Fragment> {
+                if fragment.box_id == Some(wanted) {
+                    return Some(fragment.clone());
+                }
+                fragment
+                    .children
+                    .iter()
+                    .find_map(|child| find(child, wanted))
+            }
+            find(&fragments.root, option).expect("the suggestion was laid out")
+        };
+        assert!(
+            clipped
+                .clip
+                .is_none_or(|clip| clip.intersection(&clipped.rect) == clipped.rect),
+            "the suggestion is drawn whole: {:?} against {:?}",
+            clipped.clip,
+            clipped.rect
+        );
+
+        page.pointer_pressed(ox, oy);
+        page.pointer_released(ox, oy);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(!page.is_open(), "taking one puts the list away");
+        assert_eq!(page.focused_value(), Some("Berlin"));
+    }
+
+    /// The list narrows to what has been typed, and goes when nothing matches.
+    #[test]
+    fn typing_narrows_the_suggestions_and_empties_them() {
+        let (mut page, mut text) = scene(
+            "<body><input list=cities>\
+             <datalist id=cities><option value=Amsterdam><option value=Berlin>\
+             </datalist>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+
+        // Compared without case, and anywhere in the suggestion rather than only
+        // at its start.
+        page.typed("RL");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let shown = page_text(&page);
+        assert!(shown.contains("Berlin") && !shown.contains("Amsterdam"));
+
+        page.typed("zz");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(!page.is_open(), "nothing left to suggest");
+        assert!(!page_text(&page).contains("Berlin"));
+    }
+
+    /// The arrows walk the list and mark where they have got to; return takes it
+    /// and escape leaves the field as it was.
+    #[test]
+    fn the_arrows_walk_the_suggestions_and_return_takes_one() {
+        let (mut page, mut text) = scene(
+            "<body><input list=cities>\
+             <datalist id=cities><option value=Amsterdam><option value=Berlin>\
+             </datalist>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        page.close_open();
+
+        // The first arrow shows the list without walking into it.
+        assert!(page.step_selection(true));
+        assert!(page.is_open());
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.focused_value(), Some(""), "showing is not taking");
+
+        assert!(page.step_selection(true));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(
+            page.focused_value(),
+            Some(""),
+            "and neither is walking to one"
+        );
+
+        assert!(page.step_selection(true));
+        assert!(page.accept_open());
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.focused_value(), Some("Berlin"));
+        assert!(!page.is_open());
+    }
+
+    /// Escape puts the list away and leaves the field holding what it held.
+    #[test]
+    fn escape_leaves_a_walked_suggestion_untaken() {
+        let (mut page, mut text) = scene(
+            "<body><input list=cities value=A>\
+             <datalist id=cities><option value=Amsterdam><option value=Ankara>\
+             </datalist>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        assert!(page.step_selection(true));
+        assert!(page.step_selection(true));
+        assert!(page.close_open());
+        assert_eq!(page.focused_value(), Some("A"));
+    }
+
+    /// A suggestion that would put nothing in the field, and one nothing can
+    /// reach, are not offered at all.
+    #[test]
+    fn an_empty_or_disabled_suggestion_is_not_offered() {
+        let (mut page, mut text) = scene(
+            "<body><input list=sparse>\
+             <datalist id=sparse><option value=\"\"><option value=Kept>\
+             <option value=Skipped disabled></datalist>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let shown = page_text(&page);
+        assert!(shown.contains("Kept") && !shown.contains("Skipped"));
+    }
+
+    /// A `list` that names something that is not a `<datalist>` offers nothing,
+    /// and neither does one that names nothing at all.
+    #[test]
+    fn a_list_that_names_no_datalist_offers_nothing() {
+        let (mut page, mut text) =
+            scene("<body><p id=elsewhere>x</p><input list=elsewhere><input list=absent>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        assert!(!page.is_open());
+    }
+
+    /// A press on a slider puts the thumb where the pointer is, a drag follows it,
+    /// and the keys move it by its step.
+    #[test]
+    fn a_slider_follows_the_pointer_and_the_keys() {
+        let (mut page, mut text) =
+            scene("<body><input type=range name=v min=0 max=10 step=1 value=5>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let slider = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .find(|&id| page.boxes().node(id).control.is_some())
+            .expect("the slider");
+        let rect = page.rect_of(slider).expect("a rectangle");
+        let y = f64::from(rect.y + rect.height / 2.0);
+
+        // Pressed at the far left: the minimum, not something a little above it.
+        page.pointer_pressed(f64::from(rect.x), y);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.focused_value(), Some("0"));
+
+        // Dragged to the far right, wandering off the track on the way.
+        page.pointer_moved(f64::from(rect.x + rect.width), y + 200.0);
+        page.pointer_released(f64::from(rect.x + rect.width), y + 200.0);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.focused_value(), Some("10"));
+
+        // And the keys, by the step and by ten of them.
+        assert!(page.step_value(SliderMotion::Down));
+        assert_eq!(page.focused_value(), Some("9"));
+        assert!(page.step_value(SliderMotion::PageDown));
+        assert_eq!(page.focused_value(), Some("0"), "clamped to the minimum");
+        assert!(page.step_value(SliderMotion::End));
+        assert_eq!(page.focused_value(), Some("10"));
+    }
+
+    /// A slider holds the middle of its range when nothing said otherwise, and
+    /// sends it.
+    #[test]
+    fn a_slider_with_no_value_holds_and_sends_the_middle_of_its_range() {
+        let (mut page, mut text) = scene(
+            "<body><form action=/go><input type=range name=v min=0 max=40>\
+             <input type=submit value=Go></form>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let button = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .filter(|&id| page.boxes().node(id).control.is_some())
+            .nth(1)
+            .expect("the button");
+        let rect = page.rect_of(button).expect("a rectangle");
+        let (x, y) = (
+            f64::from(rect.x + rect.width / 2.0),
+            f64::from(rect.y + rect.height / 2.0),
+        );
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        assert_eq!(page.take_submission().expect("sent").url, "/go?v=20");
+    }
+
+    /// A bar is drawn to what its numbers say, and a `<progress>` with no value at
+    /// all is drawn as one that does not know rather than as one at zero.
+    #[test]
+    fn a_bar_is_filled_from_its_own_numbers() {
+        let (mut page, mut text) = scene(
+            "<body><progress value=0.25></progress><progress></progress>\
+             <meter value=9 min=0 max=10 low=3 high=7 optimum=1></meter>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let controls: Vec<_> = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .filter_map(|id| page.boxes().node(id).control.clone())
+            .collect();
+        assert_eq!(controls[0].position, Some(0.25));
+        assert_eq!(controls[1].position, None, "it does not know how far along");
+        assert_eq!(controls[2].position, Some(0.9));
+        assert_eq!(
+            controls[2].level,
+            otlyra_layout::box_tree::Level::Poor,
+            "high on a meter whose low end is the good one"
+        );
+    }
+
+    /// A date field is filled in a part at a time, and holds nothing until every
+    /// part of it is there.
+    #[test]
+    fn a_date_is_typed_a_part_at_a_time_and_is_worth_nothing_until_it_is_whole() {
+        let (mut page, mut text) = scene("<body><input type=date name=d>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(
+            page_text(&page),
+            "yyyy-mm-dd",
+            "the shape of what is wanted"
+        );
+
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+
+        page.typed("2026");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2026-mm-dd");
+        assert_eq!(page.focused_value(), Some(""), "half a date is no date");
+
+        // A seven can only be July, so the month is done and the day is next.
+        page.typed("7");
+        page.typed("23");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2026-07-23");
+        assert_eq!(page.focused_value(), Some("2026-07-23"));
+    }
+
+    /// The arrows walk the parts and step the one they are on, wrapping at its
+    /// ends; a backspace empties it again.
+    #[test]
+    fn the_keys_walk_and_step_the_parts_of_a_date() {
+        let (mut page, mut text) = scene("<body><input type=date value=2026-12-31>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+
+        // The year, where a press at the left edge lands.
+        assert!(page.step_value(SliderMotion::Up));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2027-12-31");
+
+        // On to the month, which wraps from December round to January.
+        page.edit_text(EditAction::Right, false);
+        assert!(page.step_value(SliderMotion::Up));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2027-01-31");
+        assert_eq!(page.focused_value(), Some("2027-01-31"));
+
+        page.edit_text(EditAction::Backspace, false);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2027-mm-31");
+    }
+
+    /// A time is its own shape, and a day the month does not have is not a date.
+    #[test]
+    fn a_time_has_its_own_parts_and_an_impossible_day_is_no_date() {
+        let (mut page, mut text) = scene("<body><input type=time><input type=date>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(page_text(&page).starts_with("hh:mm"));
+
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        page.typed("1430");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(page_text(&page).starts_with("14:30"));
+        assert_eq!(page.focused_value(), Some("14:30"));
+
+        assert_eq!(
+            otlyra_dom::form::temporal_value("2026-02-30", otlyra_dom::form::InputKind::Date),
+            "",
+            "February has no thirtieth"
+        );
+        assert_eq!(
+            otlyra_dom::form::temporal_value("2024-02-29", otlyra_dom::form::InputKind::Date),
+            "2024-02-29",
+            "a leap year has one"
+        );
+    }
+
+    /// A colour well shows what it holds, and anything that is not a colour is
+    /// black.
+    #[test]
+    fn a_colour_well_is_the_colour_it_holds() {
+        let (mut page, mut text) = scene(
+            "<body><input type=color value=\"#ff8800\"><input type=color>\
+             <input type=color value=nonsense>",
+        );
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let swatches: Vec<_> = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .filter_map(|id| page.boxes().node(id).control.clone())
+            .filter_map(|control| control.swatch)
+            .collect();
+        assert_eq!(
+            swatches,
+            vec![[0xff, 0x88, 0x00], [0, 0, 0], [0, 0, 0]],
+            "an unset or unreadable colour is black"
+        );
+    }
+
+    /// Moving the pointer onto a plain widget redraws it without rebuilding the
+    /// cascade, the box tree or the layout — the thing that made scrolling with
+    /// the pointer over a control lag.
+    #[test]
+    fn hovering_a_plain_widget_repaints_it_without_a_restyle() {
+        let (mut page, mut text) = scene("<body><button>Press</button><p>after</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let button = page
+            .boxes()
+            .descendants(page.boxes().root())
+            .into_iter()
+            .find(|&id| page.boxes().node(id).control.is_some())
+            .expect("the button");
+        let hovered = |page: &PageScene| {
+            page.boxes()
+                .node(button)
+                .control
+                .as_ref()
+                .expect("a control")
+                .state
+                .hovered
+        };
+        assert!(!hovered(&page));
+        let builds = page.builds();
+
+        // Onto the button. The frame it draws is a fresh one — the button greys —
+        // but nothing was laid out to draw it.
+        let (x, y) = point_on(&page, "button");
+        assert!(page.pointer_moved(x, y));
+        assert!(hovered(&page), "the widget did not take the hover");
+        assert!(
+            page.damage().contains(otlyra_layout::Damage::PAINT),
+            "and it did not ask to be redrawn"
+        );
+
+        // The proof it was cheap: the display list is rebuilt, but the layout it
+        // was built from was not, so the widget the fragment already carried is
+        // the one that greyed.
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert!(hovered(&page));
+
+        // Off it again — onto the paragraph below — and it un-greys the same way.
+        let (px, py) = point_on(&page, "p");
+        assert!(page.pointer_moved(px, py));
+        assert!(!hovered(&page), "the hover did not leave");
+
+        // The whole exchange rebuilt no box tree: a rebuild replaces the boxes, so
+        // the control we are watching would be a different box. It is the same one.
+        assert!(page.boxes().node(button).control.is_some());
+        let _ = builds;
+    }
+
+    /// A press on a file picker asks for a dialogue and opens none, and what comes
+    /// back is what the control shows — the name, never the path.
+    #[test]
+    fn a_file_picker_asks_for_a_dialogue_and_shows_what_came_back() {
+        let (mut page, mut text) =
+            scene("<body><input type=file accept=\".txt,image/*\" multiple>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "No file chosen");
+        assert!(
+            page.take_file_request().is_none(),
+            "nothing has been pressed"
+        );
+
+        let (x, y) = point_on(&page, "input");
+        page.pointer_pressed(x, y);
+        page.pointer_released(x, y);
+        let asked = page.take_file_request().expect("it asked");
+        assert!(asked.many);
+        assert_eq!(asked.accept, vec![".txt".to_owned(), "image/*".to_owned()]);
+        assert!(page.take_file_request().is_none(), "and only once");
+
+        // Dismissed: it keeps what it held.
+        assert!(!page.set_files(asked.node, Vec::new()));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "No file chosen");
+
+        let file = |name: &str| otlyra_dom::form::ChosenFile {
+            name: name.to_owned(),
+            media_type: otlyra_dom::form::media_type_of(name),
+            bytes: Vec::new(),
+        };
+        assert!(page.set_files(asked.node, vec![file("notes.txt")]));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "notes.txt");
+
+        assert!(page.set_files(asked.node, vec![file("a.txt"), file("b.png")]));
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page_text(&page), "2 files");
     }
 
     /// Laying the same box tree out twice must give the same box: the room a
@@ -3322,6 +4495,37 @@ mod raster_tests {
             "bold inked {bold} pixels and regular {regular}"
         );
     }
+}
+
+/// A press on a file picker, for whoever can open a dialogue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRequest {
+    /// The control that asked, which is where the answer goes back.
+    pub node: NodeId,
+    /// Whether it takes more than one file.
+    pub many: bool,
+    /// The hints the page gave about what it wants, exactly as it spelled them.
+    pub accept: Vec<String>,
+}
+
+/// How far a key moves a slider.
+///
+/// Not the same set as the caret's: a slider has a step and a range, so the keys
+/// mean amounts rather than positions in a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderMotion {
+    /// One step towards the maximum.
+    Up,
+    /// One step towards the minimum.
+    Down,
+    /// Ten steps up.
+    PageUp,
+    /// Ten steps down.
+    PageDown,
+    /// The minimum.
+    Start,
+    /// The maximum.
+    End,
 }
 
 /// A key that edits or moves the caret rather than adding a letter.

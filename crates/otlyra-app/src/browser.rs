@@ -455,9 +455,28 @@ impl Browser {
         if let Some(page) = self.tabs[self.active].page.as_mut() {
             match key {
                 Key::Escape if page.is_open() => return page.close_open(),
-                Key::Enter if page.is_open() => return page.close_open(),
+                Key::Enter if page.is_open() => return page.accept_open(),
                 Key::Up | Key::Down if page.step_selection(key == Key::Down) => return true,
                 _ => {}
+            }
+        }
+        // A slider takes the keys that move it before anything else looks at
+        // them: an arrow on a focused slider is a step, not a scroll.
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            use crate::page::SliderMotion;
+            let motion = match key {
+                Key::Left | Key::Down => Some(SliderMotion::Down),
+                Key::Right | Key::Up => Some(SliderMotion::Up),
+                Key::PageUp => Some(SliderMotion::PageUp),
+                Key::PageDown => Some(SliderMotion::PageDown),
+                Key::Home => Some(SliderMotion::Start),
+                Key::End => Some(SliderMotion::End),
+                _ => None,
+            };
+            if let Some(motion) = motion
+                && page.step_value(motion)
+            {
+                return true;
             }
         }
         let extend = modifiers.shift;
@@ -722,6 +741,30 @@ impl Browser {
     /// `user_initiated` says whether the address came from the person rather than
     /// from the page: it is what decides whether a `file:` URL may be reached at
     /// all, and a page from the internet must never be able to claim it.
+    /// Open the dialogue a file picker asked for, and hand the page what came
+    /// back.
+    ///
+    /// The page asked and this answers, which is the whole of the split: what a
+    /// reader is shown here is the machine's own dialogue where there is one, and
+    /// on a machine with none the request simply goes unanswered and the control
+    /// goes on saying that no file was chosen.
+    fn answer_file_request(&mut self) {
+        let Some(request) = self.tabs[self.active]
+            .page
+            .as_mut()
+            .and_then(PageScene::take_file_request)
+        else {
+            return;
+        };
+        let chosen = choose_files(&request);
+        if chosen.is_empty() {
+            return;
+        }
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.set_files(request.node, chosen);
+        }
+    }
+
     /// Go wherever a form the reader has just sent points.
     ///
     /// A form that submits is a form that navigates, and that is the whole of it
@@ -794,6 +837,21 @@ impl Browser {
 
         let changed = match action {
             otlyra_platform::AccessibilityAction::Focus => page.focus_node(element),
+            // A reader asking a slider to move is the same request an arrow key
+            // makes, one step further in: the focus goes to the control first, as
+            // it would if the reader had reached it, and then it moves.
+            otlyra_platform::AccessibilityAction::Increment
+            | otlyra_platform::AccessibilityAction::Decrement => {
+                let mut changed = page.focus_node(element);
+                changed |= page.step_value(
+                    if action == otlyra_platform::AccessibilityAction::Increment {
+                        crate::page::SliderMotion::Up
+                    } else {
+                        crate::page::SliderMotion::Down
+                    },
+                );
+                changed
+            }
             otlyra_platform::AccessibilityAction::Activate => {
                 // A link is followed rather than activated: there is no control
                 // behind it, and what pressing one means is a navigation.
@@ -806,6 +864,7 @@ impl Browser {
                 }
                 let changed = page.activate_node(element);
                 self.follow_submission();
+                self.answer_file_request();
                 changed
             }
         };
@@ -2308,6 +2367,7 @@ impl Painter for Browser {
                     page.pointer_released(x, y);
                 }
                 self.follow_submission();
+                self.answer_file_request();
                 self.settings.pointer_released();
                 self.history_page.pointer_released();
                 self.ui.pointer_released();
@@ -3153,6 +3213,76 @@ mod system_page_tests {
         assert_eq!(browser.ui().address.text(), "");
         assert_eq!(browser.tabs()[0].title, "New tab");
     }
+}
+
+/// Ask the machine for files, where the machine has a way of asking.
+///
+/// The dialogue is modal and blocks this thread while it is up, which is what a
+/// file dialogue is everywhere: nothing else in the window can be answered until
+/// the reader has chosen or dismissed it.
+///
+/// The bytes are read here rather than remembered as a path, because a form is
+/// sent long after the dialogue closed and by then the file may have moved: what
+/// was chosen is what is sent. A file too large to hold is not offered at all —
+/// this is the one place the browser reads a whole file into memory, and it is
+/// worth saying out loud rather than discovering.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn choose_files(request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::ChosenFile> {
+    /// The most of one file the browser will hold.
+    const LARGEST: u64 = 256 * 1024 * 1024;
+
+    let mut dialogue = rfd::FileDialog::new();
+    // Extensions are the only hint the dialogue takes; a media type or a
+    // `image/*` is a hint about kinds it has no list for, so those are left to it.
+    let extensions: Vec<&str> = request
+        .accept
+        .iter()
+        .filter_map(|hint| hint.strip_prefix('.'))
+        .collect();
+    if !extensions.is_empty() {
+        dialogue = dialogue.add_filter("Accepted", &extensions);
+    }
+    let paths = if request.many {
+        dialogue.pick_files().unwrap_or_default()
+    } else {
+        dialogue.pick_file().into_iter().collect()
+    };
+
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::metadata(&path) {
+                Ok(about) if about.len() > LARGEST => {
+                    tracing::warn!(file = %name, size = about.len(), "the file is too large to send");
+                    return None;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(file = %name, %error, "the file could not be read");
+                    return None;
+                }
+            }
+            let bytes = std::fs::read(&path)
+                .inspect_err(|error| tracing::warn!(file = %name, %error, "the file could not be read"))
+                .ok()?;
+            Some(otlyra_dom::form::ChosenFile {
+                media_type: otlyra_dom::form::media_type_of(&name),
+                name,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+/// The same, where there is nothing to ask.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn choose_files(_request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::ChosenFile> {
+    tracing::debug!("no file dialogue on this platform; the picker keeps what it held");
+    Vec::new()
 }
 
 #[cfg(test)]

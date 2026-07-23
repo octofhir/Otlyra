@@ -56,13 +56,15 @@ impl Actions {
 
 impl ActionHandler for Actions {
     fn do_action(&mut self, request: ActionRequest) {
-        // The two a page can answer without a script: press this, and put the
-        // keyboard here. The rest name things this browser has no node for yet,
-        // and logging the ones dropped is what makes a missing one findable
-        // rather than mysterious.
+        // The four a page can answer without a script: press this, put the
+        // keyboard here, and move a slider either way. The rest name things this
+        // browser has no node for yet, and logging the ones dropped is what makes
+        // a missing one findable rather than mysterious.
         let action = match request.action {
             accesskit::Action::Click => crate::AccessibilityAction::Activate,
             accesskit::Action::Focus => crate::AccessibilityAction::Focus,
+            accesskit::Action::Increment => crate::AccessibilityAction::Increment,
+            accesskit::Action::Decrement => crate::AccessibilityAction::Decrement,
             other => {
                 tracing::debug!(action = ?other, "accessibility action ignored");
                 return;

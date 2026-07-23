@@ -117,6 +117,10 @@ pub enum AccessibilityAction {
     Activate,
     /// Put the keyboard on it.
     Focus,
+    /// Move it one step up its range: what a reader asks of a slider.
+    Increment,
+    /// Move it one step down.
+    Decrement,
 }
 
 /// Something happened that the browser above may care about.

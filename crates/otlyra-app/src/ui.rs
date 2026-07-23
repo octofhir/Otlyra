@@ -1058,7 +1058,18 @@ impl BrowserUi {
             active,
             history,
             spinner,
-            pointer: self.pointer,
+            // A pointer over the page below hovers nothing in the toolbar, so its
+            // exact position there is not something the toolbar is drawn from:
+            // every such position is collapsed to one, or the toolbar would be
+            // rebuilt — every tab title reshaped — on each pixel the pointer moved
+            // over the document, which is what made scrolling with the mouse
+            // moving lag. A press in progress and an open menu both reach past the
+            // toolbar's edge, so the real pointer stands then.
+            pointer: if self.pointer.1 >= UI_HEIGHT && !self.menu_open && !self.pointer_down {
+                (-1.0, -1.0)
+            } else {
+                self.pointer
+            },
             pointer_down: self.pointer_down,
             address: self.address.text().to_owned(),
             caret: self.address_focused().then(|| self.address.caret()),
@@ -1897,6 +1908,35 @@ mod tests {
         let taller = frame_at(&mut ui, &mut text, 1000.0, 400.0);
         assert_eq!(ui.builds(), 1, "a height-only resize rebuilds nothing");
         assert_eq!(taller, first, "and draws exactly what the last frame drew");
+    }
+
+    #[test]
+    fn a_pointer_over_the_page_does_not_rebuild_the_interface() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let first = frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        assert_eq!(ui.builds(), 1);
+
+        // The pointer moves around the document, well below the toolbar. Nothing
+        // in the toolbar is hovered wherever it goes, so the toolbar is not
+        // rebuilt — which is what keeps scrolling with the mouse moving from
+        // reshaping every tab title on every frame.
+        for y in [200.0, 400.0, 600.0, 799.0] {
+            ui.pointer_moved(500.0, y, &mut text);
+            let again = frame_at(&mut ui, &mut text, 1000.0, 800.0);
+            assert_eq!(ui.builds(), 1, "a pointer at y={y} rebuilt the toolbar");
+            assert_eq!(again, first, "and it drew something different");
+        }
+
+        // Back up onto a toolbar control, and it does rebuild: now the hover is
+        // its own.
+        ui.pointer_moved(500.0, TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0, &mut text);
+        let _ = frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        assert_eq!(
+            ui.builds(),
+            2,
+            "a pointer over the toolbar is its own hover"
+        );
     }
 
     #[test]

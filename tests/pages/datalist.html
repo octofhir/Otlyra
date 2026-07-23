@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>datalist</title>
+<style>body { font: 16px/1.4 serif; margin: 16px; }</style>
+<p><label for="c">City</label> <input id="c" list="cities" value=""></p>
+<datalist id="cities">
+  <option value="Amsterdam">
+  <option value="Ankara">
+  <option value="Berlin">
+  <option value="Bern">
+  <option value="Bratislava">
+  <option value="Brussels">
+  <option value="Budapest">
+</datalist>
+
+<p><label for="s">Search</label> <input id="s" type="search" list="cities"></p>
+
+<p>Suggestions that are not offered: one disabled, one empty.</p>
+<p><input list="sparse"></p>
+<datalist id="sparse">
+  <option value="">
+  <option value="Kept">
+  <option value="Skipped" disabled>
+</datalist>
+
+<p>A field whose list names nothing, and one whose list names something else.</p>
+<p><input list="absent"> <input list="c"></p>

@@ -471,6 +471,21 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
 /// however far the scroll port this fragment is inside has been scrolled — and the
 /// edge that port cuts its contents off at moves with the page, not with them.
 #[allow(clippy::too_many_arguments)]
+/// The content box inside a border box, by the style's own edges.
+fn content_box_of(rect: Rect, style: &otlyra_css::ComputedStyle) -> Rect {
+    let length = |value: otlyra_css::Length| value.resolve(0.0);
+    let left = length(style.padding.left) + style.border.left.width;
+    let right = length(style.padding.right) + style.border.right.width;
+    let top = length(style.padding.top) + style.border.top.width;
+    let bottom = length(style.padding.bottom) + style.border.bottom.width;
+    Rect::new(
+        rect.x + left,
+        rect.y + top,
+        (rect.width - left - right).max(0.0),
+        (rect.height - top - bottom).max(0.0),
+    )
+}
+
 fn paint(
     fragment: &Fragment,
     scroll_y: f32,
@@ -575,7 +590,11 @@ fn paint(
                 Some(control) => {
                     let mut painted = rect;
                     painted.y -= scroll_y;
-                    widget::paint(list, control, painted)
+                    // A colour well fills its content box and nothing else, so
+                    // the widget is given both edges: the frame it draws is the
+                    // border box, and what it shows is inside the padding.
+                    let inner = content_box_of(painted, &fragment.style);
+                    widget::paint(list, control, painted, inner)
                 }
                 None => false,
             };
