@@ -1,0 +1,57 @@
+name: startup-performance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/startup-performance.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/otlyra-app/**"
+      - "crates/otlyra-gfx/**"
+      - "crates/otlyra-platform/**"
+      - "crates/otlyra-text/**"
+      - "tools/startup-benchmark.py"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/startup-performance.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/otlyra-app/**"
+      - "crates/otlyra-gfx/**"
+      - "crates/otlyra-platform/**"
+      - "crates/otlyra-text/**"
+      - "tools/startup-benchmark.py"
+  workflow_dispatch:
+
+# Performance distributions are meaningful only on one reserved machine. The
+# required labels name the reference Mac rather than silently falling back to a
+# noisy shared runner.
+jobs:
+  launch:
+    runs-on: [self-hosted, macOS, ARM64, otlyra-performance]
+    timeout-minutes: 30
+    concurrency:
+      group: startup-performance
+      cancel-in-progress: false
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build release browser
+        run: cargo build --locked --release -p otlyra-app
+      - name: Measure and enforce startup budgets
+        run: >-
+          python3 tools/startup-benchmark.py
+          --binary target/release/otlyra
+          --samples 30
+          --warmups 3
+          --check
+          --output target/startup-benchmark.json
+      - name: Upload startup distribution
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-benchmark-${{ github.sha }}
+          path: target/startup-benchmark.json
+          if-no-files-found: error

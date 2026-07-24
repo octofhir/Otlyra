@@ -2753,6 +2753,7 @@ dependencies = [
  "otlyra-gfx",
  "pollster 1.0.1",
  "raw-window-handle",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
  "wgpu",

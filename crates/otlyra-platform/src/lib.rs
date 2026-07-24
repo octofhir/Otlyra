@@ -43,6 +43,7 @@ pub use event_loop::{PlatformError, run};
 pub use menu::{Menu, MenuBar, MenuEntry, MenuError, MenuId, SystemItem};
 
 use otlyra_gfx::PaintTarget;
+use std::time::Instant;
 
 /// The accessibility vocabulary, re-exported so the browser names the same types
 /// the platform hands on.
@@ -330,6 +331,42 @@ pub enum Cursor {
     Text,
 }
 
+/// When the embedder needs another frame.
+///
+/// Requests are coalesced by the platform loop. `Now` is for a state change that
+/// is already visible, `Vsync` for a continuous animation, and `At` for something
+/// with a known transition time such as a caret blink.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum FrameRequest {
+    /// Nothing visible changed.
+    #[default]
+    None,
+    /// Present the changed state as soon as the platform can.
+    Now,
+    /// Present on the next display-paced animation tick.
+    Vsync,
+    /// Wake for a transition at this instant.
+    At(Instant),
+}
+
+/// Cumulative work performed above the platform paint seam.
+///
+/// Legacy chrome builds, lays out, and paints together; retained roots advance
+/// only the counters for work they actually perform.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PainterWork {
+    /// Browser-owned UI trees built or reconciled.
+    pub chrome_reconciles: u64,
+    /// Browser-owned UI layout passes.
+    pub chrome_layouts: u64,
+    /// Browser-owned UI display lists built.
+    pub chrome_paints: u64,
+    /// Browser-owned semantic descriptions built.
+    pub chrome_semantics: u64,
+    /// Page display lists built rather than reused.
+    pub page_paints: u64,
+}
+
 /// The embedder's side of the boundary: given a target and a viewport, draw.
 pub trait Painter {
     /// Take the handle that wakes the loop. Called once, before the first frame.
@@ -340,19 +377,33 @@ pub trait Painter {
         let _ = waker;
     }
 
-    /// Whether the painter wants a frame at the display's pace rather than only
-    /// when something happens.
-    ///
-    /// The loop otherwise blocks, so an animation that nobody asks for does not
-    /// run: this is how a spinner spins without the browser burning a core when
-    /// nothing is moving.
-    fn animating(&self) -> bool {
-        false
-    }
-
     /// React to a platform event. Default: ignore it.
     fn on_event(&mut self, event: PlatformEvent) {
         let _ = event;
+    }
+
+    /// Deliver a platform event and say whether it changed visible output.
+    ///
+    /// The loop blocks when no frame is requested. Returning [`FrameRequest::None`]
+    /// is therefore both a correctness statement and a performance contract. The
+    /// default preserves the old event contract; painters opt into narrower
+    /// scheduling by overriding this method.
+    fn handle_event(&mut self, event: PlatformEvent) -> FrameRequest {
+        self.on_event(event);
+        FrameRequest::Now
+    }
+
+    /// When a frame should follow the one just presented.
+    ///
+    /// This is separate from [`Painter::on_event`] because an animation or a
+    /// deadline continues without another input event.
+    fn next_frame(&self) -> FrameRequest {
+        FrameRequest::None
+    }
+
+    /// Cumulative work above this seam, for frame diagnostics.
+    fn work_counters(&self) -> PainterWork {
+        PainterWork::default()
     }
 
     /// The accessibility tree, if it has changed since the last frame.
@@ -388,6 +439,58 @@ pub trait Painter {
     fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport);
 }
 
+/// Records ordered process-origin milestones for the startup benchmark.
+///
+/// One handle is cloned across the app bootstrap, the event-loop thread, and the
+/// GPU worker threads. Every milestone is stored as milliseconds from a single
+/// process origin, so the benchmark can attribute the whole launch timeline to
+/// named stages rather than to the three coarse spans the report used to carry.
+///
+/// Interior mutability, because the marks come from wherever the milestone is
+/// actually reached and the loop only owns `&self` at most of those points.
+#[derive(Clone)]
+pub struct StartupTrace {
+    origin: Instant,
+    stages: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, f64)>>>,
+}
+
+impl StartupTrace {
+    /// A fresh trace measured from `origin`, the same instant the coarse spans use.
+    pub fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            stages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Record `name` at the current instant, in milliseconds from the origin.
+    ///
+    /// The first mark for a name wins: a milestone reached on a path that can run
+    /// twice — a resume that fires again, a first frame retried after a dropped
+    /// swapchain — is not double-counted.
+    pub fn mark(&self, name: &'static str) {
+        let ms = self.origin.elapsed().as_secs_f64() * 1000.0;
+        let mut stages = self.stages.lock().expect("startup trace poisoned");
+        if stages.iter().any(|(existing, _)| *existing == name) {
+            return;
+        }
+        stages.push((name, ms));
+    }
+
+    /// The milestones recorded so far, in the order they were reached.
+    pub fn stages(&self) -> Vec<(&'static str, f64)> {
+        self.stages.lock().expect("startup trace poisoned").clone()
+    }
+}
+
+impl std::fmt::Debug for StartupTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartupTrace")
+            .field("stages", &self.stages())
+            .finish()
+    }
+}
+
 /// How the window should be created.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
@@ -403,6 +506,23 @@ pub struct WindowConfig {
     /// Needed because an unbundled binary has no plist to read an icon from, which
     /// is exactly the `cargo run` case.
     pub icon: Option<&'static [u8]>,
+    /// The origin used for startup milestones.
+    ///
+    /// The executable sets this at the beginning of `main`; other embedders get
+    /// a useful run-to-first-frame measurement from [`WindowConfig::default`].
+    pub startup_origin: Instant,
+    /// Write machine-readable startup timings after the first presented frame,
+    /// then close the window.
+    ///
+    /// This is a benchmark probe, not ordinary application logging. A dedicated
+    /// file keeps the measurement independent of tracing format and log level.
+    pub startup_report: Option<std::path::PathBuf>,
+    /// Per-stage startup milestones, recorded from `startup_origin`.
+    ///
+    /// The executable seeds this with its bootstrap milestones and shares the same
+    /// handle here; the loop records the rest and folds them into the startup
+    /// report. `None` for embedders that only want the coarse spans.
+    pub startup_trace: Option<StartupTrace>,
 }
 
 impl Default for WindowConfig {
@@ -412,6 +532,9 @@ impl Default for WindowConfig {
             logical_size: (1024.0, 768.0),
             menu_bar: MenuBar::new(),
             icon: None,
+            startup_origin: Instant::now(),
+            startup_report: None,
+            startup_trace: None,
         }
     }
 }
@@ -430,7 +553,7 @@ pub fn render_offscreen(
 
     {
         let _guard = span.enter();
-        painter.on_event(PlatformEvent::SurfaceReady(viewport));
+        let _ = painter.handle_event(PlatformEvent::SurfaceReady(viewport));
         target.reset();
         painter.paint(&mut target, viewport);
     }

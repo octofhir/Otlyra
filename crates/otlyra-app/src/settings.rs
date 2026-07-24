@@ -486,7 +486,11 @@ pub struct SettingsSurface {
     press_origin: Option<(f64, f64)>,
     /// How many clicks the current press is the latest of.
     clicks: u32,
-    engine: TextEngine,
+    /// The engine `offer` needs a `Cx` to hold. Built on first use, not at
+    /// construction: nothing in the tree measures text to decide whether it was
+    /// hit, and building an engine enumerates the system's fonts — a cost this
+    /// surface's `offer` never needs and startup should not pay.
+    engine: Option<TextEngine>,
     /// The focusable controls the last frame built, in the order it built them.
     ///
     /// Kept beside the tree rather than inside the preferences: it is a fact
@@ -528,7 +532,7 @@ impl SettingsSurface {
             pointer_down: false,
             press_origin: None,
             clicks: 1,
-            engine: TextEngine::new(),
+            engine: None,
             focus: Focus::default(),
             cache: None,
             builds: 0,
@@ -751,9 +755,10 @@ impl SettingsSurface {
             return Action::None;
         };
         // Nothing in the tree measures text to decide whether it was hit, but
-        // the context needs an engine to exist. It is the surface's own, kept
-        // rather than made: building one enumerates the system's fonts.
-        let mut cx = Cx::new(&mut self.engine);
+        // the context needs an engine to exist. It is the surface's own, built
+        // on this first offer rather than at construction: building one
+        // enumerates the system's fonts, which startup should not pay for.
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;

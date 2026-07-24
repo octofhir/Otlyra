@@ -10,7 +10,9 @@ use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::NodeId;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_layout::Images;
-use otlyra_platform::{Cursor, Key, Modifiers, Painter, PlatformEvent, Viewport, Waker};
+use otlyra_platform::{
+    Cursor, FrameRequest, Key, Modifiers, Painter, PainterWork, PlatformEvent, Viewport, Waker,
+};
 use otlyra_text::TextEngine;
 
 use crate::about::{self, AboutSurface};
@@ -368,6 +370,8 @@ pub struct Browser {
     scheme: otlyra_platform::ColorScheme,
     /// The palette every surface is currently drawn from.
     theme: crate::widget::theme::Theme,
+    /// Whether the platform needs a new accessibility tree after the next frame.
+    accessibility_dirty: bool,
 }
 
 impl Browser {
@@ -416,6 +420,7 @@ impl Browser {
             history_page: crate::history::HistorySurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
+            accessibility_dirty: true,
         };
         browser.apply_theme();
         browser
@@ -2122,6 +2127,7 @@ impl Browser {
         self.tabs
             .iter()
             .map(|tab| TabLabel {
+                id: tab.id.0,
                 title: tab.title.clone(),
                 loading: tab.loading(),
             })
@@ -2138,17 +2144,100 @@ impl Painter for Browser {
         self.pump();
     }
 
-    /// A frame at the display's pace while something is loading, so the spinner
-    /// turns; nothing at all when the browser is idle.
-    fn animating(&self) -> bool {
-        // A caret is the one thing on a page that is otherwise still and still
-        // changes: without this the loop goes back to blocking and the caret stops
-        // half way through a blink, wherever it happened to be.
-        self.tabs.iter().any(Tab::loading)
-            || self.tabs[self.active]
-                .page
-                .as_ref()
-                .is_some_and(crate::page::PageScene::caret_blinks)
+    /// Continue only visible animation. Background tabs wake the loop when their
+    /// model changes; they do not drive the active window at display pace.
+    fn next_frame(&self) -> FrameRequest {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return FrameRequest::None;
+        };
+        if tab.loading() {
+            return FrameRequest::Vsync;
+        }
+        tab.page
+            .as_ref()
+            .and_then(crate::page::PageScene::next_caret_frame)
+            .map_or(FrameRequest::None, FrameRequest::At)
+    }
+
+    fn work_counters(&self) -> PainterWork {
+        let legacy = self.settings.builds()
+            + self.history_page.builds()
+            + self.about.builds()
+            + self.inspector.builds();
+        let chrome_roots = legacy + self.ui.builds();
+        let retained_boundaries = self.ui.tab_builds()
+            + self.ui.toolbar_builds()
+            + self.inspector.header_builds()
+            + self.inspector.body_builds();
+        PainterWork {
+            // Legacy surfaces still perform all three passes on a cache miss.
+            // BrowserUi additionally reports work performed behind the retained
+            // tab-strip and toolbar boundaries.
+            chrome_reconciles: chrome_roots,
+            chrome_layouts: chrome_roots + retained_boundaries,
+            chrome_paints: chrome_roots + retained_boundaries,
+            chrome_semantics: self.ui.tab_semantics_builds()
+                + self.ui.toolbar_semantics_builds()
+                + self.inspector.header_semantics_builds()
+                + self.inspector.body_semantics_builds(),
+            page_paints: self
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.page.as_ref())
+                .map(PageScene::builds)
+                .sum(),
+        }
+    }
+
+    fn handle_event(&mut self, event: PlatformEvent) -> FrameRequest {
+        let previous_pointer = self.pointer;
+        let page_damage = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.page.as_ref())
+            .map(PageScene::damage);
+        self.on_event(event);
+
+        let PlatformEvent::PointerMoved { x, y } = event else {
+            self.accessibility_dirty = true;
+            return FrameRequest::Now;
+        };
+        if previous_pointer == (x, y) {
+            return FrameRequest::None;
+        }
+
+        let current_damage = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.page.as_ref())
+            .map(PageScene::damage);
+        let dock_top = self.dock_top();
+        let chrome_changed = previous_pointer.1 < UI_HEIGHT
+            || y < UI_HEIGHT
+            || self.ui.menu_open
+            || self.ui.pointer_captured();
+        let inspector_changed =
+            self.inspector.open && (previous_pointer.1 >= dock_top || y >= dock_top);
+        let system_page_changed = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.system.is_some())
+            && (previous_pointer.1 >= UI_HEIGHT || y >= UI_HEIGHT);
+        let request = if chrome_changed
+            || inspector_changed
+            || system_page_changed
+            || page_damage != current_damage
+        {
+            FrameRequest::Now
+        } else {
+            FrameRequest::None
+        };
+        if page_damage != current_damage
+            && current_damage.is_some_and(|damage| damage.contains(otlyra_layout::Damage::LAYOUT))
+        {
+            self.accessibility_dirty = true;
+        }
+        request
     }
 
     fn on_event(&mut self, event: PlatformEvent) {
@@ -2207,14 +2296,11 @@ impl Painter for Browser {
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
                     let over_page = y >= UI_HEIGHT && y < self.dock_top();
                     if let Some(page) = self.tabs[self.active].page.as_mut() {
-                        let moved = if over_page {
+                        let _ = if over_page {
                             page.pointer_moved(x, y)
                         } else {
                             page.pointer_left()
                         };
-                        // Every event already asks for a frame; what `moved` says
-                        // is whether anything had to be styled again.
-                        let _ = moved;
                     }
                 }
                 match self.tabs[self.active].system {
@@ -2583,6 +2669,7 @@ impl Painter for Browser {
             },
 
             PlatformEvent::AccessibilityRequest { node, action } => {
+                self.accessibility_dirty = true;
                 // A node the page owns rather than the interface. It takes the
                 // route the pointer takes — the focus first and the activation
                 // behaviour after — because a reader pressing a control means what
@@ -2632,9 +2719,13 @@ impl Painter for Browser {
     }
 
     fn accessibility(&mut self) -> Option<otlyra_platform::accesskit::TreeUpdate> {
-        // Rebuilt whenever the frame it describes changed. The tree is a function
-        // of the document and the last layout, so anything cheaper would be a
-        // second copy of that state to keep honest.
+        if !self.accessibility_dirty {
+            return None;
+        }
+        self.accessibility_dirty = false;
+
+        // Rebuilt only after something that can change semantics, geometry or
+        // focus. Paint-only animation leaves the last tree valid.
         let tab = self.tabs.get(self.active)?;
         let document = match tab.page.as_ref() {
             Some(page) => crate::a11y::tree_for(page, &tab.title),
@@ -2693,7 +2784,9 @@ impl Painter for Browser {
         // Every frame takes in whatever has arrived. A wake is what *asks* for a
         // frame; this is what makes a frame that happened for any other reason —
         // a resize, an animation tick — show what has landed since the last one.
-        self.pump();
+        if self.pump() {
+            self.accessibility_dirty = true;
+        }
 
         let width = viewport.logical_width();
         let height = viewport.logical_height();
@@ -3361,6 +3454,79 @@ mod tests {
             requested: std::sync::Arc::clone(&requested),
         };
         (Browser::new(loader), requested)
+    }
+
+    #[test]
+    fn a_repeated_pointer_position_requests_no_frame() {
+        let mut browser = browser();
+        let event = PlatformEvent::PointerMoved { x: 320.0, y: 240.0 };
+
+        assert_eq!(browser.handle_event(event), FrameRequest::Now);
+        assert_eq!(
+            browser.handle_event(event),
+            FrameRequest::None,
+            "identical input changes neither hover nor drag geometry"
+        );
+    }
+
+    #[test]
+    fn pointer_motion_across_an_unchanged_page_requests_no_frame() {
+        let mut browser = browser();
+        assert_eq!(
+            browser.handle_event(PlatformEvent::PointerMoved { x: 320.0, y: 240.0 }),
+            FrameRequest::Now,
+            "leaving the initial off-window position clears any chrome hover"
+        );
+        assert_eq!(
+            browser.handle_event(PlatformEvent::PointerMoved { x: 420.0, y: 340.0 }),
+            FrameRequest::None,
+            "the cursor moved, but no pixels changed"
+        );
+    }
+
+    #[test]
+    fn only_the_active_loading_tab_drives_vsync() {
+        let mut browser = browser();
+        browser.navigate("example.com");
+        assert_eq!(browser.next_frame(), FrameRequest::Vsync);
+
+        browser.new_tab();
+        assert_eq!(
+            browser.next_frame(),
+            FrameRequest::None,
+            "a background load wakes on model changes instead of repainting continuously"
+        );
+    }
+
+    #[test]
+    fn a_static_browser_page_has_no_follow_up_frame() {
+        let mut browser = browser();
+        browser.open_system(SystemPage::About);
+        assert_eq!(browser.next_frame(), FrameRequest::None);
+    }
+
+    #[test]
+    fn an_unchanged_frame_does_not_rebuild_accessibility() {
+        let mut browser = browser();
+        let mut target = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+
+        assert!(
+            browser.accessibility().is_some(),
+            "the first tree is published"
+        );
+        assert!(
+            browser.accessibility().is_none(),
+            "and remains valid until semantics, geometry or focus changes"
+        );
+
+        let _ = browser.handle_event(PlatformEvent::PointerMoved { x: 300.0, y: 300.0 });
+        let request = browser.handle_event(PlatformEvent::PointerMoved { x: 400.0, y: 300.0 });
+        assert_eq!(request, FrameRequest::None);
+        assert!(
+            browser.accessibility().is_none(),
+            "paint-free pointer motion changes no accessibility nodes"
+        );
     }
 
     /// Wait for whatever was asked for to arrive.

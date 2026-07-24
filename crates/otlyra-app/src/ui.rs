@@ -5,14 +5,11 @@
 //! text layout, hit testing, input routing and painting, and a second toolkit
 //! would duplicate all four and bring a second event model with it.
 //!
-//! The interface is a [`crate::widget`] tree, rebuilt from this struct's state
-//! every frame and thrown away after. That sounds wasteful and is not: a toolbar
-//! is a dozen boxes, and building from state means there is no second copy of
-//! anything to fall out of step — no widget holding a stale title, no hover flag
-//! left set when the pointer moved somewhere else, no identity to match between
-//! frames. What survives a frame is the *geometry*: the tree is kept so that the
-//! next press can be tested against exactly the rectangles that were drawn,
-//! which is the one thing that must not be recomputed.
+//! The interface is described with the existing [`crate::widget`] constructors.
+//! During retained-tree migration, the tab strip and toolbar live behind
+//! persistent boundaries: an address edit replaces and redraws the toolbar but
+//! reuses the tab strip's tree, geometry, and display list. Browser model state
+//! remains outside both boundaries.
 //!
 //! Two rows. The tab strip on top, on the recessed grey; the toolbar under it,
 //! on white, with the active tab merging into it — so the tab and the page it
@@ -29,6 +26,9 @@ pub use crate::widget::Rect;
 use crate::clipboard::Clipboard;
 use crate::widget::controls::{self, Elide, FieldHit, FieldView, TextInput};
 use crate::widget::icon;
+use crate::widget::runtime::{
+    NodeSpec, RenderArena, Retained, UiDirty, UiNodeId, WidgetKey, WidgetType,
+};
 use crate::widget::theme::Theme;
 use crate::widget::{
     Align, Background, Button, Child, Cx, Described, Event, Fixed, Focus, FocusId, FocusKind,
@@ -487,6 +487,9 @@ impl SystemPage {
 /// What one tab shows in the strip.
 #[derive(Clone, Debug)]
 pub struct TabLabel {
+    /// Stable browser-model identity. A strip position is not an identity:
+    /// closing the first tab moves every later one.
+    pub id: u64,
     /// The tab's title, or its URL until it has one.
     pub title: String,
     /// Whether it is still loading.
@@ -509,7 +512,7 @@ pub struct TabLabel {
 #[derive(Clone, PartialEq)]
 struct Appearance {
     width: f64,
-    tabs: Vec<(String, bool)>,
+    tabs: Vec<(u64, String, bool)>,
     active: usize,
     history: (bool, bool),
     spinner: Option<f32>,
@@ -521,6 +524,32 @@ struct Appearance {
     focus: Option<FocusId>,
     menu: Option<f64>,
     tab_scroll: f64,
+}
+
+#[derive(Clone, PartialEq)]
+struct TabAppearance {
+    width: f64,
+    tabs: Vec<(u64, String, bool)>,
+    active: usize,
+    spinner: Option<f32>,
+    pointer: Option<(f64, f64, bool)>,
+    focus: Option<FocusId>,
+    tab_scroll: f64,
+}
+
+struct TabStripRenderNode;
+struct TabRenderNode;
+
+#[derive(Clone, PartialEq)]
+struct ToolbarAppearance {
+    width: f64,
+    history: (bool, bool),
+    spinner: Option<f32>,
+    pointer: Option<(f64, f64, bool)>,
+    address: String,
+    caret: Option<usize>,
+    selection: Option<std::ops::Range<usize>>,
+    focus: Option<FocusId>,
 }
 
 /// The interface's own state: what is focused, where the pointer is, what is typed.
@@ -565,6 +594,19 @@ pub struct BrowserUi {
     clicks: u32,
     /// What the last built list was built from, and the list itself.
     cache: Option<(Appearance, DisplayList)>,
+    /// Persistent migration boundaries. A changed toolbar no longer rebuilds,
+    /// measures, shapes, or paints the tab strip beside it.
+    tab_tree: Retained<UiAction>,
+    toolbar_tree: Retained<UiAction>,
+    tab_appearance: Option<TabAppearance>,
+    toolbar_appearance: Option<ToolbarAppearance>,
+    tab_runtime: RenderArena,
+    tab_runtime_root: UiNodeId,
+    /// Work attributed by the latest reconciliation, retained for diagnostics.
+    tab_runtime_work: Vec<(UiNodeId, UiDirty)>,
+    /// Stable focus-id prefix owned by each retained boundary.
+    tab_focus_end: usize,
+    toolbar_focus_end: usize,
     /// How many lists have been built, as opposed to reused.
     ///
     /// Kept because "it did not rebuild" is the whole claim of the cache, and a
@@ -594,6 +636,9 @@ impl std::fmt::Debug for BrowserUi {
 impl BrowserUi {
     /// A new interface with an empty address field.
     pub fn new() -> Self {
+        let mut tab_runtime = RenderArena::new();
+        let tab_runtime_root =
+            tab_runtime.mount(None, WidgetType::of::<TabStripRenderNode>(), None);
         Self {
             address: TextField::default(),
             menu_open: false,
@@ -609,6 +654,15 @@ impl BrowserUi {
             press_origin: None,
             clicks: 1,
             cache: None,
+            tab_tree: Retained::new(Box::new(crate::widget::Gap::new(0.0, 0.0))),
+            toolbar_tree: Retained::new(Box::new(crate::widget::Gap::new(0.0, 0.0))),
+            tab_appearance: None,
+            toolbar_appearance: None,
+            tab_runtime,
+            tab_runtime_root,
+            tab_runtime_work: Vec::new(),
+            tab_focus_end: 0,
+            toolbar_focus_end: 0,
             builds: 0,
             root: None,
         }
@@ -640,6 +694,26 @@ impl BrowserUi {
         self.builds
     }
 
+    /// Tab-strip display lists built behind its retained boundary.
+    pub fn tab_builds(&self) -> u64 {
+        self.tab_tree.builds()
+    }
+
+    /// Toolbar display lists built behind its retained boundary.
+    pub fn toolbar_builds(&self) -> u64 {
+        self.toolbar_tree.builds()
+    }
+
+    /// Tab-strip semantic descriptions built behind its retained boundary.
+    pub fn tab_semantics_builds(&self) -> u64 {
+        self.tab_tree.semantics_builds()
+    }
+
+    /// Toolbar semantic descriptions built behind its retained boundary.
+    pub fn toolbar_semantics_builds(&self) -> u64 {
+        self.toolbar_tree.semantics_builds()
+    }
+
     /// Draw from `theme` from the next frame on.
     ///
     /// Through a method rather than the field, because the cache does not key
@@ -649,6 +723,8 @@ impl BrowserUi {
         if self.theme != theme {
             self.theme = theme;
             self.cache = None;
+            self.tab_appearance = None;
+            self.toolbar_appearance = None;
         }
     }
 
@@ -732,6 +808,11 @@ impl BrowserUi {
     /// press on the panel stops being a press on the document under it.
     pub fn owns_pointer(&self) -> bool {
         self.pointer.1 < UI_HEIGHT || self.menu_open
+    }
+
+    /// Whether a press that began in the interface still owns pointer motion.
+    pub fn pointer_captured(&self) -> bool {
+        self.press_origin.is_some()
     }
 
     /// Handle a press at the last reported pointer position.
@@ -1053,7 +1134,7 @@ impl BrowserUi {
             width,
             tabs: tabs
                 .iter()
-                .map(|tab| (tab.title.clone(), tab.loading))
+                .map(|tab| (tab.id, tab.title.clone(), tab.loading))
                 .collect(),
             active,
             history,
@@ -1093,6 +1174,7 @@ impl BrowserUi {
             return;
         }
 
+        self.prepare_retained(&appearance, tabs, active, history, spinner, text);
         self.builds += 1;
         let mut built = DisplayList::new();
         let list = &mut built;
@@ -1118,12 +1200,21 @@ impl BrowserUi {
         // band: an open menu hangs below the toolbar, and both drawing and hit
         // testing have to reach it there.
         let surface = Size::new(width, height.max(UI_HEIGHT));
-        self.focus.begin();
-        let mut root = self.build(width, tabs, active, history, spinner, text);
+        let mut root = self.build();
         let mut cx = self.cx(text);
         root.measure(surface, &mut cx);
         root.place(Rect::new(0.0, 0.0, surface.width, surface.height), &mut cx);
         root.draw(&mut cx, list);
+        let tab_nodes = self
+            .tab_runtime
+            .children(self.tab_runtime_root)
+            .unwrap_or_default()
+            .to_vec();
+        for node in tab_nodes {
+            self.tab_runtime.clear_dirty(node, UiDirty::ALL);
+        }
+        self.tab_runtime
+            .clear_dirty(self.tab_runtime_root, UiDirty::ALL);
 
         // The line the page starts under. Drawn last so nothing overlaps it, and
         // it is what tells the eye where the browser stops and the document
@@ -1145,6 +1236,159 @@ impl BrowserUi {
         out.append(built);
     }
 
+    /// Update only retained boundaries whose visible inputs changed.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_retained(
+        &mut self,
+        appearance: &Appearance,
+        tabs: &[TabLabel],
+        active: usize,
+        history: (bool, bool),
+        spinner: Option<f32>,
+        text: &mut TextEngine,
+    ) {
+        let tab_pointer = (appearance.pointer.0 >= 0.0
+            && appearance.pointer.1 >= 0.0
+            && appearance.pointer.1 < TAB_STRIP_HEIGHT)
+            .then_some((
+                appearance.pointer.0,
+                appearance.pointer.1,
+                appearance.pointer_down,
+            ));
+        let toolbar_pointer = (appearance.pointer.0 >= 0.0
+            && appearance.pointer.1 >= TAB_STRIP_HEIGHT
+            && appearance.pointer.1 < UI_HEIGHT)
+            .then_some((
+                appearance.pointer.0,
+                appearance.pointer.1,
+                appearance.pointer_down,
+            ));
+        let tab_appearance = TabAppearance {
+            width: appearance.width,
+            tabs: appearance.tabs.clone(),
+            active: appearance.active,
+            spinner: appearance.spinner,
+            pointer: tab_pointer,
+            focus: appearance.focus,
+            tab_scroll: appearance.tab_scroll,
+        };
+        let toolbar_appearance = ToolbarAppearance {
+            width: appearance.width,
+            history: appearance.history,
+            spinner: appearance.spinner,
+            pointer: toolbar_pointer,
+            address: appearance.address.clone(),
+            caret: appearance.caret,
+            selection: appearance.selection.clone(),
+            focus: appearance.focus,
+        };
+
+        let previous = self.tab_appearance.as_ref();
+        let previous_active = previous
+            .and_then(|state| state.tabs.get(state.active))
+            .map(|tab| tab.0);
+        let current_active = tabs.get(active).map(|tab| tab.id);
+        let geometry_changed = previous.is_none_or(|state| {
+            state.width != appearance.width || state.tab_scroll != appearance.tab_scroll
+        });
+        let specs = tabs.iter().map(|tab| {
+            let old = previous.and_then(|state| state.tabs.iter().find(|old| old.0 == tab.id));
+            let mut dirty = UiDirty::default();
+            if geometry_changed {
+                dirty = dirty.union(UiDirty::LAYOUT).union(UiDirty::SEMANTICS);
+            }
+            if old.is_none_or(|old| old.1 != tab.title || old.2 != tab.loading)
+                || previous.is_some_and(|state| state.focus != appearance.focus)
+                || previous_active != current_active
+                    && (previous_active == Some(tab.id) || current_active == Some(tab.id))
+                || previous.is_some_and(|state| state.spinner != spinner)
+                    && (tab.loading || old.is_some_and(|old| old.2))
+            {
+                dirty = dirty.union(UiDirty::PAINT).union(UiDirty::SEMANTICS);
+            }
+            NodeSpec::new::<TabRenderNode>()
+                .keyed(WidgetKey::from_u64(tab.id))
+                .changed(dirty)
+        });
+        let tab_nodes = self
+            .tab_runtime
+            .reconcile_children(self.tab_runtime_root, specs);
+        self.tab_runtime_work = tab_nodes
+            .iter()
+            .filter_map(|id| self.tab_runtime.dirty(*id).map(|dirty| (*id, dirty)))
+            .collect();
+
+        let tab_changed = self.tab_appearance.as_ref() != Some(&tab_appearance);
+        let tab_semantics_dirty = self
+            .tab_runtime_work
+            .iter()
+            .any(|(_, dirty)| dirty.contains(UiDirty::SEMANTICS));
+        let toolbar_semantics_dirty = self.toolbar_appearance.as_ref().is_none_or(|old| {
+            old.width != toolbar_appearance.width
+                || old.history != toolbar_appearance.history
+                || old.address != toolbar_appearance.address
+                || old.caret != toolbar_appearance.caret
+                || old.selection != toolbar_appearance.selection
+                || old.focus != toolbar_appearance.focus
+        });
+        let toolbar_changed =
+            tab_changed || self.toolbar_appearance.as_ref() != Some(&toolbar_appearance);
+
+        if tab_changed {
+            self.focus.begin();
+            let theme = self.theme.clone();
+            let focus = self.focus.clone();
+            let mut cx = self.cx(text);
+            let child = tab_strip(
+                &theme,
+                &focus,
+                &mut cx,
+                appearance.width,
+                tabs,
+                active,
+                spinner,
+                &Sliding {
+                    scroll: self.tab_scroll,
+                    overflow: &self.tab_overflow,
+                    active_tab: &self.active_tab,
+                    window: &self.tab_window,
+                },
+            );
+            self.tab_tree.replace_with_dirty(
+                child,
+                if tab_semantics_dirty {
+                    UiDirty::SEMANTICS
+                } else {
+                    UiDirty::PAINT
+                },
+            );
+            self.tab_focus_end = self.focus.len();
+        } else if toolbar_changed {
+            self.focus.truncate(self.tab_focus_end);
+        }
+
+        if toolbar_changed {
+            let theme = self.theme.clone();
+            let focus = self.focus.clone();
+            self.toolbar_tree.replace_with_dirty(
+                toolbar(&theme, &focus, self, history, spinner),
+                if toolbar_semantics_dirty {
+                    UiDirty::SEMANTICS
+                } else {
+                    UiDirty::PAINT
+                },
+            );
+            self.toolbar_focus_end = self.focus.len();
+        }
+
+        // Menu controls are still in the short-lived adapter and are rebuilt
+        // after this point. Remove their previous suffix while retaining the
+        // stable ids owned by the two migrated boundaries.
+        self.focus.truncate(self.toolbar_focus_end);
+        self.tab_appearance = Some(tab_appearance);
+        self.toolbar_appearance = Some(toolbar_appearance);
+    }
+
     /// A drawing context over `text`, carrying this interface's pointer and theme.
     fn cx<'a>(&self, text: &'a mut TextEngine) -> Cx<'a> {
         let mut cx = Cx::new(text);
@@ -1157,19 +1401,10 @@ impl BrowserUi {
         cx
     }
 
-    /// Build this frame's tree from this frame's state.
-    fn build(
-        &self,
-        width: f64,
-        tabs: &[TabLabel],
-        active: usize,
-        history: (bool, bool),
-        spinner: Option<f32>,
-        text: &mut TextEngine,
-    ) -> Child<UiAction> {
+    /// Build the short-lived parent around two persistent migration boundaries.
+    fn build(&self) -> Child<UiAction> {
         let theme = self.theme.clone();
         let focus = self.focus.clone();
-        let mut cx = self.cx(text);
         // A column with an empty flexible tail rather than an aligner: an
         // aligner would shrink the interface to what it measured, and what the
         // toolbar measures is its buttons — not the window it has to span.
@@ -1181,28 +1416,8 @@ impl BrowserUi {
                     Box::new(Stack::column(
                         0.0,
                         vec![
-                            Box::new(Fixed::height(
-                                TAB_STRIP_HEIGHT,
-                                tab_strip(
-                                    &theme,
-                                    &focus,
-                                    &mut cx,
-                                    width,
-                                    tabs,
-                                    active,
-                                    spinner,
-                                    &Sliding {
-                                        scroll: self.tab_scroll,
-                                        overflow: &self.tab_overflow,
-                                        active_tab: &self.active_tab,
-                                        window: &self.tab_window,
-                                    },
-                                ),
-                            )),
-                            Box::new(Fixed::height(
-                                TOOLBAR_HEIGHT,
-                                toolbar(&theme, &focus, self, history, spinner),
-                            )),
+                            Box::new(Fixed::height(TAB_STRIP_HEIGHT, self.tab_tree.widget())),
+                            Box::new(Fixed::height(TOOLBAR_HEIGHT, self.toolbar_tree.widget())),
                         ],
                     )),
                 )),
@@ -1737,6 +1952,7 @@ mod tests {
     fn labels(count: usize) -> Vec<TabLabel> {
         (0..count)
             .map(|index| TabLabel {
+                id: index as u64 + 1,
                 title: format!("Tab {index}"),
                 loading: false,
             })
@@ -1880,18 +2096,66 @@ mod tests {
 
     /// Draw one frame at a given window size, and say what it drew.
     fn frame_at(ui: &mut BrowserUi, text: &mut TextEngine, width: f64, height: f64) -> DisplayList {
+        frame_with_labels(ui, text, width, height, &labels(2), 0)
+    }
+
+    fn frame_with_labels(
+        ui: &mut BrowserUi,
+        text: &mut TextEngine,
+        width: f64,
+        height: f64,
+        tabs: &[TabLabel],
+        active: usize,
+    ) -> DisplayList {
         let mut list = DisplayList::new();
         ui.build_display_list(
             width,
             height,
-            &labels(2),
-            0,
+            tabs,
+            active,
             (true, true),
             None,
             text,
             &mut list,
         );
         list
+    }
+
+    #[test]
+    fn closing_a_tab_preserves_the_runtime_identity_of_the_others() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let mut tabs = labels(3);
+        frame_with_labels(&mut ui, &mut text, 1000.0, 800.0, &tabs, 0);
+        let before: Vec<_> = ui.tab_runtime_work.iter().map(|(id, _)| *id).collect();
+
+        tabs.remove(0);
+        frame_with_labels(&mut ui, &mut text, 1000.0, 800.0, &tabs, 0);
+        let after: Vec<_> = ui.tab_runtime_work.iter().map(|(id, _)| *id).collect();
+
+        assert_eq!(after, before[1..]);
+    }
+
+    #[test]
+    fn a_title_change_invalidates_only_the_tab_that_owns_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let mut tabs = labels(3);
+        frame_with_labels(&mut ui, &mut text, 1000.0, 800.0, &tabs, 0);
+
+        tabs[1].title = "Renamed".to_owned();
+        frame_with_labels(&mut ui, &mut text, 1000.0, 800.0, &tabs, 0);
+        let work: Vec<_> = ui
+            .tab_runtime_work
+            .iter()
+            .map(|(_, dirty)| *dirty)
+            .collect();
+
+        assert!(work[0].is_empty());
+        assert!(work[1].contains(UiDirty::PAINT));
+        assert!(work[1].contains(UiDirty::SEMANTICS));
+        assert!(!work[1].contains(UiDirty::LAYOUT));
+        assert!(work[2].is_empty());
     }
 
     #[test]
@@ -1945,10 +2209,71 @@ mod tests {
         let mut ui = BrowserUi::new();
 
         frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        let tab_builds = ui.tab_builds();
+        let toolbar_builds = ui.toolbar_builds();
         // Width is the one thing the interface is laid out against: the tabs
         // share it and the address field takes what is left.
         frame_at(&mut ui, &mut text, 700.0, 800.0);
         assert_eq!(ui.builds(), 2);
+        assert_eq!(ui.tab_builds(), tab_builds + 1);
+        assert_eq!(ui.toolbar_builds(), toolbar_builds + 1);
+    }
+
+    #[test]
+    fn typing_in_the_omnibox_reuses_the_retained_tab_strip() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.focus_address();
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.describe();
+        let tab_builds = ui.tab_builds();
+        let toolbar_builds = ui.toolbar_builds();
+        let tab_semantics = ui.tab_semantics_builds();
+        let toolbar_semantics = ui.toolbar_semantics_builds();
+
+        assert!(ui.text_input('o'));
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.describe();
+
+        assert_eq!(
+            ui.tab_builds(),
+            tab_builds,
+            "an address edit reshaped or repainted the tab strip"
+        );
+        assert_eq!(
+            ui.toolbar_builds(),
+            toolbar_builds + 1,
+            "the changed field itself was not rebuilt"
+        );
+        assert_eq!(ui.tab_semantics_builds(), tab_semantics);
+        assert_eq!(ui.toolbar_semantics_builds(), toolbar_semantics + 1);
+    }
+
+    #[test]
+    fn toolbar_hover_reuses_the_retained_tab_strip() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.describe();
+        let tab_builds = ui.tab_builds();
+        let toolbar_builds = ui.toolbar_builds();
+        let tab_semantics = ui.tab_semantics_builds();
+        let toolbar_semantics = ui.toolbar_semantics_builds();
+        ui.pointer_moved(60.0, TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0, &mut text);
+        frame_at(&mut ui, &mut text, 1000.0, 800.0);
+        ui.describe();
+
+        assert_eq!(ui.tab_builds(), tab_builds);
+        assert_eq!(ui.toolbar_builds(), toolbar_builds + 1);
+        assert_eq!(ui.tab_semantics_builds(), tab_semantics);
+        assert_eq!(
+            ui.toolbar_semantics_builds(),
+            toolbar_semantics,
+            "paint-only hover rebuilt toolbar semantics"
+        );
     }
 
     #[test]

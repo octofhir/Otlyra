@@ -37,10 +37,11 @@ use otlyra_text::TextEngine;
 
 use crate::widget::controls;
 use crate::widget::data::{Mono, Split, Table, Tree, TreeRow};
+use crate::widget::runtime::{Retained, UiDirty};
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Child, Cx, Event, Fixed, Flex, Focus, Gap, Insets, Label, Overflow, Padding,
-    Rect, Size, Stack, fill_rounded,
+    Align, Background, Child, Cx, Described, Event, Fixed, Flex, Focus, Gap, Insets, Label,
+    Overflow, Padding, Rect, Size, Stack, fill_rounded,
 };
 
 /// Which pane of the panel is showing.
@@ -401,6 +402,51 @@ struct Appearance {
     focus: Option<crate::widget::FocusId>,
 }
 
+/// Inputs owned by the persistent header boundary.
+#[derive(Clone, PartialEq)]
+struct HeaderAppearance {
+    rect: Rect,
+    picking: bool,
+    pane: Pane,
+    pointer: Option<(f64, f64)>,
+    pointer_down: bool,
+    focus: Option<crate::widget::FocusId>,
+}
+
+/// Inputs owned by the persistent pane boundary.
+///
+/// Header-only state is deliberately absent. In particular, hovering the
+/// picker or lighting it up must not make a large DOM tree rebuild.
+#[derive(Clone, PartialEq)]
+struct BodyAppearance {
+    rect: Rect,
+    nodes: usize,
+    accessible: usize,
+    selected: Option<NodeId>,
+    expanded: usize,
+    collapsed: usize,
+    split: f64,
+    scroll: f64,
+    pane_scroll: f64,
+    pane: Pane,
+    sidebar: Sidebar,
+    search: String,
+    caret: Option<usize>,
+    selection: Option<std::ops::Range<usize>>,
+    level: Level,
+    exchanges: usize,
+    settled: usize,
+    exchange: Option<u64>,
+    kind_filter: KindFilter,
+    net_tab: NetTab,
+    property: Option<usize>,
+    attribute: Option<usize>,
+    attribute_value: String,
+    pointer: Option<(f64, f64)>,
+    pointer_down: bool,
+    focus: Option<crate::widget::FocusId>,
+}
+
 /// The panel, and what it is showing.
 pub struct Inspector {
     /// Whether the panel is on screen at all.
@@ -470,9 +516,19 @@ pub struct Inspector {
     pointer: (f64, f64),
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
-    engine: TextEngine,
+    /// The engine `offer` hands to a `Cx`. Built on first use, not at
+    /// construction: nothing in event handling shapes text, and building an
+    /// engine enumerates the system's fonts — dozens of milliseconds this
+    /// panel's `offer` never needs and startup should not pay.
+    engine: Option<TextEngine>,
     cache: Option<(Appearance, DisplayList)>,
     builds: u64,
+    header_tree: Retained<Action>,
+    body_tree: Retained<Action>,
+    header_appearance: Option<HeaderAppearance>,
+    body_appearance: Option<BodyAppearance>,
+    header_focus_end: usize,
+    body_focus_end: usize,
     root: Option<Child<Action>>,
 }
 
@@ -518,9 +574,15 @@ impl Inspector {
             pointer: (-1.0, -1.0),
             pointer_down: false,
             press_origin: None,
-            engine: TextEngine::new(),
+            engine: None,
             cache: None,
             builds: 0,
+            header_tree: Retained::new(Box::new(Gap::new(0.0, 0.0))),
+            body_tree: Retained::new(Box::new(Gap::new(0.0, 0.0))),
+            header_appearance: None,
+            body_appearance: None,
+            header_focus_end: 0,
+            body_focus_end: 0,
             root: None,
         }
     }
@@ -531,12 +593,43 @@ impl Inspector {
         if self.theme != theme {
             self.theme = theme;
             self.cache = None;
+            self.header_appearance = None;
+            self.body_appearance = None;
         }
     }
 
     /// How many display lists this panel has built rather than reused.
     pub fn builds(&self) -> u64 {
         self.builds
+    }
+
+    /// Header display lists actually rebuilt behind the persistent boundary.
+    pub fn header_builds(&self) -> u64 {
+        self.header_tree.builds()
+    }
+
+    /// Pane display lists actually rebuilt behind the persistent boundary.
+    pub fn body_builds(&self) -> u64 {
+        self.body_tree.builds()
+    }
+
+    /// Header semantic descriptions rebuilt behind the persistent boundary.
+    pub fn header_semantics_builds(&self) -> u64 {
+        self.header_tree.semantics_builds()
+    }
+
+    /// Pane semantic descriptions rebuilt behind the persistent boundary.
+    pub fn body_semantics_builds(&self) -> u64 {
+        self.body_tree.semantics_builds()
+    }
+
+    /// What the last inspector frame drew, from the same retained tree.
+    pub fn describe(&self) -> Vec<Described> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            root.describe(&mut out);
+        }
+        out
     }
 
     /// How tall the panel is in a content area of `height` logical pixels.
@@ -1058,7 +1151,7 @@ impl Inspector {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
-        let mut cx = Cx::new(&mut self.engine);
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;
@@ -1363,6 +1456,7 @@ impl Inspector {
         self.builds += 1;
         self.rows = rows;
         self.accessible = accessible;
+        self.prepare_retained(&appearance, facts);
         let mut built = DisplayList::new();
         let list = &mut built;
         let theme = self.theme.clone();
@@ -1375,8 +1469,7 @@ impl Inspector {
         cx.focus = self.focused;
         cx.theme = theme.clone();
 
-        self.focus.begin();
-        let mut root = self.build(&theme, facts);
+        let mut root = self.build();
         root.measure(Size::new(rect.width, rect.height), &mut cx);
         root.place(rect, &mut cx);
         root.draw(&mut cx, list);
@@ -1391,10 +1484,124 @@ impl Inspector {
         out.append(built);
     }
 
-    fn build(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
+    /// Reconcile the two coarse inspector boundaries and preserve the stable
+    /// focus-id prefix when only the pane changes.
+    fn prepare_retained(&mut self, appearance: &Appearance, facts: &Facts<'_>) {
+        let inside_x = appearance.pointer.0 >= appearance.rect.x
+            && appearance.pointer.0 < appearance.rect.x + appearance.rect.width;
+        let over_header = inside_x
+            && appearance.pointer.1 >= appearance.rect.y
+            && appearance.pointer.1 < appearance.rect.y + HEADER;
+        let over_body = inside_x
+            && appearance.pointer.1 >= appearance.rect.y + HEADER
+            && appearance.pointer.1 < appearance.rect.y + appearance.rect.height;
+        let header_appearance = HeaderAppearance {
+            rect: appearance.rect,
+            picking: appearance.picking,
+            pane: appearance.pane,
+            pointer: over_header.then_some(appearance.pointer),
+            pointer_down: over_header && appearance.pointer_down,
+            focus: appearance.focus,
+        };
+        let body_appearance = BodyAppearance {
+            rect: appearance.rect,
+            nodes: appearance.nodes,
+            accessible: appearance.accessible,
+            selected: appearance.selected,
+            expanded: appearance.expanded,
+            collapsed: appearance.collapsed,
+            split: appearance.split,
+            scroll: appearance.scroll,
+            pane_scroll: appearance.pane_scroll,
+            pane: appearance.pane,
+            sidebar: appearance.sidebar,
+            search: appearance.search.clone(),
+            caret: appearance.caret,
+            selection: appearance.selection.clone(),
+            level: appearance.level,
+            exchanges: appearance.exchanges,
+            settled: appearance.settled,
+            exchange: appearance.exchange,
+            kind_filter: appearance.kind_filter,
+            net_tab: appearance.net_tab,
+            property: appearance.property,
+            attribute: appearance.attribute,
+            attribute_value: appearance.attribute_value.clone(),
+            pointer: over_body.then_some(appearance.pointer),
+            pointer_down: over_body && appearance.pointer_down,
+            focus: appearance.focus,
+        };
+
+        let header_changed = self.header_appearance.as_ref() != Some(&header_appearance);
+        let mut body_changed = self.body_appearance.as_ref() != Some(&body_appearance);
+        let header_semantics_dirty = self.header_appearance.as_ref().is_none_or(|old| {
+            let mut comparable = old.clone();
+            comparable.pointer = header_appearance.pointer;
+            comparable.pointer_down = header_appearance.pointer_down;
+            comparable != header_appearance
+        });
+        let body_semantics_dirty = self.body_appearance.as_ref().is_none_or(|old| {
+            let mut comparable = old.clone();
+            comparable.pointer = body_appearance.pointer;
+            comparable.pointer_down = body_appearance.pointer_down;
+            comparable != body_appearance
+        });
+
+        if header_changed {
+            let mounted = self.header_appearance.is_some() && self.body_appearance.is_some();
+            if mounted {
+                self.focus.rewrite_from(0);
+            } else {
+                self.focus.begin();
+            }
+            let theme = self.theme.clone();
+            self.header_tree.replace_with_dirty(
+                self.header(&theme),
+                if header_semantics_dirty {
+                    UiDirty::SEMANTICS
+                } else {
+                    UiDirty::PAINT
+                },
+            );
+            let old_header_end = self.header_focus_end;
+            self.header_focus_end = if mounted {
+                self.focus.finish_rewrite()
+            } else {
+                self.focus.len()
+            };
+            // The current header has a fixed focusable shape. Keep the fallback
+            // explicit so adding a conditional control later cannot leave the
+            // retained body's embedded ids out of sync with keyboard traversal.
+            if !mounted || self.header_focus_end != old_header_end {
+                self.focus.truncate(self.header_focus_end);
+                body_changed = true;
+            }
+        } else if body_changed {
+            self.focus.truncate(self.header_focus_end);
+        }
+
+        if body_changed {
+            let theme = self.theme.clone();
+            self.body_tree.replace_with_dirty(
+                self.build_body(&theme, facts),
+                if body_semantics_dirty {
+                    UiDirty::SEMANTICS
+                } else {
+                    UiDirty::PAINT
+                },
+            );
+            self.body_focus_end = self.focus.len();
+        }
+
+        self.focus.truncate(self.body_focus_end);
+        self.header_appearance = Some(header_appearance);
+        self.body_appearance = Some(body_appearance);
+    }
+
+    fn build_body(&self, theme: &Theme, facts: &Facts<'_>) -> Child<Action> {
         // Each pane takes the whole panel. Only *Elements* is two things side
         // by side, because only it has a selection for a sidebar to be about.
-        let body: Child<Action> = match self.pane {
+        match self.pane {
             // The tree, with the field that narrows it above and the path to
             // what is chosen along the bottom — which is where every browser
             // puts a breadcrumb trail, and it is full width because the path to
@@ -1452,11 +1659,17 @@ impl Inspector {
                 )),
                 Action::SplitAt,
             )),
-        };
+        }
+    }
 
+    /// Build the short-lived adapter around the two persistent subtrees.
+    fn build(&self) -> Child<Action> {
         Box::new(Stack::column(
             0.0,
-            vec![self.header(theme), Box::new(Flex::new(1.0, body))],
+            vec![
+                self.header_tree.widget(),
+                Box::new(Flex::new(1.0, self.body_tree.widget())),
+            ],
         ))
     }
 
@@ -4291,6 +4504,72 @@ mod tests {
         inspector.apply(Action::TogglePicker);
         frame(&mut inspector, &document);
         assert_eq!(inspector.builds(), 2, "the picker is drawn lit");
+    }
+
+    #[test]
+    fn moving_over_the_body_does_not_rebuild_the_header() {
+        let document = document();
+        let mut inspector = panel();
+        frame(&mut inspector, &document);
+        let header = inspector.header_builds();
+        let body = inspector.body_builds();
+
+        inspector.pointer_moved(400.0, 500.0);
+        frame(&mut inspector, &document);
+
+        assert_eq!(
+            inspector.header_builds(),
+            header,
+            "the pointer stayed outside the header boundary"
+        );
+        assert_eq!(
+            inspector.body_builds(),
+            body + 1,
+            "the hovered pane repaints"
+        );
+    }
+
+    #[test]
+    fn moving_over_the_header_does_not_rebuild_the_body() {
+        let document = document();
+        let mut inspector = panel();
+        frame(&mut inspector, &document);
+        let header = inspector.header_builds();
+        let body = inspector.body_builds();
+
+        inspector.pointer_moved(400.0, 315.0);
+        frame(&mut inspector, &document);
+
+        assert_eq!(
+            inspector.header_builds(),
+            header + 1,
+            "the hovered header repaints"
+        );
+        assert_eq!(
+            inspector.body_builds(),
+            body,
+            "the retained pane keeps its focus ids and display list"
+        );
+    }
+
+    #[test]
+    fn pointer_only_inspector_frames_reuse_semantics() {
+        let document = document();
+        let mut inspector = panel();
+        frame(&mut inspector, &document);
+        inspector.describe();
+        let header = inspector.header_semantics_builds();
+        let body = inspector.body_semantics_builds();
+
+        inspector.pointer_moved(400.0, 315.0);
+        frame(&mut inspector, &document);
+        inspector.describe();
+        inspector.pointer_moved(400.0, 500.0);
+        frame(&mut inspector, &document);
+        inspector.describe();
+
+        assert_eq!(inspector.header_semantics_builds(), header);
+        assert_eq!(inspector.body_semantics_builds(), body);
     }
 
     #[test]

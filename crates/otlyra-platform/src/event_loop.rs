@@ -15,7 +15,7 @@ use otlyra_gfx::{PaintTarget, SkiaPainter};
 use crate::a11y::Accessibility;
 use crate::menu::{NativeMenu, command_from_muda};
 use crate::present::{Presented, Presenter};
-use crate::{MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
+use crate::{FrameRequest, MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
 
 /// Logical pixels one wheel notch scrolls.
 const LINE_SCROLL: f64 = 40.0;
@@ -61,12 +61,15 @@ fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
 /// Menu activations arrive on muda's own callback, off winit's event path, so they
 /// are forwarded through the event loop proxy. Without this the loop would sit in
 /// `Wait` and the menu would appear to do nothing until the next mouse move.
-#[derive(Debug)]
 enum UserEvent {
     /// A menu item was chosen.
     Menu(MenuId),
     /// Something off the loop's thread asked for a frame.
     Woken,
+    /// Backend discovery completed; the main thread may attach the window.
+    PresenterInstanceReady(Box<crate::present::PresenterInstance>),
+    /// GPU initialization completed without blocking the window event loop.
+    PresenterReady(Box<Result<Presenter, crate::present::PresentError>>),
 }
 
 /// Anything that can go wrong opening or driving a window.
@@ -91,6 +94,9 @@ pub enum PlatformError {
     /// The rasterizer failed to allocate or read back a surface.
     #[error("rasterizer failed: {0}")]
     Rasterizer(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The requested machine-readable startup report could not be written.
+    #[error("startup report failed: {0}")]
+    StartupReport(#[source] std::io::Error),
 }
 
 impl From<Box<otlyra_gfx::SkiaError>> for PlatformError {
@@ -115,11 +121,87 @@ impl From<crate::present::PresentError> for PlatformError {
 /// enough for a spinner and cheap enough that nothing else has to opt out.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Work performed by the platform frame path since the window opened.
+///
+/// Cumulative counters make a no-op visible: tests and profiles can compare two
+/// snapshots and require every field to stay put.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct WorkCounters {
+    events_delivered: u64,
+    redraw_requests: u64,
+    frames_started: u64,
+    frames_presented: u64,
+    accessibility_updates: u64,
+    rasterized_pixels: u64,
+    uploaded_bytes: u64,
+}
+
+/// Coalesces immediate frames and owns the one future wake-up.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct FrameScheduler {
+    redraw_pending: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl FrameScheduler {
+    /// Record one request. `true` means winit needs a new redraw request now.
+    fn request(&mut self, request: FrameRequest, now: std::time::Instant) -> bool {
+        match request {
+            FrameRequest::None => false,
+            FrameRequest::Now => {
+                // This frame observes everything that a previously scheduled
+                // animation frame would have observed. The painter will publish
+                // its next deadline after presentation if the animation continues.
+                self.deadline = None;
+                self.request_now()
+            }
+            FrameRequest::Vsync => {
+                self.set_deadline(now + FRAME_INTERVAL);
+                false
+            }
+            FrameRequest::At(deadline) if deadline <= now => self.request_now(),
+            FrameRequest::At(deadline) => {
+                self.set_deadline(deadline);
+                false
+            }
+        }
+    }
+
+    fn request_now(&mut self) -> bool {
+        if self.redraw_pending {
+            return false;
+        }
+        self.redraw_pending = true;
+        true
+    }
+
+    fn set_deadline(&mut self, deadline: std::time::Instant) {
+        if self.deadline.is_none_or(|current| deadline < current) {
+            self.deadline = Some(deadline);
+        }
+    }
+
+    /// Turn a reached deadline into one coalesced redraw request.
+    fn wake_due(&mut self, now: std::time::Instant) -> bool {
+        if self.deadline.is_none_or(|deadline| deadline > now) {
+            return false;
+        }
+        self.deadline = None;
+        self.request_now()
+    }
+
+    fn redraw_started(&mut self) {
+        self.redraw_pending = false;
+        self.deadline = None;
+    }
+}
+
 /// Open one window, paint it with `painter`, and return when it closes.
 ///
 /// The loop blocks in `ControlFlow::Wait`, so nothing here may request a redraw
 /// unconditionally.
 pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), PlatformError> {
+    let startup_origin = config.startup_origin;
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
@@ -147,16 +229,24 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         }
     });
     painter.set_waker(crate::Waker::new(wake_sender));
+    let presenter_proxy = event_loop.create_proxy();
 
     let mut app = WindowedApp {
         config,
         painter,
         window: None,
         presenter: None,
+        presenter_proxy,
         rasterizer: None,
         menu: None,
         a11y: None,
         frames: 0,
+        startup_origin,
+        window_visible: None,
+        first_frame: None,
+        startup_report_written: false,
+        scheduler: FrameScheduler::default(),
+        work: WorkCounters::default(),
         modifiers: crate::Modifiers::default(),
         pointer: (-1.0, -1.0),
         last_press: None,
@@ -181,6 +271,8 @@ struct WindowedApp<'p> {
     painter: &'p mut dyn Painter,
     window: Option<Arc<Window>>,
     presenter: Option<Presenter>,
+    /// Wakes the UI thread when background GPU initialization completes.
+    presenter_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     rasterizer: Option<SkiaPainter>,
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
@@ -188,6 +280,16 @@ struct WindowedApp<'p> {
     /// degraded browser and not a broken one.
     a11y: Option<Accessibility>,
     frames: u64,
+    /// The executable's startup origin and the milestones reached from it.
+    startup_origin: std::time::Instant,
+    window_visible: Option<std::time::Instant>,
+    first_frame: Option<std::time::Instant>,
+    /// Whether benchmark mode has captured its one required presented frame.
+    startup_report_written: bool,
+    /// The only owner of redraw requests and animation deadlines.
+    scheduler: FrameScheduler,
+    /// Cumulative work, logged with every presented frame.
+    work: WorkCounters,
     /// Modifier state, tracked here because winit reports it as its own event and
     /// every key press needs it.
     modifiers: crate::Modifiers,
@@ -237,6 +339,16 @@ impl WindowedApp<'_> {
         clicks
     }
 
+    /// Record one startup milestone if the config asked for a trace.
+    ///
+    /// Takes `&self`: the marks land between ordinary mutations of the loop's
+    /// state, and a milestone is never a reason to hold the loop mutably.
+    fn mark(&self, name: &'static str) {
+        if let Some(trace) = self.config.startup_trace.as_ref() {
+            trace.mark(name);
+        }
+    }
+
     fn viewport(&self) -> Viewport {
         let Some(window) = self.window.as_ref() else {
             return Viewport::new(1, 1, 1.0);
@@ -253,13 +365,11 @@ impl WindowedApp<'_> {
         event_loop.exit();
     }
 
-    /// Hand an event up and ask for a frame.
-    ///
-    /// Every input event may change what is on screen, and the loop blocks in
-    /// `Wait`: an event nobody follows with a redraw request is an event the user
-    /// sees no result from.
+    /// Hand an event up and schedule only the frame it asks for.
     fn deliver(&mut self, event: PlatformEvent) {
-        self.painter.on_event(event);
+        self.work.events_delivered += 1;
+        tracing::trace!(?event, "platform event delivered");
+        let request = self.painter.handle_event(event);
 
         let cursor = self.painter.cursor();
         if cursor != self.cursor
@@ -274,9 +384,38 @@ impl WindowedApp<'_> {
         }
 
         self.sync_window_appearance();
+        self.request_frame(request);
+    }
 
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+    /// The one place that calls winit's `request_redraw`.
+    fn request_frame(&mut self, request: FrameRequest) {
+        tracing::trace!(?request, "frame requested");
+        if !self.scheduler.request(request, std::time::Instant::now()) {
+            return;
+        }
+        self.issue_redraw();
+    }
+
+    fn issue_redraw(&mut self) {
+        // State may change while the GPU device is being requested. The first
+        // frame after PresenterReady observes all of it; rasterizing before
+        // there is somewhere to present would only burn startup time.
+        if self.presenter.is_none() {
+            self.scheduler.redraw_pending = false;
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            self.scheduler.redraw_pending = false;
+            return;
+        };
+        window.request_redraw();
+        self.work.redraw_requests += 1;
+    }
+
+    fn sync_control_flow(&self, event_loop: &ActiveEventLoop) {
+        match self.scheduler.deadline {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -306,13 +445,29 @@ impl WindowedApp<'_> {
                 .and_then(|w| w.theme())
                 .map(translate_theme)
         {
-            self.painter
-                .on_event(PlatformEvent::AppearanceChanged(scheme));
+            let request = self
+                .painter
+                .handle_event(PlatformEvent::AppearanceChanged(scheme));
+            self.request_frame(request);
         }
     }
 
     fn redraw(&mut self) -> Result<Presented, PlatformError> {
+        self.scheduler.redraw_started();
+        self.work.frames_started += 1;
+        // Only the first frame carries startup marks. Cloning the handle (an `Arc`)
+        // once here keeps the marks free of a `&self` borrow that would collide
+        // with the rasterizer's `&mut`, and skips the work on every later frame.
+        let trace = if self.first_frame.is_none() {
+            self.config.startup_trace.clone()
+        } else {
+            None
+        };
         let viewport = self.viewport();
+        self.work.rasterized_pixels = self
+            .work
+            .rasterized_pixels
+            .saturating_add(u64::from(viewport.width) * u64::from(viewport.height));
 
         let rasterizer = match self.rasterizer.as_mut() {
             Some(rasterizer) => {
@@ -339,18 +494,85 @@ impl WindowedApp<'_> {
             rasterizer.reset();
             self.painter.paint(rasterizer, viewport);
         }
+        // Chrome build, text shaping, and CPU raster all happen inside `paint`,
+        // which interleaves list-building and Skia draw calls; the seam here can
+        // separate them from readback but not from one another.
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("chrome_raster_complete");
+        }
 
         let _present = tracing::info_span!("present", mode = "blit").entered();
         let pixels = rasterizer.read_rgba8().map_err(Box::new)?;
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("readback_complete");
+        }
         let Some(presenter) = self.presenter.as_mut() else {
             return Ok(Presented::Dropped);
         };
         presenter.resize(viewport);
+        let upload_bytes = pixels.len() as u64;
         let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
+        if outcome == Presented::Frame
+            && let Some(trace) = trace.as_ref()
+        {
+            trace.mark("upload_complete");
+        }
 
         if outcome == Presented::Frame {
+            self.work.uploaded_bytes = self.work.uploaded_bytes.saturating_add(upload_bytes);
             self.frames += 1;
-            tracing::debug!(frame = self.frames, "frame presented");
+            self.work.frames_presented += 1;
+            let now = std::time::Instant::now();
+            if self.first_frame.is_none() {
+                self.first_frame = Some(now);
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("first_present_complete");
+                }
+                let elapsed = now.saturating_duration_since(self.startup_origin);
+                tracing::info!(
+                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                    visible_ms = self
+                        .window_visible
+                        .map(
+                            |visible| now.saturating_duration_since(visible).as_secs_f64() * 1000.0
+                        ),
+                    "first chrome frame presented; browser interactive"
+                );
+                if let Some(path) = self.config.startup_report.as_deref() {
+                    let visible_ms = self.window_visible.map(|visible| {
+                        visible
+                            .saturating_duration_since(self.startup_origin)
+                            .as_secs_f64()
+                            * 1000.0
+                    });
+                    let stages = trace.as_ref().map(|t| t.stages()).unwrap_or_default();
+                    let report = startup_report_json(
+                        elapsed.as_secs_f64() * 1000.0,
+                        visible_ms,
+                        viewport,
+                        &stages,
+                    );
+                    std::fs::write(path, report).map_err(PlatformError::StartupReport)?;
+                    self.startup_report_written = true;
+                }
+            }
+            let painter_work = self.painter.work_counters();
+            tracing::debug!(
+                frame = self.frames,
+                events = self.work.events_delivered,
+                redraw_requests = self.work.redraw_requests,
+                frames_started = self.work.frames_started,
+                frames_presented = self.work.frames_presented,
+                accessibility_updates = self.work.accessibility_updates,
+                rasterized_pixels = self.work.rasterized_pixels,
+                uploaded_bytes = self.work.uploaded_bytes,
+                chrome_reconciles = painter_work.chrome_reconciles,
+                chrome_layouts = painter_work.chrome_layouts,
+                chrome_paints = painter_work.chrome_paints,
+                chrome_semantics = painter_work.chrome_semantics,
+                page_paints = painter_work.page_paints,
+                "frame presented"
+            );
         }
 
         // After the frame, because the tree describes what is now on screen.
@@ -358,6 +580,7 @@ impl WindowedApp<'_> {
             && let Some(a11y) = self.a11y.as_mut()
         {
             a11y.update(update);
+            self.work.accessibility_updates += 1;
         }
 
         Ok(outcome)
@@ -365,8 +588,8 @@ impl WindowedApp<'_> {
 }
 
 impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
-    /// The loop woke because an animated frame is due; ask for it.
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    /// Drain cross-thread work and turn a reached deadline into one redraw.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Anything a screen reader asked for arrived on its own thread and was
         // queued. Drained here, between batches of window events, so it reaches
         // the painter as an ordinary event on the loop's thread like every other.
@@ -376,20 +599,47 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             }
         }
 
-        if self.painter.animating()
-            && let Some(window) = self.window.as_ref()
-        {
-            window.request_redraw();
+        if self.scheduler.wake_due(std::time::Instant::now()) {
+            self.issue_redraw();
         }
+        self.sync_control_flow(event_loop);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(id) => {
                 tracing::debug!(id = ?id, "menu command");
                 self.deliver(PlatformEvent::MenuCommand(id));
             }
             UserEvent::Woken => self.deliver(PlatformEvent::Woken),
+            UserEvent::PresenterInstanceReady(instance) => {
+                self.mark("wgpu_instance_ready");
+                let Some(window) = self.window.as_ref().map(Arc::clone) else {
+                    return;
+                };
+                let viewport = self.viewport();
+                let seed = match Presenter::prepare(*instance, window) {
+                    Ok(seed) => seed,
+                    Err(error) => {
+                        self.fail(event_loop, error.into());
+                        return;
+                    }
+                };
+                self.mark("surface_attached");
+                let proxy = self.presenter_proxy.clone();
+                std::thread::spawn(move || {
+                    let result = Presenter::new(seed, viewport);
+                    let _ = proxy.send_event(UserEvent::PresenterReady(Box::new(result)));
+                });
+            }
+            UserEvent::PresenterReady(result) => match *result {
+                Ok(presenter) => {
+                    self.mark("gpu_ready");
+                    self.presenter = Some(presenter);
+                    self.request_frame(FrameRequest::Now);
+                }
+                Err(error) => self.fail(event_loop, error.into()),
+            },
         }
     }
 
@@ -400,11 +650,14 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             return;
         }
 
+        self.mark("event_loop_resumed");
+
         // Both before the window, so the icon and menu bar are in place the moment
         // anything is on screen.
         if let Some(icon) = self.config.icon {
             crate::icon::set_dock_icon(icon);
         }
+        self.mark("icon_ready");
 
         if !self.config.menu_bar.menus.is_empty() {
             match NativeMenu::install(&self.config.menu_bar) {
@@ -415,6 +668,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                 }
             }
         }
+        self.mark("menu_ready");
 
         // Created hidden: the accessibility adapter must exist before the window is
         // shown for the first time, and it says so by panicking otherwise.
@@ -433,24 +687,13 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                 return;
             }
         };
+        self.mark("window_created");
 
-        let viewport = {
-            let size = window.inner_size();
-            Viewport::new(size.width, size.height, window.scale_factor())
-        };
-
-        match Presenter::new(Arc::clone(&window), viewport) {
-            Ok(presenter) => self.presenter = Some(presenter),
-            Err(error) => {
-                self.fail(event_loop, error.into());
-                return;
-            }
-        }
-
+        // AccessKit requires the window to remain hidden until its adapter is
+        // attached. GPU initialization has no such requirement and is much
+        // slower, so it starts only after the hidden-window work is complete.
         self.a11y = Some(Accessibility::new(event_loop, &window));
-        window.set_visible(true);
-
-        window.request_redraw();
+        self.mark("accesskit_attached");
         // The painter may already want the window pinned — a saved preference
         // says Dark — and that has to land before the titlebar is ever seen.
         if let Some(wanted) = self.painter.window_appearance() {
@@ -463,17 +706,43 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             // What the environment is *now*, before the first frame: without
             // this the embedder would draw its first frame in the default
             // palette and switch on the first change, which reads as a flash.
-            self.painter
-                .on_event(PlatformEvent::AppearanceChanged(scheme));
+            self.work.events_delivered += 1;
+            let _ = self
+                .painter
+                .handle_event(PlatformEvent::AppearanceChanged(scheme));
         }
-        self.window = Some(window);
-        self.painter.on_event(PlatformEvent::SurfaceReady(viewport));
+
+        let viewport = {
+            let size = window.inner_size();
+            Viewport::new(size.width, size.height, window.scale_factor())
+        };
+        self.window = Some(Arc::clone(&window));
+        self.work.events_delivered += 1;
+        let _ = self
+            .painter
+            .handle_event(PlatformEvent::SurfaceReady(viewport));
+
+        window.set_visible(true);
+        let visible = std::time::Instant::now();
+        self.window_visible = Some(visible);
+        self.mark("visibility_requested");
         tracing::info!(
+            elapsed_ms = visible
+                .saturating_duration_since(self.startup_origin)
+                .as_secs_f64()
+                * 1000.0,
             width = viewport.width,
             height = viewport.height,
             scale_factor = viewport.scale_factor,
-            "window ready"
+            "window visible; gpu initialization continues in background"
         );
+
+        let proxy = self.presenter_proxy.clone();
+        let gpu_window = Arc::clone(&window);
+        std::thread::spawn(move || {
+            let instance = Presenter::instance(gpu_window);
+            let _ = proxy.send_event(UserEvent::PresenterInstanceReady(Box::new(instance)));
+        });
     }
 
     fn window_event(
@@ -488,17 +757,19 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
         match event {
             WindowEvent::CloseRequested => {
-                self.painter.on_event(PlatformEvent::CloseRequested);
+                let _ = self.painter.handle_event(PlatformEvent::CloseRequested);
                 event_loop.exit();
             }
             // Both mean the same thing above us: the drawable changed. winit
             // separates them because scale and pixel size can change alone.
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 let viewport = self.viewport();
-                self.painter.on_event(PlatformEvent::Resized(viewport));
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.work.events_delivered += 1;
+                let request = self.painter.handle_event(PlatformEvent::Resized(viewport));
+                self.request_frame(match request {
+                    FrameRequest::None => FrameRequest::Now,
+                    request => request,
+                });
             }
             // The window became visible or came to the front. Both mean the last
             // frame may never have reached the screen — a swapchain hands back an
@@ -506,9 +777,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             // blocks in `Wait` nothing else will ask for another one.
             WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
                 self.dropped_frames = 0;
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.request_frame(FrameRequest::Now);
             }
             WindowEvent::ThemeChanged(theme) => {
                 // While the window is pinned, this event is our own pin coming
@@ -516,9 +785,6 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                 // poison what *System* later resumes following.
                 if self.pinned_scheme.is_none() {
                     self.deliver(PlatformEvent::AppearanceChanged(translate_theme(theme)));
-                }
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
                 }
             }
 
@@ -578,25 +844,18 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.viewport().scale_factor;
-                self.painter.on_event(scroll_event(delta, scale));
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.deliver(scroll_event(delta, scale));
             }
             WindowEvent::RedrawRequested => match self.redraw() {
                 Err(error) => self.fail(event_loop, error),
                 Ok(Presented::Frame | Presented::Occluded) => {
                     self.dropped_frames = 0;
-                    // A painter that says it is animating gets the next frame at
-                    // the display's pace; one that does not gets none, and the
-                    // loop goes back to blocking.
-                    if self.painter.animating() {
-                        event_loop.set_control_flow(ControlFlow::WaitUntil(
-                            std::time::Instant::now() + FRAME_INTERVAL,
-                        ));
-                    } else {
-                        event_loop.set_control_flow(ControlFlow::Wait);
+                    if self.startup_report_written {
+                        event_loop.exit();
+                        return;
                     }
+                    self.request_frame(self.painter.next_frame());
+                    self.sync_control_flow(event_loop);
                 }
                 // Ask for the frame again. Bounded, because a swapchain that fails
                 // forever must not turn the blocking loop into a spinning one — that
@@ -604,9 +863,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                 Ok(Presented::Dropped) => {
                     self.dropped_frames += 1;
                     if self.dropped_frames <= MAX_DROPPED_FRAMES {
-                        if let Some(window) = self.window.as_ref() {
-                            window.request_redraw();
-                        }
+                        self.request_frame(FrameRequest::Now);
                     } else {
                         tracing::warn!(
                             dropped = self.dropped_frames,
@@ -618,6 +875,58 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             _ => {}
         }
     }
+}
+
+/// Stable wire format consumed by the startup benchmark runner.
+///
+/// `stages` is the ordered milestone table, each entry milliseconds from the
+/// process origin. It is emitted as an array so the aggregator keeps the launch
+/// order and can turn adjacent milestones into per-stage durations.
+fn startup_report_json(
+    process_to_first_frame_ms: f64,
+    process_to_visible_ms: Option<f64>,
+    viewport: Viewport,
+    stages: &[(&'static str, f64)],
+) -> String {
+    let visible = process_to_visible_ms
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "null".to_owned());
+    let visible_to_first_frame = process_to_visible_ms
+        .map(|value| format!("{:.6}", process_to_first_frame_ms - value))
+        .unwrap_or_else(|| "null".to_owned());
+    let stages_json = if stages.is_empty() {
+        "[]".to_owned()
+    } else {
+        let mut body = String::new();
+        for (index, (name, ms)) in stages.iter().enumerate() {
+            let comma = if index + 1 < stages.len() { "," } else { "" };
+            body.push_str(&format!(
+                "\n    {{ \"name\": \"{name}\", \"ms\": {ms:.6} }}{comma}"
+            ));
+        }
+        format!("[{body}\n  ]")
+    };
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": 2,\n",
+            "  \"process_to_visible_ms\": {visible},\n",
+            "  \"process_to_first_frame_ms\": {process_to_first_frame_ms:.6},\n",
+            "  \"visible_to_first_frame_ms\": {visible_to_first_frame},\n",
+            "  \"physical_width\": {width},\n",
+            "  \"physical_height\": {height},\n",
+            "  \"scale_factor\": {scale_factor:.6},\n",
+            "  \"stages\": {stages}\n",
+            "}}\n"
+        ),
+        visible = visible,
+        process_to_first_frame_ms = process_to_first_frame_ms,
+        visible_to_first_frame = visible_to_first_frame,
+        width = viewport.width,
+        height = viewport.height,
+        scale_factor = viewport.scale_factor,
+        stages = stages_json,
+    )
 }
 
 /// Turn one winit scroll delta into the event the browser above understands.
@@ -667,6 +976,55 @@ mod tests {
     use winit::event::MouseScrollDelta;
 
     #[test]
+    fn startup_report_is_stable_machine_readable_json() {
+        let stages = [
+            ("main_entered", 0.5),
+            ("visibility_requested", 40.0),
+            ("first_present_complete", 91.25),
+        ];
+        let report =
+            startup_report_json(91.25, Some(40.0), Viewport::new(2048, 1536, 2.0), &stages);
+        let value: serde_json::Value = serde_json::from_str(&report).expect("valid JSON");
+
+        assert_eq!(value["schema"], 2);
+        assert_eq!(value["process_to_visible_ms"], 40.0);
+        assert_eq!(value["process_to_first_frame_ms"], 91.25);
+        assert_eq!(value["visible_to_first_frame_ms"], 51.25);
+        assert_eq!(value["physical_width"], 2048);
+        assert_eq!(value["physical_height"], 1536);
+        assert_eq!(value["scale_factor"], 2.0);
+
+        let recorded = value["stages"].as_array().expect("stages is an array");
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0]["name"], "main_entered");
+        assert_eq!(recorded[0]["ms"], 0.5);
+        assert_eq!(recorded[2]["name"], "first_present_complete");
+        assert_eq!(recorded[2]["ms"], 91.25);
+    }
+
+    #[test]
+    fn a_startup_trace_records_each_milestone_once_in_order() {
+        let trace = crate::StartupTrace::new(std::time::Instant::now());
+        trace.mark("main_entered");
+        trace.mark("window_created");
+        // A path that runs twice must not double-count its milestone.
+        trace.mark("window_created");
+        let stages = trace.stages();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].0, "main_entered");
+        assert_eq!(stages[1].0, "window_created");
+        assert!(stages[0].1 <= stages[1].1);
+    }
+
+    #[test]
+    fn a_startup_report_without_a_trace_emits_an_empty_stage_array() {
+        let report = startup_report_json(10.0, None, Viewport::new(2, 2, 1.0), &[]);
+        let value: serde_json::Value = serde_json::from_str(&report).expect("valid JSON");
+        assert_eq!(value["process_to_visible_ms"], serde_json::Value::Null);
+        assert_eq!(value["stages"].as_array().expect("array").len(), 0);
+    }
+
+    #[test]
     fn a_wheel_notch_is_worth_a_notch_and_says_it_was_a_wheel() {
         // Winit's positive is the content moving down, which is the reader going
         // up the page, so the event that comes out is negative.
@@ -714,5 +1072,67 @@ mod tests {
         };
         assert!(down(wheel), "a wheel rolled away from the reader goes down");
         assert!(down(trackpad), "and so does the same gesture on a trackpad");
+    }
+
+    #[test]
+    fn immediate_frame_requests_are_coalesced_until_the_redraw_starts() {
+        let now = std::time::Instant::now();
+        let mut scheduler = FrameScheduler::default();
+
+        assert!(scheduler.request(FrameRequest::Now, now));
+        assert!(
+            !scheduler.request(FrameRequest::Now, now),
+            "winit already has one redraw request"
+        );
+
+        scheduler.redraw_started();
+        assert!(
+            scheduler.request(FrameRequest::Now, now),
+            "a change during or after that frame needs the next one"
+        );
+    }
+
+    #[test]
+    fn the_earliest_deadline_wins_and_wakes_once() {
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_secs(2);
+        let sooner = now + std::time::Duration::from_secs(1);
+        let mut scheduler = FrameScheduler::default();
+
+        assert!(!scheduler.request(FrameRequest::At(later), now));
+        assert!(!scheduler.request(FrameRequest::At(sooner), now));
+        assert_eq!(scheduler.deadline, Some(sooner));
+        assert!(!scheduler.wake_due(now));
+        assert!(scheduler.wake_due(sooner));
+        assert_eq!(scheduler.deadline, None);
+        assert!(
+            !scheduler.wake_due(later),
+            "a reached deadline is consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn a_vsync_request_becomes_a_future_deadline() {
+        let now = std::time::Instant::now();
+        let mut scheduler = FrameScheduler::default();
+
+        assert!(!scheduler.request(FrameRequest::Vsync, now));
+        assert_eq!(scheduler.deadline, Some(now + FRAME_INTERVAL));
+        assert!(!scheduler.wake_due(now));
+        assert!(scheduler.wake_due(now + FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn an_immediate_frame_supersedes_an_old_animation_deadline() {
+        let now = std::time::Instant::now();
+        let mut scheduler = FrameScheduler::default();
+
+        assert!(!scheduler.request(FrameRequest::Vsync, now));
+        assert!(scheduler.deadline.is_some());
+        assert!(scheduler.request(FrameRequest::Now, now));
+        assert_eq!(
+            scheduler.deadline, None,
+            "the painter will publish a fresh deadline after this frame"
+        );
     }
 }

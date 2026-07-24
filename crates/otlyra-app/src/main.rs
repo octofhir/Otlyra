@@ -11,7 +11,18 @@ use otlyra_app::browser::Browser;
 use otlyra_app::menu::menu_bar;
 use otlyra_app::scene::DemoScene;
 use otlyra_app::{observability, run_window, write_screenshot};
-use otlyra_platform::{Viewport, WindowConfig};
+use otlyra_platform::{StartupTrace, Viewport, WindowConfig};
+
+/// Evaluated by the first statement in `main` and carried to the platform loop,
+/// so startup milestones share one process-level origin.
+static PROCESS_STARTED: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// The one startup trace, measured from [`PROCESS_STARTED`]. The bootstrap marks
+/// its early milestones here; `window_config` hands the same handle to the loop,
+/// which records the rest and folds them into the startup report.
+static STARTUP_TRACE: std::sync::LazyLock<StartupTrace> =
+    std::sync::LazyLock::new(|| StartupTrace::new(*PROCESS_STARTED));
 
 /// An experimental browser.
 #[derive(Debug, Parser)]
@@ -137,6 +148,13 @@ struct Cli {
     /// Every tool is one command against the same browser the protocol drives.
     #[arg(long)]
     mcp: bool,
+
+    /// Write startup timings after the first presented frame, then exit.
+    ///
+    /// Used by the performance runner. The file is JSON and is written only
+    /// after presentation succeeds, never merely after paint begins.
+    #[arg(long, value_name = "PATH")]
+    startup_report: Option<PathBuf>,
 }
 
 impl Cli {
@@ -203,8 +221,11 @@ fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
+    let _ = *PROCESS_STARTED;
+    STARTUP_TRACE.mark("main_entered");
     observability::init();
     let cli = Cli::parse();
+    STARTUP_TRACE.mark("cli_parsed");
 
     // Answering the protocol is a mode of its own: a driver navigates, so a
     // document named on the command line would be a page the first command
@@ -212,7 +233,10 @@ fn main() -> ExitCode {
     // Nothing was named on the command line, so what happens is what the
     // preferences say happens.
     if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
-        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+        let settings = cli.settings();
+        STARTUP_TRACE.mark("preferences_ready");
+        let mut browser = Browser::with_settings(NetLoader::default(), settings);
+        STARTUP_TRACE.mark("browser_ready");
         let start = browser.settings_on_start();
         if start == otlyra_app::settings::OnStart::Home {
             browser.go_home();
@@ -360,7 +384,10 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     if let Source::Url(input) = &source
         && let Some(page) = otlyra_app::ui::SystemPage::from_url(input)
     {
-        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+        let settings = cli.settings();
+        STARTUP_TRACE.mark("preferences_ready");
+        let mut browser = Browser::with_settings(NetLoader::default(), settings);
+        STARTUP_TRACE.mark("browser_ready");
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
             Some(path) => Ok(write_screenshot(&mut browser, cli.viewport(), path)?),
@@ -471,7 +498,10 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
 
     // A document was named on the command line, and nothing asked for a dump: open
     // the browser with it already loaded.
-    let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+    let settings = cli.settings();
+    STARTUP_TRACE.mark("preferences_ready");
+    let mut browser = Browser::with_settings(NetLoader::default(), settings);
+    STARTUP_TRACE.mark("browser_ready");
     browser.set_viewport(cli.viewport());
     browser.navigate(&match &source {
         Source::Url(url) => url.clone(),
@@ -574,6 +604,9 @@ fn window_config(cli: &Cli) -> WindowConfig {
         logical_size: (f64::from(cli.width), f64::from(cli.height)),
         menu_bar: menu_bar(),
         icon: Some(otlyra_app::ICON),
+        startup_origin: *PROCESS_STARTED,
+        startup_report: cli.startup_report.clone(),
+        startup_trace: Some(STARTUP_TRACE.clone()),
     }
 }
 

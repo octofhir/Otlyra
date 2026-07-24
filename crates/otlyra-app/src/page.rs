@@ -15,6 +15,9 @@ use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images, build_box_tree};
 use otlyra_text::TextEngine;
 
+/// Time between the visible and hidden halves of a caret blink.
+const CARET_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A parsed document, laid out and painted.
 pub struct PageScene {
     /// The stylesheets the document's `<link>` elements asked for, already
@@ -1734,6 +1737,20 @@ impl PageScene {
         self.caret_source().is_some()
     }
 
+    /// The next instant at which the caret changes visibility.
+    ///
+    /// Returning a deadline instead of "animating" keeps an otherwise idle
+    /// browser asleep for the whole half-second between transitions.
+    pub fn next_caret_frame(&self) -> Option<std::time::Instant> {
+        self.caret_source()?;
+        let elapsed = std::time::Instant::now().saturating_duration_since(self.caret_since);
+        let intervals = elapsed.as_millis() / CARET_BLINK_INTERVAL.as_millis() + 1;
+        let millis = intervals
+            .saturating_mul(CARET_BLINK_INTERVAL.as_millis())
+            .min(u128::from(u64::MAX)) as u64;
+        Some(self.caret_since + std::time::Duration::from_millis(millis))
+    }
+
     /// Whether the caret is showing this instant.
     ///
     /// Half a second on and half a second off, which is what every platform does
@@ -1741,8 +1758,8 @@ impl PageScene {
     /// the last time the caret moved, so it is solid under the reader's fingers
     /// while they type and only starts blinking once they stop.
     fn caret_showing(&self) -> bool {
-        const BLINK: u128 = 500;
-        (self.caret_since.elapsed().as_millis() / BLINK).is_multiple_of(2)
+        (self.caret_since.elapsed().as_millis() / CARET_BLINK_INTERVAL.as_millis())
+            .is_multiple_of(2)
     }
 
     /// The caret was put somewhere: start its blinking over.
@@ -3933,6 +3950,10 @@ mod tests {
             page.caret_blinks(),
             "and one that has been clicked into has"
         );
+        let now = std::time::Instant::now();
+        let deadline = page.next_caret_frame().expect("the caret has a deadline");
+        assert!(deadline > now);
+        assert!(deadline <= now + CARET_BLINK_INTERVAL);
         assert!(
             caret_of(&mut page, &mut text).is_some(),
             "solid the instant it is put there"
@@ -3941,6 +3962,10 @@ mod tests {
         // Half a second on, half a second off. Rather than sleeping for one, the
         // clock is wound back by hand.
         page.wind_caret_back(std::time::Duration::from_millis(600));
+        let now = std::time::Instant::now();
+        let deadline = page.next_caret_frame().expect("the next half is scheduled");
+        assert!(deadline > now);
+        assert!(deadline <= now + CARET_BLINK_INTERVAL);
         assert!(
             caret_of(&mut page, &mut text).is_none(),
             "and gone half a second later"

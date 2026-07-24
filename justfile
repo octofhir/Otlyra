@@ -195,3 +195,13 @@ metrics-incremental:
     start=$(date +%s)
     cargo build --workspace --release --quiet
     echo "incremental release build: $(( $(date +%s) - start ))s"
+
+# Record a launch distribution without turning current misses into a local error.
+startup-benchmark samples="20":
+    cargo build --locked --release -p otlyra-app
+    python3 tools/startup-benchmark.py --samples {{samples}}
+
+# The dedicated reference runner uses this strict form.
+startup-check samples="30":
+    cargo build --locked --release -p otlyra-app
+    python3 tools/startup-benchmark.py --samples {{samples}} --check

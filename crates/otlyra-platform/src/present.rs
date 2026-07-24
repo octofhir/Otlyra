@@ -44,6 +44,16 @@ pub(crate) struct Presenter {
     staging: Option<Staging>,
 }
 
+/// The platform-bound part of presentation, created while the window handle is
+/// available on the event-loop thread and then moved to the GPU startup worker.
+pub(crate) struct PresenterSeed {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+}
+
+/// A backend instance created without a window handle on the startup worker.
+pub(crate) struct PresenterInstance(wgpu::Instance);
+
 struct Staging {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -52,17 +62,31 @@ struct Staging {
 }
 
 impl Presenter {
-    pub(crate) fn new<W>(window: Arc<W>, viewport: Viewport) -> Result<Self, PresentError>
+    pub(crate) fn instance<W>(window: Arc<W>) -> PresenterInstance
+    where
+        W: raw_window_handle::HasDisplayHandle + std::fmt::Debug + Send + Sync + 'static,
+    {
+        PresenterInstance(wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window)),
+        ))
+    }
+
+    pub(crate) fn prepare<W>(
+        instance: PresenterInstance,
+        window: Arc<W>,
+    ) -> Result<PresenterSeed, PresentError>
     where
         W: wgpu::WindowHandle + raw_window_handle::HasDisplayHandle + std::fmt::Debug + 'static,
     {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(Arc::clone(&window)),
-        ));
+        let PresenterInstance(instance) = instance;
         let surface = instance.create_surface(wgpu::SurfaceTarget::Window(Box::new(window)))?;
+        Ok(PresenterSeed { instance, surface })
+    }
 
-        // Adapter and device creation happen once, before the event loop exists.
-        // The frame path never awaits.
+    pub(crate) fn new(seed: PresenterSeed, viewport: Viewport) -> Result<Self, PresentError> {
+        let PresenterSeed { instance, surface } = seed;
+        // Adapter and device creation happen once on the startup worker. The
+        // window event loop and the frame path never await them.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             force_fallback_adapter: false,

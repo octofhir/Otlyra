@@ -26,22 +26,21 @@
 //! # What a widget does not hold
 //!
 //! State. A control is a view of a value the caller owns: a checkbox is told
-//! whether it is ticked, a field is told what it contains. The tree is built
-//! afresh each frame from that state and thrown away after, so there is no
-//! second copy to fall behind and no identity to match between frames. Hover and
-//! press need nothing stored either — where the pointer is and whether it is
-//! down are known when the frame is drawn, and the rectangle is known once the
-//! frame is placed, so *is the pointer over this* is a question with an answer
-//! rather than a flag to keep up to date.
+//! whether it is ticked, a field is told what it contains. During migration the
+//! existing constructors still build a short-lived tree, while [`runtime`]
+//! reconciles stable render nodes behind it. Runtime nodes retain only geometry,
+//! dirty flags, measurement, focus/capture membership, and semantics identity;
+//! browser model state never moves into them. Hover and press remain derived
+//! from input plus placed geometry rather than duplicated boolean state.
 //!
 //! What survives a frame is the tree itself, kept by the surface, so the next
 //! press is tested against exactly the rectangles that were drawn.
 //!
 //! # What is deliberately absent
 //!
-//! There is no description tree diffed against live instances. That would buy
-//! rebuilding a surface from data — which building afresh already gives — and
-//! cost an identity scheme and a downcast at every node.
+//! The retained runtime is deliberately smaller than a general application
+//! framework. It exists to preserve expensive layout and paint work across
+//! browser-chrome frames, not to own navigation or document state.
 //!
 //! Two further decisions worth stating, because both could have gone the other
 //! way:
@@ -57,6 +56,7 @@
 pub mod controls;
 pub mod data;
 pub mod icon;
+pub mod runtime;
 pub mod theme;
 
 use std::cell::{Cell, RefCell};
@@ -279,6 +279,7 @@ struct Entry {
 pub struct Focus {
     entries: Rc<RefCell<Vec<Entry>>>,
     groups: Rc<Cell<u32>>,
+    rewrite: Rc<Cell<Option<usize>>>,
 }
 
 impl Focus {
@@ -286,6 +287,34 @@ impl Focus {
     pub fn begin(&self) {
         self.entries.borrow_mut().clear();
         self.groups.set(0);
+        self.rewrite.set(None);
+    }
+
+    /// Keep the stable prefix and rebuild controls after it.
+    ///
+    /// Retained browser-chrome subtrees keep their old focus ids. When a later
+    /// subtree changes, its controls reclaim the same suffix instead of forcing
+    /// every earlier subtree to be reconstructed.
+    pub fn truncate(&self, len: usize) {
+        self.entries.borrow_mut().truncate(len);
+        self.rewrite.set(None);
+    }
+
+    /// Rewrite a stable retained range without discarding the suffix after it.
+    ///
+    /// This is for an earlier persistent subtree whose focusable shape has not
+    /// changed: its new widgets reclaim the ids they held, while later retained
+    /// subtrees keep both their widgets and their traversal entries.
+    pub fn rewrite_from(&self, start: usize) {
+        debug_assert!(start <= self.entries.borrow().len());
+        self.rewrite.set(Some(start));
+    }
+
+    /// Finish a retained-range rewrite and return its new exclusive end.
+    pub fn finish_rewrite(&self) -> usize {
+        self.rewrite
+            .replace(None)
+            .expect("focus rewrite was not started")
     }
 
     /// Claim the next id for something that is pressed.
@@ -315,12 +344,23 @@ impl Focus {
 
     fn push(&self, enabled: bool, kind: FocusKind, group: Option<u32>) -> FocusId {
         let mut entries = self.entries.borrow_mut();
-        entries.push(Entry {
+        let entry = Entry {
             enabled,
             kind,
             group,
-        });
-        (entries.len() - 1) as FocusId
+        };
+        if let Some(at) = self.rewrite.get() {
+            if at < entries.len() {
+                entries[at] = entry;
+            } else {
+                entries.push(entry);
+            }
+            self.rewrite.set(Some(at + 1));
+            at as FocusId
+        } else {
+            entries.push(entry);
+            (entries.len() - 1) as FocusId
+        }
     }
 
     /// How many focusable controls the last frame built.
@@ -2014,6 +2054,25 @@ pub fn ring(list: &mut DisplayList, rect: Rect, color: Color, radius: f64, width
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn rewriting_a_retained_focus_prefix_preserves_the_suffix() {
+        let focus = Focus::default();
+        assert_eq!(focus.claim(true), 0);
+        assert_eq!(focus.claim(true), 1);
+        assert_eq!(focus.claim_text(true), 2);
+        assert_eq!(focus.claim(false), 3);
+
+        focus.rewrite_from(0);
+        assert_eq!(focus.claim(false), 0);
+        assert_eq!(focus.claim(true), 1);
+        assert_eq!(focus.finish_rewrite(), 2);
+
+        assert_eq!(focus.len(), 4);
+        assert_eq!(focus.kind(Some(2)), Some(FocusKind::Text));
+        assert!(focus.is_enabled(2));
+        assert!(!focus.is_enabled(3));
+    }
 
     /// A pin wider than the room going is not a width anybody honours: `place`
     /// clamps it, so `measure` reporting the raw pin would tell the parent to

@@ -161,7 +161,10 @@ pub struct HistorySurface {
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
     clicks: u32,
-    engine: TextEngine,
+    /// Built on first `offer`, not at construction: event handling shapes no
+    /// text, and building an engine enumerates the system's fonts — cost this
+    /// surface's `offer` never needs and startup should not carry.
+    engine: Option<TextEngine>,
     cache: Option<(Drawn, DisplayList)>,
     builds: u64,
     root: Option<Child<Action>>,
@@ -187,7 +190,7 @@ impl HistorySurface {
             pointer_down: false,
             press_origin: None,
             clicks: 1,
-            engine: TextEngine::new(),
+            engine: None,
             cache: None,
             builds: 0,
             root: None,
@@ -369,7 +372,7 @@ impl HistorySurface {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
-        let mut cx = Cx::new(&mut self.engine);
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;

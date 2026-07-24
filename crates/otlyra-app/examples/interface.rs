@@ -488,7 +488,9 @@ impl Painter for InspectorFrame {
 fn tabs(titles: &[(&str, bool)]) -> Vec<TabLabel> {
     titles
         .iter()
-        .map(|(title, loading)| TabLabel {
+        .enumerate()
+        .map(|(index, (title, loading))| TabLabel {
+            id: index as u64 + 1,
             title: (*title).to_owned(),
             loading: *loading,
         })
@@ -587,7 +589,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Mail",
         ]
         .iter()
-        .map(|title| TabLabel {
+        .enumerate()
+        .map(|(index, title)| TabLabel {
+            id: index as u64 + 1,
             title: (*title).to_owned(),
             loading: false,
         })

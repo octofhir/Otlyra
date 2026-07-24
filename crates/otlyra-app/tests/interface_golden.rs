@@ -34,7 +34,9 @@ const SCALES: [f64; 2] = [1.0, 2.0];
 fn tabs(titles: &[(&str, bool)]) -> Vec<TabLabel> {
     titles
         .iter()
-        .map(|(title, loading)| TabLabel {
+        .enumerate()
+        .map(|(index, (title, loading))| TabLabel {
+            id: index as u64 + 1,
             title: (*title).to_owned(),
             loading: *loading,
         })
