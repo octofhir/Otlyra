@@ -457,7 +457,10 @@ pub struct SceneLayer {
     /// Content version; changes exactly when `list` would draw differently.
     pub epoch: u64,
     /// The device-space display list that draws the layer.
-    pub list: otlyra_gfx::DisplayList,
+    ///
+    /// Behind an `Arc` so an unchanged layer is carried frame to frame without
+    /// copying the list — the same handle the painter's own cache holds.
+    pub list: std::sync::Arc<otlyra_gfx::DisplayList>,
 }
 
 /// One frame as an ordered, back-to-front stack of retained layers.

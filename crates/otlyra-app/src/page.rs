@@ -111,7 +111,7 @@ pub struct PageScene {
     /// The page's half of W10, and the thing `Damage` was written for: every
     /// mutation on this type already records at least `PAINT`, and until now
     /// `build_display_list` took that damage and threw it away. It is read now.
-    painted: Option<(Painted, DisplayList)>,
+    painted: Option<(Painted, std::sync::Arc<DisplayList>)>,
     /// How many lists have been built rather than reused.
     builds: u64,
     /// What the reader has made the page's controls hold.
@@ -422,7 +422,7 @@ impl PageScene {
         width: f32,
         height: f32,
         top: f32,
-    ) -> DisplayList {
+    ) -> std::sync::Arc<DisplayList> {
         self.viewport_height = height;
         let damage = self.damage.take();
 
@@ -450,7 +450,9 @@ impl PageScene {
             && let Some((built, list)) = &self.painted
             && *built == key
         {
-            return list.clone();
+            // The same `Arc`, frame after frame: an unchanged page hands back a
+            // handle its consumers can compare by pointer and skip re-scaling.
+            return std::sync::Arc::clone(list);
         }
 
         self.builds += 1;
@@ -520,7 +522,8 @@ impl PageScene {
         // report damage as they go. Clearing after rather than before is what
         // keeps that from being read as a reason to build the next one again.
         self.damage = Damage::NONE;
-        self.painted = Some((key, list.clone()));
+        let list = std::sync::Arc::new(list);
+        self.painted = Some((key, std::sync::Arc::clone(&list)));
         list
     }
 

@@ -5,6 +5,7 @@
 //! type owns the two of them and the one thing they share, the font engine.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::NodeId;
@@ -373,6 +374,14 @@ pub struct Browser {
     theme: crate::widget::theme::Theme,
     /// Whether the platform needs a new accessibility tree after the next frame.
     accessibility_dirty: bool,
+    /// The page's logical list, the scale it was scaled at, and the device list
+    /// that resulted. Lets an unchanged page skip re-scaling: while the page
+    /// hands back the same `Arc` and the scale holds, the device list is reused.
+    page_device: Option<(
+        Arc<otlyra_gfx::DisplayList>,
+        f64,
+        Arc<otlyra_gfx::DisplayList>,
+    )>,
 }
 
 impl Browser {
@@ -422,6 +431,7 @@ impl Browser {
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
             accessibility_dirty: true,
+            page_device: None,
         };
         browser.apply_theme();
         browser
@@ -2182,12 +2192,16 @@ impl Browser {
     }
 
     /// The page, system page, or blank fallback, as one device-space list.
-    fn page_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
-        let mut list = otlyra_gfx::DisplayList::new();
+    ///
+    /// A real page hands back a cached `Arc` that stays identical while nothing on
+    /// it moves, so an unchanged page is scaled to device pixels once and then
+    /// reused by pointer identity — no per-frame clone, no per-frame transform.
+    fn page_list(&mut self, g: &FrameGeom) -> Arc<otlyra_gfx::DisplayList> {
         if let Some(system) = self.tabs[self.active].system {
             // A browser page takes the whole content area: it is not a document
             // in a tab, it is the browser looked at from the front.
             let content = crate::ui::Rect::new(0.0, g.top, g.width, g.content_height);
+            let mut list = otlyra_gfx::DisplayList::new();
             match system {
                 SystemPage::Settings => {
                     self.settings
@@ -2206,18 +2220,25 @@ impl Browser {
                     .about
                     .build_display_list(content, &mut self.text, &mut list),
             }
-        } else if let Some(page) = self.tabs[self.active].page.as_mut() {
+            list.transform(g.scale);
+            Arc::new(list)
+        } else if self.tabs[self.active].page.is_some() {
             // Told before the frame is built, because it decides what `medium`
             // computes to and every element that inherited a size inherited that.
-            page.set_text_scale(g.text_scale);
-            page.set_color_scheme(g.page_scheme);
-            list = page.build_display_list(
-                &mut self.text,
-                g.width as f32,
-                g.content_height as f32,
-                g.top as f32,
-            );
+            let logical = {
+                let page = self.tabs[self.active].page.as_mut().expect("a page");
+                page.set_text_scale(g.text_scale);
+                page.set_color_scheme(g.page_scheme);
+                page.build_display_list(
+                    &mut self.text,
+                    g.width as f32,
+                    g.content_height as f32,
+                    g.top as f32,
+                )
+            };
+            self.scaled_page(logical, g.scale_factor)
         } else {
+            let mut list = otlyra_gfx::DisplayList::new();
             crate::ui::paint_blank_page(
                 &mut list,
                 &self.theme,
@@ -2227,30 +2248,54 @@ impl Browser {
                 self.mark.as_ref(),
                 &mut self.text,
             );
+            list.transform(g.scale);
+            Arc::new(list)
         }
-        list.transform(g.scale);
-        list
+    }
+
+    /// Scale a page's logical list to device pixels, reusing the last result
+    /// while the logical list and the scale are the same.
+    ///
+    /// The page's own cache returns the same `Arc` frame after frame for an
+    /// unchanged page, so pointer identity is a sound "nothing moved" test: on a
+    /// hit this returns the already-scaled device list untouched.
+    fn scaled_page(
+        &mut self,
+        logical: Arc<otlyra_gfx::DisplayList>,
+        scale: f64,
+    ) -> Arc<otlyra_gfx::DisplayList> {
+        if let Some((cached_logical, cached_scale, device)) = &self.page_device
+            && Arc::ptr_eq(cached_logical, &logical)
+            && *cached_scale == scale
+        {
+            return Arc::clone(device);
+        }
+        let mut scaled = (*logical).clone();
+        scaled.transform(otlyra_gfx::kurbo::Affine::scale(scale));
+        let device = Arc::new(scaled);
+        self.page_device = Some((logical, scale, Arc::clone(&device)));
+        device
     }
 
     /// The element overlay, when the inspector has chosen a box.
-    fn highlight_list(&mut self, g: &FrameGeom) -> Option<otlyra_gfx::DisplayList> {
+    fn highlight_list(&mut self, g: &FrameGeom) -> Option<Arc<otlyra_gfx::DisplayList>> {
         self.chosen_box()?;
         let mut list = otlyra_gfx::DisplayList::new();
         self.paint_highlight(&mut list);
         list.transform(g.scale);
-        Some(list)
+        Some(Arc::new(list))
     }
 
     /// The inspector dock. The caller draws it only when `g.dock > 0`.
-    fn inspector_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
+    fn inspector_list(&mut self, g: &FrameGeom) -> Arc<otlyra_gfx::DisplayList> {
         let mut list = otlyra_gfx::DisplayList::new();
         self.paint_inspector(&mut list, g.width, g.top, g.content_height, g.dock);
         list.transform(g.scale);
-        list
+        Arc::new(list)
     }
 
     /// The tab strip and toolbar.
-    fn chrome_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
+    fn chrome_list(&mut self, g: &FrameGeom) -> Arc<otlyra_gfx::DisplayList> {
         let mut list = otlyra_gfx::DisplayList::new();
         let labels = self.labels();
         self.ui.build_display_list(
@@ -2267,7 +2312,7 @@ impl Browser {
             &mut list,
         );
         list.transform(g.scale);
-        list
+        Arc::new(list)
     }
 
     /// The picture and font work that follows a frame, once the rules that name

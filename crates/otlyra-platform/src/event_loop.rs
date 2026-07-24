@@ -1282,7 +1282,7 @@ mod tests {
             id: crate::LayerId(id),
             rect,
             epoch,
-            list: otlyra_gfx::DisplayList::new(),
+            list: std::sync::Arc::new(otlyra_gfx::DisplayList::new()),
         }
     }
 
