@@ -367,8 +367,121 @@ pub struct PainterWork {
     pub page_paints: u64,
 }
 
+/// A stable identity for one retained scene layer.
+///
+/// The compositor keys a layer's retained pixels and version on this, so it must
+/// stay the same across frames for the same conceptual surface (the tab strip,
+/// the page, the inspector) and differ between them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LayerId(pub u64);
+
+/// One layer's device-pixel rectangle on the window surface.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LayerRect {
+    /// Left edge, device pixels from the surface's left.
+    pub x: u32,
+    /// Top edge, device pixels from the surface's top.
+    pub y: u32,
+    /// Width in device pixels.
+    pub width: u32,
+    /// Height in device pixels.
+    pub height: u32,
+}
+
+impl LayerRect {
+    /// A rectangle covering the whole viewport.
+    pub fn of_viewport(viewport: Viewport) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: viewport.width,
+            height: viewport.height,
+        }
+    }
+
+    /// Nothing to draw — zero on either axis.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    fn right(&self) -> u32 {
+        self.x + self.width
+    }
+
+    fn bottom(&self) -> u32 {
+        self.y + self.height
+    }
+
+    /// Whether the two rectangles share any pixel.
+    pub fn intersects(&self, other: &LayerRect) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+
+    /// The smallest rectangle covering both. An empty operand contributes nothing.
+    pub fn union(&self, other: &LayerRect) -> LayerRect {
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let width = self.right().max(other.right()) - x;
+        let height = self.bottom().max(other.bottom()) - y;
+        LayerRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+/// One retained layer: its identity, where it sits, a content version, and the
+/// device-space display list that draws it.
+///
+/// `epoch` changes exactly when `list` would draw something different. The
+/// compositor re-rasterizes and re-uploads a layer only when its epoch or rect
+/// moved, so a layer whose epoch is unchanged costs nothing.
+pub struct SceneLayer {
+    /// Stable identity across frames.
+    pub id: LayerId,
+    /// Where the layer sits on the surface, in device pixels.
+    pub rect: LayerRect,
+    /// Content version; changes exactly when `list` would draw differently.
+    pub epoch: u64,
+    /// The device-space display list that draws the layer.
+    pub list: otlyra_gfx::DisplayList,
+}
+
+/// One frame as an ordered, back-to-front stack of retained layers.
+///
+/// A [`Painter`] that returns `Some(Scene)` from [`Painter::compose`] opts into
+/// the retained compositor; returning `None` keeps the whole-surface paint path.
+pub struct Scene {
+    /// The layers, back to front.
+    pub layers: Vec<SceneLayer>,
+}
+
 /// The embedder's side of the boundary: given a target and a viewport, draw.
 pub trait Painter {
+    /// Publish this frame as retained layers, or `None` to use [`Painter::paint`].
+    ///
+    /// The compositor re-rasterizes and re-uploads only the layers whose epoch or
+    /// rect changed since the last frame, so an input that touches one layer
+    /// leaves the others' pixels untouched. A painter that has not adopted layers
+    /// returns `None` and is drawn whole through `paint`.
+    fn compose(&mut self, viewport: Viewport) -> Option<Scene> {
+        let _ = viewport;
+        None
+    }
+
     /// Take the handle that wakes the loop. Called once, before the first frame.
     ///
     /// A painter that never works off the loop's own thread can ignore it, which is

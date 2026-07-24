@@ -11,7 +11,8 @@ use otlyra_dom::NodeId;
 use otlyra_gfx::{PaintTarget, render};
 use otlyra_layout::Images;
 use otlyra_platform::{
-    Cursor, FrameRequest, Key, Modifiers, Painter, PainterWork, PlatformEvent, Viewport, Waker,
+    Cursor, FrameRequest, Key, LayerId, LayerRect, Modifiers, Painter, PainterWork, PlatformEvent,
+    Scene, SceneLayer, Viewport, Waker,
 };
 use otlyra_text::TextEngine;
 
@@ -2133,6 +2134,243 @@ impl Browser {
             })
             .collect()
     }
+
+    // --- Frame building, shared by the whole-surface and layered paths ---
+
+    /// Run the once-per-frame prelude and settle the geometry and style inputs
+    /// every region draws from. Both `paint` and `compose` start here, so they
+    /// cannot disagree about what this frame is.
+    fn frame_geom(&mut self, viewport: Viewport) -> FrameGeom {
+        // Every frame takes in whatever has arrived. A wake is what *asks* for a
+        // frame; this is what makes a frame that happened for any other reason —
+        // a resize, an animation tick — show what has landed since the last one.
+        if self.pump() {
+            self.accessibility_dirty = true;
+        }
+
+        let width = viewport.logical_width();
+        let height = viewport.logical_height();
+        self.last_width = width;
+        self.last_height = height;
+        self.last_scale = viewport.scale_factor;
+
+        // Where the page starts: under the interface, or at the top of the window
+        // when there is none.
+        let top = if self.interface { UI_HEIGHT } else { 0.0 };
+        // The inspector takes its height *out* of the content area rather than
+        // sitting over it. A page laid out under a floating panel would be laid
+        // out for a width and a height it does not have, and every number the
+        // panel then reported about it would be a number about a different page.
+        let dock = self.dock_height(height - top);
+        let content_height = (height - top - dock).max(0.0);
+        let text_scale = (self.settings.settings.text_scale / 100.0) as f32;
+        let page_scheme = match self.effective_scheme() {
+            otlyra_platform::ColorScheme::Light => otlyra_css::cascade::ColorScheme::Light,
+            otlyra_platform::ColorScheme::Dark => otlyra_css::cascade::ColorScheme::Dark,
+        };
+        FrameGeom {
+            width,
+            height,
+            scale_factor: viewport.scale_factor,
+            scale: otlyra_gfx::kurbo::Affine::scale(viewport.scale_factor),
+            top,
+            dock,
+            content_height,
+            text_scale,
+            page_scheme,
+        }
+    }
+
+    /// The page, system page, or blank fallback, as one device-space list.
+    fn page_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
+        let mut list = otlyra_gfx::DisplayList::new();
+        if let Some(system) = self.tabs[self.active].system {
+            // A browser page takes the whole content area: it is not a document
+            // in a tab, it is the browser looked at from the front.
+            let content = crate::ui::Rect::new(0.0, g.top, g.width, g.content_height);
+            match system {
+                SystemPage::Settings => {
+                    self.settings
+                        .build_display_list(content, &mut self.text, &mut list);
+                }
+                SystemPage::History => {
+                    self.history_page.build_display_list(
+                        content,
+                        &self.history,
+                        jiff::Zoned::now().date(),
+                        &mut self.text,
+                        &mut list,
+                    );
+                }
+                _ => self
+                    .about
+                    .build_display_list(content, &mut self.text, &mut list),
+            }
+        } else if let Some(page) = self.tabs[self.active].page.as_mut() {
+            // Told before the frame is built, because it decides what `medium`
+            // computes to and every element that inherited a size inherited that.
+            page.set_text_scale(g.text_scale);
+            page.set_color_scheme(g.page_scheme);
+            list = page.build_display_list(
+                &mut self.text,
+                g.width as f32,
+                g.content_height as f32,
+                g.top as f32,
+            );
+        } else {
+            crate::ui::paint_blank_page(
+                &mut list,
+                &self.theme,
+                g.width,
+                g.height,
+                self.tabs[self.active].error.as_deref(),
+                self.mark.as_ref(),
+                &mut self.text,
+            );
+        }
+        list.transform(g.scale);
+        list
+    }
+
+    /// The element overlay, when the inspector has chosen a box.
+    fn highlight_list(&mut self, g: &FrameGeom) -> Option<otlyra_gfx::DisplayList> {
+        self.chosen_box()?;
+        let mut list = otlyra_gfx::DisplayList::new();
+        self.paint_highlight(&mut list);
+        list.transform(g.scale);
+        Some(list)
+    }
+
+    /// The inspector dock. The caller draws it only when `g.dock > 0`.
+    fn inspector_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
+        let mut list = otlyra_gfx::DisplayList::new();
+        self.paint_inspector(&mut list, g.width, g.top, g.content_height, g.dock);
+        list.transform(g.scale);
+        list
+    }
+
+    /// The tab strip and toolbar.
+    fn chrome_list(&mut self, g: &FrameGeom) -> otlyra_gfx::DisplayList {
+        let mut list = otlyra_gfx::DisplayList::new();
+        let labels = self.labels();
+        self.ui.build_display_list(
+            g.width,
+            g.height,
+            &labels,
+            self.active,
+            (
+                self.tabs[self.active].can_go_back(),
+                self.tabs[self.active].can_go_forward(),
+            ),
+            self.spinner_phase(),
+            &mut self.text,
+            &mut list,
+        );
+        list.transform(g.scale);
+        list
+    }
+
+    /// The picture and font work that follows a frame, once the rules that name
+    /// them have been computed on the way to one.
+    fn after_frame(&mut self) {
+        self.fetch_backgrounds();
+        self.fetch_fonts();
+        // Last, because it is a question about the window this frame was drawn
+        // for: the answer is for the next one.
+        self.rechoose_pictures();
+    }
+
+    /// A content version for the page layer that changes exactly when the page's
+    /// list would draw something different.
+    ///
+    /// The per-surface `builds` counters advance only on a real rebuild, so an
+    /// unchanged page keeps its epoch and its retained pixels. The blank fallback
+    /// has no such counter, so its inputs are hashed directly; the active tab
+    /// index is folded in so switching between two tabs at the same build count
+    /// still re-rasterizes.
+    fn page_epoch(&self, g: &FrameGeom) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.active.hash(&mut hasher);
+        let tab = &self.tabs[self.active];
+        if let Some(system) = tab.system {
+            match system {
+                SystemPage::Settings => 10u8,
+                SystemPage::History => 11u8,
+                _ => 12u8,
+            }
+            .hash(&mut hasher);
+            self.settings.builds().hash(&mut hasher);
+            self.history_page.builds().hash(&mut hasher);
+            self.about.builds().hash(&mut hasher);
+        } else if let Some(page) = tab.page.as_ref() {
+            1u8.hash(&mut hasher);
+            page.builds().hash(&mut hasher);
+        } else {
+            2u8.hash(&mut hasher);
+            tab.error.hash(&mut hasher);
+            g.width.to_bits().hash(&mut hasher);
+            g.height.to_bits().hash(&mut hasher);
+            g.scale_factor.to_bits().hash(&mut hasher);
+            matches!(g.page_scheme, otlyra_css::cascade::ColorScheme::Dark).hash(&mut hasher);
+            self.mark.is_some().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// A content version for the chrome layer. The tab strip and toolbar each
+    /// rebuild only when their own inputs change, so the sum of their build
+    /// counters moves exactly when the chrome's pixels would.
+    fn chrome_epoch(&self) -> u64 {
+        self.ui
+            .builds()
+            .wrapping_add(self.ui.tab_builds())
+            .wrapping_add(self.ui.toolbar_builds())
+    }
+
+    /// A content version for the inspector layer, summing its retained
+    /// boundaries' build counters for the same reason.
+    fn inspector_epoch(&self) -> u64 {
+        self.inspector
+            .builds()
+            .wrapping_add(self.inspector.header_builds())
+            .wrapping_add(self.inspector.body_builds())
+    }
+
+    /// A content version for the element overlay: the identity and geometry of
+    /// the chosen box, so it re-rasterizes when the highlight moves and not
+    /// otherwise.
+    fn highlight_epoch(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(chosen) = self.chosen_box() {
+            chosen.border.x.to_bits().hash(&mut hasher);
+            chosen.border.y.to_bits().hash(&mut hasher);
+            chosen.border.width.to_bits().hash(&mut hasher);
+            chosen.border.height.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+/// Stable layer identities for the compositor. Back to front: the page, the
+/// element overlay, the inspector dock, the chrome.
+const LAYER_PAGE: u64 = 0;
+const LAYER_HIGHLIGHT: u64 = 1;
+const LAYER_INSPECTOR: u64 = 2;
+const LAYER_CHROME: u64 = 3;
+
+/// The per-frame geometry and style inputs both paint paths share.
+struct FrameGeom {
+    width: f64,
+    height: f64,
+    scale_factor: f64,
+    scale: otlyra_gfx::kurbo::Affine,
+    top: f64,
+    dock: f64,
+    content_height: f64,
+    text_scale: f32,
+    page_scheme: otlyra_css::cascade::ColorScheme,
 }
 
 impl Painter for Browser {
@@ -2781,152 +3019,119 @@ impl Painter for Browser {
     }
 
     fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
-        // Every frame takes in whatever has arrived. A wake is what *asks* for a
-        // frame; this is what makes a frame that happened for any other reason —
-        // a resize, an animation tick — show what has landed since the last one.
-        if self.pump() {
-            self.accessibility_dirty = true;
-        }
-
-        let width = viewport.logical_width();
-        let height = viewport.logical_height();
-        self.last_width = width;
-        self.last_height = height;
-        self.last_scale = viewport.scale_factor;
-
-        let scale = otlyra_gfx::kurbo::Affine::scale(viewport.scale_factor);
-        // Where the page starts: under the interface, or at the top of the window
-        // when there is none.
-        let top = if self.interface { UI_HEIGHT } else { 0.0 };
-        // The inspector takes its height *out* of the content area rather than
-        // sitting over it. A page laid out under a floating panel would be laid
-        // out for a width and a height it does not have, and every number the
-        // panel then reported about it would be a number about a different page.
-        let dock = self.dock_height(height - top);
-        let content_height = (height - top - dock).max(0.0);
-        let text_scale = (self.settings.settings.text_scale / 100.0) as f32;
-        let page_scheme = match self.effective_scheme() {
-            otlyra_platform::ColorScheme::Light => otlyra_css::cascade::ColorScheme::Light,
-            otlyra_platform::ColorScheme::Dark => otlyra_css::cascade::ColorScheme::Dark,
-        };
+        let geom = self.frame_geom(viewport);
 
         // The page first, then the interface over it. The page is inset by the
         // interface's height and culled to what is visible, so it cannot paint
         // underneath it — but painting in this order means a future translucent
         // toolbar composites correctly rather than needing a clip.
-        if let Some(system) = self.tabs[self.active].system {
-            // A browser page takes the whole content area: it is not a document
-            // in a tab, it is the browser looked at from the front.
-            let content = crate::ui::Rect::new(0.0, top, width, content_height);
-            let mut list = otlyra_gfx::DisplayList::new();
-            match system {
-                SystemPage::Settings => {
-                    self.settings
-                        .build_display_list(content, &mut self.text, &mut list);
-                }
-                SystemPage::History => {
-                    self.history_page.build_display_list(
-                        content,
-                        &self.history,
-                        jiff::Zoned::now().date(),
-                        &mut self.text,
-                        &mut list,
-                    );
-                }
-                _ => self
-                    .about
-                    .build_display_list(content, &mut self.text, &mut list),
-            }
-            list.transform(scale);
-            render(&list, target);
-        } else if let Some(page) = self.tabs[self.active].page.as_mut() {
-            // Told before the frame is built, because it decides what `medium`
-            // computes to and every element that inherited a size inherited
-            // that. Setting it to what it already is costs nothing.
-            page.set_text_scale(text_scale);
-            // And which palette the page may ask for. A page with no
-            // `prefers-color-scheme` rule is unmoved by it; one with such a rule
-            // is restyled, which is what the preference is for.
-            page.set_color_scheme(page_scheme);
-            let mut list = page.build_display_list(
-                &mut self.text,
-                width as f32,
-                content_height as f32,
-                top as f32,
-            );
-            list.transform(scale);
-            render(&list, target);
-        } else {
-            let mut list = otlyra_gfx::DisplayList::new();
-            crate::ui::paint_blank_page(
-                &mut list,
-                &self.theme,
-                width,
-                height,
-                self.tabs[self.active].error.as_deref(),
-                self.mark.as_ref(),
-                &mut self.text,
-            );
-            list.transform(scale);
-            render(&list, target);
-        }
+        let page = self.page_list(&geom);
+        render(&page, target);
 
-        // The highlight goes over the page whether or not the panel is open.
-        // They are two things: the overlay says *this element*, and the panel
-        // says everything about it. A driver asking for the first has no use for
-        // the second, and neither does a person following the tree with the
-        // pointer — and the two were coupled here only because they were written
-        // in one go.
-        if self.chosen_box().is_some() {
-            let mut list = otlyra_gfx::DisplayList::new();
-            self.paint_highlight(&mut list);
-            list.transform(scale);
-            render(&list, target);
+        // The highlight goes over the page whether or not the panel is open. They
+        // are two things: the overlay says *this element*, the panel says
+        // everything about it.
+        if let Some(highlight) = self.highlight_list(&geom) {
+            render(&highlight, target);
         }
 
         if !self.interface {
-            // Still after the page, because the pictures a rule names are only known
-            // once the rule has been computed on the way to a frame.
-            self.fetch_backgrounds();
-            self.fetch_fonts();
-            self.rechoose_pictures();
+            self.after_frame();
             return;
         }
 
         // The panel under the overlay, so a box that reaches the bottom of the
         // content area is covered by the dock rather than drawn over it.
-        if dock > 0.0 {
-            let mut list = otlyra_gfx::DisplayList::new();
-            self.paint_inspector(&mut list, width, top, content_height, dock);
-            list.transform(scale);
-            render(&list, target);
+        if geom.dock > 0.0 {
+            let inspector = self.inspector_list(&geom);
+            render(&inspector, target);
         }
 
-        let mut list = otlyra_gfx::DisplayList::new();
-        let labels = self.labels();
-        self.ui.build_display_list(
-            width,
-            height,
-            &labels,
-            self.active,
-            (
-                self.tabs[self.active].can_go_back(),
-                self.tabs[self.active].can_go_forward(),
-            ),
-            self.spinner_phase(),
-            &mut self.text,
-            &mut list,
-        );
-        list.transform(scale);
-        render(&list, target);
+        let chrome = self.chrome_list(&geom);
+        render(&chrome, target);
 
-        // After the frame, because a rule that names a picture is only computed on
-        // the way to one.
-        self.fetch_backgrounds();
-        self.fetch_fonts();
-        // Last, because it is a question about the window this frame was drawn
-        // for: the answer is for the next one.
-        self.rechoose_pictures();
+        self.after_frame();
+    }
+
+    /// Publish the interface as retained layers so the compositor re-rasterizes
+    /// and re-uploads only what moved.
+    ///
+    /// The layers are built by the same helpers `paint` renders, in the same
+    /// order, so a full composite is pixel-for-pixel what `paint` would draw; the
+    /// only addition is a device rectangle and content epoch per layer for the
+    /// compositor's damage. Interface-less frames — a screenshot, `--no-interface`
+    /// — keep the whole-surface path.
+    fn compose(&mut self, viewport: Viewport) -> Option<Scene> {
+        if !self.interface {
+            return None;
+        }
+        let geom = self.frame_geom(viewport);
+
+        // Device bands that tile the surface top to bottom with no seam: the
+        // chrome above the content, the content, and the dock filling the rest.
+        let dev = |value: f64| (value * geom.scale_factor).round() as u32;
+        let content_top = dev(geom.top).min(viewport.height);
+        let content_bottom = dev(geom.top + geom.content_height).min(viewport.height);
+        let page_rect = LayerRect {
+            x: 0,
+            y: content_top,
+            width: viewport.width,
+            height: content_bottom.saturating_sub(content_top),
+        };
+
+        let mut layers = Vec::with_capacity(4);
+
+        let page = self.page_list(&geom);
+        layers.push(SceneLayer {
+            id: LayerId(LAYER_PAGE),
+            rect: page_rect,
+            epoch: self.page_epoch(&geom),
+            list: page,
+        });
+
+        if let Some(highlight) = self.highlight_list(&geom) {
+            // The overlay draws within the content area and can spill a little
+            // past a box's edges (labels, handles), so it claims the whole content
+            // rect; a highlight move re-rasterizes the page under it, which only
+            // happens while a person is walking the tree with the inspector.
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_HIGHLIGHT),
+                rect: page_rect,
+                epoch: self.highlight_epoch(),
+                list: highlight,
+            });
+        }
+
+        if geom.dock > 0.0 {
+            let inspector = self.inspector_list(&geom);
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_INSPECTOR),
+                rect: LayerRect {
+                    x: 0,
+                    y: content_bottom,
+                    width: viewport.width,
+                    height: viewport.height.saturating_sub(content_bottom),
+                },
+                epoch: self.inspector_epoch(),
+                list: inspector,
+            });
+        }
+
+        let chrome = self.chrome_list(&geom);
+        layers.push(SceneLayer {
+            id: LayerId(LAYER_CHROME),
+            rect: LayerRect {
+                x: 0,
+                y: 0,
+                width: viewport.width,
+                height: content_top,
+            },
+            epoch: self.chrome_epoch(),
+            list: chrome,
+        });
+
+        self.after_frame();
+        Some(Scene { layers })
     }
 }
 
@@ -5436,6 +5641,72 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// The content version of one layer in a composed scene.
+    fn epoch_of(scene: &Scene, id: u64) -> u64 {
+        scene
+            .layers
+            .iter()
+            .find(|layer| layer.id == LayerId(id))
+            .unwrap_or_else(|| panic!("layer {id} present"))
+            .epoch
+    }
+
+    #[test]
+    fn an_unchanged_frame_composes_to_the_same_layer_epochs() {
+        let mut browser = Browser::new(LongLoader);
+        go(&mut browser, "long.example");
+        let viewport = Viewport::new(1024, 768, 2.0);
+
+        // The first frame settles the caches; two more are what a no-op yields.
+        let _ = browser.compose(viewport).expect("the interface composes");
+        let before = browser.compose(viewport).expect("the interface composes");
+        let after = browser.compose(viewport).expect("the interface composes");
+
+        let ids: Vec<_> = before.layers.iter().map(|layer| layer.id).collect();
+        assert!(ids.contains(&LayerId(LAYER_PAGE)), "a page layer");
+        assert!(ids.contains(&LayerId(LAYER_CHROME)), "a chrome layer");
+        assert_eq!(before.layers.len(), after.layers.len());
+        for (b, a) in before.layers.iter().zip(after.layers.iter()) {
+            assert_eq!(b.id, a.id);
+            assert_eq!(b.rect, a.rect);
+            assert_eq!(
+                b.epoch, a.epoch,
+                "layer {:?} is unchanged between two no-op frames",
+                b.id
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_the_page_moves_its_layer_epoch_and_leaves_the_chrome_alone() {
+        let mut browser = Browser::new(LongLoader);
+        go(&mut browser, "long.example");
+        let viewport = Viewport::new(1024, 768, 2.0);
+
+        let _ = browser.compose(viewport).expect("the interface composes");
+        let before = browser.compose(viewport).expect("the interface composes");
+
+        // Scroll the long page. Only the page's own list is rebuilt; the tab strip
+        // and toolbar are drawing nothing new.
+        browser.tabs[browser.active]
+            .page
+            .as_mut()
+            .expect("a loaded page")
+            .scroll_by(300.0);
+        let after = browser.compose(viewport).expect("the interface composes");
+
+        assert_ne!(
+            epoch_of(&before, LAYER_PAGE),
+            epoch_of(&after, LAYER_PAGE),
+            "the page scrolled, so its layer must be re-rasterized"
+        );
+        assert_eq!(
+            epoch_of(&before, LAYER_CHROME),
+            epoch_of(&after, LAYER_CHROME),
+            "the chrome did not change, so the compositor leaves it untouched"
+        );
     }
 
     #[test]

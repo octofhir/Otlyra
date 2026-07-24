@@ -377,6 +377,110 @@ impl Presenter {
         self.blit(frame);
         Ok(Presented::Frame)
     }
+
+    /// Upload only `rect` of the frame and present, reusing everything the
+    /// staging texture already holds outside it.
+    ///
+    /// `sub_pixels` is the tightly packed (`rect.width * 4` stride) premultiplied
+    /// RGBA8 of `rect` alone — what [`otlyra_gfx::SkiaPainter::read_rgba8_rect`]
+    /// returns for the damaged region. `full_width`/`full_height` size the staging
+    /// texture.
+    ///
+    /// This must not be the first frame after the staging texture is created or
+    /// resized: a fresh texture holds no retained pixels, so anything outside the
+    /// rectangle would present as undefined. When that happens this reports
+    /// `Dropped`, and the caller re-presents the whole frame.
+    pub(crate) fn present_rect(
+        &mut self,
+        sub_pixels: &[u8],
+        full_width: u32,
+        full_height: u32,
+        rect: DamageRect,
+    ) -> Result<Presented, PresentError> {
+        let expected = rect.width as usize * rect.height as usize * 4;
+        if sub_pixels.len() != expected {
+            return Err(PresentError::PixelBufferSize {
+                expected,
+                actual: sub_pixels.len(),
+            });
+        }
+        if rect.x + rect.width > full_width || rect.y + rect.height > full_height {
+            return Err(PresentError::DamageOutOfBounds {
+                rect,
+                full_width,
+                full_height,
+            });
+        }
+
+        let frame = match self.acquire()? {
+            Acquired::Frame(frame) => frame,
+            Acquired::Skip(outcome) => return Ok(outcome),
+        };
+
+        // A fresh texture has nothing to retain outside the rectangle, so a
+        // partial upload would show garbage there. Report the frame as dropped so
+        // the caller re-presents it whole.
+        if self.ensure_staging(full_width, full_height) {
+            tracing::debug!(
+                "partial present onto a fresh staging texture; asking for a full frame"
+            );
+            return Ok(Presented::Dropped);
+        }
+
+        let staging = self.staging.as_ref().expect("staging texture ensured");
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &staging.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            sub_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(rect.width * 4),
+                rows_per_image: Some(rect.height),
+            },
+            wgpu::Extent3d {
+                width: rect.width,
+                height: rect.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.blit(frame);
+        Ok(Presented::Frame)
+    }
+
+    /// Present the retained staging texture again with no upload at all.
+    ///
+    /// For a frame the compositor was asked to draw but that changed nothing on
+    /// the surface: the swapchain still needs a texture, but neither raster nor
+    /// upload is owed.
+    pub(crate) fn reblit(&mut self) -> Result<Presented, PresentError> {
+        if self.staging.is_none() {
+            return Ok(Presented::Dropped);
+        }
+        let frame = match self.acquire()? {
+            Acquired::Frame(frame) => frame,
+            Acquired::Skip(outcome) => return Ok(outcome),
+        };
+        self.blit(frame);
+        Ok(Presented::Frame)
+    }
+}
+
+/// One device-pixel rectangle uploaded by [`Presenter::present_rect`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// The outcome of acquiring a swapchain texture.
@@ -410,4 +514,10 @@ pub(crate) enum PresentError {
     SurfaceValidation,
     #[error("frame buffer is {actual} bytes, expected {expected}")]
     PixelBufferSize { expected: usize, actual: usize },
+    #[error("damage rect {rect:?} runs outside the {full_width}x{full_height} frame")]
+    DamageOutOfBounds {
+        rect: DamageRect,
+        full_width: u32,
+        full_height: u32,
+    },
 }

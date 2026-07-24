@@ -543,6 +543,31 @@ impl SkiaPainter {
         );
     }
 
+    /// Restrict all subsequent drawing to `rect` until [`SkiaPainter::reset_clip`].
+    ///
+    /// The retained compositor sets this to the damaged region so re-rendering the
+    /// layers that intersect it cannot touch a pixel outside it — an unchanged
+    /// neighbour keeps exactly what it had. Balances one-to-one with `reset_clip`.
+    pub fn clip_to(&mut self, rect: Rect) {
+        let canvas = self.surface.canvas();
+        canvas.save();
+        canvas.clip_rect(
+            sk::Rect::new(
+                rect.x0 as f32,
+                rect.y0 as f32,
+                rect.x1 as f32,
+                rect.y1 as f32,
+            ),
+            sk::ClipOp::Intersect,
+            false,
+        );
+    }
+
+    /// Undo the clip a matching [`SkiaPainter::clip_to`] installed.
+    pub fn reset_clip(&mut self) {
+        self.surface.canvas().restore();
+    }
+
     /// Encode the current surface contents as a PNG. This is what `--screenshot`
     /// writes and what the image tests compare, so it must stay deterministic.
     pub fn encode_png(&mut self) -> Result<Vec<u8>, SkiaError> {

@@ -245,6 +245,8 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         window_visible: None,
         first_frame: None,
         startup_report_written: false,
+        prev_layers: Vec::new(),
+        composited_once: false,
         scheduler: FrameScheduler::default(),
         work: WorkCounters::default(),
         modifiers: crate::Modifiers::default(),
@@ -286,6 +288,12 @@ struct WindowedApp<'p> {
     first_frame: Option<std::time::Instant>,
     /// Whether benchmark mode has captured its one required presented frame.
     startup_report_written: bool,
+    /// Last composited frame's layers — identity, epoch, and rect, in order — so
+    /// the next frame's damage is the union of the layers that moved.
+    prev_layers: Vec<(crate::LayerId, u64, crate::LayerRect)>,
+    /// Whether at least one full composite has run. Until it has, and after any
+    /// surface reallocation, the compositor owes a whole-surface frame.
+    composited_once: bool,
     /// The only owner of redraw requests and animation deadlines.
     scheduler: FrameScheduler,
     /// Cumulative work, logged with every presented frame.
@@ -454,7 +462,6 @@ impl WindowedApp<'_> {
 
     fn redraw(&mut self) -> Result<Presented, PlatformError> {
         self.scheduler.redraw_started();
-        self.work.frames_started += 1;
         // Only the first frame carries startup marks. Cloning the handle (an `Arc`)
         // once here keeps the marks free of a `&self` borrow that would collide
         // with the rasterizer's `&mut`, and skips the work on every later frame.
@@ -464,6 +471,14 @@ impl WindowedApp<'_> {
             None
         };
         let viewport = self.viewport();
+
+        // Retained-layer path: a painter that publishes a scene re-rasterizes and
+        // re-uploads only what moved. Everything else is drawn whole below.
+        if let Some(scene) = self.painter.compose(viewport) {
+            return self.composite(scene, viewport, &trace);
+        }
+
+        self.work.frames_started += 1;
         self.work.rasterized_pixels = self
             .work
             .rasterized_pixels
@@ -512,67 +527,186 @@ impl WindowedApp<'_> {
         presenter.resize(viewport);
         let upload_bytes = pixels.len() as u64;
         let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
-        if outcome == Presented::Frame
-            && let Some(trace) = trace.as_ref()
-        {
-            trace.mark("upload_complete");
+        self.after_present(outcome, viewport, upload_bytes, &trace)?;
+        Ok(outcome)
+    }
+
+    /// Publish this frame as retained layers, re-rasterizing and re-uploading only
+    /// the region the moved layers cover.
+    ///
+    /// The rasterizer's surface persists between frames; an unchanged layer keeps
+    /// the pixels it already has, and a frame that touches only the tab strip
+    /// neither re-rasterizes nor re-uploads the page beneath it.
+    fn composite(
+        &mut self,
+        scene: crate::Scene,
+        viewport: Viewport,
+        trace: &Option<crate::StartupTrace>,
+    ) -> Result<Presented, PlatformError> {
+        self.work.frames_started += 1;
+
+        // Size the persistent surface. A reallocation throws away every retained
+        // pixel, so it forces a whole-surface frame.
+        let reallocated = match self.rasterizer.as_mut() {
+            Some(rasterizer) => rasterizer
+                .resize(viewport.width, viewport.height)
+                .map_err(Box::new)?,
+            None => {
+                let new =
+                    SkiaPainter::new_raster(viewport.width, viewport.height).map_err(Box::new)?;
+                let _ = self.rasterizer.insert(new);
+                true
+            }
+        };
+        let forced_full = reallocated || !self.composited_once;
+        let plan = plan_damage(&self.prev_layers, &scene.layers, forced_full);
+
+        // Rasterize into the retained surface and read back only what changed.
+        let upload = self.rasterize_damage(&scene, viewport, plan)?;
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("chrome_raster_complete");
         }
 
+        let Some(presenter) = self.presenter.as_mut() else {
+            return Ok(Presented::Dropped);
+        };
+        presenter.resize(viewport);
+
+        let _present = tracing::info_span!("present", mode = "composite").entered();
+        let (outcome, upload_bytes) = match upload {
+            DamageUpload::Unchanged => (presenter.reblit()?, 0),
+            DamageUpload::Full(pixels) => {
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("readback_complete");
+                }
+                let bytes = pixels.len() as u64;
+                let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
+                (
+                    outcome,
+                    if outcome == Presented::Frame {
+                        bytes
+                    } else {
+                        0
+                    },
+                )
+            }
+            DamageUpload::Region { pixels, rect } => {
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("readback_complete");
+                }
+                let bytes = pixels.len() as u64;
+                let outcome =
+                    presenter.present_rect(&pixels, viewport.width, viewport.height, rect)?;
+                // A fresh staging texture cannot take a partial upload; fall back to
+                // a whole frame and let the next damage be partial again.
+                if outcome == Presented::Dropped {
+                    (Presented::Dropped, 0)
+                } else {
+                    (
+                        outcome,
+                        if outcome == Presented::Frame {
+                            bytes
+                        } else {
+                            0
+                        },
+                    )
+                }
+            }
+        };
+
+        // Remember this frame's layers only once it actually reached the screen;
+        // a dropped frame must be recomposed, and forcing the next one full is the
+        // safe way to do that.
         if outcome == Presented::Frame {
+            self.prev_layers = scene
+                .layers
+                .iter()
+                .map(|layer| (layer.id, layer.epoch, layer.rect))
+                .collect();
+            self.composited_once = true;
+        } else {
+            self.composited_once = false;
+        }
+
+        self.after_present(outcome, viewport, upload_bytes, trace)?;
+        Ok(outcome)
+    }
+
+    /// Update the retained surface for `plan` and read back the region to upload.
+    fn rasterize_damage(
+        &mut self,
+        scene: &crate::Scene,
+        viewport: Viewport,
+        plan: DamagePlan,
+    ) -> Result<DamageUpload, PlatformError> {
+        let rasterizer = self.rasterizer.as_mut().expect("rasterizer ensured");
+        match plan {
+            DamagePlan::Unchanged => Ok(DamageUpload::Unchanged),
+            DamagePlan::Full => {
+                rasterizer.reset();
+                for layer in &scene.layers {
+                    otlyra_gfx::render(&layer.list, rasterizer);
+                }
+                self.work.rasterized_pixels = self
+                    .work
+                    .rasterized_pixels
+                    .saturating_add(u64::from(viewport.width) * u64::from(viewport.height));
+                let pixels = rasterizer.read_rgba8().map_err(Box::new)?;
+                Ok(DamageUpload::Full(pixels))
+            }
+            DamagePlan::Region(rect) => {
+                let clip = otlyra_gfx::kurbo::Rect::new(
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.x + rect.width),
+                    f64::from(rect.y + rect.height),
+                );
+                rasterizer.clip_to(clip);
+                rasterizer.clear_rect(clip);
+                for layer in &scene.layers {
+                    if layer.rect.intersects(&rect) {
+                        otlyra_gfx::render(&layer.list, rasterizer);
+                    }
+                }
+                rasterizer.reset_clip();
+                self.work.rasterized_pixels = self
+                    .work
+                    .rasterized_pixels
+                    .saturating_add(u64::from(rect.width) * u64::from(rect.height));
+                let pixels = rasterizer
+                    .read_rgba8_rect(rect.x, rect.y, rect.width, rect.height)
+                    .map_err(Box::new)?;
+                let rect = crate::present::DamageRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                };
+                Ok(DamageUpload::Region { pixels, rect })
+            }
+        }
+    }
+
+    /// Frame bookkeeping shared by the whole-surface and composited paths: upload
+    /// accounting, the first-frame startup report, the per-frame log, and the
+    /// accessibility push that describes what is now on screen.
+    fn after_present(
+        &mut self,
+        outcome: Presented,
+        viewport: Viewport,
+        upload_bytes: u64,
+        trace: &Option<crate::StartupTrace>,
+    ) -> Result<(), PlatformError> {
+        if outcome == Presented::Frame {
+            if let Some(trace) = trace.as_ref() {
+                trace.mark("upload_complete");
+            }
             self.work.uploaded_bytes = self.work.uploaded_bytes.saturating_add(upload_bytes);
             self.frames += 1;
             self.work.frames_presented += 1;
             let now = std::time::Instant::now();
-            if self.first_frame.is_none() {
-                self.first_frame = Some(now);
-                if let Some(trace) = trace.as_ref() {
-                    trace.mark("first_present_complete");
-                }
-                let elapsed = now.saturating_duration_since(self.startup_origin);
-                tracing::info!(
-                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
-                    visible_ms = self
-                        .window_visible
-                        .map(
-                            |visible| now.saturating_duration_since(visible).as_secs_f64() * 1000.0
-                        ),
-                    "first chrome frame presented; browser interactive"
-                );
-                if let Some(path) = self.config.startup_report.as_deref() {
-                    let visible_ms = self.window_visible.map(|visible| {
-                        visible
-                            .saturating_duration_since(self.startup_origin)
-                            .as_secs_f64()
-                            * 1000.0
-                    });
-                    let stages = trace.as_ref().map(|t| t.stages()).unwrap_or_default();
-                    let report = startup_report_json(
-                        elapsed.as_secs_f64() * 1000.0,
-                        visible_ms,
-                        viewport,
-                        &stages,
-                    );
-                    std::fs::write(path, report).map_err(PlatformError::StartupReport)?;
-                    self.startup_report_written = true;
-                }
-            }
-            let painter_work = self.painter.work_counters();
-            tracing::debug!(
-                frame = self.frames,
-                events = self.work.events_delivered,
-                redraw_requests = self.work.redraw_requests,
-                frames_started = self.work.frames_started,
-                frames_presented = self.work.frames_presented,
-                accessibility_updates = self.work.accessibility_updates,
-                rasterized_pixels = self.work.rasterized_pixels,
-                uploaded_bytes = self.work.uploaded_bytes,
-                chrome_reconciles = painter_work.chrome_reconciles,
-                chrome_layouts = painter_work.chrome_layouts,
-                chrome_paints = painter_work.chrome_paints,
-                chrome_semantics = painter_work.chrome_semantics,
-                page_paints = painter_work.page_paints,
-                "frame presented"
-            );
+            self.record_first_present(now, viewport, trace)?;
+            self.log_frame();
         }
 
         // After the frame, because the tree describes what is now on screen.
@@ -582,8 +716,127 @@ impl WindowedApp<'_> {
             a11y.update(update);
             self.work.accessibility_updates += 1;
         }
+        Ok(())
+    }
 
-        Ok(outcome)
+    /// Record the first presented frame's timings and write the startup report.
+    fn record_first_present(
+        &mut self,
+        now: std::time::Instant,
+        viewport: Viewport,
+        trace: &Option<crate::StartupTrace>,
+    ) -> Result<(), PlatformError> {
+        if self.first_frame.is_some() {
+            return Ok(());
+        }
+        self.first_frame = Some(now);
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("first_present_complete");
+        }
+        let elapsed = now.saturating_duration_since(self.startup_origin);
+        tracing::info!(
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            visible_ms = self
+                .window_visible
+                .map(|visible| now.saturating_duration_since(visible).as_secs_f64() * 1000.0),
+            "first chrome frame presented; browser interactive"
+        );
+        if let Some(path) = self.config.startup_report.as_deref() {
+            let visible_ms = self.window_visible.map(|visible| {
+                visible
+                    .saturating_duration_since(self.startup_origin)
+                    .as_secs_f64()
+                    * 1000.0
+            });
+            let stages = trace.as_ref().map(|t| t.stages()).unwrap_or_default();
+            let report = startup_report_json(
+                elapsed.as_secs_f64() * 1000.0,
+                visible_ms,
+                viewport,
+                &stages,
+            );
+            std::fs::write(path, report).map_err(PlatformError::StartupReport)?;
+            self.startup_report_written = true;
+        }
+        Ok(())
+    }
+
+    /// Log the cumulative work counters for one presented frame.
+    fn log_frame(&self) {
+        let painter_work = self.painter.work_counters();
+        tracing::debug!(
+            frame = self.frames,
+            events = self.work.events_delivered,
+            redraw_requests = self.work.redraw_requests,
+            frames_started = self.work.frames_started,
+            frames_presented = self.work.frames_presented,
+            accessibility_updates = self.work.accessibility_updates,
+            rasterized_pixels = self.work.rasterized_pixels,
+            uploaded_bytes = self.work.uploaded_bytes,
+            chrome_reconciles = painter_work.chrome_reconciles,
+            chrome_layouts = painter_work.chrome_layouts,
+            chrome_paints = painter_work.chrome_paints,
+            chrome_semantics = painter_work.chrome_semantics,
+            page_paints = painter_work.page_paints,
+            "frame presented"
+        );
+    }
+}
+
+/// The plan for one composited frame: what to re-rasterize and re-upload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DamagePlan {
+    /// Nothing changed; re-present the retained frame.
+    Unchanged,
+    /// One region moved; re-rasterize and re-upload just it.
+    Region(crate::LayerRect),
+    /// Redraw the whole surface — first frame, a resize, or a structural change.
+    Full,
+}
+
+/// What [`WindowedApp::rasterize_damage`] produced for the presenter to upload.
+enum DamageUpload {
+    /// Re-present the retained frame with no upload.
+    Unchanged,
+    /// The whole frame, tightly packed.
+    Full(Vec<u8>),
+    /// One rectangle, tightly packed, and where it goes.
+    Region {
+        pixels: Vec<u8>,
+        rect: crate::present::DamageRect,
+    },
+}
+
+/// Decide what a composited frame must redraw from the previous frame's layers.
+///
+/// A structural change — a different number of layers, or a layer identity in a
+/// different slot — forces a whole frame, because the retained surface can no
+/// longer be trusted position-for-position. Otherwise the damage is the union of
+/// the old and new rectangles of every layer whose epoch or rectangle moved.
+fn plan_damage(
+    prev: &[(crate::LayerId, u64, crate::LayerRect)],
+    next: &[crate::SceneLayer],
+    forced_full: bool,
+) -> DamagePlan {
+    if forced_full || prev.len() != next.len() {
+        return DamagePlan::Full;
+    }
+    let mut damage: Option<crate::LayerRect> = None;
+    for (previous, layer) in prev.iter().zip(next.iter()) {
+        if previous.0 != layer.id {
+            return DamagePlan::Full;
+        }
+        if previous.1 != layer.epoch || previous.2 != layer.rect {
+            let moved = previous.2.union(&layer.rect);
+            damage = Some(match damage {
+                Some(current) => current.union(&moved),
+                None => moved,
+            });
+        }
+    }
+    match damage {
+        Some(rect) => DamagePlan::Region(rect),
+        None => DamagePlan::Unchanged,
     }
 }
 
@@ -1022,6 +1275,84 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&report).expect("valid JSON");
         assert_eq!(value["process_to_visible_ms"], serde_json::Value::Null);
         assert_eq!(value["stages"].as_array().expect("array").len(), 0);
+    }
+
+    fn layer(id: u64, epoch: u64, rect: crate::LayerRect) -> crate::SceneLayer {
+        crate::SceneLayer {
+            id: crate::LayerId(id),
+            rect,
+            epoch,
+            list: otlyra_gfx::DisplayList::new(),
+        }
+    }
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> crate::LayerRect {
+        crate::LayerRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn a_forced_full_frame_redraws_everything() {
+        let next = [layer(0, 1, rect(0, 0, 10, 10))];
+        assert_eq!(plan_damage(&[], &next, true), DamagePlan::Full);
+    }
+
+    #[test]
+    fn a_different_layer_count_or_identity_redraws_everything() {
+        let prev = [(crate::LayerId(0), 1, rect(0, 0, 10, 10))];
+        let two = [
+            layer(0, 1, rect(0, 0, 10, 10)),
+            layer(1, 1, rect(0, 10, 10, 10)),
+        ];
+        assert_eq!(plan_damage(&prev, &two, false), DamagePlan::Full);
+
+        let reordered = [layer(9, 1, rect(0, 0, 10, 10))];
+        assert_eq!(plan_damage(&prev, &reordered, false), DamagePlan::Full);
+    }
+
+    #[test]
+    fn an_unchanged_frame_damages_nothing() {
+        let prev = [
+            (crate::LayerId(0), 5, rect(0, 20, 100, 80)),
+            (crate::LayerId(1), 2, rect(0, 0, 100, 20)),
+        ];
+        let next = [
+            layer(0, 5, rect(0, 20, 100, 80)),
+            layer(1, 2, rect(0, 0, 100, 20)),
+        ];
+        assert_eq!(plan_damage(&prev, &next, false), DamagePlan::Unchanged);
+    }
+
+    #[test]
+    fn one_changed_layer_damages_only_its_rectangle() {
+        // Page (id 0) below, chrome (id 1) on top. Only the chrome epoch moves:
+        // the page keeps its pixels, so damage is the chrome rect alone.
+        let prev = [
+            (crate::LayerId(0), 5, rect(0, 20, 100, 80)),
+            (crate::LayerId(1), 2, rect(0, 0, 100, 20)),
+        ];
+        let next = [
+            layer(0, 5, rect(0, 20, 100, 80)),
+            layer(1, 3, rect(0, 0, 100, 20)),
+        ];
+        assert_eq!(
+            plan_damage(&prev, &next, false),
+            DamagePlan::Region(rect(0, 0, 100, 20))
+        );
+    }
+
+    #[test]
+    fn a_moved_rectangle_damages_both_where_it_was_and_where_it_is() {
+        let prev = [(crate::LayerId(0), 1, rect(0, 0, 10, 10))];
+        let next = [layer(0, 1, rect(20, 0, 10, 10))];
+        assert_eq!(
+            plan_damage(&prev, &next, false),
+            DamagePlan::Region(rect(0, 0, 30, 10))
+        );
     }
 
     #[test]
