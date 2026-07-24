@@ -758,6 +758,13 @@ impl BrowserUi {
         self.focus.kind(self.focused) == Some(FocusKind::Text)
     }
 
+    /// Take the focus off whatever holds it — the toolbar's job when a press
+    /// lands below it. The caret and any address selection are drawn only while
+    /// the field is focused, so dropping the focus is what puts them away.
+    pub fn blur(&mut self) {
+        self.focused = None;
+    }
+
     /// Put the caret in the address field, for an accelerator that names it.
     ///
     /// The whole address is selected, which is what ⌘L is *for*: the next

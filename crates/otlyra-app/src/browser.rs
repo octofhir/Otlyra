@@ -2600,6 +2600,15 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerPressed { clicks } => {
+                // A press below the toolbar takes the focus off the address field,
+                // wherever it lands — a page, a control, a link, a scrollbar, a
+                // system page, the inspector. Every one of those paths answers the
+                // press and returns before the toolbar's own press handler runs, so
+                // without this the caret and its selection would sit in a field the
+                // reader has plainly clicked away from.
+                if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
+                    self.ui.blur();
+                }
                 // The panel owns everything below its own top edge.
                 if self.pointer.1 >= self.dock_top() && !self.ui.menu_open {
                     let action = self.inspector.pointer_pressed();
@@ -5751,6 +5760,46 @@ mod tests {
             epoch_of(&before, LAYER_CHROME),
             epoch_of(&after, LAYER_CHROME),
             "the chrome did not change, so the compositor leaves it untouched"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_page_blurs_the_address_field() {
+        let mut browser = Browser::new(LongLoader);
+        go(&mut browser, "long.example");
+        // A frame first: the field to focus and the layout to press against are
+        // both things the last frame drew.
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(1024, 768, 1.0));
+
+        browser.ui.focus_address();
+        assert!(browser.ui.address_focused(), "the address starts focused");
+
+        browser.on_event(PlatformEvent::PointerMoved { x: 500.0, y: 400.0 });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        assert!(
+            !browser.ui.address_focused(),
+            "a press on the page takes the focus off the address field"
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_system_page_blurs_the_address_field() {
+        // The system-page press paths answer the click and return before the
+        // toolbar's own handler, so this is the case that regressed.
+        let mut browser = Browser::new(LongLoader);
+        browser.open_system(SystemPage::Settings);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.paint(&mut painter, Viewport::new(1024, 768, 1.0));
+
+        browser.ui.focus_address();
+        assert!(browser.ui.address_focused(), "the address starts focused");
+
+        browser.on_event(PlatformEvent::PointerMoved { x: 500.0, y: 400.0 });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        assert!(
+            !browser.ui.address_focused(),
+            "a press on a system page blurs the address field too"
         );
     }
 
