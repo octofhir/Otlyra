@@ -214,13 +214,16 @@ impl Presenter {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn ensure_staging(&mut self, width: u32, height: u32) {
+    /// Ensure a staging texture of exactly `width` x `height` exists. Returns
+    /// `true` when a fresh texture was allocated, so the caller knows the texture
+    /// holds no retained pixels and a partial upload would leave it undefined.
+    fn ensure_staging(&mut self, width: u32, height: u32) -> bool {
         let current = self
             .staging
             .as_ref()
             .is_some_and(|staging| staging.width == width && staging.height == height);
         if current {
-            return;
+            return false;
         }
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -258,26 +261,14 @@ impl Presenter {
             width,
             height,
         });
+        true
     }
 
-    /// Upload `pixels` (tightly packed premultiplied RGBA8) and present it.
-    pub(crate) fn present(
-        &mut self,
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<Presented, PresentError> {
-        let expected = width as usize * height as usize * 4;
-        if pixels.len() != expected {
-            return Err(PresentError::PixelBufferSize {
-                expected,
-                actual: pixels.len(),
-            });
-        }
-
-        let frame = match self.surface.get_current_texture() {
+    /// Acquire the next swapchain texture, or say why this frame cannot happen.
+    fn acquire(&mut self) -> Result<Acquired, PresentError> {
+        Ok(match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Acquired::Frame(frame),
             // A lost or outdated swapchain is normal while a window is being
             // created, resized or moved between displays. Reconfigure and tell the
             // caller the frame never happened, so it can ask for another one — the
@@ -286,41 +277,26 @@ impl Presenter {
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 tracing::debug!("swapchain lost or outdated; frame dropped");
-                return Ok(Presented::Dropped);
+                Acquired::Skip(Presented::Dropped)
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
                 tracing::debug!("swapchain timed out; frame dropped");
-                return Ok(Presented::Dropped);
+                Acquired::Skip(Presented::Dropped)
             }
             // The window is hidden. Asking again would spin against a window nobody
             // can see; winit wakes us when it is visible.
-            wgpu::CurrentSurfaceTexture::Occluded => return Ok(Presented::Occluded),
+            wgpu::CurrentSurfaceTexture::Occluded => Acquired::Skip(Presented::Occluded),
             wgpu::CurrentSurfaceTexture::Validation => return Err(PresentError::SurfaceValidation),
-        };
+        })
+    }
 
-        self.ensure_staging(width, height);
+    /// Blit the current staging texture onto `frame` and present it.
+    ///
+    /// The staging texture is sampled whole, so whatever it retains from earlier
+    /// frames outside a partial upload's rectangle reaches the screen unchanged —
+    /// which is exactly what makes an unchanged region cost nothing to re-present.
+    fn blit(&mut self, frame: wgpu::SurfaceTexture) {
         let staging = self.staging.as_ref().expect("staging texture ensured");
-
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &staging.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -353,8 +329,62 @@ impl Presenter {
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
+    }
+
+    /// Upload the whole frame (`pixels`, tightly packed premultiplied RGBA8) and
+    /// present it.
+    pub(crate) fn present(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Presented, PresentError> {
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            return Err(PresentError::PixelBufferSize {
+                expected,
+                actual: pixels.len(),
+            });
+        }
+
+        let frame = match self.acquire()? {
+            Acquired::Frame(frame) => frame,
+            Acquired::Skip(outcome) => return Ok(outcome),
+        };
+
+        self.ensure_staging(width, height);
+        let staging = self.staging.as_ref().expect("staging texture ensured");
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &staging.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.blit(frame);
         Ok(Presented::Frame)
     }
+}
+
+/// The outcome of acquiring a swapchain texture.
+enum Acquired {
+    /// A texture to render this frame into.
+    Frame(wgpu::SurfaceTexture),
+    /// No frame this time; the reason is the caller's return value.
+    Skip(Presented),
 }
 
 /// What became of a frame handed to [`Presenter::present`].

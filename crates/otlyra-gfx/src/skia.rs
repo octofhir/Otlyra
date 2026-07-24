@@ -485,6 +485,64 @@ impl SkiaPainter {
         }
     }
 
+    /// Read one device-pixel rectangle back as tightly packed, premultiplied
+    /// RGBA8, stride exactly `width * 4`.
+    ///
+    /// This is the retained compositor's readback: after re-rasterizing only the
+    /// damaged region, only that region is read and uploaded. The rectangle is
+    /// clamped to the surface, so a damage rect that runs off the edge reads what
+    /// is there rather than failing.
+    pub fn read_rgba8_rect(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, SkiaError> {
+        let x = x.min(self.width);
+        let y = y.min(self.height);
+        let width = width.min(self.width - x).max(1);
+        let height = height.min(self.height - y).max(1);
+        let info = sk::ImageInfo::new(
+            (width as i32, height as i32),
+            sk::ColorType::RGBA8888,
+            sk::AlphaType::Premul,
+            None,
+        );
+        let row_bytes = width as usize * 4;
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        if self
+            .surface
+            .read_pixels(&info, &mut pixels, row_bytes, (x as i32, y as i32))
+        {
+            Ok(pixels)
+        } else {
+            Err(SkiaError::ReadPixels { width, height })
+        }
+    }
+
+    /// Replace one rectangle's pixels with transparency, honouring the surface's
+    /// premultiplied alpha.
+    ///
+    /// The retained compositor calls this before re-rasterizing a damaged region:
+    /// `PaintTarget::reset` clears the *whole* surface, which would discard the
+    /// retained pixels this design keeps. `Clear` blend replaces rather than
+    /// composites, so the region is genuinely blank and not merely darkened.
+    pub fn clear_rect(&mut self, rect: Rect) {
+        let mut paint = sk::Paint::default();
+        paint.set_blend_mode(sk::BlendMode::Clear);
+        paint.set_anti_alias(false);
+        self.surface.canvas().draw_rect(
+            sk::Rect::new(
+                rect.x0 as f32,
+                rect.y0 as f32,
+                rect.x1 as f32,
+                rect.y1 as f32,
+            ),
+            &paint,
+        );
+    }
+
     /// Encode the current surface contents as a PNG. This is what `--screenshot`
     /// writes and what the image tests compare, so it must stay deterministic.
     pub fn encode_png(&mut self) -> Result<Vec<u8>, SkiaError> {
@@ -1247,6 +1305,43 @@ mod tests {
             [0xff, 0xff, 0xff, 0xff],
             "outside the rect"
         );
+    }
+
+    #[test]
+    fn a_sub_rect_reads_back_only_that_rectangle() {
+        let mut painter = SkiaPainter::new_raster(16, 16).expect("16x16 raster surface");
+        painter.clear(Color::WHITE);
+        let brush = peniko::Brush::Solid(Color::from_rgb8(0x00, 0xff, 0x00));
+        painter.fill_rect(
+            Affine::IDENTITY,
+            (&brush).into(),
+            Rect::new(4.0, 4.0, 8.0, 8.0),
+        );
+
+        // A tight 4x4 read at the painted corner: stride is the sub-width, so the
+        // green pixel sits at local (0,0) of the returned buffer.
+        let pixels = painter.read_rgba8_rect(4, 4, 4, 4).expect("sub read");
+        assert_eq!(pixels.len(), 4 * 4 * 4, "tightly packed 4x4 RGBA8");
+        assert_eq!(pixel_at(&pixels, 4, 0, 0), [0x00, 0xff, 0x00, 0xff]);
+        assert_eq!(pixel_at(&pixels, 4, 3, 3), [0x00, 0xff, 0x00, 0xff]);
+
+        // A rect running off the edge is clamped, not an error.
+        let clamped = painter.read_rgba8_rect(14, 14, 8, 8).expect("clamped read");
+        assert_eq!(clamped.len(), 2 * 2 * 4, "clamped to the 2x2 corner");
+    }
+
+    #[test]
+    fn clearing_a_rect_leaves_the_rest_of_the_surface_intact() {
+        let mut painter = SkiaPainter::new_raster(16, 16).expect("16x16 raster surface");
+        painter.clear(Color::from_rgb8(0xff, 0x00, 0x00));
+        painter.clear_rect(Rect::new(4.0, 4.0, 8.0, 8.0));
+
+        let pixels = painter.read_rgba8().expect("read back");
+        // Inside the cleared rect: transparent (premultiplied, so all zero).
+        assert_eq!(pixel_at(&pixels, 16, 6, 6), [0x00, 0x00, 0x00, 0x00]);
+        // Outside it: the red is untouched, which is the whole point.
+        assert_eq!(pixel_at(&pixels, 16, 1, 1), [0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(pixel_at(&pixels, 16, 12, 12), [0xff, 0x00, 0x00, 0xff]);
     }
 
     /// A shape filled with a picture repeats it across the shape, and the brush
