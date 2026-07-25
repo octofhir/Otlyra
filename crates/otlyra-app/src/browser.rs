@@ -1948,6 +1948,31 @@ impl Browser {
         self.activate_surface(surface);
     }
 
+    /// Put the tab named `id` at `to`, taking the tabs after it along.
+    ///
+    /// The strip's order is the browser's, so a drag reports the move rather
+    /// than keeping an order of its own to apply on release: dropping is then
+    /// letting go, and there is no second answer to what the order is if the
+    /// drag is interrupted by anything at all. Which tab is being read moves
+    /// with it — a tab dragged somewhere else is still the tab you were on.
+    pub fn move_tab(&mut self, id: TabId, to: usize) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let to = to.min(self.tabs.len().saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let active = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .unwrap_or(self.active.min(self.tabs.len() - 1));
+    }
+
     /// Make a tab active.
     pub fn select_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
@@ -2257,6 +2282,7 @@ impl Browser {
             UiAction::NewTab => self.new_tab(),
             UiAction::CloseTab(index) => self.close_tab(index),
             UiAction::SelectTab(index) => self.select_tab(index),
+            UiAction::MoveTab { id, to } => self.move_tab(TabId(id), to),
             UiAction::Reload => self.reload(),
             UiAction::Context(command) => self.apply_context(command),
         }
@@ -3143,7 +3169,10 @@ impl Painter for Browser {
 
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);
-                self.ui.pointer_moved(x, y, &mut self.text);
+                // A move can be a drag carrying something: a tab being dragged
+                // along the strip reports where it should sit now.
+                let action = self.ui.pointer_moved(x, y, &mut self.text);
+                self.apply(action);
                 self.update_cursor(x, y);
                 self.inspector.pointer_moved(x, y);
                 // While the picker is armed, moving over the page is enough to
@@ -5158,6 +5187,55 @@ mod tests {
 
         browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
         assert_eq!(browser.tabs[0].url, "https://start.example/next");
+    }
+
+    /// Dragging a tab along the strip reorders the browser's own tabs, and the
+    /// tab being read stays the tab being read wherever it lands.
+    #[test]
+    fn dragging_a_tab_reorders_the_strip() {
+        let mut browser = Browser::new(LinkLoader);
+        browser.new_tab();
+        browser.new_tab();
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(1000, 700, 1.0),
+        );
+        let order: Vec<TabId> = browser.tabs.iter().map(|tab| tab.id).collect();
+        assert_eq!(browser.tabs[browser.active].id, order[2]);
+
+        let places = browser.ui().tab_places();
+        let rect_of = |id: TabId| {
+            places
+                .borrow()
+                .iter()
+                .find(|(key, _)| *key == id.0)
+                .map(|(_, rect)| *rect)
+                .expect("every tab was drawn")
+        };
+        let last = rect_of(order[2]);
+        let first = rect_of(order[0]);
+
+        // Press the last tab and carry it to the front.
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: last.x + last.width / 2.0,
+            y: last.y + last.height / 2.0,
+        });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: first.x + first.width / 2.0,
+            y: last.y + last.height / 2.0,
+        });
+        browser.on_event(PlatformEvent::PointerReleased);
+
+        assert_eq!(
+            browser.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![order[2], order[0], order[1]],
+            "the dragged tab did not land where it was dropped"
+        );
+        assert_eq!(
+            browser.tabs[browser.active].id, order[2],
+            "the tab being read must still be the tab being read"
+        );
     }
 
     /// Ask for a menu where the pointer is, the way the platform does.

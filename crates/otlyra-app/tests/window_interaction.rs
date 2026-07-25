@@ -321,6 +321,70 @@ fn the_browser_menu_is_visible_below_the_composited_toolbar() {
     );
 }
 
+/// A tab dragged along the strip lands where it was dropped, and the window
+/// shows it there: the order is the browser's, so the strip a person is looking
+/// at and the tabs the browser holds cannot disagree.
+#[test]
+fn dragging_a_tab_moves_it_in_the_window() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut browser = Browser::new(Pages);
+    browser.navigate("https://form.example/");
+    browser.wait_for_load(std::time::Duration::from_secs(5));
+    browser.new_tab();
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+
+    let mut pump = FramePump::new(viewport);
+    pump.open(&mut browser).expect("the first frame");
+    let before = pump.png().expect("the strip before");
+
+    let places = browser.ui().tab_places();
+    let rect = |index: usize| places.borrow()[index].1;
+    let (first, second) = (rect(0), rect(1));
+    let ids: Vec<u64> = places.borrow().iter().map(|(id, _)| *id).collect();
+
+    let y = second.y + second.height / 2.0;
+    pump.event(
+        &mut browser,
+        PlatformEvent::PointerMoved {
+            x: second.x + second.width / 2.0,
+            y,
+        },
+    );
+    pump.event(&mut browser, PlatformEvent::PointerPressed { clicks: 1 });
+    pump.event(
+        &mut browser,
+        PlatformEvent::PointerMoved {
+            x: first.x + first.width / 2.0,
+            y,
+        },
+    );
+    pump.event(&mut browser, PlatformEvent::PointerReleased);
+    pump.frame(&mut browser).expect("the dropped frame");
+    let after = pump.png().expect("the strip after");
+
+    let order: Vec<u64> = browser
+        .ui()
+        .tab_places()
+        .borrow()
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![ids[1], ids[0]],
+        "the tab was dropped in front and the strip did not follow"
+    );
+
+    let (width, before) = decode(&before);
+    let (_, after) = decode(&after);
+    let strip = (0, 0, width, 36);
+    assert_ne!(
+        region(&before, width, strip),
+        region(&after, width, strip),
+        "the tabs swapped and the window drew the old strip"
+    );
+}
+
 /// The menu the reader asks for is drawn over the page in the *window*, not
 /// only in a whole-surface paint: it hangs below the chrome band, which is the
 /// one thing a compositor that clips chrome at the toolbar would swallow.

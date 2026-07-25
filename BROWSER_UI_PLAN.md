@@ -107,10 +107,12 @@ are the two consumers they were written from.
 - [ ] Traversal *between* roots: Tab from the last chrome control into the page
   and on into the inspector, in a stated order, with the active surface
   following it.
-- [ ] Add pointer capture and a complete drag lifecycle — press, threshold,
-  move, drop, cancel — replacing the implicit "the drag began inside my
-  rectangle" rule, which cannot name a control that moves while being dragged.
-  First consumer: dragging a tab to reorder it.
+- [ ] Extend pointer capture past the chrome surface. The contract exists —
+  `CaptureId`, `Button::capture`, `Cx::take_pointer`, threshold, move, drop,
+  cancel — and dragging a tab to reorder it is its consumer. What is left is
+  the page's own drags (selection, scrollbars) and the inspector's splitter,
+  which still answer *the press began inside my rectangle* and are correct only
+  because nothing they drag moves.
 - [ ] Implement platform popup windows for a popup that must leave the browser
   window. The in-window backend covers everything that fits, flipping at an edge
   rather than clipping; a long dropdown near the bottom edge is what needs the

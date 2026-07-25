@@ -31,8 +31,9 @@ use crate::widget::runtime::{
 };
 use crate::widget::theme::Theme;
 use crate::widget::{
-    Align, Background, Button, Child, Cx, Described, Event, Fixed, Focus, FocusId, FocusKind,
-    FocusScopeId, Insets, Label, Padding, Painted, Role, Size, Stack, Widget, fill_rounded,
+    Align, Background, Button, CaptureId, Child, Cx, Described, Event, Fixed, Focus, FocusId,
+    FocusKind, FocusScopeId, Insets, Label, Padding, Painted, Role, Size, Stack, Widget,
+    fill_rounded,
 };
 
 /// Height of the tab strip, in logical pixels.
@@ -373,6 +374,17 @@ pub enum UiAction {
     Navigate(String),
     /// Open a tab.
     NewTab,
+    /// Put the tab named `id` at this position in the strip.
+    ///
+    /// By id rather than by its current index, because the index is what the
+    /// move changes: a drag reports several of these as it crosses its
+    /// neighbours, and each one is about the same tab.
+    MoveTab {
+        /// Which tab is being moved.
+        id: u64,
+        /// Where it should sit once it has moved.
+        to: usize,
+    },
     /// Close a tab by index.
     CloseTab(usize),
     /// Make a tab active.
@@ -699,6 +711,32 @@ pub enum Bookmarked {
     Yes,
 }
 
+/// A tab being dragged along the strip.
+///
+/// The order itself is not here: it is the browser's, and the drag reports
+/// [`UiAction::MoveTab`] as the pointer crosses each neighbour rather than
+/// keeping a second copy of the strip to be applied on release. What is here is
+/// what only the drag knows — which tab, where it started, and whether the
+/// pointer has moved far enough for this to be a drag at all.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct TabDrag {
+    /// The tab that was pressed.
+    id: u64,
+    /// Where it sat when the press landed, so Escape can put it back.
+    from: usize,
+    /// Where the press landed.
+    origin: f64,
+    /// Whether the pointer has passed the threshold. Until it does, the press
+    /// is still just a press, and letting go is a click on the tab.
+    started: bool,
+}
+
+/// How far the pointer travels before a press on a tab becomes a drag.
+///
+/// Far enough that a click with an unsteady hand stays a click, near enough
+/// that a deliberate drag starts before the reader wonders whether it will.
+const DRAG_THRESHOLD: f64 = 5.0;
+
 /// A panel drawn over everything else, which owns the pointer and the keyboard
 /// until it is dismissed.
 ///
@@ -779,6 +817,20 @@ pub struct BrowserUi {
     /// Where the pointer went down, while it is still down. What lets a drag
     /// that began in the address field keep selecting past its edge.
     press_origin: Option<(f64, f64)>,
+    /// Which control took the pointer, for the one kind of drag that moves the
+    /// control being dragged.
+    capture: Option<CaptureId>,
+    /// The tab being dragged along the strip, once the pointer has moved far
+    /// enough for the press to be a drag rather than a click.
+    drag: Option<TabDrag>,
+    /// Where each tab landed in the last frame, by tab id.
+    ///
+    /// Read to answer *which tab is the pointer over* during a drag. From the
+    /// frame that placed them, like every other geometry question here: a strip
+    /// works out tab positions with gaps, separators and a scroll offset, and a
+    /// second sum of the same thing would be wrong the first time one of those
+    /// changed.
+    tab_places: crate::widget::Placements,
     /// How many clicks the current press is the latest of.
     clicks: u32,
     /// What the last built list was built from, and the list itself.
@@ -849,6 +901,9 @@ impl BrowserUi {
             pointer: (-1.0, -1.0),
             pointer_down: false,
             press_origin: None,
+            capture: None,
+            drag: None,
+            tab_places: crate::widget::Placements::default(),
             clicks: 1,
             cache: None,
             dirty: None,
@@ -941,10 +996,16 @@ impl BrowserUi {
     /// While the button is down, the move is offered to the tree: a drag that
     /// began in the address field is a selection growing, and the field is the
     /// one that knows which offset the pointer is over.
-    pub fn pointer_moved(&mut self, x: f64, y: f64, text: &mut TextEngine) {
+    pub fn pointer_moved(&mut self, x: f64, y: f64, text: &mut TextEngine) -> UiAction {
         self.pointer = (x, y);
         if self.press_origin.is_none() {
-            return;
+            return UiAction::None;
+        }
+        // A control that took the pointer gets the move and nothing else does,
+        // which is the whole of what capture buys: the tab under the pointer
+        // must not answer a drag that belongs to the tab being dragged.
+        if self.capture.is_some() {
+            return self.drag_moved(x);
         }
         let mut cx = self.cx(text);
         let action = self
@@ -954,6 +1015,64 @@ impl BrowserUi {
         if let Some(UiAction::AddressHit(hit)) = action {
             self.address.hit(hit);
         }
+        UiAction::None
+    }
+
+    /// The pointer moved while a tab holds it.
+    ///
+    /// Nothing happens until it has travelled far enough for the press to be a
+    /// drag; after that, the tab is asked to sit wherever the pointer is, which
+    /// is whichever tab's rectangle the pointer is over in the frame on screen.
+    fn drag_moved(&mut self, x: f64) -> UiAction {
+        let Some(drag) = self.drag.as_mut() else {
+            return UiAction::None;
+        };
+        if !drag.started {
+            if (x - drag.origin).abs() < DRAG_THRESHOLD {
+                return UiAction::None;
+            }
+            drag.started = true;
+        }
+        let id = drag.id;
+        let places = self.tab_places.borrow();
+        let at = places.iter().position(|(key, _)| *key == id);
+        // Where the pointer is, among the tabs as they were last drawn. Past
+        // the last tab's right edge means the end of the strip, and past the
+        // first tab's left edge means the start: a drag that leaves the strip
+        // sideways still says which end it is heading for.
+        let over = places
+            .iter()
+            .position(|(_, rect)| x >= rect.x && x < rect.x + rect.width)
+            .or_else(|| {
+                let last = places.len().checked_sub(1)?;
+                let (_, first_rect) = places.first()?;
+                let (_, last_rect) = places.last()?;
+                if x >= last_rect.x + last_rect.width {
+                    Some(last)
+                } else if x < first_rect.x {
+                    Some(0)
+                } else {
+                    None
+                }
+            });
+        drop(places);
+        match (at, over) {
+            (Some(at), Some(over)) if at != over => UiAction::MoveTab { id, to: over },
+            _ => UiAction::None,
+        }
+    }
+
+    /// Whether a tab is being dragged along the strip right now.
+    pub fn dragging_tab(&self) -> bool {
+        self.drag.is_some_and(|drag| drag.started)
+    }
+
+    /// Where each tab landed in the last frame, by tab id.
+    ///
+    /// From the frame that placed them, for anything that has to ask where a
+    /// tab is without working the strip's arithmetic out a second time.
+    pub fn tab_places(&self) -> crate::widget::Placements {
+        std::rc::Rc::clone(&self.tab_places)
     }
 
     /// Whether the address field has the keyboard.
@@ -1051,6 +1170,24 @@ impl BrowserUi {
             .root
             .as_mut()
             .and_then(|root| root.event(&Event::PointerPressed, &mut cx));
+        // Whoever took the pointer keeps it until the button comes up. The
+        // claim is read here rather than applied by the widget because the tree
+        // is rebuilt every frame and a claim left in it would not survive one.
+        self.capture = cx.claimed_pointer();
+        if let Some(capture) = self.capture {
+            let id = capture.value();
+            self.drag = self
+                .tab_places
+                .borrow()
+                .iter()
+                .position(|(key, _)| *key == id)
+                .map(|from| TabDrag {
+                    id,
+                    from,
+                    origin: self.pointer.0,
+                    started: false,
+                });
+        }
 
         match action {
             Some(UiAction::Focus(id)) => {
@@ -1219,6 +1356,26 @@ impl BrowserUi {
     pub fn pointer_released(&mut self) {
         self.pointer_down = false;
         self.press_origin = None;
+        // The pointer goes back to whatever is under it. A drag that got as far
+        // as moving anything has already moved it, so there is nothing to apply
+        // here — dropping is letting go, and the strip is already the answer.
+        self.capture = None;
+        self.drag = None;
+    }
+
+    /// Abandon a drag, putting the tab back where it was picked up.
+    ///
+    /// Escape during a drag is the reader saying they did not mean it, and a
+    /// drag that could not be taken back is one a reader has to be careful
+    /// with. `None` when nothing was moved, so Escape can go on to mean
+    /// whatever else it means.
+    fn cancel_drag(&mut self) -> Option<UiAction> {
+        let drag = self.drag.take()?;
+        self.capture = None;
+        drag.started.then_some(UiAction::MoveTab {
+            id: drag.id,
+            to: drag.from,
+        })
     }
 
     /// Activate the control a reader named, by the index it was described at.
@@ -1289,6 +1446,14 @@ impl BrowserUi {
         // a character, so it cannot be something the user meant to type.
         if key == Key::F5 {
             return UiAction::Reload;
+        }
+
+        // Escape gets out of whatever is in progress, innermost first: a drag
+        // being carried, then a panel being looked at.
+        if key == Key::Escape
+            && let Some(undo) = self.cancel_drag()
+        {
+            return undo;
         }
 
         if key == Key::Escape && self.popup_open() {
@@ -1707,6 +1872,7 @@ impl BrowserUi {
                     overflow: &self.tab_overflow,
                     active_tab: &self.active_tab,
                     window: &self.tab_window,
+                    places: &self.tab_places,
                 },
             );
             self.tab_tree.replace_with_dirty(
@@ -1752,6 +1918,7 @@ impl BrowserUi {
         cx.press_origin = self.press_origin;
         cx.clicks = self.clicks;
         cx.focus = self.focused;
+        cx.capture = self.capture;
         cx.theme = self.theme.clone();
         cx
     }
@@ -1840,6 +2007,7 @@ fn tab_strip(
         overflow,
         active_tab,
         window,
+        places,
     } = *sliding;
     let inset = theme.inset * 0.75;
     let fixed = inset * 2.0 + NEW_TAB_SIZE + theme.gap;
@@ -1870,6 +2038,10 @@ fn tab_strip(
     let scroll = scroll.clamp(0.0, travel);
 
     let mut children: Vec<Child<UiAction>> = Vec::with_capacity(tabs.len() * 2 + 2);
+    // Stale entries — a tab that has since been closed — would answer a drag
+    // with a rectangle nothing is drawn in, so the list is the tabs this frame
+    // builds and only those.
+    places.borrow_mut().clear();
     for (index, label) in tabs.iter().enumerate() {
         let one = tab(
             theme,
@@ -1881,8 +2053,15 @@ fn tab_strip(
             each,
             spinner,
         );
-        // The active one reports where it landed, so the strip can be slid to
-        // bring it back when it has gone off an end.
+        // Every tab reports where it landed, which is what a drag reads to ask
+        // which tab the pointer is over.
+        let one: Child<UiAction> = Box::new(crate::widget::Track::new(
+            std::rc::Rc::clone(places),
+            label.id,
+            one,
+        ));
+        // The active one reports its rectangle a second time, on its own, so
+        // the strip can be slid to bring it back when it has gone off an end.
         children.push(if index == active {
             Box::new(crate::widget::Report::new(
                 std::rc::Rc::clone(active_tab),
@@ -1975,6 +2154,8 @@ struct Sliding<'a> {
     active_tab: &'a crate::widget::Placed,
     /// And the window it has to land inside.
     window: &'a crate::widget::Placed,
+    /// Where every tab landed, by tab id, for a drag to read.
+    places: &'a crate::widget::Placements,
 }
 
 /// One end of the strip: a chevron that slides it a screenful that way.
@@ -2192,7 +2373,12 @@ fn tab(
             Button::new(UiAction::SelectTab(index), Box::new(background))
                 .role(Role::Tab)
                 .value(if active { "selected" } else { "not selected" })
-                .focus(id),
+                .focus(id)
+                // A tab is the one control here that moves while it is dragged,
+                // so it takes the pointer with the press: by the time the drag
+                // is under way it is no longer where the press landed, and
+                // "the drag began inside my rectangle" names the wrong tab.
+                .capture(CaptureId::new(label.id)),
         ),
     ))
 }
@@ -2907,6 +3093,119 @@ mod tests {
             ),
             UiAction::Reload,
             "a control that cannot be pressed is not a place the keyboard stops"
+        );
+    }
+
+    /// Where a tab landed in the last frame, by its id.
+    fn tab_rect(ui: &BrowserUi, id: u64) -> Rect {
+        ui.tab_places
+            .borrow()
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, rect)| *rect)
+            .expect("the tab was drawn")
+    }
+
+    /// A press on a tab and a drag past its neighbour reorders the strip, and
+    /// says so by naming the tab rather than a position — the position is what
+    /// the move changes.
+    #[test]
+    fn dragging_a_tab_past_its_neighbour_asks_for_the_move() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let tabs = labels(3);
+        frame_with_labels(&mut ui, &mut text, 1000.0, 700.0, &tabs, 0);
+
+        let first = tab_rect(&ui, tabs[0].id);
+        let second = tab_rect(&ui, tabs[1].id);
+        let start = first.x + first.width / 2.0;
+        ui.pointer_moved(start, first.y + first.height / 2.0, &mut text);
+        assert_eq!(
+            ui.pointer_pressed(&mut text, 1),
+            UiAction::SelectTab(0),
+            "a press on a tab is still a press on a tab"
+        );
+
+        // A twitch is not a drag: nothing moves until the pointer has gone far
+        // enough that the reader plainly meant it to.
+        assert_eq!(
+            ui.pointer_moved(start + 2.0, first.y + 5.0, &mut text),
+            UiAction::None
+        );
+        assert!(!ui.dragging_tab());
+
+        let over = second.x + second.width / 2.0;
+        assert_eq!(
+            ui.pointer_moved(over, first.y + 5.0, &mut text),
+            UiAction::MoveTab {
+                id: tabs[0].id,
+                to: 1
+            }
+        );
+        assert!(ui.dragging_tab());
+    }
+
+    /// Escape during a drag puts the tab back where it was picked up.
+    #[test]
+    fn escape_during_a_drag_puts_the_tab_back() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let tabs = labels(3);
+        // The strip as it stands after the first tab has been dragged to the
+        // middle: the drag started at position 0 and the tab is now second.
+        frame_with_labels(&mut ui, &mut text, 1000.0, 700.0, &tabs, 0);
+        let first = tab_rect(&ui, tabs[0].id);
+        let second = tab_rect(&ui, tabs[1].id);
+        ui.pointer_moved(
+            first.x + first.width / 2.0,
+            first.y + first.height / 2.0,
+            &mut text,
+        );
+        ui.pointer_pressed(&mut text, 1);
+        ui.pointer_moved(second.x + second.width / 2.0, first.y + 5.0, &mut text);
+
+        assert_eq!(
+            ui.key_pressed(
+                Key::Escape,
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
+            UiAction::MoveTab {
+                id: tabs[0].id,
+                to: 0
+            },
+            "a drag a reader took back has to be taken back"
+        );
+        assert!(!ui.dragging_tab(), "the drag is over either way");
+    }
+
+    /// A press that never travels is a click: letting go asks for nothing.
+    #[test]
+    fn a_press_on_a_tab_that_does_not_travel_moves_nothing() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        let tabs = labels(3);
+        frame_with_labels(&mut ui, &mut text, 1000.0, 700.0, &tabs, 0);
+        let first = tab_rect(&ui, tabs[0].id);
+        ui.pointer_moved(
+            first.x + first.width / 2.0,
+            first.y + first.height / 2.0,
+            &mut text,
+        );
+        ui.pointer_pressed(&mut text, 1);
+        ui.pointer_released();
+
+        assert!(!ui.dragging_tab());
+        assert_eq!(
+            ui.key_pressed(
+                Key::Escape,
+                Modifiers::default(),
+                &mut text,
+                &mut crate::clipboard::InMemory::default()
+            ),
+            UiAction::None,
+            "Escape after a plain click has no drag to take back"
         );
     }
 

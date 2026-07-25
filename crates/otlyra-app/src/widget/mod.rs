@@ -620,6 +620,31 @@ impl std::fmt::Debug for Focus {
     }
 }
 
+/// Which control the pointer belongs to until the button comes up.
+///
+/// Named by the surface, from something that outlives a frame — a tab's id
+/// rather than its position, because the point of capture is to keep naming the
+/// same control while it moves.
+///
+/// Most drags need none of this: a control that stays where it was drawn is
+/// answered by *the press began inside my rectangle*, which is one fact and no
+/// state ([`Cx::dragging_from`]). Capture is for a control that moves while it
+/// is being dragged, where that rectangle stops being the control's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CaptureId(u64);
+
+impl CaptureId {
+    /// A capture named by the surface that owns the control.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The number the surface named it with.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// What a widget needs while it works.
 ///
 /// The text engine is here rather than passed alongside because measuring and
@@ -646,6 +671,14 @@ pub struct Cx<'a> {
     pub press_origin: Option<(f64, f64)>,
     /// Which control has the keyboard, if the surface tracks that.
     pub focus: Option<FocusId>,
+    /// Which control the pointer belongs to, if one took it.
+    pub capture: Option<CaptureId>,
+    /// What a control claimed during this dispatch, for the surface to install.
+    ///
+    /// Claimed rather than installed on the spot because *whose pointer it is*
+    /// is the surface's to hold: the widget tree is rebuilt every frame, and a
+    /// claim written into it would be forgotten by the next one.
+    claim: Option<CaptureId>,
     /// The font stack the interface draws with.
     pub fonts: FontStack,
     /// Every colour and measurement the interface is drawn from.
@@ -662,6 +695,8 @@ impl<'a> Cx<'a> {
             clicks: 1,
             press_origin: None,
             focus: None,
+            capture: None,
+            claim: None,
             fonts: FontStack::parse_css("system-ui, sans-serif"),
             theme: Theme::light(),
         }
@@ -690,6 +725,31 @@ impl<'a> Cx<'a> {
     /// Whether the drag in progress began inside `rect`.
     pub fn dragging_from(&self, rect: Rect) -> bool {
         self.press_origin.is_some_and(|(x, y)| rect.contains(x, y))
+    }
+
+    /// Take the pointer for `id` until the button comes up.
+    ///
+    /// A control does this on the press it means to be the start of a drag. The
+    /// surface reads the claim after the event has been offered to the tree and
+    /// is what remembers it.
+    pub fn take_pointer(&mut self, id: CaptureId) {
+        self.claim = Some(id);
+    }
+
+    /// What was claimed during this dispatch, if anything was.
+    pub fn claimed_pointer(&self) -> Option<CaptureId> {
+        self.claim
+    }
+
+    /// Whether `id` is the control the pointer currently belongs to.
+    pub fn holds_pointer(&self, id: CaptureId) -> bool {
+        self.capture == Some(id)
+    }
+
+    /// Whether some other control holds the pointer, so this one must not act
+    /// on it. `mine` is this control's own capture, where it has one.
+    pub fn pointer_taken(&self, mine: Option<CaptureId>) -> bool {
+        self.capture.is_some() && self.capture != mine
     }
 }
 
@@ -1549,6 +1609,64 @@ impl<A> Report<A> {
     }
 }
 
+/// Where each of several keyed children landed, in the order they were placed.
+///
+/// One shared list rather than a [`Placed`] per child, because what is asked of
+/// it is a question about all of them at once — *which of these is the pointer
+/// over* — and a list of cells the surface has to keep in step with the
+/// children is a second account of how many there are.
+pub type Placements = Rc<RefCell<Vec<(u64, Rect)>>>;
+
+/// A child that records where it landed under `key`.
+pub struct Track<A> {
+    child: Child<A>,
+    into: Placements,
+    key: u64,
+}
+
+impl<A> Track<A> {
+    /// Wrap `child` so its placed rectangle lands in `into` under `key`.
+    pub fn new(into: Placements, key: u64, child: Child<A>) -> Self {
+        Self { child, into, key }
+    }
+}
+
+impl<A> Widget<A> for Track<A> {
+    fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
+        self.child.measure(available, cx)
+    }
+
+    fn place(&mut self, rect: Rect, cx: &mut Cx) {
+        let mut placements = self.into.borrow_mut();
+        match placements.iter_mut().find(|(key, _)| *key == self.key) {
+            Some(entry) => entry.1 = rect,
+            None => placements.push((self.key, rect)),
+        }
+        drop(placements);
+        self.child.place(rect, cx);
+    }
+
+    fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
+        self.child.draw(cx, list);
+    }
+
+    fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
+        self.child.event(event, cx)
+    }
+
+    fn flex(&self) -> f64 {
+        self.child.flex()
+    }
+
+    fn describe(&self, out: &mut Vec<Described>) {
+        self.child.describe(out);
+    }
+
+    fn label_text(&self) -> Option<String> {
+        self.child.label_text()
+    }
+}
+
 impl<A> Widget<A> for Report<A> {
     fn measure(&mut self, available: Size, cx: &mut Cx) -> Size {
         self.child.measure(available, cx)
@@ -2053,6 +2171,7 @@ pub struct Button<A> {
     action: A,
     enabled: bool,
     focus: Option<FocusId>,
+    capture: Option<CaptureId>,
     rect: Rect,
     role: Role,
     value: Option<String>,
@@ -2066,6 +2185,7 @@ impl<A> Button<A> {
             action,
             enabled: true,
             focus: None,
+            capture: None,
             rect: Rect::ZERO,
             role: Role::Button,
             value: None,
@@ -2107,6 +2227,15 @@ impl<A> Button<A> {
         self.focus = Some(id);
         self
     }
+
+    /// Take the pointer on press, for a button that can be dragged.
+    ///
+    /// Only for a control that *moves* while it is dragged — a tab being
+    /// reordered. Anything that stays put is answered by where the press began.
+    pub fn capture(mut self, id: CaptureId) -> Self {
+        self.capture = Some(id);
+        self
+    }
 }
 
 impl<A: Clone> Widget<A> for Button<A> {
@@ -2138,7 +2267,15 @@ impl<A: Clone> Widget<A> for Button<A> {
             return None;
         }
         match event {
-            Event::PointerPressed if cx.hovered(self.rect) => Some(self.action.clone()),
+            Event::PointerPressed if cx.hovered(self.rect) => {
+                // A button that can be dragged takes the pointer with the
+                // press, so the rest of the drag reaches it wherever it has
+                // moved to by then.
+                if let Some(capture) = self.capture {
+                    cx.take_pointer(capture);
+                }
+                Some(self.action.clone())
+            }
             Event::Activate if self.focus.is_some() && cx.focus == self.focus => {
                 Some(self.action.clone())
             }

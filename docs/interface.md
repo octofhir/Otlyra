@@ -9,7 +9,7 @@ layout to get its geometry, and the engine never learns what a toolbar is.
 
 ## Invariants
 
-These six are why the layer is worth having. A change that breaks one of them
+These eight are why the layer is worth having. A change that breaks one of them
 is a change that needs an argument, not a patch.
 
 1. **Geometry is computed once**, by `Widget::place`, stored on the widget, and
@@ -52,7 +52,16 @@ is a change that needs an argument, not a patch.
    it. A pointer press, accessibility action, or explicit command changes the
    active root and blurs roots that remain visible in the background.
 
-7. **A popup owns the pointer and the keyboard until it is dismissed.** One
+7. **A drag names its control, not its rectangle.** A press that starts a drag
+   is answered by *the press began inside my rectangle* — one fact, no state —
+   and that is right for everything that stays where it was drawn. A control
+   that *moves* while dragged takes the pointer instead (`Button::capture`,
+   `Cx::take_pointer`), so the rest of the drag reaches it wherever it has got
+   to, and nothing else answers a move that is not theirs. A drag starts only
+   past a threshold, so a click with an unsteady hand stays a click, and Escape
+   takes it back.
+
+8. **A popup owns the pointer and the keyboard until it is dismissed.** One
    popup at a time per surface, opened with the traversal scope its rows claim
    their focus ids in, so Tab reaches those rows and wraps there instead of
    walking to controls behind the sheet. Four ways out, and all four are one
@@ -147,8 +156,8 @@ Decisions rather than omissions.
   routing. **A real dropdown** waits behind it; `segmented` stands in for a
   short list of choices meanwhile.
 - **Tooltips.** Needs a timer per surface and somewhere to hang delayed events.
-- **Dragging tabs to reorder**, and pinned tabs. The strip scrolls; neither of
-  these is in it.
+- **Pinned tabs.** The strip scrolls and its tabs can be dragged into a new
+  order; pinning is not in it.
 - **A find bar**, which needs text search over the fragment tree — engine work
   first.
 - **A live BiDi transport** — attaching to the window a person is looking at,
