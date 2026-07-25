@@ -29,6 +29,7 @@ pub mod box_tree;
 pub mod builder;
 pub mod damage;
 pub mod dump;
+pub mod find;
 pub mod flow;
 pub mod fragment;
 pub mod selection;
@@ -43,6 +44,7 @@ pub use builder::{
     build_styled_box_tree, image_sources, set_generated_text,
 };
 pub use damage::Damage;
+pub use find::PageText;
 // Re-exported because a fragment carries a style and anything reading one needs
 // the vocabulary that style is written in.
 pub use flow::{Viewport, layout, relayout_contained};

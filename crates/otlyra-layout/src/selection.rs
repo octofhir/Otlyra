@@ -58,7 +58,7 @@ impl Selection {
 }
 
 /// The runs of a page, in document order, with where each one was drawn.
-fn runs(tree: &FragmentTree) -> Vec<&Fragment> {
+pub(crate) fn runs(tree: &FragmentTree) -> Vec<&Fragment> {
     tree.iter()
         .filter(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
         .collect()
@@ -274,7 +274,7 @@ pub fn paragraph_at(tree: &FragmentTree, position: TextPosition) -> Selection {
 /// A run is in a line and a line is in the box that broke it, so the box above
 /// the line is the answer. Anonymous boxes have no identity of their own, so the
 /// line's own place in the walk stands in for one.
-fn blocks_of(tree: &FragmentTree) -> Vec<usize> {
+pub(crate) fn blocks_of(tree: &FragmentTree) -> Vec<usize> {
     fn visit(fragment: &Fragment, block: usize, next: &mut usize, out: &mut Vec<usize>) {
         if matches!(fragment.kind, FragmentKind::Text(_)) {
             out.push(block);
@@ -339,7 +339,7 @@ fn class(character: char) -> Class {
 }
 
 /// The text a run drew, if it is a run of text.
-fn text_of(fragment: &Fragment) -> Option<&str> {
+pub(crate) fn text_of(fragment: &Fragment) -> Option<&str> {
     match &fragment.kind {
         FragmentKind::Text(run) => Some(&*run.text),
         _ => None,
@@ -352,7 +352,7 @@ fn char_before(text: &str, at: usize) -> Option<char> {
 }
 
 /// Whether two runs are neighbours a word may cross: same line, no gap.
-fn joins(left: &Fragment, right: &Fragment) -> bool {
+pub(crate) fn joins(left: &Fragment, right: &Fragment) -> bool {
     (left.rect.y - right.rect.y).abs() < 0.5 && (right.rect.x - left.rect.right()).abs() < 0.5
 }
 
@@ -485,6 +485,25 @@ pub fn moved(tree: &FragmentTree, position: TextPosition, motion: Motion) -> Tex
 /// a heading and a paragraph is drawn at the height each of them was set at.
 pub fn rects(tree: &FragmentTree, selection: Selection) -> Vec<Rect> {
     let runs = runs(tree);
+    rects_over(&runs, selection)
+}
+
+/// The rectangles each of several selections covers, over one walk of the runs.
+///
+/// The same answer as calling [`rects`] for each of them, and the reason to have
+/// both: finding a word on a page produces a selection per occurrence, and
+/// collecting the page's runs once per occurrence turns a hundred matches into a
+/// hundred walks of the document.
+pub fn rects_all(tree: &FragmentTree, selections: &[Selection]) -> Vec<Vec<Rect>> {
+    let runs = runs(tree);
+    selections
+        .iter()
+        .map(|selection| rects_over(&runs, *selection))
+        .collect()
+}
+
+/// The rectangles a selection covers, against runs that have already been found.
+fn rects_over(runs: &[&Fragment], selection: Selection) -> Vec<Rect> {
     let (start, end) = selection.ends();
     let mut out = Vec::new();
 

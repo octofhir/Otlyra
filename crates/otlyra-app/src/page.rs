@@ -104,6 +104,13 @@ pub struct PageScene {
     /// A place in the text rather than a rectangle on the screen: the same
     /// rectangle means different words once the page has been laid out again.
     selection: Option<otlyra_layout::Selection>,
+    /// What the reader is looking for on the page, and where it is.
+    ///
+    /// The query is kept beside the answers because the answers do not survive a
+    /// relayout: a match is a pair of positions and a position is a run's number,
+    /// which is a number in one layout. So the page is searched again whenever it
+    /// is laid out again, rather than the matches being carried over.
+    find: Option<Found>,
     /// What the next frame has to redo.
     damage: Damage,
     /// The last list built, and what it was built from.
@@ -238,6 +245,21 @@ pub struct Numeric {
     pub step: Option<f64>,
 }
 
+/// A search over the page's text, and where the reader has got to in it.
+#[derive(Clone, Debug, PartialEq)]
+struct Found {
+    /// What is being looked for, as it was typed.
+    ///
+    /// Kept as typed rather than as it is compared, because it is what the find
+    /// bar shows and what the page is searched with again after a relayout.
+    query: String,
+    /// Every place it occurs, in document order.
+    at: Vec<otlyra_layout::Selection>,
+    /// Which of those the reader is on, counted from zero. Meaningless when there
+    /// are none, which is why the count is asked first everywhere it is read.
+    current: usize,
+}
+
 /// The smallest rectangle covering both.
 fn union(a: otlyra_layout::Rect, b: otlyra_layout::Rect) -> otlyra_layout::Rect {
     let x = a.x.min(b.x);
@@ -346,6 +368,7 @@ impl PageScene {
             background_pictures: std::collections::HashMap::new(),
             viewport_height: 0.0,
             selection: None,
+            find: None,
             damage: Damage::STYLE,
             painted: None,
             builds: 0,
@@ -410,6 +433,9 @@ impl PageScene {
             );
             self.layout = Some((width, tree));
             self.layout_stale = false;
+            // Every path to a new layout comes through here, which is what makes
+            // this the one place a search has to be asked again.
+            self.find_again();
         }
         &self.layout.as_ref().expect("just laid out").1
     }
@@ -1004,7 +1030,13 @@ impl PageScene {
         }
         let children = otlyra_layout::relayout_contained(&self.boxes, text, box_id, content);
         let (_, tree) = self.layout.as_mut()?;
-        tree.replace_contents(box_id, children).then_some(content)
+        if !tree.replace_contents(box_id, children) {
+            return None;
+        }
+        // Exchanging one box's contents renumbers every run after it, so a search
+        // over the old numbering is a search over the wrong words.
+        self.find_again();
+        Some(content)
     }
 
     /// What this build changed, in page coordinates, or `None` for all of it.
@@ -2823,6 +2855,164 @@ impl PageScene {
         }
         self.selection
             .is_some_and(|selection| !selection.is_empty())
+    }
+
+    /// Look for `query` in the text of the page, and answer how many times it
+    /// occurs.
+    ///
+    /// A case-insensitive substring of what the page reads as, and nothing more:
+    /// no regular expressions, no whole-word option, no matching a letter against
+    /// its accented form. The search runs against the layout the reader is looking
+    /// at — the last one built — because that is what a match is a place in, and
+    /// runs again by itself whenever the page is laid out again.
+    ///
+    /// The current match goes back to the first, which is what typing another
+    /// letter into a find bar means: the answers have changed, so where the reader
+    /// had got to among the old ones is not a place among these.
+    pub fn find(&mut self, query: &str) -> usize {
+        if query.is_empty() {
+            self.clear_find();
+            return 0;
+        }
+        let at = self
+            .layout
+            .as_ref()
+            .map(|(_, tree)| otlyra_layout::find::matches(tree, query))
+            .unwrap_or_default();
+        let found = Found {
+            query: query.to_owned(),
+            current: 0,
+            at,
+        };
+        let count = found.at.len();
+        if self.find.as_ref() != Some(&found) {
+            self.find = Some(found);
+            self.damage.add(Damage::PAINT);
+        }
+        count
+    }
+
+    /// What is being looked for, if anything is.
+    pub fn find_query(&self) -> Option<&str> {
+        self.find.as_ref().map(|found| found.query.as_str())
+    }
+
+    /// How many times it occurs on the page.
+    pub fn match_count(&self) -> usize {
+        self.find.as_ref().map_or(0, |found| found.at.len())
+    }
+
+    /// Which match the reader is on, counted from zero, when there is one.
+    pub fn current_match(&self) -> Option<usize> {
+        let found = self.find.as_ref()?;
+        (!found.at.is_empty()).then_some(found.current)
+    }
+
+    /// Go to the `n`th match, counting from zero and wrapping round the end.
+    ///
+    /// Wrapping rather than clamping because that is what stepping through a
+    /// find bar does at either end, and because it is the only rule under which
+    /// *next* and *previous* need no special case of their own.
+    pub fn select_match(&mut self, n: usize) -> bool {
+        let Some(found) = self.find.as_mut() else {
+            return false;
+        };
+        if found.at.is_empty() {
+            return false;
+        }
+        let current = n % found.at.len();
+        if current == found.current {
+            return false;
+        }
+        found.current = current;
+        self.damage.add(Damage::PAINT);
+        true
+    }
+
+    /// Step to the next match or the one before it, wrapping at either end.
+    pub fn step_match(&mut self, forward: bool) -> bool {
+        let Some(found) = self.find.as_ref() else {
+            return false;
+        };
+        let count = found.at.len();
+        if count == 0 {
+            return false;
+        }
+        let next = if forward {
+            found.current + 1
+        } else {
+            found.current + count - 1
+        };
+        self.select_match(next % count)
+    }
+
+    /// Stop looking, and answer whether anything was being looked for.
+    pub fn clear_find(&mut self) -> bool {
+        if self.find.take().is_none() {
+            return false;
+        }
+        self.damage.add(Damage::PAINT);
+        true
+    }
+
+    /// The rectangles every match covers, in page coordinates.
+    ///
+    /// One walk of the page's runs for all of them: a common word on a long page
+    /// is a hundred matches, and asking each of them separately would be a
+    /// hundred walks of the document.
+    pub fn match_rects(&self) -> Vec<otlyra_layout::Rect> {
+        let Some(found) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        otlyra_layout::selection::rects_all(tree, &found.at)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The rectangles the current match covers — more than one where it crosses
+    /// the runs a styled word breaks a sentence into.
+    pub fn current_match_rects(&self) -> Vec<otlyra_layout::Rect> {
+        let Some(found) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let Some(at) = found.at.get(found.current) else {
+            return Vec::new();
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        otlyra_layout::selection::rects(tree, *at)
+    }
+
+    /// What the current match reads as, which is what a test asserts on and what
+    /// a screen reader would be told.
+    pub fn current_match_text(&self) -> Option<String> {
+        let found = self.find.as_ref()?;
+        let at = found.at.get(found.current)?;
+        let (_, tree) = self.layout.as_ref()?;
+        Some(otlyra_layout::selection::text(tree, *at))
+    }
+
+    /// Search the page again, because the page has been laid out again.
+    ///
+    /// A run's number is a number in one layout, so the matches from the last one
+    /// point at whatever now happens to hold those numbers. Where the reader had
+    /// got to is kept as far as there is still something there — a resize should
+    /// not send a reader back to the top of the page — and is otherwise pulled
+    /// back to the last match there is.
+    fn find_again(&mut self) {
+        let Some(mut found) = self.find.take() else {
+            return;
+        };
+        if let Some((_, tree)) = self.layout.as_ref() {
+            found.at = otlyra_layout::find::matches(tree, &found.query);
+            found.current = found.current.min(found.at.len().saturating_sub(1));
+        }
+        self.find = Some(found);
     }
 
     fn set_selection(&mut self, selection: Option<otlyra_layout::Selection>) {
@@ -4857,6 +5047,130 @@ mod tests {
             list.items().first(),
             Some(DisplayItem::Fill { .. })
         ));
+    }
+
+    /// A search counts what is on the page, reaches across the runs a bold word
+    /// breaks a sentence into, and steps round the end.
+    #[test]
+    fn a_search_counts_what_is_on_the_page_and_steps_through_it() {
+        let (mut page, mut text) = scene("<body><p>one <b>two</b>three</p><p>Two here two</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        assert_eq!(
+            page.find("two"),
+            3,
+            "once in the first block and twice in the second"
+        );
+        assert_eq!(page.find_query(), Some("two"));
+        assert_eq!(
+            page.current_match(),
+            Some(0),
+            "a search starts at the first"
+        );
+        assert_eq!(page.current_match_text().as_deref(), Some("two"));
+
+        assert!(page.step_match(true));
+        assert_eq!(page.current_match(), Some(1));
+        assert!(page.step_match(true));
+        assert_eq!(page.current_match(), Some(2));
+        assert!(page.step_match(true));
+        assert_eq!(page.current_match(), Some(0), "and round the end");
+        assert!(page.step_match(false));
+        assert_eq!(page.current_match(), Some(2), "and back round the start");
+
+        // The word the markup broke in half is one word, and the highlight it
+        // comes back as is a rectangle over each run it crosses.
+        assert_eq!(page.find("twothree"), 1);
+        let rects = page.current_match_rects();
+        assert_eq!(
+            rects.len(),
+            2,
+            "a match over two runs is drawn over both of them: {rects:?}"
+        );
+        assert_eq!(
+            page.match_rects().len(),
+            2,
+            "and that is all there is to draw"
+        );
+
+        // Nothing typed is nothing looked for.
+        assert_eq!(page.find(""), 0);
+        assert_eq!(page.find_query(), None);
+        assert!(page.match_rects().is_empty());
+    }
+
+    /// A search that finds nothing is still a search: the bar has something to
+    /// say *none* about, and there is nothing to draw or to step to.
+    #[test]
+    fn a_search_that_finds_nothing_holds_its_query_and_offers_no_match() {
+        let (mut page, mut text) = scene("<body><p>one two three</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        assert_eq!(page.find("nowhere"), 0);
+        assert_eq!(page.find_query(), Some("nowhere"));
+        assert_eq!(page.current_match(), None);
+        assert!(!page.step_match(true), "nothing to step to");
+        assert!(page.current_match_rects().is_empty());
+
+        assert!(page.clear_find(), "and it was there to be cleared");
+        assert!(!page.clear_find(), "only once");
+    }
+
+    /// A match is a place in one layout, so a page laid out again is searched
+    /// again — the old numbers would point at whatever now holds them.
+    #[test]
+    fn a_resize_searches_the_page_again_and_keeps_where_the_reader_was() {
+        let (mut page, mut text) =
+            scene("<body><p>alpha bravo charlie delta echo</p><p>needle here</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+
+        assert_eq!(page.find("needle"), 1);
+        let wide = page.current_match_rects();
+        assert_eq!(wide.len(), 1);
+
+        // Narrow enough that the first paragraph wraps, which puts runs between
+        // the top of the page and the word that was found.
+        page.build_display_list(&mut text, 90.0, 600.0, 0.0);
+        assert_eq!(page.match_count(), 1, "the word is still on the page");
+        assert_eq!(
+            page.current_match_text().as_deref(),
+            Some("needle"),
+            "and the match still names it rather than whatever took its number"
+        );
+        let narrow = page.current_match_rects();
+        assert_eq!(narrow.len(), 1);
+        assert!(
+            narrow[0].y > wide[0].y,
+            "further down the page, because the paragraph above it now takes more \
+             lines: {narrow:?} against {wide:?}"
+        );
+    }
+
+    /// A search is not a question about a page that has not been laid out: there
+    /// is no frame for a match to be a place in.
+    #[test]
+    fn a_page_with_no_frame_yet_finds_nothing() {
+        let (mut page, _text) = scene("<body><p>one two three</p>");
+        assert_eq!(page.find("two"), 0);
+        assert!(page.match_rects().is_empty());
+    }
+
+    /// Searching asks for a frame, because the highlight is drawn in one.
+    #[test]
+    fn a_search_asks_for_the_next_frame() {
+        let (mut page, mut text) = scene("<body><p>one two three</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        let builds = page.builds();
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(
+            page.builds(),
+            builds,
+            "an unchanged page is not built again"
+        );
+
+        assert_eq!(page.find("two"), 1);
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.builds(), builds + 1, "and a search is a change");
     }
 }
 

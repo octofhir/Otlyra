@@ -136,21 +136,21 @@ browser window when required.
 Chosen over cookies/cache, page zoom and the half-drawn controls because it is
 entirely ours, it is what a reader of a document reaches for, and it lands on
 the popup, focus-scope and traversal contracts this priority already built.
-Three slices, each shippable on its own:
 
-- [ ] **Engine.** One linearized text of the laid-out page — the runs in paint
-  order, with a map from an offset back to (run, byte range) — so a match may
-  span the runs a bold word breaks a sentence into. Case-insensitive substring
-  to start; no regular expressions, and say so. `PageScene::find(query)` reports
-  how many, `select_match(n)` marks one. Reuse the selection's own arithmetic:
-  a match is the same *two places in the page's text* a selection is, so its
-  rectangles come from machinery that is already right about ligatures, line
-  breaks and bidi runs.
+The engine is in: `otlyra_layout::find` strings the runs into one sequence with
+each character carrying the run and bytes it came from, and answers in
+`Selection`s, so a match is drawn by the arithmetic that is already right about
+ligatures, line breaks and bidi runs. `PageScene::find/step_match/match_rects`
+hold the search per page and run it again on every relayout. Nothing paints it
+yet. What is left:
+
 - [ ] **Highlights and reaching them.** Every match washed, the current one
   drawn strongly, painted through the existing highlight layer rather than a
-  second overlay. Bringing the current match on screen closes a stated gap —
-  nothing scrolls into view today — so it is `scroll_to_rect` on the page, which
-  the inspector's reveal wants as well.
+  second overlay. `otlyra_paint::Frame::selection` is one slice of rectangles in
+  one colour today, so it needs a second strength rather than a second overlay.
+  Bringing the current match on screen closes a stated gap — nothing scrolls
+  into view today — so it is `scroll_to_rect` on the page, which the inspector's
+  reveal wants as well.
 - [ ] **The bar.** A panel on the popup contract: its own text field, the count
   as *3 of 17*, previous/next, and a close cross. ⌘F opens and focuses it, Enter
   and shift-Enter step, Escape closes it and drops the highlights, ⌘G steps
