@@ -106,7 +106,13 @@ are the two consumers they were written from.
 
 - [ ] Traversal *between* roots: Tab from the last chrome control into the page
   and on into the inspector, in a stated order, with the active surface
-  following it.
+  following it. **Blocked on the page having any traversal at all**: nothing in
+  `page.rs` reads `Key::Tab`, so a document's links and controls are reachable
+  only by pointer today. The pieces to build on are there — `PageScene::focus_node`
+  moves the focus and shows the ring, `is_focusable` says what may take it — but
+  it answers for form controls only, so an `<a href>` is not yet focusable and
+  sequential focus navigation has no order to walk. Do the page's own order
+  first, then hand the keyboard on at either end.
 - [ ] Extend pointer capture past the chrome surface. The contract exists —
   `CaptureId`, `Button::capture`, `Cx::take_pointer`, threshold, move, drop,
   cancel — and dragging a tab to reorder it is its consumer. What is left is
