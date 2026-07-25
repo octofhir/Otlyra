@@ -716,6 +716,21 @@ pub enum Bookmarked {
     Yes,
 }
 
+/// One place the omnibox offers under what has been typed.
+///
+/// Where it came from — somewhere the reader has been, something they kept — is
+/// the browser's to decide; the row only shows it and reports the address if it
+/// is taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    /// What the page is called.
+    pub title: String,
+    /// The address it opens.
+    pub url: String,
+    /// Whether the reader kept it, which is what the star on the row says.
+    pub kept: bool,
+}
+
 /// A tab being dragged along the strip.
 ///
 /// The order itself is not here: it is the browser's, and the drag reports
@@ -780,15 +795,42 @@ enum Popup {
         /// What the browser decided to offer there.
         rows: Vec<ContextRow>,
     },
+    /// Where the omnibox could take what has been typed.
+    Suggestions {
+        /// What the browser found, best first.
+        rows: Vec<Suggestion>,
+        /// Which row the arrows have reached, if any.
+        ///
+        /// Walking is not taking: the field keeps what was typed and keeps the
+        /// keyboard, and only Return takes what the mark reached. A list that
+        /// filled the field as the arrows moved would narrow itself under the
+        /// reader down to the row they had just got to.
+        marked: Option<usize>,
+    },
 }
 
 impl Popup {
     /// The traversal trap this popup's rows are claimed in.
-    fn scope(&self) -> FocusScopeId {
+    ///
+    /// `None` for a popup that does not own the keyboard: the omnibox's
+    /// suggestions hang under a field the reader is still typing into, so the
+    /// keyboard stays where it is and the arrows walk the list instead.
+    fn scope(&self) -> Option<FocusScopeId> {
         match self {
-            Self::Menu => MENU_SCOPE,
-            Self::Context { .. } => CONTEXT_SCOPE,
+            Self::Menu => Some(MENU_SCOPE),
+            Self::Context { .. } => Some(CONTEXT_SCOPE),
+            Self::Suggestions { .. } => None,
         }
+    }
+
+    /// Whether a sheet under it takes every press that misses the panel.
+    ///
+    /// A menu is modal to the pointer: pressing anywhere else means *put this
+    /// away* and nothing more. Suggestions are not — a reader who clicks the
+    /// page while the list is showing means to click the page, and a sheet
+    /// would also stop the wheel from scrolling what is behind it.
+    fn has_sheet(&self) -> bool {
+        !matches!(self, Self::Suggestions { .. })
     }
 }
 
@@ -851,6 +893,12 @@ pub struct BrowserUi {
     drag: Option<TabDrag>,
     /// What the pointer is resting on, for the panel that names it.
     resting: Option<Resting>,
+    /// Where the open popup's panel was drawn, for a press to be tested
+    /// against when there is no sheet to catch it.
+    popup_rect: crate::widget::Placed,
+    /// Where the address field was drawn, which is what the suggestions hang
+    /// under. From the frame that placed it, like every other geometry here.
+    address_rect: Rect,
     /// Where each tab landed in the last frame, by tab id.
     ///
     /// Read to answer *which tab is the pointer over* during a drag. From the
@@ -932,6 +980,8 @@ impl BrowserUi {
             capture: None,
             drag: None,
             resting: None,
+            popup_rect: std::rc::Rc::new(std::cell::Cell::new(Rect::ZERO)),
+            address_rect: Rect::ZERO,
             tab_places: crate::widget::Placements::default(),
             clicks: 1,
             cache: None,
@@ -1233,7 +1283,22 @@ impl BrowserUi {
     /// An open menu counts as the interface wherever it reaches, which is how a
     /// press on the panel stops being a press on the document under it.
     pub fn owns_pointer(&self) -> bool {
-        self.pointer.1 < UI_HEIGHT || self.popup_open()
+        self.pointer.1 < UI_HEIGHT || self.popup_owns(self.pointer.0, self.pointer.1)
+    }
+
+    /// Whether a press at `x`, `y` belongs to the open popup.
+    ///
+    /// A menu's sheet answers everywhere, which is what makes a press outside
+    /// it mean *put this away* and nothing else. The omnibox's suggestions
+    /// claim only the panel itself, so a press on the page is a press on the
+    /// page — dismissing the list on the way through rather than swallowing
+    /// the click the reader plainly meant.
+    pub fn popup_owns(&self, x: f64, y: f64) -> bool {
+        match self.popup.as_ref() {
+            Some(popup) if popup.has_sheet() => true,
+            Some(_) => self.popup_rect.get().contains(x, y),
+            None => false,
+        }
     }
 
     /// Whether a press that began in the interface still owns pointer motion.
@@ -1410,7 +1475,13 @@ impl BrowserUi {
         // Only the keyboard that was inside the popup moves. One resting
         // somewhere else — a field the reader pressed on the way out — stays
         // exactly where the press put it.
-        if self.focused.is_none() || self.focus.scope(self.focused) == Some(popup.scope()) {
+        // Only a popup that owned the keyboard gives it back or takes it away.
+        // The omnibox's suggestions never had it: the caret stayed in the field
+        // the whole time, and moving it now would be the list taking something
+        // it was never given.
+        if let Some(scope) = popup.scope()
+            && (self.focused.is_none() || self.focus.scope(self.focused) == Some(scope))
+        {
             self.focused = if restore { back } else { None };
         }
     }
@@ -1433,6 +1504,79 @@ impl BrowserUi {
     pub fn dismiss_context_menu(&mut self) {
         if matches!(self.popup, Some(Popup::Context { .. })) {
             self.close_popup(false);
+        }
+    }
+
+    /// Offer these places under the address field, or none at all.
+    ///
+    /// The browser decides what they are and when they change; the interface
+    /// only shows them. Nothing is offered unless the field has the keyboard —
+    /// a list under a field nobody is typing into is a panel in the way — and
+    /// a menu already open wins, because it was asked for and this was not.
+    pub fn set_suggestions(&mut self, rows: Vec<Suggestion>) {
+        if rows.is_empty() || !self.address_focused() {
+            if matches!(self.popup, Some(Popup::Suggestions { .. })) {
+                self.close_popup(false);
+            }
+            return;
+        }
+        match self.popup.as_mut() {
+            Some(Popup::Suggestions {
+                rows: showing,
+                marked,
+            }) => {
+                if *showing != rows {
+                    *showing = rows;
+                    // What was reached is a row in the old list. Keeping the
+                    // number would leave the mark on whatever now sits there.
+                    *marked = None;
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.popup = Some(Popup::Suggestions { rows, marked: None });
+                self.resting = None;
+            }
+        }
+    }
+
+    /// The address the marked suggestion would take, if one is marked.
+    fn marked_suggestion(&self) -> Option<String> {
+        let Some(Popup::Suggestions { rows, marked }) = self.popup.as_ref() else {
+            return None;
+        };
+        rows.get((*marked)?).map(|row| row.url.clone())
+    }
+
+    /// Walk the offered places, wrapping at both ends.
+    ///
+    /// Past the last row is back to no row at all rather than round to the
+    /// first: leaving the list is how a reader keeps what they typed.
+    fn mark_suggestion(&mut self, forward: bool) {
+        let Some(Popup::Suggestions { rows, marked }) = self.popup.as_mut() else {
+            return;
+        };
+        let count = rows.len();
+        *marked = match (*marked, forward) {
+            (None, true) => Some(0),
+            (None, false) => Some(count - 1),
+            (Some(at), true) if at + 1 < count => Some(at + 1),
+            (Some(_), true) => None,
+            (Some(0), false) => None,
+            (Some(at), false) => Some(at - 1),
+        };
+    }
+
+    /// Whether the omnibox is offering anywhere to go.
+    pub fn suggesting(&self) -> bool {
+        matches!(self.popup, Some(Popup::Suggestions { .. }))
+    }
+
+    /// What it is offering, in the order it offers it.
+    pub fn suggestions(&self) -> &[Suggestion] {
+        match self.popup.as_ref() {
+            Some(Popup::Suggestions { rows, .. }) => rows,
+            _ => &[],
         }
     }
 
@@ -1563,6 +1707,15 @@ impl BrowserUi {
             return UiAction::None;
         }
 
+        // The arrows walk the offered places without taking one and without
+        // moving the keyboard, which stays in the field the reader is typing
+        // into. That is what a list under a field is: a longer answer to what
+        // is in it, not somewhere else to be.
+        if self.suggesting() && matches!(key, Key::Down | Key::Up) && !modifiers.is_accelerator() {
+            self.mark_suggestion(key == Key::Down);
+            return UiAction::None;
+        }
+
         // The arrows walk an open menu, which is what every menu on every
         // platform does and what a reader who opened one from the keyboard
         // reaches for before Tab. They are the way *into* it as well: the
@@ -1629,8 +1782,13 @@ impl BrowserUi {
 
         match key {
             Key::Enter => {
+                // What the arrows reached, if they reached anything; otherwise
+                // what was typed. Taking the mark is the only thing that takes
+                // it — walking never put it in the field.
+                let taken = self.marked_suggestion();
+                self.close_popup(false);
                 self.focused = None;
-                let typed = self.address.text().trim().to_owned();
+                let typed = taken.unwrap_or_else(|| self.address.text().trim().to_owned());
                 if typed.is_empty() {
                     UiAction::None
                 } else {
@@ -1809,8 +1967,8 @@ impl BrowserUi {
         // band: an open menu hangs below the toolbar, and both drawing and hit
         // testing have to reach it there.
         let surface = Size::new(width, height.max(UI_HEIGHT));
-        let mut root = self.build();
         let mut cx = self.cx(text);
+        let mut root = self.build(&mut cx);
         root.measure(surface, &mut cx);
         root.place(Rect::new(0.0, 0.0, surface.width, surface.height), &mut cx);
         root.draw(&mut cx, list);
@@ -1840,21 +1998,25 @@ impl BrowserUi {
         );
 
         self.root = Some(root);
-        self.dirty = address_only.then(|| {
+        // Where the field is, from the frame that placed it: the suggestions
+        // hang under it, and a rectangle worked out a second time from the
+        // toolbar's arithmetic would part company with the one on screen.
+        let field = {
             let mut described = Vec::new();
             self.root
                 .as_ref()
                 .expect("the chrome tree was just built")
                 .describe(&mut described);
-            // The focus halo reaches three logical pixels outside the field and
-            // antialiasing can touch one more.
             described
                 .into_iter()
                 .find(|node| node.role == Role::TextInput)
                 .expect("the toolbar has an address field")
                 .rect
-                .inflate(4.0)
-        });
+        };
+        self.address_rect = field;
+        // The focus halo reaches three logical pixels outside the field and
+        // antialiasing can touch one more.
+        self.dirty = address_only.then(|| field.inflate(4.0));
         let built = std::sync::Arc::new(built);
         self.cache = Some((appearance, std::sync::Arc::clone(&built)));
         built
@@ -2029,7 +2191,7 @@ impl BrowserUi {
     }
 
     /// Build the short-lived parent around two persistent migration boundaries.
-    fn build(&self) -> Child<UiAction> {
+    fn build(&self, cx: &mut Cx) -> Child<UiAction> {
         let theme = self.theme.clone();
         let focus = self.focus.clone();
         // A column with an empty flexible tail rather than an aligner: an
@@ -2076,33 +2238,62 @@ impl BrowserUi {
         };
 
         // Its rows claim their ids inside the popup's own scope, which is what
-        // keeps Tab on the panel while it is open.
-        focus.open_scope(popup.scope());
+        // keeps Tab on the panel while it is open. A popup that does not own
+        // the keyboard opens none: its rows are not places the keyboard goes.
+        if let Some(scope) = popup.scope() {
+            focus.open_scope(scope);
+        }
+        // Each panel reports where it landed — inside its anchor rather than
+        // around it, or the rectangle would be the whole window the anchor was
+        // given rather than the panel it placed inside it.
+        let reported = |panel: Child<UiAction>| -> Child<UiAction> {
+            Box::new(crate::widget::Report::new(
+                std::rc::Rc::clone(&self.popup_rect),
+                panel,
+            ))
+        };
         let panel: Child<UiAction> = match popup {
             Popup::Menu => Box::new(crate::widget::Anchored::from_right(
                 theme.inset,
                 UI_HEIGHT - 2.0,
-                menu(&theme, &focus, self.bookmark),
+                reported(menu(&theme, &focus, self.bookmark)),
+            )),
+            // Under the field, as wide as the field, because it is a longer
+            // answer to what is in it — a panel of another width would read as
+            // a different thing rather than as more of the same one.
+            Popup::Suggestions { rows, marked } => Box::new(crate::widget::Anchored::at(
+                self.address_rect.x,
+                self.address_rect.y + self.address_rect.height + 4.0,
+                reported(Box::new(Fixed::width(
+                    self.address_rect.width,
+                    suggestions(&theme, cx, self.address_rect.width, rows, *marked),
+                ))),
             )),
             // At the pointer, and flipped back onto the window at an edge: a
             // menu asked for near the bottom right belongs above and to the
             // left of the press, not half off the window.
             Popup::Context { at, rows } => Box::new(
-                crate::widget::Anchored::at(at.0, at.1, context_menu(&theme, &focus, rows))
-                    .flipped(),
+                crate::widget::Anchored::at(
+                    at.0,
+                    at.1,
+                    reported(context_menu(&theme, &focus, rows)),
+                )
+                .flipped(),
             ),
         };
-        focus.close_scope();
-
+        if popup.scope().is_some() {
+            focus.close_scope();
+        }
         // Panel first in the list so it is drawn last and answers first; the
         // sheet under it catches every press that misses, which is what makes
         // clicking anywhere else dismiss the popup without also doing whatever
         // was under the pointer.
-        Box::new(crate::widget::Overlay::new(vec![
-            rows,
-            controls::scrim(UiAction::DismissPopup),
-            panel,
-        ]))
+        let mut layers: Vec<Child<UiAction>> = vec![rows];
+        if popup.has_sheet() {
+            layers.push(controls::scrim(UiAction::DismissPopup));
+        }
+        layers.push(panel);
+        Box::new(crate::widget::Overlay::new(layers))
     }
 }
 
@@ -2387,6 +2578,102 @@ fn context_menu(theme: &Theme, focus: &Focus, rows: &[ContextRow]) -> Child<UiAc
         })
         .collect();
     controls::menu_panel(theme, 236.0, built)
+}
+
+/// What the omnibox offers under what has been typed.
+///
+/// A row says what the page is called and where it goes, because a title alone
+/// is not enough to tell two pages of a site apart and an address alone is not
+/// what a person remembers a page by. The marked row is drawn as though the
+/// pointer were on it: the arrows and the pointer reach the same rows, and
+/// there is no second way of showing which one is about to be taken.
+fn suggestions(
+    theme: &Theme,
+    cx: &mut Cx,
+    width: f64,
+    rows: &[Suggestion],
+    marked: Option<usize>,
+) -> Child<UiAction> {
+    // What is left for the words once the mark, the gaps and the panel's own
+    // padding have had their share. Cut here, with the engine that will draw
+    // them: a title that overflowed would run out of the panel.
+    let room = (width - 16.0 - theme.gap * 4.5 - theme.inset).max(0.0);
+    let built = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let title = controls::elide(cx, &row.title, room, theme.font_size, Elide::End);
+            // An address is cut at the *front*: what tells two of them apart is
+            // usually the end of the path, and the host is already the part a
+            // reader can guess.
+            let url = controls::elide(cx, &row.url, room, theme.font_size_small, Elide::Start);
+            let ink = theme.ink;
+            let dim = theme.ink_dim;
+            let kept = row.kept;
+            let mark: Child<UiAction> = Box::new(Align::centre(Box::new(Painted::new(
+                16.0,
+                16.0,
+                move |rect, _cx, list| {
+                    if kept {
+                        icon::star(list, rect, ink);
+                    } else {
+                        icon::clock(list, rect, dim);
+                    }
+                },
+            ))));
+            let words = Stack::column(
+                0.0,
+                vec![
+                    Box::new(Align::left(Box::new(Label::new(
+                        title,
+                        theme.font_size,
+                        theme.ink,
+                    )))),
+                    Box::new(Align::left(Box::new(Label::new(
+                        url,
+                        theme.font_size_small,
+                        theme.ink_dim,
+                    )))),
+                ],
+            );
+            let mut face = Background::new(
+                if marked == Some(index) {
+                    theme.hover
+                } else {
+                    Theme::CLEAR
+                },
+                theme.radius_small,
+                Box::new(Padding::new(
+                    Insets::symmetric(theme.gap * 1.5, theme.gap * 0.5),
+                    Box::new(Stack::row(
+                        theme.gap * 1.5,
+                        vec![
+                            mark,
+                            Box::new(crate::widget::Flex::new(1.0, Box::new(words))),
+                        ],
+                    )),
+                )),
+            );
+            face = face.on_hover(theme.hover).on_press(theme.press);
+            Box::new(Button::new(
+                UiAction::Navigate(row.url.clone()),
+                Box::new(face),
+            )) as Child<UiAction>
+        })
+        .collect();
+
+    Box::new(Background::new(
+        theme.raised,
+        theme.radius,
+        Box::new(controls::Outline::new(
+            theme.border,
+            theme.radius,
+            Box::new(Padding::new(
+                Insets::all(theme.gap * 0.75),
+                Box::new(Stack::column(1.0, built)),
+            )),
+        )),
+    ))
 }
 
 /// The hairline between two background tabs.

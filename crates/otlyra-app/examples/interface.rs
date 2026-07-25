@@ -45,6 +45,10 @@ struct Frame {
     /// been drawn, because what the pointer is resting *on* is read off the
     /// frame that drew it.
     rest_at: Option<(f64, f64)>,
+    /// What the omnibox offers under what is typed, for the state that shows
+    /// the list. Applied after a frame, because the panel hangs off the
+    /// field's own rectangle and that is read off the frame that placed it.
+    suggestions: Vec<otlyra_app::ui::Suggestion>,
     text: TextEngine,
     clipboard: InMemory,
 }
@@ -73,6 +77,9 @@ impl Frame {
                 &mut self.text,
                 &mut self.clipboard,
             );
+        }
+        if !self.suggestions.is_empty() {
+            self.ui.set_suggestions(self.suggestions.clone());
         }
         if let Some((x, y)) = self.rest_at {
             self.ui.pointer_moved(x, y, &mut self.text);
@@ -534,6 +541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         select_address: false,
         tabs_pressed: 0,
         rest_at: None,
+        suggestions: Vec::new(),
         text: TextEngine::new(),
         clipboard: InMemory::default(),
     };
@@ -659,6 +667,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.ui.address.set_text("https://example.com/");
     menu.ui.open_menu();
     frames.push(menu);
+
+    // The omnibox offering somewhere to go under what has been typed: the one
+    // panel that hangs off a control's own rectangle and is as wide as it.
+    let mut offering = toolbar(
+        "suggestions",
+        tabs(&[("Otlyra", false)]),
+        0,
+        (true, false),
+        None,
+    );
+    offering.ui.address.set_text("otl");
+    offering.focus_address = true;
+    offering.suggestions = vec![
+        otlyra_app::ui::Suggestion {
+            title: "Otlyra — a browser engine".to_owned(),
+            url: "https://octofhir.github.io/Otlyra/".to_owned(),
+            kept: true,
+        },
+        otlyra_app::ui::Suggestion {
+            title: "Otlyra browser UI plan".to_owned(),
+            url:
+                "https://octofhir.github.io/Otlyra/plan/browser-ui/and/a/path/long/enough/to/be/cut"
+                    .to_owned(),
+            kept: false,
+        },
+        otlyra_app::ui::Suggestion {
+            title: "otlyra — search".to_owned(),
+            url: "https://example.com/search?q=otlyra".to_owned(),
+            kept: false,
+        },
+    ];
+    frames.push(offering);
 
     // The pointer resting on a control long enough to be told what it is.
     let mut named = toolbar(

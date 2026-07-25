@@ -2288,6 +2288,58 @@ impl Browser {
         }
     }
 
+    /// Offer the omnibox somewhere to go, from what has been typed.
+    ///
+    /// Kept pages first and then where the reader has been, newest first,
+    /// because a page somebody kept is a page they meant to come back to and
+    /// one they visited once may not be. Matching is on the address and on the
+    /// title, without case: a person typing "otl" is as likely to be reaching
+    /// for the words in the title as for the host.
+    fn refresh_suggestions(&mut self) {
+        const OFFERED: usize = 6;
+
+        if !self.ui.address_focused() {
+            self.ui.set_suggestions(Vec::new());
+            return;
+        }
+        let typed = self.ui.address.text().trim().to_lowercase();
+        if typed.is_empty() {
+            self.ui.set_suggestions(Vec::new());
+            return;
+        }
+        let matches = |url: &str, title: &str| {
+            url.to_lowercase().contains(&typed) || title.to_lowercase().contains(&typed)
+        };
+
+        let mut rows: Vec<crate::ui::Suggestion> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for bookmark in self.bookmarks.bookmarks() {
+            if rows.len() == OFFERED {
+                break;
+            }
+            if matches(&bookmark.url, &bookmark.title) && seen.insert(bookmark.url.clone()) {
+                rows.push(crate::ui::Suggestion {
+                    title: bookmark.title.clone(),
+                    url: bookmark.url.clone(),
+                    kept: true,
+                });
+            }
+        }
+        for visit in self.history.visits() {
+            if rows.len() == OFFERED {
+                break;
+            }
+            if matches(&visit.url, &visit.title) && seen.insert(visit.url.clone()) {
+                rows.push(crate::ui::Suggestion {
+                    title: visit.title.clone(),
+                    url: visit.url.clone(),
+                    kept: false,
+                });
+            }
+        }
+        self.ui.set_suggestions(rows);
+    }
+
     /// Offer a menu for whatever the reader asked over.
     ///
     /// The rows are decided here rather than in the interface because every one
@@ -2601,7 +2653,7 @@ impl Browser {
     fn update_cursor(&mut self, x: f64, y: f64) {
         self.cursor = if let Some(interface) = self.ui.cursor_at(x, y, &mut self.text) {
             interface
-        } else if y < UI_HEIGHT || self.ui.popup_open() {
+        } else if y < UI_HEIGHT || self.ui.popup_owns(x, y) {
             // Over the interface but over nothing in it.
             Cursor::Default
         } else if y >= self.dock_top() {
@@ -3245,7 +3297,15 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerPressed { clicks } => {
-                let surface = if self.ui.popup_open() || self.pointer.1 < UI_HEIGHT {
+                // A popup owns the press only where it is drawn — a menu's
+                // sheet is drawn everywhere, a list of suggestions only under
+                // the field. Outside it, the press is the page's and the list
+                // goes away on the way past.
+                let owned = self.ui.popup_owns(self.pointer.0, self.pointer.1);
+                if !owned {
+                    self.ui.dismiss_popup();
+                }
+                let surface = if owned || self.pointer.1 < UI_HEIGHT {
                     SURFACE_CHROME
                 } else if self.inspector.open && self.pointer.1 >= self.dock_top() {
                     SURFACE_INSPECTOR
@@ -3261,11 +3321,11 @@ impl Painter for Browser {
                 // press and returns before the toolbar's own press handler runs, so
                 // without this the caret and its selection would sit in a field the
                 // reader has plainly clicked away from.
-                if self.pointer.1 >= UI_HEIGHT && !self.ui.popup_open() {
+                if self.pointer.1 >= UI_HEIGHT && !owned {
                     self.ui.blur();
                 }
                 // The panel owns everything below its own top edge.
-                if self.pointer.1 >= self.dock_top() && !self.ui.popup_open() {
+                if self.pointer.1 >= self.dock_top() && !owned {
                     let action = self.inspector.pointer_pressed();
                     self.apply_inspector(action);
                     return;
@@ -3300,7 +3360,7 @@ impl Painter for Browser {
                 // The settings surface owns everything below the toolbar while it
                 // is showing, so a press there never reaches the document behind
                 // it — there is no document behind it.
-                if self.pointer.1 >= UI_HEIGHT && !self.ui.popup_open() {
+                if self.pointer.1 >= UI_HEIGHT && !owned {
                     match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
                             let before = self.settings.settings.clone();
@@ -3567,6 +3627,7 @@ impl Painter for Browser {
                     || modifiers.is_accelerator()
                     || (key == Key::Escape && self.ui.popup_open());
                 if self.keyboard_surface == SURFACE_CHROME || global {
+                    let typed = self.ui.address.text().to_owned();
                     let action = self.ui.key_pressed(
                         key,
                         modifiers,
@@ -3576,6 +3637,12 @@ impl Painter for Browser {
                     let none = action == UiAction::None;
                     let address = self.ui.address_focused();
                     self.apply(action);
+                    // Only when the key changed what is in the field: Escape
+                    // puts the list away, and a refresh that ran anyway would
+                    // put it straight back.
+                    if typed != self.ui.address.text() {
+                        self.refresh_suggestions();
+                    }
                     if address {
                         self.activate_surface(SURFACE_CHROME);
                     }
@@ -3615,8 +3682,11 @@ impl Painter for Browser {
                         }
                         _ => {}
                     },
-                    SURFACE_CHROME => {
-                        let _ = self.ui.text_input(character);
+                    SURFACE_CHROME if self.ui.text_input(character) => {
+                        // What is offered is a function of what is typed, so it
+                        // is settled here rather than remembered: one place
+                        // that can go stale instead of two.
+                        self.refresh_suggestions();
                     }
                     _ => {}
                 }
@@ -5244,6 +5314,145 @@ mod tests {
         assert_eq!(
             browser.tabs[browser.active].id, order[2],
             "the tab being read must still be the tab being read"
+        );
+    }
+
+    /// Put the caret in the address bar the way a reader does, so the browser
+    /// knows the chrome is what the keyboard belongs to.
+    fn name_the_address_bar(browser: &mut Browser) {
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Character('l'),
+            modifiers: Modifiers {
+                command: cfg!(target_os = "macos"),
+                control: !cfg!(target_os = "macos"),
+                ..Modifiers::default()
+            },
+        });
+        assert!(browser.ui().address_focused(), "the caret is in the field");
+    }
+
+    /// Typing in the omnibox offers where the reader has been and what they
+    /// kept, and Return takes what the arrows reached rather than what was
+    /// typed — which is the whole reason to offer anything.
+    #[test]
+    fn typing_offers_places_and_the_arrows_take_one() {
+        let (mut browser, requests) = browser_with_log();
+        go(&mut browser, "start.example");
+        browser
+            .bookmarks
+            .add("https://kept.example/page", "A kept page");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(1000, 700, 1.0),
+        );
+
+        name_the_address_bar(&mut browser);
+        browser.ui.address.clear();
+        for character in "example".chars() {
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+        assert!(
+            browser.ui().suggesting(),
+            "typing something both stores know offered nothing"
+        );
+
+        // A kept page comes before a place merely visited: it was kept because
+        // the reader meant to come back to it.
+        let offered: Vec<String> = browser
+            .ui()
+            .suggestions()
+            .iter()
+            .map(|row| row.url.clone())
+            .collect();
+        assert_eq!(
+            offered.first().map(String::as_str),
+            Some("https://kept.example/page")
+        );
+        assert!(offered.iter().any(|url| url.contains("start.example")));
+        assert!(browser.ui().suggestions()[0].kept);
+
+        // Down marks the first row without touching what was typed, and Return
+        // takes the marked one.
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Down,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            browser.ui().address.text(),
+            "example",
+            "walking the list rewrote the field"
+        );
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        });
+        settle(&mut browser);
+        assert_eq!(
+            asked_for(&requests).last().map(String::as_str),
+            Some("https://kept.example/page"),
+            "Return took what was typed rather than what the arrows reached"
+        );
+        assert!(!browser.ui().suggesting(), "the list outlived the choice");
+    }
+
+    /// Escape puts the list away and leaves the caret where it was.
+    #[test]
+    fn escape_puts_the_offered_places_away_and_keeps_the_caret() {
+        let (mut browser, _requests) = browser_with_log();
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(1000, 700, 1.0),
+        );
+        name_the_address_bar(&mut browser);
+        browser.ui.address.clear();
+        for character in "start".chars() {
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+        assert!(browser.ui().suggesting());
+
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Escape,
+            modifiers: Modifiers::default(),
+        });
+        assert!(!browser.ui().suggesting(), "Escape left the list showing");
+        assert!(
+            browser.ui().address_focused(),
+            "Escape took the caret out of the field as well as the list"
+        );
+    }
+
+    /// A press on the page while the list is showing is a press on the page:
+    /// the list has no sheet, so it dismisses on the way through rather than
+    /// swallowing the click the reader meant.
+    #[test]
+    fn a_press_on_the_page_goes_through_the_suggestions() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(1000, 700, 1.0),
+        );
+        name_the_address_bar(&mut browser);
+        browser.ui.address.clear();
+        for character in "start".chars() {
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(1000, 700, 1.0),
+        );
+        assert!(browser.ui().suggesting());
+
+        let (x, y) = link_position(&browser);
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        settle(&mut browser);
+
+        assert!(!browser.ui().suggesting(), "the list stayed over the page");
+        assert_eq!(
+            browser.tabs[browser.active].url, "https://start.example/next",
+            "the press that dismissed the list never reached the link"
         );
     }
 

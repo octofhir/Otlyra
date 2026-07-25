@@ -121,7 +121,11 @@ are the two consumers they were written from.
   on, scheduled through the frame deadline the caret already uses; the settings,
   history, downloads and inspector surfaces do not.
 - [ ] Build the surfaces that should be on the popup contract and are not built
-  at all: a dropdown, omnibox suggestions, permission prompts.
+  at all: a dropdown, and permission prompts (which need something that asks for
+  a permission first). Omnibox suggestions are on it, and are what taught the
+  contract that a popup need not own the keyboard: theirs stays in the field,
+  the arrows walk the rows, and there is no sheet, so a press outside reaches
+  what it landed on rather than being swallowed by a dismissal.
 
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.

@@ -68,10 +68,14 @@ is a change that needs an argument, not a patch.
    drift. It is not a popup: it takes no focus, catches no press, and goes when
    the pointer moves off, when anything is pressed, or when a key is struck.
 
-9. **A popup owns the pointer and the keyboard until it is dismissed.** One
-   popup at a time per surface, opened with the traversal scope its rows claim
-   their focus ids in, so Tab reaches those rows and wraps there instead of
-   walking to controls behind the sheet. Four ways out, and all four are one
+9. **A popup owns the pointer, and usually the keyboard, until it is
+   dismissed.** One popup at a time per surface. A menu owns the keyboard: it
+   opens a traversal scope its rows claim their focus ids in, so Tab reaches
+   those rows and wraps there instead of walking to controls behind the sheet.
+   A list under a field the reader is still typing into owns neither the
+   keyboard nor the whole window: it opens no scope, the arrows walk its rows
+   without taking one, and it has no sheet — so a press outside reaches what it
+   landed on and the list goes away on the way through. Four ways out, and all four are one
    code path: a press outside it, Escape, the keyboard being named elsewhere,
    and the thing it belongs to going away — a navigation, a resize, another
    root becoming the active one. Escape puts the keyboard back where it was;

@@ -244,6 +244,29 @@ fn the_open_menu_outline_is_stable() {
     insta::assert_snapshot!(outline(&list));
 }
 
+/// What the omnibox offers under what has been typed: as wide as the field,
+/// hanging off its own rectangle rather than off a number written here.
+#[test]
+fn the_suggestions_outline_is_stable() {
+    let (mut ui, tabs, mut text) = toolbar();
+    toolbar_list(&mut ui, &tabs, &mut text, None);
+    ui.focus_address();
+    ui.set_suggestions(vec![
+        otlyra_app::ui::Suggestion {
+            title: "Otlyra — a browser engine".to_owned(),
+            url: "https://octofhir.github.io/Otlyra/".to_owned(),
+            kept: true,
+        },
+        otlyra_app::ui::Suggestion {
+            title: "Search results".to_owned(),
+            url: "https://example.com/search?q=widgets".to_owned(),
+            kept: false,
+        },
+    ]);
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    insta::assert_snapshot!(outline(&list));
+}
+
 /// The panel that names what the pointer has been resting on.
 #[test]
 fn the_tooltip_outline_is_stable() {
