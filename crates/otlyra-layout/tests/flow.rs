@@ -1455,3 +1455,47 @@ fn flex_items_are_measured_at_the_width_they_end_up_with() {
         "and the other two are stretched to match it: {items:?}"
     );
 }
+
+/// A column of items with `flex-basis: 0` is a column of their own heights, not
+/// a column of nothing.
+///
+/// Down a column the main axis is the height, and a container that is as tall as
+/// its contents has no free space to share out — so items that started at a
+/// basis of nothing stayed nothing. `min-height: auto` is the rule that stops
+/// that, and it is the rule a responsive layout leans on: the same three cards
+/// that sit in a row on a wide window stack on a narrow one, and stacked they
+/// came out as three empty lines.
+#[test]
+fn a_column_of_zero_basis_items_is_as_tall_as_what_is_in_it() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'><div style='display: flex; flex-direction: column'>\
+         <div style='flex-grow: 1; flex-basis: 0'>one</div>\
+         <div style='flex-grow: 1; flex-basis: 0'>two<br>three</div></div>",
+        400.0,
+    );
+
+    let column = tree
+        .root
+        .children
+        .first()
+        .and_then(|html| html.children.first())
+        .and_then(|body| body.children.first())
+        .expect("a flex container");
+    let items: Vec<f32> = column
+        .children
+        .iter()
+        .filter(|child| matches!(child.kind, FragmentKind::Box))
+        .map(|child| child.rect.height)
+        .collect();
+    assert_eq!(items.len(), 2, "two items: {items:?}");
+    assert!(items[0] > 10.0, "one line of text, not nothing: {items:?}");
+    assert!(
+        items[1] > items[0] * 1.5,
+        "and two lines are taller than one: {items:?}"
+    );
+    assert!(
+        column.rect.height >= items[0] + items[1] - 0.5,
+        "the column holds both of them: {:?} against {items:?}",
+        column.rect
+    );
+}

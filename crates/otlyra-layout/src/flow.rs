@@ -2815,10 +2815,23 @@ impl<'a> Flow<'a> {
             // the point where its own content spills out of it. An item that says
             // `min-width` or `overflow` of its own would override this; neither is
             // read yet, so the content is the floor.
-            let floor = if row && item_style.min_width == Length::ZERO {
-                self.min_content_width(child, width, true).min(basis)
+            //
+            // Down a column that floor is the item's own height, and it is not a
+            // nicety: `flex-basis: 0` down a column whose container has no height
+            // of its own leaves every item with a base of nothing and no free
+            // space to grow into, so a stack of cards came out as a stack of
+            // nothing. `min-height: auto` is what CSS calls the rule that stops
+            // it.
+            let floor = if row {
+                if item_style.min_width == Length::ZERO {
+                    self.min_content_width(child, width, true).min(basis)
+                } else {
+                    item_style.min_width.resolve(width)
+                }
+            } else if item_style.min_height == Length::ZERO {
+                fragment.rect.height
             } else {
-                item_style.min_width.resolve(width)
+                item_style.min_height.resolve(width)
             };
 
             items.push(FlexItem {
@@ -2989,8 +3002,11 @@ impl<'a> Flow<'a> {
             .sum();
         let free = inner - used - gaps;
 
+        // The floor applies whether or not there is free space to share: a
+        // container with no main size of its own has none to share, and an item
+        // that started at nothing would stay nothing.
         for item in &mut items[line.clone()] {
-            item.main = item.base;
+            item.main = item.base.max(item.floor);
         }
         if free.is_finite() && free != 0.0 {
             let factors: f32 = items[line.clone()]
