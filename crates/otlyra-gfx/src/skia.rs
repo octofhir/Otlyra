@@ -1310,6 +1310,12 @@ fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
     /// picture cannot ask for a surface measured in gigabytes.
     const LARGEST: f32 = 4096.0;
 
+    // Its own stylesheet, written onto the elements it styles, because Skia's
+    // parser reads presentation attributes and nothing else. `None` where there
+    // is nothing to do, and then the file goes over untouched.
+    let inlined = crate::svg_style::inline_styles(bytes);
+    let bytes = inlined.as_deref().unwrap_or(bytes);
+
     let fonts = sk::FontMgr::new();
     let dom = sk::svg::Dom::from_bytes(bytes, fonts).map_err(|_| SkiaError::ImageDecode)?;
 

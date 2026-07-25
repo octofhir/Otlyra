@@ -38,6 +38,7 @@ mod paint_target;
 mod recording;
 mod render;
 mod skia;
+mod svg_style;
 
 pub use display_list::{DisplayItem, DisplayList, FontId, FontTable, HitTestId, ImageResource};
 pub use hit_test::{Hit, hit_test, hit_test_all};
