@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 kurbo = { workspace = true, features = ["serde"] }
 peniko = { workspace = true, features = ["serde"] }
+resvg.workspace = true
 serde.workspace = true
 skia-safe = { workspace = true, features = ["textlayout"] }
 smallvec.workspace = true

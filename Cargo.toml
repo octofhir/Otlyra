@@ -71,6 +71,35 @@ raw-window-handle = "=0.6.2"
 # nothing too.
 skia-safe = { version = "=0.99.0", features = ["svg", "webp"] }
 
+# Static SVG: parsing, the cascade inside the file, `use`, gradients, masks,
+# text as paths — and the rasterizing of all of it.
+#
+# Skia has an SVG module and it is the one that was used, but it reads
+# presentation attributes and nothing else: there is no `<style>` in its node
+# set, so a file that colours itself with `.st0{fill:…}` and `class="st0"` —
+# which is what every drawing program exports and therefore what a great many
+# logos on the web are — draws every shape in the default black. Writing the
+# rules onto the elements first got those files right and nothing else; a
+# picture with a `use`, a mask or a pattern in it was still wrong.
+#
+# This is the same choice Servo made and for the same reason. It costs a second
+# rasterizer, `tiny-skia`, which is a real cost and is taken with open eyes: it
+# rasterizes *pictures*, the way a JPEG decoder produces pixels, and the display
+# list still goes through one rasterizer and always will. The alternative —
+# `usvg` alone, walked into our own painter — keeps one rasterizer and asks us
+# to write and then maintain the half of a renderer that draws gradients, masks,
+# patterns and text. That is a worse trade for a browser this early.
+#
+# `text` and `system-fonts` because a logo is often lettering; `raster-images`
+# because an SVG may embed a photograph and one that drew nothing there would be
+# the black-shapes bug again in a different place.
+resvg = { version = "=0.47.0", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+    "raster-images",
+] }
+
 # Font enumeration, CSS family matching, shaping and line breaking.
 parley = "=0.11.0"
 

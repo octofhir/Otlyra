@@ -61,10 +61,25 @@ deny = [
     # second font database means two answers to how wide a string is.
     { crate = "cosmic-text", reason = "parley is the text stack; §1" },
     { crate = "swash", reason = "harfrust shapes for us; §1" },
-    { crate = "fontdb", reason = "fontique enumerates for us; §1" },
+    # `fontdb` and `tiny-skia` were both on this list and are deliberately off
+    # it, for `resvg` and only for it.
+    #
+    # Both bans were written to keep a second answer out of the *page*: a second
+    # rasterizer for the display list, a second font database for the document's
+    # own text. Neither is what these are doing. `tiny-skia` rasterizes
+    # pictures, the way a JPEG decoder produces pixels — what comes back is an
+    # `ImageData` the display list carries, and the display list still goes
+    # through Skia and always will. `fontdb` is the list `usvg` sets the
+    # lettering *inside a picture* from; the document's own text is shaped by
+    # parley over fontique alone, and nothing in the page asks this one anything.
+    #
+    # What they buy: Skia's own SVG module reads presentation attributes and
+    # nothing else — there is no `<style>` in its node set, so a file that
+    # colours itself with classes draws every shape black — and writing those
+    # rules onto the elements first fixed that one shape of file and left `use`,
+    # masks and patterns wrong. Servo made the same choice for the same reason.
     # Rasterizers: Skia is the one behind `PaintTarget`. Vello is a planned
     # second *backend* behind that same seam, which is why it is not here.
-    { crate = "tiny-skia", reason = "skia-safe is the rasterizer; §4.3" },
     { crate = "femtovg", reason = "same" },
     { crate = "raqote", reason = "same" },
 ]

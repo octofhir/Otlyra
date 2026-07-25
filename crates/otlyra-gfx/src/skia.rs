@@ -1297,84 +1297,66 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
     head.contains("<svg")
 }
 
+/// The fonts an SVG's text is set in, enumerated once.
+///
+/// Once, because enumerating the system's fonts is the most expensive thing this
+/// process does and a picture is decoded whenever one arrives. Lazily, because a
+/// browser that never meets an SVG with lettering in it should never pay for
+/// this at all — and the startup path must not, whatever it meets.
+fn svg_fonts() -> &'static std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut fonts = resvg::usvg::fontdb::Database::new();
+        fonts.load_system_fonts();
+        std::sync::Arc::new(fonts)
+    })
+}
+
 /// Draw an SVG at the size it declares.
 ///
-/// The size is the document's own — its `width` and `height`, or the extent of its
-/// `viewBox` — and a document that declares neither is drawn at a modest square,
-/// because something has to be picked and a picture nobody sized is an icon often
-/// enough.
+/// The size is the document's own — its `width` and `height`, or the extent of
+/// its `viewBox` — which is what `usvg` resolves for us, and it is the browser's
+/// answer: a picture with a `viewBox` and no size of its own is what every
+/// drawing program exports, and drawing one at a guessed square is drawing it at
+/// the wrong shape, which a background then tiles.
+///
+/// Drawn rather than decoded: there are no pixels in the file, only instructions
+/// for making some, and these are made at the size the file says it is. A rule
+/// that then draws it larger magnifies these — see the gap about that.
 fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
-    /// What an SVG with no size of its own is drawn at.
-    const UNSIZED: f32 = 150.0;
     /// As large as one will be drawn, so that a document declaring a page-sized
     /// picture cannot ask for a surface measured in gigabytes.
     const LARGEST: f32 = 4096.0;
 
-    // Its own stylesheet, written onto the elements it styles, because Skia's
-    // parser reads presentation attributes and nothing else. `None` where there
-    // is nothing to do, and then the file goes over untouched.
-    let inlined = crate::svg_style::inline_styles(bytes);
-    let bytes = inlined.as_deref().unwrap_or(bytes);
-
-    let fonts = sk::FontMgr::new();
-    let dom = sk::svg::Dom::from_bytes(bytes, fonts).map_err(|_| SkiaError::ImageDecode)?;
-
-    // The document's own `width` and `height` where it declares them, and the
-    // extent of its `viewBox` where it does not. The second is not a fallback for
-    // tidiness: a picture with a `viewBox` and no size is what every drawing
-    // program exports and what every icon on the web is, and drawing one at a
-    // guessed square is drawing it at the wrong shape — which a background then
-    // tiles, because a tile the size of the box is one tile and a tile a third of
-    // it is three.
-    let root = dom.root();
-    let declared = root.intrinsic_size();
-    let boxed = root.view_box().map(|view| (view.width(), view.height()));
-    drop(root);
-    let size = |declared: f32, extent: Option<f32>| {
-        if declared.is_finite() && declared >= 1.0 {
-            return declared.min(LARGEST);
-        }
-        match extent {
-            Some(extent) if extent.is_finite() && extent >= 1.0 => extent.min(LARGEST),
-            _ => UNSIZED,
-        }
+    let options = resvg::usvg::Options {
+        fontdb: std::sync::Arc::clone(svg_fonts()),
+        ..Default::default()
     };
-    let (width, height) = (
-        size(declared.width, boxed.map(|(width, _)| width)),
-        size(declared.height, boxed.map(|(_, height)| height)),
-    );
+    let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|_| SkiaError::ImageDecode)?;
 
-    let mut surface = sk::surfaces::raster_n32_premul((width as i32, height as i32))
-        .ok_or(SkiaError::ImageDecode)?;
-    let mut dom = dom;
-    dom.set_container_size((width, height));
-    dom.render(surface.canvas());
+    // Capped, and the picture scaled to fit the cap rather than cropped to it:
+    // a document that says it is ten thousand pixels across is still that shape.
+    let declared = tree.size();
+    let scale = (LARGEST / declared.width())
+        .min(LARGEST / declared.height())
+        .min(1.0);
+    let width = ((declared.width() * scale).round() as u32).max(1);
+    let height = ((declared.height() * scale).round() as u32).max(1);
 
-    let image = surface.image_snapshot();
-    let info = sk::ImageInfo::new(
-        (image.width(), image.height()),
-        sk::ColorType::RGBA8888,
-        sk::AlphaType::Premul,
-        None,
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or(SkiaError::ImageDecode)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
     );
-    let row_bytes = image.width() as usize * 4;
-    let mut pixels = vec![0u8; row_bytes * image.height() as usize];
-    if !image.read_pixels(
-        &info,
-        &mut pixels,
-        row_bytes,
-        (0, 0),
-        sk::image::CachingHint::Allow,
-    ) {
-        return Err(SkiaError::ImageDecode);
-    }
 
     Ok(peniko::ImageData {
-        data: peniko::Blob::new(std::sync::Arc::new(pixels)),
+        data: peniko::Blob::new(std::sync::Arc::new(pixmap.take())),
         format: peniko::ImageFormat::Rgba8,
         alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
-        width: image.width() as u32,
-        height: image.height() as u32,
+        width,
+        height,
     })
 }
 
@@ -1821,11 +1803,12 @@ mod variation_tests {
             "the extent of the view box, not a square of somebody's choosing"
         );
 
-        // A picture with neither is still drawn at something rather than refused.
+        // A picture with neither is drawn at the extent of what it holds, which
+        // is a guess like any other and is at least a guess about this file.
         let neither = br##"<svg xmlns="http://www.w3.org/2000/svg">
              <rect width="10" height="10" fill="#00ff00"/></svg>"##;
         let drawn = decode_image(neither).expect("a vector picture draws");
-        assert_eq!((drawn.width, drawn.height), (150, 150));
+        assert_eq!((drawn.width, drawn.height), (10, 10));
     }
 
     use super::{SegmentMap, axis_segment_maps, unmap_axis};
