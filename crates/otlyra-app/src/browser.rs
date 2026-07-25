@@ -3579,6 +3579,49 @@ impl Painter for Browser {
                         _ => {}
                     }
                 }
+                // Walking the document with Tab, before anything else reads the
+                // key: it is never a character, and it is what a reader without
+                // a pointer moves through a page with.
+                if key == Key::Tab
+                    && !modifiers.is_accelerator()
+                    && self.keyboard_surface == SURFACE_PAGE
+                    && self.tabs[self.active].system.is_none()
+                {
+                    let forward = !modifiers.shift;
+                    let walked = self.tabs[self.active]
+                        .page
+                        .as_mut()
+                        .is_some_and(|page| page.focus_step(forward));
+                    if walked {
+                        self.accessibility_dirty = true;
+                        return;
+                    }
+                    // Off the end of the document, so the keyboard goes on to
+                    // the browser around it — which is the whole of what a
+                    // document not trapping the keyboard means.
+                    self.activate_surface(SURFACE_CHROME);
+                    self.ui.focus_edge(forward);
+                    return;
+                }
+
+                // Return on a link the keyboard reached follows it, which is
+                // the same navigation a click on it is — one route, so the two
+                // cannot come to disagree about what following a link means.
+                if key == Key::Enter
+                    && !modifiers.is_accelerator()
+                    && self.keyboard_surface == SURFACE_PAGE
+                    && self.tabs[self.active].system.is_none()
+                    && let Some(href) = self.tabs[self.active]
+                        .page
+                        .as_ref()
+                        .and_then(PageScene::focused_link)
+                {
+                    let url =
+                        otlyra_net::resolve(&self.tabs[self.active].url, &href).unwrap_or(href);
+                    self.navigate_from(&url, false);
+                    return;
+                }
+
                 // Copying what is selected on the page, before the interface reads
                 // the key: the address bar takes ⌘C for its own text only while it
                 // holds the caret, and the page's selection is the one on screen.
@@ -5329,6 +5372,121 @@ mod tests {
             },
         });
         assert!(browser.ui().address_focused(), "the caret is in the field");
+    }
+
+    /// Tab walks the document: links and fields, in the order they are written,
+    /// with the ring following. Without it a reader without a pointer cannot
+    /// reach anything on a page at all.
+    #[test]
+    fn tab_walks_the_page_and_leaves_it_at_the_end() {
+        struct TwoLinks;
+
+        impl Loader for TwoLinks {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<title>Two</title><body>\
+                        <p><a href=\"/first\">first</a> and <a href=\"/second\">second</a></p>\
+                        <input id=field value=\"typed\">"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(TwoLinks);
+        go(&mut browser, "https://walk.example/");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(900, 700, 1.0),
+        );
+        // A press on the page is what makes the document the active surface,
+        // the same way a reader starts reading before they start walking.
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        browser.on_event(PlatformEvent::PointerReleased);
+
+        let tab = |browser: &mut Browser, shift: bool| {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Tab,
+                modifiers: Modifiers {
+                    shift,
+                    ..Modifiers::default()
+                },
+            });
+        };
+        let focused_link = |browser: &Browser| {
+            browser.tabs[browser.active]
+                .page
+                .as_ref()
+                .and_then(PageScene::focused_link)
+        };
+
+        tab(&mut browser, false);
+        assert_eq!(
+            focused_link(&browser).as_deref(),
+            Some("/first"),
+            "Tab reached nothing, so the page cannot be walked at all"
+        );
+        tab(&mut browser, false);
+        assert_eq!(focused_link(&browser).as_deref(), Some("/second"));
+        tab(&mut browser, true);
+        assert_eq!(
+            focused_link(&browser).as_deref(),
+            Some("/first"),
+            "shift-Tab walks back the way it came"
+        );
+
+        // Return on a link the keyboard reached follows it, resolved against
+        // the page it was on.
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        });
+        settle(&mut browser);
+        assert_eq!(
+            browser.tabs[browser.active].url,
+            "https://walk.example/first"
+        );
+    }
+
+    /// Past the last thing on the page, the keyboard goes to the browser around
+    /// it: a document that trapped Tab would be a document a reader could not
+    /// leave without a pointer.
+    #[test]
+    fn tab_past_the_end_of_the_page_reaches_the_interface() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(900, 700, 1.0),
+        );
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        browser.on_event(PlatformEvent::PointerReleased);
+
+        // The page the loader serves has one link, so two steps run off it.
+        for _ in 0..2 {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Tab,
+                modifiers: Modifiers::default(),
+            });
+        }
+
+        assert!(
+            browser.ui().focused().is_some(),
+            "the keyboard left the page and landed nowhere"
+        );
+        assert!(
+            browser.tabs[browser.active]
+                .page
+                .as_ref()
+                .and_then(PageScene::focused_link)
+                .is_none(),
+            "the page kept the focus it handed on"
+        );
     }
 
     /// Typing in the omnibox offers where the reader has been and what they

@@ -658,6 +658,12 @@ impl PageScene {
 
     /// Whether an element can take the focus.
     fn is_focusable(&self, node: NodeId) -> bool {
+        // A link is focusable and is not a form control, so it is asked about
+        // first: without this the keyboard could reach a page's fields and
+        // never its links, which is most of what a page is.
+        if self.is_link(node) {
+            return true;
+        }
         match otlyra_dom::form::Control::of(&self.document, node) {
             Some(control) => {
                 !matches!(
@@ -672,6 +678,74 @@ impl PageScene {
             }
             None => false,
         }
+    }
+
+    /// Whether `node` is a link a reader can follow.
+    ///
+    /// A name with no address is not one: `<a name=…>` is a place in the page
+    /// rather than a way out of it, and it is not focusable anywhere else
+    /// either.
+    fn is_link(&self, node: NodeId) -> bool {
+        self.document
+            .get(node)
+            .and_then(otlyra_dom::Node::element)
+            .is_some_and(|element| element.name.local.as_ref() == "a")
+            && self.attribute(node, "href").is_some()
+    }
+
+    /// Everything the keyboard may stop on, in the order a reader meets it.
+    ///
+    /// Document order and nothing else: `tabindex` is not read, so this is the
+    /// specification's *sequential focus navigation* over what a browser
+    /// focuses by default. A page that reorders its own traversal does not get
+    /// what it asked for, which is stated in the plan rather than guessed at
+    /// here.
+    fn focus_order(&self) -> Vec<NodeId> {
+        in_document_order(&self.document, self.document.root())
+            .into_iter()
+            .filter(|node| self.is_focusable(*node))
+            .collect()
+    }
+
+    /// Move the keyboard to the next thing it can stop on.
+    ///
+    /// `false` when there is nothing that way, which is the page saying the
+    /// keyboard belongs to whatever is beyond it. Leaving rather than wrapping
+    /// is what makes Tab reach the toolbar at the end of a document instead of
+    /// trapping a reader inside one.
+    pub fn focus_step(&mut self, forward: bool) -> bool {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return false;
+        }
+        let at = self
+            .interaction
+            .focus
+            .and_then(|node| order.iter().position(|candidate| *candidate == node));
+        let next = match (at, forward) {
+            (Some(at), true) => at.checked_add(1).filter(|next| *next < order.len()),
+            (Some(at), false) => at.checked_sub(1),
+            (None, true) => Some(0),
+            (None, false) => Some(order.len() - 1),
+        };
+        let Some(next) = next else {
+            // Off the end: the focus goes with the keyboard rather than being
+            // left behind on a control nobody is on any more.
+            self.blur();
+            return false;
+        };
+        // Whether the focus *moved*, which is not whether the page has to be
+        // styled again: a link with no rule that reads `:focus` restyles to the
+        // same thing, and a walk that reported that as "there was nowhere to
+        // go" would hand the keyboard to the toolbar on the first link.
+        self.focus_node(order[next]);
+        true
+    }
+
+    /// The address the focused element goes to, if it is a link.
+    pub fn focused_link(&self) -> Option<String> {
+        let node = self.interaction.focus?;
+        self.is_link(node).then(|| self.attribute(node, "href"))?
     }
 
     /// Whether the focused control takes typing.
@@ -4935,6 +5009,23 @@ fn attribute_of(document: &Document, id: NodeId, name: &str) -> Option<String> {
 }
 
 /// Every node under `root`, in tree order.
+/// Every node under `root`, in the order the markup put them in.
+///
+/// [`descendants_of`] answers the same set in whatever order the walk happens
+/// to pop them, which is fine for *did any of these change* and wrong for
+/// traversal: what Tab does next is a question about the order a reader meets
+/// things in.
+fn in_document_order(document: &Document, root: NodeId) -> Vec<NodeId> {
+    let mut order = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        order.push(node);
+        let children: Vec<NodeId> = document.children(node).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    order
+}
+
 fn descendants_of(document: &Document, root: NodeId) -> Vec<NodeId> {
     let mut order = Vec::new();
     let mut stack = vec![root];

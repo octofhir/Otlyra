@@ -1234,6 +1234,19 @@ impl BrowserUi {
         self.focused = None;
     }
 
+    /// Put the keyboard on the first or last control this surface has.
+    ///
+    /// What another root hands the keyboard over with: a document walked to its
+    /// end passes it on, and where it lands depends on which way the reader was
+    /// going.
+    pub fn focus_edge(&mut self, forward: bool) {
+        self.focused = if forward {
+            self.focus.next(None)
+        } else {
+            self.focus.previous(None)
+        };
+    }
+
     /// Put the caret in the address field, for an accelerator that names it.
     ///
     /// The whole address is selected, which is what ⌘L is *for*: the next

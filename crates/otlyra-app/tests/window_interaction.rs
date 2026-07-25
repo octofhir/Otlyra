@@ -321,6 +321,58 @@ fn the_browser_menu_is_visible_below_the_composited_toolbar() {
     );
 }
 
+/// Tab puts the ring on the first thing in the document, and the window shows
+/// it: a focus a reader cannot see is a focus they cannot use.
+#[test]
+fn tab_shows_the_ring_on_what_it_reached() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut browser = Browser::new(Pages);
+    browser.navigate("https://form.example/");
+    browser.wait_for_load(std::time::Duration::from_secs(5));
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+
+    let mut pump = FramePump::new(viewport);
+    pump.open(&mut browser).expect("the first frame");
+
+    // A press on plain page makes the document the active surface without
+    // putting the keyboard on anything.
+    pump.event(
+        &mut browser,
+        PlatformEvent::PointerMoved { x: 600.0, y: 500.0 },
+    );
+    pump.event(&mut browser, PlatformEvent::PointerPressed { clicks: 1 });
+    pump.event(&mut browser, PlatformEvent::PointerReleased);
+    pump.frame(&mut browser).expect("the pressed frame");
+    let before = pump.png().expect("the window before");
+
+    pump.event(
+        &mut browser,
+        PlatformEvent::KeyPressed {
+            key: Key::Tab,
+            modifiers: Modifiers::default(),
+        },
+    );
+    pump.frame(&mut browser).expect("the walked frame");
+    let after = pump.png().expect("the window after");
+
+    let (width, before) = decode(&before);
+    let (_, after) = decode(&after);
+    let field = field_in_window();
+    // Around the field rather than inside it: the ring is drawn outside its
+    // border, and what is inside it did not change.
+    let around = (
+        field.0.saturating_sub(4),
+        field.1.saturating_sub(4),
+        field.2 + 8,
+        4,
+    );
+    assert_ne!(
+        region(&before, width, around),
+        region(&after, width, around),
+        "Tab reached the field and the window drew no ring on it"
+    );
+}
+
 /// A tab dragged along the strip lands where it was dropped, and the window
 /// shows it there: the order is the browser's, so the strip a person is looking
 /// at and the tabs the browser holds cannot disagree.
