@@ -8148,4 +8148,127 @@ mod find_tests {
         assert!(!browser.ui.finding());
         assert_eq!(browser.ui.find_status.total, 0);
     }
+
+    /// ⌘C in the bar's field copies what is selected in it, rather than the
+    /// page's selection or nothing at all.
+    #[test]
+    fn command_c_in_the_find_bar_copies_the_bars_own_text() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+        assert_eq!(browser.ui.find.text(), "needle");
+
+        // Select the whole query the way ⌘A does, then copy it.
+        key(&mut browser, Key::Character('a'), ACCELERATOR);
+        assert_eq!(browser.ui.find.selected_text(), Some("needle"));
+        key(&mut browser, Key::Character('c'), ACCELERATOR);
+        assert_eq!(
+            browser.clipboard.read().as_deref(),
+            Some("needle"),
+            "⌘C in the find bar copied something else"
+        );
+    }
+
+    /// Ctrl+C on a platform whose accelerator is ⌘ is not a copy — and must not
+    /// become a character in the query either.
+    #[test]
+    fn a_control_key_that_is_not_the_accelerator_types_nothing_into_the_bar() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        key(&mut browser, Key::Character('c'), control);
+        assert_eq!(
+            browser.ui.find.text(),
+            "needle",
+            "a control chord left a character in the query"
+        );
+        assert_eq!(
+            browser.ui.find_status.total, 3,
+            "and changed what was found"
+        );
+    }
+
+    /// A double-click in the bar's field takes the word under it, the way it
+    /// does in the address field: selecting is what a copy needs first.
+    #[test]
+    fn the_pointer_selects_inside_the_find_bars_field() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+        frame(&mut browser);
+
+        // Where the field was drawn, from the frame that drew it.
+        let field = browser
+            .ui
+            .describe()
+            .into_iter()
+            .rfind(|node| node.role == crate::widget::Role::TextInput)
+            .expect("the bar's field");
+        let (x, y) = (
+            field.rect.x + field.rect.width / 2.0,
+            field.rect.y + field.rect.height / 2.0,
+        );
+
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 2 });
+        browser.on_event(PlatformEvent::PointerReleased);
+        assert_eq!(
+            browser.ui.find.selected_text(),
+            Some("needle"),
+            "a double-click in the field selected nothing"
+        );
+
+        key(&mut browser, Key::Character('c'), ACCELERATOR);
+        assert_eq!(browser.clipboard.read().as_deref(), Some("needle"));
+    }
+
+    /// What was found is what is selected, so ⌘C copies it — with the bar open
+    /// and, once the bar has been closed, still.
+    #[test]
+    fn the_current_match_is_the_selection_and_can_be_copied() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+
+        let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+        assert_eq!(
+            page.selected_text().as_deref(),
+            Some("needle"),
+            "the match a reader was taken to is what is selected"
+        );
+
+        // With the keyboard in the document, ⌘C copies the page's selection.
+        browser.ui.blur();
+        browser.activate_surface(SURFACE_PAGE);
+        key(&mut browser, Key::Character('c'), ACCELERATOR);
+        assert_eq!(browser.clipboard.read().as_deref(), Some("needle"));
+
+        // And closing the bar leaves the last match selected, the way every
+        // browser does: the wash goes and what was found stays copyable.
+        key(&mut browser, Key::Escape, Modifiers::default());
+        let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+        assert_eq!(page.match_count(), 0, "the wash is gone");
+        assert_eq!(page.selected_text().as_deref(), Some("needle"));
+    }
+
+    /// A resize renumbers every run, and what was selected has to follow the
+    /// match rather than whatever took its number.
+    #[test]
+    fn a_resize_keeps_the_selection_on_the_match_it_was_on() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+        frame(&mut browser);
+
+        let mut target = otlyra_gfx::RecordingPainter::default();
+        browser.paint(&mut target, Viewport::new(360, 600, 1.0));
+
+        let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+        assert_eq!(page.match_count(), 3, "still three of them, laid out anew");
+        assert_eq!(
+            page.selected_text().as_deref(),
+            Some("needle"),
+            "the selection followed the match across the relayout"
+        );
+    }
 }

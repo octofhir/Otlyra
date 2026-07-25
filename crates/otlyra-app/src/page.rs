@@ -567,14 +567,6 @@ impl PageScene {
         let ports = self.port_scroll.clone();
         let pictures = self.background_pictures.clone();
         let scrollbars = self.scrollbars;
-        let selected = self.selection;
-        // The search's answers, taken before the layout is borrowed for the same
-        // reason the selection is. Cloned only while a search is on, and a build
-        // only happens when something changed.
-        let searched = self
-            .find
-            .as_ref()
-            .map(|found| (found.at.clone(), found.current));
         // What the caret is *of*, taken before the layout is borrowed: where it
         // lands needs the fragments, and what it belongs to needs the document.
         let caret_of = self.caret_source();
@@ -583,6 +575,18 @@ impl PageScene {
             .and_then(|(node, from, to)| self.boxes.box_for(node).map(|box_id| (box_id, from, to)));
         self.keep_caret_in_view(caret_of, text, width, height);
         self.keep_choice_in_view(text, width, height);
+        // Laid out before anything counted in runs is taken off this page: a
+        // relayout renumbers every run, and laying out is what searches the page
+        // again. The second call below is the same layout handed back.
+        self.fragments(text, width, height);
+        let selected = self.selection;
+        // The search's answers, taken before the layout is borrowed for the same
+        // reason the selection is. Cloned only while a search is on, and a build
+        // only happens when something changed.
+        let searched = self
+            .find
+            .as_ref()
+            .map(|found| (found.at.clone(), found.current));
         let showing = self.caret_showing();
         let fragments = self.fragments(text, width, height);
         let caret = showing
@@ -2930,7 +2934,7 @@ impl PageScene {
         // Every search brings the reader to what it found, including one that
         // found what the last one did: asking again after scrolling away means
         // *take me back to it*.
-        self.reveal_current_match();
+        self.take_current_match();
         count
     }
 
@@ -2968,8 +2972,7 @@ impl PageScene {
         }
         found.current = current;
         self.damage.add(Damage::PAINT);
-        // Stepping to a match that stays off screen is not stepping to it.
-        self.reveal_current_match();
+        self.take_current_match();
         true
     }
 
@@ -3056,7 +3059,14 @@ impl PageScene {
             found.at = otlyra_layout::find::matches(tree, &found.query);
             found.current = found.current.min(found.at.len().saturating_sub(1));
         }
+        let at = found.at.get(found.current).copied();
         self.find = Some(found);
+        // What was selected was the match, and it is numbered in the layout that
+        // has just been replaced. The page is not scrolled to it: a resize is not
+        // a reader asking to be taken anywhere.
+        if let Some(at) = at {
+            self.set_selection(Some(at));
+        }
     }
 
     fn set_selection(&mut self, selection: Option<otlyra_layout::Selection>) {
@@ -3288,6 +3298,25 @@ impl PageScene {
         self.scroll = scroll;
         self.damage.add(Damage::PAINT);
         true
+    }
+
+    /// Make the current match what is selected, and bring it on screen.
+    ///
+    /// Selected as well as washed, because a match and a selection are the same
+    /// thing — two places in the page's text — and every browser hands the
+    /// reader the current match as the selection. That is what makes ⌘C after a
+    /// search copy what was found, and what leaves the last match copyable once
+    /// the bar has been closed. It costs nothing to look at: the wash for the
+    /// current match is drawn over the selection's, rectangle for rectangle.
+    fn take_current_match(&mut self) {
+        let at = self
+            .find
+            .as_ref()
+            .and_then(|found| found.at.get(found.current).copied());
+        if let Some(at) = at {
+            self.set_selection(Some(at));
+        }
+        self.reveal_current_match();
     }
 
     /// Bring the current match on screen, and answer whether the page moved.
