@@ -52,6 +52,7 @@ pub mod downloads;
 pub mod fetcher;
 pub mod history;
 pub mod inspector;
+pub mod io;
 pub mod mcp;
 pub mod menu;
 pub mod observability;

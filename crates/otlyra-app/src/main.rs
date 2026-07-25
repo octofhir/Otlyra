@@ -240,7 +240,7 @@ fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::io::Write::flush(&mut std::io::stdout())?;
     tracing::info!(address = %server.address(), "answering WebDriver BiDi");
 
-    let browser = Browser::with_settings(NetLoader::default(), cli.settings());
+    let browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
     let mut session = cli.session(browser);
     loop {
         server.serve_one(&mut session)?;
@@ -262,7 +262,7 @@ fn main() -> ExitCode {
     if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
         let settings = cli.settings();
         STARTUP_TRACE.mark("preferences_ready");
-        let mut browser = Browser::with_settings(NetLoader::default(), settings);
+        let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
         STARTUP_TRACE.mark("browser_ready");
         let start = browser.settings_on_start();
         if start == otlyra_app::settings::OnStart::Home {
@@ -292,7 +292,7 @@ fn main() -> ExitCode {
     if cli.mcp {
         // stdout is the wire from here on. Everything this program says about
         // itself already goes to stderr, which is what makes that safe.
-        let browser = Browser::with_settings(NetLoader::default(), cli.settings());
+        let browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
         let mut session = cli.session(browser);
         let input = std::io::BufReader::new(std::io::stdin().lock());
         return match otlyra_app::mcp::serve(&mut session, input, std::io::stdout().lock()) {
@@ -370,7 +370,7 @@ fn main() -> ExitCode {
         // is ours, with no system font and no network in it.
         Some(path) => write_screenshot(&mut scene, viewport, path),
         None => {
-            let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+            let mut browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
             run_windowed(&cli, &mut browser)
         }
     };
@@ -413,7 +413,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     {
         let settings = cli.settings();
         STARTUP_TRACE.mark("preferences_ready");
-        let mut browser = Browser::with_settings(NetLoader::default(), settings);
+        let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
         STARTUP_TRACE.mark("browser_ready");
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
@@ -431,7 +431,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         || cli.dump_fragments
         || cli.dump_selectors.is_some();
     if !wants_bytes {
-        let mut browser = Browser::with_settings(NetLoader::default(), cli.settings());
+        let mut browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
         if cli.no_interface {
             browser.hide_interface();
         }
@@ -527,7 +527,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     // the browser with it already loaded.
     let settings = cli.settings();
     STARTUP_TRACE.mark("preferences_ready");
-    let mut browser = Browser::with_settings(NetLoader::default(), settings);
+    let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
     STARTUP_TRACE.mark("browser_ready");
     browser.set_viewport(cli.viewport());
     browser.navigate(&match &source {
@@ -654,9 +654,10 @@ fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppE
 
 /// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.
 ///
-/// One client behind a `OnceLock`, shared by every fetch thread: the client owns
-/// the connection pool, so one per thread would be several pools and several
-/// runtimes for no gain.
+/// One client behind a `OnceLock`, shared by every outstanding fetch: the client
+/// owns the connection pool, so one per request would be several pools for no gain.
+/// Built on first use rather than at startup, so opening a browser costs no TLS
+/// setup until something is fetched.
 #[derive(Default)]
 struct NetLoader {
     loader: std::sync::OnceLock<otlyra_net::Loader>,
@@ -727,72 +728,76 @@ fn content_type_of(path: &std::path::Path) -> Option<String> {
     Some(mime.to_owned())
 }
 
-impl otlyra_app::fetcher::Loader for NetLoader {
-    fn load(&self, input: &str) -> Result<otlyra_app::fetcher::Loaded, String> {
-        self.send(input, None)
-    }
-
-    fn send(
-        &self,
-        input: &str,
+impl otlyra_app::fetcher::AsyncLoader for NetLoader {
+    fn fetch(
+        self: std::sync::Arc<Self>,
+        input: String,
         body: Option<otlyra_net::Body>,
-    ) -> Result<otlyra_app::fetcher::Loaded, String> {
-        // A path typed into the address bar becomes the `file:` URL it names, so
-        // that what the bar shows is an address and not a filename — and so that a
-        // relative link on the page has something to resolve against.
-        if let Some(url) = file_url(input) {
-            // A file has nothing to receive a body with, so a form aimed at one is
-            // read rather than refused — which is what the references do with it.
-            let path = url
-                .to_file_path()
-                .map_err(|()| format!("not a path: {input}"))?;
-            let bytes =
-                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-            // A filesystem has no `Content-Type`, so the extension stands in for
-            // one — which is what every browser does with a `file:` URL, and is why
-            // opening a `.css` shows the stylesheet rather than rendering it.
-            return Ok(otlyra_app::fetcher::Loaded {
-                bytes,
-                content_type: content_type_of(&path),
-                final_url: url.to_string(),
-                ..Default::default()
-            });
-        }
+    ) -> otlyra_app::fetcher::Fetching {
+        Box::pin(async move {
+            // A path typed into the address bar becomes the `file:` URL it names, so
+            // that what the bar shows is an address and not a filename — and so that
+            // a relative link on the page has something to resolve against.
+            if let Some(url) = file_url(&input) {
+                // A file has nothing to receive a body with, so a form aimed at one
+                // is read rather than refused — which is what the references do.
+                let path = url
+                    .to_file_path()
+                    .map_err(|()| format!("not a path: {input}"))?;
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                // A filesystem has no `Content-Type`, so the extension stands in for
+                // one — which is what every browser does with a `file:` URL, and is
+                // why opening a `.css` shows the stylesheet rather than rendering it.
+                return Ok(otlyra_app::fetcher::Loaded {
+                    bytes,
+                    content_type: content_type_of(&path),
+                    final_url: url.to_string(),
+                    ..Default::default()
+                });
+            }
 
-        otlyra_net::install_crypto_provider();
-        // A `data:` URL carries its own bytes, so it is read rather than resolved:
-        // normalizing it would refuse it, because it is not an address anything can
-        // be navigated to and the two rules are deliberately not the same one.
-        let url = if input.trim_start().starts_with("data:") {
-            url::Url::parse(input.trim()).map_err(|error| error.to_string())?
-        } else {
-            otlyra_net::normalize(input).map_err(|error| error.to_string())?
-        };
-        // Built once, on whichever thread asks first; the rest wait for it and then
-        // share it.
-        if self.loader.get().is_none() {
-            let built = otlyra_net::Loader::new().map_err(|error| error.to_string())?;
-            let _ = self.loader.set(built);
-        }
-        let loader = self.loader.get().expect("the loader was just built");
+            otlyra_net::install_crypto_provider();
+            // A `data:` URL carries its own bytes, so it is read rather than
+            // resolved: normalizing it would refuse it, because it is not an address
+            // anything can be navigated to and the two rules are deliberately not
+            // the same one.
+            let url = if input.trim_start().starts_with("data:") {
+                url::Url::parse(input.trim()).map_err(|error| error.to_string())?
+            } else {
+                otlyra_net::normalize(&input).map_err(|error| error.to_string())?
+            };
+            // Built once, by whichever fetch asks first; a second that raced it
+            // drops its own and uses the one that won, so there is still exactly one
+            // connection pool.
+            if self.loader.get().is_none() {
+                let built = otlyra_net::Loader::new().map_err(|error| error.to_string())?;
+                let _ = self.loader.set(built);
+            }
+            let loader = self.loader.get().expect("the loader was just built");
 
-        let request = match body {
-            Some(body) => otlyra_net::LoadRequest::post(url, body),
-            None => otlyra_net::LoadRequest::new(url),
-        };
-        let resource = loader
-            .fetch_blocking(request)
-            .map_err(|error| error.to_string())?;
-        let charset = resource.charset();
-        Ok(otlyra_app::fetcher::Loaded {
-            bytes: resource.body,
-            charset,
-            content_type: resource.content_type,
-            nosniff: resource.nosniff,
-            status: Some(resource.status),
-            request_headers: resource.request_headers,
-            response_headers: resource.response_headers,
-            final_url: resource.final_url,
+            let request = match body {
+                Some(body) => otlyra_net::LoadRequest::post(url, body),
+                None => otlyra_net::LoadRequest::new(url),
+            };
+            // The transport on the browser's own runtime: no thread is held while
+            // the server thinks, and no runtime is created to wait for it.
+            let resource = loader
+                .fetch(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            let charset = resource.charset();
+            Ok(otlyra_app::fetcher::Loaded {
+                bytes: resource.body,
+                charset,
+                content_type: resource.content_type,
+                nosniff: resource.nosniff,
+                status: Some(resource.status),
+                request_headers: resource.request_headers,
+                response_headers: resource.response_headers,
+                final_url: resource.final_url,
+            })
         })
     }
 }

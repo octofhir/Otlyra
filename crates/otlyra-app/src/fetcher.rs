@@ -1,14 +1,28 @@
 //! Fetching, off the thread the window runs on.
 //!
 //! The event loop blocks, and a load takes as long as a network takes; doing one
-//! on the loop's thread is a frozen window for the duration. So the loader lives on
-//! a thread of its own, reachable through two channels and nothing else: requests
-//! go out, results come back, and everything that decides what a result *means*
-//! stays where the state it changes lives.
+//! on the loop's thread is a frozen window for the duration. So a fetch is a task
+//! on the shared [`crate::io`] runtime, reachable through one channel and nothing
+//! else: results come back, and everything that decides what a result *means* stays
+//! where the state it changes lives.
 //!
 //! What crosses the boundary is owned bytes and a request number. No DOM, no style,
 //! no fragment: a document parsed on the wrong thread is a document that has to be
 //! `Send` forever after.
+//!
+//! It was six operating system threads taking from one queue, each blocking on a
+//! transport that had a runtime of its own inside it. The shape was right and the
+//! implementation was three sleeping mechanisms deep: a thread parked on a mutex,
+//! parked on a channel, blocking on a reactor. Now the wait is a suspended future
+//! and the only thing bounding how many run at once is the thing that should —
+//! [`FETCH_CONCURRENCY`], as a semaphore.
+//!
+//! Two seams rather than one, because the browser and its tests want opposite
+//! things. [`AsyncLoader`] is what a real transport implements: a future, no thread
+//! taken while it waits. [`Loader`] is a plain blocking function, which is what the
+//! three dozen fake loaders in this crate's tests are and should stay — a canned
+//! page is not worth a future — and it reaches the same pool through
+//! [`Fetcher::spawn`], which runs it on Tokio's blocking pool.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -132,7 +146,7 @@ pub struct Exchange {
     /// How long the transport took, once it ended.
     pub took: Option<std::time::Duration>,
     /// How long from the ask to the browser noticing, which includes the wait
-    /// for a free fetch thread.
+    /// for a free slot in the pool.
     pub waited: Option<std::time::Duration>,
     asked_at: std::time::Instant,
 }
@@ -164,15 +178,21 @@ impl Exchange {
 /// How many requests the list keeps before the oldest goes.
 const EXCHANGE_LIMIT: usize = 300;
 
-/// How a tab gets its bytes.
+/// How a tab gets its bytes, when getting them blocks.
 ///
 /// A trait rather than a direct call to `otlyra-net` for one reason: the browser's
 /// behaviour around navigation — which tab, what title, what happens on failure —
-/// is worth testing without a socket.
+/// is worth testing without a socket. A test's loader answers out of a table, so a
+/// plain function that returns a result is exactly the right shape for one and a
+/// future would be ceremony around a `match`.
 ///
-/// `Send + Sync` and `&self`, because the pool shares one of these across every
-/// fetch thread: a loader holds a client and a connection pool, and one per thread
-/// would be several of both.
+/// `Send + Sync` and `&self`, because one of these is shared by every outstanding
+/// fetch: a loader holds a client and a connection pool, and one per request would
+/// be several of both.
+///
+/// A real transport implements [`AsyncLoader`] instead. This one is run on Tokio's
+/// blocking pool, which is correct for reading a file or a canned string and wrong
+/// for holding a socket open.
 pub trait Loader: Send + Sync + 'static {
     /// Fetch `url`, returning the bytes and the little the transport knows about
     /// them. What they *are* is decided above this, from the bytes as well.
@@ -190,6 +210,50 @@ pub trait Loader: Send + Sync + 'static {
     }
 }
 
+/// One fetch in progress, as the pool holds it.
+///
+/// Boxed rather than an `async fn` in the trait because the trait is used as
+/// `dyn`: the browser holds one loader whose type it does not know, and an
+/// `-> impl Future` cannot be called through a pointer.
+pub type Fetching = std::pin::Pin<Box<dyn Future<Output = Result<Loaded, String>> + Send>>;
+
+/// How a tab gets its bytes without a thread waiting for them.
+///
+/// The receiver is `Arc<Self>` so the future can outlive the call: the pool spawns
+/// it and returns, and the loader has to still be there when the socket answers.
+/// That also means one loader — one client, one connection pool, one DNS cache —
+/// however many requests are in flight.
+pub trait AsyncLoader: Send + Sync + 'static {
+    /// Fetch `url`, sending `body` with it if there is one.
+    ///
+    /// Owned arguments rather than borrowed: what is returned is a future that
+    /// outlives this call, and a borrow of the caller's string would not survive
+    /// being spawned.
+    fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching;
+}
+
+/// A blocking [`Loader`] made to look like an [`AsyncLoader`].
+///
+/// The blocking pool rather than a worker thread: `spawn_blocking` is where Tokio
+/// puts work that parks its thread, and a fake loader that sleeps to prove the pool
+/// overlaps is exactly that. Bounded above by the fetcher's own semaphore, so this
+/// cannot grow the blocking pool past [`FETCH_CONCURRENCY`] threads.
+struct Blocking<L: Loader>(L);
+
+impl<L: Loader> AsyncLoader for Blocking<L> {
+    fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || self.0.send(&url, body))
+                .await
+                // A panic in a loader is a bug in a loader, and the fetch it was
+                // answering has to end as *something*: reported as this request's
+                // failure, where a person can see it, rather than as a request that
+                // stays pending until the window closes.
+                .unwrap_or_else(|error| Err(format!("the fetch task failed: {error}")))
+        })
+    }
+}
+
 /// How many fetches may be in flight at once.
 ///
 /// Six, which is the number browsers settled on per host over HTTP/1.1: enough that
@@ -197,26 +261,30 @@ pub trait Loader: Send + Sync + 'static {
 /// point only so many connections at a server. Ours is a total rather than a
 /// per-host count, which is stricter and simpler; per-host queues belong with a
 /// real connection pool underneath.
+///
+/// A semaphore rather than a thread count, so the limit says what it means: six
+/// requests may be *outstanding*, and a suspended one holds nothing but a permit.
 pub const FETCH_CONCURRENCY: usize = 6;
 
-/// The handle the browser keeps on the fetch thread.
+/// The handle the browser keeps on the fetch pool.
 pub struct Fetcher {
     /// Every request made, oldest first, bounded.
     exchanges: Vec<Exchange>,
-    requests: Sender<Request>,
+    loader: Arc<dyn AsyncLoader>,
+    /// How many fetches may be awake at once. Held by the task for as long as its
+    /// transport runs, which is what makes it a limit rather than a rate.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Kept beside the receiver so each task can be handed a clone. The channel
+    /// therefore never disconnects while the browser is alive, which is what
+    /// [`Fetcher::wait`] relies on to mean *nothing finished yet* rather than
+    /// *nothing ever will*.
+    finished: Sender<Fetched>,
     results: Receiver<Fetched>,
-    /// Set once the platform hands one over, and shared with the fetch thread so a
+    /// Set once the platform hands one over, and shared with every fetch task so a
     /// finished load can ask for a frame. `None` in a test, where there is no loop
     /// to wake and nothing to draw.
     waker: Arc<Mutex<Option<Waker>>>,
     next: u64,
-}
-
-struct Request {
-    id: u64,
-    kind: ResourceKind,
-    url: String,
-    body: Option<Body>,
 }
 
 impl std::fmt::Debug for Fetcher {
@@ -226,69 +294,42 @@ impl std::fmt::Debug for Fetcher {
 }
 
 impl Fetcher {
-    /// Start a pool of fetch threads over `loader`.
+    /// A fetch pool over a blocking `loader`.
     ///
-    /// [`FETCH_CONCURRENCY`] threads take from one queue, so a page's pictures are
-    /// fetched several at a time and a slow one does not hold up the rest. Results
-    /// therefore arrive in whatever order they finish, which is why every reply
-    /// carries the number it was asked under.
+    /// The loader runs on Tokio's blocking pool, so a fake one may sleep, read a
+    /// file, or take a lock without stalling anything else. What a real transport
+    /// wants is [`Fetcher::spawn_async`].
     pub fn spawn<L: Loader>(loader: L) -> Self {
-        let (request_sender, request_receiver) = channel::<Request>();
-        let (result_sender, result_receiver) = channel::<Fetched>();
-        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        Self::over(Arc::new(Blocking(loader)))
+    }
 
-        let loader: Arc<dyn Loader> = Arc::new(loader);
-        // One queue, several takers: the mutex is held only long enough to take the
-        // next request, never across a fetch.
-        let queue = Arc::new(Mutex::new(request_receiver));
+    /// A fetch pool over an `loader` that suspends instead of blocking.
+    pub fn spawn_async<L: AsyncLoader>(loader: L) -> Self {
+        Self::over(Arc::new(loader))
+    }
 
-        for worker in 0..FETCH_CONCURRENCY {
-            let queue = Arc::clone(&queue);
-            let loader = Arc::clone(&loader);
-            let results = result_sender.clone();
-            let thread_waker = Arc::clone(&waker);
-
-            std::thread::Builder::new()
-                .name(format!("otlyra-fetch-{worker}"))
-                .spawn(move || {
-                    // Ends when the browser drops its sender, which is when the
-                    // window has gone and there is nothing left to load for.
-                    while let Ok(request) = {
-                        let queue = queue.lock().expect("no panic while taking a request");
-                        queue.recv()
-                    } {
-                        let started = std::time::Instant::now();
-                        let result = loader.send(&request.url, request.body);
-                        let fetched = Fetched {
-                            id: request.id,
-                            kind: request.kind,
-                            url: request.url,
-                            took: started.elapsed(),
-                            result,
-                        };
-                        if results.send(fetched).is_err() {
-                            break;
-                        }
-                        if let Some(waker) =
-                            thread_waker.lock().ok().and_then(|waker| waker.clone())
-                        {
-                            waker.wake();
-                        }
-                    }
-                })
-                .expect("a fetch thread must start");
-        }
-
+    /// The pool itself, over whichever seam the caller brought.
+    ///
+    /// Nothing is spawned here and the runtime is not touched: a browser that never
+    /// fetches never builds one, which keeps the startup path free of a reactor.
+    /// [`FETCH_CONCURRENCY`] fetches then run at once, so a page's pictures arrive
+    /// several at a time and a slow one does not hold up the rest — in whatever
+    /// order they finish, which is why every reply carries the number it was asked
+    /// under.
+    fn over(loader: Arc<dyn AsyncLoader>) -> Self {
+        let (finished, results) = channel::<Fetched>();
         Self {
             exchanges: Vec::new(),
-            requests: request_sender,
-            results: result_receiver,
-            waker,
+            loader,
+            permits: Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY)),
+            finished,
+            results,
+            waker: Arc::new(Mutex::new(None)),
             next: 0,
         }
     }
 
-    /// Tell the fetch thread how to ask for a frame when something finishes.
+    /// Tell the fetch tasks how to ask for a frame when something finishes.
     pub fn set_waker(&self, waker: Waker) {
         if let Ok(mut slot) = self.waker.lock() {
             *slot = Some(waker);
@@ -325,11 +366,37 @@ impl Fetcher {
             waited: None,
             asked_at: std::time::Instant::now(),
         });
-        let _ = self.requests.send(Request {
-            id,
-            kind,
-            url: url.to_owned(),
-            body,
+        let loader = Arc::clone(&self.loader);
+        let permits = Arc::clone(&self.permits);
+        let finished = self.finished.clone();
+        let waker = Arc::clone(&self.waker);
+        let url = url.to_owned();
+        crate::io::shared().spawn(async move {
+            // The queue is the wait for a permit, and it is deliberately outside the
+            // timing below: `took` is how slow the transport was and `waited` is how
+            // busy the pool was, and the panel shows both so neither has to stand in
+            // for the other.
+            let Ok(_permit) = permits.acquire().await else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            let result = loader.fetch(url.clone(), body).await;
+            let fetched = Fetched {
+                id,
+                kind,
+                url,
+                took: started.elapsed(),
+                result,
+            };
+            // A closed channel is a browser that has gone. Nothing to report to and
+            // nothing to wake, so the bytes are dropped here rather than kept for a
+            // receiver that will not read them.
+            if finished.send(fetched).is_err() {
+                return;
+            }
+            if let Some(waker) = waker.lock().ok().and_then(|waker| waker.clone()) {
+                waker.wake();
+            }
         });
         id
     }
@@ -423,6 +490,19 @@ mod tests {
         }
     }
 
+    /// Drain `fetcher` until `count` results have arrived, or fail loudly.
+    fn drain(fetcher: &mut Fetcher, count: usize) -> Vec<Fetched> {
+        let mut finished = Vec::new();
+        while finished.len() < count {
+            let batch = fetcher.wait(std::time::Duration::from_secs(10));
+            if batch.is_empty() {
+                panic!("the pool stalled; {} of {count} arrived", finished.len());
+            }
+            finished.extend(batch);
+        }
+        finished
+    }
+
     /// The point of the pool: a page that asks for several things gets them at
     /// once rather than one after another.
     #[test]
@@ -440,19 +520,122 @@ mod tests {
             );
         }
 
-        let mut finished = 0;
-        while finished < FETCH_CONCURRENCY {
-            let batch = fetcher.wait(std::time::Duration::from_secs(5));
-            if batch.is_empty() {
-                panic!("the pool never finished; {finished} of {FETCH_CONCURRENCY} arrived");
-            }
-            finished += batch.len();
-        }
+        drain(&mut fetcher, FETCH_CONCURRENCY);
 
         assert!(
             highest.load(Ordering::SeqCst) > 1,
             "only one fetch ever ran at a time"
         );
+    }
+
+    /// And the limit is a limit. Asking for four times the allowance must never put
+    /// more than the allowance on the wire at once — that is the whole reason the
+    /// count exists, and it used to be enforced by there being exactly six threads.
+    /// Now that a fetch is a task, nothing but the semaphore stands between a page
+    /// of two hundred pictures and two hundred sockets.
+    #[test]
+    fn no_more_than_the_allowance_is_ever_in_flight() {
+        let highest = Arc::new(AtomicUsize::new(0));
+        let mut fetcher = Fetcher::spawn(SlowLoader {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            highest: Arc::clone(&highest),
+        });
+
+        let asked = FETCH_CONCURRENCY * 4;
+        for index in 0..asked {
+            fetcher.request(
+                &format!("https://example.test/{index}"),
+                ResourceKind::Image,
+            );
+        }
+        drain(&mut fetcher, asked);
+
+        assert_eq!(
+            highest.load(Ordering::SeqCst),
+            FETCH_CONCURRENCY,
+            "the pool ran more fetches at once than it is allowed to"
+        );
+    }
+
+    /// A transport that suspends rather than blocking reaches the same pool, and its
+    /// results carry the same numbers. This is the seam the real network uses; the
+    /// blocking one above is what the fake loaders use.
+    #[test]
+    fn an_async_loader_answers_through_the_same_pool() {
+        struct Suspending {
+            in_flight: Arc<AtomicUsize>,
+            highest: Arc<AtomicUsize>,
+        }
+
+        impl AsyncLoader for Suspending {
+            fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching {
+                Box::pin(async move {
+                    assert!(body.is_none(), "nothing here posts");
+                    let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.highest.fetch_max(now, Ordering::SeqCst);
+                    // A timer rather than a sleep: the point of the async seam is
+                    // that a waiting fetch holds no thread at all.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(Loaded {
+                        final_url: url,
+                        ..Default::default()
+                    })
+                })
+            }
+        }
+
+        let highest = Arc::new(AtomicUsize::new(0));
+        let mut fetcher = Fetcher::spawn_async(Suspending {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            highest: Arc::clone(&highest),
+        });
+
+        let asked: Vec<u64> = (0..FETCH_CONCURRENCY * 2)
+            .map(|index| {
+                fetcher.request(
+                    &format!("https://example.test/{index}"),
+                    ResourceKind::Image,
+                )
+            })
+            .collect();
+
+        let mut ids: Vec<u64> = drain(&mut fetcher, asked.len())
+            .into_iter()
+            .map(|fetched| fetched.id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, asked);
+        let highest = highest.load(Ordering::SeqCst);
+        assert!(highest > 1, "the async pool ran one fetch at a time");
+        assert!(
+            highest <= FETCH_CONCURRENCY,
+            "the async pool ran {highest} fetches at once, past its allowance"
+        );
+    }
+
+    /// A loader that panics ends the request it was answering rather than leaving it
+    /// pending forever. A row stuck on *Pending* with no thread behind it is the
+    /// worst of both: nothing is loading and nothing says so.
+    #[test]
+    fn a_panicking_loader_fails_its_request() {
+        struct Broken;
+
+        impl Loader for Broken {
+            fn load(&self, _url: &str) -> Result<Loaded, String> {
+                panic!("the transport came apart");
+            }
+        }
+
+        let mut fetcher = Fetcher::spawn(Broken);
+        fetcher.request("https://example.test/", ResourceKind::Document);
+        let finished = drain(&mut fetcher, 1);
+
+        assert!(finished[0].result.is_err());
+        assert!(matches!(
+            fetcher.exchanges()[0].status,
+            Status::Failed(ref error) if error.contains("fetch task failed")
+        ));
     }
 
     /// A body reaches the transport, and the list says which request carried one.

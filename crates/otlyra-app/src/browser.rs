@@ -447,12 +447,28 @@ impl Browser {
     /// and the suite passed or failed according to what had been clicked last.
     /// Loading them is the shell's job; this is what a browser does with them.
     pub fn with_settings<L: Loader>(loader: L, settings: crate::settings::Settings) -> Self {
+        Self::with_fetcher(Fetcher::spawn(loader), settings)
+    }
+
+    /// A browser over a transport that suspends rather than blocking.
+    ///
+    /// What the shell builds. Everything else in the crate hands in a blocking
+    /// [`Loader`], because a canned page does not need a future.
+    pub fn with_async_loader<L: crate::fetcher::AsyncLoader>(
+        loader: L,
+        settings: crate::settings::Settings,
+    ) -> Self {
+        Self::with_fetcher(Fetcher::spawn_async(loader), settings)
+    }
+
+    /// The constructor itself, over a pool that has already been built.
+    fn with_fetcher(fetcher: Fetcher, settings: crate::settings::Settings) -> Self {
         let mut browser = Self {
             text: TextEngine::new(),
             ui: BrowserUi::new(),
             tabs: vec![Tab::blank()],
             active: 0,
-            fetcher: Fetcher::spawn(loader),
+            fetcher,
             load_started: std::time::Instant::now(),
             interface: true,
             images: ImageCache::default(),

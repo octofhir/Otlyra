@@ -10,7 +10,7 @@
 
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use otlyra_gfx::DisplayList;
 use otlyra_platform::{Key, Modifiers, Waker};
@@ -240,7 +240,7 @@ impl DownloadWriter {
     pub fn save(&self, id: DownloadId, path: std::path::PathBuf, bytes: Arc<[u8]>) {
         let sender = self.sender.clone();
         let waker = Arc::clone(&self.waker);
-        download_runtime().spawn(async move {
+        crate::io::shared().spawn(async move {
             let result = tokio::fs::write(&path, bytes.as_ref())
                 .await
                 .map_err(|error| error.to_string());
@@ -259,19 +259,6 @@ impl DownloadWriter {
         }
         finished
     }
-}
-
-/// One small runtime for background file I/O, shared by every browser window.
-fn download_runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("otlyra-download")
-            .enable_all()
-            .build()
-            .expect("the download I/O runtime must start")
-    })
 }
 
 /// Return the attachment's safe leaf filename when the headers say this

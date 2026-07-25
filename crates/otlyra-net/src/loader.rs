@@ -215,14 +215,21 @@ pub enum NetError {
 /// whose behaviour we do not yet have.
 const USER_AGENT: &str = concat!("Otlyra/", env!("CARGO_PKG_VERSION"));
 
-/// The process's network stack: one HTTP client, one runtime.
+/// The process's network stack: one HTTP client.
 ///
 /// One client for the whole process, not one per request — a fresh client throws
 /// away the connection pool, the DNS cache and the TLS session cache, which is
 /// most of what makes the second request to a host fast.
+///
+/// No runtime of its own unless something asks it to block. [`Loader::fetch`] is
+/// what the browser uses, on the runtime the browser already has; the shell's
+/// one-shot `--url` mode has no runtime at all and [`Loader::fetch_blocking`] builds
+/// it one, once, the first time it is called. A runtime built here unconditionally
+/// was a second reactor sitting inside every fetch, which is what the fetch pool
+/// used to block on.
 pub struct Loader {
     client: reqwest::Client,
-    runtime: tokio::runtime::Runtime,
+    blocking: std::sync::OnceLock<tokio::runtime::Runtime>,
     limits: Limits,
 }
 
@@ -240,11 +247,6 @@ impl Loader {
         let startup =
             |source: Box<dyn std::error::Error + Send + Sync>| NetError::Startup { source };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| startup(Box::new(error)))?;
-
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(limits.timeout)
@@ -254,7 +256,7 @@ impl Loader {
 
         Ok(Self {
             client,
-            runtime,
+            blocking: std::sync::OnceLock::new(),
             limits,
         })
     }
@@ -267,19 +269,35 @@ impl Loader {
     /// Fetch one resource, blocking the calling thread until it is complete.
     ///
     /// **This blocks, and that is why it is named so.** It exists for the shell's
-    /// one-shot `--url` mode, and for the fetch threads, which have nothing else to
-    /// do while it runs. The window's own thread must never reach it: a main loop
-    /// that blocks on the network is a main loop that has stopped painting and
-    /// stopped answering the keyboard. Everything crossing this signature is owned,
-    /// so moving the transport further away is a change of transport rather than a
-    /// change of design.
+    /// one-shot `--url` mode, which has no event loop and nothing else to do. The
+    /// window's own thread must never reach it: a main loop that blocks on the
+    /// network is a main loop that has stopped painting and stopped answering the
+    /// keyboard. The browser calls [`Loader::fetch`] on its own runtime instead.
+    ///
+    /// Calling this from inside a Tokio runtime is a panic, as it should be — it is
+    /// exactly the mistake the name is warning about.
     pub fn fetch_blocking(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
         let span = tracing::info_span!("resource_load", url = %request.url);
         let _entered = span.enter();
-        self.runtime.block_on(self.fetch(request))
+        if self.blocking.get().is_none() {
+            let built = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| NetError::Startup {
+                    source: Box::new(error),
+                })?;
+            let _ = self.blocking.set(built);
+        }
+        let runtime = self.blocking.get().expect("the runtime was just built");
+        runtime.block_on(self.fetch(request))
     }
 
-    async fn fetch(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
+    /// Fetch one resource on the caller's runtime.
+    ///
+    /// The whole transport: `data:` read out of the address, scheme policy, the
+    /// declared and the arriving body caps, and the headers as sent and as received.
+    /// Nothing here knows what the bytes mean.
+    pub async fn fetch(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
         // A `data:` URL is not a request at all: the resource is written into the
         // address, and reading it is decoding rather than fetching. Answered here
         // so that everything upstream — a picture, a stylesheet, a font — takes one
