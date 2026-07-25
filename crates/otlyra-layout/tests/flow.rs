@@ -1276,3 +1276,60 @@ fn a_clip_travels_with_the_inline_block_it_belongs_to() {
         "the clip stayed at the origin: {clipped:?}"
     );
 }
+
+/// A table cell holds its own floats and grows to hold them.
+///
+/// A cell is the root of a formatting context, the way a box that clips is. It
+/// was not one here, and a footer laid out as a table of floated links — which
+/// is a shape a great many sites still use — came out with every row on top of
+/// the one above it: the floats escaped their cell, the cell measured empty, and
+/// the rows had no height to keep them apart.
+#[test]
+fn a_table_cell_contains_the_floats_inside_it() {
+    let tree = lay_out_styled(
+        "<body><table><tr><td id=label>label</td>\
+         <td id=links><ul><li style='float: left'>one</li>\
+         <li style='float: left'>two</li></ul></td></tr>\
+         <tr><td>second</td><td><ul><li style='float: left'>three</li></ul></td></tr>\
+         </table><p id=after>after</p>",
+        800.0,
+    );
+
+    // Every floated word is still on the page: one that escaped its cell would
+    // have been laid beside the table rather than inside it.
+    let text = otlyra_layout::selection::text(
+        &tree,
+        otlyra_layout::selection::all(&tree).expect("a page with text"),
+    );
+    for word in ["label", "one", "two", "second", "three", "after"] {
+        assert!(text.contains(word), "{word:?} is not on the page: {text:?}");
+    }
+
+    // The rows do not sit on top of each other: the second row's label starts
+    // below the first row's floats end.
+    let runs: Vec<&Fragment> = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
+        .collect();
+    let find = |word: &str| {
+        runs.iter()
+            .find(|run| match &run.kind {
+                FragmentKind::Text(text) => text.text.contains(word),
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no run for {word}"))
+            .rect
+    };
+    let (one, second) = (find("one"), find("second"));
+    assert!(
+        second.y >= one.bottom() - 0.5,
+        "the second row landed on the first: {second:?} against {one:?}"
+    );
+
+    // And what follows the table follows all of it, floats included.
+    let after = find("after");
+    assert!(
+        after.y >= find("three").bottom() - 0.5,
+        "the table did not grow to hold its floats: {after:?}"
+    );
+}

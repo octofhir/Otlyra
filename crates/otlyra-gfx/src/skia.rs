@@ -1313,15 +1313,30 @@ fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
     let fonts = sk::FontMgr::new();
     let dom = sk::svg::Dom::from_bytes(bytes, fonts).map_err(|_| SkiaError::ImageDecode)?;
 
-    let declared = dom.root().intrinsic_size();
-    let size = |value: f32| {
-        if value.is_finite() && value >= 1.0 {
-            value.min(LARGEST)
-        } else {
-            UNSIZED
+    // The document's own `width` and `height` where it declares them, and the
+    // extent of its `viewBox` where it does not. The second is not a fallback for
+    // tidiness: a picture with a `viewBox` and no size is what every drawing
+    // program exports and what every icon on the web is, and drawing one at a
+    // guessed square is drawing it at the wrong shape — which a background then
+    // tiles, because a tile the size of the box is one tile and a tile a third of
+    // it is three.
+    let root = dom.root();
+    let declared = root.intrinsic_size();
+    let boxed = root.view_box().map(|view| (view.width(), view.height()));
+    drop(root);
+    let size = |declared: f32, extent: Option<f32>| {
+        if declared.is_finite() && declared >= 1.0 {
+            return declared.min(LARGEST);
+        }
+        match extent {
+            Some(extent) if extent.is_finite() && extent >= 1.0 => extent.min(LARGEST),
+            _ => UNSIZED,
         }
     };
-    let (width, height) = (size(declared.width), size(declared.height));
+    let (width, height) = (
+        size(declared.width, boxed.map(|(width, _)| width)),
+        size(declared.height, boxed.map(|(_, height)| height)),
+    );
 
     let mut surface = sk::surfaces::raster_n32_premul((width as i32, height as i32))
         .ok_or(SkiaError::ImageDecode)?;
@@ -1777,6 +1792,34 @@ mod variation_tests {
 
         // Something that is not a picture at all is still refused.
         assert!(decode_image(b"not a picture").is_err());
+    }
+
+    /// A picture that declares no size is drawn at the shape of its `viewBox`.
+    ///
+    /// Which is nearly every icon and logo on the web: a drawing program exports
+    /// a `viewBox` and no `width`, and a browser reads the extent of that box as
+    /// the picture's own. Drawing it at a guessed square instead is drawing it at
+    /// the wrong shape — and a background then *tiles* the wrong shape, because a
+    /// tile the size of the box covers it once and a tile a third of it covers it
+    /// three times.
+    #[test]
+    fn an_svg_with_only_a_view_box_is_drawn_at_its_extent() {
+        use crate::decode_image;
+
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 450 175">
+             <rect width="450" height="175" fill="#00ff00"/></svg>"##;
+        let drawn = decode_image(svg).expect("a vector picture draws");
+        assert_eq!(
+            (drawn.width, drawn.height),
+            (450, 175),
+            "the extent of the view box, not a square of somebody's choosing"
+        );
+
+        // A picture with neither is still drawn at something rather than refused.
+        let neither = br##"<svg xmlns="http://www.w3.org/2000/svg">
+             <rect width="10" height="10" fill="#00ff00"/></svg>"##;
+        let drawn = decode_image(neither).expect("a vector picture draws");
+        assert_eq!((drawn.width, drawn.height), (150, 150));
     }
 
     use super::{SegmentMap, axis_segment_maps, unmap_axis};

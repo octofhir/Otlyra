@@ -1617,8 +1617,17 @@ impl<'a> Flow<'a> {
         // A box that cuts its contents off is a formatting context of its own: the
         // floats outside it do not shorten the lines inside it, and its own do not
         // reach out. This is the rule `overflow: hidden` is best known for.
-        let outer_floats = (style.overflow == otlyra_css::Overflow::Clip)
-            .then(|| std::mem::take(&mut self.floats));
+        //
+        // A table cell and an `inline-block` are roots of one for the same reason
+        // and without saying so. Leaving them out is what let a footer laid out as
+        // a table of floated links collapse: the floats escaped the cell, the cell
+        // came out empty, and every row landed on the one above it.
+        let root = style.overflow == otlyra_css::Overflow::Clip
+            || matches!(
+                style.display,
+                otlyra_css::Display::TableCell | otlyra_css::Display::InlineBlock
+            );
+        let outer_floats = root.then(|| std::mem::take(&mut self.floats));
         // A block-level picture is its own size and has no children to lay out;
         // everything else about it — margins, borders — is an ordinary block's.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
@@ -1650,9 +1659,22 @@ impl<'a> Flow<'a> {
         // height, when it has one to give them.
         let outer_height = self.containing_height;
         self.containing_height = self.inner_height(&style, padding);
-        let content_height =
+        let mut content_height =
             self.layout_inside(id, content_width, content_x, content_y, &mut children);
         self.containing_height = outer_height;
+        // A root of a formatting context is at least as tall as the floats inside
+        // it. Everywhere else a float is out of the flow and adds nothing to the
+        // height of what holds it — which is the whole of what floating means —
+        // but nothing outside this box can be moved by them, so a box that did not
+        // grow to hold its own would leave them hanging out of its bottom.
+        if outer_floats.is_some() {
+            let reach = self
+                .floats
+                .iter()
+                .map(|float| float.rect.bottom())
+                .fold(content_y, f32::max);
+            content_height = content_height.max(reach - content_y);
+        }
         // A table with no width of its own is only as wide as its columns turned
         // out to need. One that names a width keeps it, and its columns were
         // stretched to fill it instead.
