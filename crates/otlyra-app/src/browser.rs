@@ -1145,17 +1145,13 @@ impl Browser {
         for saved in self.downloads_writer.poll() {
             changed = true;
             match saved.result {
-                Ok(()) => {
-                    tracing::info!(file = %saved.path.display(), "attachment saved");
+                Ok(path) => {
+                    tracing::info!(file = %path.display(), "attachment saved");
                     self.downloads
-                        .mark_saved(saved.id, saved.path.to_string_lossy().into_owned());
+                        .mark_saved(saved.id, path.to_string_lossy().into_owned());
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        file = %saved.path.display(),
-                        %error,
-                        "attachment could not be saved"
-                    );
+                    tracing::warn!(%error, "attachment could not be saved");
                     self.downloads.mark_save_failed(saved.id, error);
                 }
             }
@@ -1507,12 +1503,30 @@ impl Browser {
                 });
             let final_url = loaded.final_url;
             let size = loaded.bytes.len();
-            self.downloads.record(
+            let recorded = self.downloads.record(
                 filename.clone(),
                 final_url.clone(),
                 loaded.content_type,
                 loaded.bytes,
             );
+
+            // The preference decides here rather than on the page: an automatic
+            // download is one nobody pressed anything for, so the write has to
+            // start where the bytes arrive.
+            if let Some(id) = recorded
+                && !self.settings.settings.asks_where_to_save()
+                && let Some(directory) = self.settings.settings.download_directory()
+                && let Some(bytes) = self.downloads.get(id).map(downloads::Download::payload)
+            {
+                self.start_save(
+                    id,
+                    downloads::Destination::Into {
+                        directory,
+                        filename: filename.clone(),
+                    },
+                    bytes,
+                );
+            }
 
             let tab = &mut self.tabs[index];
             tab.system = Some(SystemPage::Downloads);
@@ -1959,9 +1973,30 @@ impl Browser {
         crate::preferences::save(&self.settings.settings);
     }
 
-    fn close_settings_if(&mut self, action: &settings::Action) {
-        if *action == settings::Action::Close {
-            self.close_system_page();
+    /// Answer what the settings surface reported and could not do itself.
+    ///
+    /// Two things: leaving the surface, which is a tab's business, and putting a
+    /// native dialogue on the screen, which is the platform's. Everything else the
+    /// surface has already applied to the preferences by the time this runs.
+    fn handle_settings_action(&mut self, action: &settings::Action) {
+        match action {
+            settings::Action::Close => self.close_system_page(),
+            settings::Action::ChooseDownloadDirectory => {
+                let current = self.settings.settings.download_directory();
+                let Some(chosen) = choose_download_directory(current.as_deref()) else {
+                    return;
+                };
+                // Through `apply`, like every other change, and saved here because
+                // the caller's own before/after comparison already ran — the
+                // dialogue was up while it did.
+                self.settings
+                    .settings
+                    .apply(settings::Action::SetDownloadDirectory(
+                        chosen.to_string_lossy().into_owned(),
+                    ));
+                crate::preferences::save(&self.settings.settings);
+            }
+            _ => {}
         }
     }
 
@@ -1998,18 +2033,65 @@ impl Browser {
         match action {
             downloads::Action::Clear => self.downloads.clear(),
             downloads::Action::Save(id) => {
-                let selected = self.downloads.get(id).and_then(|download| {
-                    choose_download_path(download.filename()).map(|path| (path, download.payload()))
+                let asked = self.downloads.get(id).and_then(|download| {
+                    // The dialogue opens in the download folder, so the preference
+                    // is where a manual save starts from as well as where an
+                    // automatic one ends up.
+                    choose_download_path(
+                        download.filename(),
+                        self.settings.settings.download_directory().as_deref(),
+                    )
+                    .map(|path| (path, download.payload()))
                 });
-                if let Some((path, bytes)) = selected {
-                    self.downloads
-                        .mark_saving(id, path.to_string_lossy().into_owned());
-                    self.downloads_writer.save(id, path, bytes);
+                if let Some((path, bytes)) = asked {
+                    self.start_save(id, downloads::Destination::Exact(path), bytes);
+                }
+            }
+            downloads::Action::Retry(id) => {
+                // The directory is read again rather than remembered: the usual
+                // reason a write failed is that where it was going was wrong, and
+                // the usual answer is that the reader has since changed it.
+                let Some(directory) = self.settings.settings.download_directory() else {
+                    return;
+                };
+                let retry = self
+                    .downloads
+                    .get(id)
+                    .map(|download| (download.retry_destination(directory), download.payload()));
+                if let Some((destination, bytes)) = retry {
+                    self.start_save(id, destination, bytes);
                 }
             }
             downloads::Action::Close => self.close_system_page(),
             downloads::Action::None => {}
         }
+    }
+
+    /// Mark a row as being written and hand the bytes to the writer.
+    ///
+    /// One place, because the row's in-progress state and the write starting must
+    /// not be able to disagree: a row that says nothing is happening while a file
+    /// is being written offers a second Save As over the top of the first.
+    fn start_save(
+        &mut self,
+        id: downloads::DownloadId,
+        destination: downloads::Destination,
+        bytes: std::sync::Arc<[u8]>,
+    ) {
+        match &destination {
+            downloads::Destination::Exact(path) => self.downloads.mark_saving(
+                id,
+                path.to_string_lossy().into_owned(),
+                Some(path.clone()),
+            ),
+            // No path yet: which name a directory write lands on is the writer's
+            // answer, and the row says the folder until it comes back.
+            downloads::Destination::Into { directory, .. } => {
+                self.downloads
+                    .mark_saving(id, directory.to_string_lossy().into_owned(), None);
+            }
+        }
+        self.downloads_writer.save(id, destination, bytes);
     }
 
     /// Apply what the inspector reported that the browser has to do about.
@@ -2875,7 +2957,7 @@ impl Painter for Browser {
                     // what a drag is made of.
                     Some(SystemPage::Settings) => {
                         let action = self.settings.pointer_moved(x, y);
-                        self.close_settings_if(&action);
+                        self.handle_settings_action(&action);
                     }
                     Some(SystemPage::History) => self.history_page.pointer_moved(x, y),
                     Some(SystemPage::Downloads) => self.downloads_page.pointer_moved(x, y),
@@ -2946,7 +3028,7 @@ impl Painter for Browser {
                             let before = self.settings.settings.clone();
                             let action = self.settings.pointer_pressed(clicks);
                             self.save_preferences_if_changed(&before);
-                            self.close_settings_if(&action);
+                            self.handle_settings_action(&action);
                             return;
                         }
                         Some(SystemPage::History) => {
@@ -3107,7 +3189,7 @@ impl Painter for Browser {
                                     .key_pressed(key, modifiers, self.clipboard.as_mut())
                             {
                                 self.save_preferences_if_changed(&before);
-                                self.close_settings_if(&action);
+                                self.handle_settings_action(&action);
                                 return;
                             }
                         }
@@ -3346,7 +3428,7 @@ impl Painter for Browser {
                         let before = self.settings.settings.clone();
                         let action = self.settings.activate_described(index);
                         self.save_preferences_if_changed(&before);
-                        self.close_settings_if(&action);
+                        self.handle_settings_action(&action);
                     }
                     Some(SystemPage::History) => {
                         let action = self.history_page.activate_described(index);
@@ -3891,7 +3973,7 @@ mod system_page_tests {
         browser.navigate("about:otlyra");
         browser.navigate("about:settings");
 
-        browser.close_settings_if(&crate::settings::Action::Close);
+        browser.handle_settings_action(&crate::settings::Action::Close);
         assert_eq!(
             browser.system_page(),
             Some(SystemPage::About),
@@ -3904,7 +3986,7 @@ mod system_page_tests {
         let mut browser = Browser::new(NoNetwork);
         browser.navigate("about:settings");
 
-        browser.close_settings_if(&crate::settings::Action::Close);
+        browser.handle_settings_action(&crate::settings::Action::Close);
         assert_eq!(browser.system_page(), None);
         assert_eq!(browser.tabs()[0].title, "New tab");
     }
@@ -4028,11 +4110,126 @@ mod system_page_tests {
         assert_eq!(download.bytes(), b"id,name\n1,Ada\n");
     }
 
+    /// With asking turned off, an attachment reaches the disk on its own — nobody
+    /// presses anything, so the write has to start where the bytes arrive.
+    #[test]
+    fn an_attachment_saves_itself_when_the_preference_says_not_to_ask() {
+        struct Attachment;
+
+        impl Loader for Attachment {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    bytes: b"id,name\n1,Ada\n".to_vec(),
+                    content_type: Some("text/csv".to_owned()),
+                    response_headers: vec![(
+                        "content-disposition".to_owned(),
+                        "attachment; filename=people.csv".to_owned(),
+                    )],
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        // A directory this test owns. The preference is set directly rather than
+        // through the environment, because the environment is process-wide and the
+        // rest of the suite is running beside this.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "otlyra-automatic-download-{}-{unique}",
+            std::process::id()
+        ));
+
+        let mut settings = crate::settings::Settings::default();
+        settings.apply(crate::settings::Action::ToggleDownloadAsk);
+        settings.apply(crate::settings::Action::SetDownloadDirectory(
+            directory.to_string_lossy().into_owned(),
+        ));
+        assert!(!settings.asks_where_to_save());
+
+        let mut browser = Browser::with_settings(Attachment, settings);
+        browser.navigate("https://example.test/export");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+
+        // The write is asynchronous, so the row is pending here and the file
+        // arrives through `pump` — the same route the running browser takes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let saved = loop {
+            browser.pump();
+            if let Some(saved) = browser
+                .downloads
+                .downloads()
+                .next()
+                .and_then(|download| download.saved_to())
+            {
+                break saved.to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the download never reached the disk: {:?}",
+                browser.downloads.downloads().next().map(|download| (
+                    download.saving_to().map(str::to_owned),
+                    download.save_error().map(str::to_owned)
+                ))
+            );
+            std::thread::yield_now();
+        };
+
+        assert_eq!(
+            std::path::Path::new(&saved),
+            directory.join("people.csv"),
+            "the file went somewhere other than the download folder"
+        );
+        assert_eq!(
+            std::fs::read(&saved).expect("the saved download"),
+            b"id,name\n1,Ada\n"
+        );
+        std::fs::remove_dir_all(&directory).expect("remove the test-owned directory");
+    }
+
+    /// And with asking left on — the default — nothing is written without a person.
+    #[test]
+    fn an_attachment_waits_to_be_asked_about_by_default() {
+        struct Attachment;
+
+        impl Loader for Attachment {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    bytes: b"id,name\n1,Ada\n".to_vec(),
+                    response_headers: vec![(
+                        "content-disposition".to_owned(),
+                        "attachment; filename=people.csv".to_owned(),
+                    )],
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Attachment);
+        assert!(browser.settings.settings.asks_where_to_save());
+        browser.navigate("https://example.test/export");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+        browser.pump();
+
+        let download = browser
+            .downloads
+            .downloads()
+            .next()
+            .expect("the attachment was retained");
+        assert!(download.saved_to().is_none(), "it saved itself uninvited");
+        assert!(download.saving_to().is_none());
+        assert!(download.save_error().is_none());
+    }
+
     #[test]
     fn leaving_the_settings_leaves_the_tab_blank_rather_than_still_on_them() {
         let mut browser = Browser::new(NoNetwork);
         browser.navigate("about:settings");
-        browser.close_settings_if(&crate::settings::Action::Close);
+        browser.handle_settings_action(&crate::settings::Action::Close);
 
         assert_eq!(browser.system_page(), None);
         assert_eq!(browser.ui().address.text(), "");
@@ -4116,14 +4313,44 @@ fn choose_files(_request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::Ch
 /// after it closes and runs through [`downloads::DownloadWriter`], never on the
 /// browser thread.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn choose_download_path(filename: &str) -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new().set_file_name(filename).save_file()
+fn choose_download_path(
+    filename: &str,
+    directory: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let mut dialogue = rfd::FileDialog::new().set_file_name(filename);
+    // Only a directory that is there: a dialogue told to open somewhere that does
+    // not exist opens somewhere of its own choosing on some platforms and refuses
+    // on others, and neither is what the preference meant.
+    if let Some(directory) = directory.filter(|directory| directory.is_dir()) {
+        dialogue = dialogue.set_directory(directory);
+    }
+    dialogue.save_file()
 }
 
 /// The same, where the platform has no native file dialogue.
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn choose_download_path(_filename: &str) -> Option<std::path::PathBuf> {
+fn choose_download_path(
+    _filename: &str,
+    _directory: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     tracing::debug!("no save dialogue on this platform; the attachment remains in the session");
+    None
+}
+
+/// Ask which folder automatic downloads should go into.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn choose_download_directory(current: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let mut dialogue = rfd::FileDialog::new();
+    if let Some(current) = current.filter(|current| current.is_dir()) {
+        dialogue = dialogue.set_directory(current);
+    }
+    dialogue.pick_folder()
+}
+
+/// The same, where there is nothing to ask.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn choose_download_directory(_current: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    tracing::debug!("no folder dialogue on this platform; the download folder is unchanged");
     None
 }
 
@@ -5799,7 +6026,7 @@ mod tests {
         let document = browser.tabs[0].url.clone();
         browser.open_system(SystemPage::Settings);
 
-        browser.close_settings_if(&settings::Action::Close);
+        browser.handle_settings_action(&settings::Action::Close);
         settle(&mut browser);
         assert_eq!(
             browser.tabs[0].url, document,
@@ -5810,7 +6037,7 @@ mod tests {
         // page nobody can leave.
         let mut fresh = Browser::new(LongLoader);
         fresh.open_system(SystemPage::Settings);
-        fresh.close_settings_if(&settings::Action::Close);
+        fresh.handle_settings_action(&settings::Action::Close);
         assert_eq!(fresh.system_page(), None);
         assert!(fresh.tabs[0].url.is_empty());
     }

@@ -134,6 +134,17 @@ arboard = { version = "=3.6.1", default-features = false }
 # maintaining a tz database — which is exactly what this crate is.
 jiff = "=0.2.34"
 
+# Where the platform keeps a person's Downloads folder.
+#
+# The one directory in this program that is genuinely not derivable from the
+# environment. `preferences.rs` works its own out by hand and says why: a
+# configuration directory is three stable cases. A downloads directory is not —
+# on Linux it is whatever `~/.config/user-dirs.dirs` says and may be localized or
+# absent, and on Windows it is a Known Folder the reader is allowed to move, which
+# no environment variable reports. Guessing `$HOME/Downloads` is right on macOS
+# and a wrong answer everywhere a person has moved theirs.
+dirs = "=6.0.0"
+
 # Observability.
 tracing = { version = "=0.1.44", features = ["log"] }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }

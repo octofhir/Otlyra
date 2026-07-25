@@ -113,9 +113,16 @@ impl SettingsFrame {
     fn new() -> Self {
         let mut ui = BrowserUi::new();
         ui.address.set_text("about:settings");
+        // The download folder is named rather than left to the platform, which
+        // would draw whoever ran the test into the picture: the default is the
+        // home directory's `Downloads`.
+        let mut settings = otlyra_app::settings::Settings::default();
+        settings.apply(otlyra_app::settings::Action::SetDownloadDirectory(
+            "/downloads".to_owned(),
+        ));
         Self {
             ui,
-            surface: SettingsSurface::new(),
+            surface: SettingsSurface::with(settings),
             text: TextEngine::isolated(),
         }
     }

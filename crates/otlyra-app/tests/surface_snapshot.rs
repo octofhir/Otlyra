@@ -12,7 +12,7 @@
 //!
 //! Review and accept changes with `cargo insta review`.
 
-use otlyra_app::settings::SettingsSurface;
+use otlyra_app::settings::{Settings, SettingsSurface};
 use otlyra_app::ui::{BrowserUi, Rect, TabLabel, UI_HEIGHT};
 use otlyra_gfx::kurbo::Shape;
 use otlyra_gfx::peniko::{Brush, Color};
@@ -149,6 +149,19 @@ fn outline(list: &DisplayList) -> String {
 }
 
 /// The busy toolbar: tabs, history, a spinner, an address.
+/// Preferences that draw the same on every machine.
+///
+/// The download folder is named rather than left to the platform: the default is
+/// the home directory's `Downloads`, so a surface built from the defaults would
+/// draw whoever ran the test into the snapshot.
+fn fixed_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.apply(otlyra_app::settings::Action::SetDownloadDirectory(
+        "/downloads".to_owned(),
+    ));
+    settings
+}
+
 fn toolbar() -> (BrowserUi, Vec<TabLabel>, TextEngine) {
     let mut ui = BrowserUi::new();
     ui.address.set_text("https://example.com/some/path");
@@ -199,7 +212,7 @@ fn the_open_menu_outline_is_stable() {
 
 #[test]
 fn the_settings_outline_is_stable() {
-    let mut surface = SettingsSurface::new();
+    let mut surface = SettingsSurface::with(fixed_settings());
     let mut text = TextEngine::isolated();
     let mut list = DisplayList::new();
     surface.build_display_list(

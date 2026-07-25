@@ -4,10 +4,23 @@
 //! browser keeps its bytes here instead of feeding them to the HTML parser, and
 //! this surface shows the result without depending on the document engine.
 //!
-//! Each retained attachment can then be written through the native Save As
-//! dialog. Automatic saving can use the same store once a download directory is
-//! a persisted browser preference.
+//! A retained attachment reaches the disk two ways, and the preference decides
+//! which: the native Save As dialog names one exact path, or the download
+//! directory takes it under a name that is not already spoken for. Both go
+//! through one writer, and the writer's rules are the interesting part:
+//!
+//! - the bytes land in a `<name>.otlyra-part` beside the destination and are
+//!   renamed onto it only once they are all there, so a half-written file never
+//!   looks like a finished one — and the rename is within one directory, so it is
+//!   the atomic operation the platform promises rather than a copy;
+//! - that part file is also the *reservation*. Two downloads of `report.csv`
+//!   arriving together cannot both pick `report (1).csv`, because claiming a name
+//!   means creating its part file exclusively, and the loser moves on to the next
+//!   number. A check for whether the final name is free cannot do that on its own;
+//! - a failed write leaves nothing behind and says why, and the row offers to try
+//!   again.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -45,6 +58,12 @@ pub struct Download {
     saved_to: Option<String>,
     saving_to: Option<String>,
     save_error: Option<String>,
+    /// The exact path the last attempt was aimed at, when a person named one.
+    ///
+    /// `None` means it went to the download directory, and trying again asks the
+    /// preference afresh rather than reusing a directory the reader may have
+    /// changed *because* the write failed.
+    chosen: Option<PathBuf>,
 }
 
 impl Download {
@@ -92,6 +111,17 @@ impl Download {
     pub fn save_error(&self) -> Option<&str> {
         self.save_error.as_deref()
     }
+
+    /// Where trying again should write, given what the last attempt aimed at.
+    pub(crate) fn retry_destination(&self, directory: PathBuf) -> Destination {
+        match self.chosen.clone() {
+            Some(path) => Destination::Exact(path),
+            None => Destination::Into {
+                directory,
+                filename: self.filename.clone(),
+            },
+        }
+    }
 }
 
 /// Completed attachments owned by the browser rather than by any one tab.
@@ -106,13 +136,15 @@ pub struct DownloadStore {
 impl DownloadStore {
     /// Keep a completed attachment, evicting the oldest retained payloads if
     /// the session budget would otherwise be exceeded.
+    /// Returns the identity the row was given, so an automatic save can start on
+    /// it without searching the list for what was just added.
     pub fn record(
         &mut self,
         filename: impl Into<String>,
         url: impl Into<String>,
         content_type: Option<String>,
         bytes: Vec<u8>,
-    ) {
+    ) -> Option<DownloadId> {
         let incoming = bytes.len();
         while self.bytes + incoming > BYTE_BUDGET && !self.entries.is_empty() {
             let removed = self.entries.remove(0);
@@ -122,7 +154,7 @@ impl DownloadStore {
         // The network limit is below the store budget in production. Keeping
         // this guard makes the store safe when used with a custom Loader.
         if incoming > BYTE_BUDGET {
-            return;
+            return None;
         }
 
         self.bytes += incoming;
@@ -137,8 +169,10 @@ impl DownloadStore {
             saved_to: None,
             saving_to: None,
             save_error: None,
+            chosen: None,
         });
         self.revision += 1;
+        Some(id)
     }
 
     /// Forget all completed attachments and release their payloads.
@@ -170,11 +204,21 @@ impl DownloadStore {
     }
 
     /// Put a row into its in-progress state before the writer starts.
-    pub fn mark_saving(&mut self, id: DownloadId, path: impl Into<String>) {
+    ///
+    /// `destination` is what the row says while the write runs, and `chosen` is
+    /// the exact path to try again at — `None` for a write into the download
+    /// directory, whose final name the writer has not settled yet.
+    pub fn mark_saving(
+        &mut self,
+        id: DownloadId,
+        destination: impl Into<String>,
+        chosen: Option<PathBuf>,
+    ) {
         let Some(download) = self.entries.iter_mut().find(|download| download.id == id) else {
             return;
         };
-        download.saving_to = Some(path.into());
+        download.saving_to = Some(destination.into());
+        download.chosen = chosen;
         download.save_error = None;
         self.revision += 1;
     }
@@ -199,10 +243,95 @@ impl DownloadStore {
 pub struct SaveResult {
     /// Which row asked for it.
     pub id: DownloadId,
-    /// The chosen destination.
-    pub path: std::path::PathBuf,
-    /// Success, or the operating system's reason.
-    pub result: Result<(), String>,
+    /// Where it ended up, or the reason it did not.
+    ///
+    /// The path is in the answer rather than beside it because a write into the
+    /// download directory does not know its own name until it has claimed one:
+    /// the reader asked for a directory, and which of `report.csv` and
+    /// `report (1).csv` they got is something only the writer can report.
+    pub result: Result<PathBuf, String>,
+}
+
+/// Where a completed attachment should be written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Destination {
+    /// This exact path, replacing whatever is there.
+    ///
+    /// What the Save As dialog promised: the platform's own dialogue has already
+    /// asked about replacing a file, so asking again here would be asking twice.
+    Exact(PathBuf),
+    /// Inside this directory, under `filename` or the first free number after it.
+    Into {
+        /// The directory to write into, created if it is not there.
+        directory: PathBuf,
+        /// The name to aim for. Reduced to a leaf again before it is used, so a
+        /// server that answered `../../etc/passwd` cannot name a path.
+        filename: String,
+    },
+}
+
+/// How many numbered copies of one name the writer will try before giving up.
+///
+/// A bound rather than a loop, because the alternative is a directory that
+/// somehow answers "taken" forever and a browser that stops responding while it
+/// asks. A thousand copies of one file is someone else's problem to explain.
+const MOST_COLLISIONS: usize = 999;
+
+/// What an unfinished download is called while it is being written.
+const PART_SUFFIX: &str = ".otlyra-part";
+
+/// The part file that stands in for `destination` until the bytes are all there.
+///
+/// A sibling, deliberately: the finishing move is a rename, and a rename is only
+/// the atomic operation the platform promises when both names are in the same
+/// directory. Across filesystems it becomes a copy, which is the very thing this
+/// is here to avoid.
+fn part_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(PART_SUFFIX);
+    destination.with_file_name(name)
+}
+
+/// `report.csv` numbered: `report.csv`, `report (1).csv`, `report (2).csv`.
+///
+/// Split at the last dot, which is what the platform means by an extension, so
+/// `archive.tar.gz` becomes `archive.tar (1).gz`. Not what every browser does, and
+/// the alternative is a list of compound extensions to keep current forever.
+fn indexed_name(filename: &str, index: usize) -> String {
+    if index == 0 {
+        return filename.to_owned();
+    }
+    let path = Path::new(filename);
+    match (path.file_stem(), path.extension()) {
+        (Some(stem), Some(extension)) if !stem.is_empty() => format!(
+            "{} ({index}).{}",
+            stem.to_string_lossy(),
+            extension.to_string_lossy()
+        ),
+        _ => format!("{filename} ({index})"),
+    }
+}
+
+/// Where downloads go when nothing has said otherwise.
+///
+/// The platform's own Downloads folder, asked of the platform rather than guessed
+/// at. `preferences::path` works its own directory out by hand and says why — a
+/// configuration directory is three stable cases — and this one is deliberately
+/// not that: on Linux it is whatever `~/.config/user-dirs.dirs` names, which may
+/// be localized, relative, or missing, and on Windows it is a Known Folder the
+/// reader may have moved and that no environment variable reports. `$HOME/Downloads`
+/// is right on macOS and a wrong answer for anyone who has moved theirs.
+///
+/// `None` means the platform would not say, which is a browser that has to ask
+/// before it can save anything — see [`crate::settings::Settings::asks_where_to_save`].
+pub fn default_directory() -> Option<PathBuf> {
+    // The same escape hatch the preferences file has, and for the same reason: a
+    // person running the browser by hand must be able to keep it out of their own
+    // Downloads folder. Read before the platform is asked, so it wins.
+    if let Some(directory) = std::env::var_os("OTLYRA_DOWNLOAD_DIR") {
+        return Some(PathBuf::from(directory));
+    }
+    dirs::download_dir()
 }
 
 /// Writes completed attachments without blocking the browser thread.
@@ -236,15 +365,13 @@ impl DownloadWriter {
         }
     }
 
-    /// Start writing `bytes` and return immediately.
-    pub fn save(&self, id: DownloadId, path: std::path::PathBuf, bytes: Arc<[u8]>) {
+    /// Start writing `bytes` to `destination` and return immediately.
+    pub fn save(&self, id: DownloadId, destination: Destination, bytes: Arc<[u8]>) {
         let sender = self.sender.clone();
         let waker = Arc::clone(&self.waker);
         crate::io::shared().spawn(async move {
-            let result = tokio::fs::write(&path, bytes.as_ref())
-                .await
-                .map_err(|error| error.to_string());
-            let _ = sender.send(SaveResult { id, path, result });
+            let result = write(destination, bytes).await;
+            let _ = sender.send(SaveResult { id, result });
             if let Some(waker) = waker.lock().ok().and_then(|slot| slot.clone()) {
                 waker.wake();
             }
@@ -259,6 +386,102 @@ impl DownloadWriter {
         }
         finished
     }
+}
+
+/// Write `bytes` where `destination` says, and answer with where they went.
+///
+/// Through a part file in both cases. A reader who watches the folder while a
+/// large file arrives sees `report.csv.otlyra-part` growing and then `report.csv`
+/// appearing whole — never a `report.csv` that opens to half a document.
+async fn write(destination: Destination, bytes: Arc<[u8]>) -> Result<PathBuf, String> {
+    let (path, part) = match destination {
+        Destination::Exact(path) => {
+            if let Some(directory) = path.parent() {
+                ensure_directory(directory).await?;
+            }
+            // No reservation here: the reader named this path through a dialogue
+            // that already asked about replacing it, and a stale part file left by
+            // a crash is not a reason to refuse the write.
+            let part = part_path(&path);
+            (path, part)
+        }
+        Destination::Into {
+            directory,
+            filename,
+        } => {
+            ensure_directory(&directory).await?;
+            claim(&directory, &filename).await?
+        }
+    };
+
+    let written = async {
+        tokio::fs::write(&part, bytes.as_ref())
+            .await
+            .map_err(|error| format!("{}: {error}", part.display()))?;
+        tokio::fs::rename(&part, &path)
+            .await
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok(path)
+    }
+    .await;
+
+    if written.is_err() {
+        // Whatever was written is not a download and must not look like the start
+        // of one. Best effort: if this fails too there is nothing further to say.
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    written
+}
+
+/// Make `directory` if it is not there.
+async fn ensure_directory(directory: &Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| format!("{}: {error}", directory.display()))
+}
+
+/// Claim a free name for `filename` in `directory`, returning it and its part file.
+///
+/// Claiming is creating the part file exclusively, not finding a free name: two
+/// downloads called `report.csv` that arrive together both see `report (1).csv`
+/// free, and only one of them can create `report (1).csv.otlyra-part`. The other
+/// is told the name is taken and moves on, which is a check no amount of looking
+/// could have made safe.
+async fn claim(directory: &Path, filename: &str) -> Result<(PathBuf, PathBuf), String> {
+    // Reduced to a leaf again rather than trusted. The name reached here through
+    // `attachment_filename`, which already does this — but this function joins a
+    // path with a server's string, and a second guard at the join is cheaper than
+    // being sure about every route into it.
+    let filename = safe_leaf(filename).unwrap_or_else(|| "download".to_owned());
+    let mut refused = None;
+    for index in 0..=MOST_COLLISIONS {
+        let candidate = directory.join(indexed_name(&filename, index));
+        // An error rather than a `false` means the directory will not say, and
+        // treating "cannot tell" as free is how a file gets overwritten.
+        if tokio::fs::try_exists(&candidate).await.unwrap_or(true) {
+            continue;
+        }
+        let part = part_path(&candidate);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .await
+        {
+            Ok(_file) => return Ok((candidate, part)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                refused = Some(format!("{}: {error}", part.display()));
+                break;
+            }
+        }
+    }
+    Err(refused.unwrap_or_else(|| {
+        format!(
+            "{}: {filename} and {MOST_COLLISIONS} numbered copies of it are all taken",
+            directory.display()
+        )
+    }))
 }
 
 /// Return the attachment's safe leaf filename when the headers say this
@@ -398,6 +621,8 @@ pub enum Action {
     Clear,
     /// Choose where to save this attachment.
     Save(DownloadId),
+    /// Write this attachment again, wherever the failed attempt was aimed.
+    Retry(DownloadId),
     /// Leave the surface.
     Close,
 }
@@ -556,7 +781,9 @@ impl DownloadsSurface {
     pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> otlyra_platform::Cursor {
         match self.action_at(x, y, text) {
             Action::None => otlyra_platform::Cursor::Default,
-            Action::Clear | Action::Save(_) | Action::Close => otlyra_platform::Cursor::Pointer,
+            Action::Clear | Action::Save(_) | Action::Retry(_) | Action::Close => {
+                otlyra_platform::Cursor::Pointer
+            }
         }
     }
 
@@ -751,22 +978,32 @@ impl DownloadsSurface {
             1.0,
             Box::new(Stack::column(theme.gap * 0.5, vec![name, source, detail])),
         ));
+        let idle = download.saving_to().is_none();
+        let mut buttons: Vec<Child<Action>> = vec![labels];
+        // Only after a failure, and before Save As…: a write that did not happen
+        // is the one thing on the row worth pressing, and "try that again" is a
+        // shorter answer than "choose somewhere else".
+        if download.save_error().is_some() {
+            buttons.push(Box::new(Align::centre(controls::button(
+                theme,
+                focus,
+                Action::Retry(download.id()),
+                "Retry",
+                Emphasis::Primary,
+                idle,
+            ))));
+        }
+        buttons.push(Box::new(Align::centre(controls::button(
+            theme,
+            focus,
+            Action::Save(download.id()),
+            "Save As…",
+            Emphasis::Normal,
+            idle,
+        ))));
         Box::new(Padding::new(
             Insets::symmetric(theme.inset, theme.gap),
-            Box::new(Stack::row(
-                theme.inset,
-                vec![
-                    labels,
-                    Box::new(Align::centre(controls::button(
-                        theme,
-                        focus,
-                        Action::Save(download.id()),
-                        "Save As…",
-                        Emphasis::Normal,
-                        download.saving_to().is_none(),
-                    ))),
-                ],
-            )),
+            Box::new(Stack::row(theme.inset, buttons)),
         ))
     }
 }
@@ -899,40 +1136,249 @@ mod tests {
         assert!(found, "the Save As button was not reachable");
     }
 
-    #[test]
-    fn the_writer_finishes_on_the_tokio_runtime() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time moves forward")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "otlyra-download-writer-{}-{unique}",
-            std::process::id()
-        ));
-        let writer = DownloadWriter::new();
-        writer.save(
-            DownloadId(7),
-            path.clone(),
-            Arc::<[u8]>::from(&b"async bytes"[..]),
-        );
+    /// A directory of this test's own, gone when the test is.
+    struct Scratch(PathBuf);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let saved = loop {
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time moves forward")
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("otlyra-{tag}-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn payload(bytes: &[u8]) -> Arc<[u8]> {
+        Arc::<[u8]>::from(bytes)
+    }
+
+    /// Wait for the next write to finish, or fail rather than hang.
+    fn settled(writer: &DownloadWriter) -> SaveResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
             if let Some(saved) = writer.poll().into_iter().next() {
-                break saved;
+                return saved;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "the asynchronous write never completed"
             );
             std::thread::yield_now();
-        };
+        }
+    }
+
+    #[test]
+    fn the_writer_finishes_on_the_tokio_runtime() {
+        let scratch = Scratch::new("download-writer");
+        let path = scratch.path().join("saved.bin");
+        let writer = DownloadWriter::new();
+        writer.save(
+            DownloadId(7),
+            Destination::Exact(path.clone()),
+            payload(b"async bytes"),
+        );
+
+        let saved = settled(&writer);
         assert_eq!(saved.id, DownloadId(7));
-        assert!(saved.result.is_ok(), "{:?}", saved.result);
+        assert_eq!(saved.result.as_deref().ok(), Some(path.as_path()));
         assert_eq!(
             std::fs::read(&path).expect("the saved file"),
             b"async bytes"
         );
-        std::fs::remove_file(path).expect("remove the test-owned file");
+    }
+
+    /// The part file is a means, not a leftover: once the bytes are all there the
+    /// only thing in the folder is the download.
+    #[test]
+    fn a_finished_write_leaves_only_the_file_it_promised() {
+        let scratch = Scratch::new("download-part");
+        let writer = DownloadWriter::new();
+        writer.save(
+            DownloadId(1),
+            Destination::Into {
+                directory: scratch.path().to_owned(),
+                filename: "report.csv".to_owned(),
+            },
+            payload(b"a,b\n1,2\n"),
+        );
+        let saved = settled(&writer).result.expect("the write");
+
+        assert_eq!(saved, scratch.path().join("report.csv"));
+        let listed: Vec<String> = std::fs::read_dir(scratch.path())
+            .expect("the scratch directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(listed, ["report.csv"]);
+    }
+
+    /// Two downloads of one name are two files, and the second is numbered rather
+    /// than written over the first.
+    #[test]
+    fn a_name_that_is_taken_is_numbered_rather_than_replaced() {
+        let scratch = Scratch::new("download-collision");
+        let writer = DownloadWriter::new();
+        let into = || Destination::Into {
+            directory: scratch.path().to_owned(),
+            filename: "report.csv".to_owned(),
+        };
+
+        writer.save(DownloadId(1), into(), payload(b"first"));
+        let first = settled(&writer).result.expect("the first write");
+        writer.save(DownloadId(2), into(), payload(b"second"));
+        let second = settled(&writer).result.expect("the second write");
+
+        assert_eq!(first, scratch.path().join("report.csv"));
+        assert_eq!(second, scratch.path().join("report (1).csv"));
+        assert_eq!(std::fs::read(&first).expect("the first file"), b"first");
+        assert_eq!(std::fs::read(&second).expect("the second file"), b"second");
+    }
+
+    /// A write that cannot happen says why and leaves nothing that looks like a
+    /// download in progress.
+    #[test]
+    fn a_failed_write_leaves_nothing_behind() {
+        let scratch = Scratch::new("download-failure");
+        // A file where the directory should be: `create_dir_all` cannot make one,
+        // which is the same shape as a folder the reader cannot write to and is a
+        // failure this test can cause on any platform.
+        let blocked = scratch.path().join("not-a-directory");
+        std::fs::write(&blocked, b"in the way").expect("the blocking file");
+
+        let writer = DownloadWriter::new();
+        writer.save(
+            DownloadId(3),
+            Destination::Into {
+                directory: blocked.clone(),
+                filename: "report.csv".to_owned(),
+            },
+            payload(b"never written"),
+        );
+        let error = settled(&writer).result.expect_err("the write must fail");
+
+        assert!(
+            error.contains("not-a-directory"),
+            "the reason must name where it was going: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&blocked).expect("the blocking file"),
+            b"in the way",
+            "the failed write must not have touched anything"
+        );
+    }
+
+    #[test]
+    fn a_numbered_name_keeps_the_extension_where_it_can() {
+        assert_eq!(indexed_name("report.csv", 0), "report.csv");
+        assert_eq!(indexed_name("report.csv", 2), "report (2).csv");
+        assert_eq!(indexed_name("README", 1), "README (1)");
+        // The last dot is what the platform calls an extension, so a compound one
+        // splits where the platform splits it rather than where a person would.
+        assert_eq!(indexed_name("archive.tar.gz", 1), "archive.tar (1).gz");
+        assert_eq!(indexed_name(".bashrc", 1), ".bashrc (1)");
+    }
+
+    /// Trying again goes back where the reader pointed, and asks the preference
+    /// again when they never pointed anywhere.
+    #[test]
+    fn retrying_reuses_a_chosen_path_and_not_a_chosen_directory() {
+        let mut store = DownloadStore::default();
+        let id = store
+            .record("one.txt", "https://example.test/one", None, vec![1])
+            .expect("the download was recorded");
+        let directory = PathBuf::from("/tmp/otlyra-downloads");
+
+        store.mark_saving(
+            id,
+            "/elsewhere/one.txt",
+            Some(PathBuf::from("/elsewhere/one.txt")),
+        );
+        store.mark_save_failed(id, "read-only file system");
+        assert_eq!(
+            store
+                .get(id)
+                .expect("the download")
+                .retry_destination(directory.clone()),
+            Destination::Exact(PathBuf::from("/elsewhere/one.txt"))
+        );
+
+        store.mark_saving(id, directory.to_string_lossy().into_owned(), None);
+        store.mark_save_failed(id, "read-only file system");
+        assert_eq!(
+            store
+                .get(id)
+                .expect("the download")
+                .retry_destination(directory.clone()),
+            Destination::Into {
+                directory,
+                filename: "one.txt".to_owned(),
+            }
+        );
+    }
+
+    /// A row that failed offers the press that matters, and one that did not does
+    /// not offer it at all.
+    #[test]
+    fn only_a_failed_row_offers_retry() {
+        let mut store = DownloadStore::default();
+        let id = store
+            .record("one.txt", "https://example.test/one", None, vec![1])
+            .expect("the download was recorded");
+        let mut surface = DownloadsSurface::new();
+        let mut text = TextEngine::new();
+        let rect = Rect::new(0.0, 0.0, 900.0, 700.0);
+
+        let reachable = |surface: &mut DownloadsSurface,
+                         store: &DownloadStore,
+                         text: &mut TextEngine,
+                         wanted: Action| {
+            let mut list = DisplayList::new();
+            surface.build_display_list(rect, store, text, &mut list);
+            (0..700).step_by(4).any(|y| {
+                (0..900)
+                    .step_by(8)
+                    .any(|x| surface.action_at(f64::from(x), f64::from(y), text) == wanted)
+            })
+        };
+
+        assert!(
+            !reachable(&mut surface, &store, &mut text, Action::Retry(id)),
+            "a download that has not failed must not offer Retry"
+        );
+        store.mark_save_failed(id, "read-only file system");
+        assert!(
+            reachable(&mut surface, &store, &mut text, Action::Retry(id)),
+            "a download that failed must offer Retry"
+        );
+    }
+
+    /// There is somewhere to put a download without anyone naming one.
+    ///
+    /// Read rather than written: the environment is process-wide and the tests in
+    /// this binary run at once, so a test that set a variable would be racing every
+    /// other test that reads one. The override exists for a person running the
+    /// browser by hand, and is exercised there.
+    #[test]
+    fn the_download_folder_has_a_default() {
+        assert!(default_directory().is_some_and(|path| path.ends_with("Downloads")));
     }
 }

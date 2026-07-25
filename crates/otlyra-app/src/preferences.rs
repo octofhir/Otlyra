@@ -3,8 +3,8 @@
 //! # The format
 //!
 //! `key = value`, one per line, `#` to the end of a line is a comment. That is a
-//! subset of TOML and deliberately not the whole of it: this file holds seven
-//! scalars, it is written and read by this program, and a parser for tables and
+//! subset of TOML and deliberately not the whole of it: this file holds a handful
+//! of scalars, it is written and read by this program, and a parser for tables and
 //! arrays would be a parser for shapes nothing here can produce. A line that
 //! does not fit the subset is skipped with a warning rather than refused — a
 //! preferences file is not worth failing to start over, and a person who has
@@ -103,7 +103,9 @@ pub fn to_text(settings: &Settings) -> String {
          do_not_track = {}\n\
          restore_tabs = {}\n\
          appearance = \"{}\"\n\
-         text_scale = {}\n",
+         text_scale = {}\n\
+         download_ask = {}\n\
+         download_directory = \"{}\"\n",
         match settings.on_start {
             OnStart::Blank => "blank",
             OnStart::Home => "home",
@@ -126,6 +128,13 @@ pub fn to_text(settings: &Settings) -> String {
             Appearance::System => "system",
         },
         settings.text_scale,
+        settings.download_ask,
+        // A path may hold a quote or a backslash — a Windows one holds nothing
+        // but backslashes — so it is escaped exactly as the home address is.
+        settings
+            .download_directory
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
     )
 }
 
@@ -182,6 +191,12 @@ pub fn from_text(text: &str) -> Settings {
                     }
                 };
             }
+            "download_ask" => settings.download_ask = flag().unwrap_or(settings.download_ask),
+            "download_directory" => {
+                if let Some(directory) = text() {
+                    settings.download_directory = directory;
+                }
+            }
             "text_scale" => {
                 if let Ok(scale) = value.parse::<f64>() {
                     // Clamped to what the control can express: a file saying
@@ -218,6 +233,22 @@ mod tests {
         assert_eq!(read.on_start, OnStart::Home);
         assert_eq!(read.appearance, Appearance::Dark);
         assert_eq!(read.home.text(), "https://example.org/start");
+    }
+
+    /// Where downloads go outlives the run that chose it — a preference that had
+    /// to be set again on every launch would not be a preference.
+    #[test]
+    fn where_downloads_go_survives_the_round_trip() {
+        let mut settings = Settings::default();
+        settings.apply(crate::settings::Action::ToggleDownloadAsk);
+        settings.apply(crate::settings::Action::SetDownloadDirectory(
+            r"C:\Users\Ada\Downloads".to_owned(),
+        ));
+
+        let read = from_text(&to_text(&settings));
+        assert!(!read.download_ask);
+        // Backslashes and all: a Windows path is nothing else.
+        assert_eq!(read.download_directory, r"C:\Users\Ada\Downloads");
     }
 
     #[test]

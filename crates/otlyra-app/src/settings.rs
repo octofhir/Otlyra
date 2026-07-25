@@ -102,6 +102,19 @@ pub struct Settings {
     pub appearance: Appearance,
     /// The size text is drawn at, as a percentage of the default.
     pub text_scale: f64,
+    /// Ask where to put each download instead of saving it straight away.
+    ///
+    /// On by default, which is the conservative half of the choice: a browser
+    /// that has never been configured should not be writing files into a folder
+    /// nobody named.
+    pub download_ask: bool,
+    /// Where downloads go when they are not asked about.
+    ///
+    /// Empty means the platform's own Downloads folder, resolved at the moment a
+    /// file is saved rather than written in here — a path baked into the
+    /// preferences file would be wrong the moment the account is renamed, and
+    /// would say "you chose this" about something nobody chose.
+    pub download_directory: String,
     /// Which control has the keyboard.
     ///
     /// The whole of what focus is on this surface: whether the home field shows
@@ -124,6 +137,8 @@ impl Default for Settings {
             restore_tabs: true,
             appearance: Appearance::System,
             text_scale: 100.0,
+            download_ask: true,
+            download_directory: String::new(),
             focus: None,
             scroll: 0.0,
             overflow: Overflow::default(),
@@ -157,6 +172,16 @@ pub enum Action {
     SetAppearance(Appearance),
     /// Draw text at this percentage of the default.
     SetTextScale(f64),
+    /// Ask where each download goes, or stop asking.
+    ToggleDownloadAsk,
+    /// Show the platform's folder chooser for the download directory.
+    ///
+    /// A request rather than a change: only the browser can put a dialogue on the
+    /// screen, so the surface says what was pressed and the answer comes back as
+    /// [`Action::SetDownloadDirectory`].
+    ChooseDownloadDirectory,
+    /// Put downloads here from now on. Empty means the platform's own folder.
+    SetDownloadDirectory(String),
     /// Put everything back the way it came.
     Reset,
     /// Leave the surface.
@@ -191,6 +216,11 @@ impl Settings {
             Action::SetTextScale(scale) => {
                 self.text_scale = (scale / 5.0).round() * 5.0;
             }
+            Action::ToggleDownloadAsk => self.download_ask = !self.download_ask,
+            // The dialogue is the browser's to open; nothing here changes until it
+            // comes back with `SetDownloadDirectory`.
+            Action::ChooseDownloadDirectory => {}
+            Action::SetDownloadDirectory(directory) => self.download_directory = directory,
             Action::Reset => {
                 let scroll = self.scroll;
                 let focus = self.focus;
@@ -218,6 +248,30 @@ impl Settings {
             && self.restore_tabs == other.restore_tabs
             && self.appearance == other.appearance
             && (self.text_scale - other.text_scale).abs() < f64::EPSILON
+            && self.download_ask == other.download_ask
+            && self.download_directory == other.download_directory
+    }
+
+    /// Where a download goes when it is not asked about.
+    ///
+    /// The preference if it names one, the platform's folder otherwise. `None`
+    /// means neither answered, which is a browser that cannot save automatically
+    /// and has to ask — see [`Settings::asks_where_to_save`].
+    pub fn download_directory(&self) -> Option<std::path::PathBuf> {
+        let named = self.download_directory.trim();
+        if !named.is_empty() {
+            return Some(std::path::PathBuf::from(named));
+        }
+        crate::downloads::default_directory()
+    }
+
+    /// Whether a completed download must be asked about rather than saved.
+    ///
+    /// The preference, *or* the absence of anywhere to put one: a platform that
+    /// will not say where a home directory is leaves asking as the only honest
+    /// behaviour, and silently doing nothing as the dishonest one.
+    pub fn asks_where_to_save(&self) -> bool {
+        self.download_ask || self.download_directory().is_none()
     }
 
     /// Scroll by `delta` logical pixels, stopping at the ends.
@@ -239,6 +293,7 @@ impl Settings {
         let rows = vec![
             self.startup_card(theme, focus),
             self.content_card(theme, focus),
+            self.downloads_card(theme, focus),
             self.appearance_card(theme, focus),
             self.privacy_card(theme, focus),
             self.reset_row(theme, focus),
@@ -401,6 +456,53 @@ impl Settings {
                     // size still wins, exactly as it would over any other.
                     Some("The default size on pages that do not name one."),
                     scale,
+                ),
+            ],
+        )
+    }
+
+    fn downloads_card(&self, theme: &Theme, focus: &Focus) -> Child<Action> {
+        // What a file would actually be saved as, not what the field holds: an
+        // empty preference means the platform's folder, and a reader deciding
+        // whether to turn asking off needs to see where the files would land.
+        let (where_to, note) = match self.download_directory() {
+            Some(directory) => (
+                directory.display().to_string(),
+                if self.download_directory.trim().is_empty() {
+                    "The platform's own Downloads folder."
+                } else {
+                    "Chosen for this browser."
+                },
+            ),
+            None => (
+                "Nowhere yet".to_owned(),
+                "This platform did not say where a home directory is, so downloads are asked about.",
+            ),
+        };
+
+        controls::card(
+            theme,
+            "Downloads",
+            vec![
+                controls::setting_row(
+                    theme,
+                    "Ask where to save",
+                    Some("Off saves each file straight into the folder below."),
+                    controls::toggle(theme, focus, Action::ToggleDownloadAsk, self.download_ask),
+                ),
+                controls::divider(theme),
+                controls::setting_row(
+                    theme,
+                    format!("Save files to — {where_to}"),
+                    Some(note),
+                    controls::button(
+                        theme,
+                        focus,
+                        Action::ChooseDownloadDirectory,
+                        "Change…",
+                        Emphasis::Normal,
+                        true,
+                    ),
                 ),
             ],
         )
@@ -987,9 +1089,16 @@ mod tests {
         )
     }
 
+    /// How many places the keyboard stops on the whole surface.
+    ///
+    /// Named once: three tests walk the surface, and three hard-coded counts
+    /// disagreeing with each other is how a control ends up unreachable with the
+    /// tests still passing.
+    const STOPS: usize = 15;
+
     /// What every control on the surface reports, in the order Tab reaches them.
     fn traversal() -> Vec<Action> {
-        (1..=13).filter_map(activate_after).collect()
+        (1..=STOPS).filter_map(activate_after).collect()
     }
 
     #[test]
@@ -1014,6 +1123,10 @@ mod tests {
                 // be pressed is not a place the keyboard stops.
                 // The slider answers the arrows, not Return.
                 Action::None,
+                Action::ToggleDownloadAsk,
+                // The folder chooser is a request rather than a change: only the
+                // browser can put a dialogue on the screen.
+                Action::ChooseDownloadDirectory,
                 Action::SetAppearance(Appearance::Light),
                 Action::SetAppearance(Appearance::Dark),
                 Action::SetAppearance(Appearance::System),
@@ -1057,6 +1170,8 @@ mod tests {
         // word about it.
         for wanted in [
             Action::ToggleImages,
+            Action::ToggleDownloadAsk,
+            Action::ChooseDownloadDirectory,
             Action::ToggleDoNotTrack,
             Action::Reset,
             Action::Close,
@@ -1067,7 +1182,7 @@ mod tests {
             pressed.pointer_moved(x, y);
             assert_eq!(pressed.pointer_pressed(1), wanted);
 
-            let by_key = (1..=13)
+            let by_key = (1..=STOPS)
                 .filter_map(activate_after)
                 .find(|action| *action == wanted);
             assert_eq!(by_key, Some(wanted), "the keyboard cannot reach it");
