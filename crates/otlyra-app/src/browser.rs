@@ -3048,10 +3048,19 @@ impl Painter for Browser {
         if tab.loading() {
             return FrameRequest::Vsync;
         }
-        tab.page
+        // The caret's next half-second and the pause before a control is named:
+        // whichever comes first, because one wake serves both and a loop told
+        // about the later one would sleep through the earlier.
+        let caret = tab
+            .page
             .as_ref()
-            .and_then(crate::page::PageScene::next_caret_frame)
-            .map_or(FrameRequest::None, FrameRequest::At)
+            .and_then(crate::page::PageScene::next_caret_frame);
+        let tooltip = self.ui.next_tooltip_frame();
+        match (caret, tooltip) {
+            (Some(caret), Some(tooltip)) => FrameRequest::At(caret.min(tooltip)),
+            (Some(at), None) | (None, Some(at)) => FrameRequest::At(at),
+            (None, None) => FrameRequest::None,
+        }
     }
 
     fn work_counters(&self) -> PainterWork {

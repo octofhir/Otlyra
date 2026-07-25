@@ -40,6 +40,11 @@ struct Frame {
     select_address: bool,
     /// How many times Tab is pressed before the frame that is written.
     tabs_pressed: usize,
+    /// Where the pointer comes to rest before the frame that is written, for
+    /// the state that shows a control being named. Applied after a frame has
+    /// been drawn, because what the pointer is resting *on* is read off the
+    /// frame that drew it.
+    rest_at: Option<(f64, f64)>,
     text: TextEngine,
     clipboard: InMemory,
 }
@@ -68,6 +73,11 @@ impl Frame {
                 &mut self.text,
                 &mut self.clipboard,
             );
+        }
+        if let Some((x, y)) = self.rest_at {
+            self.ui.pointer_moved(x, y, &mut self.text);
+            self.ui
+                .wind_rest_back(std::time::Duration::from_millis(1_000));
         }
     }
 }
@@ -523,6 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         focus_address: false,
         select_address: false,
         tabs_pressed: 0,
+        rest_at: None,
         text: TextEngine::new(),
         clipboard: InMemory::default(),
     };
@@ -648,6 +659,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.ui.address.set_text("https://example.com/");
     menu.ui.open_menu();
     frames.push(menu);
+
+    // The pointer resting on a control long enough to be told what it is.
+    let mut named = toolbar(
+        "tooltip",
+        tabs(&[("Otlyra", false), ("Second", false)]),
+        0,
+        (true, true),
+        None,
+    );
+    named.ui.address.set_text("https://example.com/");
+    named.rest_at = Some((80.0, UI_HEIGHT - 20.0));
+    frames.push(named);
 
     // The pointer resting on the reload button, so the hover wash is visible.
     let mut hovered = toolbar(

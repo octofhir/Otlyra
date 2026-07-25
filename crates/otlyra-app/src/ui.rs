@@ -639,6 +639,11 @@ struct Appearance {
     caret: Option<usize>,
     selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
+    /// What the pointer has rested on long enough to be named, and where.
+    ///
+    /// Part of what the frame draws, so it belongs in the key: without it the
+    /// first tooltip would be the only one the cache ever built.
+    tooltip: Option<(String, Rect)>,
     /// The popup drawn over everything, and the window height its sheet covers.
     ///
     /// The whole popup rather than a flag: its rows and where it hangs are
@@ -730,6 +735,27 @@ struct TabDrag {
     /// is still just a press, and letting go is a click on the tab.
     started: bool,
 }
+
+/// What the pointer has been resting on, and since when.
+///
+/// The label is the control's own — the name a screen reader is given — so what
+/// a tooltip says and what a reader is told are one string. Two would drift,
+/// and the one nobody can see is the one that would drift.
+#[derive(Clone, Debug, PartialEq)]
+struct Resting {
+    /// What the control is called.
+    label: String,
+    /// Where it was drawn, which is what the panel hangs off.
+    anchor: Rect,
+    /// When the pointer came to rest on it.
+    since: std::time::Instant,
+}
+
+/// How long the pointer rests on a control before it is named.
+///
+/// Long enough that moving across the toolbar names nothing on the way, short
+/// enough that a reader who stopped to ask has an answer before they give up.
+const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// How far the pointer travels before a press on a tab becomes a drag.
 ///
@@ -823,6 +849,8 @@ pub struct BrowserUi {
     /// The tab being dragged along the strip, once the pointer has moved far
     /// enough for the press to be a drag rather than a click.
     drag: Option<TabDrag>,
+    /// What the pointer is resting on, for the panel that names it.
+    resting: Option<Resting>,
     /// Where each tab landed in the last frame, by tab id.
     ///
     /// Read to answer *which tab is the pointer over* during a drag. From the
@@ -903,6 +931,7 @@ impl BrowserUi {
             press_origin: None,
             capture: None,
             drag: None,
+            resting: None,
             tab_places: crate::widget::Placements::default(),
             clicks: 1,
             cache: None,
@@ -998,6 +1027,7 @@ impl BrowserUi {
     /// one that knows which offset the pointer is over.
     pub fn pointer_moved(&mut self, x: f64, y: f64, text: &mut TextEngine) -> UiAction {
         self.pointer = (x, y);
+        self.rest_on_what_is_under_the_pointer();
         if self.press_origin.is_none() {
             return UiAction::None;
         }
@@ -1059,6 +1089,69 @@ impl BrowserUi {
         match (at, over) {
             (Some(at), Some(over)) if at != over => UiAction::MoveTab { id, to: over },
             _ => UiAction::None,
+        }
+    }
+
+    /// Note what the pointer has come to rest on, if it is anything.
+    ///
+    /// Read off the last frame's own description of itself, which is where
+    /// every other question about what is on screen is answered: a control's
+    /// rectangle and its name are both there, and neither is worked out a
+    /// second time. Coming to rest on the *same* control keeps the clock
+    /// running, so crossing a wide button does not restart it every pixel.
+    fn rest_on_what_is_under_the_pointer(&mut self) {
+        // Nothing is named while the button is down or a panel is open: a
+        // reader dragging or choosing is not asking what anything is called.
+        if self.pointer_down || self.popup_open() {
+            self.resting = None;
+            return;
+        }
+        let (x, y) = self.pointer;
+        // The innermost match, which is the last described: the cross inside a
+        // tab is what the pointer is on when it is over both.
+        let found = self
+            .describe()
+            .into_iter()
+            .rfind(|node| node.enabled && !node.label.is_empty() && node.rect.contains(x, y));
+        match found {
+            Some(node) => {
+                let same = self
+                    .resting
+                    .as_ref()
+                    .is_some_and(|resting| resting.label == node.label);
+                if !same {
+                    self.resting = Some(Resting {
+                        label: node.label,
+                        anchor: node.rect,
+                        since: std::time::Instant::now(),
+                    });
+                }
+            }
+            None => self.resting = None,
+        }
+    }
+
+    /// When the panel naming what the pointer rests on is due, if one is.
+    ///
+    /// `None` once it is showing: it does not need waking again, and a deadline
+    /// in the past asked for a frame every tick.
+    pub fn next_tooltip_frame(&self) -> Option<std::time::Instant> {
+        let resting = self.resting.as_ref()?;
+        let due = resting.since + TOOLTIP_DELAY;
+        (std::time::Instant::now() < due).then_some(due)
+    }
+
+    /// What to name, and where, if the pointer has rested long enough.
+    fn tooltip(&self) -> Option<(&str, Rect)> {
+        let resting = self.resting.as_ref()?;
+        (resting.since.elapsed() >= TOOLTIP_DELAY)
+            .then_some((resting.label.as_str(), resting.anchor))
+    }
+
+    /// Wind the resting clock back, so a test need not wait for a tooltip.
+    pub fn wind_rest_back(&mut self, by: std::time::Duration) {
+        if let Some(resting) = self.resting.as_mut() {
+            resting.since -= by;
         }
     }
 
@@ -1157,6 +1250,10 @@ impl BrowserUi {
         self.pointer_down = true;
         self.press_origin = Some(self.pointer);
         self.clicks = clicks;
+        // A reader who has pressed is no longer asking what the thing is
+        // called, and a panel left over the control they just pressed is in
+        // the way of seeing what the press did.
+        self.resting = None;
         if self.pointer.1 >= UI_HEIGHT && !self.popup_open() {
             // The press belongs to the page, and it takes focus away from the
             // address field — which is what every browser does, and what makes
@@ -1288,6 +1385,7 @@ impl BrowserUi {
 
     /// Open one popup, which is what closes any other.
     fn open_popup(&mut self, popup: Popup) {
+        self.resting = None;
         // The keyboard to come back to is the one from before *any* popup: a
         // context menu opened over an open menu must not offer its rows as the
         // place to return to.
@@ -1441,6 +1539,10 @@ impl BrowserUi {
         text: &mut TextEngine,
         clipboard: &mut dyn Clipboard,
     ) -> UiAction {
+        // Typing puts away the panel naming whatever the pointer happens to be
+        // resting on: it was asked for by resting, and the reader has moved on.
+        self.resting = None;
+
         // Accelerators work whether or not the field has focus.
         // F5 reloads whatever has focus, including the address field: it is not
         // a character, so it cannot be something the user meant to type.
@@ -1660,6 +1762,9 @@ impl BrowserUi {
                 .flatten(),
             focus: self.focused,
             popup: self.popup.clone().map(|popup| (height, popup)),
+            tooltip: self
+                .tooltip()
+                .map(|(label, anchor)| (label.to_owned(), anchor)),
             bookmark: self.bookmark,
             tab_scroll: self.tab_scroll,
         };
@@ -1951,7 +2056,23 @@ impl BrowserUi {
         ));
 
         let Some(popup) = self.popup.as_ref() else {
-            return rows;
+            // A tooltip is not a popup: it takes no focus, catches no press and
+            // is dismissed by the pointer moving off what it names. It hangs
+            // just under the control, flipped above it near the bottom edge.
+            let Some((label, anchor)) = self.tooltip() else {
+                return rows;
+            };
+            return Box::new(crate::widget::Overlay::new(vec![
+                rows,
+                Box::new(
+                    crate::widget::Anchored::at(
+                        anchor.x,
+                        anchor.y + anchor.height + 4.0,
+                        controls::tooltip(&theme, label),
+                    )
+                    .flipped(),
+                ),
+            ]));
         };
 
         // Its rows claim their ids inside the popup's own scope, which is what
@@ -3094,6 +3215,88 @@ mod tests {
             UiAction::Reload,
             "a control that cannot be pressed is not a place the keyboard stops"
         );
+    }
+
+    /// Whether the frame drew a panel naming something.
+    fn named_by_a_tooltip(ui: &BrowserUi) -> Option<String> {
+        ui.tooltip().map(|(label, _)| label.to_owned())
+    }
+
+    /// A pointer resting on a control is a reader asking what it is, and after
+    /// a pause they are told — in the control's own name, which is the same
+    /// string a screen reader is given.
+    #[test]
+    fn resting_on_a_control_names_it_after_a_pause() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+        ui.pointer_moved(20.0, middle, &mut text);
+        assert_eq!(named_by_a_tooltip(&ui), None, "named without a pause");
+        assert!(
+            ui.next_tooltip_frame().is_some(),
+            "a pause nobody is woken for is a pause that never ends"
+        );
+
+        ui.wind_rest_back(TOOLTIP_DELAY);
+        assert_eq!(named_by_a_tooltip(&ui).as_deref(), Some("Back"));
+        assert_eq!(
+            ui.next_tooltip_frame(),
+            None,
+            "a panel already drawn does not need waking again"
+        );
+
+        // The frame draws it, and the one after it does not rebuild for nothing.
+        let builds = ui.builds();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert_eq!(ui.builds(), builds + 1);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert_eq!(
+            ui.builds(),
+            builds + 1,
+            "a still tooltip rebuilt the chrome"
+        );
+    }
+
+    /// Moving on takes it away, and a press never gets one at all.
+    #[test]
+    fn a_tooltip_goes_when_the_pointer_or_the_reader_moves_on() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+
+        ui.pointer_moved(20.0, middle, &mut text);
+        ui.wind_rest_back(TOOLTIP_DELAY);
+        assert!(named_by_a_tooltip(&ui).is_some());
+
+        // Off the control and onto plain toolbar.
+        ui.pointer_moved(20.0, 700.0 - 10.0, &mut text);
+        assert_eq!(named_by_a_tooltip(&ui), None);
+        assert_eq!(ui.next_tooltip_frame(), None, "nothing is being rested on");
+
+        // And a press on one is a reader who has stopped asking.
+        ui.pointer_moved(20.0, middle, &mut text);
+        ui.wind_rest_back(TOOLTIP_DELAY);
+        assert!(named_by_a_tooltip(&ui).is_some());
+        ui.pointer_pressed(&mut text, 1);
+        assert_eq!(named_by_a_tooltip(&ui), None);
+    }
+
+    /// Crossing one wide control keeps its clock running rather than starting
+    /// over at every pixel, or a slow hand would never be told anything.
+    #[test]
+    fn moving_within_one_control_does_not_restart_the_pause() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        let middle = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0;
+
+        ui.pointer_moved(18.0, middle, &mut text);
+        ui.wind_rest_back(TOOLTIP_DELAY);
+        ui.pointer_moved(22.0, middle + 2.0, &mut text);
+        assert_eq!(named_by_a_tooltip(&ui).as_deref(), Some("Back"));
     }
 
     /// Where a tab landed in the last frame, by its id.

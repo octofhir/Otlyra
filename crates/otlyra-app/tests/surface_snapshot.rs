@@ -244,6 +244,19 @@ fn the_open_menu_outline_is_stable() {
     insta::assert_snapshot!(outline(&list));
 }
 
+/// The panel that names what the pointer has been resting on.
+#[test]
+fn the_tooltip_outline_is_stable() {
+    let (mut ui, tabs, mut text) = toolbar();
+    // Drawn once so there is a frame to read what the pointer is over from,
+    // then rested on the reload button with the clock wound past the pause.
+    toolbar_list(&mut ui, &tabs, &mut text, None);
+    ui.pointer_moved(80.0, UI_HEIGHT - 20.0, &mut text);
+    ui.wind_rest_back(std::time::Duration::from_millis(1_000));
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    insta::assert_snapshot!(outline(&list));
+}
+
 /// The menu the reader asks for over the page: the one panel placed where a
 /// press landed rather than against a control, so where it lands is the thing
 /// worth pinning.

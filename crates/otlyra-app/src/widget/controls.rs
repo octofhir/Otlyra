@@ -1123,6 +1123,27 @@ pub fn menu_panel<A: 'static>(theme: &Theme, width: f64, rows: Vec<Child<A>>) ->
     ))
 }
 
+/// The little panel that says what a control is, after a pause over it.
+///
+/// Built from the same surface, border and radius a menu is, because it is the
+/// same idea — something drawn over the window that belongs to a control under
+/// it — and a second look for one small panel is a second thing to keep in step
+/// with the palette.
+pub fn tooltip<A: 'static>(theme: &Theme, text: impl Into<String>) -> Child<A> {
+    Box::new(Background::new(
+        theme.raised,
+        theme.radius_small,
+        Box::new(Outline::new(
+            theme.border,
+            theme.radius_small,
+            Box::new(Padding::new(
+                Insets::symmetric(theme.gap, theme.gap * 0.5),
+                Box::new(Label::new(text, theme.font_size_small, theme.ink)),
+            )),
+        )),
+    ))
+}
+
 /// A caption above a group of menu rows.
 pub fn menu_heading<A: 'static>(theme: &Theme, text: impl Into<String>) -> Child<A> {
     Box::new(Padding::new(

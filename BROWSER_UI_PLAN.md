@@ -117,8 +117,9 @@ are the two consumers they were written from.
   window. The in-window backend covers everything that fits, flipping at an edge
   rather than clipping; a long dropdown near the bottom edge is what needs the
   platform window.
-- [ ] Add tooltip scheduling and dismissal. Needs a delayed event per surface,
-  which nothing in the widget layer has yet.
+- [ ] Give the other surfaces tooltips. The chrome names what the pointer rests
+  on, scheduled through the frame deadline the caret already uses; the settings,
+  history, downloads and inspector surfaces do not.
 - [ ] Build the surfaces that should be on the popup contract and are not built
   at all: a dropdown, omnibox suggestions, permission prompts.
 

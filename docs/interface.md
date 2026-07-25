@@ -9,7 +9,7 @@ layout to get its geometry, and the engine never learns what a toolbar is.
 
 ## Invariants
 
-These eight are why the layer is worth having. A change that breaks one of them
+These nine are why the layer is worth having. A change that breaks one of them
 is a change that needs an argument, not a patch.
 
 1. **Geometry is computed once**, by `Widget::place`, stored on the widget, and
@@ -61,7 +61,14 @@ is a change that needs an argument, not a patch.
    past a threshold, so a click with an unsteady hand stays a click, and Escape
    takes it back.
 
-8. **A popup owns the pointer and the keyboard until it is dismissed.** One
+8. **What the pointer rests on is named, after a pause.** The delay is
+   scheduled through the same frame deadline the caret blinks on — the loop is
+   woken once, at the earlier of the two — and the name is the control's own,
+   the string a screen reader is given, so what is shown and what is said cannot
+   drift. It is not a popup: it takes no focus, catches no press, and goes when
+   the pointer moves off, when anything is pressed, or when a key is struck.
+
+9. **A popup owns the pointer and the keyboard until it is dismissed.** One
    popup at a time per surface, opened with the traversal scope its rows claim
    their focus ids in, so Tab reaches those rows and wraps there instead of
    walking to controls behind the sheet. Four ways out, and all four are one
@@ -155,7 +162,6 @@ Decisions rather than omissions.
   window per popup, which is an `otlyra-platform` change with its own event
   routing. **A real dropdown** waits behind it; `segmented` stands in for a
   short list of choices meanwhile.
-- **Tooltips.** Needs a timer per surface and somewhere to hang delayed events.
 - **Pinned tabs.** The strip scrolls and its tabs can be dragged into a new
   order; pinning is not in it.
 - **A find bar**, which needs text search over the fragment tree — engine work
