@@ -54,6 +54,14 @@ pub enum Command {
     ViewSource,
     /// Toggle the developer tools.
     ToggleDevTools,
+    /// Cut what is selected.
+    Cut,
+    /// Copy it.
+    Copy,
+    /// Paste over it.
+    Paste,
+    /// Select everything the keyboard is in.
+    SelectAll,
 }
 
 impl Command {
@@ -79,6 +87,10 @@ impl Command {
         Self::ActualSize,
         Self::ViewSource,
         Self::ToggleDevTools,
+        Self::Cut,
+        Self::Copy,
+        Self::Paste,
+        Self::SelectAll,
     ];
 
     /// The id this command travels under across the platform boundary.
@@ -121,6 +133,10 @@ impl Command {
                 | Self::ToggleBookmark
                 | Self::ShowBookmarks
                 | Self::ToggleDevTools
+                | Self::Cut
+                | Self::Copy
+                | Self::Paste
+                | Self::SelectAll
         )
     }
 }
@@ -164,10 +180,16 @@ pub fn menu_bar() -> MenuBar {
                 MenuEntry::System(SystemItem::Undo),
                 MenuEntry::System(SystemItem::Redo),
                 MenuEntry::Separator,
-                MenuEntry::System(SystemItem::Cut),
-                MenuEntry::System(SystemItem::Copy),
-                MenuEntry::System(SystemItem::Paste),
-                MenuEntry::System(SystemItem::SelectAll),
+                // Ours rather than the platform's four. A predefined Cut, Copy,
+                // Paste or Select All on macOS *is* the keystroke: the item owns
+                // ⌘C and sends `copy:` down the responder chain, where nothing of
+                // ours answers — so the key never arrives at the window and
+                // copying out of the address field did nothing at all, however
+                // right everything downstream of the keystroke was.
+                entry(Command::Cut, "Cut", Some("CmdOrCtrl+KeyX")),
+                entry(Command::Copy, "Copy", Some("CmdOrCtrl+KeyC")),
+                entry(Command::Paste, "Paste", Some("CmdOrCtrl+KeyV")),
+                entry(Command::SelectAll, "Select All", Some("CmdOrCtrl+KeyA")),
             ],
         ))
         .with(Menu::new(
@@ -279,6 +301,26 @@ mod tests {
     fn command_ids_round_trip() {
         for command in Command::ALL {
             assert_eq!(Command::from_id(command.id()), Some(*command));
+        }
+    }
+
+    /// Cut, Copy, Paste and Select All are ours, not the platform's.
+    ///
+    /// A predefined one on macOS *is* the keystroke: the item owns ⌘C and sends
+    /// `copy:` down the responder chain, where nothing of ours answers. The key
+    /// never reaches the window, so copying out of the address field did nothing
+    /// — and every test passed, because a test delivers the key press itself.
+    #[test]
+    fn the_editing_commands_are_ours_so_their_keys_reach_the_window() {
+        let bar = format!("{:?}", menu_bar());
+        for name in ["Cut", "Copy", "Paste", "Select All"] {
+            assert!(bar.contains(name), "{name} is not on the menu: {bar}");
+        }
+        for taken in ["Cut)", "Copy)", "Paste)", "SelectAll)"] {
+            assert!(
+                !bar.contains(&format!("System({taken}")),
+                "{taken} is still the platform's, so its key never arrives"
+            );
         }
     }
 

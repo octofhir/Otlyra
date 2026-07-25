@@ -195,6 +195,9 @@ pub struct Layer {
     /// Whether the box is positioned at all, which is what lifts it off the flow's
     /// level and makes a context of it.
     pub positioned: bool,
+    /// Whether it floats, which lifts it off the flow's level too — above every
+    /// in-flow block and below anything positioned.
+    pub floated: bool,
     /// One step per level, outermost first.
     ///
     /// Filled in once the tree is built, because a box's place in the order is its
@@ -234,13 +237,21 @@ impl Default for Layer {
 }
 
 impl Layer {
-    /// Which level a box is on: the flow's, or however far a `z-index` moves it.
+    /// Which level a box is on: the flow's, a float's, or however far a `z-index`
+    /// moves it.
     ///
-    /// One number, and the arithmetic is the ordering: a positioned box at index
-    /// zero sits above the flow, and a negative index sits below it.
-    fn level(index: i32, positioned: bool) -> i64 {
+    /// One number, and the arithmetic is the ordering. In-flow blocks are at
+    /// zero. A float is above all of them — which is what CSS's painting order
+    /// says and what a float escaping its container makes visible: without this
+    /// the background of any block written after the float is painted over it,
+    /// and the float disappears under a paragraph it has nothing to do with. A
+    /// positioned box is above the floats, and a negative `z-index` below
+    /// everything in the flow.
+    fn level(index: i32, positioned: bool, floated: bool) -> i64 {
         if positioned {
-            i64::from(index) * 2 + 1
+            i64::from(index) * 4 + 2
+        } else if floated {
+            1
         } else {
             0
         }
@@ -251,6 +262,7 @@ impl Layer {
         Self {
             index: 0,
             positioned: false,
+            floated: false,
             order: std::sync::Arc::from(Vec::new()),
             enter: 0,
             exit: 0,
@@ -262,6 +274,14 @@ impl Layer {
         Self {
             index,
             positioned: true,
+            ..Self::flow()
+        }
+    }
+
+    /// And of a float, which is above the flow without being positioned.
+    pub fn floated() -> Self {
+        Self {
+            floated: true,
             ..Self::flow()
         }
     }
@@ -297,11 +317,13 @@ fn assign(fragment: &mut Fragment, context: &Layer, next: &mut u32) {
     *next += 1;
 
     let positioned = fragment.layer.positioned;
+    let floated = fragment.layer.floated;
     let index = fragment.layer.index;
     let own = Layer {
         index,
         positioned,
-        order: context.descend(Layer::level(index, positioned), enter),
+        floated,
+        order: context.descend(Layer::level(index, positioned, floated), enter),
         enter,
         exit: enter,
     };
@@ -314,7 +336,15 @@ fn assign(fragment: &mut Fragment, context: &Layer, next: &mut u32) {
     // per line of a faded paragraph would be a context per line of it.
     let grouped = matches!(fragment.kind, FragmentKind::Box)
         && (fragment.style.opacity < 1.0 || !fragment.style.transform.is_empty());
-    let context = if positioned || grouped { &own } else { context };
+    // A float takes its contents with it for the same reason: CSS paints a
+    // float's background and everything in it together, at the float's own place
+    // in the order, and contents left behind on the flow's level would be
+    // painted under the very blocks the float is drawn over.
+    let context = if positioned || grouped || floated {
+        &own
+    } else {
+        context
+    };
 
     for child in &mut fragment.children {
         assign(child, context, next);

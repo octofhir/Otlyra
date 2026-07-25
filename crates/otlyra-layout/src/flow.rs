@@ -1448,6 +1448,10 @@ impl<'a> Flow<'a> {
             }
         };
         self.floats = outer_floats;
+        // Above every in-flow block, which is where CSS paints a float and what
+        // keeps it from disappearing under the background of a paragraph that
+        // happens to be written after it.
+        fragment.layer = Layer::floated();
 
         let margin = resolve_margin(&style, containing_width);
         let outer = fragment.rect.width + margin.left + margin.right;

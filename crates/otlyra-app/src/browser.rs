@@ -3912,6 +3912,32 @@ impl Painter for Browser {
                 Some(crate::menu::Command::ToggleDevTools) => self.toggle_inspector(),
                 Some(crate::menu::Command::NewTab) => self.new_tab(),
                 Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
+                // The editing four are the keystroke they carry, delivered as
+                // one. A menu item that did the copying itself would be a second
+                // answer to *what does ⌘C mean here* — and the answer depends on
+                // which surface holds the keyboard, which the key path already
+                // knows and this would have to learn again.
+                Some(
+                    command @ (crate::menu::Command::Cut
+                    | crate::menu::Command::Copy
+                    | crate::menu::Command::Paste
+                    | crate::menu::Command::SelectAll),
+                ) => {
+                    let character = match command {
+                        crate::menu::Command::Cut => 'x',
+                        crate::menu::Command::Copy => 'c',
+                        crate::menu::Command::Paste => 'v',
+                        _ => 'a',
+                    };
+                    self.on_event(PlatformEvent::KeyPressed {
+                        key: Key::Character(character),
+                        modifiers: Modifiers {
+                            command: cfg!(target_os = "macos"),
+                            control: !cfg!(target_os = "macos"),
+                            ..Modifiers::default()
+                        },
+                    });
+                }
                 Some(command) => tracing::info!(?command, "command not implemented yet"),
                 None => tracing::warn!(?id, "menu reported an id no command claims"),
             },
