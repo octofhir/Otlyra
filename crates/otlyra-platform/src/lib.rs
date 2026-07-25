@@ -186,6 +186,15 @@ pub enum PlatformEvent {
     },
     /// The primary pointer button came up.
     PointerReleased,
+    /// The reader asked for a context menu at the last reported position.
+    ///
+    /// One event rather than a secondary button, because *what asks for a
+    /// context menu* is a platform convention and this crate is where platform
+    /// conventions live: the right button everywhere, and on macOS the primary
+    /// button with control held, which is how a one-button pointer has always
+    /// asked. An embedder that had to know the difference would get it wrong on
+    /// whichever platform its author does not use.
+    ContextMenuRequested,
     /// A key went down.
     KeyPressed {
         /// Which key, in a vocabulary that does not depend on the keyboard layout.

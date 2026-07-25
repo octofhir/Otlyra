@@ -49,6 +49,9 @@ pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT;
 /// still walk out there would be walking to controls a reader cannot see.
 const MENU_SCOPE: FocusScopeId = FocusScopeId::new(1);
 
+/// The same trap, for the menu the reader asks for over the page.
+const CONTEXT_SCOPE: FocusScopeId = FocusScopeId::new(2);
+
 /// The widest a tab is allowed to be, however few there are.
 const TAB_MAX_WIDTH: f64 = 220.0;
 /// The narrowest a tab may shrink to before the strip overflows instead.
@@ -398,9 +401,11 @@ pub enum UiAction {
     /// Never reaches the browser either: where the strip is scrolled to is the
     /// interface's own, in the same way the menu being open is.
     ScrollTabs(bool),
-    /// Put the menu away without doing anything else — what a press anywhere
-    /// off the panel means.
-    CloseMenu,
+    /// Put the open popup away without doing anything else — what a press
+    /// anywhere off its panel means.
+    DismissPopup,
+    /// A row of the context menu, chosen.
+    Context(ContextCommand),
     /// Give this control the keyboard — on the toolbar, always the address field.
     ///
     /// Never reaches the browser: [`BrowserUi::pointer_pressed`] applies it to
@@ -414,6 +419,92 @@ pub enum UiAction {
     /// The field reports where; what a click, a double-click or a drag there
     /// means to the caret and the anchor is the interface's to decide.
     AddressHit(FieldHit),
+}
+
+/// What one row of the context menu does.
+///
+/// The browser decides which of these a particular press offers and whether
+/// each is available; the interface only draws them and reports the one that
+/// was chosen. Where the press landed — which link, which element — is the
+/// browser's to remember, because the row says *what* and the browser is the
+/// only thing that knows *to what*.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContextCommand {
+    /// Open the link that was pressed in a tab of its own.
+    OpenLinkInNewTab,
+    /// Put the link's address on the clipboard.
+    CopyLinkAddress,
+    /// Copy what is selected on the page.
+    CopySelection,
+    /// Select the whole document.
+    SelectAll,
+    /// Go back one entry.
+    Back,
+    /// Go forward one entry.
+    Forward,
+    /// Load this page again.
+    Reload,
+    /// Open the inspector on the element that was pressed.
+    InspectElement,
+}
+
+impl ContextCommand {
+    /// What the row says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenLinkInNewTab => "Open Link in New Tab",
+            Self::CopyLinkAddress => "Copy Link Address",
+            Self::CopySelection => "Copy",
+            Self::SelectAll => "Select All",
+            Self::Back => "Back",
+            Self::Forward => "Forward",
+            Self::Reload => "Reload",
+            Self::InspectElement => "Inspect Element",
+        }
+    }
+
+    /// The accelerator that does the same thing, where one does.
+    fn shortcut(self) -> Option<&'static str> {
+        match self {
+            Self::CopySelection => Some("⌘C"),
+            Self::SelectAll => Some("⌘A"),
+            Self::Reload => Some("⌘R"),
+            Self::InspectElement => Some("⌥⌘I"),
+            _ => None,
+        }
+    }
+
+    /// What is drawn in the row's mark column.
+    ///
+    /// The two arrows, the reload and the inspector are things with a picture
+    /// already, and drawing it is what makes a row here and the button that
+    /// does the same thing recognizably one command. The rest draw nothing
+    /// rather than borrowing a shape that means something else — a page beside
+    /// "Copy" is a picture of the wrong idea. The column stays either way, so
+    /// the labels line up whether their row has a mark or not.
+    fn mark(self) -> fn(&mut DisplayList, Rect, otlyra_gfx::peniko::Color) {
+        match self {
+            Self::OpenLinkInNewTab => icon::plus,
+            Self::CopyLinkAddress | Self::CopySelection | Self::SelectAll => |_, _, _| {},
+            Self::Back => {
+                |list, rect, color| icon::chevron(list, rect, icon::Direction::Left, color)
+            }
+            Self::Forward => {
+                |list, rect, color| icon::chevron(list, rect, icon::Direction::Right, color)
+            }
+            Self::Reload => |list, rect, color| icon::reload(list, rect, None, color),
+            Self::InspectElement => icon::page,
+        }
+    }
+}
+
+/// One row of a context menu, as the browser decided it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextRow {
+    /// Something to choose, drawn dim when it cannot be chosen.
+    Command(ContextCommand, bool),
+    /// A line between two groups of them.
+    Divider,
 }
 
 /// A page the browser serves about itself.
@@ -536,7 +627,12 @@ struct Appearance {
     caret: Option<usize>,
     selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
-    menu: Option<f64>,
+    /// The popup drawn over everything, and the window height its sheet covers.
+    ///
+    /// The whole popup rather than a flag: its rows and where it hangs are
+    /// things the frame draws, and a key that did not carry them would draw the
+    /// first context menu forever.
+    popup: Option<(f64, Popup)>,
     /// Whether the page in the active tab is one the reader kept.
     ///
     /// Part of what the interface draws because the star and the menu both say which
@@ -603,12 +699,41 @@ pub enum Bookmarked {
     Yes,
 }
 
+/// A panel drawn over everything else, which owns the pointer and the keyboard
+/// until it is dismissed.
+///
+/// One value rather than a flag per popup: two popups open at once is a thing
+/// the interface would have to decide about at every press, and the answer —
+/// opening one dismisses the other — is what one value says by construction.
+#[derive(Clone, Debug, PartialEq)]
+enum Popup {
+    /// The menu behind the cogwheel.
+    Menu,
+    /// The menu the reader asked for, where they asked for it.
+    Context {
+        /// Where the pointer was, in logical window coordinates.
+        at: (f64, f64),
+        /// What the browser decided to offer there.
+        rows: Vec<ContextRow>,
+    },
+}
+
+impl Popup {
+    /// The traversal trap this popup's rows are claimed in.
+    fn scope(&self) -> FocusScopeId {
+        match self {
+            Self::Menu => MENU_SCOPE,
+            Self::Context { .. } => CONTEXT_SCOPE,
+        }
+    }
+}
+
 /// The interface's own state: what is focused, where the pointer is, what is typed.
 pub struct BrowserUi {
     /// The address field.
     pub address: TextField,
-    /// Whether the menu behind the cogwheel is open.
-    pub menu_open: bool,
+    /// The panel drawn over everything, if one is open.
+    popup: Option<Popup>,
     /// Whether the page in the active tab is one the reader kept.
     ///
     /// Written by the browser wherever the address is synchronized, because it is a
@@ -623,13 +748,13 @@ pub struct BrowserUi {
     /// field shows a caret exactly when this lands on its id, so there is
     /// nothing to keep in step.
     focused: Option<FocusId>,
-    /// Where the keyboard was when the menu opened.
+    /// Where the keyboard was when the popup opened.
     ///
-    /// Escape puts it back there, which is what makes a menu something a
-    /// keyboard can look into and leave again. A press that dismisses the menu
-    /// does not: a ring appearing on the toolbar after a click is the interface
+    /// Escape puts it back there, which is what makes a popup something a
+    /// keyboard can look into and leave again. A press that dismisses it does
+    /// not: a ring appearing on the toolbar after a click is the interface
     /// answering a question nobody asked.
-    menu_return: Option<FocusId>,
+    popup_return: Option<FocusId>,
     /// The focusable controls the last frame built, in the order it built them.
     focus: Focus,
     /// How far the tab strip is slid along, and how far it could be.
@@ -711,11 +836,11 @@ impl BrowserUi {
             tab_runtime.mount(None, WidgetType::of::<TabStripRenderNode>(), None);
         Self {
             address: TextField::default(),
-            menu_open: false,
+            popup: None,
             bookmark: Bookmarked::Impossible,
             theme: Theme::light(),
             focused: None,
-            menu_return: None,
+            popup_return: None,
             focus: Focus::default(),
             tab_scroll: 0.0,
             tab_overflow: crate::widget::Overflow::default(),
@@ -886,7 +1011,7 @@ impl BrowserUi {
             // The sheet behind an open menu answers everywhere, and everywhere
             // is not a thing to point at: dismissing is what happens when you
             // press *nothing*, so it reads as nothing.
-            Some(UiAction::CloseMenu) | None => None,
+            Some(UiAction::DismissPopup) | None => None,
             Some(_) => Some(Cursor::Pointer),
         }
     }
@@ -896,7 +1021,7 @@ impl BrowserUi {
     /// An open menu counts as the interface wherever it reaches, which is how a
     /// press on the panel stops being a press on the document under it.
     pub fn owns_pointer(&self) -> bool {
-        self.pointer.1 < UI_HEIGHT || self.menu_open
+        self.pointer.1 < UI_HEIGHT || self.popup_open()
     }
 
     /// Whether a press that began in the interface still owns pointer motion.
@@ -913,7 +1038,7 @@ impl BrowserUi {
         self.pointer_down = true;
         self.press_origin = Some(self.pointer);
         self.clicks = clicks;
-        if self.pointer.1 >= UI_HEIGHT && !self.menu_open {
+        if self.pointer.1 >= UI_HEIGHT && !self.popup_open() {
             // The press belongs to the page, and it takes focus away from the
             // address field — which is what every browser does, and what makes
             // typing after clicking a page do nothing surprising.
@@ -929,7 +1054,7 @@ impl BrowserUi {
 
         match action {
             Some(UiAction::Focus(id)) => {
-                self.close_menu(false);
+                self.close_popup(false);
                 self.focused = Some(id);
                 UiAction::None
             }
@@ -938,7 +1063,7 @@ impl BrowserUi {
             // click count. The field said where; whose keyboard it is stays
             // the surface's business.
             Some(UiAction::AddressHit(hit)) => {
-                self.close_menu(false);
+                self.close_popup(false);
                 if let Some(id) = self.focus.first_text() {
                     self.focused = Some(id);
                 }
@@ -955,22 +1080,28 @@ impl BrowserUi {
                 self.scroll_tabs_page(forward);
                 UiAction::None
             }
-            Some(UiAction::CloseMenu) => {
-                self.close_menu(false);
+            Some(UiAction::DismissPopup) => {
+                self.close_popup(false);
                 UiAction::None
             }
             // Choosing something from the menu closes it. A menu that stayed
             // open over the page it just opened would have to be dismissed by
             // hand every time.
             Some(UiAction::OpenPage(page)) => {
-                self.close_menu(false);
+                self.close_popup(false);
                 UiAction::OpenPage(page)
             }
             // The same for the inspector: chosen from the menu, the menu goes
             // away and what was chosen is what happens.
             Some(UiAction::ToggleInspector) => {
-                self.close_menu(false);
+                self.close_popup(false);
                 UiAction::ToggleInspector
+            }
+            // A row of the context menu, which is the whole of what that menu is
+            // for: it goes away and the browser is told what was chosen.
+            Some(UiAction::Context(command)) => {
+                self.close_popup(false);
+                UiAction::Context(command)
             }
             Some(action) => {
                 if !matches!(
@@ -983,41 +1114,105 @@ impl BrowserUi {
             }
             None => {
                 self.focused = None;
-                self.close_menu(false);
+                self.close_popup(false);
                 UiAction::None
             }
         }
     }
 
-    /// Open the menu, or put it away again.
+    /// Open the menu behind the cogwheel, or put it away again.
     fn toggle_menu(&mut self) {
-        if self.menu_open {
-            self.close_menu(false);
+        if self.menu_open() {
+            self.close_popup(false);
         } else {
-            self.menu_open = true;
-            self.menu_return = self.focused;
-            self.focused = None;
+            self.open_popup(Popup::Menu);
         }
     }
 
-    /// Put the menu away.
+    /// Show the browser menu, for a caller that is not a press on the cogwheel.
+    pub fn open_menu(&mut self) {
+        if !self.menu_open() {
+            self.open_popup(Popup::Menu);
+        }
+    }
+
+    /// Show `rows` as a menu at `x`, `y`, where the reader asked for one.
     ///
-    /// `restore` gives the keyboard back to whatever held it before the menu
-    /// opened, which is what leaving a menu by Escape means. A press dismisses
-    /// without restoring: the reader is looking at where they clicked, not at
-    /// the button they walked away from.
-    fn close_menu(&mut self, restore: bool) {
-        if !self.menu_open {
+    /// The rows are the browser's decision: what is under the pointer is a
+    /// question about the document, and the interface is the wrong place to ask
+    /// it. Nothing is offered at all when the list is empty, because a menu with
+    /// no rows is a rectangle that only gets in the way.
+    pub fn open_context_menu(&mut self, x: f64, y: f64, rows: Vec<ContextRow>) {
+        if rows.is_empty() {
             return;
         }
-        self.menu_open = false;
-        let back = self.menu_return.take();
-        // Only the keyboard that was inside the menu moves. One resting
+        self.open_popup(Popup::Context { at: (x, y), rows });
+    }
+
+    /// Open one popup, which is what closes any other.
+    fn open_popup(&mut self, popup: Popup) {
+        // The keyboard to come back to is the one from before *any* popup: a
+        // context menu opened over an open menu must not offer its rows as the
+        // place to return to.
+        if self.popup.is_none() {
+            self.popup_return = self.focused;
+        }
+        self.popup = Some(popup);
+        self.focused = None;
+    }
+
+    /// Put the open popup away.
+    ///
+    /// `restore` gives the keyboard back to whatever held it before the popup
+    /// opened, which is what leaving one by Escape means. A press dismisses
+    /// without restoring: the reader is looking at where they clicked, not at
+    /// the button they walked away from.
+    fn close_popup(&mut self, restore: bool) {
+        let Some(popup) = self.popup.take() else {
+            return;
+        };
+        let back = self.popup_return.take();
+        // Only the keyboard that was inside the popup moves. One resting
         // somewhere else — a field the reader pressed on the way out — stays
         // exactly where the press put it.
-        if self.focused.is_none() || self.focus.scope(self.focused) == Some(MENU_SCOPE) {
+        if self.focused.is_none() || self.focus.scope(self.focused) == Some(popup.scope()) {
             self.focused = if restore { back } else { None };
         }
+    }
+
+    /// Put any popup away because what it belongs to has gone.
+    ///
+    /// The browser says when that happens, because the interface cannot see it:
+    /// a popup belongs to the root that opened it, and a root that stops being
+    /// the active one has no business keeping a panel over the window.
+    pub fn dismiss_popup(&mut self) {
+        self.close_popup(false);
+    }
+
+    /// Put away only the menu the reader asked for over the page.
+    ///
+    /// Its rows are about a document at a point — this link, this element — and
+    /// a navigation or a resize leaves every one of them describing something
+    /// that is no longer there. The menu behind the cogwheel is about the
+    /// browser and survives both.
+    pub fn dismiss_context_menu(&mut self) {
+        if matches!(self.popup, Some(Popup::Context { .. })) {
+            self.close_popup(false);
+        }
+    }
+
+    /// Whether the menu behind the cogwheel is open.
+    pub fn menu_open(&self) -> bool {
+        self.popup == Some(Popup::Menu)
+    }
+
+    /// Whether any panel is drawn over the window.
+    ///
+    /// What the browser routes a press by: a popup owns the pointer wherever it
+    /// reaches, so the page under it neither follows a link nor starts a
+    /// selection while one is open.
+    pub fn popup_open(&self) -> bool {
+        self.popup.is_some()
     }
 
     /// The press ended: drags stop growing selections.
@@ -1065,12 +1260,16 @@ impl BrowserUi {
                 UiAction::None
             }
             Some(UiAction::OpenPage(page)) => {
-                self.close_menu(true);
+                self.close_popup(true);
                 UiAction::OpenPage(page)
             }
             Some(UiAction::ToggleInspector) => {
-                self.close_menu(true);
+                self.close_popup(true);
                 UiAction::ToggleInspector
+            }
+            Some(UiAction::Context(command)) => {
+                self.close_popup(true);
+                UiAction::Context(command)
             }
             Some(action) => action,
             None => UiAction::None,
@@ -1092,8 +1291,8 @@ impl BrowserUi {
             return UiAction::Reload;
         }
 
-        if key == Key::Escape && self.menu_open {
-            self.close_menu(true);
+        if key == Key::Escape && self.popup_open() {
+            self.close_popup(true);
             return UiAction::None;
         }
 
@@ -1102,7 +1301,7 @@ impl BrowserUi {
         // reaches for before Tab. They are the way *into* it as well: the
         // keyboard is on the cogwheel behind the sheet, and traversal out of a
         // scope it is not in enters that scope.
-        if self.menu_open && matches!(key, Key::Down | Key::Up) && !modifiers.is_accelerator() {
+        if self.popup_open() && matches!(key, Key::Down | Key::Up) && !modifiers.is_accelerator() {
             self.focused = if key == Key::Down {
                 self.focus.next(self.focused)
             } else {
@@ -1130,7 +1329,7 @@ impl BrowserUi {
                     // An accelerator that names a control is the keyboard
                     // leaving the menu, and a popup a keyboard has left is a
                     // popup that is closed.
-                    self.close_menu(false);
+                    self.close_popup(false);
                     self.focus_address();
                     UiAction::None
                 }
@@ -1282,7 +1481,7 @@ impl BrowserUi {
             // over the document, which is what made scrolling with the mouse
             // moving lag. A press in progress and an open menu both reach past the
             // toolbar's edge, so the real pointer stands then.
-            pointer: if self.pointer.1 >= UI_HEIGHT && !self.menu_open && !self.pointer_down {
+            pointer: if self.pointer.1 >= UI_HEIGHT && !self.popup_open() && !self.pointer_down {
                 (-1.0, -1.0)
             } else {
                 self.pointer
@@ -1295,7 +1494,7 @@ impl BrowserUi {
                 .then(|| self.address.selection())
                 .flatten(),
             focus: self.focused,
-            menu: self.menu_open.then_some(height),
+            popup: self.popup.clone().map(|popup| (height, popup)),
             bookmark: self.bookmark,
             tab_scroll: self.tab_scroll,
         };
@@ -1584,28 +1783,37 @@ impl BrowserUi {
             ],
         ));
 
-        if !self.menu_open {
+        let Some(popup) = self.popup.as_ref() else {
             return rows;
-        }
+        };
 
-        // Its rows claim their ids inside the menu's own scope, which is what
+        // Its rows claim their ids inside the popup's own scope, which is what
         // keeps Tab on the panel while it is open.
-        focus.open_scope(MENU_SCOPE);
-        let panel = menu(&theme, &focus, self.bookmark);
+        focus.open_scope(popup.scope());
+        let panel: Child<UiAction> = match popup {
+            Popup::Menu => Box::new(crate::widget::Anchored::from_right(
+                theme.inset,
+                UI_HEIGHT - 2.0,
+                menu(&theme, &focus, self.bookmark),
+            )),
+            // At the pointer, and flipped back onto the window at an edge: a
+            // menu asked for near the bottom right belongs above and to the
+            // left of the press, not half off the window.
+            Popup::Context { at, rows } => Box::new(
+                crate::widget::Anchored::at(at.0, at.1, context_menu(&theme, &focus, rows))
+                    .flipped(),
+            ),
+        };
         focus.close_scope();
 
         // Panel first in the list so it is drawn last and answers first; the
         // sheet under it catches every press that misses, which is what makes
-        // clicking anywhere else dismiss the menu without also doing whatever
+        // clicking anywhere else dismiss the popup without also doing whatever
         // was under the pointer.
         Box::new(crate::widget::Overlay::new(vec![
             rows,
-            controls::scrim(UiAction::CloseMenu),
-            Box::new(crate::widget::Anchored::from_right(
-                theme.inset,
-                UI_HEIGHT - 2.0,
-                panel,
-            )),
+            controls::scrim(UiAction::DismissPopup),
+            panel,
         ]))
     }
 }
@@ -1853,6 +2061,30 @@ fn menu(theme: &Theme, focus: &Focus, bookmark: Bookmarked) -> Child<UiAction> {
             row(About, icon::info, None),
         ],
     )
+}
+
+/// The menu the reader asked for, over whatever they asked on.
+///
+/// The same rows the browser menu is made of, so a context menu looks like a
+/// menu rather than like a second idea of one, and so anything learned about
+/// hover, disabled rows, keyboard traversal or accessibility applies to both.
+fn context_menu(theme: &Theme, focus: &Focus, rows: &[ContextRow]) -> Child<UiAction> {
+    let built = rows
+        .iter()
+        .map(|row| match row {
+            ContextRow::Command(command, enabled) => controls::menu_item(
+                theme,
+                focus,
+                UiAction::Context(*command),
+                *enabled,
+                command.mark(),
+                command.label(),
+                command.shortcut(),
+            ),
+            ContextRow::Divider => controls::divider(theme),
+        })
+        .collect();
+    controls::menu_panel(theme, 236.0, built)
 }
 
 /// The hairline between two background tabs.
@@ -2494,7 +2726,7 @@ mod tests {
     fn an_open_menu_makes_the_height_matter_again() {
         let mut text = TextEngine::new();
         let mut ui = BrowserUi::new();
-        ui.menu_open = true;
+        ui.open_menu();
 
         frame_at(&mut ui, &mut text, 1000.0, 800.0);
         // The panel hangs below the band and its sheet covers the window, so
@@ -2682,7 +2914,7 @@ mod tests {
     fn open_the_menu(ui: &mut BrowserUi, text: &mut TextEngine) {
         frame_at(ui, text, 1000.0, 700.0);
         press(ui, text, 1000.0 - 22.0, UI_HEIGHT - 21.0);
-        assert!(ui.menu_open, "the cogwheel opens the menu");
+        assert!(ui.menu_open(), "the cogwheel opens the menu");
         frame_at(ui, text, 1000.0, 700.0);
     }
 
@@ -2746,7 +2978,7 @@ mod tests {
         let before = ui.focused().expect("Tab reached the first control");
 
         press(&mut ui, &mut text, 1000.0 - 22.0, UI_HEIGHT - 21.0);
-        assert!(ui.menu_open);
+        assert!(ui.menu_open());
         frame_at(&mut ui, &mut text, 1000.0, 700.0);
         ui.key_pressed(
             Key::Down,
@@ -2766,7 +2998,7 @@ mod tests {
             &mut text,
             &mut crate::clipboard::InMemory::default(),
         );
-        assert!(!ui.menu_open, "Escape dismisses the menu");
+        assert!(!ui.menu_open(), "Escape dismisses the menu");
         assert_eq!(ui.focused(), Some(before), "the keyboard came back");
     }
 
@@ -2785,7 +3017,7 @@ mod tests {
         // Well below the panel, on the sheet that covers the window.
         press(&mut ui, &mut text, 100.0, 600.0);
 
-        assert!(!ui.menu_open);
+        assert!(!ui.menu_open());
         assert_eq!(ui.focused(), None);
     }
 
@@ -2807,7 +3039,7 @@ mod tests {
             &mut text,
             &mut crate::clipboard::InMemory::default(),
         );
-        assert!(!ui.menu_open, "the menu stayed open behind the caret");
+        assert!(!ui.menu_open(), "the menu stayed open behind the caret");
         assert!(ui.address_focused());
     }
 

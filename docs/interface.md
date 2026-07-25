@@ -52,6 +52,16 @@ is a change that needs an argument, not a patch.
    it. A pointer press, accessibility action, or explicit command changes the
    active root and blurs roots that remain visible in the background.
 
+7. **A popup owns the pointer and the keyboard until it is dismissed.** One
+   popup at a time per surface, opened with the traversal scope its rows claim
+   their focus ids in, so Tab reaches those rows and wraps there instead of
+   walking to controls behind the sheet. Four ways out, and all four are one
+   code path: a press outside it, Escape, the keyboard being named elsewhere,
+   and the thing it belongs to going away — a navigation, a resize, another
+   root becoming the active one. Escape puts the keyboard back where it was;
+   the others do not, because a ring appearing after a click answers a question
+   nobody asked.
+
 ## Before a commit
 
 ```
@@ -129,11 +139,13 @@ logo beside a wordmark came out as wide as the wordmark alone.
 
 Decisions rather than omissions.
 
-- **A popup that can leave the window.** The menu is drawn inside the window, so
-  one near the bottom edge is clipped by it. Real popups need a platform window
-  per popup, which is an `otlyra-platform` change with its own event routing.
-  **Context menus** and **a real dropdown** both wait behind it; `segmented`
-  stands in for a short list of choices meanwhile.
+- **A popup that can leave the window.** Popups are drawn inside the window and
+  flip back onto it at an edge rather than being clipped by it, which is enough
+  for a menu and for the menu a reader asks for over the page. One that must
+  *leave* the window — a long dropdown near the bottom edge — needs a platform
+  window per popup, which is an `otlyra-platform` change with its own event
+  routing. **A real dropdown** waits behind it; `segmented` stands in for a
+  short list of choices meanwhile.
 - **Tooltips.** Needs a timer per surface and somewhere to hang delayed events.
 - **Dragging tabs to reorder**, and pinned tabs. The strip scrolls; neither of
   these is in it.

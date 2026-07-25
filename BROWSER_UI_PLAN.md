@@ -301,13 +301,24 @@ tree for an unrelated visual change.
   an ordered "first root that consumes it" chain, so a stale inspector search
   caret cannot steal typing after the page is pressed. A window-compositor
   regression covers the handoff.
-- [ ] Implement platform popup windows plus an in-window backend for tests and
-  screenshots.
-- [ ] Build shared dismissal rules: outside click, Escape, focus loss, and
-  parent destruction.
+- [~] Implement platform popup windows plus an in-window backend for tests and
+  screenshots. The in-window backend is what both menus use: one popup per
+  surface, drawn in the chrome tree over a sheet, anchored either against a
+  control or at the point a press landed, and flipped back onto the window at an
+  edge rather than clipped by it. A platform window per popup is still needed
+  for one that must leave the window, and nothing needs that yet.
+- [x] Build shared dismissal rules: outside click, Escape, focus loss, and
+  parent destruction. One code path (`BrowserUi::close_popup`), four ways in:
+  the sheet's press, Escape, an accelerator that names a control elsewhere, and
+  the browser saying the popup's subject has gone — a navigation, a resize, or
+  another root becoming the active surface. Escape restores the keyboard; the
+  rest do not.
 - [ ] Add tooltip scheduling and dismissal.
-- [ ] Move menus, context menus, dropdowns, omnibox suggestions, and permission
-  prompts onto this contract.
+- [~] Move menus, context menus, dropdowns, omnibox suggestions, and permission
+  prompts onto this contract. The browser menu and the context menu are on it
+  and are the two consumers it was written from. A dropdown, omnibox
+  suggestions and permission prompts do not exist yet; each is a new surface
+  rather than a migration.
 
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.

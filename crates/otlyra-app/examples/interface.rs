@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use otlyra_app::clipboard::InMemory;
-use otlyra_app::ui::{BrowserUi, TabLabel, UI_HEIGHT};
+use otlyra_app::ui::{BrowserUi, ContextCommand, ContextRow, TabLabel, UI_HEIGHT};
 use otlyra_gfx::DisplayList;
 use otlyra_gfx::PaintTarget;
 use otlyra_gfx::kurbo::Affine;
@@ -51,12 +51,10 @@ impl Frame {
     /// start, or the second one would be a different number of Tabs along than
     /// the first and the two shots would not be of one state.
     fn settle(&mut self) {
-        self.ui.key_pressed(
-            Key::Escape,
-            Modifiers::default(),
-            &mut self.text,
-            &mut self.clipboard,
-        );
+        // Blurring rather than pressing Escape, which is what this did and why
+        // the state showing the open menu was a picture of a closed one: Escape
+        // is *dismiss*, and every popup here is the thing the shot is of.
+        self.ui.blur();
         if self.focus_address {
             self.ui.focus_address();
             if !self.select_address {
@@ -648,7 +646,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // past the interface and over the page.
     let mut menu = toolbar("menu", tabs(&[("Otlyra", false)]), 0, (true, false), None);
     menu.ui.address.set_text("https://example.com/");
-    menu.ui.menu_open = true;
+    menu.ui.open_menu();
     frames.push(menu);
 
     // The pointer resting on the reload button, so the hover wash is visible.
@@ -746,6 +744,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             700.0,
             |frame| frame.settle(),
         )?;
+    }
+
+    // The menu the reader asked for, over the page and away from the toolbar:
+    // the one panel that is placed where a press landed rather than against a
+    // control, so where it hangs is worth looking at.
+    let mut context = toolbar(
+        "context-menu",
+        tabs(&[("Otlyra", false)]),
+        0,
+        (true, false),
+        None,
+    );
+    context.ui.address.set_text("https://example.com/");
+    context.ui.open_context_menu(
+        280.0,
+        UI_HEIGHT + 120.0,
+        vec![
+            ContextRow::Command(ContextCommand::OpenLinkInNewTab, true),
+            ContextRow::Command(ContextCommand::CopyLinkAddress, true),
+            ContextRow::Divider,
+            ContextRow::Command(ContextCommand::CopySelection, true),
+            ContextRow::Divider,
+            ContextRow::Command(ContextCommand::Back, false),
+            ContextRow::Command(ContextCommand::Forward, false),
+            ContextRow::Command(ContextCommand::Reload, true),
+            ContextRow::Divider,
+            ContextRow::Command(ContextCommand::SelectAll, true),
+            ContextRow::Command(ContextCommand::InspectElement, true),
+        ],
+    );
+
+    // The same menu asked for near the bottom right corner, where it has to
+    // flip back onto the window rather than run off it.
+    let mut corner = toolbar(
+        "context-menu-corner",
+        tabs(&[("Otlyra", false)]),
+        0,
+        (true, false),
+        None,
+    );
+    corner.ui.address.set_text("https://example.com/");
+    corner.ui.open_context_menu(
+        860.0,
+        520.0,
+        vec![
+            ContextRow::Command(ContextCommand::Back, true),
+            ContextRow::Command(ContextCommand::Forward, false),
+            ContextRow::Command(ContextCommand::Reload, true),
+            ContextRow::Divider,
+            ContextRow::Command(ContextCommand::SelectAll, true),
+            ContextRow::Command(ContextCommand::InspectElement, true),
+        ],
+    );
+
+    // Both are drawn in a taller window than the toolbar states: a menu is as
+    // long as its rows, and one that does not fit says more about the window
+    // than about the menu.
+    for frame in [&mut context, &mut corner] {
+        let name = frame.name;
+        write_states(&directory, name, frame, 1100.0, 620.0, |frame| {
+            frame.settle();
+        })?;
     }
 
     for mut frame in frames {

@@ -239,9 +239,79 @@ fn the_focused_selected_address_outline_is_stable() {
 #[test]
 fn the_open_menu_outline_is_stable() {
     let (mut ui, tabs, mut text) = toolbar();
-    ui.menu_open = true;
+    ui.open_menu();
     let list = toolbar_list(&mut ui, &tabs, &mut text, None);
     insta::assert_snapshot!(outline(&list));
+}
+
+/// The menu the reader asks for over the page: the one panel placed where a
+/// press landed rather than against a control, so where it lands is the thing
+/// worth pinning.
+#[test]
+fn the_context_menu_outline_is_stable() {
+    let (mut ui, tabs, mut text) = toolbar();
+    ui.open_context_menu(
+        280.0,
+        UI_HEIGHT + 60.0,
+        vec![
+            otlyra_app::ui::ContextRow::Command(
+                otlyra_app::ui::ContextCommand::OpenLinkInNewTab,
+                true,
+            ),
+            otlyra_app::ui::ContextRow::Command(
+                otlyra_app::ui::ContextCommand::CopyLinkAddress,
+                true,
+            ),
+            otlyra_app::ui::ContextRow::Divider,
+            otlyra_app::ui::ContextRow::Command(otlyra_app::ui::ContextCommand::Back, false),
+            otlyra_app::ui::ContextRow::Command(otlyra_app::ui::ContextCommand::Reload, true),
+            otlyra_app::ui::ContextRow::Command(
+                otlyra_app::ui::ContextCommand::InspectElement,
+                true,
+            ),
+        ],
+    );
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    insta::assert_snapshot!(outline(&list));
+}
+
+/// And the same menu asked for near the bottom right corner, which has to open
+/// back onto the window instead of running off it.
+#[test]
+fn a_context_menu_at_the_corner_opens_back_onto_the_window() {
+    let (mut ui, tabs, mut text) = toolbar();
+    ui.open_context_menu(
+        860.0,
+        560.0,
+        vec![
+            otlyra_app::ui::ContextRow::Command(otlyra_app::ui::ContextCommand::Reload, true),
+            otlyra_app::ui::ContextRow::Command(
+                otlyra_app::ui::ContextCommand::InspectElement,
+                true,
+            ),
+        ],
+    );
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    let panel = list
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Fill { shape, .. } => Some(shape.bounding_box()),
+            _ => None,
+        })
+        // The panel is the one filled shape as wide as a menu that is drawn
+        // below the toolbar.
+        .find(|bounds| bounds.width() > 200.0 && bounds.width() < 300.0 && bounds.y0 > UI_HEIGHT)
+        .expect("the panel was drawn");
+    assert!(
+        panel.x1 <= 900.0 && panel.y1 <= 600.0,
+        "the panel ran off the window at {panel:?}"
+    );
+    assert!(
+        panel.y1 <= 561.0 && panel.x1 <= 861.0,
+        "a menu that does not fit below and right of the press belongs above \
+         and left of it, not over the edge: {panel:?}"
+    );
 }
 
 #[test]

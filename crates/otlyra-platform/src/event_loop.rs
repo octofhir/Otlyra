@@ -968,13 +968,29 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == winit::event::ElementState::Pressed;
+                // The right button asks for a context menu everywhere, and on
+                // macOS so does the primary button with control held — which is
+                // the gesture that predates a second button and the one this
+                // platform's readers still use with a trackpad.
+                let secondary = button == winit::event::MouseButton::Right
+                    || (button == winit::event::MouseButton::Left
+                        && cfg!(target_os = "macos")
+                        && self.modifiers.control);
+                if secondary {
+                    // Only the press: what a release of it would mean is
+                    // nothing, and delivering one would end a drag nobody began.
+                    if pressed {
+                        self.deliver(PlatformEvent::ContextMenuRequested);
+                    }
+                    return;
+                }
                 if button == winit::event::MouseButton::Left {
-                    let event = match state {
-                        winit::event::ElementState::Pressed => {
-                            let clicks = self.count_click();
-                            PlatformEvent::PointerPressed { clicks }
-                        }
-                        winit::event::ElementState::Released => PlatformEvent::PointerReleased,
+                    let event = if pressed {
+                        let clicks = self.count_click();
+                        PlatformEvent::PointerPressed { clicks }
+                    } else {
+                        PlatformEvent::PointerReleased
                     };
                     self.deliver(event);
                 }

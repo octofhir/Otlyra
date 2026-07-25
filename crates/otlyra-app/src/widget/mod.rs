@@ -1800,6 +1800,7 @@ pub struct Anchored<A> {
     at: (f64, f64),
     from_right: bool,
     rect: Rect,
+    flip: bool,
 }
 
 impl<A> Anchored<A> {
@@ -1810,6 +1811,7 @@ impl<A> Anchored<A> {
             at: (x, y),
             from_right: false,
             rect: Rect::ZERO,
+            flip: false,
         }
     }
 
@@ -1820,7 +1822,20 @@ impl<A> Anchored<A> {
             at: (x, y),
             from_right: true,
             rect: Rect::ZERO,
+            flip: false,
         }
+    }
+
+    /// Hang the child on the other side of the anchor when it would not fit.
+    ///
+    /// What a menu asked for near the bottom right of the window does: it opens
+    /// up and to the left of the press instead of running off the edge. Flipping
+    /// rather than sliding, because a panel slid back along the edge would sit
+    /// under the pointer that asked for it, with a different row under the
+    /// cursor than the one the press was aimed at.
+    pub fn flipped(mut self) -> Self {
+        self.flip = true;
+        self
     }
 }
 
@@ -1832,17 +1847,28 @@ impl<A> Widget<A> for Anchored<A> {
     fn place(&mut self, rect: Rect, cx: &mut Cx) {
         self.rect = rect;
         let wanted = self.child.measure(Size::new(rect.width, rect.height), cx);
-        let x = if self.from_right {
+        let mut x = if self.from_right {
             rect.x + rect.width - self.at.0 - wanted.width
         } else {
             rect.x + self.at.0
         };
+        let mut y = rect.y + self.at.1;
+        if self.flip {
+            // Past an edge, the anchor point becomes the panel's other corner.
+            // Only then: a panel that fits hangs where it was asked to.
+            if x + wanted.width > rect.x + rect.width {
+                x = (x - wanted.width).max(rect.x);
+            }
+            if y + wanted.height > rect.y + rect.height {
+                y = (y - wanted.height).max(rect.y);
+            }
+        }
         self.child.place(
             Rect::new(
                 // Never off the left edge, however narrow the window: a panel
                 // that cannot be reached cannot be dismissed either.
                 x.max(rect.x),
-                rect.y + self.at.1,
+                y,
                 wanted.width.min(rect.width),
                 wanted.height,
             ),

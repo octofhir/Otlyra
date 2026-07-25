@@ -22,7 +22,7 @@ use crate::downloads::{self, DownloadsSurface};
 use crate::fetcher::{Body, Fetched, Fetcher, Loader, ResourceKind};
 use crate::page::{PageScene, title_of};
 use crate::settings::{self, SettingsSurface};
-use crate::ui::{BrowserUi, SystemPage, TabLabel, UI_HEIGHT, UiAction};
+use crate::ui::{BrowserUi, ContextCommand, ContextRow, SystemPage, TabLabel, UI_HEIGHT, UiAction};
 use crate::widget::runtime::UiSurfaceId;
 
 /// How long a caller with no event loop waits between checks for a finished fetch.
@@ -71,6 +71,14 @@ fn report_limit(asked: usize, limit: usize, what: &str) {
             "the document asks for more {what} than the limit"
         );
     }
+}
+
+/// What an open context menu was asked about.
+struct ContextTarget {
+    /// Where the press landed, in window logical pixels.
+    at: (f64, f64),
+    /// The link under it, resolved, if it landed on one.
+    link: Option<String>,
 }
 
 /// One place a tab has been.
@@ -358,6 +366,13 @@ pub struct Browser {
     cursor: Cursor,
     /// The one UI root that owns keyboard, text/IME, clipboard, and a11y focus.
     keyboard_surface: UiSurfaceId,
+    /// What the open context menu was asked about, while it is open.
+    ///
+    /// Kept here rather than on the menu because it is a fact about the
+    /// document: the row says "open this link in a new tab" and this is what
+    /// *this link* means. It is taken when a row is chosen, so a menu dismissed
+    /// without choosing anything leaves nothing behind.
+    context_target: Option<ContextTarget>,
     /// The preferences.
     ///
     /// One surface for the whole browser rather than one per tab: a preference
@@ -492,6 +507,7 @@ impl Browser {
             pointer: (0.0, 0.0),
             cursor: Cursor::Default,
             keyboard_surface: SURFACE_CHROME,
+            context_target: None,
             settings: SettingsSurface::with(settings),
             inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
@@ -730,9 +746,18 @@ impl Browser {
     }
 
     /// Give one UI root exclusive ownership of keyboard-like input.
+    ///
+    /// A popup belongs to the root that opened it, so a root becoming the
+    /// active one puts away whatever popup the previous one had open. That is
+    /// the focus-loss rule and the parent-destruction rule at once: switching
+    /// tabs, opening a browser page, or pressing into the panel all arrive here.
     fn activate_surface(&mut self, surface: UiSurfaceId) {
         if self.keyboard_surface == surface {
             return;
+        }
+        if surface != SURFACE_CHROME {
+            self.ui.dismiss_popup();
+            self.context_target = None;
         }
         if surface != SURFACE_CHROME {
             self.ui.blur();
@@ -1054,6 +1079,10 @@ impl Browser {
         body: Option<Body>,
     ) {
         let _span = tracing::info_span!("navigation", url).entered();
+        // The document a context menu was asked about is being replaced, and
+        // its rows name things in it.
+        self.ui.dismiss_context_menu();
+        self.context_target = None;
 
         // A browser's own page is fetched from nothing and parsed from nothing:
         // it is a surface this program draws. Catching it in the one place every
@@ -2211,7 +2240,7 @@ impl Browser {
             UiAction::Focus(_)
             | UiAction::AddressHit(_)
             | UiAction::ToggleMenu
-            | UiAction::CloseMenu
+            | UiAction::DismissPopup
             | UiAction::ScrollTabs(_) => {}
             UiAction::ToggleInspector => self.toggle_inspector(),
             UiAction::ToggleBookmark => self.toggle_bookmark(),
@@ -2229,6 +2258,106 @@ impl Browser {
             UiAction::CloseTab(index) => self.close_tab(index),
             UiAction::SelectTab(index) => self.select_tab(index),
             UiAction::Reload => self.reload(),
+            UiAction::Context(command) => self.apply_context(command),
+        }
+    }
+
+    /// Offer a menu for whatever the reader asked over.
+    ///
+    /// The rows are decided here rather than in the interface because every one
+    /// of them is a question about the document: is there a link under the
+    /// pointer, is anything selected, is there anywhere to go back to. What is
+    /// under the pointer is also remembered here, so the row says *what* and
+    /// this says *to what* — a menu row that carried a URL would be a second
+    /// copy of a fact the browser already holds.
+    fn context_menu_requested(&mut self) {
+        let (x, y) = self.pointer;
+        // The interface has its own menu and the panel has none: a press for a
+        // menu that lands on either dismisses whatever is open and stops there,
+        // rather than offering the page's rows over something that is not a page.
+        self.ui.dismiss_popup();
+        if !self.interface && y < UI_HEIGHT {
+            return;
+        }
+        if y < UI_HEIGHT || y >= self.dock_top() {
+            return;
+        }
+        if self.tabs[self.active].page.is_none() {
+            return;
+        }
+
+        let link = self.link_under_pointer();
+        let selection = self.tabs[self.active]
+            .page
+            .as_ref()
+            .is_some_and(PageScene::has_selection);
+        let mut rows = Vec::new();
+        if link.is_some() {
+            rows.push(ContextRow::Command(ContextCommand::OpenLinkInNewTab, true));
+            rows.push(ContextRow::Command(ContextCommand::CopyLinkAddress, true));
+            rows.push(ContextRow::Divider);
+        }
+        if selection {
+            rows.push(ContextRow::Command(ContextCommand::CopySelection, true));
+            rows.push(ContextRow::Divider);
+        }
+        rows.push(ContextRow::Command(
+            ContextCommand::Back,
+            self.can_go_back(),
+        ));
+        rows.push(ContextRow::Command(
+            ContextCommand::Forward,
+            self.can_go_forward(),
+        ));
+        rows.push(ContextRow::Command(ContextCommand::Reload, true));
+        rows.push(ContextRow::Divider);
+        rows.push(ContextRow::Command(ContextCommand::SelectAll, true));
+        rows.push(ContextRow::Command(ContextCommand::InspectElement, true));
+
+        self.context_target = Some(ContextTarget { at: (x, y), link });
+        self.ui.open_context_menu(x, y, rows);
+        self.activate_surface(SURFACE_CHROME);
+    }
+
+    /// Do what a row of the context menu says, to what it was asked about.
+    fn apply_context(&mut self, command: ContextCommand) {
+        // Where the press landed, as it was when the menu opened. A menu that
+        // read the pointer now would act on wherever the pointer drifted to
+        // between opening the menu and choosing a row.
+        let Some(target) = self.context_target.take() else {
+            return;
+        };
+        match command {
+            ContextCommand::OpenLinkInNewTab => {
+                if let Some(url) = target.link {
+                    self.new_tab();
+                    self.navigate(&url);
+                }
+            }
+            ContextCommand::CopyLinkAddress => {
+                if let Some(url) = target.link {
+                    self.clipboard.write(url);
+                }
+            }
+            ContextCommand::CopySelection => {
+                self.copy_selection();
+            }
+            ContextCommand::SelectAll => {
+                if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    page.select_all();
+                }
+                self.activate_surface(SURFACE_PAGE);
+            }
+            ContextCommand::Back => self.go_back(),
+            ContextCommand::Forward => self.go_forward(),
+            ContextCommand::Reload => self.reload(),
+            ContextCommand::InspectElement => {
+                if !self.inspector.open {
+                    self.toggle_inspector();
+                }
+                self.pick_at(target.at.0, target.at.1);
+                self.activate_surface(SURFACE_INSPECTOR);
+            }
         }
     }
 
@@ -2446,7 +2575,7 @@ impl Browser {
     fn update_cursor(&mut self, x: f64, y: f64) {
         self.cursor = if let Some(interface) = self.ui.cursor_at(x, y, &mut self.text) {
             interface
-        } else if y < UI_HEIGHT || self.ui.menu_open {
+        } else if y < UI_HEIGHT || self.ui.popup_open() {
             // Over the interface but over nothing in it.
             Cursor::Default
         } else if y >= self.dock_top() {
@@ -2958,7 +3087,7 @@ impl Painter for Browser {
         let dock_top = self.dock_top();
         let chrome_changed = previous_pointer.1 < UI_HEIGHT
             || y < UI_HEIGHT
-            || self.ui.menu_open
+            || self.ui.popup_open()
             || self.ui.pointer_captured();
         let inspector_changed =
             self.inspector.open && (previous_pointer.1 >= dock_top || y >= dock_top);
@@ -2997,6 +3126,19 @@ impl Painter for Browser {
             PlatformEvent::AppearanceChanged(scheme) => {
                 self.scheme = scheme;
                 self.apply_theme();
+            }
+
+            // A context menu hangs off a point in a window that has just
+            // stopped being that window: the page reflows under it and its rows
+            // go on describing what used to be there.
+            PlatformEvent::Resized(viewport) => {
+                if viewport.logical_width() != self.last_width
+                    || viewport.logical_height() != self.last_height
+                {
+                    self.ui.dismiss_context_menu();
+                    self.context_target = None;
+                }
+                self.set_viewport(viewport);
             }
 
             PlatformEvent::PointerMoved { x, y } => {
@@ -3065,7 +3207,7 @@ impl Painter for Browser {
             }
 
             PlatformEvent::PointerPressed { clicks } => {
-                let surface = if self.ui.menu_open || self.pointer.1 < UI_HEIGHT {
+                let surface = if self.ui.popup_open() || self.pointer.1 < UI_HEIGHT {
                     SURFACE_CHROME
                 } else if self.inspector.open && self.pointer.1 >= self.dock_top() {
                     SURFACE_INSPECTOR
@@ -3081,11 +3223,11 @@ impl Painter for Browser {
                 // press and returns before the toolbar's own press handler runs, so
                 // without this the caret and its selection would sit in a field the
                 // reader has plainly clicked away from.
-                if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
+                if self.pointer.1 >= UI_HEIGHT && !self.ui.popup_open() {
                     self.ui.blur();
                 }
                 // The panel owns everything below its own top edge.
-                if self.pointer.1 >= self.dock_top() && !self.ui.menu_open {
+                if self.pointer.1 >= self.dock_top() && !self.ui.popup_open() {
                     let action = self.inspector.pointer_pressed();
                     self.apply_inspector(action);
                     return;
@@ -3120,7 +3262,7 @@ impl Painter for Browser {
                 // The settings surface owns everything below the toolbar while it
                 // is showing, so a press there never reaches the document behind
                 // it — there is no document behind it.
-                if self.pointer.1 >= UI_HEIGHT && !self.ui.menu_open {
+                if self.pointer.1 >= UI_HEIGHT && !self.ui.popup_open() {
                     match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
                             let before = self.settings.settings.clone();
@@ -3225,6 +3367,8 @@ impl Painter for Browser {
                 let action = self.ui.pointer_pressed(&mut self.text, clicks);
                 self.apply(action);
             }
+
+            PlatformEvent::ContextMenuRequested => self.context_menu_requested(),
 
             PlatformEvent::PointerReleased => {
                 self.selecting = false;
@@ -3383,7 +3527,7 @@ impl Painter for Browser {
 
                 let global = key == Key::F5
                     || modifiers.is_accelerator()
-                    || (key == Key::Escape && self.ui.menu_open);
+                    || (key == Key::Escape && self.ui.popup_open());
                 if self.keyboard_surface == SURFACE_CHROME || global {
                     let action = self.ui.key_pressed(
                         key,
@@ -3455,7 +3599,7 @@ impl Painter for Browser {
                     // more of: a mouse with one wheel says `y` and a trackpad
                     // swiped sideways says `x`, and both mean the same thing to a
                     // strip that only runs one way.
-                    if self.pointer.1 < crate::ui::TAB_STRIP_HEIGHT && !self.ui.menu_open {
+                    if self.pointer.1 < crate::ui::TAB_STRIP_HEIGHT && !self.ui.popup_open() {
                         let delta = if x.abs() > y.abs() { x } else { y };
                         self.ui.scroll_tabs_by(delta);
                     }
@@ -3771,7 +3915,7 @@ impl Painter for Browser {
                 x: 0,
                 y: 0,
                 width: viewport.width,
-                height: if self.ui.menu_open {
+                height: if self.ui.popup_open() {
                     viewport.height
                 } else {
                     content_top
@@ -3965,7 +4109,7 @@ mod system_page_tests {
 
         // The cogwheel is the last control on the toolbar, at its right end.
         press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
-        assert!(browser.ui().menu_open, "the cogwheel opens the menu");
+        assert!(browser.ui().menu_open(), "the cogwheel opens the menu");
 
         // The panel hangs below the toolbar at the right-hand edge; its rows are
         // 30 tall under a heading, so this is the first of them.
@@ -3973,7 +4117,7 @@ mod system_page_tests {
         press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 34.0);
 
         assert!(
-            !browser.ui().menu_open,
+            !browser.ui().menu_open(),
             "choosing something closes the menu"
         );
         assert_eq!(
@@ -3992,7 +4136,7 @@ mod system_page_tests {
 
         // The second row is History, and since W8 it is a real page.
         press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 65.0);
-        assert!(!browser.ui().menu_open);
+        assert!(!browser.ui().menu_open());
         assert_eq!(browser.system_page(), Some(SystemPage::History));
     }
 
@@ -4004,7 +4148,7 @@ mod system_page_tests {
         frame(&mut browser, 1000.0, 700.0);
 
         press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 127.0);
-        assert!(!browser.ui().menu_open);
+        assert!(!browser.ui().menu_open());
         assert_eq!(browser.system_page(), Some(SystemPage::Downloads));
     }
 
@@ -4020,7 +4164,7 @@ mod system_page_tests {
         // sheet and only dismissed the menu. Every row on this menu is now a real
         // page, so what is worth checking is that this one opens.
         press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 96.0);
-        assert!(!browser.ui().menu_open);
+        assert!(!browser.ui().menu_open());
         assert_eq!(browser.system_page(), Some(SystemPage::Bookmarks));
     }
 
@@ -5016,6 +5160,197 @@ mod tests {
         assert_eq!(browser.tabs[0].url, "https://start.example/next");
     }
 
+    /// Ask for a menu where the pointer is, the way the platform does.
+    fn ask_for_a_menu(browser: &mut Browser, x: f64, y: f64) {
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::ContextMenuRequested);
+    }
+
+    /// What the open context menu offers, in the order it offers it.
+    fn context_rows(browser: &Browser) -> Vec<ContextCommand> {
+        browser
+            .ui()
+            .describe()
+            .into_iter()
+            .filter(|node| node.role == crate::widget::Role::MenuItem)
+            .filter_map(|node| {
+                [
+                    ContextCommand::OpenLinkInNewTab,
+                    ContextCommand::CopyLinkAddress,
+                    ContextCommand::CopySelection,
+                    ContextCommand::SelectAll,
+                    ContextCommand::Back,
+                    ContextCommand::Forward,
+                    ContextCommand::Reload,
+                    ContextCommand::InspectElement,
+                ]
+                .into_iter()
+                .find(|command| command.label() == node.label)
+            })
+            .collect()
+    }
+
+    /// A menu asked for over a link offers what can be done with a link, and
+    /// what it offers is decided from the document rather than guessed.
+    #[test]
+    fn a_menu_asked_for_over_a_link_offers_the_link() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        let (x, y) = link_position(&browser);
+        ask_for_a_menu(&mut browser, x, y);
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        let rows = context_rows(&browser);
+        assert_eq!(
+            rows.first(),
+            Some(&ContextCommand::OpenLinkInNewTab),
+            "the link is what the reader asked about, so it comes first"
+        );
+        assert!(rows.contains(&ContextCommand::CopyLinkAddress));
+        assert!(rows.contains(&ContextCommand::InspectElement));
+        assert!(
+            !rows.contains(&ContextCommand::CopySelection),
+            "nothing is selected, so there is nothing to copy"
+        );
+
+        // And choosing the first row opens the link the press landed on — in a
+        // tab of its own, with the one being read left where it was.
+        let before = browser.tabs.len();
+        let panel = browser
+            .ui()
+            .describe()
+            .into_iter()
+            .position(|node| node.label == ContextCommand::OpenLinkInNewTab.label())
+            .expect("the row that was just described");
+        let action = browser.ui.activate_described(panel, &mut browser.text);
+        browser.apply(action);
+        settle(&mut browser);
+
+        assert_eq!(browser.tabs.len(), before + 1);
+        assert_eq!(browser.tabs[before].url, "https://start.example/next");
+        assert_eq!(browser.tabs[0].url, "https://start.example/");
+        assert!(!browser.ui().popup_open(), "choosing a row closes the menu");
+    }
+
+    /// Away from a link the same menu is the page's own, and Back says whether
+    /// there is anywhere to go back to rather than pretending there is.
+    #[test]
+    fn a_menu_over_the_page_offers_what_the_page_can_do() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        ask_for_a_menu(&mut browser, 700.0, 500.0);
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        let rows = context_rows(&browser);
+        assert_eq!(
+            rows,
+            vec![
+                ContextCommand::Back,
+                ContextCommand::Forward,
+                ContextCommand::Reload,
+                ContextCommand::SelectAll,
+                ContextCommand::InspectElement,
+            ]
+        );
+        let back = browser
+            .ui()
+            .describe()
+            .into_iter()
+            .find(|node| node.label == ContextCommand::Back.label())
+            .expect("the back row");
+        assert!(
+            !back.enabled,
+            "there is nowhere to go back to, and a row that says otherwise is a lie"
+        );
+    }
+
+    /// A press for a menu never reaches the page behind it: it does not follow
+    /// the link it lands on, and it does not start a selection.
+    #[test]
+    fn asking_for_a_menu_over_a_link_does_not_follow_it() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        let (x, y) = link_position(&browser);
+        ask_for_a_menu(&mut browser, x, y);
+        settle(&mut browser);
+
+        assert_eq!(browser.tabs[0].url, "https://start.example/");
+        assert!(browser.ui().popup_open());
+    }
+
+    /// The document the menu was asked about is gone, and so are its rows.
+    #[test]
+    fn navigating_puts_away_a_menu_asked_for_on_the_page() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+        ask_for_a_menu(&mut browser, 700.0, 500.0);
+        assert!(browser.ui().popup_open());
+
+        browser.navigate("start.example/elsewhere");
+        assert!(
+            !browser.ui().popup_open(),
+            "the menu outlived the page it described"
+        );
+        settle(&mut browser);
+    }
+
+    /// So is a menu whose window has just been resized under it.
+    #[test]
+    fn resizing_puts_away_a_menu_asked_for_on_the_page() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+        ask_for_a_menu(&mut browser, 700.0, 500.0);
+        assert!(browser.ui().popup_open());
+
+        browser.on_event(PlatformEvent::Resized(Viewport::new(640, 480, 1.0)));
+        assert!(!browser.ui().popup_open());
+    }
+
+    /// A menu asked for over the interface is not the page's menu: the browser
+    /// has its own, and offering "Inspect Element" over the toolbar would be
+    /// offering to inspect something the press did not land on.
+    #[test]
+    fn asking_for_a_menu_over_the_toolbar_offers_nothing() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(800, 600, 1.0),
+        );
+
+        ask_for_a_menu(&mut browser, 400.0, UI_HEIGHT - 20.0);
+        assert!(!browser.ui().popup_open());
+    }
+
     #[test]
     fn the_cursor_is_ordinary_away_from_a_link() {
         let mut browser = Browser::new(LinkLoader);
@@ -5125,7 +5460,7 @@ mod tests {
         let mut painter = otlyra_gfx::RecordingPainter::new();
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
-        browser.ui.menu_open = true;
+        browser.ui.open_menu();
         browser.on_event(PlatformEvent::PointerMoved {
             x: 700.0,
             y: UI_HEIGHT + 40.0,
@@ -5145,7 +5480,7 @@ mod tests {
             "and started selecting behind it"
         );
         assert!(
-            !browser.ui.menu_open,
+            !browser.ui.menu_open(),
             "the interface got the press, and a press outside an open menu \
              closes it"
         );
@@ -6844,7 +7179,7 @@ mod tests {
             y: UI_HEIGHT - 21.0,
         });
         browser.handle_event(PlatformEvent::PointerPressed { clicks: 1 });
-        assert!(browser.ui.menu_open, "the cogwheel opened the menu");
+        assert!(browser.ui.menu_open(), "the cogwheel opened the menu");
 
         let open = browser.compose(viewport).expect("the interface composes");
         let open_chrome = open

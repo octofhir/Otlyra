@@ -321,6 +321,47 @@ fn the_browser_menu_is_visible_below_the_composited_toolbar() {
     );
 }
 
+/// The menu the reader asks for is drawn over the page in the *window*, not
+/// only in a whole-surface paint: it hangs below the chrome band, which is the
+/// one thing a compositor that clips chrome at the toolbar would swallow.
+#[test]
+fn a_menu_asked_for_over_the_page_is_composited_over_it() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut browser = Browser::new(Pages);
+    browser.navigate("https://form.example/");
+    browser.wait_for_load(std::time::Duration::from_secs(5));
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+
+    let mut pump = FramePump::new(viewport);
+    pump.open(&mut browser).expect("the first frame");
+    let before = pump.png().expect("the window before");
+
+    let (x, y) = (300.0, UI_HEIGHT + 200.0);
+    pump.event(&mut browser, PlatformEvent::PointerMoved { x, y });
+    pump.event(&mut browser, PlatformEvent::ContextMenuRequested);
+    pump.frame(&mut browser).expect("the open-menu frame");
+    let after = pump.png().expect("the window with the menu");
+
+    let (width, before) = decode(&before);
+    let (_, after) = decode(&after);
+    let panel = (x as u32, y as u32, 200, 120);
+    assert_ne!(
+        region(&before, width, panel),
+        region(&after, width, panel),
+        "the menu was asked for and the window never showed it"
+    );
+
+    // And what the window composited is what a whole-surface paint draws, so
+    // the popup is one picture rather than two that agree by luck.
+    let painted =
+        otlyra_platform::render_offscreen(&mut browser, viewport).expect("the whole-surface menu");
+    let (_, painted) = decode(&painted);
+    assert_eq!(
+        after, painted,
+        "the retained compositor and whole-surface path disagree on the context menu"
+    );
+}
+
 #[test]
 fn typing_in_a_page_field_damages_only_the_field() {
     let viewport = Viewport::new(900, 640, 1.0);
