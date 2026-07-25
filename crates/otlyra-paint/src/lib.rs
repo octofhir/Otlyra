@@ -118,6 +118,48 @@ fn paint_scrollbar(list: &mut DisplayList, area: Rect, content_height: f32, scro
 /// over it rather than through it.
 const SELECTION: Color = Color::from_rgb8(0xB4, 0xD5, 0xFE);
 
+/// The colour every place a search found is washed in.
+///
+/// Yellow rather than the selection's blue, because the two mean different
+/// things and a reader who has both on the page has to be able to tell which is
+/// which. Pale, because there may be a hundred of them and a page of bright
+/// blocks is a page nobody can read.
+const MATCH: Color = Color::from_rgb8(0xFD, 0xE8, 0x8B);
+
+/// And the colour the one the reader is on is washed in.
+///
+/// The same hue carried further, rather than a different one: it is the same
+/// kind of thing as the others and has to be found among them at a glance, which
+/// a stronger version of them is and a fourth colour is not.
+const CURRENT_MATCH: Color = Color::from_rgb8(0xFF, 0x9C, 0x30);
+
+/// Why a rectangle behind the text is washed.
+///
+/// Which rectangle means what is a question about the page, so the caller
+/// answers it; what each of them looks like is a question about the picture, so
+/// this crate answers that. Drawn in the order they are given, so a caller that
+/// puts two washes over one word decides which of them is seen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Highlight {
+    /// What the reader has selected.
+    Selection,
+    /// One of the places a search found.
+    Match,
+    /// The one of those the reader is on.
+    CurrentMatch,
+}
+
+impl Highlight {
+    /// The colour it is washed in, for whoever has to check that it was.
+    pub fn colour(self) -> Color {
+        match self {
+            Self::Selection => SELECTION,
+            Self::Match => MATCH,
+            Self::CurrentMatch => CURRENT_MATCH,
+        }
+    }
+}
+
 /// A box that draws its contents as a group: composited once, moved as one, or
 /// both.
 struct Group<'a> {
@@ -218,12 +260,15 @@ pub struct Frame<'a> {
     /// Whether scrollbars are drawn. Off for a picture that is going to be compared
     /// with one from elsewhere: a scrollbar is the browser's, not the page's.
     pub scrollbars: bool,
-    /// What the reader has selected, in page coordinates.
+    /// What is washed behind the text, in page coordinates, and why.
     ///
-    /// Drawn behind the text rather than over it, which is what makes the letters
-    /// still readable: a highlight over them would tint them, and inverting them
-    /// instead is a different tradition that this platform is not in.
-    pub selection: &'a [Rect],
+    /// Behind the text rather than over it, which is what makes the letters still
+    /// readable: a highlight over them would tint them, and inverting them
+    /// instead is a different tradition that this platform is not in. One layer
+    /// for the selection and for a search's matches rather than an overlay each,
+    /// because they are the same picture — a colour under a run of letters — and
+    /// two of them would be two answers about which is on top.
+    pub highlights: &'a [(Rect, Highlight)],
     /// Where the caret is, in page coordinates, if the page has one.
     ///
     /// Over everything rather than under it, unlike the selection: a caret sits
@@ -239,7 +284,7 @@ impl Default for Frame<'_> {
             port_offset: None,
             background: None,
             scrollbars: true,
-            selection: &[],
+            highlights: &[],
             caret: None,
         }
     }
@@ -373,7 +418,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         // The highlight goes under the run it covers, so the letters are drawn over
         // it rather than through it.
         if matches!(fragment.kind, FragmentKind::Text(_)) {
-            for rect in frame.selection {
+            for (rect, highlight) in frame.highlights {
                 let covered = rect.intersection(&fragment.rect);
                 if covered.width <= 0.0 || covered.height <= 0.0 {
                     continue;
@@ -391,7 +436,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
                     transform: Affine::IDENTITY,
-                    brush: Brush::Solid(SELECTION),
+                    brush: Brush::Solid(highlight.colour()),
                     brush_transform: None,
                     shape: KurboRect::new(
                         f64::from(moved.x),
@@ -1750,12 +1795,16 @@ mod tests {
             },
         );
         assert!(!highlight.is_empty(), "something is selected");
+        let highlight: Vec<_> = highlight
+            .into_iter()
+            .map(|rect| (rect, Highlight::Selection))
+            .collect();
 
         let list = build_display_list_with(
             &fragments,
             &Frame {
                 viewport: (800.0, 600.0),
-                selection: &highlight,
+                highlights: &highlight,
                 ..Frame::default()
             },
         );

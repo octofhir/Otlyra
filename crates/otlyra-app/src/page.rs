@@ -279,6 +279,12 @@ struct Painted {
     pictures: usize,
     ports: Vec<(BoxId, f32)>,
     selection: Option<otlyra_layout::Selection>,
+    /// How many places the search found and which of them is the current one.
+    ///
+    /// Both are drawn, and neither is the rectangles themselves: comparing a
+    /// hundred matches against a hundred matches every frame to find out that an
+    /// idle page is still idle is not worth the two numbers it would prove.
+    find: Option<(usize, usize)>,
     /// The field the caret is in and how far into it.
     ///
     /// Moving the caret changes nothing else about the page — no style, no
@@ -307,6 +313,7 @@ impl Painted {
             && self.pictures == other.pictures
             && self.ports == other.ports
             && self.selection == other.selection
+            && self.find == other.find
     }
 
     /// The fields a caret or a field selection names, in either frame.
@@ -525,6 +532,10 @@ impl PageScene {
             pictures: self.background_pictures.len(),
             ports,
             selection: self.selection,
+            find: self
+                .find
+                .as_ref()
+                .map(|found| (found.at.len(), found.current)),
             caret: self.focused_field().map(|node| (node, self.caret)),
             caret_shown: self.caret_blinks() && self.caret_showing(),
             field_selection: self.field_selection(),
@@ -557,6 +568,13 @@ impl PageScene {
         let pictures = self.background_pictures.clone();
         let scrollbars = self.scrollbars;
         let selected = self.selection;
+        // The search's answers, taken before the layout is borrowed for the same
+        // reason the selection is. Cloned only while a search is on, and a build
+        // only happens when something changed.
+        let searched = self
+            .find
+            .as_ref()
+            .map(|found| (found.at.clone(), found.current));
         // What the caret is *of*, taken before the layout is borrowed: where it
         // lands needs the fragments, and what it belongs to needs the document.
         let caret_of = self.caret_source();
@@ -570,15 +588,35 @@ impl PageScene {
         let caret = showing
             .then(|| caret_of.and_then(|source| source.rect(fragments)))
             .flatten();
-        let mut highlight = selected
+        // What is washed behind the text, in the order it is drawn: the selection,
+        // then every place the search found, then the one the reader is on. Last
+        // wins where two of them cover a word, and the one the reader was just
+        // taken to is the one they are looking for.
+        let mut highlight: Vec<(otlyra_layout::Rect, otlyra_paint::Highlight)> = selected
             .map(|selection| otlyra_layout::selection::rects(fragments, selection))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|rect| (rect, otlyra_paint::Highlight::Selection))
+            .collect();
         // A field's own selection, which is counted in what the control holds and
         // so cannot be one of the page's.
         if let Some((box_id, from, to)) = in_field
             && let Some(rect) = otlyra_layout::selection::range_in(fragments, box_id, from, to)
         {
-            highlight.push(rect);
+            highlight.push((rect, otlyra_paint::Highlight::Selection));
+        }
+        if let Some((at, current)) = &searched {
+            for (index, rects) in otlyra_layout::selection::rects_all(fragments, at)
+                .into_iter()
+                .enumerate()
+            {
+                let wash = if index == *current {
+                    otlyra_paint::Highlight::CurrentMatch
+                } else {
+                    otlyra_paint::Highlight::Match
+                };
+                highlight.extend(rects.into_iter().map(|rect| (rect, wash)));
+            }
         }
         let mut list = otlyra_paint::build_display_list_with(
             fragments,
@@ -588,7 +626,7 @@ impl PageScene {
                 port_offset: Some(&|id| ports.get(&id).copied().unwrap_or(0.0)),
                 background: Some(&|url: &str| pictures.get(url).cloned()),
                 scrollbars,
-                selection: &highlight,
+                highlights: &highlight,
                 caret,
             },
         );
@@ -2889,6 +2927,10 @@ impl PageScene {
             self.find = Some(found);
             self.damage.add(Damage::PAINT);
         }
+        // Every search brings the reader to what it found, including one that
+        // found what the last one did: asking again after scrolling away means
+        // *take me back to it*.
+        self.reveal_current_match();
         count
     }
 
@@ -2926,6 +2968,8 @@ impl PageScene {
         }
         found.current = current;
         self.damage.add(Damage::PAINT);
+        // Stepping to a match that stays off screen is not stepping to it.
+        self.reveal_current_match();
         true
     }
 
@@ -3196,6 +3240,65 @@ impl PageScene {
         }
 
         self.scroll_by(delta);
+    }
+
+    /// Scroll the page until `rect` is on screen, and answer whether it moved.
+    ///
+    /// The least that will do it, which is what every *scroll into view* means: a
+    /// rectangle already in sight is left where it is, one above the top is
+    /// brought to the top and one below the bottom to the bottom, each with a
+    /// margin so that it does not end up against the edge with nothing around it.
+    /// A rectangle taller than the window is aligned at its top, because the top
+    /// of a thing is where reading it starts.
+    ///
+    /// The page's own scroll and no more. A rectangle inside a box that scrolls
+    /// is brought as far into view as moving the page can bring it, and the box
+    /// itself is not scrolled — which needs the rectangle in the box's own
+    /// coordinates rather than the page's, and is not what this knows.
+    pub fn scroll_to_rect(&mut self, rect: otlyra_layout::Rect) -> bool {
+        /// How much room is left around what is scrolled to.
+        const MARGIN: f32 = 24.0;
+
+        let height = self.viewport_height;
+        if height <= 0.0 {
+            return false;
+        }
+        let top = rect.y - MARGIN;
+        let bottom = rect.bottom() + MARGIN;
+        let wanted = if top < self.scroll {
+            top
+        } else if bottom > self.scroll + height {
+            if bottom - top > height {
+                top
+            } else {
+                bottom - height
+            }
+        } else {
+            return false;
+        };
+
+        let content = self
+            .layout
+            .as_ref()
+            .map_or(0.0, |(_, tree)| tree.content_height());
+        let scroll = wanted.clamp(0.0, (content - height).max(0.0));
+        if (scroll - self.scroll).abs() < f32::EPSILON {
+            return false;
+        }
+        self.scroll = scroll;
+        self.damage.add(Damage::PAINT);
+        true
+    }
+
+    /// Bring the current match on screen, and answer whether the page moved.
+    ///
+    /// The whole match rather than its first line: a phrase found across a line
+    /// break is one thing to read, and reaching half of it is not reaching it.
+    pub fn reveal_current_match(&mut self) -> bool {
+        let Some(bounds) = self.current_match_rects().into_iter().reduce(union) else {
+            return false;
+        };
+        self.scroll_to_rect(bounds)
     }
 
     /// Scroll the page by `delta` logical pixels, clamped to the content.
@@ -5153,6 +5256,125 @@ mod tests {
         let (mut page, _text) = scene("<body><p>one two three</p>");
         assert_eq!(page.find("two"), 0);
         assert!(page.match_rects().is_empty());
+    }
+
+    /// Every match is washed and the one the reader is on is washed differently,
+    /// through the layer the selection is drawn in rather than an overlay of its
+    /// own.
+    #[test]
+    fn a_search_washes_every_match_and_the_current_one_more_strongly() {
+        let (mut page, mut text) = scene("<body><p>two one two one two</p>");
+        page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+        assert_eq!(page.find("two"), 3);
+
+        let washes = |page: &mut PageScene, text: &mut TextEngine| {
+            let list = page.build_display_list(text, 800.0, 600.0, 0.0);
+            let count = |wash: otlyra_paint::Highlight| {
+                list.items()
+                    .iter()
+                    .filter(|item| {
+                        matches!(item, DisplayItem::Fill {
+                            brush: otlyra_gfx::peniko::Brush::Solid(colour), ..
+                        } if *colour == wash.colour())
+                    })
+                    .count()
+            };
+            (
+                count(otlyra_paint::Highlight::Match),
+                count(otlyra_paint::Highlight::CurrentMatch),
+            )
+        };
+
+        assert_eq!(
+            washes(&mut page, &mut text),
+            (2, 1),
+            "three matches: two washed and the one the reader is on drawn strongly"
+        );
+
+        assert!(page.step_match(true));
+        assert_eq!(
+            washes(&mut page, &mut text),
+            (2, 1),
+            "stepping moves which one is strong without changing how many there are"
+        );
+
+        page.clear_find();
+        assert_eq!(
+            washes(&mut page, &mut text),
+            (0, 0),
+            "and closing the search takes every wash off the page"
+        );
+    }
+
+    /// Reaching a match is scrolling the page to it — and a match already in
+    /// sight is left where it is.
+    #[test]
+    fn stepping_to_a_match_brings_it_on_screen() {
+        let filler = "<p>filler</p>".repeat(80);
+        let (mut page, mut text) = scene(&format!("<body><p>needle</p>{filler}<p>needle</p>"));
+        page.build_display_list(&mut text, 800.0, 400.0, 0.0);
+
+        assert_eq!(page.find("needle"), 2);
+        assert_eq!(
+            page.scroll(),
+            0.0,
+            "the first is at the top, and reaching it moves nothing"
+        );
+
+        assert!(page.step_match(true));
+        assert!(
+            page.scroll() > 0.0,
+            "the second is past the bottom of the window"
+        );
+        let rects = page.current_match_rects();
+        let at = rects.first().expect("the match has a rectangle");
+        assert!(
+            at.y >= page.scroll() && at.bottom() <= page.scroll() + 400.0,
+            "and it is on screen once it has been stepped to: {at:?} at {}",
+            page.scroll()
+        );
+
+        assert!(page.step_match(false));
+        assert_eq!(page.scroll(), 0.0, "and back round to the first one");
+    }
+
+    /// Scrolling something into view moves the page the least that will do it,
+    /// and does not move it at all for something already in sight.
+    #[test]
+    fn scrolling_into_view_moves_the_page_the_least_that_will_do_it() {
+        let filler = "<p>filler</p>".repeat(80);
+        let (mut page, mut text) = scene(&format!("<body>{filler}"));
+        page.build_display_list(&mut text, 800.0, 400.0, 0.0);
+
+        assert!(
+            !page.scroll_to_rect(otlyra_layout::Rect::new(0.0, 100.0, 50.0, 20.0)),
+            "already in sight"
+        );
+        assert_eq!(page.scroll(), 0.0);
+
+        assert!(page.scroll_to_rect(otlyra_layout::Rect::new(0.0, 900.0, 50.0, 20.0)));
+        let below = page.scroll();
+        assert!(
+            below > 0.0 && below < 900.0,
+            "brought to the bottom of the window rather than to the top: {below}"
+        );
+
+        assert!(page.scroll_to_rect(otlyra_layout::Rect::new(0.0, 100.0, 50.0, 20.0)));
+        assert!(
+            page.scroll() < 100.0,
+            "and something above the top is brought to the top: {}",
+            page.scroll()
+        );
+
+        // Taller than the window: its top, because that is where reading it
+        // starts and no scroll can show all of it.
+        page.set_scroll(0.0);
+        assert!(page.scroll_to_rect(otlyra_layout::Rect::new(0.0, 600.0, 50.0, 900.0)));
+        assert!(
+            page.scroll() <= 600.0 && page.scroll() > 500.0,
+            "aligned at its top: {}",
+            page.scroll()
+        );
     }
 
     /// Searching asks for a frame, because the highlight is drawn in one.

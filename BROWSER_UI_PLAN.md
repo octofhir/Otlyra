@@ -140,17 +140,14 @@ the popup, focus-scope and traversal contracts this priority already built.
 The engine is in: `otlyra_layout::find` strings the runs into one sequence with
 each character carrying the run and bytes it came from, and answers in
 `Selection`s, so a match is drawn by the arithmetic that is already right about
-ligatures, line breaks and bidi runs. `PageScene::find/step_match/match_rects`
-hold the search per page and run it again on every relayout. Nothing paints it
-yet. What is left:
+ligatures, line breaks and bidi runs. `PageScene` holds the search per page and
+runs it again on every relayout. The matches are painted: one highlight layer
+carrying `otlyra_paint::Highlight` per rectangle, every match washed and the one
+the reader is on drawn strongly over it. `PageScene::scroll_to_rect` moves the
+page the least that will bring a rectangle on screen, and stepping to a match
+uses it — the inspector's reveal wants the same call, and a box that scrolls
+still scrolls for nobody. What is left:
 
-- [ ] **Highlights and reaching them.** Every match washed, the current one
-  drawn strongly, painted through the existing highlight layer rather than a
-  second overlay. `otlyra_paint::Frame::selection` is one slice of rectangles in
-  one colour today, so it needs a second strength rather than a second overlay.
-  Bringing the current match on screen closes a stated gap — nothing scrolls
-  into view today — so it is `scroll_to_rect` on the page, which the inspector's
-  reveal wants as well.
 - [ ] **The bar.** A panel on the popup contract: its own text field, the count
   as *3 of 17*, previous/next, and a close cross. ⌘F opens and focuses it, Enter
   and shift-Enter step, Escape closes it and drops the highlights, ⌘G steps
