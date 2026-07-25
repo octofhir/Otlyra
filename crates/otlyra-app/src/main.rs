@@ -649,6 +649,9 @@ fn window_config(cli: &Cli) -> WindowConfig {
 /// Every headless mode keeps the in-memory default.
 fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppError> {
     browser.set_clipboard(Box::new(otlyra_app::clipboard::System::new()));
+    // And the bookmarks the last run kept, for the same reason: a window means a
+    // person, and what they chose to keep outlives the process.
+    browser.persist_bookmarks();
     run_window(window_config(cli), browser)
 }
 

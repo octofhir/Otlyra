@@ -165,6 +165,7 @@ fn fixed_settings() -> Settings {
 fn toolbar() -> (BrowserUi, Vec<TabLabel>, TextEngine) {
     let mut ui = BrowserUi::new();
     ui.address.set_text("https://example.com/some/path");
+    ui.bookmark = otlyra_app::ui::Bookmarked::No;
     let tabs = tabs(&[
         ("CSS support — Otlyra", false),
         ("A title long enough that it has to be cut short", true),
@@ -189,6 +190,39 @@ fn the_toolbar_outline_is_stable() {
     let (mut ui, tabs, mut text) = toolbar();
     let list = toolbar_list(&mut ui, &tabs, &mut text, Some(1.2));
     insta::assert_snapshot!(outline(&list));
+}
+
+/// The star says whether this page is kept, and it says it in a way that survives
+/// being looked at rather than read: hollow is a stroke, kept is a filled accent.
+/// Without this the two states could converge and every golden would still pass.
+#[test]
+fn the_bookmark_star_is_hollow_until_the_page_is_kept() {
+    let (mut ui, tabs, mut text) = toolbar();
+    let accent = hex(&BrowserUi::new().theme.accent);
+    // Counted rather than searched for: the accent is also the colour of an active
+    // tab's dot, so *whether* it appears says nothing. One more of it does.
+    let accents = |outline: &str| {
+        outline
+            .lines()
+            .filter(|line| line.starts_with(&format!("fill {accent}")))
+            .count()
+    };
+
+    ui.bookmark = otlyra_app::ui::Bookmarked::No;
+    let hollow = outline(&toolbar_list(&mut ui, &tabs, &mut text, None));
+    ui.bookmark = otlyra_app::ui::Bookmarked::Yes;
+    let kept = outline(&toolbar_list(&mut ui, &tabs, &mut text, None));
+
+    assert_eq!(
+        accents(&kept),
+        accents(&hollow) + 1,
+        "keeping the page must fill exactly one more shape in the accent\n\
+         hollow:\n{hollow}\nkept:\n{kept}"
+    );
+    assert!(
+        hollow.lines().count() == kept.lines().count(),
+        "the two stars must be one item each, not one and two"
+    );
 }
 
 #[test]
@@ -230,6 +264,26 @@ fn the_about_page_outline_is_stable() {
     let mut list = DisplayList::new();
     surface.build_display_list(
         Rect::new(0.0, UI_HEIGHT, 900.0, 700.0 - UI_HEIGHT),
+        &mut text,
+        &mut list,
+    );
+    insta::assert_snapshot!(outline(&list));
+}
+
+#[test]
+fn the_bookmarks_page_outline_is_stable() {
+    let mut store = otlyra_app::bookmarks::BookmarkStore::default();
+    store.add("https://example.com/", "Example Domain");
+    store.add(
+        "https://doc.rust-lang.org/stable/std/index.html?search=long+enough+to+be+cut",
+        "Rust standard library",
+    );
+    let mut surface = otlyra_app::bookmarks::BookmarksSurface::new();
+    let mut text = TextEngine::isolated();
+    let mut list = DisplayList::new();
+    surface.build_display_list(
+        Rect::new(0.0, UI_HEIGHT, 900.0, 700.0 - UI_HEIGHT),
+        &store,
         &mut text,
         &mut list,
     );

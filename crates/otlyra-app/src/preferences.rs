@@ -26,6 +26,16 @@ const FOLDER: &str = "Otlyra";
 /// And the file inside that.
 const FILE: &str = "preferences.toml";
 
+/// The directory the browser keeps its own files in, if the platform will say.
+///
+/// Derived from the preferences' path rather than worked out a second time, so the
+/// `OTLYRA_CONFIG_DIR` override covers everything the browser saves — a test that
+/// redirected the preferences and not the bookmarks would still be writing into the
+/// developer's home directory.
+pub fn directory() -> Option<PathBuf> {
+    path()?.parent().map(std::path::Path::to_path_buf)
+}
+
 /// Where the preferences live, if the platform will say.
 pub fn path() -> Option<PathBuf> {
     // An escape hatch, and the reason it exists is worth stating: without it a

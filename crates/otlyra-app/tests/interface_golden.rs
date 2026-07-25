@@ -54,6 +54,9 @@ impl InterfaceFrame {
     fn new() -> Self {
         let mut ui = BrowserUi::new();
         ui.address.set_text("https://example.com/some/path");
+        // A toolbar showing an address is a toolbar on a page, so the star is the
+        // ordinary hollow-and-pressable one rather than the dimmed blank-tab star.
+        ui.bookmark = otlyra_app::ui::Bookmarked::No;
         Self {
             ui,
             tabs: tabs(&[

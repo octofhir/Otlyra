@@ -331,6 +331,20 @@ pub fn clock(list: &mut DisplayList, rect: Rect, color: Color) {
 
 /// A star: a page kept on purpose.
 pub fn star(list: &mut DisplayList, rect: Rect, color: Color) {
+    fill(list, star_path(rect), color);
+}
+
+/// The same star, drawn as an outline: a page nobody has kept.
+///
+/// The pair is the whole of how a toolbar says *kept* or *not kept* without a
+/// word: filled is kept, hollow is not, which is what every browser's star means
+/// and therefore needs no explaining.
+pub fn star_hollow(list: &mut DisplayList, rect: Rect, color: Color) {
+    stroke(list, star_path(rect), color, 1.5);
+}
+
+/// Five points, standing on two legs rather than balancing on one.
+fn star_path(rect: Rect) -> BezPath {
     let (centre, reach) = centre(rect, 0.42);
     let mut path = BezPath::new();
     for point in 0..10 {
@@ -349,7 +363,7 @@ pub fn star(list: &mut DisplayList, rect: Rect, color: Color) {
         }
     }
     path.close_path();
-    fill(list, path, color);
+    path
 }
 
 /// An arrow into a tray: what was fetched to disk.

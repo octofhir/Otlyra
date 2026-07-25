@@ -722,6 +722,7 @@ impl<A> Widget<A> for TextInput<A> {
             cx,
             &content,
             available,
+            cx.theme.font_size,
             if self.view.caret.is_some() && !placeholder {
                 Elide::Start
             } else {
@@ -1225,7 +1226,7 @@ impl<A> Widget<A> for Elided {
     }
 
     fn draw(&mut self, cx: &mut Cx, list: &mut DisplayList) {
-        let shown = elide(cx, &self.text, self.rect.width, self.end);
+        let shown = elide(cx, &self.text, self.rect.width, self.size, self.end);
         let mut label = Label::new(shown, self.size, self.ink);
         Widget::<A>::place(&mut label, self.rect, cx);
         Widget::<A>::draw(&mut label, cx, list);
@@ -1249,8 +1250,13 @@ pub enum Elide {
 /// Binary search over character boundaries, measuring with the engine that will
 /// draw the result. Counting characters would be wrong the moment the text is
 /// not monospaced, which is always.
-pub fn elide(cx: &mut Cx, content: &str, available: f64, end: Elide) -> String {
-    let size = cx.theme.font_size;
+///
+/// `size` is the size the text will be *drawn* at, and it is a parameter because it
+/// used to be the theme's body size no matter what the caller drew: a URL under a
+/// title is drawn small, so it was measured two points too large and cut short with
+/// room to spare. Every list of addresses in the browser was losing characters it
+/// had space for.
+pub fn elide(cx: &mut Cx, content: &str, available: f64, size: f32, end: Elide) -> String {
     if available <= 0.0 {
         return String::new();
     }
@@ -1351,16 +1357,44 @@ mod tests {
     fn eliding_keeps_what_fits_and_says_that_it_cut() {
         let mut text = TextEngine::new();
         let mut cx = Cx::new(&mut text);
+        let size = cx.theme.font_size;
         let long = "a title far too long for the space it has been given";
 
-        let cut = elide(&mut cx, long, 60.0, Elide::End);
+        let cut = elide(&mut cx, long, 60.0, size, Elide::End);
         assert!(cut.ends_with(ELLIPSIS), "{cut:?} should say it was cut");
-        assert!(cx.measure_text(&cut, cx.theme.font_size) <= 60.0);
+        assert!(cx.measure_text(&cut, size) <= 60.0);
 
-        let front = elide(&mut cx, long, 60.0, Elide::Start);
+        let front = elide(&mut cx, long, 60.0, size, Elide::Start);
         assert!(front.starts_with(ELLIPSIS));
 
         // What fits is returned whole, with nothing added.
-        assert_eq!(elide(&mut cx, "short", 500.0, Elide::End), "short");
+        assert_eq!(elide(&mut cx, "short", 500.0, size, Elide::End), "short");
+    }
+
+    /// The size text is measured at is the size it is drawn at. It used to be the
+    /// theme's body size whatever the caller asked for, so small text — a URL under
+    /// a title, everywhere in this browser — was cut with room left over.
+    #[test]
+    fn eliding_measures_at_the_size_the_text_is_drawn_at() {
+        let mut text = TextEngine::new();
+        let mut cx = Cx::new(&mut text);
+        let small = cx.theme.font_size_small;
+        let body = cx.theme.font_size;
+        let address = "https://example.com/";
+
+        // Room for it at the small size, and not at the body size: the two answers
+        // must differ, or this test would pass without measuring anything.
+        let room = cx.measure_text(address, small) + 1.0;
+        assert!(cx.measure_text(address, body) > room);
+
+        assert_eq!(
+            elide(&mut cx, address, room, small, Elide::End),
+            address,
+            "small text that fits must be left alone"
+        );
+        assert!(
+            elide(&mut cx, address, room, body, Elide::End).ends_with(ELLIPSIS),
+            "and the same room at body size is not enough"
+        );
     }
 }

@@ -40,6 +40,10 @@ pub enum Command {
     ShowHistory,
     /// Open completed downloads.
     ShowDownloads,
+    /// Keep the page the reader is on, or stop keeping it.
+    ToggleBookmark,
+    /// Open what the reader kept.
+    ShowBookmarks,
     /// Increase the page zoom.
     ZoomIn,
     /// Decrease the page zoom.
@@ -68,6 +72,8 @@ impl Command {
         Self::Settings,
         Self::ShowHistory,
         Self::ShowDownloads,
+        Self::ToggleBookmark,
+        Self::ShowBookmarks,
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ActualSize,
@@ -112,6 +118,8 @@ impl Command {
                 | Self::Settings
                 | Self::ShowHistory
                 | Self::ShowDownloads
+                | Self::ToggleBookmark
+                | Self::ShowBookmarks
                 | Self::ToggleDevTools
         )
     }
@@ -196,6 +204,28 @@ pub fn menu_bar() -> MenuBar {
                     Command::ShowDownloads,
                     "Show Downloads",
                     Some("CmdOrCtrl+Shift+KeyJ"),
+                ),
+            ],
+        ))
+        // Between History and Develop, where every browser puts it.
+        .with(Menu::new(
+            "Bookmarks",
+            vec![
+                // One item for both directions. The label says what pressing it on
+                // a page nobody kept does, which is the common case; the item
+                // cannot yet be relabelled while the browser runs, because the
+                // native bar is built once at startup. The browser's own menu is
+                // rebuilt every frame and says which of the two it will do.
+                entry(
+                    Command::ToggleBookmark,
+                    "Bookmark This Page",
+                    Some("CmdOrCtrl+KeyD"),
+                ),
+                MenuEntry::Separator,
+                entry(
+                    Command::ShowBookmarks,
+                    "Show Bookmarks",
+                    Some("CmdOrCtrl+Alt+KeyB"),
                 ),
             ],
         ))
@@ -292,7 +322,14 @@ mod tests {
         assert_eq!(
             titles,
             [
-                "Otlyra", "File", "Edit", "View", "History", "Develop", "Window"
+                "Otlyra",
+                "File",
+                "Edit",
+                "View",
+                "History",
+                "Bookmarks",
+                "Develop",
+                "Window"
             ]
         );
     }

@@ -383,6 +383,10 @@ pub struct Browser {
     downloads_writer: crate::downloads::DownloadWriter,
     /// The surface that shows them.
     downloads_page: DownloadsSurface,
+    /// What the reader kept, which outlives every tab and every run.
+    bookmarks: crate::bookmarks::BookmarkStore,
+    /// The surface that shows them.
+    bookmarks_page: crate::bookmarks::BookmarksSurface,
     /// What the platform last said the environment is. What *System* follows.
     scheme: otlyra_platform::ColorScheme,
     /// The palette every surface is currently drawn from.
@@ -497,6 +501,10 @@ impl Browser {
             downloads: crate::downloads::DownloadStore::default(),
             downloads_writer: crate::downloads::DownloadWriter::new(),
             downloads_page: DownloadsSurface::new(),
+            // In memory, and nothing on disk until a shell asks for it: see
+            // `persist_bookmarks`.
+            bookmarks: crate::bookmarks::BookmarkStore::default(),
+            bookmarks_page: crate::bookmarks::BookmarksSurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
             accessibility_dirty: true,
@@ -522,6 +530,7 @@ impl Browser {
         self.inspector.set_theme(theme.clone());
         self.history_page.set_theme(theme.clone());
         self.downloads_page.set_theme(theme.clone());
+        self.bookmarks_page.set_theme(theme.clone());
         self.about.set_theme(theme);
     }
 
@@ -740,6 +749,7 @@ impl Browser {
             self.settings.blur();
             self.history_page.blur();
             self.downloads_page.blur();
+            self.bookmarks_page.blur();
             self.about.blur();
         }
         self.keyboard_surface = surface;
@@ -1087,7 +1097,11 @@ impl Browser {
             picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
         });
-        self.ui.address.set_text(url);
+        // Through `sync_address` rather than straight into the field: the address
+        // and whether this page is one the reader kept are two things the toolbar
+        // draws from the same fact, and setting one without the other is how the
+        // star ends up describing the page before this one.
+        self.sync_address();
     }
 
     /// Scroll the page by whatever a key means, if it means one.
@@ -1632,7 +1646,7 @@ impl Browser {
             page.hide_scrollbars();
         }
         if index == self.active {
-            self.ui.address.set_text(&final_url);
+            self.sync_address();
         }
 
         let Some(pending) = self.tabs[index].pending.as_mut() else {
@@ -1918,6 +1932,16 @@ impl Browser {
     /// Put the active tab's URL back in the address bar.
     fn sync_address(&mut self) {
         let url = self.tabs[self.active].url.clone();
+        // Whether this page is kept is a property of the address, so it is answered
+        // wherever the address is: one place, and neither the star nor the menu can
+        // end up offering to keep a page that is already kept.
+        self.ui.bookmark = if url.trim().is_empty() {
+            crate::ui::Bookmarked::Impossible
+        } else if self.bookmarks.contains(&url) {
+            crate::ui::Bookmarked::Yes
+        } else {
+            crate::ui::Bookmarked::No
+        };
         self.ui.address.set_text(url);
     }
 
@@ -2012,6 +2036,7 @@ impl Browser {
         tab.url = String::new();
         tab.title = "New tab".to_owned();
         self.ui.address.clear();
+        self.ui.bookmark = crate::ui::Bookmarked::Impossible;
         self.ui.focus_address();
         self.activate_surface(SURFACE_CHROME);
     }
@@ -2025,6 +2050,66 @@ impl Browser {
             crate::history::Action::None
             | crate::history::Action::Focus(_)
             | crate::history::Action::SearchHit(_) => {}
+        }
+    }
+
+    /// Keep the page the reader is on, or stop keeping it.
+    ///
+    /// One command for both, because ⌘D is one key and a reader pressing it twice
+    /// means *undo that*. What it did is reported in the log rather than on the
+    /// page: the native menu bar is built once at startup and cannot yet be
+    /// relabelled, so the browser's own menu — rebuilt every frame — is where the
+    /// state is said out loud.
+    fn toggle_bookmark(&mut self) {
+        let tab = &self.tabs[self.active];
+        let url = tab.url.clone();
+        if url.trim().is_empty() {
+            // A blank tab is not a page, and a bookmark that opens nowhere is
+            // worse than no bookmark.
+            return;
+        }
+        let title = if tab.title.trim().is_empty() {
+            url.clone()
+        } else {
+            tab.title.clone()
+        };
+        let kept = self.bookmarks.toggle(url.clone(), title);
+        tracing::info!(%url, kept, "bookmark toggled");
+        self.ui.bookmark = if kept {
+            crate::ui::Bookmarked::Yes
+        } else {
+            crate::ui::Bookmarked::No
+        };
+        self.accessibility_dirty = true;
+    }
+
+    /// Keep bookmarks between runs, reading what the last one left.
+    ///
+    /// Called by the shell for a browser a person is using, beside the system
+    /// clipboard and for the same reason: a window means a person, and a person
+    /// expects what they kept to still be there tomorrow. Every headless mode — a
+    /// screenshot, an automation session, a test — keeps the in-memory store, so
+    /// none of them can read or overwrite that person's bookmarks.
+    pub fn persist_bookmarks(&mut self) {
+        self.bookmarks = crate::bookmarks::BookmarkStore::persisted();
+        self.sync_address();
+    }
+
+    /// Whether the page the reader is on is one they kept.
+    pub fn is_bookmarked(&self) -> bool {
+        self.bookmarks.contains(&self.tabs[self.active].url)
+    }
+
+    /// Act on what the bookmarks surface reported.
+    fn handle_bookmarks_action(&mut self, action: crate::bookmarks::Action) {
+        match action {
+            crate::bookmarks::Action::Open(url) => self.navigate_from(&url, false),
+            crate::bookmarks::Action::Remove(url) => {
+                self.bookmarks.remove(&url);
+            }
+            crate::bookmarks::Action::Clear => self.bookmarks.clear(),
+            crate::bookmarks::Action::Close => self.close_system_page(),
+            crate::bookmarks::Action::None => {}
         }
     }
 
@@ -2129,6 +2214,7 @@ impl Browser {
             | UiAction::CloseMenu
             | UiAction::ScrollTabs(_) => {}
             UiAction::ToggleInspector => self.toggle_inspector(),
+            UiAction::ToggleBookmark => self.toggle_bookmark(),
             // Chosen from the menu, a browser page opens beside what you were
             // reading rather than over it: the menu is reached *while* looking
             // at something, and losing that to check a preference is the whole
@@ -2377,8 +2463,8 @@ impl Browser {
                 Some(SystemPage::Settings) => self.settings.cursor_at(x, y),
                 Some(SystemPage::History) => self.history_page.cursor_at(x, y),
                 Some(SystemPage::Downloads) => self.downloads_page.cursor_at(x, y, &mut self.text),
+                Some(SystemPage::Bookmarks) => self.bookmarks_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::About) => self.about.cursor_at(x, y, &mut self.text),
-                Some(_) => Cursor::Default,
                 None if self.link_under_pointer().is_some() => Cursor::Pointer,
                 None => Cursor::Default,
             }
@@ -2537,6 +2623,14 @@ impl Browser {
                         &mut list,
                     );
                 }
+                SystemPage::Bookmarks => {
+                    self.bookmarks_page.build_display_list(
+                        content,
+                        &self.bookmarks,
+                        &mut self.text,
+                        &mut list,
+                    );
+                }
                 _ => self
                     .about
                     .build_display_list(content, &mut self.text, &mut list),
@@ -2649,12 +2743,14 @@ impl Browser {
                 SystemPage::Settings => 10u8,
                 SystemPage::History => 11u8,
                 SystemPage::Downloads => 12u8,
+                SystemPage::Bookmarks => 14u8,
                 _ => 13u8,
             }
             .hash(&mut hasher);
             self.settings.builds().hash(&mut hasher);
             self.history_page.builds().hash(&mut hasher);
             self.downloads_page.builds().hash(&mut hasher);
+            self.bookmarks_page.builds().hash(&mut hasher);
             self.about.builds().hash(&mut hasher);
         } else if let Some(page) = tab.page.as_ref() {
             1u8.hash(&mut hasher);
@@ -2807,6 +2903,7 @@ impl Painter for Browser {
         let legacy = self.settings.builds()
             + self.history_page.builds()
             + self.downloads_page.builds()
+            + self.bookmarks_page.builds()
             + self.about.builds()
             + self.inspector.builds();
         let chrome_roots = legacy + self.ui.builds();
@@ -2961,6 +3058,7 @@ impl Painter for Browser {
                     }
                     Some(SystemPage::History) => self.history_page.pointer_moved(x, y),
                     Some(SystemPage::Downloads) => self.downloads_page.pointer_moved(x, y),
+                    Some(SystemPage::Bookmarks) => self.bookmarks_page.pointer_moved(x, y),
                     Some(SystemPage::About) => self.about.pointer_moved(x, y),
                     _ => {}
                 }
@@ -3039,6 +3137,11 @@ impl Painter for Browser {
                         Some(SystemPage::Downloads) => {
                             let action = self.downloads_page.pointer_pressed(&mut self.text);
                             self.handle_downloads_action(action);
+                            return;
+                        }
+                        Some(SystemPage::Bookmarks) => {
+                            let action = self.bookmarks_page.pointer_pressed(&mut self.text);
+                            self.handle_bookmarks_action(action);
                             return;
                         }
                         Some(SystemPage::About) => {
@@ -3212,6 +3315,15 @@ impl Painter for Browser {
                                 return;
                             }
                         }
+                        Some(SystemPage::Bookmarks) => {
+                            if let Some(action) =
+                                self.bookmarks_page
+                                    .key_pressed(key, modifiers, &mut self.text)
+                            {
+                                self.handle_bookmarks_action(action);
+                                return;
+                            }
+                        }
                         Some(SystemPage::About) => {
                             match self.about.key_pressed(key, modifiers, &mut self.text) {
                                 Some(about::Action::OpenSettings) => {
@@ -3361,6 +3473,8 @@ impl Painter for Browser {
                     self.history_page.scroll_by(y);
                 } else if self.tabs[self.active].system == Some(SystemPage::Downloads) {
                     self.downloads_page.scroll_by(y);
+                } else if self.tabs[self.active].system == Some(SystemPage::Bookmarks) {
+                    self.bookmarks_page.scroll_by(y);
                 } else if let Some(page) = self.tabs[self.active].page.as_mut() {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box
@@ -3389,6 +3503,10 @@ impl Painter for Browser {
                 Some(crate::menu::Command::ShowDownloads) => {
                     self.open_system_in_new_tab(SystemPage::Downloads);
                 }
+                Some(crate::menu::Command::ShowBookmarks) => {
+                    self.open_system_in_new_tab(SystemPage::Bookmarks);
+                }
+                Some(crate::menu::Command::ToggleBookmark) => self.toggle_bookmark(),
                 Some(crate::menu::Command::ToggleDevTools) => self.toggle_inspector(),
                 Some(crate::menu::Command::NewTab) => self.new_tab(),
                 Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
@@ -3439,6 +3557,12 @@ impl Painter for Browser {
                             .downloads_page
                             .activate_described(index, &mut self.text);
                         self.handle_downloads_action(action);
+                    }
+                    Some(SystemPage::Bookmarks) => {
+                        let action = self
+                            .bookmarks_page
+                            .activate_described(index, &mut self.text);
+                        self.handle_bookmarks_action(action);
                     }
                     Some(SystemPage::About)
                         if self.about.activate_described(index, &mut self.text)
@@ -3491,6 +3615,10 @@ impl Painter for Browser {
             Some(SystemPage::Downloads) => (
                 self.downloads_page.focused(),
                 self.downloads_page.describe(),
+            ),
+            Some(SystemPage::Bookmarks) => (
+                self.bookmarks_page.focused(),
+                self.bookmarks_page.describe(),
             ),
             Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
             // The pages that are still a placeholder draw no controls, so they
@@ -3881,18 +4009,19 @@ mod system_page_tests {
     }
 
     #[test]
-    fn a_row_for_a_page_that_does_not_exist_yet_only_closes_the_menu() {
+    fn the_bookmarks_row_opens_the_bookmarks() {
         let mut browser = Browser::new(NoNetwork);
         frame(&mut browser, 1000.0, 700.0);
         press(&mut browser, 1000.0 - 22.0, UI_HEIGHT - 21.0);
         frame(&mut browser, 1000.0, 700.0);
 
-        // The third row is Bookmarks, which is dimmed: the press falls through
-        // it to the sheet behind the panel, which dismisses the menu and does
-        // nothing else. That is the whole of what a disabled row does.
+        // The third row. It was the dimmed one — the test that used to live here
+        // proved that a press on a page that did not exist yet fell through to the
+        // sheet and only dismissed the menu. Every row on this menu is now a real
+        // page, so what is worth checking is that this one opens.
         press(&mut browser, 1000.0 - 120.0, UI_HEIGHT + 96.0);
         assert!(!browser.ui().menu_open);
-        assert_eq!(browser.system_page(), None);
+        assert_eq!(browser.system_page(), Some(SystemPage::Bookmarks));
     }
 
     #[test]
@@ -4223,6 +4352,122 @@ mod system_page_tests {
         assert!(download.saved_to().is_none(), "it saved itself uninvited");
         assert!(download.saving_to().is_none());
         assert!(download.save_error().is_none());
+    }
+
+    #[test]
+    fn bookmarks_address_opens_the_native_surface_without_fetching() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:bookmarks");
+
+        assert_eq!(browser.system_page(), Some(SystemPage::Bookmarks));
+        assert_eq!(browser.tabs()[0].url, "about:bookmarks");
+        assert!(browser.tabs()[0].error.is_none());
+    }
+
+    /// ⌘D keeps the page, and ⌘D again stops keeping it. One command both ways,
+    /// because that is what one key can mean.
+    #[test]
+    fn the_bookmark_command_keeps_the_page_and_then_drops_it() {
+        struct Page;
+
+        impl Loader for Page {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    bytes: b"<title>Kept</title><p>hello".to_vec(),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Page);
+        browser.navigate("https://example.test/keep");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+        assert!(!browser.is_bookmarked());
+        assert_eq!(browser.ui().bookmark, crate::ui::Bookmarked::No);
+
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ToggleBookmark.id(),
+        ));
+        assert!(browser.is_bookmarked());
+        assert_eq!(
+            browser.ui().bookmark,
+            crate::ui::Bookmarked::Yes,
+            "the star and the menu must know, or they offer to keep it twice"
+        );
+        let kept: Vec<(String, String)> = browser
+            .bookmarks
+            .bookmarks()
+            .map(|bookmark| (bookmark.url.clone(), bookmark.title.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [("https://example.test/keep".to_owned(), "Kept".to_owned())],
+            "the document's own title names it"
+        );
+
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ToggleBookmark.id(),
+        ));
+        assert!(!browser.is_bookmarked());
+        assert_eq!(browser.ui().bookmark, crate::ui::Bookmarked::No);
+        assert!(browser.bookmarks.is_empty());
+    }
+
+    /// A blank tab has no address, and a bookmark that opens nowhere is worse than
+    /// no bookmark.
+    #[test]
+    fn the_bookmark_command_does_nothing_on_a_blank_tab() {
+        let mut browser = Browser::new(NoNetwork);
+        assert_eq!(
+            browser.ui().bookmark,
+            crate::ui::Bookmarked::Impossible,
+            "and the star says as much rather than looking pressable"
+        );
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ToggleBookmark.id(),
+        ));
+        assert!(browser.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn the_native_bookmarks_command_opens_the_page() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ShowBookmarks.id(),
+        ));
+        assert_eq!(browser.system_page(), Some(SystemPage::Bookmarks));
+    }
+
+    /// Pressing a row goes there, and the address bar agrees that this is a page
+    /// the reader kept.
+    #[test]
+    fn a_kept_page_can_be_opened_from_the_list_again() {
+        struct Page;
+
+        impl Loader for Page {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    bytes: b"<title>Kept</title>".to_vec(),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Page);
+        browser.bookmarks.add("https://example.test/keep", "Kept");
+        browser.handle_bookmarks_action(crate::bookmarks::Action::Open(
+            "https://example.test/keep".to_owned(),
+        ));
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+
+        assert_eq!(browser.tabs()[0].url, "https://example.test/keep");
+        assert_eq!(
+            browser.ui().bookmark,
+            crate::ui::Bookmarked::Yes,
+            "arriving at a kept page must fill the star"
+        );
     }
 
     #[test]

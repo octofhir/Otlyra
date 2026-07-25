@@ -379,6 +379,8 @@ pub enum UiAction {
     OpenPage(SystemPage),
     /// Show the inspector, or put it away.
     ToggleInspector,
+    /// Keep the page the active tab is on, or stop keeping it.
+    ToggleBookmark,
     /// Show the menu behind the cogwheel, or put it away.
     ///
     /// Never reaches the browser: the menu is the interface's own state, like
@@ -434,7 +436,7 @@ impl SystemPage {
     pub fn available(self) -> bool {
         matches!(
             self,
-            Self::Settings | Self::History | Self::Downloads | Self::About
+            Self::Settings | Self::History | Self::Bookmarks | Self::Downloads | Self::About
         )
     }
 
@@ -528,6 +530,12 @@ struct Appearance {
     selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
     menu: Option<f64>,
+    /// Whether the page in the active tab is one the reader kept.
+    ///
+    /// Part of what the interface draws because the star and the menu both say which
+    /// of *keep this* and *stop keeping this* a press will do, and either saying the
+    /// wrong one would be the interface lying about what a press does.
+    bookmark: Bookmarked,
     tab_scroll: f64,
 }
 
@@ -566,6 +574,26 @@ struct ToolbarAppearance {
     caret: Option<usize>,
     selection: Option<std::ops::Range<usize>>,
     focus: Option<FocusId>,
+    /// The star is in the toolbar, so the retained toolbar has to know: a boundary
+    /// that does not key on something it draws is a boundary that draws it once and
+    /// then keeps the first answer forever.
+    bookmark: Bookmarked,
+}
+
+/// What the toolbar's star says about the page in the active tab.
+///
+/// Three states rather than a `bool`, because there are three things to draw and a
+/// flag beside a second flag saying *and this one counts* is two things to keep in
+/// step. A blank tab has no address, so there is nothing to keep and the star is
+/// dimmed rather than lying about being pressable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Bookmarked {
+    /// There is no page to keep.
+    Impossible,
+    /// A page, not kept.
+    No,
+    /// A page the reader kept.
+    Yes,
 }
 
 /// The interface's own state: what is focused, where the pointer is, what is typed.
@@ -574,6 +602,12 @@ pub struct BrowserUi {
     pub address: TextField,
     /// Whether the menu behind the cogwheel is open.
     pub menu_open: bool,
+    /// Whether the page in the active tab is one the reader kept.
+    ///
+    /// Written by the browser wherever the address is synchronized, because it is a
+    /// property of the address. The interface keeps it only to draw with: the star
+    /// in the toolbar and the words on the menu are the same fact twice.
+    pub bookmark: Bookmarked,
     /// Every colour and measurement the interface is drawn from.
     pub theme: Theme,
     /// Which control has the keyboard, if any.
@@ -664,6 +698,7 @@ impl BrowserUi {
         Self {
             address: TextField::default(),
             menu_open: false,
+            bookmark: Bookmarked::Impossible,
             theme: Theme::light(),
             focused: None,
             focus: Focus::default(),
@@ -1198,6 +1233,7 @@ impl BrowserUi {
                 .flatten(),
             focus: self.focused,
             menu: self.menu_open.then_some(height),
+            bookmark: self.bookmark,
             tab_scroll: self.tab_scroll,
         };
 
@@ -1337,6 +1373,7 @@ impl BrowserUi {
             caret: appearance.caret,
             selection: appearance.selection.clone(),
             focus: appearance.focus,
+            bookmark: appearance.bookmark,
         };
 
         let previous = self.tab_appearance.as_ref();
@@ -1498,7 +1535,7 @@ impl BrowserUi {
             Box::new(crate::widget::Anchored::from_right(
                 theme.inset,
                 UI_HEIGHT - 2.0,
-                menu(&theme, &focus),
+                menu(&theme, &focus, self.bookmark),
             )),
         ]))
     }
@@ -1689,7 +1726,7 @@ fn chevron_button(theme: &Theme, focus: &Focus, forward: bool, enabled: bool) ->
 
 /// The menu behind the cogwheel: everything the browser is, as opposed to
 /// everything a page is.
-fn menu(theme: &Theme, focus: &Focus) -> Child<UiAction> {
+fn menu(theme: &Theme, focus: &Focus, bookmark: Bookmarked) -> Child<UiAction> {
     use SystemPage::{About, Bookmarks, Downloads, History, Settings};
 
     let row = |page: SystemPage,
@@ -1713,9 +1750,27 @@ fn menu(theme: &Theme, focus: &Focus) -> Child<UiAction> {
             controls::menu_heading(theme, "Otlyra"),
             row(Settings, icon::gear, Some("⌘,")),
             row(History, icon::clock, Some("⌘Y")),
-            row(Bookmarks, icon::star, None),
+            row(Bookmarks, icon::star, Some("⌥⌘B")),
             row(Downloads, icon::download, Some("⌘⇧J")),
             controls::divider(theme),
+            // Below the line, with the other thing that acts on what is open
+            // rather than opening something. The one item on this menu whose words
+            // depend on the page: the native menu bar is built once at startup and
+            // cannot yet be relabelled, so this is where a reader is told which way
+            // ⌘D will go.
+            controls::menu_item(
+                theme,
+                focus,
+                UiAction::ToggleBookmark,
+                bookmark != Bookmarked::Impossible,
+                icon::star,
+                if bookmark == Bookmarked::Yes {
+                    "Remove bookmark"
+                } else {
+                    "Bookmark this page"
+                },
+                Some("⌘D"),
+            ),
             controls::menu_item(
                 theme,
                 focus,
@@ -1788,7 +1843,7 @@ fn tab(
     // the same engine that will draw it — a title that overflowed would be
     // clipped mid-word with no sign that anything was lost.
     let room = width - 14.0 - 18.0 - theme.gap * 3.0 - theme.inset;
-    let title = controls::elide(cx, &label.title, room, Elide::End);
+    let title = controls::elide(cx, &label.title, room, theme.font_size, Elide::End);
 
     let close = controls::icon_button(
         theme,
@@ -1914,6 +1969,31 @@ fn toolbar(
     .face(theme.surface)
     .into_widget(theme);
 
+    // Filled and accented when this page is kept, hollow when it is not, dimmed
+    // when there is no page to keep. The colour is captured rather than taken from
+    // the button, which hands every icon the same ink: a star that is *on* is the
+    // one thing in this toolbar that is not drawn in the foreground colour.
+    let kept = ui.bookmark;
+    let accent = theme.accent;
+    let bookmark = controls::icon_button(
+        theme,
+        focus,
+        UiAction::ToggleBookmark,
+        kept != Bookmarked::Impossible,
+        if kept == Bookmarked::Yes {
+            "Remove bookmark"
+        } else {
+            "Bookmark this page"
+        },
+        move |list, rect, color| {
+            if kept == Bookmarked::Yes {
+                icon::star(list, rect, accent);
+            } else {
+                icon::star_hollow(list, rect, color);
+            }
+        },
+    );
+
     Box::new(Padding::new(
         Insets::symmetric(theme.inset, (TOOLBAR_HEIGHT - theme.control_height) / 2.0),
         Box::new(Stack::row(
@@ -1924,6 +2004,10 @@ fn toolbar(
                 reload,
                 controls::gap(theme.gap * 0.5),
                 field,
+                // Immediately right of the address, where every browser puts it, and
+                // before the menu so the two things that act on *this page* are not
+                // separated by the one that opens other pages.
+                bookmark,
                 controls::gap(theme.gap * 0.5),
                 controls::icon_button(
                     theme,

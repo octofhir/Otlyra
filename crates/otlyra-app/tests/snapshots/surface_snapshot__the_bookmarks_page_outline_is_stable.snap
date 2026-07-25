@@ -1,0 +1,25 @@
+---
+source: crates/otlyra-app/tests/surface_snapshot.rs
+expression: outline(&list)
+---
+fill #f4f4f7ff (0.0, 78.0) 900.0x622.0
+fill #e4e4eaff (0.0, 78.0) 900.0x52.0
+glyphs n=9 size=16 #1c1c21ff at (16.0, 93.2)
+fill #c0362cff (736.6, 89.0) 87.4x30.0
+glyphs n=10 size=13 #ffffffff at (748.6, 95.2)
+fill #2f6fd6ff (830.0, 89.0) 54.0x30.0
+glyphs n=4 size=13 #ffffffff at (842.0, 95.2)
+layer alpha=1 clip (0.0, 130.0) 900.0x570.0
+fill #ffffffff (126.0, 146.0) 648.0x127.8
+glyphs n=21 size=13 #1c1c21ff at (146.0, 164.0)
+glyphs n=76 size=11 #6e6e78ff at (146.0, 184.6)
+fill #ffffffff (683.2, 166.7) 70.8x30.0
+glyphs n=6 size=13 #1c1c21ff at (695.2, 172.9)
+fill #d5d5ddff (683.2, 166.7) 70.8x30.0
+glyphs n=14 size=13 #1c1c21ff at (146.0, 220.4)
+glyphs n=20 size=11 #6e6e78ff at (146.0, 241.0)
+fill #ffffffff (683.2, 223.1) 70.8x30.0
+glyphs n=6 size=13 #1c1c21ff at (695.2, 229.3)
+fill #d5d5ddff (683.2, 223.1) 70.8x30.0
+fill #d5d5ddff (126.0, 146.0) 648.0x127.8
+end layer
