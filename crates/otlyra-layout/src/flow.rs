@@ -3001,6 +3001,31 @@ impl<'a> Flow<'a> {
             }
         }
 
+        // How tall an item is depends on how wide it ended up, and until the
+        // sharing above has run nobody knows how wide that is. The base sizes
+        // were measured against the whole container, where a column of wrapping
+        // text comes back one line tall — so a line that took its cross size from
+        // those had nothing for `stretch` to stretch to, and a row of cards kept
+        // its own ragged heights while each one grew past the line it was on.
+        // Measured again at the size each item actually got.
+        if row {
+            let floats = std::mem::take(&mut self.floats);
+            let ports = self.scroll_ports.len();
+            for index in line.clone() {
+                // An item that names a height is that tall whatever it holds and
+                // whatever width it ended up at, and the first measurement
+                // already said so. Asking again with no height to give it would
+                // be asking what it is worth without the thing it declared.
+                if self.asked_height(&items[index].style).is_some() {
+                    continue;
+                }
+                let (id, main) = (items[index].id, items[index].main);
+                items[index].cross = self.layout_item(id, 0.0, 0.0, main, 0.0).rect.height;
+            }
+            self.scroll_ports.truncate(ports);
+            self.floats = floats;
+        }
+
         // The cross axis: the line is as big as its largest item, and `stretch`
         // makes the rest of them match it.
         let line_cross = items[line.clone()]

@@ -1410,3 +1410,48 @@ fn floated_siblings_are_measured_side_by_side() {
         "they sit on one line rather than one to a line: {tops:?}"
     );
 }
+
+/// Columns of wrapping text come out equal height, which is what a row of cards
+/// on a home page is.
+///
+/// How tall an item is depends on how wide it ended up, and until the row has
+/// shared its width out nobody knows how wide that is. Measured against the
+/// whole container instead, a column of text comes back one line tall — so the
+/// line had nothing for `stretch` to stretch to, every column kept its own
+/// height, and the tallest of them grew out of the bottom of the row.
+#[test]
+fn flex_items_are_measured_at_the_width_they_end_up_with() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'><div style='display: flex; flex-direction: row'>\
+         <div style='flex-grow: 1; flex-basis: 0'>one two three four five six seven \
+         eight nine ten eleven twelve thirteen fourteen fifteen sixteen</div>\
+         <div style='flex-grow: 1; flex-basis: 0'>short</div>\
+         <div style='flex-grow: 1; flex-basis: 0'>short</div></div>",
+        900.0,
+    );
+
+    // The root fragment is the initial containing block, then `html`, `body`,
+    // and the container itself.
+    let row = tree
+        .root
+        .children
+        .first()
+        .and_then(|html| html.children.first())
+        .and_then(|body| body.children.first())
+        .expect("a flex container");
+    let items: Vec<f32> = row
+        .children
+        .iter()
+        .filter(|child| matches!(child.kind, FragmentKind::Box))
+        .map(|child| child.rect.height)
+        .collect();
+    assert_eq!(items.len(), 3, "three columns: {items:?}");
+    assert!(
+        items[0] > 40.0,
+        "the first wraps to more than one line at a third of the row: {items:?}"
+    );
+    assert!(
+        items.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.5),
+        "and the other two are stretched to match it: {items:?}"
+    );
+}
