@@ -168,7 +168,5 @@ Decisions rather than omissions.
   short list of choices meanwhile.
 - **Pinned tabs.** The strip scrolls and its tabs can be dragged into a new
   order; pinning is not in it.
-- **A find bar**, which needs text search over the fragment tree — engine work
-  first.
 - **A live BiDi transport** — attaching to the window a person is looking at,
   rather than driving a browser of one's own.

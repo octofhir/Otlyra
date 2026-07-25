@@ -131,6 +131,31 @@ are the two consumers they were written from.
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
 
+## Next large feature — find in page
+
+Chosen over cookies/cache, page zoom and the half-drawn controls because it is
+entirely ours, it is what a reader of a document reaches for, and it lands on
+the popup, focus-scope and traversal contracts this priority already built.
+Three slices, each shippable on its own:
+
+- [ ] **Engine.** One linearized text of the laid-out page — the runs in paint
+  order, with a map from an offset back to (run, byte range) — so a match may
+  span the runs a bold word breaks a sentence into. Case-insensitive substring
+  to start; no regular expressions, and say so. `PageScene::find(query)` reports
+  how many, `select_match(n)` marks one. Reuse the selection's own arithmetic:
+  a match is the same *two places in the page's text* a selection is, so its
+  rectangles come from machinery that is already right about ligatures, line
+  breaks and bidi runs.
+- [ ] **Highlights and reaching them.** Every match washed, the current one
+  drawn strongly, painted through the existing highlight layer rather than a
+  second overlay. Bringing the current match on screen closes a stated gap —
+  nothing scrolls into view today — so it is `scroll_to_rect` on the page, which
+  the inspector's reveal wants as well.
+- [ ] **The bar.** A panel on the popup contract: its own text field, the count
+  as *3 of 17*, previous/next, and a close cross. ⌘F opens and focuses it, Enter
+  and shift-Enter step, Escape closes it and drops the highlights, ⌘G steps
+  without the bar having the keyboard. Per tab, cleared on navigation.
+
 ## Priority 5 — Design system and fast UI authoring
 
 - [ ] Centralize semantic colors, typography, spacing, size, radius, border,
