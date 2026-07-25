@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A picture inside a box that is not its shape</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  .row { display: flex; gap: 16px; margin-bottom: 20px; }
+  figure { margin: 0; }
+  figcaption { font-size: 13px; color: #555; margin-top: 4px; }
+  /* The box is a square and the picture is twice as wide as it is tall, so
+     every value below has something to do. The grey square behind each picture
+     is the box: what is inside it is what the property decided. */
+  .box { width: 150px; height: 150px; background: #f0f0f0; }
+  img { width: 150px; height: 150px; }
+</style>
+</head>
+<body>
+
+<h1>object-fit</h1>
+
+<div class="row">
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: fill"></div>
+    <figcaption>fill — stretched</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: contain"></div>
+    <figcaption>contain — all of it</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: cover"></div>
+    <figcaption>cover — no gaps</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: none"></div>
+    <figcaption>none — its own size</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: scale-down"></div>
+    <figcaption>scale-down</figcaption></figure>
+</div>
+
+<h1>object-position</h1>
+
+<div class="row">
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: none; object-position: left top"></div>
+    <figcaption>none, top left</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: none; object-position: right bottom"></div>
+    <figcaption>none, bottom right</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: contain; object-position: 0 100%"></div>
+    <figcaption>contain, at the bottom</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-400.png" style="object-fit: cover; object-position: 20% 50%"></div>
+    <figcaption>cover, a fifth across</figcaption></figure>
+</div>
+
+<h1>A smaller picture</h1>
+
+<div class="row">
+  <figure><div class="box"><img src="images/tile-100.png" style="object-fit: none"></div>
+    <figcaption>none — no larger than it is</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-100.png" style="object-fit: scale-down"></div>
+    <figcaption>scale-down — likewise</figcaption></figure>
+  <figure><div class="box"><img src="images/tile-100.png" style="object-fit: contain"></div>
+    <figcaption>contain — blown up</figcaption></figure>
+</div>
+
+</body>
+</html>

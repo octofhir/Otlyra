@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Opacity</title>
+<style>
+  body { margin: 8px; font: 14px/1.3 Times; background: white; }
+  .row { position: relative; height: 120px; margin-bottom: 16px; }
+  .plate { width: 220px; height: 100px; background: crimson; color: white; padding: 6px; }
+  .over { position: absolute; left: 80px; top: 30px; width: 160px; height: 60px;
+          background: navy; color: white; padding: 6px; }
+  .half { opacity: 0.5; }
+  .quarter { opacity: 0.25; }
+</style>
+</head>
+<body>
+
+<h2>A group is composited once</h2>
+<div class="row">
+  <div class="plate half">
+    solid crimson at half
+    <div class="over">navy over it, inside the group</div>
+  </div>
+</div>
+
+<h2>The same without the group</h2>
+<div class="row">
+  <div class="plate">
+    solid crimson
+    <div class="over">navy over it</div>
+  </div>
+</div>
+
+<h2>A group inside a group</h2>
+<div class="row">
+  <div class="plate half">
+    half
+    <div class="quarter" style="background: green; color: white; padding: 6px">a quarter of a half</div>
+  </div>
+</div>
+
+<h2>Half over the page's own background</h2>
+<div class="row" style="background: gold">
+  <div class="plate half" style="background: black">black at half over gold</div>
+</div>
+
+<h2>Text at a quarter</h2>
+<div class="row">
+  <p class="quarter">A paragraph set at a quarter of its colour, over the page.</p>
+</div>
+
+</body>
+</html>

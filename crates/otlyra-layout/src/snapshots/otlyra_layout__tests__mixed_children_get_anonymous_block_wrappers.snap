@@ -1,0 +1,14 @@
+---
+source: crates/otlyra-layout/src/lib.rs
+expression: "dump::serialize(&tree)"
+---
+BLOCK (initial containing block) font=16px
+  BLOCK html font=16px
+    BLOCK body font=16px
+      BLOCK div font=16px
+        BLOCK (anonymous) font=16px
+          TEXT "loose text"
+        BLOCK p font=16px
+          TEXT "a paragraph"
+        BLOCK (anonymous) font=16px
+          TEXT "more text"

@@ -1,0 +1,31 @@
+---
+source: crates/otlyra-app/tests/surface_snapshot.rs
+expression: outline(&list)
+---
+fill #e4e4eaff (0.0, 0.0) 900.0x36.0
+fill #ffffffff (0.0, 36.0) 900.0x42.0
+fill #ffffffff (6.0, 4.0) 220.0x32.0
+fill #1c1c21ff (19.2, 17.2) 5.6x5.6
+glyphs n=20 size=13 #1c1c21ff at (35.0, 11.2)
+stroke #1c1c21ff width=1.5 (204.0, 16.0) 7.9x7.9
+fill #2f6fd6ff (241.2, 17.2) 5.6x5.6
+glyphs n=29 size=13 #6e6e78ff at (257.0, 11.2)
+stroke #1c1c21ff width=1.5 (426.0, 16.0) 7.9x7.9
+fill #cfcfd7ff (450.0, 12.0) 1.0x16.0
+fill #6e6e78ff (466.2, 17.2) 5.6x5.6
+glyphs n=6 size=13 #6e6e78ff at (482.0, 11.2)
+stroke #1c1c21ff width=1.5 (651.0, 16.0) 7.9x7.9
+stroke #1c1c21ff width=1.6 (682.0, 13.0) 14.0x14.0
+stroke #1c1c21ff width=1.7 (17.7, 50.8) 8.6x12.3
+stroke #1c1c21ff width=1.7 (48.7, 50.8) 8.6x12.3
+stroke #1c1c21ff width=1.6 (75.6, 49.3) 16.8x16.1
+fill #1c1c21ff (77.7, 46.4) 6.4x6.9
+fill #2f6fd638 (104.0, 39.0) 754.0x36.0
+fill #ffffffff (107.0, 42.0) 748.0x30.0
+fill #2f6fd6ff (107.0, 42.0) 748.0x30.0
+fill #6e6e78ff (119.8, 55.9) 6.3x5.0
+stroke #6e6e78ff width=1.4 (120.9, 53.8) 4.2x2.1
+fill #2f6fd62e (136.0, 48.2) 189.1x17.6
+glyphs n=29 size=13 #1c1c21ff at (136.0, 48.2)
+fill #1c1c21ff (868.5, 47.5) 18.9x18.9
+fill #cfcfd7ff (0.0, 77.0) 900.0x1.0

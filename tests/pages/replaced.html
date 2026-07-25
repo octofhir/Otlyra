@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A picture's own box</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  .row { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 8px; }
+  figure { margin: 0; }
+  figcaption { font-size: 13px; color: #555; margin-top: 4px; }
+  /* Every picture below is the same file: a hundred wide and fifty tall. What
+     differs is the frame around it, so anything drawn in the wrong place is a
+     difference in one box and not in the row. */
+  img { display: block; }
+  .framed { border: 10px solid #c33; padding: 5px; background: #cfc; }
+</style>
+</head>
+<body>
+
+<h1>A border and a background belong to the picture</h1>
+
+<div class="row">
+  <figure><img src="images/tile-100.png">
+    <figcaption>bare — 100&times;50</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png">
+    <figcaption>framed — 130&times;80</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png" style="border-radius: 12px">
+    <figcaption>rounded</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png" style="border-color: #36c #3a3 #c33 #c93">
+    <figcaption>a colour a side</figcaption></figure>
+</div>
+
+<h1>Where the width is measured across</h1>
+
+<div class="row">
+  <figure><img class="framed" src="images/tile-100.png" style="width: 100px">
+    <figcaption>width 100 — box 130&times;80</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png" style="width: 100px; box-sizing: border-box">
+    <figcaption>border-box — box 100&times;65</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png" style="width: 100px; height: 40px; box-sizing: border-box">
+    <figcaption>both given — 100&times;40</figcaption></figure>
+  <figure><img class="framed" src="images/tile-100.png" style="width: 200px; height: 60px; object-fit: contain">
+    <figcaption>fitted inside 200&times;60</figcaption></figure>
+</div>
+
+<h1>In a line, the frame takes room too</h1>
+
+<p style="width: 460px; background: #f4f4f4">
+  Before <img class="framed" style="display: inline" src="images/tile-100.png"> and after,
+  with enough words to carry the line past the picture and show where the next one starts.
+</p>
+
+<h1>A frame on a picture that has not arrived</h1>
+
+<div class="row">
+  <figure><img class="framed" src="images/missing.png" alt="nothing here" style="display: inline">
+    <figcaption>the alternative text, framed</figcaption></figure>
+</div>
+
+</body>
+</html>

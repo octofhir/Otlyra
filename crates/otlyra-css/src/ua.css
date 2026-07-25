@@ -1,0 +1,275 @@
+/* The user-agent stylesheet, as CSS.
+ *
+ * This is the same set of decisions the hardcoded table made, written in the
+ * language they belong to: one rule per selector, values in CSS units, and the
+ * cascade — not a `match` arm — deciding what wins. The source for the values is
+ * the HTML standard's rendering chapter.
+ */
+
+html, body, div, center, section, article, aside, header, footer, main, nav,
+figcaption, form, dl, dt, dd,
+li, details, summary, figure, hgroup, search, address, hr, p, pre,
+blockquote, ul, ol, menu, fieldset, optgroup, option, legend { display: block; }
+/* Inline outside, a box inside: a control takes its place in a line of text and
+   is laid out as a block within its own edges. */
+input, button, select, textarea, progress, meter, marquee { display: inline-block; }
+
+head, title, meta, link, style, script, base, template { display: none; }
+/* `datalist` is a list of suggestions for a field rather than something to show,
+   and `audio` without controls shows nothing either. `rp` is the parenthesis a
+   browser *without* ruby support would show, so a browser that has ruby hides it —
+   and one that lays ruby out as ordinary text, as this does, hides it too rather
+   than printing brackets around every reading. */
+datalist, audio, rp { display: none; }
+/* The content of `noscript` is what a page shows when scripts do not run, and
+   here they do not. */
+noscript { display: inline; }
+/* The attribute that says "not yet, or not any more". It is a rule rather than a
+   special case in the box tree, so a page that overrides it in its own stylesheet
+   still wins — which is what the attribute is defined to allow. */
+[hidden] { display: none; }
+input[type="hidden"] { display: none; }
+/* A closed disclosure shows its summary and nothing else. What opens one is a
+   click, which needs script or a control of our own; until then a page that ships
+   one closed reads as it would anywhere else. */
+details:not([open]) > *:not(summary) { display: none; }
+/* A dialog is not shown until it is opened. Nothing opens one yet — that takes
+   script — so this is the whole of it, and the padding and border are what one
+   would have. */
+dialog { display: none; margin: auto; padding: 1em; border: solid; }
+
+/* A table is a formatting context of its own: rows and cells are placed into a
+   grid whose columns are sized by what is in them, not stacked as blocks. */
+table { display: table; border-spacing: 2px; border-collapse: separate; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; padding: 1px; }
+caption { display: table-caption; }
+/* The other half of a `border` attribute: it draws on the table itself, from the
+   presentational hints, *and* one pixel wide on every cell however wide the
+   table's own is — which is what makes `border=5` a thick frame around a thin
+   grid. `border=0` asks for neither. */
+table[border]:not([border="0"]) > tr > td,
+table[border]:not([border="0"]) > tr > th,
+table[border]:not([border="0"]) > * > tr > td,
+table[border]:not([border="0"]) > * > tr > th { border: 1px inset gray; }
+col { display: table-column; }
+colgroup { display: table-column-group; }
+
+/* Neither a font-size nor a font-family here, on purpose. Both initial values are
+   what a browser's own preferences answer: `medium` is sixteen pixels for prose and
+   thirteen for monospace, and the default family is the serif one. Writing a length
+   here would pin every descendant to it and take the monospace base away with it;
+   writing a family here would make a page that says nothing look unlike the same
+   page everywhere else. */
+html { color: black; }
+body { margin: 8px; }
+
+h1 { display: block; font-size: 2em;    font-weight: bold; margin: 0.67em 0; }
+h2 { display: block; font-size: 1.5em;  font-weight: bold; margin: 0.83em 0; }
+h3 { display: block; font-size: 1.17em; font-weight: bold; margin: 1em 0; }
+h4 { display: block; font-size: 1em;    font-weight: bold; margin: 1.33em 0; }
+h5 { display: block; font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
+h6 { display: block; font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
+
+p { margin: 1em 0; }
+blockquote { margin: 1em 40px; }
+ul, menu { list-style-type: disc; }
+ol { list-style-type: decimal; }
+ul, menu, ol { margin: 1em 0; padding-left: 40px; }
+/* A list inside a list is part of the item above it, not a paragraph of its own,
+   so it gets no margin of its own — and its bullets change shape so a reader can
+   tell the levels apart at a glance. */
+ul ul, ul menu, ul ol, menu ul, menu menu, menu ol,
+ol ul, ol menu, ol ol { margin-top: 0; margin-bottom: 0; }
+ul ul, ul menu, menu ul, menu menu,
+ol ul, ol menu { list-style-type: circle; }
+ul ul ul, ul ul menu, ul menu ul, ul menu menu,
+ul ol ul, ul ol menu, menu ul ul, menu ul menu,
+ol ul ul, ol ul menu, ol ol ul, ol ol menu { list-style-type: square; }
+dd { margin-left: 40px; }
+dl { margin: 1em 0; }
+figure { margin: 1em 40px; }
+pre { font-family: monospace; white-space: pre; margin: 1em 0; }
+/* A rule is a border, not a filled strip: `border-style: inset` renders as one
+   flat grey line here, which is what an inset one-pixel border looks like. */
+hr { height: 0; border-top: 1px solid #c0c0c0; margin: 8px 0; }
+
+b, strong { font-weight: bold; }
+i, em, cite, var, dfn, address { font-style: italic; }
+code, kbd, samp, tt { font-family: monospace; }
+small, sub, sup { font-size: 0.83em; }
+big { font-size: 1.2em; }
+sub { vertical-align: sub; }
+sup { vertical-align: super; }
+mark { background-color: yellow; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+/* An anchor without an address is not a link: it is a name for a place in the
+   page, and it is not blue and not underlined anywhere else either. */
+a[href] { color: #0000ee; text-decoration: underline; }
+
+/* Controls.
+
+   The numbers are measured from two references rather than remembered, and where
+   the two disagree the one the pictures are compared against wins. What they agree
+   on is most of it: a control's text is smaller than the prose around it and the
+   size is a length rather than a fraction, so a field in a heading is not set at
+   heading size; the family is the platform's own rather than the page's; a field
+   measures across its content and a button across its border.
+
+   What is *not* here is a checkbox's size. It is thirteen pixels because the
+   widget is thirteen pixels, not because a rule says so — which is why both
+   references shrink a checkbox to nothing when it is told to stop being a widget,
+   and why the size is layout's answer and not the cascade's.
+
+   `appearance` is the property the cascade does not have; it is carried under
+   another name, and this is where the widgets are told they are widgets. */
+@property --otlyra-appearance {
+  syntax: "*";
+  inherits: false;
+  initial-value: none;
+}
+input, button, select, textarea, meter, progress {
+  --otlyra-appearance: auto;
+}
+
+input {
+  display: inline-block;
+  box-sizing: content-box;
+  font: 400 13.3333px sans-serif;
+  padding: 1px 2px;
+  border: 2px inset #767676;
+  background-color: #ffffff;
+  color: #000000;
+  cursor: text;
+  text-align: start;
+  text-indent: 0;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-transform: none;
+  /* A field shows one line however much is in it: what is past its edge is cut
+     off rather than spilled across the page. */
+  overflow: clip;
+}
+
+button,
+input[type="button" i], input[type="submit" i], input[type="reset" i] {
+  display: inline-block;
+  box-sizing: border-box;
+  font: 400 13.3333px sans-serif;
+  padding: 1px 6px;
+  border: 2px outset #767676;
+  background-color: #efefef;
+  color: #000000;
+  text-align: center;
+  cursor: default;
+}
+
+/* A checkbox and a radio button carry no text and no edge of their own: the tick
+   and the ring are drawn, not set, so everything a box normally has is cleared
+   and the shape is put in its place. The margins are the two references' own, to
+   the pixel, and they are not the same on all four sides. */
+input[type="checkbox" i], input[type="radio" i] {
+  box-sizing: border-box;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  cursor: default;
+}
+input[type="checkbox" i] { margin: 3px 3px 3px 4px; }
+input[type="radio" i] { margin: 3px 3px 0 5px; }
+
+/* A slider carries no text and no edge of its own either: the track and the thumb
+   are drawn. Both references give it the same two-pixel margin all round, and
+   neither takes its size from the font. */
+input[type="range" i] {
+  box-sizing: border-box;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  margin: 2px;
+  cursor: default;
+}
+
+/* A date or a time is a row of digits in fixed places, so it is set in a fixed
+   pitch: both references do this, and a proportional font makes the parts of a
+   half-filled date jump about as it is filled in. */
+input[type="date" i], input[type="time" i], input[type="month" i],
+input[type="week" i], input[type="datetime-local" i] {
+  font-family: monospace;
+}
+
+/* A colour well is the colour it holds, drawn inside a thin frame. The numbers
+   are the reference's: a one-pixel edge rather than the two an ordinary field
+   gets, and the swatch inside the padding. */
+input[type="color" i] {
+  box-sizing: content-box;
+  padding: 1px 2px;
+  border: 1px solid #767676;
+  background-color: #efefef;
+  cursor: default;
+}
+
+input[type="hidden" i] { display: none; }
+
+select {
+  display: inline-block;
+  box-sizing: border-box;
+  font: 400 13.3333px sans-serif;
+  padding: 0;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  color: #000000;
+  align-items: center;
+  white-space: pre;
+  cursor: default;
+  overflow: clip;
+}
+
+textarea {
+  display: inline-block;
+  box-sizing: content-box;
+  font: 400 13.3333px monospace;
+  padding: 2px;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  color: #000000;
+  white-space: pre-wrap;
+  cursor: text;
+  /* As many rows as it was asked for, whatever is in it: what is past the last of
+     them is cut off, and the text slides under the box to follow the caret. */
+  overflow: clip;
+}
+
+/* A bar is a widget with a size and no contents. Both references give the same
+   two, and neither takes them from the font. */
+progress { display: inline-block; box-sizing: border-box; width: 160px; height: 16px;
+           vertical-align: -0.2em; }
+meter { display: inline-block; box-sizing: border-box; width: 80px; height: 16px;
+        vertical-align: -0.2em; }
+
+/* A control nothing can do anything with says so in its text as well as in its
+   face: both references grey the words, and only one of the two greys the edge. */
+input:disabled, button:disabled, select:disabled, textarea:disabled,
+option:disabled, optgroup:disabled { color: #545454; }
+
+fieldset { padding: 0.35em 0.75em 0.625em; margin: 0 2px;
+           border: 2px groove #c0c0c0; }
+legend { padding: 0 2px; }
+optgroup { font-weight: bold; }
+option { padding: 0 2px; }
+/* Only ever seen in an open list: a closed drop-down shows one option and it is
+   not one of these boxes. The chosen one is marked and the one under the pointer
+   is lit, which is what a menu does everywhere. */
+option:checked { background-color: #cce4ff; }
+option:hover { background-color: #e8f1ff; }
+option:checked:hover { background-color: #b8d8ff; }
+/* A frame is a document of its own, which this cannot show — but the space it
+   takes and the edge around it are what a page is laid out against either way. */
+iframe { border: 2px inset; }
+
+center, caption { text-align: center; }
+th { font-weight: bold; text-align: center; }

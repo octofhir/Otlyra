@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stacking</title>
+<style>
+  body { margin: 8px; font: 14px/1.2 Times; }
+  .case { position: relative; height: 150px; margin-bottom: 24px; }
+  .box { position: absolute; width: 160px; height: 90px; padding: 4px; }
+  .flow { width: 200px; height: 110px; padding: 4px; background: silver; }
+  .red { background: crimson; color: white; }
+  .blue { background: navy; color: white; }
+  .green { background: green; color: white; }
+</style>
+</head>
+<body>
+
+<h2>A large index inside a small one stays inside it</h2>
+<div class="case">
+  <div class="box red" style="left: 0; top: 0; z-index: 1">
+    z-index 1
+    <div class="box blue" style="left: 40px; top: 40px; z-index: 100">z-index 100, inside the 1</div>
+  </div>
+  <div class="box green" style="left: 120px; top: 20px; z-index: 2">z-index 2, beside the 1</div>
+</div>
+
+<h2>A negative index paints under the flow but over its parent</h2>
+<div class="case">
+  <div class="flow">in the flow</div>
+  <div class="box red" style="left: 60px; top: 30px">positioned, no index</div>
+  <div class="box blue" style="left: 100px; top: 60px; z-index: -1">z-index -1</div>
+</div>
+
+<h2>A negative index inside a positioned parent</h2>
+<div class="case">
+  <div class="box red" style="left: 0; top: 0; width: 260px; height: 120px; z-index: 0">
+    the parent
+    <div class="box blue" style="left: 20px; top: 30px; z-index: -1">z-index -1, inside it</div>
+  </div>
+</div>
+
+<h2>Document order decides when nothing else does</h2>
+<div class="case">
+  <div class="box red" style="left: 0; top: 0">written first</div>
+  <div class="box green" style="left: 60px; top: 30px">written second</div>
+  <div class="box blue" style="left: 120px; top: 60px">written third</div>
+</div>
+
+</body>
+</html>

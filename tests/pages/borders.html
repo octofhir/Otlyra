@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The lines a border draws</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  .row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; }
+  figure { margin: 0 0 12px; }
+  figcaption { font-size: 13px; color: #555; margin-top: 4px; }
+  /* Every box the same size and the same colour, so a difference is a
+     difference in the line and not in anything around it. */
+  .b { width: 140px; height: 34px; border-color: #3060c0; background: #f5f7ff; }
+  .w1 { border-width: 1px } .w3 { border-width: 3px } .w8 { border-width: 8px }
+</style>
+</head>
+<body>
+
+<h1>One width, every style</h1>
+
+<div class="row">
+  <figure><div class="b w8" style="border-style: solid"></div><figcaption>solid</figcaption></figure>
+  <figure><div class="b w8" style="border-style: dashed"></div><figcaption>dashed</figcaption></figure>
+  <figure><div class="b w8" style="border-style: dotted"></div><figcaption>dotted</figcaption></figure>
+  <figure><div class="b w8" style="border-style: double"></div><figcaption>double</figcaption></figure>
+  <figure><div class="b w8" style="border-style: groove"></div><figcaption>groove</figcaption></figure>
+  <figure><div class="b w8" style="border-style: ridge"></div><figcaption>ridge</figcaption></figure>
+  <figure><div class="b w8" style="border-style: inset"></div><figcaption>inset</figcaption></figure>
+  <figure><div class="b w8" style="border-style: outset"></div><figcaption>outset</figcaption></figure>
+  <figure><div class="b w8" style="border-style: hidden"></div><figcaption>hidden — nothing</figcaption></figure>
+</div>
+
+<h1>The same styles thin</h1>
+
+<div class="row">
+  <figure><div class="b w1" style="border-style: dashed"></div><figcaption>dashed 1</figcaption></figure>
+  <figure><div class="b w1" style="border-style: dotted"></div><figcaption>dotted 1</figcaption></figure>
+  <figure><div class="b w3" style="border-style: dashed"></div><figcaption>dashed 3</figcaption></figure>
+  <figure><div class="b w3" style="border-style: dotted"></div><figcaption>dotted 3</figcaption></figure>
+  <figure><div class="b w3" style="border-style: double"></div><figcaption>double 3</figcaption></figure>
+  <figure><div class="b" style="border-width: 10px; border-style: double"></div><figcaption>double 10</figcaption></figure>
+</div>
+
+<h1>A dark colour lightens instead of darkening</h1>
+
+<div class="row">
+  <figure><div class="b w8" style="border: 8px groove #303030"></div><figcaption>#303030</figcaption></figure>
+  <figure><div class="b w8" style="border: 8px groove #808080"></div><figcaption>#808080</figcaption></figure>
+  <figure><div class="b w8" style="border: 8px groove #000"></div><figcaption>black</figcaption></figure>
+  <figure><div class="b w8" style="border: 8px outset #00ff88"></div><figcaption>outset, green</figcaption></figure>
+</div>
+
+<h1>Two sides that disagree meet on the diagonal</h1>
+
+<div class="row">
+  <figure><div class="b" style="border: 16px solid; border-color: #36c #3a3 #c33 #c93"></div>
+    <figcaption>four colours</figcaption></figure>
+  <figure><div class="b" style="border-style: solid; border-width: 20px 4px"></div>
+    <figcaption>two widths</figcaption></figure>
+  <figure><div class="b" style="border: 12px solid #36c; border-right-style: dashed; border-bottom-style: dotted"></div>
+    <figcaption>three styles</figcaption></figure>
+</div>
+
+<h1>A collapsed border is settled by width, then by style</h1>
+
+<table style="border-collapse: collapse; margin-top: 8px">
+  <tr>
+    <td style="border: 3px solid #3060c0; padding: 6px">solid 3</td>
+    <td style="border: 3px double #3060c0; padding: 6px">double 3 wins the shared edge</td>
+    <td style="border: 3px dotted #3060c0; padding: 6px">dotted 3</td>
+  </tr>
+  <tr>
+    <td style="border: 3px solid #3060c0; padding: 6px">solid 3</td>
+    <td style="border-style: hidden; padding: 6px">hidden silences every edge it touches</td>
+    <td style="border: 3px solid #3060c0; padding: 6px">solid 3</td>
+  </tr>
+</table>
+
+</body>
+</html>

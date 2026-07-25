@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The reader's palette</title>
+<style>
+  body {
+    margin: 0;
+    padding: 24px;
+    font: 16px/1.5 system-ui, sans-serif;
+    background: #ffffff;
+    color: #111111;
+  }
+
+  .card {
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    background: #f6f6f6;
+  }
+
+  .in-dark { display: none; }
+
+  /* Everything below is what the environment asks for. A page that does not
+     ask looks the same either way, which is the row at the bottom. */
+  @media (prefers-color-scheme: dark) {
+    body { background: #14161a; color: #e8e8e8; }
+    .card { background: #1e2128; border-color: #333a44; }
+    .in-light { display: none; }
+    .in-dark { display: inline; }
+  }
+
+  @media (prefers-color-scheme: light) {
+    .light-only { border-color: #2a7d2a; }
+  }
+
+  .unmoved {
+    background: #7a5cff;
+    color: #ffffff;
+    padding: 8px;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+  <h1>The reader's palette</h1>
+
+  <div class="card">
+    <p>prefers-color-scheme answers:
+      <strong class="in-light">light</strong><strong class="in-dark">dark</strong></p>
+    <p>Switch the appearance preference in settings and this page follows it.
+      A page with no such rule does not move.</p>
+  </div>
+
+  <div class="card light-only">
+    <p>A green border here means the <code>light</code> query matched — the two
+      queries are separate rules, and exactly one of them should apply.</p>
+  </div>
+
+  <p class="unmoved">This paragraph names its own colours and asks nothing, so
+    it is the same in both palettes.</p>
+</body>
+</html>

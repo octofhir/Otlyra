@@ -1,0 +1,18 @@
+[package]
+name = "otlyra-html"
+description = "Encoding determination and the tokenizer driver: the two things html5ever leaves to the browser."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+otlyra-dom.workspace = true
+encoding_rs.workspace = true
+html5ever.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

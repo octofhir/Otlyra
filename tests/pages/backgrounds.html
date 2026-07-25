@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Layers behind a box, and the shadow inside it</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  .row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; }
+  figure { margin: 0 0 12px; }
+  figcaption { font-size: 13px; color: #555; margin-top: 4px; }
+  .b { width: 180px; height: 90px; }
+</style>
+</head>
+<body>
+
+<h1>Several layers, the first one on top</h1>
+
+<div class="row">
+  <figure><div class="b" style="background:
+      url(images/tile-100.png) no-repeat left top,
+      linear-gradient(90deg, #cfe, #fce)"></div>
+    <figcaption>a picture over a wash</figcaption></figure>
+  <figure><div class="b" style="background-image: url(images/small.png), url(images/tile-100.png);
+      background-repeat: no-repeat; background-position: left top, right bottom"></div>
+    <figcaption>a corner each</figcaption></figure>
+  <figure><div class="b" style="background-image: url(images/small.png), url(images/tile-100.png);
+      background-repeat: no-repeat, repeat; background-position: 50% 50%"></div>
+    <figcaption>one placed, one tiled</figcaption></figure>
+  <figure><div class="b" style="background-color: #ffe;
+      background-image: linear-gradient(#0000, #0006)"></div>
+    <figcaption>a wash over a colour</figcaption></figure>
+  <figure><div class="b" style="background-image: url(images/small.png), url(images/tile-100.png);
+      background-size: 30px 30px, 180px 90px; background-repeat: repeat, no-repeat"></div>
+    <figcaption>a size each</figcaption></figure>
+</div>
+
+<h1>A shadow inside the box</h1>
+
+<div class="row">
+  <figure><div class="b" style="box-shadow: inset 0 0 0 8px #3060c0"></div>
+    <figcaption>spread only — a ring</figcaption></figure>
+  <figure><div class="b" style="box-shadow: inset 12px 8px 0 0 #3060c0"></div>
+    <figcaption>offset, no blur</figcaption></figure>
+  <figure><div class="b" style="box-shadow: inset 0 0 16px #3060c0"></div>
+    <figcaption>blur from every edge</figcaption></figure>
+  <figure><div class="b" style="box-shadow: inset 8px 8px 12px 4px #3060c0"></div>
+    <figcaption>offset, blurred and spread</figcaption></figure>
+  <figure><div class="b" style="box-shadow: inset 0 0 0 -20px #3060c0"></div>
+    <figcaption>pulled back past the edge — nothing</figcaption></figure>
+</div>
+
+<h1>Inside and outside at once</h1>
+
+<div class="row">
+  <figure><div class="b" style="background: #ffe; border: 4px solid #999;
+      box-shadow: inset 0 0 0 6px #3060c0, 0 0 0 5px #c33"></div>
+    <figcaption>the inset one is inside the border</figcaption></figure>
+  <figure><div class="b" style="background: #ffe; border-radius: 24px;
+      box-shadow: inset 0 6px 10px #0006, 0 4px 8px #0004"></div>
+    <figcaption>both follow the corners</figcaption></figure>
+  <figure><div class="b" style="background: linear-gradient(#fff, #ddd);
+      box-shadow: inset 0 1px 0 #fff, inset 0 -2px 6px #0003, 0 1px 2px #0003"></div>
+    <figcaption>three shadows, in order</figcaption></figure>
+</div>
+
+</body>
+</html>

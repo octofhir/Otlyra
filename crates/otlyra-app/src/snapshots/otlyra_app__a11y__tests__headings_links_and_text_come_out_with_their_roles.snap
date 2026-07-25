@@ -1,0 +1,12 @@
+---
+source: crates/otlyra-app/src/a11y.rs
+expression: "outline.join(\"\\n\")"
+---
+Document "The title"
+  Heading
+    Label "A heading"
+  Paragraph
+    Label "Some"
+    Link
+      Label "link"
+    Label "text"

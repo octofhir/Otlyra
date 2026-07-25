@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>What happens to the spaces</title>
+<style>
+  body { margin: 0; padding: 24px; font: 16px/1.5 monospace; }
+  section { margin-bottom: 18px; }
+  h2 { font: bold 13px/1.4 system-ui, sans-serif; margin: 0 0 4px; color: #555; }
+  /* A ruler behind the text: every case is judged on where the ink starts and
+     how wide it is, and in a monospace face that is countable by eye. */
+  .m { background: #f2f2f2; display: inline-block; }
+  .narrow { width: 90px; background: #f2f2f2; }
+  img { width: 40px; height: 20px; vertical-align: bottom; }
+</style>
+</head>
+<body>
+
+<section>
+  <h2>A space that ends one element is the space before the next</h2>
+  <div class="m"><span>a </span><span>b</span></div>
+  <div class="m"><span>a </span> <span>b</span></div>
+  <div class="m"><b>bold</b> <i>ital</i></div>
+</section>
+
+<section>
+  <h2>The ends of a paragraph are not spaces</h2>
+  <div class="m">   leading and trailing   </div>
+  <div class="m">
+    <span>first</span>
+    <span>second</span>
+  </div>
+</section>
+
+<section>
+  <h2>A forced break has no spaces either side of it</h2>
+  <div class="m">a<br> b</div>
+  <div class="m">a <br>b</div>
+</section>
+
+<section>
+  <h2>Pictures, and the markup between them</h2>
+  <div class="m"><img src="images/tile-100.png"><img src="images/tile-100.png"></div>
+  <div class="m">
+    <img src="images/tile-100.png">
+    <img src="images/tile-100.png">
+  </div>
+  <div class="m">word <img src="images/tile-100.png"> word</div>
+</section>
+
+<section>
+  <h2>The four ways of treating white space</h2>
+  <div class="m" style="white-space: pre">  two   spaces
+second line</div>
+  <div class="m" style="white-space: pre-wrap">  two   spaces
+second line</div>
+  <div class="m" style="white-space: pre-line">  two   spaces
+second line</div>
+  <div class="m" style="white-space: nowrap">nowrap   collapses   the same</div>
+</section>
+
+<section>
+  <h2>Wrapping, where the spaces fall between lines</h2>
+  <div class="narrow">one two three four five</div>
+  <div class="narrow" style="white-space: pre-wrap">one two three four five</div>
+</section>
+
+</body>
+</html>

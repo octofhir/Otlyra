@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Choosing between the pictures a page offers</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  section { margin-bottom: 20px; }
+  h2 { font-size: 15px; margin: 0 0 6px; }
+  p { margin: 0 0 8px; color: #444; }
+  img { display: block; }
+  /* Each file is one flat colour, so which one was chosen is the colour on the
+     page: red is a hundred pixels wide, green two hundred, blue four hundred,
+     purple eight hundred. The size it is drawn at is the file's own divided by
+     the density it was chosen for. */
+</style>
+</head>
+<body>
+
+<section>
+  <h2>Two densities</h2>
+  <p>Red at one device pixel per CSS pixel, green at two.</p>
+  <img srcset="images/tile-100.png 1x, images/tile-200.png 2x"
+       src="images/tile-400.png">
+</section>
+
+<section>
+  <h2>A src beside a density list</h2>
+  <p>Nothing in the list is for this density, so the plain address is what is
+    left: blue, four hundred pixels wide and drawn at four hundred.</p>
+  <img srcset="images/tile-200.png 2x" src="images/tile-400.png">
+</section>
+
+<section>
+  <h2>Widths against a stated size</h2>
+  <p>Drawn a hundred and fifty across: the two-hundred file is the smallest that
+    can fill it, so green, drawn at a hundred and fifty.</p>
+  <img srcset="images/tile-100.png 100w,
+               images/tile-200.png 200w,
+               images/tile-400.png 400w"
+       sizes="150px">
+</section>
+
+<section>
+  <h2>Widths against half the window</h2>
+  <p>Nothing on offer is dense enough for half of a wide window, so the widest
+    file wins and is drawn at the size it was asked for.</p>
+  <img srcset="images/tile-100.png 100w,
+               images/tile-400.png 400w,
+               images/tile-800.png 800w"
+       sizes="(max-width: 600px) 100vw, 50vw">
+</section>
+
+<section>
+  <h2>Widths with nothing said about the size</h2>
+  <p>The whole window, which is what the specification says an absent
+    <code>sizes</code> means — so the widest file, drawn the width of the page.</p>
+  <img srcset="images/tile-400.png 400w, images/tile-800.png 800w">
+</section>
+
+<section>
+  <h2>Alternatives in front of the picture</h2>
+  <p>A wide window takes the first source; a format nothing can decode is passed
+    over; the <code>&lt;img&gt;</code> is what is left when none of them apply.</p>
+  <picture>
+    <source media="(min-width: 700px)" srcset="images/tile-400.png">
+    <source type="image/nonesuch" srcset="images/tile-800.png">
+    <img src="images/tile-100.png">
+  </picture>
+</section>
+
+</body>
+</html>

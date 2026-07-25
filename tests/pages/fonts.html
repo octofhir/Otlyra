@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fonts a page brings with it</title>
+<style>
+  /* The vendored face, under a name no installed family has: if the page is set
+     in it, it was fetched and registered rather than fallen back to. */
+  @font-face {
+    font-family: "Brought Along";
+    src: url("../../crates/otlyra-text/fonts/Roboto-Regular.ttf");
+  }
+  @font-face {
+    font-family: "Never Arrives";
+    src: url("nothing-here.ttf");
+  }
+  body { margin: 8px; font: 24px/1.3 Times; }
+  .brought { font-family: "Brought Along", Times; }
+  .missing { font-family: "Never Arrives", Times; }
+  .local { font-family: Times; }
+</style>
+</head>
+<body>
+
+<p class="brought">Handgloves 0123 — the family the page brought</p>
+<p class="local">Handgloves 0123 — the family the platform has</p>
+<p class="missing">Handgloves 0123 — a family that never arrived</p>
+
+<p class="brought" style="font-weight: bold">Bold, from a face that has no bold</p>
+<p class="brought" style="font-style: italic">Italic, from a face that has no italic</p>
+
+</body>
+</html>

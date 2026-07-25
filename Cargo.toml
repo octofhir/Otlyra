@@ -1,0 +1,252 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/otlyra-app",
+    "crates/otlyra-css",
+    "crates/otlyra-dom",
+    "crates/otlyra-gfx",
+    "crates/otlyra-html",
+    "crates/otlyra-layout",
+    "crates/otlyra-net",
+    "crates/otlyra-paint",
+    "crates/otlyra-platform",
+    "crates/otlyra-text",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/octofhir/Otlyra"
+
+# Every version is pinned exactly. No wildcards, no unpinned git dependencies.
+[workspace.dependencies]
+otlyra-css = { path = "crates/otlyra-css", version = "0.0.0" }
+otlyra-dom = { path = "crates/otlyra-dom", version = "0.0.0" }
+otlyra-gfx = { path = "crates/otlyra-gfx", version = "0.0.0" }
+otlyra-html = { path = "crates/otlyra-html", version = "0.0.0" }
+otlyra-layout = { path = "crates/otlyra-layout", version = "0.0.0" }
+otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
+otlyra-paint = { path = "crates/otlyra-paint", version = "0.0.0" }
+otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
+otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
+
+# Windowing and GPU surface. Both are wrapped by otlyra-platform: neither may
+# appear in that crate's public API.
+#
+# `default-features = false` drops winit's X11 and Wayland backends. They are inert
+# on macOS but drag in the whole wayland-scanner/quick-xml and sctk-adwaita/ttf-parser
+# tree, which carries live advisories. Linux support re-enables them per target.
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+wgpu = "=30.0.0"
+
+# Native menus. winit has none, and drawing them ourselves would lose the system
+# menu bar, accessibility and system-wide shortcut handling.
+#
+# `default-features = false` drops muda's GTK3 and libxdo backends, which are Linux
+# only and pull in the unmaintained gtk-rs GTK3 bindings. Linux re-enables them.
+muda = { version = "=0.19.3", default-features = false }
+
+# Cocoa bindings, for the Dock icon an unbundled binary cannot get from a plist.
+# Versions match muda's so the two share one objc2 in the graph.
+objc2 = "=0.6.4"
+objc2-app-kit = "=0.3.2"
+objc2-foundation = "=0.3.2"
+raw-window-handle = "=0.6.2"
+
+# 2D rasterizer, behind the PaintTarget seam.
+# Defaults kept deliberately. Dropping `embed-icudtl` would shed ~10 MB and a
+# one-off ~79 ms on the first glyph — but rust-skia publishes prebuilt binaries per
+# feature permutation, and that one is not among them, so the saving costs a
+# from-source Skia build on every machine. Revisit if the permutation appears.
+# `svg` is the module that parses and draws SVG. A page's logo and its icons are
+# vector, and a rasterizer that refuses them draws the most recognisable thing on
+# a page as nothing at all — so this is the same rasterizer doing one more job
+# rather than a second one beside it.
+# `webp` comes with it because the published binaries are built per feature set
+# and this is the set that exists — which is no loss: the web serves WebP
+# everywhere, and a rasterizer that cannot decode it draws those pictures as
+# nothing too.
+skia-safe = { version = "=0.99.0", features = ["svg", "webp"] }
+
+# Font enumeration, CSS family matching, shaping and line breaking.
+parley = "=0.11.0"
+
+# Reading a font's own tables. Already in the tree as parley's own dependency and
+# pinned to the same version, so this costs no package and cannot pull a second
+# copy — it is named here because we need one thing parley does not hand back: a
+# face's vertical metrics *before* a paragraph is shaped, which is what decides how
+# tall a line with `line-height: normal` is.
+skrifa = "=0.43.2"
+
+# Unpacking the fonts a page brings with it. A `@font-face` on the web names a
+# WOFF or a WOFF2, which is an OpenType font in a compressed container, and every
+# font library in this tree reads OpenType and nothing else — so a page that ships
+# its typeface was silently set in whatever the stack fell back to. Pure Rust, and
+# its three dependencies (`brotli-decompressor`, `flate2`, `bytes`) are all already
+# in the tree, so it is one package rather than a subtree.
+wuff = "=0.2.8"
+
+# Reading a `data:` URL, which is a resource written into the page rather than
+# fetched: the payload is percent-encoded, and often base64 on top of that. Both
+# crates are already in the tree — `url` brings the first and the TLS stack the
+# second — so these are two lines in a manifest rather than two packages.
+base64 = "=0.22.1"
+percent-encoding = "=2.3.2"
+
+# Geometry and brush vocabulary shared by every PaintTarget backend.
+kurbo = "=0.13.1"
+peniko = "=0.6.1"
+
+# Accessibility. winit has none of its own (#1878, open since 2021), and a browser
+# has to build this tree out of the DOM whatever toolkit it uses — which is why the
+# plan puts it here rather than later: retrofitting it is the expensive path.
+#
+# `accesskit_winit` 0.33 rather than the 0.32 the plan named: both target the winit
+# 0.30 line and the same accesskit, and the newer one is where the fixes are.
+accesskit = "=0.24.1"
+#
+# `default-features = false` for the same reason winit and muda take it: the
+# defaults turn on the X11 and Wayland backends, which are inert on macOS and drag
+# in `wayland-scanner` and its `quick-xml`, currently carrying two high-severity
+# advisories. Linux re-enables `accesskit_unix` per target.
+accesskit_winit = { version = "=0.33.2", default-features = false, features = ["rwh_06"] }
+
+# The system file dialogue, for `<input type=file>`. The page never opens it: it
+# asks, the shell answers, and what answers is a swappable detail — which is what
+# makes a platform this crate does not cover (a phone) a matter of answering the
+# same request another way rather than of changing the page.
+#
+# Defaults kept: on Linux they are the desktop portal and Wayland, which is what a
+# sandboxed application is supposed to use. The `gtk3` feature is *not* taken — it
+# is the same unmaintained GTK3 binding tree that is dropped from winit and muda.
+rfd = "=0.17.2"
+
+# The system clipboard, for the interface's text fields. Text only:
+# `default-features = false` drops `image-data` (which drags in the `image`
+# crate) and the Linux Wayland backend; Linux re-enables the latter per target.
+arboard = { version = "=3.6.1", default-features = false }
+
+# Civil time, for grouping the history by the reader's local day. The one thing
+# std cannot answer is the local timezone, and answering it by hand means
+# maintaining a tz database — which is exactly what this crate is.
+jiff = "=0.2.34"
+
+# Observability.
+tracing = { version = "=0.1.44", features = ["log"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+
+# Data structures.
+smallvec = { version = "=1.15.2", features = ["union"] }
+rustc-hash = "=2.1.3"
+slotmap = "=1.1.1"
+
+# HTML tokenizer and tree construction. Hand-writing one to html5lib-green is
+# 8-11 kLOC and months; the parts we do write ourselves are the ones html5ever
+# leaves out, in otlyra-html.
+#
+# Pinned exactly and deliberately: html5ever's minors break, and its version is
+# further constrained by Stylo — `markup5ever` must agree with Stylo's `web_atoms`
+# when the cascade lands at M8.
+html5ever = "=0.39.0"
+
+# Zero-copy text slices off the parse buffer. `subtendril` is O(1) where `String`
+# is a copy, and the tokenizer produces a great many small slices.
+tendril = { version = "=0.5.1", features = ["encoding_rs"] }
+
+# The CSS engine. Seven version-locked crates, MPL-2.0, and the reason is §4.7 —
+# exactly two Rust crates model typed CSS property values, and the other one has no
+# cascade, no inheritance and no computed values, which is the hard part of the job.
+#
+# Pinned exactly and upgraded deliberately: stylo has no API stability and ships
+# semver-breaking releases roughly monthly.
+stylo = "=0.19.0"
+stylo_traits = "=0.19.0"
+stylo_atoms = "=0.19.0"
+stylo_dom = "=0.19.0"
+stylo_static_prefs = "=0.19.0"
+selectors = "=0.39.0"
+cssparser = "=0.37.0"
+servo_arc = "=0.4.3"
+# The interior mutability the style engine's element data is stored behind. Its
+# own API hands these out, so the version has to be the one it uses.
+atomic_refcell = "=0.1.13"
+# Geometry and length types the style engine's own API hands back, so the versions
+# have to be the ones it uses.
+euclid = "=0.22.11"
+app_units = "=0.7.8"
+
+# The WebSocket the remote-debugging protocol speaks over.
+#
+# Synchronous, and deliberately: the browser is one `!Send` object on one thread —
+# the page holds `Rc`s all the way down — so an async runtime around it would buy
+# nothing and cost a second scheduler beside the fetcher's threads. Defaults are
+# off because a debugging endpoint listens on the loopback and has no business
+# terminating TLS.
+tungstenite = { version = "=0.30.0", default-features = false, features = [
+    "handshake",
+] }
+
+# Display-list serialization, for snapshots today and IPC later.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.147"
+
+# Snapshot testing of display lists.
+insta = "=1.48.0"
+
+# PNG decoding, for image-comparison tests only.
+png = "=0.18.1"
+
+# Network. The feature set is Otter's, plus `stream`, so the two share one HTTP and
+# TLS tree rather than resolving two of everything.
+#
+# `default-features = false` drops reqwest's `charset` (which is `mime` plus a second
+# copy of the charset logic we own) and `system-proxy`. `rustls` brings
+# `rustls-platform-verifier`, so certificates are checked against the OS trust store
+# and not a vendored Mozilla list that we could never revoke from.
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "rustls",
+    "http2",
+    "json",
+    "gzip",
+    "stream",
+] }
+tokio = { version = "=1.53.0", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+] }
+
+# Named directly, and only, so that the process can install one crypto provider
+# explicitly. With two providers reachable there is no implicit default and
+# `ClientConfig::builder()` panics; being explicit turns that into our decision.
+rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-rs"] }
+
+# WHATWG URL. Hand-rolling this is how CVE-2024-12224 happened.
+url = "=2.5.8"
+
+# WHATWG encodings. The legacy index tables are not writable by hand.
+encoding_rs = "=0.8.35"
+
+# CLI and error plumbing.
+clap = { version = "=4.6.2", features = ["derive"] }
+thiserror = "=2.0.19"
+pollster = "=1.0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = "debuginfo"

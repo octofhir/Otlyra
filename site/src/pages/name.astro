@@ -1,0 +1,83 @@
+---
+import Base from "../layouts/Base.astro";
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+<Base
+  title="The name — Otlyra"
+  description="Why the browser is called Otlyra, how to say it, and the legend nobody asked for."
+>
+  <h1>Otlyra</h1>
+  <p class="lede">
+    <strong>Ot·ly·ra</strong>, said <em>OT-lee-ra</em>. Three syllables, stress on
+    the first.
+  </p>
+
+  <p>
+    The <strong>Ot</strong> is from <a href="https://github.com/octofhir/otter">Otter</a>,
+    which is what the browser is built on and what the mark is a picture of. The
+    rest is <em>lyra</em> — a lyre, and the constellation named after one.
+  </p>
+
+  <h2>Why this one</h2>
+  <ul>
+    <li>It keeps the <code>Ot</code> that ties the browser to Otter.</li>
+    <li>It does not read like a crate name. A browser is a thing people open, not a dependency they add.</li>
+    <li>It is short enough to be a binary: <code>otlyra</code>.</li>
+    <li>It works for the browser, for the interface engine, and for the organisation, without any of the three sounding borrowed.</li>
+    <li>Searching for it turned up no existing product, company, browser or repository. Whether the domain is free is a question for a registrar rather than for a search engine.</li>
+  </ul>
+
+  <h2>The legend</h2>
+  <blockquote>
+    <p>
+      An otter carries one favourite stone its whole life, tucked in the pocket
+      of loose skin under its arm. It is not sentiment. It is a tool: everything
+      the river closes — a clam, a mussel, a snail — the otter opens by knowing
+      exactly where the shell is weak and striking there, and nowhere else.
+    </p>
+    <p>
+      The story goes that one otter, floating on its back in the usual way, found
+      a lyre drifting down the river with its strings still on. It set the lyre on
+      its chest where the stone normally went, and struck a shell against it out of
+      habit. The shell opened. So did the note.
+    </p>
+    <p>
+      From then on the otter could hear the structure of a thing before it broke
+      it: which part was holding the rest together, and which part was only in the
+      way. It stopped hammering. It started listening, and then it opened things
+      on the first try.
+    </p>
+  </blockquote>
+  <p>
+    Which is a long way of saying: a browser is a machine for turning bytes into
+    a structure, and the useful ones let you <em>see</em> the structure rather
+    than guess at it from the pixels. That is what the
+    <a href={`${base}/devtools/`}>inspector</a> is for, and it is why the same
+    answers are on the wire for <a href={`${base}/agents/`}>a program</a> to ask
+    for.
+  </p>
+  <p style="color: var(--dim)">
+    No otters were involved in the naming. The lyre is, as far as anyone can
+    establish, entirely made up.
+  </p>
+
+  <h2>The mark</h2>
+  <p>
+    An otter, face on, half out of the water. The ring behind it runs violet to
+    cyan through blue, and every accent on this site is a point on that same run —
+    so the palette has one source rather than a designer's opinion of one.
+  </p>
+  <div class="marks">
+    <img src={`${base}/logo-circle.png`} alt="Otlyra's otter in a circle" width="84" height="84" />
+    <img src={`${base}/logo-square.png`} alt="Otlyra's otter in a rounded square" width="84" height="84" />
+    <img src={`${base}/logo-chrome.png`} alt="Otlyra's otter as a browser chrome mark" width="84" height="84" />
+    <img src={`${base}/logo-line.png`} alt="Otlyra's otter as a line drawing" width="84" height="84" />
+  </div>
+  <p>
+    The circle is the one on this page and in the tab bar of your browser. The
+    rounded square is the application icon, which is the shape macOS wants. The
+    line drawing is for places that get one colour and no say in which — a stamp
+    on a diagram, a terminal, a print.
+  </p>
+</Base>
