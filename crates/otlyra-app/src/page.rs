@@ -664,6 +664,11 @@ impl PageScene {
         if self.is_link(node) {
             return true;
         }
+        // Anything the page put a readable `tabindex` on, whatever it is
+        // otherwise: that is what the attribute is for.
+        if self.tabindex_of(node).is_some() {
+            return true;
+        }
         match otlyra_dom::form::Control::of(&self.document, node) {
             Some(control) => {
                 !matches!(
@@ -693,18 +698,49 @@ impl PageScene {
             && self.attribute(node, "href").is_some()
     }
 
+    /// What `tabindex` says about a node, if it says anything readable.
+    ///
+    /// A value that is not a number is no value: HTML says an invalid one is
+    /// ignored, which leaves the element focusable exactly as it would have
+    /// been without the attribute.
+    fn tabindex_of(&self, node: NodeId) -> Option<i32> {
+        self.attribute(node, "tabindex")?.trim().parse().ok()
+    }
+
     /// Everything the keyboard may stop on, in the order a reader meets it.
     ///
-    /// Document order and nothing else: `tabindex` is not read, so this is the
-    /// specification's *sequential focus navigation* over what a browser
-    /// focuses by default. A page that reorders its own traversal does not get
-    /// what it asked for, which is stated in the plan rather than guessed at
-    /// here.
+    /// HTML's sequential focus navigation order: the positive `tabindex` values
+    /// first, ascending, then everything focusable by default or by `tabindex=0`
+    /// in document order. Ties keep document order, which is what makes the
+    /// order stable rather than an accident of how it was collected. A negative
+    /// value is focusable — a script or a press may put the focus there — and
+    /// is not walked to, which is the whole of what it is for.
     fn focus_order(&self) -> Vec<NodeId> {
-        in_document_order(&self.document, self.document.root())
-            .into_iter()
-            .filter(|node| self.is_focusable(*node))
-            .collect()
+        let mut ordered: Vec<(i32, usize, NodeId)> =
+            in_document_order(&self.document, self.document.root())
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, node)| {
+                    if !self.is_focusable(node) {
+                        return None;
+                    }
+                    let index = self.tabindex_of(node).unwrap_or(0);
+                    (index >= 0).then_some((index, position, node))
+                })
+                .collect();
+        // Zero comes last among the numbers, so it sorts as though it were
+        // larger than every positive one rather than smaller than all of them.
+        ordered.sort_by_key(|(index, position, _)| {
+            (
+                if *index == 0 {
+                    i64::MAX
+                } else {
+                    i64::from(*index)
+                },
+                *position,
+            )
+        });
+        ordered.into_iter().map(|(_, _, node)| node).collect()
     }
 
     /// Move the keyboard to the next thing it can stop on.

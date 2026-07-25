@@ -545,6 +545,25 @@ impl Focus {
             .map(|index| index as FocusId)
     }
 
+    /// The control at one end of the traversal, in the given direction.
+    ///
+    /// What a surface asks to know whether a step would wrap: at the end going
+    /// forward, the keyboard belongs to whatever is beyond this surface rather
+    /// than back at its start.
+    pub fn edge(&self, forward: bool) -> Option<FocusId> {
+        let entries = self.entries.borrow();
+        let mut members = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.enabled && entry.scope == 0)
+            .map(|(index, _)| index as FocusId);
+        if forward {
+            members.next_back()
+        } else {
+            members.next()
+        }
+    }
+
     /// What Tab moves to from `from`, wrapping past the end.
     pub fn next(&self, from: Option<FocusId>) -> Option<FocusId> {
         self.step(from, 1)

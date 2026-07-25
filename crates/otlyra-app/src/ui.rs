@@ -374,6 +374,12 @@ pub enum UiAction {
     Navigate(String),
     /// Open a tab.
     NewTab,
+    /// The keyboard walked off the end of the chrome and belongs to the page.
+    ///
+    /// The interface cannot put it there itself: which surface is beyond it,
+    /// and whether there is a document to walk at all, is the browser's to
+    /// know. `true` when the reader was going forward.
+    LeaveChrome(bool),
     /// Put the tab named `id` at this position in the strip.
     ///
     /// By id rather than by its current index, because the index is what the
@@ -1773,6 +1779,18 @@ impl BrowserUi {
         // Traversal, before anything a control might read the key as: Tab is
         // never a character the address field wants.
         if key == Key::Tab {
+            // At the end of the chrome's own order, the keyboard belongs to
+            // what is beyond it — the document — rather than back at this
+            // surface's other end. A popup that owns the keyboard keeps it:
+            // that is what makes it a trap.
+            let forward = !modifiers.shift;
+            if self.focus.scope(self.focused).is_none()
+                && self.focused.is_some()
+                && self.focused == self.focus.edge(forward)
+            {
+                self.focused = None;
+                return UiAction::LeaveChrome(forward);
+            }
             self.focused = if modifiers.shift {
                 self.focus.previous(self.focused)
             } else {

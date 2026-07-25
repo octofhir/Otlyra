@@ -2285,7 +2285,31 @@ impl Browser {
             UiAction::MoveTab { id, to } => self.move_tab(TabId(id), to),
             UiAction::Reload => self.reload(),
             UiAction::Context(command) => self.apply_context(command),
+            UiAction::LeaveChrome(forward) => self.hand_keyboard_to_the_page(forward),
         }
+    }
+
+    /// The keyboard walked off the end of the chrome: give it to the document.
+    ///
+    /// Only where there is one to walk. A blank tab and a browser page have
+    /// nothing to hand it to, so the chrome keeps it and wraps within itself,
+    /// which is what it did before there was anywhere else for it to go.
+    fn hand_keyboard_to_the_page(&mut self, forward: bool) {
+        let entered = self.tabs[self.active].system.is_none()
+            && self.tabs[self.active].page.as_mut().is_some_and(|page| {
+                // From the end the reader is coming in at, which is what
+                // makes shift-Tab out of the toolbar land on the last thing
+                // in the document rather than the first.
+                page.blur();
+                page.focus_step(forward)
+            });
+        if entered {
+            self.activate_surface(SURFACE_PAGE);
+            self.accessibility_dirty = true;
+            return;
+        }
+        // Nowhere to go: the chrome takes the keyboard back at its other end.
+        self.ui.focus_edge(forward);
     }
 
     /// Offer the omnibox somewhere to go, from what has been typed.
@@ -5449,6 +5473,98 @@ mod tests {
         assert_eq!(
             browser.tabs[browser.active].url,
             "https://walk.example/first"
+        );
+    }
+
+    /// And back again: at the end of the toolbar's own order the keyboard
+    /// returns to the document, entering from the end the reader is coming in
+    /// at. Without this the chrome is its own trap and the page is unreachable
+    /// once the keyboard has left it.
+    #[test]
+    fn tab_off_the_end_of_the_chrome_goes_back_into_the_page() {
+        let mut browser = Browser::new(LinkLoader);
+        go(&mut browser, "start.example");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(900, 700, 1.0),
+        );
+
+        // Walk the chrome until the keyboard runs off its end, which is where
+        // the document begins again.
+        let mut entered = false;
+        for _ in 0..40 {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Tab,
+                modifiers: Modifiers::default(),
+            });
+            if browser.keyboard_surface == SURFACE_PAGE {
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered, "the toolbar kept the keyboard to itself");
+        assert_eq!(
+            browser.tabs[browser.active]
+                .page
+                .as_ref()
+                .and_then(PageScene::focused_link)
+                .as_deref(),
+            Some("/next"),
+            "coming in forwards lands on the first thing in the document"
+        );
+    }
+
+    /// `tabindex` orders a page's own traversal: a positive value comes before
+    /// everything the browser would have walked by default, and a negative one
+    /// is reachable but never walked to.
+    #[test]
+    fn tabindex_orders_the_walk_and_takes_things_out_of_it() {
+        struct Indexed;
+
+        impl Loader for Indexed {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<title>Order</title><body>\
+                        <a href=\"/plain\">plain</a>\
+                        <a href=\"/skipped\" tabindex=\"-1\">skipped</a>\
+                        <a href=\"/first\" tabindex=\"1\">first</a>"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Indexed);
+        go(&mut browser, "https://order.example/");
+        browser.paint(
+            &mut otlyra_gfx::RecordingPainter::new(),
+            Viewport::new(900, 700, 1.0),
+        );
+        browser.on_event(PlatformEvent::PointerMoved { x: 700.0, y: 500.0 });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        browser.on_event(PlatformEvent::PointerReleased);
+
+        let mut reached = Vec::new();
+        for _ in 0..2 {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Tab,
+                modifiers: Modifiers::default(),
+            });
+            reached.push(
+                browser.tabs[browser.active]
+                    .page
+                    .as_ref()
+                    .and_then(PageScene::focused_link),
+            );
+        }
+
+        assert_eq!(
+            reached,
+            vec![Some("/first".to_owned()), Some("/plain".to_owned())],
+            "a positive tabindex comes first and a negative one is not walked to"
         );
     }
 

@@ -104,13 +104,10 @@ Focus scopes, the popup lifecycle and the shared dismissal rules are in place
 and are documented in `docs/interface.md`; the browser menu and the context menu
 are the two consumers they were written from.
 
-- [ ] Finish sequential focus navigation in the page. Tab and shift-Tab now
-  walk a document's links and controls in document order, show the ring, follow
-  a link on Return, and hand the keyboard to the chrome at either end. What is
-  missing: `tabindex` is not read, so a page cannot order or add to its own
-  traversal; the chrome does not hand back into the page when *its* traversal
-  runs off the end (it still wraps within itself); and the inspector is not in
-  the order at all.
+- [ ] Put the inspector in the traversal order. Chrome and page hand the
+  keyboard to each other at either end and `tabindex` is read; the panel is
+  still reachable only by pressing into it. It needs a stated place in the
+  round trip — after the page, before the chrome — and its own edge detection.
 - [ ] Extend pointer capture past the chrome surface. The contract exists —
   `CaptureId`, `Button::capture`, `Cx::take_pointer`, threshold, move, drop,
   cancel — and dragging a tab to reorder it is its consumer. What is left is
