@@ -1333,3 +1333,80 @@ fn a_table_cell_contains_the_floats_inside_it() {
         "the table did not grow to hold its floats: {after:?}"
     );
 }
+
+/// A percentage `min-height` against an ancestor that is as tall as its own
+/// contents means nothing, rather than meaning that fraction of its *width*.
+///
+/// `html { min-height: 100% }` and `body { min-height: 100% }` is what a great
+/// many pages open with. Resolved against the width — which is what everything
+/// horizontal resolves against and what this used to be handed — the body came
+/// out as tall as the window is wide and painted its background over the whole
+/// of it, hiding the canvas and the root element's background behind it.
+#[test]
+fn a_percentage_min_height_needs_an_ancestor_that_has_one() {
+    let tree = lay_out_styled(
+        "<html style='min-height: 100%'><body style='min-height: 100%; margin: 0'>\
+         <p style='margin: 0'>short</p></body></html>",
+        600.0,
+    );
+
+    // The root fragment is the initial containing block, then `html`, then the
+    // body: the height being asked about is the innermost of the three.
+    let root = tree.root.children.first().expect("an html box");
+    let body = root.children.first().expect("a body box");
+    assert!(
+        (root.rect.height - 600.0).abs() < 1.0,
+        "`html` takes its hundred percent of the viewport, which does have a height: {:?}",
+        root.rect
+    );
+    assert!(
+        body.rect.height < 100.0,
+        "and the body is as tall as one line of text rather than as tall as the page is wide: {:?}",
+        body.rect
+    );
+
+    // And one whose ancestor *does* have a height still takes its share of it.
+    let tree = lay_out_styled(
+        "<body style='margin: 0'><div style='height: 400px'>\
+         <div id=half style='min-height: 50%; background: #eee'>x</div></div>",
+        600.0,
+    );
+    let half = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Box))
+        .find(|fragment| (fragment.rect.height - 200.0).abs() < 1.0);
+    assert!(
+        half.is_some(),
+        "half of a four-hundred-tall ancestor is two hundred: {:?}",
+        tree.iter()
+            .filter(|fragment| matches!(fragment.kind, FragmentKind::Box))
+            .map(|fragment| fragment.rect.height)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A row of floated links is as wide as they add up to, so a column sized for
+/// one of them is a column that puts every link on a line of its own.
+#[test]
+fn floated_siblings_are_measured_side_by_side() {
+    let tree = lay_out_styled(
+        "<body style='margin: 0'><table><tr><td id=cell>\
+         <ul style='margin: 0; padding: 0'>\
+         <li style='list-style: none; float: left'>alpha</li>\
+         <li style='list-style: none; float: left'>bravo</li>\
+         <li style='list-style: none; float: left'>charlie</li>\
+         </ul></td></tr></table>",
+        800.0,
+    );
+
+    let runs: Vec<&Fragment> = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
+        .collect();
+    assert_eq!(runs.len(), 3, "three links: {runs:?}");
+    let tops: Vec<f32> = runs.iter().map(|run| run.rect.y).collect();
+    assert!(
+        tops.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.5),
+        "they sit on one line rather than one to a line: {tops:?}"
+    );
+}

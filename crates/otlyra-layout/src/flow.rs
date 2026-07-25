@@ -52,7 +52,10 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         collapsed: slotmap::SecondaryMap::new(),
         collapsed_lines: slotmap::SecondaryMap::new(),
         measured: std::collections::HashMap::new(),
-        containing_height: None,
+        // The initial containing block is the viewport, and the viewport has a
+        // height. So `html { min-height: 100% }` — which a great many pages open
+        // with — is a hundred percent of something rather than of nothing.
+        containing_height: Some(viewport.height),
         line_reach: (0.0, 0.0),
         span_reach: Vec::new(),
     };
@@ -1351,11 +1354,11 @@ impl<'a> Flow<'a> {
         // flex item is as wide as its line gave it. Taken rather than left, so a
         // table inside one does not report its width to the block outside.
         self.table_width = None;
-        let content_height = clamp(
+        let content_height = clamp_height(
             self.asked_height(&style).unwrap_or(content_height),
             style.min_height,
             style.max_height,
-            width,
+            self.containing_height,
         );
 
         // A field is one line long however much has been typed into it, so what
@@ -1683,11 +1686,11 @@ impl<'a> Flow<'a> {
             Some(_) => content_width,
             None => shrunk.unwrap_or(content_width),
         };
-        let content_height = clamp(
+        let content_height = clamp_height(
             self.asked_height(&style).unwrap_or(content_height),
             style.min_height,
             style.max_height,
-            containing_width,
+            self.containing_height,
         );
 
         if let Some(floats) = outer_floats {
@@ -3202,15 +3205,36 @@ impl<'a> Flow<'a> {
                 }
             }
             _ => {
+                // Boxes that stack need the widest of them. Floated siblings do
+                // not stack — they sit side by side until one clears or
+                // something that is not a float comes between them — so a run of
+                // them needs what it adds up to, the way a row of flex items
+                // does. Taking the widest of a row of floated links is asking a
+                // table for a column one word across and getting the links back
+                // one to a line.
                 let children = node.children.clone();
-                children
-                    .into_iter()
-                    .map(|child| {
-                        let child_style = &self.tree.node(child).style;
-                        let margin = resolve_margin(child_style, containing_width);
-                        self.max_content_width(child, containing_width) + margin.left + margin.right
-                    })
-                    .fold(0.0, f32::max)
+                let mut widest: f32 = 0.0;
+                let mut run: f32 = 0.0;
+                for child in children {
+                    let (floated, clears, margin) = {
+                        let style = &self.tree.node(child).style;
+                        (
+                            style.float != otlyra_css::Float::None,
+                            style.clear != otlyra_css::Clear::None,
+                            resolve_margin(style, containing_width),
+                        )
+                    };
+                    let width = self.max_content_width(child, containing_width)
+                        + margin.left
+                        + margin.right;
+                    run = match (floated, clears) {
+                        (true, false) => run + width,
+                        (true, true) => width,
+                        (false, _) => 0.0,
+                    };
+                    widest = widest.max(run).max(width);
+                }
+                widest
             }
         };
 
@@ -4426,6 +4450,30 @@ fn clamp(value: f32, min: Length, max: Option<Length>, containing: f32) -> f32 {
         None => value,
     };
     capped.max(min.resolve(containing))
+}
+
+/// The same, for a height.
+///
+/// A percentage here is of the containing block's *height*, and against an
+/// ancestor that is as tall as its own contents CSS says it means nothing at
+/// all — so it is dropped rather than resolved against something else. Against
+/// the width, which is what everything horizontal resolves against and what this
+/// used to be handed, `min-height: 100%` makes a box as tall as its parent is
+/// wide: a `<body>` painting its own background over the whole window and hiding
+/// the canvas — and the root element's background — behind it.
+fn clamp_height(value: f32, min: Length, max: Option<Length>, containing: Option<f32>) -> f32 {
+    let resolve = |length: Length| match length {
+        Length::Px(px) => Some(px),
+        Length::Percent(fraction) => containing.map(|height| fraction * height),
+    };
+    let capped = match max.and_then(resolve) {
+        Some(max) => value.min(max),
+        None => value,
+    };
+    match resolve(min) {
+        Some(min) => capped.max(min),
+        None => capped,
+    }
 }
 
 /// The four border widths, which are already absolute lengths by this point.
