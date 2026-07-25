@@ -445,3 +445,34 @@ fn hovering_a_button_emits_the_wash_under_its_mark() {
         "the wash goes down before the mark on top of it"
     );
 }
+
+/// The find bar, open over the page with a count of what it found.
+///
+/// Two frames because the first is what claims the field's focus id: ⌘F asks
+/// for the keyboard before the control it asks for exists, and the frame that
+/// builds the bar is what grants it.
+#[test]
+fn the_find_bar_outline_is_stable() {
+    let (mut ui, tabs, mut text) = toolbar();
+    ui.find.set_text("needle");
+    ui.find_status = otlyra_app::ui::FindStatus {
+        total: 17,
+        current: 3,
+    };
+    ui.open_find();
+    let _ = toolbar_list(&mut ui, &tabs, &mut text, None);
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    insta::assert_snapshot!(outline(&list));
+}
+
+/// The same bar with a query the page does not hold: the arrows are drawn dead
+/// and the count says *0 of 0* rather than saying nothing.
+#[test]
+fn a_find_bar_that_found_nothing_dims_its_arrows() {
+    let (mut ui, tabs, mut text) = toolbar();
+    ui.find.set_text("nowhere");
+    ui.open_find();
+    let _ = toolbar_list(&mut ui, &tabs, &mut text, None);
+    let list = toolbar_list(&mut ui, &tabs, &mut text, None);
+    insta::assert_snapshot!(outline(&list));
+}

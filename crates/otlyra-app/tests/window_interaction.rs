@@ -687,3 +687,70 @@ fn the_composited_window_is_what_a_whole_surface_paint_would_have_drawn() {
         "{differing} pixels differ between the composited window and a whole-surface paint",
     );
 }
+
+/// The find bar and the wash it puts on the page, both in the window.
+///
+/// Two claims at once, and both are compositor claims: the bar is a popup that
+/// hangs below the chrome band, and the wash is inside the page's own layer.
+/// A retained surface that clipped either to its own root would pass every
+/// offscreen test in this crate and show a reader nothing.
+#[test]
+fn the_find_bar_and_what_it_found_are_both_composited() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut browser = Browser::new(Pages);
+    browser.navigate("https://form.example/");
+    browser.wait_for_load(std::time::Duration::from_secs(5));
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+
+    let mut pump = FramePump::new(viewport);
+    pump.open(&mut browser)
+        .expect("the frame before the search");
+    let before = pump.png().expect("the window before");
+
+    let accelerator = Modifiers {
+        command: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        ..Modifiers::default()
+    };
+    pump.event(
+        &mut browser,
+        PlatformEvent::KeyPressed {
+            key: Key::Character('f'),
+            modifiers: accelerator,
+        },
+    );
+    // The frame that builds the bar is the frame that gives it the keyboard.
+    pump.frame(&mut browser)
+        .expect("the frame that opened the bar");
+    for character in "place".chars() {
+        pump.event(&mut browser, PlatformEvent::TextInput(character));
+    }
+    pump.frame(&mut browser).expect("the searched frame");
+    let after = pump.png().expect("the window after");
+
+    let (width, before) = decode(&before);
+    let (_, after) = decode(&after);
+
+    // The bar itself, under the toolbar at the right-hand end.
+    let bar = (520, UI_HEIGHT as u32 + 8, 360, 34);
+    assert_ne!(
+        region(&before, width, bar),
+        region(&after, width, bar),
+        "the bar opened and the compositor clipped it away"
+    );
+    // And the word it found, far down the page, washed behind the letters.
+    let found = (40, UI_HEIGHT as u32 + 360, 300, 20);
+    assert_ne!(
+        region(&before, width, found),
+        region(&after, width, found),
+        "the match was found and the page's layer was never redrawn"
+    );
+
+    let painted =
+        otlyra_platform::render_offscreen(&mut browser, viewport).expect("the whole-surface bar");
+    let (_, painted) = decode(&painted);
+    assert_eq!(
+        after, painted,
+        "the retained compositor and whole-surface path disagree on the find bar"
+    );
+}

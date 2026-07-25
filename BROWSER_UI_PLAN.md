@@ -131,27 +131,35 @@ are the two consumers they were written from.
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
 
-## Next large feature — find in page
+## Next large feature — page zoom
 
-Chosen over cookies/cache, page zoom and the half-drawn controls because it is
-entirely ours, it is what a reader of a document reaches for, and it lands on
-the popup, focus-scope and traversal contracts this priority already built.
+Find in page is done, and what it left behind is worth knowing before the next
+thing is built on it. `PageScene::scroll_to_rect` moves the page and not a box
+inside it, which needs the rectangle in the box's own coordinates rather than
+the page's; the inspector's reveal will want that version. The find bar is the
+first popup that is a *mode* rather than a choice — it declares a focus scope,
+carries no sheet, and is not dismissed by a press or an accelerator elsewhere —
+so `Popup::transient` is the question every dismissal now asks. Its field takes
+the keyboard during the build that claims its id, which is the only way a
+control can be focused in the same frame it first appears in.
 
-The engine is in: `otlyra_layout::find` strings the runs into one sequence with
-each character carrying the run and bytes it came from, and answers in
-`Selection`s, so a match is drawn by the arithmetic that is already right about
-ligatures, line breaks and bidi runs. `PageScene` holds the search per page and
-runs it again on every relayout. The matches are painted: one highlight layer
-carrying `otlyra_paint::Highlight` per rectangle, every match washed and the one
-the reader is on drawn strongly over it. `PageScene::scroll_to_rect` moves the
-page the least that will bring a rectangle on screen, and stepping to a match
-uses it — the inspector's reveal wants the same call, and a box that scrolls
-still scrolls for nobody. What is left:
+Page zoom is next, over cookies/cache and the half-drawn controls: it is
+entirely ours, it needs nothing from a script engine, and it is the one setting
+a reader changes on a page they are already reading. Three slices:
 
-- [ ] **The bar.** A panel on the popup contract: its own text field, the count
-  as *3 of 17*, previous/next, and a close cross. ⌘F opens and focuses it, Enter
-  and shift-Enter step, Escape closes it and drops the highlights, ⌘G steps
-  without the bar having the keyboard. Per tab, cleared on navigation.
+- [ ] **The factor, and what it multiplies.** A zoom per origin, held by the
+  browser and applied to the page's own scale rather than to the window's — the
+  chrome does not zoom, which is what separates this from the device scale the
+  compositor already carries. `PageScene::set_text_scale` is the wrong lever:
+  it moves the root font size, and a zoom moves lengths, borders and pictures
+  too.
+- [ ] **Reaching it.** ⌘+, ⌘− and ⌘0, a row in the browser menu showing the
+  current factor, and the wheel with the accelerator held. Where the page was
+  scrolled to has to survive a zoom, which means the scroll is restored against
+  content that is a different height.
+- [ ] **Remembering it.** Per origin, in the preferences store, so a site that
+  needs 125% keeps it across a restart — which is the whole reason a reader
+  bothers to set one.
 
 ## Priority 5 — Design system and fast UI authoring
 

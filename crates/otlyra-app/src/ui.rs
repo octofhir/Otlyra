@@ -53,6 +53,10 @@ const MENU_SCOPE: FocusScopeId = FocusScopeId::new(1);
 /// The same trap, for the menu the reader asks for over the page.
 const CONTEXT_SCOPE: FocusScopeId = FocusScopeId::new(2);
 
+/// And for the find bar, whose field, arrows and cross are the whole of where
+/// Tab may go while it is open.
+const FIND_SCOPE: FocusScopeId = FocusScopeId::new(3);
+
 /// The widest a tab is allowed to be, however few there are.
 const TAB_MAX_WIDTH: f64 = 220.0;
 /// The narrowest a tab may shrink to before the strip overflows instead.
@@ -437,6 +441,38 @@ pub enum UiAction {
     /// The field reports where; what a click, a double-click or a drag there
     /// means to the caret and the anchor is the interface's to decide.
     AddressHit(FieldHit),
+    /// The same, for the find bar's own field.
+    ///
+    /// A second action rather than a second reader of the first: the two fields
+    /// hold different text and one press belongs to exactly one of them, and an
+    /// offset with no field attached would be an offset either could take.
+    FindHit(FieldHit),
+    /// Go to the next place the query occurs, or the one before it.
+    ///
+    /// Never reaches the query itself: what is being looked for is in the bar's
+    /// field, which the browser reads, so this says only *move*.
+    FindStep(bool),
+    /// Put the find bar away.
+    ///
+    /// Never reaches the browser: whether a bar is open is the interface's own
+    /// state, like the menu, and whether the page is still searched is answered
+    /// by asking the bar rather than by being told.
+    CloseFind,
+}
+
+/// What the find bar says about what it found.
+///
+/// Written by the browser wherever the page is searched, because how many times
+/// a query occurs is a fact about the document. The interface keeps it only to
+/// draw *3 of 17* with.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindStatus {
+    /// How many places the query occurs on the page.
+    pub total: usize,
+    /// Which of them the reader is on, counted from one. Zero when there are
+    /// none — there is no zeroth match, and *0 of 0* is what a bar with nothing
+    /// found says.
+    pub current: usize,
 }
 
 /// What one row of the context menu does.
@@ -656,6 +692,13 @@ struct Appearance {
     /// things the frame draws, and a key that did not carry them would draw the
     /// first context menu forever.
     popup: Option<(f64, Popup)>,
+    /// What the find bar shows, while one is open.
+    ///
+    /// Beside the popup rather than inside it, because `Popup::Find` carries
+    /// nothing: the query lives on the interface the way the address does, and
+    /// the count is the browser's answer about the document. All of it is drawn,
+    /// so all of it is in the key.
+    find: Option<FindLook>,
     /// Whether the page in the active tab is one the reader kept.
     ///
     /// Part of what the interface draws because the star and the menu both say which
@@ -663,6 +706,15 @@ struct Appearance {
     /// wrong one would be the interface lying about what a press does.
     bookmark: Bookmarked,
     tab_scroll: f64,
+}
+
+/// Everything the find bar draws.
+#[derive(Clone, PartialEq)]
+struct FindLook {
+    text: String,
+    caret: Option<usize>,
+    selection: Option<std::ops::Range<usize>>,
+    status: FindStatus,
 }
 
 impl Appearance {
@@ -813,6 +865,12 @@ enum Popup {
         /// reader down to the row they had just got to.
         marked: Option<usize>,
     },
+    /// The bar that looks for a run of characters in the page.
+    ///
+    /// It carries nothing: what has been typed is a field on the interface, the
+    /// way the address is, and what was found is the browser's answer about the
+    /// document.
+    Find,
 }
 
 impl Popup {
@@ -826,7 +884,20 @@ impl Popup {
             Self::Menu => Some(MENU_SCOPE),
             Self::Context { .. } => Some(CONTEXT_SCOPE),
             Self::Suggestions { .. } => None,
+            Self::Find => Some(FIND_SCOPE),
         }
+    }
+
+    /// Whether reaching past this panel puts it away.
+    ///
+    /// A menu is a choice being made, so pressing elsewhere or naming another
+    /// control with an accelerator is that choice being abandoned. The find bar
+    /// is not a choice — it is a mode the reader is in, with a query they are
+    /// part way through — so clicking the page or pressing ⌘L leaves it open,
+    /// which is what every browser does and what makes *look for this, then
+    /// look at that* possible at all.
+    fn transient(&self) -> bool {
+        !matches!(self, Self::Find)
     }
 
     /// Whether a sheet under it takes every press that misses the panel.
@@ -834,9 +905,11 @@ impl Popup {
     /// A menu is modal to the pointer: pressing anywhere else means *put this
     /// away* and nothing more. Suggestions are not — a reader who clicks the
     /// page while the list is showing means to click the page, and a sheet
-    /// would also stop the wheel from scrolling what is behind it.
+    /// would also stop the wheel from scrolling what is behind it. Neither is
+    /// the find bar, for the stronger version of the same reason: reading the
+    /// page it is searching is the whole point of having searched it.
     fn has_sheet(&self) -> bool {
-        !matches!(self, Self::Suggestions { .. })
+        !matches!(self, Self::Suggestions { .. } | Self::Find)
     }
 }
 
@@ -844,6 +917,20 @@ impl Popup {
 pub struct BrowserUi {
     /// The address field.
     pub address: TextField,
+    /// The find bar's own field: what is being looked for on the page.
+    pub find: TextField,
+    /// What the browser found for it.
+    pub find_status: FindStatus,
+    /// Whether the bar's field should take the keyboard as soon as it exists.
+    ///
+    /// ⌘F opens the bar *and* focuses it, but a control's focus id is claimed by
+    /// the frame that draws it and there is no id to hand the keyboard to before
+    /// then. So the wish is recorded here and granted during the build, at the
+    /// moment the field claims its id — which is why it is a cell: the tree is
+    /// built from `&self`.
+    find_takes_keyboard: std::cell::Cell<bool>,
+    /// The id the build moved the keyboard to, for the build to adopt afterwards.
+    focus_granted: std::cell::Cell<Option<FocusId>>,
     /// The panel drawn over everything, if one is open.
     popup: Option<Popup>,
     /// Whether the page in the active tab is one the reader kept.
@@ -970,6 +1057,10 @@ impl BrowserUi {
             tab_runtime.mount(None, WidgetType::of::<TabStripRenderNode>(), None);
         Self {
             address: TextField::default(),
+            find: TextField::default(),
+            find_status: FindStatus::default(),
+            find_takes_keyboard: std::cell::Cell::new(false),
+            focus_granted: std::cell::Cell::new(None),
             popup: None,
             bookmark: Bookmarked::Impossible,
             theme: Theme::light(),
@@ -1098,8 +1189,10 @@ impl BrowserUi {
             .root
             .as_mut()
             .and_then(|root| root.event(&Event::PointerMoved, &mut cx));
-        if let Some(UiAction::AddressHit(hit)) = action {
-            self.address.hit(hit);
+        match action {
+            Some(UiAction::AddressHit(hit)) => self.address.hit(hit),
+            Some(UiAction::FindHit(hit)) => self.find.hit(hit),
+            _ => {}
         }
         UiAction::None
     }
@@ -1226,11 +1319,77 @@ impl BrowserUi {
 
     /// Whether the address field has the keyboard.
     ///
-    /// A question about where the focus is, not a flag: the field is the one
-    /// text entry the toolbar builds, so the caret is on exactly when the focus
-    /// is on something a caret belongs in.
+    /// A question about where the focus is, not a flag. There are two fields on
+    /// this surface once the find bar is open, and they hold different text —
+    /// so *a caret is somewhere* is not the question, and which scope the
+    /// keyboard is in is what tells them apart.
     pub fn address_focused(&self) -> bool {
+        self.focus.kind(self.focused) == Some(FocusKind::Text) && !self.find_focused()
+    }
+
+    /// Whether the find bar's own field has it.
+    pub fn find_focused(&self) -> bool {
         self.focus.kind(self.focused) == Some(FocusKind::Text)
+            && self.focus.scope(self.focused) == Some(FIND_SCOPE)
+    }
+
+    /// Whether the find bar is open.
+    pub fn finding(&self) -> bool {
+        self.popup == Some(Popup::Find)
+    }
+
+    /// Whether ⌘F has asked for the keyboard and the bar has yet to be built.
+    ///
+    /// What the browser routes the next keystroke by: the field is about to hold
+    /// the keyboard and does not hold it yet, and a surface chosen on the second
+    /// fact alone would send the letter after ⌘F to the page.
+    pub fn find_wants_keyboard(&self) -> bool {
+        self.find_takes_keyboard.get()
+    }
+
+    /// Open the find bar and give it the keyboard, which is what ⌘F means.
+    ///
+    /// Everything already in the field is selected, so the next character typed
+    /// replaces the last search rather than extending it — a reader who presses
+    /// ⌘F is starting a search, and one who wanted to keep the old query still
+    /// has it in front of them to step through.
+    pub fn open_find(&mut self) {
+        if !self.finding() {
+            self.open_popup(Popup::Find);
+        }
+        self.find.select_all();
+        self.find_takes_keyboard.set(true);
+    }
+
+    /// Show the bar for a search the page is already carrying.
+    ///
+    /// What a tab coming to the front does: the query belongs to the page, so
+    /// the bar is the page's search made visible rather than a second copy of
+    /// it. The keyboard stays where it is — arriving at a tab is not asking to
+    /// type into it.
+    pub fn restore_find(&mut self, query: &str) {
+        if !self.finding() {
+            self.open_popup(Popup::Find);
+        }
+        self.find.set_text(query);
+    }
+
+    /// Put the find bar away.
+    pub fn close_find(&mut self) {
+        if self.finding() {
+            self.close_popup(true);
+        }
+    }
+
+    /// Put away a panel that reaching past it dismisses.
+    ///
+    /// Every press that lands elsewhere and every accelerator that names another
+    /// control comes through here rather than through [`Self::close_popup`], so
+    /// that the one panel which is a mode rather than a choice stays open.
+    fn dismiss_transient(&mut self) {
+        if self.popup.as_ref().is_some_and(Popup::transient) {
+            self.close_popup(false);
+        }
     }
 
     /// Take the focus off whatever holds it — the toolbar's job when a press
@@ -1288,7 +1447,9 @@ impl BrowserUi {
     /// What the pointer should look like at `x`, `y`, if the interface claims it.
     pub fn cursor_at(&mut self, x: f64, y: f64, text: &mut TextEngine) -> Option<Cursor> {
         match self.action_at(x, y, text) {
-            Some(UiAction::Focus(_) | UiAction::AddressHit(_)) => Some(Cursor::Text),
+            Some(UiAction::Focus(_) | UiAction::AddressHit(_) | UiAction::FindHit(_)) => {
+                Some(Cursor::Text)
+            }
             // The sheet behind an open menu answers everywhere, and everywhere
             // is not a thing to point at: dismissing is what happens when you
             // press *nothing*, so it reads as nothing.
@@ -1372,7 +1533,7 @@ impl BrowserUi {
 
         match action {
             Some(UiAction::Focus(id)) => {
-                self.close_popup(false);
+                self.dismiss_transient();
                 self.focused = Some(id);
                 UiAction::None
             }
@@ -1381,11 +1542,20 @@ impl BrowserUi {
             // click count. The field said where; whose keyboard it is stays
             // the surface's business.
             Some(UiAction::AddressHit(hit)) => {
-                self.close_popup(false);
+                self.dismiss_transient();
                 if let Some(id) = self.focus.first_text() {
                     self.focused = Some(id);
                 }
                 self.address.hit(hit);
+                UiAction::None
+            }
+            // The same for the find bar's field, which is the last one built
+            // because the panel it is in is drawn over everything else.
+            Some(UiAction::FindHit(hit)) => {
+                if let Some(id) = self.focus.last_text() {
+                    self.focused = Some(id);
+                }
+                self.find.hit(hit);
                 UiAction::None
             }
             Some(UiAction::ToggleMenu) => {
@@ -1406,21 +1576,29 @@ impl BrowserUi {
             // open over the page it just opened would have to be dismissed by
             // hand every time.
             Some(UiAction::OpenPage(page)) => {
-                self.close_popup(false);
+                self.dismiss_transient();
                 UiAction::OpenPage(page)
             }
             // The same for the inspector: chosen from the menu, the menu goes
             // away and what was chosen is what happens.
             Some(UiAction::ToggleInspector) => {
-                self.close_popup(false);
+                self.dismiss_transient();
                 UiAction::ToggleInspector
             }
             // A row of the context menu, which is the whole of what that menu is
             // for: it goes away and the browser is told what was chosen.
             Some(UiAction::Context(command)) => {
-                self.close_popup(false);
+                self.dismiss_transient();
                 UiAction::Context(command)
             }
+            // The bar's own cross, which is the one press that closes it.
+            Some(UiAction::CloseFind) => {
+                self.close_popup(true);
+                UiAction::None
+            }
+            // Its arrows keep the keyboard where it is: a reader stepping with
+            // the pointer is still typing into the field.
+            Some(UiAction::FindStep(forward)) => UiAction::FindStep(forward),
             Some(action) => {
                 if !matches!(
                     action,
@@ -1432,7 +1610,7 @@ impl BrowserUi {
             }
             None => {
                 self.focused = None;
-                self.close_popup(false);
+                self.dismiss_transient();
                 UiAction::None
             }
         }
@@ -1510,8 +1688,13 @@ impl BrowserUi {
     /// The browser says when that happens, because the interface cannot see it:
     /// a popup belongs to the root that opened it, and a root that stops being
     /// the active one has no business keeping a panel over the window.
+    ///
+    /// The find bar belongs to the page rather than to the chrome, so the
+    /// keyboard moving to the document is not its root going away — it is the
+    /// reader reading what they searched for. It goes when the page does, which
+    /// is a different question, asked by whoever owns the page.
     pub fn dismiss_popup(&mut self) {
-        self.close_popup(false);
+        self.dismiss_transient();
     }
 
     /// Put away only the menu the reader asked for over the page.
@@ -1726,6 +1909,14 @@ impl BrowserUi {
             return UiAction::None;
         }
 
+        // Return in the find bar's field steps rather than submits: there is
+        // nothing to submit, and stepping is what a reader who has typed a query
+        // and pressed Return means. Before the accelerator block, because
+        // shift-Return is the only modifier it takes and it is not one.
+        if self.find_focused() && key == Key::Enter {
+            return UiAction::FindStep(!modifiers.shift);
+        }
+
         // The arrows walk the offered places without taking one and without
         // moving the keyboard, which stays in the field the reader is typing
         // into. That is what a list under a field is: a longer answer to what
@@ -1756,8 +1947,20 @@ impl BrowserUi {
             if self.address_focused() && self.address.edit(key, modifiers, clipboard) {
                 return UiAction::None;
             }
+            if self.find_focused() && self.find.edit(key, modifiers, clipboard) {
+                return UiAction::None;
+            }
             return match key {
                 Key::Character('r') => UiAction::Reload,
+                // ⌘F opens the bar and gives it the keyboard, and ⌘G steps
+                // through what it found without asking for the keyboard at all —
+                // which is what makes *find, then read* possible: the reader is
+                // looking at the page and the bar is only keeping count.
+                Key::Character('f') => {
+                    self.open_find();
+                    UiAction::None
+                }
+                Key::Character('g') => UiAction::FindStep(!modifiers.shift),
                 // The bracket keys are what this platform's browsers use, and the
                 // arrows are what the rest of them use; both are here because a
                 // person's fingers know one of the two.
@@ -1767,8 +1970,9 @@ impl BrowserUi {
                 Key::Character('l') => {
                     // An accelerator that names a control is the keyboard
                     // leaving the menu, and a popup a keyboard has left is a
-                    // popup that is closed.
-                    self.close_popup(false);
+                    // popup that is closed — unless it is the find bar, which
+                    // is a mode rather than a choice and stays where it is.
+                    self.dismiss_transient();
                     self.focus_address();
                     UiAction::None
                 }
@@ -1796,6 +2000,15 @@ impl BrowserUi {
             } else {
                 self.focus.next(self.focused)
             };
+            return UiAction::None;
+        }
+
+        // The find bar's own field takes what is typed into it, the way the
+        // address field does. Not Escape, Tab or Return: all three were answered
+        // above, because what they mean here is about the bar rather than about
+        // the text in it.
+        if self.find_focused() {
+            self.find.edit(key, modifiers, clipboard);
             return UiAction::None;
         }
 
@@ -1839,6 +2052,10 @@ impl BrowserUi {
 
     /// Handle typed text. Returns whether the interface consumed it.
     pub fn text_input(&mut self, character: char) -> bool {
+        if self.find_focused() {
+            self.find.insert(character);
+            return true;
+        }
         if !self.address_focused() {
             return false;
         }
@@ -1921,7 +2138,7 @@ impl BrowserUi {
         // frame's geometry, which is the rule every hit test here already keeps.
         self.reveal_active_tab();
 
-        let appearance = Appearance {
+        let mut appearance = Appearance {
             width,
             tabs: tabs
                 .iter()
@@ -1951,6 +2168,12 @@ impl BrowserUi {
                 .flatten(),
             focus: self.focused,
             popup: self.popup.clone().map(|popup| (height, popup)),
+            find: self.finding().then(|| FindLook {
+                text: self.find.text().to_owned(),
+                caret: self.find_focused().then(|| self.find.caret()),
+                selection: self.find_focused().then(|| self.find.selection()).flatten(),
+                status: self.find_status,
+            }),
             tooltip: self
                 .tooltip()
                 .map(|(label, anchor)| (label.to_owned(), anchor)),
@@ -2029,6 +2252,20 @@ impl BrowserUi {
         );
 
         self.root = Some(root);
+        // A field that took the keyboard as it was built. The key is corrected
+        // rather than left alone: it says what this list was drawn from, and a
+        // key claiming the keyboard was elsewhere would let this frame — the one
+        // with the caret in it — be handed back for a frame without one.
+        if let Some(id) = self.focus_granted.take() {
+            self.focused = Some(id);
+            appearance.focus = Some(id);
+            appearance.find = self.finding().then(|| FindLook {
+                text: self.find.text().to_owned(),
+                caret: Some(self.find.caret()),
+                selection: self.find.selection(),
+                status: self.find_status,
+            });
+        }
         // Where the field is, from the frame that placed it: the suggestions
         // hang under it, and a rectangle worked out a second time from the
         // toolbar's arithmetic would part company with the one on screen.
@@ -2299,6 +2536,22 @@ impl BrowserUi {
                     self.address_rect.width,
                     suggestions(&theme, cx, self.address_rect.width, rows, *marked),
                 ))),
+            )),
+            // Under the toolbar at the right-hand end, which is where every
+            // browser puts it: out of the way of the text a page begins with,
+            // and against the edge the reader's eye is not reading along.
+            Popup::Find => Box::new(crate::widget::Anchored::from_right(
+                theme.inset,
+                UI_HEIGHT + theme.gap,
+                reported(find_bar(
+                    &theme,
+                    &focus,
+                    &self.find,
+                    self.focused,
+                    self.find_status,
+                    &self.find_takes_keyboard,
+                    &self.focus_granted,
+                )),
             )),
             // At the pointer, and flipped back onto the window at an edge: a
             // menu asked for near the bottom right belongs above and to the
@@ -2618,6 +2871,112 @@ fn context_menu(theme: &Theme, focus: &Focus, rows: &[ContextRow]) -> Child<UiAc
 /// what a person remembers a page by. The marked row is drawn as though the
 /// pointer were on it: the arrows and the pointer reach the same rows, and
 /// there is no second way of showing which one is about to be taken.
+/// The bar that looks for a run of characters in the page.
+///
+/// A field, what it found, the two ways through it, and the cross that puts it
+/// away — in that order, which is the order a reader uses them in and therefore
+/// the order Tab walks them in.
+///
+/// The field takes the keyboard here rather than where ⌘F was pressed, because
+/// its focus id does not exist until this builds it: `takes_keyboard` is the
+/// wish and `granted` is how the frame tells the surface what it did about it.
+///
+/// Which is also why it is handed `keyboard` — where the focus is — rather than
+/// *whether the field has it*. That question is answered against the ids a frame
+/// claimed, and this frame has not claimed the field's yet when it is asked: the
+/// answer was always no, and the bar drew without a caret in it.
+fn find_bar(
+    theme: &Theme,
+    focus: &Focus,
+    field: &TextField,
+    keyboard: Option<FocusId>,
+    status: FindStatus,
+    takes_keyboard: &std::cell::Cell<bool>,
+    granted: &std::cell::Cell<Option<FocusId>>,
+) -> Child<UiAction> {
+    /// How wide the field is. Wide enough for a phrase, narrow enough that the
+    /// bar does not cover the page it is searching.
+    const FIELD_WIDTH: f64 = 220.0;
+
+    let field_id = focus.claim_text(true);
+    let focused = if takes_keyboard.replace(false) {
+        granted.set(Some(field_id));
+        true
+    } else {
+        keyboard == Some(field_id)
+    };
+    let input = Box::new(Fixed::width(
+        FIELD_WIDTH,
+        TextInput::new(
+            FieldView {
+                text: field.text().to_owned(),
+                caret: focused.then(|| field.caret()),
+                selection: focused.then(|| field.selection()).flatten(),
+                placeholder: "Find in page".to_owned(),
+            },
+            UiAction::FindHit,
+        )
+        .face(theme.surface)
+        .into_widget(theme),
+    )) as Child<UiAction>;
+
+    // *3 of 17*, and *0 of 0* where there is nothing: a bar that said nothing
+    // about a query that found nothing would look like a bar that had not been
+    // asked yet.
+    let count = Box::new(Align::centre(Box::new(Label::new(
+        format!("{} of {}", status.current, status.total),
+        theme.font_size_small,
+        if status.total == 0 {
+            theme.ink_dim
+        } else {
+            theme.ink
+        },
+    )))) as Child<UiAction>;
+
+    let steps = status.total > 0;
+    let row = Stack::row(
+        theme.gap,
+        vec![
+            input,
+            count,
+            controls::icon_button(
+                theme,
+                focus,
+                UiAction::FindStep(false),
+                steps,
+                "Previous match",
+                |list, rect, color| icon::chevron(list, rect, icon::Direction::Up, color),
+            ),
+            controls::icon_button(
+                theme,
+                focus,
+                UiAction::FindStep(true),
+                steps,
+                "Next match",
+                |list, rect, color| icon::chevron(list, rect, icon::Direction::Down, color),
+            ),
+            controls::icon_button(
+                theme,
+                focus,
+                UiAction::CloseFind,
+                true,
+                "Close find bar",
+                icon::cross,
+            ),
+        ],
+    );
+
+    Box::new(Background::new(
+        theme.raised,
+        theme.radius,
+        Box::new(controls::Outline::new(
+            theme.border,
+            theme.radius,
+            Box::new(Padding::new(Insets::all(theme.gap), Box::new(row))),
+        )),
+    ))
+}
+
 fn suggestions(
     theme: &Theme,
     cx: &mut Cx,
@@ -3161,6 +3520,14 @@ mod tests {
             "a browser with no history describes no disabled control"
         );
     }
+
+    /// The platform's own accelerator modifier, whichever platform this is.
+    const ACCELERATOR: Modifiers = Modifiers {
+        command: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        shift: false,
+        alt: false,
+    };
 
     /// The rectangle the widget tree placed something at, found by pressing.
     fn press(ui: &mut BrowserUi, text: &mut TextEngine, x: f64, y: f64) -> UiAction {
@@ -4431,5 +4798,185 @@ mod tests {
             None,
             text,
         ));
+    }
+
+    /// The accelerator every browser uses: ⌘F opens the bar, gives it the
+    /// keyboard, and selects what was there so the next letter replaces it.
+    #[test]
+    fn command_f_opens_the_find_bar_and_gives_it_the_keyboard() {
+        let mut text = TextEngine::isolated();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+
+        assert!(!ui.finding(), "nothing is being looked for yet");
+        assert_eq!(
+            ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard),
+            UiAction::None,
+            "the bar is the interface's own, so the browser hears nothing"
+        );
+        assert!(ui.finding());
+        assert!(
+            ui.find_wants_keyboard(),
+            "the field it asked for does not exist until the next frame"
+        );
+
+        // The frame that builds it is the frame that grants it.
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert!(ui.find_focused(), "the bar's field has the keyboard");
+        assert!(!ui.address_focused(), "and the address field has not");
+        assert!(!ui.find_wants_keyboard(), "the wish was granted once");
+
+        // What is typed goes into the bar rather than into the address.
+        assert!(ui.text_input('n'));
+        assert!(ui.text_input('e'));
+        assert_eq!(ui.find.text(), "ne");
+        assert_eq!(
+            ui.address.text(),
+            "",
+            "the address field was not typed into"
+        );
+
+        // And ⌘F again selects it all, so the next letter starts over.
+        ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert_eq!(ui.find.selected_text(), Some("ne"));
+    }
+
+    /// Return steps forward, shift-Return steps back, and ⌘G does both without
+    /// the bar needing the keyboard at all.
+    #[test]
+    fn the_bar_steps_with_return_and_with_command_g() {
+        let mut text = TextEngine::isolated();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+
+        ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert_eq!(
+            ui.key_pressed(Key::Enter, Modifiers::default(), &mut text, &mut clipboard),
+            UiAction::FindStep(true),
+            "Return in the bar is *next*, not *submit*"
+        );
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            ui.key_pressed(Key::Enter, shift, &mut text, &mut clipboard),
+            UiAction::FindStep(false)
+        );
+
+        // The keyboard goes back to the page and ⌘G still steps: a reader who
+        // has found what they were looking for is reading it, not typing.
+        ui.blur();
+        assert!(!ui.find_focused());
+        assert_eq!(
+            ui.key_pressed(Key::Character('g'), ACCELERATOR, &mut text, &mut clipboard),
+            UiAction::FindStep(true)
+        );
+        let shift_accelerator = Modifiers {
+            shift: true,
+            ..ACCELERATOR
+        };
+        assert_eq!(
+            ui.key_pressed(
+                Key::Character('g'),
+                shift_accelerator,
+                &mut text,
+                &mut clipboard
+            ),
+            UiAction::FindStep(false)
+        );
+    }
+
+    /// Escape closes the bar and hands the keyboard back to where it was, which
+    /// is what makes the bar something a keyboard can look into and leave.
+    #[test]
+    fn escape_closes_the_find_bar_and_returns_the_keyboard() {
+        let mut text = TextEngine::isolated();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        ui.focus_address();
+        let before = ui.focused();
+
+        ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        assert!(ui.find_focused());
+
+        ui.key_pressed(Key::Escape, Modifiers::default(), &mut text, &mut clipboard);
+        assert!(!ui.finding(), "the bar is gone");
+        assert_eq!(
+            ui.focused(),
+            before,
+            "and the keyboard is back where it was"
+        );
+    }
+
+    /// Tab walks the bar's own controls and no further: the field, the two
+    /// arrows and the cross are the whole of where the keyboard may go.
+    #[test]
+    fn tab_is_trapped_inside_the_open_find_bar() {
+        let mut text = TextEngine::isolated();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        // Something found, so the arrows are live: a dead control is not a place
+        // the keyboard goes, here or anywhere else.
+        ui.find_status = FindStatus {
+            total: 17,
+            current: 1,
+        };
+        ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            ui.key_pressed(Key::Tab, Modifiers::default(), &mut text, &mut clipboard);
+            assert_eq!(
+                ui.focus.scope(ui.focused()),
+                Some(FIND_SCOPE),
+                "Tab walked out of the bar"
+            );
+            let at = ui.focused();
+            if !seen.contains(&at) {
+                seen.push(at);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            4,
+            "the field, both arrows and the cross: {seen:?}"
+        );
+    }
+
+    /// The bar is a mode rather than a choice, so reaching past it leaves it
+    /// open — a menu would have gone away.
+    #[test]
+    fn a_press_elsewhere_and_command_l_leave_the_find_bar_open() {
+        let mut text = TextEngine::isolated();
+        let mut clipboard = crate::clipboard::InMemory::default();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        ui.key_pressed(Key::Character('f'), ACCELERATOR, &mut text, &mut clipboard);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+
+        // ⌘L takes the keyboard to the address field. The bar stays: a reader
+        // who types an address has not stopped looking for anything.
+        ui.key_pressed(Key::Character('l'), ACCELERATOR, &mut text, &mut clipboard);
+        assert!(ui.address_focused());
+        assert!(ui.finding(), "⌘L closed the find bar");
+
+        // A press on plain toolbar, which dismisses a menu.
+        ui.pointer_moved(500.0, TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT / 2.0, &mut text);
+        ui.pointer_pressed(&mut text, 1);
+        assert!(ui.finding(), "a press elsewhere closed the find bar");
+
+        // The menu, for contrast: opening it displaces the bar, because there
+        // is one popup, and pressing away from the menu puts the menu away.
+        ui.open_menu();
+        assert!(!ui.finding(), "two panels at once");
     }
 }

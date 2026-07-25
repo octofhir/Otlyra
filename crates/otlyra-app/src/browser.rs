@@ -1997,6 +1997,7 @@ impl Browser {
             crate::ui::Bookmarked::No
         };
         self.ui.address.set_text(url);
+        self.sync_find();
     }
 
     /// Leave the settings when the surface says it is done with them.
@@ -2264,9 +2265,12 @@ impl Browser {
             // are only here to keep the match honest about the whole enum.
             UiAction::Focus(_)
             | UiAction::AddressHit(_)
+            | UiAction::FindHit(_)
+            | UiAction::CloseFind
             | UiAction::ToggleMenu
             | UiAction::DismissPopup
             | UiAction::ScrollTabs(_) => {}
+            UiAction::FindStep(forward) => self.step_match(forward),
             UiAction::ToggleInspector => self.toggle_inspector(),
             UiAction::ToggleBookmark => self.toggle_bookmark(),
             // Chosen from the menu, a browser page opens beside what you were
@@ -2287,6 +2291,70 @@ impl Browser {
             UiAction::Context(command) => self.apply_context(command),
             UiAction::LeaveChrome(forward) => self.hand_keyboard_to_the_page(forward),
         }
+    }
+
+    /// Make the active page's search agree with the find bar, and the bar's
+    /// count agree with the page.
+    ///
+    /// A pull rather than a push, because the bar stops being open in more ways
+    /// than it starts: Escape, its own cross, and a menu opening over it are all
+    /// the same answer to *is the reader still looking for something*, and a
+    /// route that had to be remembered at each of them is a route that would be
+    /// forgotten at the next one added.
+    ///
+    /// The query is searched again only when it has changed. Asking for the same
+    /// one twice would be honest and would also take the reader back to the
+    /// first match every time anything at all happened.
+    fn update_find(&mut self) {
+        let wanted = self
+            .ui
+            .finding()
+            .then(|| self.ui.find.text().to_owned())
+            .filter(|query| !query.is_empty());
+        let Some(page) = self.tabs[self.active].page.as_mut() else {
+            self.ui.find_status = crate::ui::FindStatus::default();
+            return;
+        };
+        match wanted {
+            Some(query) if page.find_query() != Some(query.as_str()) => {
+                page.find(&query);
+            }
+            Some(_) => {}
+            None => {
+                page.clear_find();
+            }
+        }
+        self.ui.find_status = crate::ui::FindStatus {
+            total: page.match_count(),
+            current: page.current_match().map_or(0, |at| at + 1),
+        };
+    }
+
+    /// Go to the next place the query occurs, or the one before it.
+    fn step_match(&mut self, forward: bool) {
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.step_match(forward);
+        }
+        self.update_find();
+    }
+
+    /// Show the find bar for whatever the active tab is already searching for.
+    ///
+    /// The search lives on the page, so a tab coming to the front brings its own
+    /// query with it and a tab that is not searching brings no bar. That is what
+    /// makes the bar per tab without a second copy of the query to keep in step —
+    /// and it is why navigating clears it: the page a search belongs to is gone.
+    fn sync_find(&mut self) {
+        let query = self.tabs[self.active]
+            .page
+            .as_ref()
+            .and_then(PageScene::find_query)
+            .map(str::to_owned);
+        match query {
+            Some(query) => self.ui.restore_find(&query),
+            None => self.ui.close_find(),
+        }
+        self.update_find();
     }
 
     /// The keyboard walked off the end of the chrome: give it to the document.
@@ -3488,6 +3556,10 @@ impl Painter for Browser {
                 // which is the frame the user was looking at when they pressed.
                 let action = self.ui.pointer_pressed(&mut self.text, clicks);
                 self.apply(action);
+                // The bar's own cross closes it, and a menu opening over it
+                // displaces it. Neither says so — the page's search is asked
+                // about rather than told.
+                self.update_find();
             }
 
             PlatformEvent::ContextMenuRequested => self.context_menu_requested(),
@@ -3702,7 +3774,12 @@ impl Painter for Browser {
                         self.clipboard.as_mut(),
                     );
                     let none = action == UiAction::None;
-                    let address = self.ui.address_focused();
+                    // Which keyboard the chrome now claims. ⌘F claims it before
+                    // the field it claims it for exists — the bar is built by
+                    // the next frame — so the wish counts as much as the fact.
+                    let chrome = self.ui.address_focused()
+                        || self.ui.find_focused()
+                        || self.ui.find_wants_keyboard();
                     self.apply(action);
                     // Only when the key changed what is in the field: Escape
                     // puts the list away, and a refresh that ran anyway would
@@ -3710,7 +3787,11 @@ impl Painter for Browser {
                     if typed != self.ui.address.text() {
                         self.refresh_suggestions();
                     }
-                    if address {
+                    // What the page is searching for is whatever the bar says,
+                    // and the key may have changed either — ⌘F opened it, a
+                    // letter narrowed it, Escape put it away.
+                    self.update_find();
+                    if chrome {
                         self.activate_surface(SURFACE_CHROME);
                     }
                     if none && self.keyboard_surface == SURFACE_PAGE {
@@ -3754,6 +3835,8 @@ impl Painter for Browser {
                         // is settled here rather than remembered: one place
                         // that can go stale instead of two.
                         self.refresh_suggestions();
+                        // And so is what the page is searching for.
+                        self.update_find();
                     }
                     _ => {}
                 }
@@ -4983,7 +5066,7 @@ mod tests {
         }
     }
 
-    fn browser() -> Browser {
+    pub(super) fn browser() -> Browser {
         browser_with_log().0
     }
 
@@ -5078,7 +5161,7 @@ mod tests {
     }
 
     /// Navigate and wait, which is what every test means by "load this".
-    fn go(browser: &mut Browser, url: &str) {
+    pub(super) fn go(browser: &mut Browser, url: &str) {
         browser.navigate(url);
         settle(browser);
     }
@@ -7903,5 +7986,166 @@ mod tests {
                 >= 2,
             "the page's text and the interface's own"
         );
+    }
+}
+
+/// Finding a run of characters in the page, from the bar down to the wash.
+#[cfg(test)]
+mod find_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// The platform's own accelerator modifier, whichever platform this is.
+    const ACCELERATOR: Modifiers = Modifiers {
+        command: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        shift: false,
+        alt: false,
+    };
+
+    fn frame(browser: &mut Browser) {
+        let mut target = otlyra_gfx::RecordingPainter::default();
+        browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+    }
+
+    fn key(browser: &mut Browser, key: Key, modifiers: Modifiers) {
+        browser.on_event(PlatformEvent::KeyPressed { key, modifiers });
+    }
+
+    /// Open the bar and type `query` into it, the way a reader does.
+    fn look_for(browser: &mut Browser, query: &str) {
+        frame(browser);
+        key(browser, Key::Character('f'), ACCELERATOR);
+        frame(browser);
+        for character in query.chars() {
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+    }
+
+    /// A page holding the same word three times, so stepping has somewhere to go.
+    fn three_needles() -> Browser {
+        let mut browser = browser();
+        go(&mut browser, "file:///a/needle/needle/needle");
+        browser
+    }
+
+    /// ⌘F, a query, and the page is searched: the count reaches the bar and the
+    /// wash reaches the page.
+    #[test]
+    fn the_bar_searches_the_page_and_steps_through_what_it_found() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+
+        assert!(browser.ui.finding());
+        assert_eq!(
+            browser.ui.find_status,
+            crate::ui::FindStatus {
+                total: 3,
+                current: 1
+            },
+            "the bar counts what the page found"
+        );
+        let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+        assert_eq!(page.match_count(), 3);
+        assert_eq!(
+            page.match_rects().len(),
+            3,
+            "and every one of them has somewhere to be drawn"
+        );
+
+        // Return steps on, shift-Return steps back, and both wrap.
+        key(&mut browser, Key::Enter, Modifiers::default());
+        assert_eq!(browser.ui.find_status.current, 2);
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        key(&mut browser, Key::Enter, shift);
+        assert_eq!(browser.ui.find_status.current, 1);
+        key(&mut browser, Key::Enter, shift);
+        assert_eq!(browser.ui.find_status.current, 3, "round the start");
+
+        // Escape closes the bar and takes the wash off the page with it.
+        key(&mut browser, Key::Escape, Modifiers::default());
+        assert!(!browser.ui.finding());
+        let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+        assert_eq!(page.match_count(), 0);
+        assert!(page.match_rects().is_empty());
+    }
+
+    /// A query nothing on the page holds is still a query: the bar says none
+    /// rather than saying nothing, and there is nothing to step to.
+    #[test]
+    fn a_query_the_page_does_not_hold_counts_none() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "haystack");
+
+        assert_eq!(
+            browser.ui.find_status,
+            crate::ui::FindStatus {
+                total: 0,
+                current: 0
+            }
+        );
+        key(&mut browser, Key::Enter, Modifiers::default());
+        assert_eq!(browser.ui.find_status.current, 0, "nowhere to step to");
+    }
+
+    /// ⌘G steps without the bar holding the keyboard, which is what lets a
+    /// reader look at the page they searched.
+    #[test]
+    fn command_g_steps_while_the_page_has_the_keyboard() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+        assert_eq!(browser.ui.find_status.current, 1);
+
+        // The keyboard goes back to the document.
+        browser.ui.blur();
+        browser.activate_surface(SURFACE_PAGE);
+        assert!(!browser.ui.find_focused());
+
+        key(&mut browser, Key::Character('g'), ACCELERATOR);
+        assert_eq!(browser.ui.find_status.current, 2);
+        key(
+            &mut browser,
+            Key::Character('g'),
+            Modifiers {
+                shift: true,
+                ..ACCELERATOR
+            },
+        );
+        assert_eq!(browser.ui.find_status.current, 1);
+        assert!(
+            browser.ui.finding(),
+            "stepping never took the bar away or gave it the keyboard"
+        );
+        assert!(!browser.ui.find_focused());
+    }
+
+    /// A search belongs to the page it was made in: another tab has its own, and
+    /// going somewhere else leaves it behind.
+    #[test]
+    fn a_search_belongs_to_its_tab_and_goes_when_the_page_does() {
+        let mut browser = three_needles();
+        look_for(&mut browser, "needle");
+        assert_eq!(browser.ui.find_status.total, 3);
+
+        // A second tab is not searching anything, so it shows no bar.
+        browser.new_tab();
+        go(&mut browser, "example.com");
+        assert!(!browser.ui.finding(), "the bar came along to another tab");
+
+        // Back to the first, which still is: the query is the page's, so the
+        // bar is the page's search made visible rather than a copy of it.
+        browser.select_tab(0);
+        assert!(browser.ui.finding());
+        assert_eq!(browser.ui.find.text(), "needle");
+        assert_eq!(browser.ui.find_status.total, 3);
+
+        // And going somewhere else in that tab leaves the search behind, because
+        // the page it was a search of is gone.
+        go(&mut browser, "example.com");
+        assert!(!browser.ui.finding());
+        assert_eq!(browser.ui.find_status.total, 0);
     }
 }

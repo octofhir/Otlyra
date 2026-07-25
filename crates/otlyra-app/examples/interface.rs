@@ -49,6 +49,10 @@ struct Frame {
     /// the list. Applied after a frame, because the panel hangs off the
     /// field's own rectangle and that is read off the frame that placed it.
     suggestions: Vec<otlyra_app::ui::Suggestion>,
+    /// What the find bar is looking for and what it found, for the state that
+    /// shows it. The count is the browser's answer in the running browser; here
+    /// it is written down, because there is no document behind this frame.
+    find: Option<(&'static str, otlyra_app::ui::FindStatus)>,
     text: TextEngine,
     clipboard: InMemory,
 }
@@ -80,6 +84,11 @@ impl Frame {
         }
         if !self.suggestions.is_empty() {
             self.ui.set_suggestions(self.suggestions.clone());
+        }
+        if let Some((query, status)) = self.find {
+            self.ui.find.set_text(query);
+            self.ui.find_status = status;
+            self.ui.open_find();
         }
         if let Some((x, y)) = self.rest_at {
             self.ui.pointer_moved(x, y, &mut self.text);
@@ -542,6 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tabs_pressed: 0,
         rest_at: None,
         suggestions: Vec::new(),
+        find: None,
         text: TextEngine::new(),
         clipboard: InMemory::default(),
     };
@@ -667,6 +677,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.ui.address.set_text("https://example.com/");
     menu.ui.open_menu();
     frames.push(menu);
+
+    // The find bar, open over the page, with the count of what it found. The
+    // one panel that keeps the keyboard *and* lets the pointer through to what
+    // is behind it: a reader looking for something is still reading.
+    let mut finding = toolbar("find", tabs(&[("Otlyra", false)]), 0, (true, false), None);
+    finding.ui.address.set_text("https://example.com/");
+    finding.find = Some((
+        "needle",
+        otlyra_app::ui::FindStatus {
+            total: 17,
+            current: 3,
+        },
+    ));
+    frames.push(finding);
+
+    // The same bar with a query nothing on the page holds: the arrows are dead
+    // and the count says so rather than saying nothing.
+    let mut missing = toolbar(
+        "find-nothing",
+        tabs(&[("Otlyra", false)]),
+        0,
+        (true, false),
+        None,
+    );
+    missing.ui.address.set_text("https://example.com/");
+    missing.find = Some((
+        "nowhere",
+        otlyra_app::ui::FindStatus {
+            total: 0,
+            current: 0,
+        },
+    ));
+    frames.push(missing);
 
     // The omnibox offering somewhere to go under what has been typed: the one
     // panel that hangs off a control's own rectangle and is as wide as it.
