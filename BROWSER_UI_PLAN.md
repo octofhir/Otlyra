@@ -284,8 +284,17 @@ tree for an unrelated visual change.
 - [x] Introduce `UiSurfaceId` and multiple UI roots. Chrome, page, system page,
   and inspector have stable identities; a pointer press or explicit surface
   action selects exactly one active root.
-- [ ] Add focus scopes and deterministic traversal across root and popup
-  surfaces.
+- [~] Add focus scopes and deterministic traversal across root and popup
+  surfaces. A scope is a traversal trap declared by whatever opens it
+  (`Focus::open_scope`), and an id records the scope it was claimed in, so
+  traversal is confined by construction rather than by a rule each surface has
+  to remember. Tab inside the browser menu reaches its rows and wraps there;
+  from outside, a step *enters* the innermost open scope, which is what makes
+  the sheet mean something to a keyboard. Escape restores the keyboard to
+  wherever it was when the popup opened; a press dismisses without restoring.
+  Scopes nest, and no consumer needs a non-trapping one yet. What is left is
+  traversal *between* roots — Tab from the last chrome control into the page —
+  which needs the popup lifecycle below first.
 - [ ] Add pointer capture and a complete drag lifecycle.
 - [x] Route IME/text input, clipboard editing keys, accessibility focus, and
   keyboard input through the active surface. Delivery is exclusive rather than

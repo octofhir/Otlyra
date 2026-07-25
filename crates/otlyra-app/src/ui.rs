@@ -32,7 +32,7 @@ use crate::widget::runtime::{
 use crate::widget::theme::Theme;
 use crate::widget::{
     Align, Background, Button, Child, Cx, Described, Event, Fixed, Focus, FocusId, FocusKind,
-    Insets, Label, Padding, Painted, Role, Size, Stack, Widget, fill_rounded,
+    FocusScopeId, Insets, Label, Padding, Painted, Role, Size, Stack, Widget, fill_rounded,
 };
 
 /// Height of the tab strip, in logical pixels.
@@ -41,6 +41,13 @@ pub const TAB_STRIP_HEIGHT: f64 = 36.0;
 const TOOLBAR_HEIGHT: f64 = 42.0;
 /// Total height the interface takes from the top of the window.
 pub const UI_HEIGHT: f64 = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT;
+
+/// The traversal trap the menu behind the cogwheel declares.
+///
+/// While it is open, Tab walks its rows and nothing else: the toolbar behind it
+/// is covered by a sheet a press cannot reach through, and a keyboard that could
+/// still walk out there would be walking to controls a reader cannot see.
+const MENU_SCOPE: FocusScopeId = FocusScopeId::new(1);
 
 /// The widest a tab is allowed to be, however few there are.
 const TAB_MAX_WIDTH: f64 = 220.0;
@@ -616,6 +623,13 @@ pub struct BrowserUi {
     /// field shows a caret exactly when this lands on its id, so there is
     /// nothing to keep in step.
     focused: Option<FocusId>,
+    /// Where the keyboard was when the menu opened.
+    ///
+    /// Escape puts it back there, which is what makes a menu something a
+    /// keyboard can look into and leave again. A press that dismisses the menu
+    /// does not: a ring appearing on the toolbar after a click is the interface
+    /// answering a question nobody asked.
+    menu_return: Option<FocusId>,
     /// The focusable controls the last frame built, in the order it built them.
     focus: Focus,
     /// How far the tab strip is slid along, and how far it could be.
@@ -701,6 +715,7 @@ impl BrowserUi {
             bookmark: Bookmarked::Impossible,
             theme: Theme::light(),
             focused: None,
+            menu_return: None,
             focus: Focus::default(),
             tab_scroll: 0.0,
             tab_overflow: crate::widget::Overflow::default(),
@@ -914,8 +929,8 @@ impl BrowserUi {
 
         match action {
             Some(UiAction::Focus(id)) => {
+                self.close_menu(false);
                 self.focused = Some(id);
-                self.menu_open = false;
                 UiAction::None
             }
             // A press in the field: the keyboard moves there and the caret goes
@@ -923,16 +938,15 @@ impl BrowserUi {
             // click count. The field said where; whose keyboard it is stays
             // the surface's business.
             Some(UiAction::AddressHit(hit)) => {
+                self.close_menu(false);
                 if let Some(id) = self.focus.first_text() {
                     self.focused = Some(id);
                 }
-                self.menu_open = false;
                 self.address.hit(hit);
                 UiAction::None
             }
             Some(UiAction::ToggleMenu) => {
-                self.menu_open = !self.menu_open;
-                self.focused = None;
+                self.toggle_menu();
                 UiAction::None
             }
             // Where the strip is slid to is the interface's own, so the press
@@ -942,20 +956,20 @@ impl BrowserUi {
                 UiAction::None
             }
             Some(UiAction::CloseMenu) => {
-                self.menu_open = false;
+                self.close_menu(false);
                 UiAction::None
             }
             // Choosing something from the menu closes it. A menu that stayed
             // open over the page it just opened would have to be dismissed by
             // hand every time.
             Some(UiAction::OpenPage(page)) => {
-                self.menu_open = false;
+                self.close_menu(false);
                 UiAction::OpenPage(page)
             }
             // The same for the inspector: chosen from the menu, the menu goes
             // away and what was chosen is what happens.
             Some(UiAction::ToggleInspector) => {
-                self.menu_open = false;
+                self.close_menu(false);
                 UiAction::ToggleInspector
             }
             Some(action) => {
@@ -969,9 +983,40 @@ impl BrowserUi {
             }
             None => {
                 self.focused = None;
-                self.menu_open = false;
+                self.close_menu(false);
                 UiAction::None
             }
+        }
+    }
+
+    /// Open the menu, or put it away again.
+    fn toggle_menu(&mut self) {
+        if self.menu_open {
+            self.close_menu(false);
+        } else {
+            self.menu_open = true;
+            self.menu_return = self.focused;
+            self.focused = None;
+        }
+    }
+
+    /// Put the menu away.
+    ///
+    /// `restore` gives the keyboard back to whatever held it before the menu
+    /// opened, which is what leaving a menu by Escape means. A press dismisses
+    /// without restoring: the reader is looking at where they clicked, not at
+    /// the button they walked away from.
+    fn close_menu(&mut self, restore: bool) {
+        if !self.menu_open {
+            return;
+        }
+        self.menu_open = false;
+        let back = self.menu_return.take();
+        // Only the keyboard that was inside the menu moves. One resting
+        // somewhere else — a field the reader pressed on the way out — stays
+        // exactly where the press put it.
+        if self.focused.is_none() || self.focus.scope(self.focused) == Some(MENU_SCOPE) {
+            self.focused = if restore { back } else { None };
         }
     }
 
@@ -1012,7 +1057,7 @@ impl BrowserUi {
                 UiAction::None
             }
             Some(UiAction::ToggleMenu) => {
-                self.menu_open = !self.menu_open;
+                self.toggle_menu();
                 UiAction::None
             }
             Some(UiAction::ScrollTabs(forward)) => {
@@ -1020,11 +1065,11 @@ impl BrowserUi {
                 UiAction::None
             }
             Some(UiAction::OpenPage(page)) => {
-                self.menu_open = false;
+                self.close_menu(true);
                 UiAction::OpenPage(page)
             }
             Some(UiAction::ToggleInspector) => {
-                self.menu_open = false;
+                self.close_menu(true);
                 UiAction::ToggleInspector
             }
             Some(action) => action,
@@ -1048,7 +1093,21 @@ impl BrowserUi {
         }
 
         if key == Key::Escape && self.menu_open {
-            self.menu_open = false;
+            self.close_menu(true);
+            return UiAction::None;
+        }
+
+        // The arrows walk an open menu, which is what every menu on every
+        // platform does and what a reader who opened one from the keyboard
+        // reaches for before Tab. They are the way *into* it as well: the
+        // keyboard is on the cogwheel behind the sheet, and traversal out of a
+        // scope it is not in enters that scope.
+        if self.menu_open && matches!(key, Key::Down | Key::Up) && !modifiers.is_accelerator() {
+            self.focused = if key == Key::Down {
+                self.focus.next(self.focused)
+            } else {
+                self.focus.previous(self.focused)
+            };
             return UiAction::None;
         }
 
@@ -1068,6 +1127,10 @@ impl BrowserUi {
                 Key::Character(']') | Key::Right => UiAction::Forward,
                 Key::Character('t') => UiAction::NewTab,
                 Key::Character('l') => {
+                    // An accelerator that names a control is the keyboard
+                    // leaving the menu, and a popup a keyboard has left is a
+                    // popup that is closed.
+                    self.close_menu(false);
                     self.focus_address();
                     UiAction::None
                 }
@@ -1525,6 +1588,12 @@ impl BrowserUi {
             return rows;
         }
 
+        // Its rows claim their ids inside the menu's own scope, which is what
+        // keeps Tab on the panel while it is open.
+        focus.open_scope(MENU_SCOPE);
+        let panel = menu(&theme, &focus, self.bookmark);
+        focus.close_scope();
+
         // Panel first in the list so it is drawn last and answers first; the
         // sheet under it catches every press that misses, which is what makes
         // clicking anywhere else dismiss the menu without also doing whatever
@@ -1535,7 +1604,7 @@ impl BrowserUi {
             Box::new(crate::widget::Anchored::from_right(
                 theme.inset,
                 UI_HEIGHT - 2.0,
-                menu(&theme, &focus, self.bookmark),
+                panel,
             )),
         ]))
     }
@@ -2607,6 +2676,139 @@ mod tests {
             UiAction::Reload,
             "a control that cannot be pressed is not a place the keyboard stops"
         );
+    }
+
+    /// The cogwheel, which is the last control on the toolbar.
+    fn open_the_menu(ui: &mut BrowserUi, text: &mut TextEngine) {
+        frame_at(ui, text, 1000.0, 700.0);
+        press(ui, text, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        assert!(ui.menu_open, "the cogwheel opens the menu");
+        frame_at(ui, text, 1000.0, 700.0);
+    }
+
+    fn tab(ui: &mut BrowserUi, text: &mut TextEngine, shift: bool) {
+        ui.key_pressed(
+            Key::Tab,
+            Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+            text,
+            &mut crate::clipboard::InMemory::default(),
+        );
+    }
+
+    /// An open menu is a place the keyboard cannot walk out of. Without this,
+    /// Tab walked from its last row onto the toolbar behind the sheet — to
+    /// controls a press cannot reach and an eye cannot see the ring on.
+    #[test]
+    fn tab_inside_an_open_menu_never_reaches_the_toolbar_behind_it() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        open_the_menu(&mut ui, &mut text);
+
+        let mut reached = Vec::new();
+        // More steps than the menu has rows, so a traversal that leaks would
+        // land outside and be caught rather than merely be lucky.
+        for _ in 0..16 {
+            tab(&mut ui, &mut text, false);
+            reached.push(ui.focused().expect("traversal reached something"));
+        }
+        for id in &reached {
+            assert_eq!(
+                ui.focus.scope(Some(*id)),
+                Some(MENU_SCOPE),
+                "Tab left the open menu"
+            );
+        }
+        let rows: std::collections::BTreeSet<_> = reached.iter().copied().collect();
+        assert!(rows.len() > 1, "the menu has more than one row to reach");
+        assert_eq!(
+            reached.first(),
+            reached.get(rows.len()),
+            "traversal inside the menu wraps"
+        );
+
+        // And backwards from the first row is the last one, not the cogwheel.
+        ui.focused = reached.first().copied();
+        tab(&mut ui, &mut text, true);
+        assert_eq!(ui.focus.scope(ui.focused()), Some(MENU_SCOPE));
+    }
+
+    /// Escape leaves the menu and puts the keyboard back where it was, which is
+    /// what makes looking into a menu something a keyboard can undo.
+    #[test]
+    fn escape_closes_the_menu_and_returns_the_keyboard() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        tab(&mut ui, &mut text, false);
+        let before = ui.focused().expect("Tab reached the first control");
+
+        press(&mut ui, &mut text, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        assert!(ui.menu_open);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        ui.key_pressed(
+            Key::Down,
+            Modifiers::default(),
+            &mut text,
+            &mut crate::clipboard::InMemory::default(),
+        );
+        assert_eq!(
+            ui.focus.scope(ui.focused()),
+            Some(MENU_SCOPE),
+            "Down is the way into an open menu"
+        );
+
+        ui.key_pressed(
+            Key::Escape,
+            Modifiers::default(),
+            &mut text,
+            &mut crate::clipboard::InMemory::default(),
+        );
+        assert!(!ui.menu_open, "Escape dismisses the menu");
+        assert_eq!(ui.focused(), Some(before), "the keyboard came back");
+    }
+
+    /// A press that dismisses the menu leaves no ring behind: the reader is
+    /// looking at where they clicked, not at the control they walked away from.
+    #[test]
+    fn a_press_outside_the_menu_dismisses_it_without_a_ring() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        tab(&mut ui, &mut text, false);
+        assert!(ui.focused().is_some());
+
+        press(&mut ui, &mut text, 1000.0 - 22.0, UI_HEIGHT - 21.0);
+        frame_at(&mut ui, &mut text, 1000.0, 700.0);
+        // Well below the panel, on the sheet that covers the window.
+        press(&mut ui, &mut text, 100.0, 600.0);
+
+        assert!(!ui.menu_open);
+        assert_eq!(ui.focused(), None);
+    }
+
+    /// An accelerator that names a control takes the keyboard out of the menu,
+    /// and a menu the keyboard has left is a menu that is closed.
+    #[test]
+    fn naming_the_address_bar_closes_an_open_menu() {
+        let mut text = TextEngine::new();
+        let mut ui = BrowserUi::new();
+        open_the_menu(&mut ui, &mut text);
+
+        ui.key_pressed(
+            Key::Character('l'),
+            Modifiers {
+                command: cfg!(target_os = "macos"),
+                control: !cfg!(target_os = "macos"),
+                ..Modifiers::default()
+            },
+            &mut text,
+            &mut crate::clipboard::InMemory::default(),
+        );
+        assert!(!ui.menu_open, "the menu stayed open behind the caret");
+        assert!(ui.address_focused());
     }
 
     #[test]

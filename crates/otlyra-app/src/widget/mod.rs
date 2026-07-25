@@ -252,12 +252,33 @@ pub enum FocusKind {
     Text,
 }
 
+/// Stable identity of one focus scope: the traversal trap a popup declares.
+///
+/// Chosen by the surface that opens the scope, in the way a [`WidgetKey`] is,
+/// because a scope outlives the frame that declared it and a number counted
+/// during a build would name a different scope after every partial rebuild.
+///
+/// [`WidgetKey`]: runtime::WidgetKey
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FocusScopeId(u32);
+
+impl FocusScopeId {
+    /// A scope named by the surface that opens it. Zero is the root scope and
+    /// is not a name anything may take.
+    pub const fn new(value: u32) -> Self {
+        assert!(value > 0, "zero names the root scope");
+        Self(value)
+    }
+}
+
 /// One focusable control, as its surface recorded it.
 #[derive(Copy, Clone, Debug)]
 struct Entry {
     enabled: bool,
     kind: FocusKind,
     group: Option<u32>,
+    /// Which scope was open when this control claimed its id. `0` is the root.
+    scope: u32,
 }
 
 /// The focusable controls a surface built this frame, in the order it built them.
@@ -280,6 +301,11 @@ pub struct Focus {
     entries: Rc<RefCell<Vec<Entry>>>,
     groups: Rc<Cell<u32>>,
     rewrite: Rc<Cell<Option<usize>>>,
+    /// Each declared scope's parent, indexed by scope id. Slot `0` is the root
+    /// and is its own parent, which is what ends every walk up the chain.
+    parents: Rc<RefCell<Vec<u32>>>,
+    /// The scopes open at this point in the build, innermost last.
+    open: Rc<RefCell<Vec<u32>>>,
 }
 
 impl Focus {
@@ -288,6 +314,100 @@ impl Focus {
         self.entries.borrow_mut().clear();
         self.groups.set(0);
         self.rewrite.set(None);
+        self.parents.borrow_mut().clear();
+        self.open.borrow_mut().clear();
+    }
+
+    /// Open a scope: everything claimed until it closes traps traversal.
+    ///
+    /// A popup is a place the keyboard cannot walk out of by pressing Tab —
+    /// that is what makes it a popup rather than a panel drawn on top. Scopes
+    /// nest, so a submenu traps inside its menu, and the innermost one built
+    /// this frame is the one traversal is confined to.
+    ///
+    /// The scope's *parent* is whichever scope is open here, so a popup built
+    /// under a partial rebuild registers the same shape it had before.
+    pub fn open_scope(&self, scope: FocusScopeId) {
+        let parent = self.current_scope();
+        let mut parents = self.parents.borrow_mut();
+        let slot = scope.0 as usize;
+        if parents.len() <= slot {
+            parents.resize(slot + 1, 0);
+        }
+        parents[slot] = parent;
+        self.open.borrow_mut().push(scope.0);
+    }
+
+    /// Close the innermost open scope.
+    pub fn close_scope(&self) {
+        let popped = self.open.borrow_mut().pop();
+        debug_assert!(popped.is_some(), "closed a scope that was never opened");
+    }
+
+    /// The scope controls claimed here belong to.
+    fn current_scope(&self) -> u32 {
+        self.open.borrow().last().copied().unwrap_or(0)
+    }
+
+    /// How far `scope` is from the root, which is what makes one scope inner.
+    fn depth(&self, scope: u32) -> u32 {
+        let parents = self.parents.borrow();
+        let mut at = scope;
+        let mut depth = 0;
+        while at != 0 && depth as usize <= parents.len() {
+            at = parents.get(at as usize).copied().unwrap_or(0);
+            depth += 1;
+        }
+        depth
+    }
+
+    /// Whether `scope` is `root` or something opened inside it.
+    fn within(&self, root: u32, scope: u32) -> bool {
+        if root == 0 {
+            return true;
+        }
+        let parents = self.parents.borrow();
+        let mut at = scope;
+        let mut steps = 0;
+        while at != 0 && steps <= parents.len() {
+            if at == root {
+                return true;
+            }
+            at = parents.get(at as usize).copied().unwrap_or(0);
+            steps += 1;
+        }
+        false
+    }
+
+    /// The scope traversal may not leave, given where the keyboard is.
+    ///
+    /// The focused control's own scope, when it is in one — so a menu item
+    /// reaches only its menu. Otherwise the innermost scope anything was built
+    /// in, which is what makes Tab *enter* an open popup rather than walking
+    /// the toolbar behind it. With no scope open at all this is the root, and
+    /// traversal is the whole surface, as it was before scopes existed.
+    fn confinement(&self, from: Option<FocusId>) -> u32 {
+        let entries = self.entries.borrow();
+        if let Some(scope) = from
+            .and_then(|id| entries.get(id as usize))
+            .map(|entry| entry.scope)
+            && scope != 0
+        {
+            return scope;
+        }
+        let mut innermost = 0;
+        let mut deepest = 0;
+        for entry in entries.iter() {
+            if entry.scope == 0 {
+                continue;
+            }
+            let depth = self.depth(entry.scope);
+            if depth >= deepest {
+                deepest = depth;
+                innermost = entry.scope;
+            }
+        }
+        innermost
     }
 
     /// Keep the stable prefix and rebuild controls after it.
@@ -343,11 +463,13 @@ impl Focus {
     }
 
     fn push(&self, enabled: bool, kind: FocusKind, group: Option<u32>) -> FocusId {
+        let scope = self.current_scope();
         let mut entries = self.entries.borrow_mut();
         let entry = Entry {
             enabled,
             kind,
             group,
+            scope,
         };
         if let Some(at) = self.rewrite.get() {
             if at < entries.len() {
@@ -380,6 +502,21 @@ impl Focus {
             .borrow()
             .get(id as usize)
             .map(|entry| entry.kind)
+    }
+
+    /// Which scope `id` was claimed in, if it was claimed inside one.
+    ///
+    /// `None` for the root scope and for an id no live control holds, which are
+    /// the same answer to the question a surface actually asks: is the keyboard
+    /// still inside the popup?
+    pub fn scope(&self, id: Option<FocusId>) -> Option<FocusScopeId> {
+        let id = id?;
+        self.entries
+            .borrow()
+            .get(id as usize)
+            .map(|entry| entry.scope)
+            .filter(|scope| *scope != 0)
+            .map(FocusScopeId)
     }
 
     /// Whether `id` names a control that is drawn but does nothing.
@@ -436,24 +573,41 @@ impl Focus {
         Some(members[(at + step) % members.len()] as FocusId)
     }
 
-    /// Traversal, in either direction, skipping anything disabled.
+    /// Traversal, in either direction, skipping anything disabled and anything
+    /// outside the scope the keyboard is confined to.
     fn step(&self, from: Option<FocusId>, by: isize) -> Option<FocusId> {
+        let root = self.confinement(from);
         let entries = self.entries.borrow();
-        let count = entries.len() as isize;
-        if count == 0 {
+        let members: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.enabled && self.within(root, entry.scope))
+            .map(|(index, _)| index)
+            .collect();
+        if members.is_empty() {
             return None;
         }
-        // With nothing focused, forward starts before the first and backward
-        // starts after the last, so one step lands on the end being entered.
-        let start = match from {
-            Some(id) if (id as isize) < count => id as isize,
-            _ if by > 0 => -1,
-            _ => count,
+        // Where the keyboard is may not be a member: it is disabled, it belongs
+        // to the surface behind an open popup, or there is no keyboard on this
+        // surface at all. In each case traversal resumes at the member it would
+        // have reached, so a step is a step in the direction it was asked for
+        // rather than a jump back to an end.
+        let count = members.len();
+        let at = from.and_then(|id| members.iter().position(|index| *index == id as usize));
+        let next = match (at, from) {
+            (Some(at), _) => (at as isize + by).rem_euclid(count as isize) as usize,
+            (None, Some(id)) => {
+                let after = members.partition_point(|index| *index < id as usize);
+                if by > 0 {
+                    after % count
+                } else {
+                    (after + count - 1) % count
+                }
+            }
+            (None, None) if by > 0 => 0,
+            (None, None) => count - 1,
         };
-        (1..=count)
-            .map(|step| (start + by * step).rem_euclid(count))
-            .find(|index| entries[*index as usize].enabled)
-            .map(|index| index as FocusId)
+        Some(members[next] as FocusId)
     }
 }
 
@@ -2072,6 +2226,85 @@ mod tests {
         assert_eq!(focus.kind(Some(2)), Some(FocusKind::Text));
         assert!(focus.is_enabled(2));
         assert!(!focus.is_enabled(3));
+    }
+
+    /// A popup traps the keyboard: Tab reaches its rows and wraps inside them,
+    /// and the controls behind it are as unreachable as the sheet makes them.
+    #[test]
+    fn traversal_stays_inside_an_open_scope_and_wraps_there() {
+        let focus = Focus::default();
+        let toolbar = focus.claim(true);
+        let star = focus.claim(true);
+        focus.open_scope(FocusScopeId::new(1));
+        let first = focus.claim(true);
+        let last = focus.claim(true);
+        focus.close_scope();
+
+        assert_eq!(focus.next(Some(first)), Some(last));
+        assert_eq!(focus.next(Some(last)), Some(first), "the trap must wrap");
+        assert_eq!(focus.previous(Some(first)), Some(last));
+        // From outside, a step is the way in rather than a step along the
+        // toolbar — which is the whole of what "modal" means to a keyboard.
+        assert_eq!(focus.next(Some(toolbar)), Some(first));
+        assert_eq!(focus.previous(Some(star)), Some(last));
+        assert_eq!(focus.next(None), Some(first));
+    }
+
+    /// With the popup closed, the same surface traverses as it always did.
+    #[test]
+    fn a_surface_with_no_scope_traverses_the_whole_of_itself() {
+        let focus = Focus::default();
+        let first = focus.claim(true);
+        let disabled = focus.claim(false);
+        let last = focus.claim_text(true);
+
+        assert_eq!(focus.next(Some(first)), Some(last), "disabled is skipped");
+        assert_eq!(focus.next(Some(last)), Some(first));
+        assert_eq!(
+            focus.next(Some(disabled)),
+            Some(last),
+            "a step from something disabled is still a step forward"
+        );
+        assert_eq!(focus.previous(Some(disabled)), Some(first));
+    }
+
+    /// Scopes nest: a submenu is a trap inside its menu's trap, and the
+    /// innermost one is what an outside keyboard is drawn into.
+    #[test]
+    fn the_innermost_open_scope_is_the_one_traversal_enters() {
+        let focus = Focus::default();
+        let toolbar = focus.claim(true);
+        focus.open_scope(FocusScopeId::new(1));
+        let row = focus.claim(true);
+        focus.open_scope(FocusScopeId::new(2));
+        let sub_first = focus.claim(true);
+        let sub_last = focus.claim(true);
+        focus.close_scope();
+        focus.close_scope();
+
+        assert_eq!(focus.next(Some(toolbar)), Some(sub_first));
+        assert_eq!(focus.next(Some(sub_last)), Some(sub_first));
+        // The menu row is in the outer scope, which contains the submenu — so
+        // from there the submenu is reachable and the toolbar still is not.
+        assert_eq!(focus.next(Some(row)), Some(sub_first));
+        assert_eq!(focus.previous(Some(row)), Some(sub_last));
+        assert_eq!(focus.scope(Some(row)), Some(FocusScopeId::new(1)));
+        assert_eq!(focus.scope(Some(toolbar)), None);
+    }
+
+    /// A frame that begins again forgets the scopes with the controls.
+    #[test]
+    fn beginning_a_frame_closes_every_scope() {
+        let focus = Focus::default();
+        focus.open_scope(FocusScopeId::new(1));
+        let trapped = focus.claim(true);
+        assert_eq!(focus.scope(Some(trapped)), Some(FocusScopeId::new(1)));
+
+        focus.begin();
+        let plain = focus.claim(true);
+        let other = focus.claim(true);
+        assert_eq!(focus.scope(Some(plain)), None);
+        assert_eq!(focus.next(Some(plain)), Some(other));
     }
 
     /// A pin wider than the room going is not a width anybody honours: `place`
