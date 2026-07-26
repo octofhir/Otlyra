@@ -46,6 +46,8 @@ pub enum Command {
     ShowBookmarks,
     /// Open `about:cookies`.
     ShowCookies,
+    /// Open `about:cache`.
+    ShowCache,
     /// Increase the page zoom.
     ZoomIn,
     /// Decrease the page zoom.
@@ -85,6 +87,7 @@ impl Command {
         Self::ToggleBookmark,
         Self::ShowBookmarks,
         Self::ShowCookies,
+        Self::ShowCache,
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ActualSize,
@@ -136,6 +139,7 @@ impl Command {
                 | Self::ToggleBookmark
                 | Self::ShowBookmarks
                 | Self::ShowCookies
+                | Self::ShowCache
                 | Self::ToggleDevTools
                 | Self::ZoomIn
                 | Self::ZoomOut
@@ -237,6 +241,7 @@ pub fn menu_bar() -> MenuBar {
                 // With the rest of what a browser has kept about where the reader
                 // has been, which is what a cookie is.
                 entry(Command::ShowCookies, "Show Cookies", None),
+                entry(Command::ShowCache, "Show Cache", None),
             ],
         ))
         // Between History and Develop, where every browser puts it.

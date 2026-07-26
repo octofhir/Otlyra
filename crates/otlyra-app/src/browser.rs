@@ -424,6 +424,7 @@ pub struct Browser {
     /// The surface that shows them.
     bookmarks_page: crate::bookmarks::BookmarksSurface,
     cookies_page: crate::cookies::CookiesSurface,
+    cache_page: crate::cache::CacheSurface,
     /// What the platform last said the environment is. What *System* follows.
     scheme: otlyra_platform::ColorScheme,
     /// The palette every surface is currently drawn from.
@@ -548,6 +549,7 @@ impl Browser {
             cache: None,
             bookmarks_page: crate::bookmarks::BookmarksSurface::new(),
             cookies_page: crate::cookies::CookiesSurface::new(),
+            cache_page: crate::cache::CacheSurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
             accessibility_dirty: true,
@@ -2487,6 +2489,27 @@ impl Browser {
         }
     }
 
+    /// Act on what the cache surface reported.
+    fn handle_cache_action(&mut self, action: crate::cache::Action) {
+        if action == crate::cache::Action::Close {
+            self.close_system_page();
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let mut held = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match action {
+            crate::cache::Action::ClearSite(site) => {
+                held.clear_site(&site);
+            }
+            crate::cache::Action::Clear => held.clear(),
+            crate::cache::Action::Close | crate::cache::Action::None => {}
+        }
+    }
+
     /// Act on what the cookies surface reported.
     fn handle_cookies_action(&mut self, action: crate::cookies::Action) {
         match action {
@@ -3103,6 +3126,7 @@ impl Browser {
                 Some(SystemPage::Downloads) => self.downloads_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::Bookmarks) => self.bookmarks_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::Cookies) => self.cookies_page.cursor_at(x, y, &mut self.text),
+                Some(SystemPage::Cache) => self.cache_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::About) => self.about.cursor_at(x, y, &mut self.text),
                 None if self.link_under_pointer().is_some() => Cursor::Pointer,
                 None => Cursor::Default,
@@ -3280,6 +3304,14 @@ impl Browser {
                         &mut list,
                     );
                 }
+                SystemPage::Cache => {
+                    self.cache_page.build_display_list(
+                        content,
+                        self.cache.as_ref(),
+                        &mut self.text,
+                        &mut list,
+                    );
+                }
                 _ => self
                     .about
                     .build_display_list(content, &mut self.text, &mut list),
@@ -3402,6 +3434,7 @@ impl Browser {
                 SystemPage::Downloads => 12u8,
                 SystemPage::Bookmarks => 14u8,
                 SystemPage::Cookies => 15u8,
+                SystemPage::Cache => 16u8,
                 _ => 13u8,
             }
             .hash(&mut hasher);
@@ -3410,6 +3443,7 @@ impl Browser {
             self.downloads_page.builds().hash(&mut hasher);
             self.bookmarks_page.builds().hash(&mut hasher);
             self.cookies_page.builds().hash(&mut hasher);
+            self.cache_page.builds().hash(&mut hasher);
             self.about.builds().hash(&mut hasher);
         } else if let Some(page) = tab.page.as_ref() {
             1u8.hash(&mut hasher);
@@ -3743,6 +3777,7 @@ impl Painter for Browser {
                     Some(SystemPage::Downloads) => self.downloads_page.pointer_moved(x, y),
                     Some(SystemPage::Bookmarks) => self.bookmarks_page.pointer_moved(x, y),
                     Some(SystemPage::Cookies) => self.cookies_page.pointer_moved(x, y),
+                    Some(SystemPage::Cache) => self.cache_page.pointer_moved(x, y),
                     Some(SystemPage::About) => self.about.pointer_moved(x, y),
                     _ => {}
                 }
@@ -3840,6 +3875,11 @@ impl Painter for Browser {
                         Some(SystemPage::Cookies) => {
                             let action = self.cookies_page.pointer_pressed(&mut self.text);
                             self.handle_cookies_action(action);
+                            return;
+                        }
+                        Some(SystemPage::Cache) => {
+                            let action = self.cache_page.pointer_pressed(&mut self.text);
+                            self.handle_cache_action(action);
                             return;
                         }
                         Some(SystemPage::About) => {
@@ -4048,6 +4088,14 @@ impl Painter for Browser {
                                     .key_pressed(key, modifiers, &mut self.text)
                             {
                                 self.handle_cookies_action(action);
+                                return;
+                            }
+                        }
+                        Some(SystemPage::Cache) => {
+                            if let Some(action) =
+                                self.cache_page.key_pressed(key, modifiers, &mut self.text)
+                            {
+                                self.handle_cache_action(action);
                                 return;
                             }
                         }
@@ -4321,6 +4369,9 @@ impl Painter for Browser {
                 }
                 Some(crate::menu::Command::ShowCookies) => {
                     self.open_system_in_new_tab(SystemPage::Cookies);
+                }
+                Some(crate::menu::Command::ShowCache) => {
+                    self.open_system_in_new_tab(SystemPage::Cache);
                 }
                 Some(crate::menu::Command::ToggleBookmark) => self.toggle_bookmark(),
                 Some(crate::menu::Command::ToggleDevTools) => self.toggle_inspector(),
@@ -5330,6 +5381,58 @@ mod system_page_tests {
         );
         browser.reload_ignoring_cache();
         assert_eq!(browser.next_cache_mode, otlyra_net::CacheMode::Default);
+    }
+
+    /// The cache page opens, lists what is held, and empties it.
+    #[test]
+    fn the_cache_page_opens_and_empties() {
+        let cache: otlyra_net::SharedCache =
+            std::sync::Arc::new(std::sync::Mutex::new(otlyra_net::cache::Cache::new()));
+        let mut browser = Browser::new(NoNetwork);
+        browser.set_cache(std::sync::Arc::clone(&cache));
+        for url in ["https://one.test/a", "https://two.test/b"] {
+            let now = std::time::SystemTime::now();
+            cache.lock().expect("not poisoned").store(
+                url,
+                "GET",
+                otlyra_net::cache::Stored {
+                    status: 200,
+                    headers: vec![("cache-control".to_owned(), "max-age=3600".to_owned())],
+                    body: b"body".to_vec(),
+                    final_url: url.to_owned(),
+                    directives: otlyra_net::cache::Directives::parse(["max-age=3600"]),
+                    lifetime: otlyra_net::cache::Lifetime::Stated(std::time::Duration::from_secs(
+                        3600,
+                    )),
+                    times: otlyra_net::cache::Times {
+                        requested: now,
+                        received: now,
+                        date: now,
+                        age: std::time::Duration::ZERO,
+                    },
+                    varied: Vec::new(),
+                    varies_on_everything: false,
+                },
+                &[],
+            );
+        }
+
+        browser.navigate("about:cache");
+        assert_eq!(browser.system_page(), Some(SystemPage::Cache));
+
+        browser.handle_cache_action(crate::cache::Action::ClearSite("one.test".into()));
+        assert_eq!(cache.lock().expect("not poisoned").len(), 1);
+        browser.handle_cache_action(crate::cache::Action::Clear);
+        assert!(cache.lock().expect("not poisoned").is_empty());
+
+        // And from the menu, in a browser that has no cache at all — which every
+        // headless mode is, and which must open the page rather than fall over.
+        let mut none = Browser::new(NoNetwork);
+        none.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ShowCache.id(),
+        ));
+        assert_eq!(none.system_page(), Some(SystemPage::Cache));
+        none.handle_cache_action(crate::cache::Action::Clear);
     }
 
     /// The cookies page is reachable the three ways every browser page is: by

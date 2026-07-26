@@ -580,6 +580,8 @@ pub enum SystemPage {
     Downloads,
     /// What sites are keeping here.
     Cookies,
+    /// What has already been fetched.
+    Cache,
     /// What this program is.
     About,
 }
@@ -597,6 +599,7 @@ impl SystemPage {
                 | Self::Bookmarks
                 | Self::Downloads
                 | Self::Cookies
+                | Self::Cache
                 | Self::About
         )
     }
@@ -615,6 +618,7 @@ impl SystemPage {
             Self::Bookmarks => "about:bookmarks",
             Self::Downloads => "about:downloads",
             Self::Cookies => "about:cookies",
+            Self::Cache => "about:cache",
             Self::About => "about:otlyra",
         }
     }
@@ -635,6 +639,7 @@ impl SystemPage {
             "bookmarks" => Self::Bookmarks,
             "downloads" => Self::Downloads,
             "cookies" => Self::Cookies,
+            "cache" => Self::Cache,
             // `about:` on its own is the browser talking about itself, which is
             // what every other browser does with it too.
             "otlyra" | "about" | "version" | "" => Self::About,
@@ -650,6 +655,7 @@ impl SystemPage {
             Self::Bookmarks => "Bookmarks",
             Self::Downloads => "Downloads",
             Self::Cookies => "Cookies",
+            Self::Cache => "Cache",
             Self::About => "About Otlyra",
         }
     }

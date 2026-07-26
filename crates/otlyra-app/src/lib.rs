@@ -48,6 +48,7 @@ pub mod about;
 pub mod bidi;
 pub mod bookmarks;
 pub mod browser;
+pub mod cache;
 pub mod clipboard;
 pub mod cookies;
 pub mod downloads;

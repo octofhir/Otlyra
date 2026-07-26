@@ -116,7 +116,11 @@ pub fn same_site(one: &Url, other: &Url) -> bool {
 /// An address is its own site and is never taken apart. Reading `127.0.0.1` as a
 /// name gives `0.1` — a suffix two other machines on the network share — so a
 /// registrable domain is exactly the wrong question to ask of one.
-fn site_of(host: &str) -> &str {
+///
+/// Public because the cache groups by the same thing, and two answers to *what
+/// site is this* would mean a reader seeing one name on the cookie page and
+/// another on the cache page for the same site.
+pub fn site_of(host: &str) -> &str {
     if is_address(host) {
         return host;
     }

@@ -154,9 +154,7 @@ The two the last one was picked over, either of which is the obvious next:
   different problem — a format, a size budget against a real disk, two windows
   writing at once — and it is what would make a cold start fast rather than a
   second navigation.
-- **A page listing what is cached, and a way to empty it.** `about:cookies` is
-  the shape; `Cache::counts` and `Cache::clear` are the parts. Today the only way
-  to empty the cache is ⌘⇧R.
+
 
 What the finished ones left behind, which is work and not history:
 

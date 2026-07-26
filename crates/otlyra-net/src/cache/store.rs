@@ -148,6 +148,20 @@ impl Stored {
     }
 }
 
+/// The site an address belongs to: its registrable domain, or its host where
+/// there is none.
+///
+/// What a page listing the cache groups by, and the same answer the cookie page
+/// groups by — so a reader looking at both sees one name for one site.
+pub fn site_of(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    // The cookie jar's own answer, not a second one beside it: an address is its
+    // own site and is never taken apart, and a reader must see one name for one
+    // site on both pages.
+    Some(crate::cookie::site_of(host).to_owned())
+}
+
 /// The names `Vary` listed, lowercased. `None` where it said `*`.
 fn varied_names(headers: &[(String, String)]) -> Option<Vec<String>> {
     let mut names = Vec::new();
@@ -255,6 +269,32 @@ impl Cache {
     /// of what it does is invisible except as speed.
     pub fn counts(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    /// Everything held, for a page that lists it.
+    ///
+    /// Address and entry, in no particular order — the order the cache keeps is
+    /// how recently each was used, which is a fact about eviction and not one a
+    /// reader is looking for.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Stored)> {
+        self.entries
+            .iter()
+            .map(|(url, stored)| (url.as_str(), stored))
+    }
+
+    /// Throw away everything one site is keeping. Answers how many went.
+    pub fn clear_site(&mut self, site: &str) -> usize {
+        let doomed: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(url, _)| site_of(url).as_deref() == Some(site))
+            .map(|(url, _)| url.clone())
+            .collect();
+        let count = doomed.len();
+        for url in doomed {
+            self.remove(&url);
+        }
+        count
     }
 
     /// Throw everything away.
@@ -736,5 +776,84 @@ mod tests {
         cache.clear();
         assert!(cache.is_empty());
         assert_eq!(cache.bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    fn filled() -> Cache {
+        let mut cache = Cache::new();
+        for url in [
+            "https://www.example.com/a",
+            "https://api.example.com/b",
+            "https://other.test/c",
+        ] {
+            let headers = vec![("cache-control".to_owned(), "max-age=3600".to_owned())];
+            let directives = Directives::parse(["max-age=3600"]);
+            cache.store(
+                url,
+                "GET",
+                Stored {
+                    status: 200,
+                    headers,
+                    body: b"body".to_vec(),
+                    final_url: url.to_owned(),
+                    directives,
+                    lifetime: Lifetime::Stated(Duration::from_secs(3600)),
+                    times: Times {
+                        requested: now(),
+                        received: now(),
+                        date: now(),
+                        age: Duration::ZERO,
+                    },
+                    varied: Vec::new(),
+                    varies_on_everything: false,
+                },
+                &[],
+            );
+        }
+        cache
+    }
+
+    /// Grouped by the site that served it, and by the same name the cookie page
+    /// groups by — so a reader looking at both sees one name for one site.
+    #[test]
+    fn an_address_belongs_to_its_site() {
+        assert_eq!(
+            site_of("https://www.example.com/a").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            site_of("https://api.example.co.uk/b").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            site_of("http://127.0.0.1:8080/x").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(site_of("http://localhost/x").as_deref(), Some("localhost"));
+        assert_eq!(site_of("not a url"), None);
+    }
+
+    /// Being rid of one site is being rid of that site, and of nothing else.
+    #[test]
+    fn one_site_can_be_thrown_away_without_the_rest() {
+        let mut cache = filled();
+        assert_eq!(cache.entries().count(), 3);
+        assert_eq!(cache.clear_site("example.com"), 2);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 4, "and the bytes went with them");
+        assert_eq!(
+            cache.entries().map(|(url, _)| url).collect::<Vec<_>>(),
+            ["https://other.test/c"]
+        );
+        assert_eq!(cache.clear_site("nobody.test"), 0);
     }
 }

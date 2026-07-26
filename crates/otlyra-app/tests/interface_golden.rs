@@ -244,6 +244,96 @@ impl Painter for CookiesFrame {
     fn on_event(&mut self, _event: PlatformEvent) {}
 }
 
+/// The cache surface with a page's worth of things in it.
+struct CacheFrame {
+    ui: BrowserUi,
+    surface: otlyra_app::cache::CacheSurface,
+    store: otlyra_net::SharedCache,
+    text: TextEngine,
+}
+
+impl CacheFrame {
+    fn new() -> Self {
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("about:cache");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut cache = otlyra_net::cache::Cache::new();
+        for (url, size) in [
+            ("https://www.example.com/index.html", 4_200),
+            ("https://www.example.com/assets/app.css", 18_000),
+            ("https://www.example.com/assets/app.js", 96_000),
+            ("https://static.example.com/logo.png", 12_400),
+            ("https://news.test/", 31_000),
+        ] {
+            cache.store(
+                url,
+                "GET",
+                otlyra_net::cache::Stored {
+                    status: 200,
+                    headers: vec![("cache-control".to_owned(), "max-age=3600".to_owned())],
+                    body: vec![b'x'; size],
+                    final_url: url.to_owned(),
+                    directives: otlyra_net::cache::Directives::parse(["max-age=3600"]),
+                    lifetime: otlyra_net::cache::Lifetime::Stated(std::time::Duration::from_secs(
+                        3600,
+                    )),
+                    times: otlyra_net::cache::Times {
+                        requested: now,
+                        received: now,
+                        date: now,
+                        age: std::time::Duration::ZERO,
+                    },
+                    varied: Vec::new(),
+                    varies_on_everything: false,
+                },
+                &[],
+            );
+        }
+        // Two answered from the cache, so the summary has a number to say.
+        cache.look_up("https://www.example.com/assets/app.css", &[], now);
+        cache.look_up("https://news.test/", &[], now);
+        Self {
+            ui,
+            surface: otlyra_app::cache::CacheSurface::new(),
+            store: std::sync::Arc::new(std::sync::Mutex::new(cache)),
+            text: TextEngine::isolated(),
+        }
+    }
+
+    fn dark() -> Self {
+        let mut frame = Self::new();
+        frame.ui.set_theme(Theme::dark());
+        frame.surface.set_theme(Theme::dark());
+        frame
+    }
+}
+
+impl Painter for CacheFrame {
+    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        let (width, height) = (viewport.logical_width(), viewport.logical_height());
+        let mut list = DisplayList::new();
+        self.surface.build_display_list(
+            Rect::new(0.0, UI_HEIGHT, width, (height - UI_HEIGHT).max(0.0)),
+            Some(&self.store),
+            &mut self.text,
+            &mut list,
+        );
+        list.append(&self.ui.build_display_list(
+            width,
+            height,
+            &tabs(&[("Cache", false)]),
+            0,
+            (true, false),
+            None,
+            &mut self.text,
+        ));
+        list.transform(Affine::scale(viewport.scale_factor));
+        otlyra_gfx::render(&list, target);
+    }
+
+    fn on_event(&mut self, _event: PlatformEvent) {}
+}
+
 fn assert_frame_matches(name: &str, frame: &mut dyn Painter, width: f64, height: f64) {
     for scale in SCALES {
         let viewport = Viewport::new(
@@ -291,4 +381,14 @@ fn the_cookies_match_their_goldens_at_both_scales() {
 #[test]
 fn the_dark_cookies_match_their_goldens_at_both_scales() {
     assert_frame_matches("cookies-dark", &mut CookiesFrame::dark(), 900.0, 700.0);
+}
+
+#[test]
+fn the_cache_matches_its_goldens_at_both_scales() {
+    assert_frame_matches("cache", &mut CacheFrame::new(), 900.0, 700.0);
+}
+
+#[test]
+fn the_dark_cache_matches_its_goldens_at_both_scales() {
+    assert_frame_matches("cache-dark", &mut CacheFrame::dark(), 900.0, 700.0);
 }
