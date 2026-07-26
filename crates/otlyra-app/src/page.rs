@@ -1126,6 +1126,15 @@ impl PageScene {
         self.dirty
     }
 
+    /// Everything the page was laid out and styled for has changed.
+    ///
+    /// What a zoom does: the page is laid out in a viewport of a different size,
+    /// so the cascade's media queries and viewport units have a different answer
+    /// and every box has a different width to fill.
+    pub fn invalidate_layout(&mut self) {
+        self.invalidate_styles();
+    }
+
     /// Everything the cascade produced is out of date.
     fn invalidate_styles(&mut self) {
         self.styled = false;

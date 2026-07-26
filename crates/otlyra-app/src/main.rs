@@ -47,6 +47,15 @@ struct Cli {
     #[arg(long, default_value_t = 2.0)]
     scale_factor: f64,
 
+    /// Draw the page this much larger than its own pixels.
+    ///
+    /// Not the scale factor and not the text size: a zoom makes the CSS pixel
+    /// itself larger for the page and leaves the browser's own interface alone,
+    /// so a zoomed page reflows into the fewer pixels the window now holds
+    /// rather than being magnified.
+    #[arg(long, default_value_t = 1.0)]
+    zoom: f32,
+
     /// Write the frame's display list to this path as JSON, then exit.
     ///
     /// Needs neither a GPU nor a rasterizer, so it is the cheapest way to answer
@@ -438,6 +447,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         // Before the navigation, because a page picks between the pictures it
         // offers while it loads and the load can finish before the first frame.
         browser.set_viewport(cli.viewport());
+        browser.set_zoom(cli.zoom);
         browser.navigate(&match &source {
             Source::Url(url) => url.clone(),
             Source::File(path) => path.display().to_string(),
@@ -530,6 +540,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
     STARTUP_TRACE.mark("browser_ready");
     browser.set_viewport(cli.viewport());
+    browser.set_zoom(cli.zoom);
     browser.navigate(&match &source {
         Source::Url(url) => url.clone(),
         Source::File(path) => path.display().to_string(),

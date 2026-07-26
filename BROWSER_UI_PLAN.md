@@ -147,19 +147,27 @@ Page zoom is next, over cookies/cache and the half-drawn controls: it is
 entirely ours, it needs nothing from a script engine, and it is the one setting
 a reader changes on a page they are already reading. Three slices:
 
-- [ ] **The factor, and what it multiplies.** A zoom per origin, held by the
-  browser and applied to the page's own scale rather than to the window's — the
-  chrome does not zoom, which is what separates this from the device scale the
-  compositor already carries. `PageScene::set_text_scale` is the wrong lever:
-  it moves the root font size, and a zoom moves lengths, borders and pictures
-  too.
+The factor is in. `Browser::zoom`/`set_zoom` makes the CSS pixel itself larger
+for the page: it lays out in the fewer of them the window now holds and its
+display list is scaled back up, so a zoomed page *reflows* — its media queries
+and viewport units answer to the new width — rather than being magnified. The
+chrome is untouched, which is what separates a zoom from the device scale the
+compositor carries and from the reader's text size, which moves only the root
+font. Every question a pointer asks the page goes through `Browser::in_page`,
+because a press answered in a coordinate system it did not land in is a link
+that opens when the pointer was somewhere else. `--zoom` sets it for a
+screenshot. What is left:
+
 - [ ] **Reaching it.** ⌘+, ⌘− and ⌘0, a row in the browser menu showing the
-  current factor, and the wheel with the accelerator held. Where the page was
-  scrolled to has to survive a zoom, which means the scroll is restored against
-  content that is a different height.
-- [ ] **Remembering it.** Per origin, in the preferences store, so a site that
-  needs 125% keeps it across a restart — which is the whole reason a reader
-  bothers to set one.
+  current factor, and the wheel with the accelerator held. The menu's `ZoomIn`,
+  `ZoomOut` and `ActualSize` exist and are greyed out, so this is mostly
+  handing them to `set_zoom` in steps a reader recognizes — and deciding what
+  the steps are. Where the page was scrolled to has to survive a zoom, which
+  means restoring it against content of a different height.
+- [ ] **Remembering it, per origin.** One factor for the whole browser today.
+  It belongs to the site: a reader who needs 125% on one needs it every time
+  they go back, and needs the next site left alone. That means the preferences
+  store, and a zoom that follows the active tab rather than the window.
 
 ## Priority 5 — Design system and fast UI authoring
 

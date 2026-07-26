@@ -357,6 +357,8 @@ pub struct Browser {
     /// And how many device pixels went to one of them. A page choosing between
     /// the pictures it offers is choosing by this number.
     last_scale: f64,
+    /// How much larger than its CSS pixels the page is drawn. See [`Browser::zoom`].
+    zoom: f32,
     /// The mark shown on an empty tab. `None` if it failed to decode, which is a
     /// cosmetic problem and not a reason to refuse to draw a frame.
     mark: Option<otlyra_gfx::peniko::ImageData>,
@@ -501,6 +503,7 @@ impl Browser {
             last_width: 1024.0,
             last_height: 768.0,
             last_scale: 1.0,
+            zoom: 1.0,
             mark: otlyra_gfx::decode_image(crate::MARK)
                 .inspect_err(|error| tracing::error!(%error, "the mark failed to decode"))
                 .ok(),
@@ -650,6 +653,55 @@ impl Browser {
         };
         page.move_selection(motion, true);
         true
+    }
+
+    /// How much larger than its CSS pixels the page in the active tab is drawn.
+    ///
+    /// A page zoom is not the device scale and not the reader's text size. The
+    /// device scale is how many device pixels go to a CSS pixel and applies to
+    /// the whole window, chrome and all. The text size moves the root font and
+    /// nothing else, so a page that sizes its cards in pixels does not grow with
+    /// it. A zoom makes the CSS pixel itself larger for one page: every length,
+    /// border and picture grows, the chrome does not, and the page lays out in
+    /// the fewer CSS pixels the window now holds — which is why a zoomed page
+    /// reflows rather than being magnified.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Draw the page this much larger, between an eighth and five times.
+    ///
+    /// The range is every browser's: past those a page is either unreadable or
+    /// a wall of one word, and a factor a reader cannot get back from is a
+    /// factor they should not be able to reach.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(0.25, 5.0);
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom = zoom;
+        // Everything below the zoom is a function of it: the page lays out in a
+        // viewport of a different size, so it has to be laid out again.
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.invalidate_layout();
+        }
+    }
+
+    /// A point in the window, in the page's own coordinates.
+    ///
+    /// A zoomed page is laid out in fewer CSS pixels than the window has logical
+    /// ones and drawn back up to fill them, so every question a pointer asks it
+    /// has to be asked in its units. One place, because a press answered in a
+    /// coordinate system it did not land in is a link that opens when the
+    /// pointer was somewhere else.
+    fn in_page(&self, x: f64, y: f64) -> (f64, f64) {
+        let zoom = f64::from(self.zoom);
+        (x / zoom, y / zoom)
+    }
+
+    /// The page's top inset, in the page's own coordinates.
+    fn page_top(&self) -> f32 {
+        ((if self.interface { UI_HEIGHT } else { 0.0 }) / f64::from(self.zoom)) as f32
     }
 
     /// Tell the browser how big the window is going to be, before it has drawn
@@ -2813,6 +2865,7 @@ impl Browser {
     /// the element the overlay names is the element a click would have hit.
     /// Nothing new is measured and no second answer to *what is here* exists.
     fn pick_at(&mut self, x: f64, y: f64) {
+        let (x, y) = self.in_page(x, y);
         let Some(page) = self.tabs[self.active].page.as_ref() else {
             return;
         };
@@ -2864,6 +2917,7 @@ impl Browser {
         if y < UI_HEIGHT {
             return None;
         }
+        let (x, y) = self.in_page(x, y);
         let tab = self.tabs.get(self.active)?;
         let href = tab.page.as_ref()?.link_at(x, y)?;
         Some(otlyra_net::resolve(&tab.url, &href).unwrap_or(href))
@@ -2976,18 +3030,26 @@ impl Browser {
         } else if self.tabs[self.active].page.is_some() && !self.blocked_on_style(self.active) {
             // Told before the frame is built, because it decides what `medium`
             // computes to and every element that inherited a size inherited that.
+            // Laid out in the page's own pixels and drawn back up to the
+            // window's. A zoom makes the CSS pixel larger, so the same window
+            // holds fewer of them and the page reflows into what is left —
+            // which is the difference between zooming a page and magnifying a
+            // picture of one. The inset is divided too, so that scaling it back
+            // up lands the page under the chrome rather than under a chrome the
+            // zoom has moved.
+            let zoom = f64::from(self.zoom);
             let logical = {
                 let page = self.tabs[self.active].page.as_mut().expect("a page");
                 page.set_text_scale(g.text_scale);
                 page.set_color_scheme(g.page_scheme);
                 page.build_display_list(
                     &mut self.text,
-                    g.width as f32,
-                    g.content_height as f32,
-                    g.top as f32,
+                    (g.width / zoom) as f32,
+                    (g.content_height / zoom) as f32,
+                    (g.top / zoom) as f32,
                 )
             };
-            self.scaled_page(logical, g.scale_factor)
+            self.scaled_page(logical, g.scale_factor * zoom)
         } else {
             let mut list = otlyra_gfx::DisplayList::new();
             crate::ui::paint_blank_page(
@@ -3377,7 +3439,8 @@ impl Painter for Browser {
                 // does: what is between where the press landed and where the
                 // pointer is now is what is selected, wherever it wanders.
                 if self.selecting {
-                    let top = UI_HEIGHT as f32;
+                    let top = self.page_top();
+                    let (x, y) = self.in_page(x, y);
                     if let Some(page) = self.tabs[self.active].page.as_mut() {
                         page.select_to(x as f32, y as f32, top);
                         return;
@@ -3386,15 +3449,12 @@ impl Painter for Browser {
 
                 // A scrollbar being dragged keeps the pointer until it is let go,
                 // wherever the pointer wanders.
-                let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
+                let (width, height) = self.in_page(self.last_width, self.last_height - UI_HEIGHT);
+                let (_, page_y) = self.in_page(0.0, y - UI_HEIGHT);
                 if let Some(page) = self.tabs[self.active].page.as_mut()
                     && page.dragging_scrollbar()
                 {
-                    page.drag_scrollbar(
-                        (y - UI_HEIGHT) as f32,
-                        width as f32,
-                        height.max(0.0) as f32,
-                    );
+                    page.drag_scrollbar(page_y as f32, width as f32, height.max(0.0) as f32);
                     return;
                 }
                 // The page follows the pointer: `:hover` on what it is over, and
@@ -3402,9 +3462,10 @@ impl Painter for Browser {
                 // something depends on it, which for most pages is never.
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
                     let over_page = y >= UI_HEIGHT && y < self.dock_top();
+                    let (page_x, page_y) = self.in_page(x, y);
                     if let Some(page) = self.tabs[self.active].page.as_mut() {
                         let _ = if over_page {
-                            page.pointer_moved(x, y)
+                            page.pointer_moved(page_x, page_y)
                         } else {
                             page.pointer_left()
                         };
@@ -3472,12 +3533,13 @@ impl Painter for Browser {
                 // A press on a scrollbar belongs to it rather than to the page
                 // behind it.
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
-                    let (x, y) = self.pointer;
-                    let (width, height) = (self.last_width, self.last_height - UI_HEIGHT);
+                    let (width, height) =
+                        self.in_page(self.last_width, self.last_height - UI_HEIGHT);
+                    let (x, y) = self.in_page(self.pointer.0, self.pointer.1 - UI_HEIGHT);
                     if let Some(page) = self.tabs[self.active].page.as_mut()
                         && page.grab_scrollbar(
                             x as f32,
-                            (y - UI_HEIGHT) as f32,
+                            y as f32,
                             width as f32,
                             height.max(0.0) as f32,
                         )
@@ -3540,7 +3602,7 @@ impl Painter for Browser {
                     && self.tabs[self.active].system.is_none()
                     && self.pointer.1 >= UI_HEIGHT
                 {
-                    let (x, y) = self.pointer;
+                    let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
                     let pressed = self.tabs[self.active]
                         .page
                         .as_mut()
@@ -3565,8 +3627,8 @@ impl Painter for Browser {
                 // away whatever was selected before — which is what a press on a
                 // page means everywhere else.
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
-                    let (x, y) = self.pointer;
-                    let top = UI_HEIGHT as f32;
+                    let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
+                    let top = self.page_top();
                     if let Some(page) = self.tabs[self.active].page.as_mut() {
                         let (x, y) = (x as f32, y as f32);
                         // A second click takes the word and a third the block it
@@ -3603,7 +3665,7 @@ impl Painter for Browser {
 
             PlatformEvent::PointerReleased => {
                 self.selecting = false;
-                let (x, y) = self.pointer;
+                let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
                 if let Some(page) = self.tabs[self.active].page.as_mut() {
                     page.release_scrollbar();
                     // A control is activated on the release and only where the
@@ -3919,7 +3981,15 @@ impl Painter for Browser {
                     // scrolls takes it first, and the page takes it once that box
                     // has reached its end.
                     let (x, pointer_y) = self.pointer;
-                    page.scroll_at(x as f32, (pointer_y - UI_HEIGHT) as f32, y as f32);
+                    // In the page's own pixels, like every other question a
+                    // pointer asks it. Read from the field rather than through
+                    // `in_page`, which wants a borrow the page already has.
+                    let zoom = f64::from(self.zoom);
+                    page.scroll_at(
+                        (x / zoom) as f32,
+                        ((pointer_y - UI_HEIGHT) / zoom) as f32,
+                        y as f32,
+                    );
                 }
             }
 
@@ -7702,6 +7772,112 @@ mod tests {
         assert!(
             paragraph(&mut browser),
             "and it was drawn once the stylesheet was in"
+        );
+    }
+
+    /// A zoomed page is laid out in fewer CSS pixels and drawn back up to fill
+    /// the window — it reflows, rather than being magnified.
+    ///
+    /// That is the whole difference between a page zoom and a picture of a page
+    /// scaled up, and it is what a reader wants: bigger text that still uses the
+    /// window it is in.
+    #[test]
+    fn a_zoomed_page_reflows_rather_than_being_magnified() {
+        struct Prose;
+
+        impl Loader for Prose {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<title>T</title><body style='margin:0'><p>one two three four \
+                             five six seven eight nine ten eleven twelve thirteen fourteen \
+                             fifteen sixteen seventeen eighteen nineteen twenty"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: format!("https://{url}/"),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(Prose);
+        go(&mut browser, "prose.example");
+
+        let runs = |browser: &mut Browser| {
+            let mut target = otlyra_gfx::RecordingPainter::default();
+            browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+            target
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, otlyra_gfx::PaintOp::DrawGlyphs { .. }))
+                .count()
+        };
+
+        assert_eq!(browser.zoom(), 1.0, "a page opens at its own size");
+        let plain = runs(&mut browser);
+
+        browser.set_zoom(2.0);
+        assert_eq!(browser.zoom(), 2.0);
+        let zoomed = runs(&mut browser);
+        assert!(
+            zoomed > plain,
+            "the paragraph broke into more lines in half the pixels: {plain} then {zoomed}"
+        );
+
+        // And back, exactly: a reader who undoes a zoom gets the page they had.
+        browser.set_zoom(1.0);
+        assert_eq!(runs(&mut browser), plain);
+
+        // The range is every browser's, and a factor outside it is brought back
+        // rather than refused — a control that silently does nothing is worse
+        // than one that stops.
+        browser.set_zoom(50.0);
+        assert_eq!(browser.zoom(), 5.0);
+        browser.set_zoom(0.01);
+        assert_eq!(browser.zoom(), 0.25);
+    }
+
+    /// A press lands where the reader aimed it, whatever the zoom.
+    ///
+    /// The page is laid out in its own pixels, so a pointer arriving in the
+    /// window's has to be converted — and a press answered in the coordinate
+    /// system it did not land in is a link that opens when the pointer was
+    /// somewhere else.
+    #[test]
+    fn a_press_on_a_zoomed_page_lands_where_it_was_aimed() {
+        let mut browser = browser();
+        go(&mut browser, "example.com");
+
+        let draw = |browser: &mut Browser| {
+            let mut target = otlyra_gfx::RecordingPainter::default();
+            browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+        };
+        let hit = |browser: &Browser, x: f64, y: f64| {
+            let (x, y) = browser.in_page(x, y);
+            browser.tabs[browser.active]
+                .page
+                .as_ref()
+                .expect("a page")
+                .box_at(x, y)
+        };
+
+        draw(&mut browser);
+        // Thirty of the page's own pixels into its content, which unzoomed is
+        // thirty of the window's below the chrome.
+        let plain = hit(&mut browser, 30.0, UI_HEIGHT + 30.0);
+        assert!(
+            plain.is_some(),
+            "the paragraph is under that point unzoomed"
+        );
+
+        browser.set_zoom(2.0);
+        draw(&mut browser);
+        // The same thirty page pixels, drawn twice as large: twice as far into
+        // the window, and the chrome's own inset is not doubled with them.
+        assert_eq!(
+            hit(&mut browser, 60.0, UI_HEIGHT + 60.0),
+            plain,
+            "the same place in the page, aimed at where it is now drawn"
         );
     }
 
