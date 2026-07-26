@@ -10,6 +10,9 @@
 //! - [`policy`] answers the three questions, and nothing else: may this be kept,
 //!   how long is it good for, and what may be done with it now. Pure, and against
 //!   a clock the caller passes in.
+//! - [`store`] is what has been kept: one entry per address, `Vary` recorded
+//!   against the request it was stored for, and a capacity that evicts what was
+//!   used longest ago.
 //!
 //! ## Invariants
 //!
@@ -22,5 +25,7 @@
 //!    `private` storable and `s-maxage` none of its business.
 
 pub mod policy;
+pub mod store;
 
 pub use policy::{Directives, Lifetime, Times, Use, lifetime, may_store, use_of};
+pub use store::{Cache, Capacity, Stored};
