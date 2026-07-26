@@ -49,6 +49,7 @@ pub mod bidi;
 pub mod bookmarks;
 pub mod browser;
 pub mod clipboard;
+pub mod cookies;
 pub mod downloads;
 pub mod fetcher;
 pub mod history;

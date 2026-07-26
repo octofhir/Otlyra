@@ -31,20 +31,51 @@ pub struct LoadRequest {
     /// for, so the body is the method rather than a second field that could
     /// disagree with it.
     pub body: Option<Body>,
+    /// The page this request was made from, if a page made it.
+    ///
+    /// `None` is nobody: a typed address, a bookmark, a session restored. This is
+    /// what `SameSite` is decided against, and it is the caller's to answer
+    /// because only the caller knows — a loader looking at a URL cannot tell a
+    /// link followed from a picture fetched.
+    pub initiator: Option<Url>,
+    /// Whether this is a top-level navigation — something whose result the reader
+    /// will be looking at — rather than a resource inside a page.
+    ///
+    /// The other half of the `SameSite=Lax` question. Whether the method is a
+    /// safe one is *not* asked here: it is [`LoadRequest::body`], which the
+    /// loader reads itself and which a redirect can change on the way.
+    pub navigation: bool,
 }
 
 impl LoadRequest {
-    /// A request for `url`.
+    /// A request for `url`, caused by nobody.
     pub fn new(url: Url) -> Self {
-        Self { url, body: None }
+        Self {
+            url,
+            body: None,
+            initiator: None,
+            navigation: false,
+        }
     }
 
     /// A request that sends `body` to `url`.
     pub fn post(url: Url, body: Body) -> Self {
         Self {
-            url,
             body: Some(body),
+            ..Self::new(url)
         }
+    }
+
+    /// The same request, caused by a page at `initiator`.
+    pub fn from(mut self, initiator: Url) -> Self {
+        self.initiator = Some(initiator);
+        self
+    }
+
+    /// The same request, marked as a top-level navigation.
+    pub fn navigating(mut self) -> Self {
+        self.navigation = true;
+        self
     }
 
     /// The method this request is made with.
@@ -249,7 +280,17 @@ pub struct Loader {
     client: reqwest::Client,
     blocking: std::sync::OnceLock<tokio::runtime::Runtime>,
     limits: Limits,
+    jar: Option<SharedJar>,
 }
+
+/// The one jar, shared by everything that sends a request and everything that
+/// shows the reader what is kept.
+///
+/// A `std::sync::Mutex` rather than tokio's, and never held across an `await`:
+/// the two things done under it — asking for a header, taking one — are a walk
+/// over a few hundred cookies with no waiting in them, and an async mutex would
+/// be a scheduling point where there is nothing to schedule.
+pub type SharedJar = std::sync::Arc<std::sync::Mutex<crate::cookie::Jar>>;
 
 impl Loader {
     /// A loader with the document limits.
@@ -282,7 +323,23 @@ impl Loader {
             client,
             blocking: std::sync::OnceLock::new(),
             limits,
+            jar: None,
         })
+    }
+
+    /// The same loader, sending and storing cookies through `jar`.
+    ///
+    /// Optional, and off by default: a loader with no jar sends no `Cookie` and
+    /// keeps no `Set-Cookie`, which is what a one-shot `--url` fetch and most of
+    /// this crate's own tests want. A browser gives it one.
+    pub fn with_jar(mut self, jar: SharedJar) -> Self {
+        self.jar = Some(jar);
+        self
+    }
+
+    /// The jar this loader sends from, if it has one.
+    pub fn jar(&self) -> Option<&SharedJar> {
+        self.jar.as_ref()
     }
 
     /// The limits this loader enforces.
@@ -356,6 +413,17 @@ impl Loader {
         let mut url = request.url;
         let mut body = request.body;
 
+        // One instant for the whole chain. A cookie that expires between the first
+        // hop and the last is one the chain was decided against inconsistently,
+        // and asking the clock four times is how that happens.
+        let now = std::time::SystemTime::now();
+        // `SameSite` across a chain is the whole chain's answer, not each hop's:
+        // once a redirect has left the initiator's site, everything after it was
+        // caused by that departure however same-site the last two hops look. A
+        // request nobody initiated never leaves, which is what makes a bookmark to
+        // a bank open it signed in.
+        let mut still_same_site = true;
+
         for hop in 0.. {
             if hop > self.limits.max_redirects {
                 return Err(NetError::TooManyRedirects {
@@ -364,7 +432,24 @@ impl Loader {
                 });
             }
 
-            let (response, request_headers) = self.send(&url, body.clone()).await?;
+            still_same_site &= request
+                .initiator
+                .as_ref()
+                .is_none_or(|from| crate::cookie::same_site(from, &url));
+            let context = if still_same_site {
+                crate::cookie::Context::SameSite
+            } else if request.navigation && body.is_none() {
+                // Top-level, and by a method that changes nothing — which is where
+                // `Lax` was drawn. A cross-site form post is top-level and is not
+                // safe, and a 303 that drops the body makes the hop after it safe,
+                // which is what browsers do as well.
+                crate::cookie::Context::CrossSiteNavigation
+            } else {
+                crate::cookie::Context::CrossSite
+            };
+
+            let (response, request_headers) = self.send(&url, body.clone(), context, now).await?;
+            self.take_cookies(&response, &url, now);
 
             match Self::redirect_from(&response, &url)? {
                 // Not a redirect, or one with nowhere to go — which a server does
@@ -400,6 +485,8 @@ impl Loader {
         &self,
         url: &Url,
         body: Option<Body>,
+        context: crate::cookie::Context,
+        now: std::time::SystemTime,
     ) -> Result<(reqwest::Response, Vec<(String, String)>), NetError> {
         let shown = url.to_string();
         let built = match body {
@@ -416,6 +503,16 @@ impl Loader {
         }
         .build()
         .map_err(|error| self.classify(error, &shown))?;
+        let mut built = built;
+        // Asked for and written here rather than left to the client, so the header
+        // is on the request the inspector reads back and so the jar sees each hop.
+        // The guard is taken and dropped before anything is awaited.
+        if let Some(header) = self.cookie_header(url, context, now)
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&header)
+        {
+            built.headers_mut().insert(reqwest::header::COOKIE, value);
+        }
+        let built = built;
         let request_headers = headers_to_pairs(built.headers());
 
         let response = self
@@ -484,6 +581,54 @@ impl Loader {
             response_headers,
             body,
         })
+    }
+
+    /// The `Cookie` header for one hop, or `None` when there is nothing to send.
+    fn cookie_header(
+        &self,
+        url: &Url,
+        context: crate::cookie::Context,
+        now: std::time::SystemTime,
+    ) -> Option<String> {
+        let jar = self.jar.as_ref()?;
+        // A jar poisoned by a panic somewhere else must not stop every later fetch
+        // from having cookies: the data behind it is a list of cookies, not an
+        // invariant a panic can have broken halfway.
+        let mut jar = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        jar.header_for(url, context, now)
+    }
+
+    /// Take whatever a response set, one `Set-Cookie` at a time.
+    ///
+    /// Every hop, including the redirects — which is the point of walking the
+    /// chain here. A sign-in sets its session on the hop that redirects, and a
+    /// client that handed back only the last response never showed it to anyone.
+    fn take_cookies(&self, response: &reqwest::Response, url: &Url, now: std::time::SystemTime) {
+        let Some(jar) = self.jar.as_ref() else {
+            return;
+        };
+        let lines: Vec<&str> = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            // A header value is bytes and a cookie may be written in some legacy
+            // encoding. One that is not text is dropped rather than mangled: a
+            // name or a value read wrong is a cookie that goes back wrong, which
+            // is worse than one that never arrived.
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+
+        let mut jar = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for line in lines {
+            if let Err(refused) = jar.set(url, line, now) {
+                // Named rather than swallowed: this is what a person debugging
+                // their own site needs to see, and what the inspector will show.
+                tracing::debug!(%url, %refused, "a cookie was refused");
+            }
+        }
     }
 
     /// Where a response says to go next, and what to carry there.

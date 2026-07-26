@@ -249,7 +249,7 @@ fn serve_bidi(port: u16, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::io::Write::flush(&mut std::io::stdout())?;
     tracing::info!(address = %server.address(), "answering WebDriver BiDi");
 
-    let browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
+    let browser = browser(cli.settings());
     let mut session = cli.session(browser);
     loop {
         server.serve_one(&mut session)?;
@@ -271,7 +271,7 @@ fn main() -> ExitCode {
     if cli.url.is_none() && cli.file.is_none() && !cli.mcp && cli.bidi.is_none() {
         let settings = cli.settings();
         STARTUP_TRACE.mark("preferences_ready");
-        let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
+        let mut browser = browser(settings);
         STARTUP_TRACE.mark("browser_ready");
         let start = browser.settings_on_start();
         if start == otlyra_app::settings::OnStart::Home {
@@ -301,7 +301,7 @@ fn main() -> ExitCode {
     if cli.mcp {
         // stdout is the wire from here on. Everything this program says about
         // itself already goes to stderr, which is what makes that safe.
-        let browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
+        let browser = browser(cli.settings());
         let mut session = cli.session(browser);
         let input = std::io::BufReader::new(std::io::stdin().lock());
         return match otlyra_app::mcp::serve(&mut session, input, std::io::stdout().lock()) {
@@ -379,7 +379,7 @@ fn main() -> ExitCode {
         // is ours, with no system font and no network in it.
         Some(path) => write_screenshot(&mut scene, viewport, path),
         None => {
-            let mut browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
+            let mut browser = browser(cli.settings());
             run_windowed(&cli, &mut browser)
         }
     };
@@ -422,7 +422,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     {
         let settings = cli.settings();
         STARTUP_TRACE.mark("preferences_ready");
-        let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
+        let mut browser = browser(settings);
         STARTUP_TRACE.mark("browser_ready");
         browser.open_system(page);
         return match cli.screenshot.as_deref() {
@@ -440,7 +440,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
         || cli.dump_fragments
         || cli.dump_selectors.is_some();
     if !wants_bytes {
-        let mut browser = Browser::with_async_loader(NetLoader::default(), cli.settings());
+        let mut browser = browser(cli.settings());
         if cli.no_interface {
             browser.hide_interface();
         }
@@ -537,7 +537,7 @@ fn open_document(source: Source, cli: &Cli) -> Result<(), Box<dyn std::error::Er
     // the browser with it already loaded.
     let settings = cli.settings();
     STARTUP_TRACE.mark("preferences_ready");
-    let mut browser = Browser::with_async_loader(NetLoader::default(), settings);
+    let mut browser = browser(settings);
     STARTUP_TRACE.mark("browser_ready");
     browser.set_viewport(cli.viewport());
     browser.set_zoom(cli.zoom);
@@ -663,6 +663,10 @@ fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppE
     // And the bookmarks the last run kept, for the same reason: a window means a
     // person, and what they chose to keep outlives the process.
     browser.persist_bookmarks();
+    // And the sessions the last run was signed in with, for the same reason and
+    // one degree more so: this file is what makes closing the browser not mean
+    // signing out of everything.
+    browser.persist_cookies();
     run_window(window_config(cli), browser)
 }
 
@@ -672,9 +676,28 @@ fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppE
 /// owns the connection pool, so one per request would be several pools for no gain.
 /// Built on first use rather than at startup, so opening a browser costs no TLS
 /// setup until something is fetched.
-#[derive(Default)]
 struct NetLoader {
     loader: std::sync::OnceLock<otlyra_net::Loader>,
+    /// The jar this loader fills and sends from, shared with the browser that
+    /// shows it. Handed in rather than made here, because the loader is built
+    /// before the browser and both have to end up holding the same one.
+    jar: otlyra_net::SharedJar,
+}
+
+/// A browser and the loader that fills its jar.
+///
+/// The jar is made first because the loader needs it, and the browser is given
+/// the store afterwards. In memory until a shell asks for a file: see
+/// `Browser::persist_cookies`.
+fn browser(settings: otlyra_app::settings::Settings) -> Browser {
+    let cookies = otlyra_app::cookies::CookieStore::in_memory();
+    let loader = NetLoader {
+        loader: std::sync::OnceLock::new(),
+        jar: cookies.jar(),
+    };
+    let mut browser = Browser::with_async_loader(loader, settings);
+    browser.set_cookie_store(cookies);
+    browser
 }
 
 /// The `file:` URL an input names, if it names one.
@@ -786,7 +809,9 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
             // drops its own and uses the one that won, so there is still exactly one
             // connection pool.
             if self.loader.get().is_none() {
-                let built = otlyra_net::Loader::new().map_err(|error| error.to_string())?;
+                let built = otlyra_net::Loader::new()
+                    .map_err(|error| error.to_string())?
+                    .with_jar(std::sync::Arc::clone(&self.jar));
                 let _ = self.loader.set(built);
             }
             let loader = self.loader.get().expect("the loader was just built");

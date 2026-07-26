@@ -413,6 +413,8 @@ pub struct Browser {
     downloads_page: DownloadsSurface,
     /// What the reader kept, which outlives every tab and every run.
     bookmarks: crate::bookmarks::BookmarkStore,
+    /// The one jar. In memory until a shell asks for it: see `persist_cookies`.
+    cookies: crate::cookies::CookieStore,
     /// The surface that shows them.
     bookmarks_page: crate::bookmarks::BookmarksSurface,
     /// What the platform last said the environment is. What *System* follows.
@@ -534,6 +536,7 @@ impl Browser {
             // In memory, and nothing on disk until a shell asks for it: see
             // `persist_bookmarks`.
             bookmarks: crate::bookmarks::BookmarkStore::default(),
+            cookies: crate::cookies::CookieStore::in_memory(),
             bookmarks_page: crate::bookmarks::BookmarksSurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
@@ -1335,6 +1338,10 @@ impl Browser {
         for fetched in finished {
             changed |= self.receive(fetched);
         }
+        // A fetch that finished is the only moment cookies can have changed, so
+        // this is where the file catches up. Cheap when nothing did: the store
+        // compares a revision before it writes anything.
+        self.cookies.flush();
         for saved in self.downloads_writer.poll() {
             changed = true;
             match saved.result {
@@ -2336,6 +2343,37 @@ impl Browser {
     pub fn persist_bookmarks(&mut self) {
         self.bookmarks = crate::bookmarks::BookmarkStore::persisted();
         self.sync_address();
+    }
+
+    /// Keep the cookies the last run left, and write every change from now on.
+    ///
+    /// The same rule as the bookmarks and for a sharper reason: the file is
+    /// somebody's signed-in sessions, so every headless mode — a screenshot, an
+    /// automation session, a test — keeps the in-memory jar and none of them can
+    /// read or overwrite it.
+    ///
+    /// The jar handed to the loader is unchanged by this; only what is in it and
+    /// where it is written are.
+    pub fn persist_cookies(&mut self) {
+        self.cookies.persist();
+    }
+
+    /// The jar, to hand to a loader before the browser is built.
+    pub fn cookies(&self) -> &crate::cookies::CookieStore {
+        &self.cookies
+    }
+
+    /// The jar, to list and to empty.
+    pub fn cookies_mut(&mut self) -> &mut crate::cookies::CookieStore {
+        &mut self.cookies
+    }
+
+    /// Use `store` as this browser's jar.
+    ///
+    /// For a shell that made the jar first because the loader needed it — which is
+    /// the ordinary case, since a loader is built before the browser that holds it.
+    pub fn set_cookie_store(&mut self, store: crate::cookies::CookieStore) {
+        self.cookies = store;
     }
 
     /// Whether the page the reader is on is one they kept.

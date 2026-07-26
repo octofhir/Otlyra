@@ -43,7 +43,8 @@
 pub mod date;
 pub mod jar;
 pub mod parse;
+pub mod store;
 pub mod suffix;
 
-pub use jar::{Capacity, Context, Cookie, Jar, MAX_LIFETIME, Refused};
+pub use jar::{Capacity, Context, Cookie, Jar, MAX_LIFETIME, Refused, same_site};
 pub use parse::{SameSite, SetCookie, Unreadable};

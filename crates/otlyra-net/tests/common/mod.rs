@@ -44,6 +44,10 @@ impl Request {
 pub struct Server {
     /// `http://127.0.0.1:port`, with no trailing slash.
     pub base: String,
+    /// The same socket under the name `localhost`: the same machine, and a
+    /// different site, because `localhost` and `127.0.0.1` share no registrable
+    /// domain.
+    pub alias: String,
     seen: Arc<Mutex<Vec<Request>>>,
 }
 
@@ -69,11 +73,12 @@ impl Server {
 
 /// Start a server that answers each request with `reply`.
 ///
-/// The reply is the whole response, head and body, with `\r\n` line endings. Two
-/// conveniences, because both are needed in every second test: `{base}` in the
-/// reply is replaced with this server's own address, so an absolute `Location`
-/// can be written before the port is known, and a `Connection: close` header is
-/// appended when the reply does not carry one.
+/// The reply is the whole response, head and body, with `\r\n` line endings.
+/// `{base}` in it is replaced with this server's own address, so an absolute
+/// `Location` can be written before the port is known, and `{alias}` with the
+/// same socket under the name `localhost` — the same machine and a different
+/// site, which is what lets a test cross a site boundary without a second server
+/// or a name that has to resolve.
 pub fn serve(reply: impl Fn(&Request) -> String + Send + Sync + 'static) -> Server {
     serve_bytes(move |request| reply(request).into_bytes())
 }
@@ -86,24 +91,30 @@ pub fn serve_bytes(reply: impl Fn(&Request) -> Vec<u8> + Send + Sync + 'static) 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let base = format!("http://127.0.0.1:{port}");
+    let alias = format!("http://localhost:{port}");
     let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
 
     let recorded = Arc::clone(&seen);
     let answering = base.clone();
+    let aliased = alias.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let Some(request) = read_request(&mut stream) else {
                 continue;
             };
-            let answer = replace_base(reply(&request), answering.as_bytes());
+            let answer = substitute(
+                substitute(reply(&request), b"{base}", answering.as_bytes()),
+                b"{alias}",
+                aliased.as_bytes(),
+            );
             recorded.lock().expect("not poisoned").push(request);
             let _ = stream.write_all(&answer);
             let _ = stream.flush();
         }
     });
 
-    Server { base, seen }
+    Server { base, alias, seen }
 }
 
 /// A response head and body, with the lengths and the close a client expects.
@@ -119,19 +130,18 @@ pub fn respond(status: &str, headers: &[&str], body: &str) -> String {
     head
 }
 
-/// Substitute `{base}` with the server's own address, on bytes rather than on a
-/// string, so a reply carrying a header value that is not UTF-8 still gets it.
-fn replace_base(answer: Vec<u8>, base: &[u8]) -> Vec<u8> {
-    const MARKER: &[u8] = b"{base}";
+/// Replace every `marker` with `with`, on bytes rather than on a string, so a
+/// reply carrying a header value that is not UTF-8 still gets its substitutions.
+fn substitute(answer: Vec<u8>, marker: &[u8], with: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(answer.len());
     let mut rest = answer.as_slice();
     while let Some(at) = rest
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)
+        .windows(marker.len())
+        .position(|window| window == marker)
     {
         out.extend_from_slice(&rest[..at]);
-        out.extend_from_slice(base);
-        rest = &rest[at + MARKER.len()..];
+        out.extend_from_slice(with);
+        rest = &rest[at + marker.len()..];
     }
     out.extend_from_slice(rest);
     out

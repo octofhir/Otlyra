@@ -166,33 +166,30 @@ are what is in it. What it settled that the next two slices inherit:
 - The public suffix list is vendored, at `crates/otlyra-net/data/`, with the
   reasoning and the refresh procedure in `BROWSER_RESEARCH_PLAN.md`.
 
-- [ ] **On the wire, and on disk.** The jar attached to the fetcher, sent and
-  received per request, with a session jar that dies with the process and a
-  persistent one that does not.
+The wire and the disk are done too. **The redirect fork was resolved by taking
+the chain ourselves** — `Policy::none()` and a loop in `Loader` — rather than by
+handing `reqwest` a store through its `cookies` feature. The second would have
+been cheaper and would have put the rules just written behind a second
+implementation of them: `reqwest`'s store answers domain and path matching
+itself, has no public-suffix rule, and is not reachable from a browser surface.
+It would also have been two jars disagreeing about what is kept. What the loop
+bought beyond cookies is where the rest of the per-hop work now goes: a
+`Location` naming a scheme we do not fetch is refused, and the method rewriting
+that turns a redirected `POST` into a `GET` is ours and is tested.
 
-  **The redirect fork, which is a decision and not a detail.** `reqwest` follows
-  redirects inside `execute` — `Policy::limited(max_redirects)` in
-  `crates/otlyra-net/src/loader.rs` — so a `Set-Cookie` on an intermediate hop
-  never reaches us, and neither does the chance to put a `Cookie` on the hop
-  after it. A sign-in is almost always a redirect, so this is not an edge: with
-  it unresolved the first real scenario does not work at all. Two ways out, and
-  they are not equivalent:
+What slice 3 inherits from it:
 
-  - *Give the jar to `reqwest`* by enabling its `cookies` feature and handing it
-    a store. Cheapest, and it puts the rules we just wrote behind a second
-    implementation of them — `reqwest`'s store answers domain and path matching
-    itself, has no public-suffix rule, and is not reachable from a browser
-    surface. It also means two jars disagreeing about what is kept.
-  - *Take the redirects ourselves*: `Policy::none()`, and a loop in `Loader` that
-    reads the `Location`, applies the jar to each hop, and enforces the hop limit
-    that `Policy::limited` enforces today. More code, and it is the code that
-    already has to exist for anything else that is per-hop — `may_navigate` across
-    a redirect into `file:`, the referrer, and the same-site context that decides
-    which cookies a hop carries. `LoadedResource::final_url` already says the
-    chain ended somewhere else, so callers do not change shape.
-
-  Take the second. Slice 2 states the hop limit it enforces and keeps the
-  `TooManyRedirects` error meaning what it means today.
+- `LoadRequest` carries `initiator` and `navigation`, and the loader turns the
+  two into a `Context` per hop. Once a chain leaves the initiator's site it stays
+  away for the rest of the chain, which is the rule a per-hop answer gets wrong.
+- `crate::cookies::CookieStore` is the browser's half: one `SharedJar` handed to
+  the loader before the browser exists, and a file attached later by
+  `Browser::persist_cookies`. **The jar is never replaced** — the loader is
+  already holding it — so anything that wants to change what is kept changes the
+  contents.
+- Writing is driven by `Jar::kept_revision`, which moves only when the persistent
+  set does. `Browser::pump` flushes; a site resetting a session cookie on every
+  response costs no disk.
 
 - [ ] **What the reader can see and do about it.** A page in the browser's own
   surfaces listing what is kept and by whom, with a way to throw it away — per

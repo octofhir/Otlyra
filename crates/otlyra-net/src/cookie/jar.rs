@@ -73,6 +73,56 @@ pub enum Context {
     CrossSite,
 }
 
+impl Context {
+    /// How a request to `target` relates to the site that caused it.
+    ///
+    /// `initiator` is the page that asked, and `None` means nobody did — a typed
+    /// address, a bookmark, a session restored. There is no other site involved
+    /// then, so the request is same-site with wherever it is going, which is what
+    /// makes a bookmark to a bank open it signed in.
+    ///
+    /// `top_level_and_safe` is the `Lax` line: a navigation the reader can see the
+    /// result of, made by a method that changes nothing. A cross-site form post is
+    /// top-level and is not safe, and is exactly what `Lax` was drawn to stop.
+    pub fn of(target: &Url, initiator: Option<&Url>, top_level_and_safe: bool) -> Self {
+        match initiator {
+            None => Self::SameSite,
+            Some(from) if same_site(from, target) => Self::SameSite,
+            Some(_) if top_level_and_safe => Self::CrossSiteNavigation,
+            Some(_) => Self::CrossSite,
+        }
+    }
+}
+
+/// Whether two addresses belong to the same site.
+///
+/// The same registrable domain, reached over the same scheme. The second half is
+/// *schemeful* same-site, and it is not pedantry: without it a page served over
+/// plain `http` — which anyone on the path can write — counts as the same site as
+/// the `https` one and can cause its cookies to be sent.
+///
+/// A host with no registrable domain is its own site, which is what makes
+/// `localhost` and a bare address behave.
+pub fn same_site(one: &Url, other: &Url) -> bool {
+    let (Some(here), Some(there)) = (one.host_str(), other.host_str()) else {
+        return false;
+    };
+    one.scheme() == other.scheme() && site_of(here) == site_of(there)
+}
+
+/// The site a host belongs to: its registrable domain, or itself where it has
+/// none.
+///
+/// An address is its own site and is never taken apart. Reading `127.0.0.1` as a
+/// name gives `0.1` — a suffix two other machines on the network share — so a
+/// registrable domain is exactly the wrong question to ask of one.
+fn site_of(host: &str) -> &str {
+    if is_address(host) {
+        return host;
+    }
+    suffix::registrable_domain(host).unwrap_or(host)
+}
+
 /// One cookie as it is kept.
 ///
 /// Every field here is the resolved one: the domain is what the cookie goes back
@@ -120,7 +170,16 @@ impl Cookie {
     /// The site this belongs to: its registrable domain, or its domain where
     /// there is no registrable one. What a page listing cookies groups by.
     pub fn site(&self) -> &str {
-        suffix::registrable_domain(&self.domain).unwrap_or(&self.domain)
+        site_of(&self.domain)
+    }
+
+    /// Whether this cookie outlives the process.
+    ///
+    /// A cookie with no expiry is a session cookie: it is sent for as long as the
+    /// browser is open and is never written down. The split that decides what
+    /// goes on disk.
+    pub fn is_persistent(&self) -> bool {
+        self.expires.is_some()
     }
 
     /// What identifies this cookie for the purpose of replacing it.
@@ -186,6 +245,12 @@ pub enum Refused {
 pub struct Jar {
     cookies: Vec<Cookie>,
     capacity: Capacity,
+    /// Bumped whenever what would be written down changes.
+    ///
+    /// Only the persistent cookies count. A session cookie never reaches a disk,
+    /// so a site that resets one on every response — which is most of them — must
+    /// not be able to make the browser write a file on every response.
+    kept_revision: u64,
 }
 
 impl Jar {
@@ -199,7 +264,29 @@ impl Jar {
         Self {
             cookies: Vec::new(),
             capacity,
+            kept_revision: 0,
         }
+    }
+
+    /// A number that changes whenever the cookies that outlive the process do.
+    ///
+    /// What a store on disk compares against to decide whether it has anything to
+    /// write. Not a count and not a hash: only that it differs is meaningful.
+    pub fn kept_revision(&self) -> u64 {
+        self.kept_revision
+    }
+
+    /// Note that the persistent set changed, if it did.
+    fn kept_changed(&mut self, before: u64) {
+        let after = self.cookies.iter().filter(|c| c.is_persistent()).count() as u64;
+        if after != before {
+            self.kept_revision += 1;
+        }
+    }
+
+    /// How many cookies here outlive the process.
+    fn kept_count(&self) -> u64 {
+        self.cookies.iter().filter(|c| c.is_persistent()).count() as u64
     }
 
     /// What this jar will hold.
@@ -225,21 +312,27 @@ impl Jar {
 
     /// Throw everything away.
     pub fn clear(&mut self) {
+        let before = self.kept_count();
         self.cookies.clear();
+        self.kept_changed(before);
     }
 
     /// Throw away everything belonging to one site, named by its registrable
     /// domain. Answers how many went.
     pub fn clear_site(&mut self, site: &str) -> usize {
+        let kept = self.kept_count();
         let before = self.cookies.len();
         self.cookies.retain(|cookie| cookie.site() != site);
+        self.kept_changed(kept);
         before - self.cookies.len()
     }
 
     /// Drop what has expired. Answers how many went.
     pub fn purge_expired(&mut self, now: SystemTime) -> usize {
+        let kept = self.kept_count();
         let before = self.cookies.len();
         self.cookies.retain(|cookie| !cookie.is_expired(now));
+        self.kept_changed(kept);
         before - self.cookies.len()
     }
 
@@ -247,7 +340,7 @@ impl Jar {
     /// closing the browser does to them.
     pub fn clear_session_cookies(&mut self) -> usize {
         let before = self.cookies.len();
-        self.cookies.retain(|cookie| cookie.expires.is_some());
+        self.cookies.retain(Cookie::is_persistent);
         before - self.cookies.len()
     }
 
@@ -259,6 +352,20 @@ impl Jar {
     pub fn set(&mut self, url: &Url, line: &str, now: SystemTime) -> Result<(), Refused> {
         let parsed = SetCookie::parse(line).map_err(Refused::Unreadable)?;
         self.store(url, parsed, now)
+    }
+
+    /// Put a cookie in that has already been through the storage model.
+    ///
+    /// **This applies none of the rules.** It exists for one caller: a jar being
+    /// read back from the file it was written to, where every cookie was checked
+    /// when the site first set it and rechecking would need the request that is
+    /// long gone. It is not a way to accept a cookie — [`Jar::set`] is — and
+    /// anything reaching this from a network is a bug.
+    pub fn put(&mut self, cookie: Cookie) {
+        if cookie.is_persistent() {
+            self.kept_revision += 1;
+        }
+        self.cookies.push(cookie);
     }
 
     /// Take a cookie that has already been read. Split out so a caller holding a
@@ -367,20 +474,28 @@ impl Jar {
         // Replacing one keeps its creation time: the header is ordered by it, and
         // a site refreshing a cookie every request would otherwise walk itself to
         // the front of the queue.
+        let mut touched_the_kept = false;
         if let Some(index) = self
             .cookies
             .iter()
             .position(|kept| kept.identity() == cookie.identity())
         {
             cookie.created = self.cookies[index].created;
+            touched_the_kept = self.cookies[index].is_persistent();
             self.cookies.remove(index);
         }
 
         // An expiry in the past is how a server deletes a cookie: the old one is
         // gone by now, and the new one is not kept.
         if !cookie.is_expired(now) {
+            touched_the_kept |= cookie.is_persistent();
             self.cookies.push(cookie);
             self.make_room(now);
+        }
+        // Counting is not enough here: a cookie replaced by one with a different
+        // value leaves the count alone and still has to reach the disk.
+        if touched_the_kept {
+            self.kept_revision += 1;
         }
 
         Ok(())
@@ -1245,6 +1360,79 @@ mod tests {
         assert!(
             jar.matching(&url("file:///tmp/page.html"), Context::SameSite, now())
                 .is_empty()
+        );
+    }
+
+    /// Two addresses are the same site when they share a registrable domain and a
+    /// scheme. The scheme half is not pedantry: without it a page served over
+    /// plain http, which anyone on the path can write, counts as the same site as
+    /// the https one.
+    #[test]
+    fn a_site_is_a_registrable_domain_and_a_scheme() {
+        let same = |one, other| same_site(&url(one), &url(other));
+        assert!(same(
+            "https://www.example.com/",
+            "https://api.example.com/x"
+        ));
+        assert!(same("https://example.com/", "https://example.com:8443/"));
+        assert!(!same("https://example.com/", "http://example.com/"));
+        assert!(!same("https://example.com/", "https://example.org/"));
+        assert!(!same("https://example.co.uk/", "https://other.co.uk/"));
+        // A machine on the local network is its own site, and is never taken
+        // apart: `127.0.0.1` read as a name gives `0.1`, which two other machines
+        // would share.
+        assert_eq!(site_of("127.0.0.1"), "127.0.0.1");
+        assert_eq!(site_of("192.168.0.1"), "192.168.0.1");
+        assert!(!same("http://127.0.0.1:8080/", "http://192.168.0.1:8080/"));
+        assert!(same("http://127.0.0.1:8080/", "http://127.0.0.1:9090/"));
+        // And so is a name with nothing above it.
+        assert_eq!(site_of("localhost"), "localhost");
+        assert!(!same("http://localhost:8080/", "http://127.0.0.1:8080/"));
+    }
+
+    /// A cookie kept for an address groups under that address, not under the tail
+    /// of it that reads like a domain.
+    #[test]
+    fn a_cookie_from_an_address_belongs_to_that_address() {
+        let mut jar = Jar::new();
+        set(&mut jar, "http://127.0.0.1:8080/", "a=1");
+        assert_eq!(jar.all()[0].site(), "127.0.0.1");
+        assert_eq!(jar.clear_site("0.1"), 0);
+        assert_eq!(jar.clear_site("127.0.0.1"), 1);
+    }
+
+    /// Nobody caused a typed address, so there is no other site involved and the
+    /// request is same-site with wherever it goes. This is what makes a bookmark
+    /// to a bank open it signed in.
+    #[test]
+    fn a_request_nobody_caused_is_same_site() {
+        assert_eq!(
+            Context::of(&url("https://bank.test/"), None, true),
+            Context::SameSite
+        );
+        assert_eq!(
+            Context::of(
+                &url("https://bank.test/"),
+                Some(&url("https://bank.test/app")),
+                false
+            ),
+            Context::SameSite
+        );
+        assert_eq!(
+            Context::of(
+                &url("https://bank.test/"),
+                Some(&url("https://elsewhere.test/")),
+                true
+            ),
+            Context::CrossSiteNavigation
+        );
+        assert_eq!(
+            Context::of(
+                &url("https://bank.test/"),
+                Some(&url("https://elsewhere.test/")),
+                false
+            ),
+            Context::CrossSite
         );
     }
 
