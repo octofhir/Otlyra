@@ -71,15 +71,19 @@ glyphs n=4 size=13 #6e6e78ff at (661.3, 821.1)
 fill #ffffffff (698.9, 816.9) 61.1x26.0
 glyphs n=6 size=13 #1c1c21ff at (707.9, 821.1)
 fill #d5d5ddff (126.0, 759.1) 648.0x100.0
-fill #ffffffff (126.0, 871.1) 648.0x100.0
+fill #ffffffff (126.0, 871.1) 648.0x143.4
 glyphs n=7 size=13 #6e6e78ff at (138.0, 883.1)
 glyphs n=12 size=13 #1c1c21ff at (138.0, 924.6)
 glyphs n=54 size=11 #6e6e78ff at (138.0, 944.1)
 fill #d5d5ddff (726.0, 931.8) 36.0x20.0
 fill #ffffffff (728.0, 933.8) 16.0x16.0
-fill #d5d5ddff (126.0, 871.1) 648.0x100.0
-fill #c0362cff (700.7, 983.0) 73.3x30.0
-glyphs n=9 size=13 #ffffffff at (712.7, 989.2)
+glyphs n=30 size=13 #1c1c21ff at (138.0, 968.0)
+glyphs n=110 size=11 #6e6e78ff at (138.0, 987.6)
+fill #d5d5ddff (726.0, 975.2) 36.0x20.0
+fill #ffffffff (728.0, 977.2) 16.0x16.0
+fill #d5d5ddff (126.0, 871.1) 648.0x143.4
+fill #c0362cff (700.7, 1026.4) 73.3x30.0
+glyphs n=9 size=13 #ffffffff at (712.7, 1032.6)
 end layer
-fill #b4b4bdff (893.0, 130.0) 4.0x350.5
+fill #b4b4bdff (893.0, 130.0) 4.0x334.8
 fill #cfcfd7ff (0.0, 129.0) 900.0x1.0

@@ -96,6 +96,14 @@ pub struct Settings {
     pub run_scripts: bool,
     /// Ask sites not to follow the reader between them.
     pub do_not_track: bool,
+    /// Refuse the cookies a page asks for on another site's behalf.
+    ///
+    /// Off by default, which is what every browser still ships: turning it on
+    /// breaks the sign-ins that are genuinely done through a third site, and a
+    /// browser that had never been configured breaking those would look broken
+    /// rather than careful. Arriving at another site by following a link is not
+    /// a third party — that is the reader going there.
+    pub block_third_party_cookies: bool,
     /// Restore the tabs that were open, when `on_start` says to.
     pub restore_tabs: bool,
     /// Which palette the interface is drawn from.
@@ -143,6 +151,7 @@ impl Default for Settings {
             load_images: true,
             run_scripts: true,
             do_not_track: false,
+            block_third_party_cookies: false,
             restore_tabs: true,
             appearance: Appearance::System,
             text_scale: 100.0,
@@ -176,6 +185,8 @@ pub enum Action {
     ToggleScripts,
     /// Ask not to be followed, or stop asking.
     ToggleDoNotTrack,
+    /// Refuse another site's cookies, or stop refusing them.
+    ToggleThirdPartyCookies,
     /// Restore tabs, or stop.
     ToggleRestoreTabs,
     /// Draw the interface from this palette.
@@ -219,6 +230,9 @@ impl Settings {
             Action::ToggleImages => self.load_images = !self.load_images,
             Action::ToggleScripts => self.run_scripts = !self.run_scripts,
             Action::ToggleDoNotTrack => self.do_not_track = !self.do_not_track,
+            Action::ToggleThirdPartyCookies => {
+                self.block_third_party_cookies = !self.block_third_party_cookies;
+            }
             Action::ToggleRestoreTabs => self.restore_tabs = !self.restore_tabs,
             Action::SetAppearance(choice) => self.appearance = choice,
             // Rounded to fives: a text size of 103% is a number nobody asked for
@@ -522,12 +536,27 @@ impl Settings {
         controls::card(
             theme,
             "Privacy",
-            vec![controls::setting_row(
-                theme,
-                "Do Not Track",
-                Some("Sends a request sites are free to ignore, and most do."),
-                controls::toggle(theme, focus, Action::ToggleDoNotTrack, self.do_not_track),
-            )],
+            vec![
+                controls::setting_row(
+                    theme,
+                    "Do Not Track",
+                    Some("Sends a request sites are free to ignore, and most do."),
+                    controls::toggle(theme, focus, Action::ToggleDoNotTrack, self.do_not_track),
+                ),
+                controls::setting_row(
+                    theme,
+                    "Block cookies from other sites",
+                    Some(
+                        "A page can no longer set or read a cookie for somewhere else. Following a link somewhere is still going there.",
+                    ),
+                    controls::toggle(
+                        theme,
+                        focus,
+                        Action::ToggleThirdPartyCookies,
+                        self.block_third_party_cookies,
+                    ),
+                ),
+            ],
         )
     }
 
@@ -1104,7 +1133,7 @@ mod tests {
     /// Named once: three tests walk the surface, and three hard-coded counts
     /// disagreeing with each other is how a control ends up unreachable with the
     /// tests still passing.
-    const STOPS: usize = 15;
+    const STOPS: usize = 16;
 
     /// What every control on the surface reports, in the order Tab reaches them.
     fn traversal() -> Vec<Action> {
@@ -1141,6 +1170,7 @@ mod tests {
                 Action::SetAppearance(Appearance::Dark),
                 Action::SetAppearance(Appearance::System),
                 Action::ToggleDoNotTrack,
+                Action::ToggleThirdPartyCookies,
                 Action::Reset,
             ]
         );
@@ -1183,6 +1213,7 @@ mod tests {
             Action::ToggleDownloadAsk,
             Action::ChooseDownloadDirectory,
             Action::ToggleDoNotTrack,
+            Action::ToggleThirdPartyCookies,
             Action::Reset,
             Action::Close,
         ] {

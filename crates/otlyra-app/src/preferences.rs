@@ -111,6 +111,7 @@ pub fn to_text(settings: &Settings) -> String {
          load_images = {}\n\
          run_scripts = {}\n\
          do_not_track = {}\n\
+         block_third_party_cookies = {}\n\
          restore_tabs = {}\n\
          appearance = \"{}\"\n\
          text_scale = {}\n\
@@ -131,6 +132,7 @@ pub fn to_text(settings: &Settings) -> String {
         settings.load_images,
         settings.run_scripts,
         settings.do_not_track,
+        settings.block_third_party_cookies,
         settings.restore_tabs,
         match settings.appearance {
             Appearance::Light => "light",
@@ -219,6 +221,10 @@ pub fn from_text(text: &str) -> Settings {
             "load_images" => settings.load_images = flag().unwrap_or(settings.load_images),
             "run_scripts" => settings.run_scripts = flag().unwrap_or(settings.run_scripts),
             "do_not_track" => settings.do_not_track = flag().unwrap_or(settings.do_not_track),
+            "block_third_party_cookies" => {
+                settings.block_third_party_cookies =
+                    flag().unwrap_or(settings.block_third_party_cookies);
+            }
             "restore_tabs" => settings.restore_tabs = flag().unwrap_or(settings.restore_tabs),
             "appearance" => {
                 settings.appearance = match text().as_deref() {
@@ -269,6 +275,10 @@ mod tests {
         let read = from_text(&to_text(&settings));
         assert_eq!(read.load_images, settings.load_images);
         assert_eq!(read.do_not_track, settings.do_not_track);
+        assert_eq!(
+            read.block_third_party_cookies,
+            settings.block_third_party_cookies
+        );
         assert_eq!(read.text_scale, 125.0);
         assert_eq!(read.on_start, OnStart::Home);
         assert_eq!(read.appearance, Appearance::Dark);

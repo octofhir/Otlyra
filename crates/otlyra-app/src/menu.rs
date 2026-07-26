@@ -44,6 +44,8 @@ pub enum Command {
     ToggleBookmark,
     /// Open what the reader kept.
     ShowBookmarks,
+    /// Open `about:cookies`.
+    ShowCookies,
     /// Increase the page zoom.
     ZoomIn,
     /// Decrease the page zoom.
@@ -82,6 +84,7 @@ impl Command {
         Self::ShowDownloads,
         Self::ToggleBookmark,
         Self::ShowBookmarks,
+        Self::ShowCookies,
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ActualSize,
@@ -132,6 +135,7 @@ impl Command {
                 | Self::ShowDownloads
                 | Self::ToggleBookmark
                 | Self::ShowBookmarks
+                | Self::ShowCookies
                 | Self::ToggleDevTools
                 | Self::ZoomIn
                 | Self::ZoomOut
@@ -230,6 +234,9 @@ pub fn menu_bar() -> MenuBar {
                     "Show Downloads",
                     Some("CmdOrCtrl+Shift+KeyJ"),
                 ),
+                // With the rest of what a browser has kept about where the reader
+                // has been, which is what a cookie is.
+                entry(Command::ShowCookies, "Show Cookies", None),
             ],
         ))
         // Between History and Develop, where every browser puts it.

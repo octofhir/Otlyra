@@ -417,6 +417,7 @@ pub struct Browser {
     cookies: crate::cookies::CookieStore,
     /// The surface that shows them.
     bookmarks_page: crate::bookmarks::BookmarksSurface,
+    cookies_page: crate::cookies::CookiesSurface,
     /// What the platform last said the environment is. What *System* follows.
     scheme: otlyra_platform::ColorScheme,
     /// The palette every surface is currently drawn from.
@@ -538,6 +539,7 @@ impl Browser {
             bookmarks: crate::bookmarks::BookmarkStore::default(),
             cookies: crate::cookies::CookieStore::in_memory(),
             bookmarks_page: crate::bookmarks::BookmarksSurface::new(),
+            cookies_page: crate::cookies::CookiesSurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
             theme: crate::widget::theme::Theme::light(),
             accessibility_dirty: true,
@@ -546,6 +548,7 @@ impl Browser {
             inspector_device: None,
         };
         browser.apply_theme();
+        browser.sync_cookie_policy();
         browser
     }
 
@@ -564,6 +567,7 @@ impl Browser {
         self.history_page.set_theme(theme.clone());
         self.downloads_page.set_theme(theme.clone());
         self.bookmarks_page.set_theme(theme.clone());
+        self.cookies_page.set_theme(theme.clone());
         self.about.set_theme(theme);
     }
 
@@ -928,6 +932,7 @@ impl Browser {
             self.history_page.blur();
             self.downloads_page.blur();
             self.bookmarks_page.blur();
+            self.cookies_page.blur();
             self.about.blur();
         }
         self.keyboard_surface = surface;
@@ -2253,6 +2258,12 @@ impl Browser {
     /// native dialogue on the screen, which is the platform's. Everything else the
     /// surface has already applied to the preferences by the time this runs.
     fn handle_settings_action(&mut self, action: &settings::Action) {
+        // Unconditional, and before the match: the surface has already written
+        // every change into the preferences, and the jar is the one piece of
+        // state a preference reaches that is not read back out of them on use.
+        // Doing it here rather than under the one action that needs it is what
+        // stops the next such preference from being forgotten.
+        self.sync_cookie_policy();
         match action {
             settings::Action::Close => self.close_system_page(),
             settings::Action::ChooseDownloadDirectory => {
@@ -2374,6 +2385,18 @@ impl Browser {
     /// the ordinary case, since a loader is built before the browser that holds it.
     pub fn set_cookie_store(&mut self, store: crate::cookies::CookieStore) {
         self.cookies = store;
+        self.sync_cookie_policy();
+    }
+
+    /// Tell the jar what the reader's switch says.
+    ///
+    /// The jar holds the answer rather than the loader, because the loader is
+    /// built once and the switch moves — and because the surfaces have to be able
+    /// to show what is in force.
+    fn sync_cookie_policy(&mut self) {
+        let accepts = !self.settings.settings.block_third_party_cookies;
+        self.cookies
+            .with(|jar| jar.set_accepts_third_party(accepts));
     }
 
     /// Whether the page the reader is on is one they kept.
@@ -2391,6 +2414,25 @@ impl Browser {
             crate::bookmarks::Action::Clear => self.bookmarks.clear(),
             crate::bookmarks::Action::Close => self.close_system_page(),
             crate::bookmarks::Action::None => {}
+        }
+    }
+
+    /// Act on what the cookies surface reported.
+    fn handle_cookies_action(&mut self, action: crate::cookies::Action) {
+        match action {
+            crate::cookies::Action::ClearSite(site) => {
+                self.cookies.with(|jar| jar.clear_site(&site));
+                // Immediately, not at the next fetch: a person who asked to be rid
+                // of something should not have it on the disk while they read the
+                // page that says it is gone.
+                self.cookies.flush();
+            }
+            crate::cookies::Action::Clear => {
+                self.cookies.with(otlyra_net::cookie::Jar::clear);
+                self.cookies.flush();
+            }
+            crate::cookies::Action::Close => self.close_system_page(),
+            crate::cookies::Action::None => {}
         }
     }
 
@@ -2990,6 +3032,7 @@ impl Browser {
                 Some(SystemPage::History) => self.history_page.cursor_at(x, y),
                 Some(SystemPage::Downloads) => self.downloads_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::Bookmarks) => self.bookmarks_page.cursor_at(x, y, &mut self.text),
+                Some(SystemPage::Cookies) => self.cookies_page.cursor_at(x, y, &mut self.text),
                 Some(SystemPage::About) => self.about.cursor_at(x, y, &mut self.text),
                 None if self.link_under_pointer().is_some() => Cursor::Pointer,
                 None => Cursor::Default,
@@ -3159,6 +3202,14 @@ impl Browser {
                         &mut list,
                     );
                 }
+                SystemPage::Cookies => {
+                    self.cookies_page.build_display_list(
+                        content,
+                        &self.cookies,
+                        &mut self.text,
+                        &mut list,
+                    );
+                }
                 _ => self
                     .about
                     .build_display_list(content, &mut self.text, &mut list),
@@ -3280,6 +3331,7 @@ impl Browser {
                 SystemPage::History => 11u8,
                 SystemPage::Downloads => 12u8,
                 SystemPage::Bookmarks => 14u8,
+                SystemPage::Cookies => 15u8,
                 _ => 13u8,
             }
             .hash(&mut hasher);
@@ -3287,6 +3339,7 @@ impl Browser {
             self.history_page.builds().hash(&mut hasher);
             self.downloads_page.builds().hash(&mut hasher);
             self.bookmarks_page.builds().hash(&mut hasher);
+            self.cookies_page.builds().hash(&mut hasher);
             self.about.builds().hash(&mut hasher);
         } else if let Some(page) = tab.page.as_ref() {
             1u8.hash(&mut hasher);
@@ -3619,6 +3672,7 @@ impl Painter for Browser {
                     Some(SystemPage::History) => self.history_page.pointer_moved(x, y),
                     Some(SystemPage::Downloads) => self.downloads_page.pointer_moved(x, y),
                     Some(SystemPage::Bookmarks) => self.bookmarks_page.pointer_moved(x, y),
+                    Some(SystemPage::Cookies) => self.cookies_page.pointer_moved(x, y),
                     Some(SystemPage::About) => self.about.pointer_moved(x, y),
                     _ => {}
                 }
@@ -3711,6 +3765,11 @@ impl Painter for Browser {
                         Some(SystemPage::Bookmarks) => {
                             let action = self.bookmarks_page.pointer_pressed(&mut self.text);
                             self.handle_bookmarks_action(action);
+                            return;
+                        }
+                        Some(SystemPage::Cookies) => {
+                            let action = self.cookies_page.pointer_pressed(&mut self.text);
+                            self.handle_cookies_action(action);
                             return;
                         }
                         Some(SystemPage::About) => {
@@ -3910,6 +3969,15 @@ impl Painter for Browser {
                                     .key_pressed(key, modifiers, &mut self.text)
                             {
                                 self.handle_bookmarks_action(action);
+                                return;
+                            }
+                        }
+                        Some(SystemPage::Cookies) => {
+                            if let Some(action) =
+                                self.cookies_page
+                                    .key_pressed(key, modifiers, &mut self.text)
+                            {
+                                self.handle_cookies_action(action);
                                 return;
                             }
                         }
@@ -4141,6 +4209,8 @@ impl Painter for Browser {
                     self.downloads_page.scroll_by(y);
                 } else if self.tabs[self.active].system == Some(SystemPage::Bookmarks) {
                     self.bookmarks_page.scroll_by(y);
+                } else if self.tabs[self.active].system == Some(SystemPage::Cookies) {
+                    self.cookies_page.scroll_by(y);
                 } else if let Some(page) = self.tabs[self.active].page.as_mut() {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box
@@ -4179,6 +4249,9 @@ impl Painter for Browser {
                 }
                 Some(crate::menu::Command::ShowBookmarks) => {
                     self.open_system_in_new_tab(SystemPage::Bookmarks);
+                }
+                Some(crate::menu::Command::ShowCookies) => {
+                    self.open_system_in_new_tab(SystemPage::Cookies);
                 }
                 Some(crate::menu::Command::ToggleBookmark) => self.toggle_bookmark(),
                 Some(crate::menu::Command::ToggleDevTools) => self.toggle_inspector(),
@@ -4267,6 +4340,10 @@ impl Painter for Browser {
                             .activate_described(index, &mut self.text);
                         self.handle_bookmarks_action(action);
                     }
+                    Some(SystemPage::Cookies) => {
+                        let action = self.cookies_page.activate_described(index, &mut self.text);
+                        self.handle_cookies_action(action);
+                    }
                     Some(SystemPage::About)
                         if self.about.activate_described(index, &mut self.text)
                             == about::Action::OpenSettings =>
@@ -4323,6 +4400,9 @@ impl Painter for Browser {
                 self.bookmarks_page.focused(),
                 self.bookmarks_page.describe(),
             ),
+            Some(SystemPage::Cookies) => {
+                (self.cookies_page.focused(), self.cookies_page.describe())
+            }
             Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
             // The pages that are still a placeholder draw no controls, so they
             // describe none.
@@ -5115,6 +5195,67 @@ mod system_page_tests {
         assert!(!browser.is_bookmarked());
         assert_eq!(browser.ui().bookmark, crate::ui::Bookmarked::No);
         assert!(browser.bookmarks.is_empty());
+    }
+
+    /// The cookies page is reachable the three ways every browser page is: by
+    /// address, from the menu, and by the keyboard once it is open.
+    #[test]
+    fn the_cookies_page_opens_and_closes() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("about:cookies");
+        assert_eq!(browser.system_page(), Some(SystemPage::Cookies));
+        assert_eq!(browser.tabs()[0].url, "about:cookies");
+
+        let mut fresh = Browser::new(NoNetwork);
+        fresh.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ShowCookies.id(),
+        ));
+        assert_eq!(fresh.system_page(), Some(SystemPage::Cookies));
+    }
+
+    /// Throwing a site away throws that site away and leaves the rest.
+    #[test]
+    fn the_page_can_be_rid_of_one_site_or_of_everything() {
+        let mut browser = Browser::new(NoNetwork);
+        let now = std::time::SystemTime::now();
+        browser.cookies.with(|jar| {
+            for address in ["https://one.test/", "https://two.test/"] {
+                jar.set(&url::Url::parse(address).expect("a url"), "a=1", now)
+                    .expect("kept");
+            }
+        });
+        assert_eq!(browser.cookies.with(|jar| jar.len()), 2);
+
+        browser.handle_cookies_action(crate::cookies::Action::ClearSite("one.test".into()));
+        assert_eq!(browser.cookies.with(|jar| jar.len()), 1);
+        browser.handle_cookies_action(crate::cookies::Action::Clear);
+        assert!(browser.cookies.with(|jar| jar.is_empty()));
+    }
+
+    /// The switch in the preferences is the switch in the jar. Two places that
+    /// could disagree about whether a cookie is refused would be one place too
+    /// many.
+    #[test]
+    fn the_third_party_switch_reaches_the_jar() {
+        let mut browser = Browser::new(NoNetwork);
+        assert!(
+            browser.cookies.with(|jar| jar.accepts_third_party()),
+            "the default is what every browser still ships"
+        );
+
+        browser
+            .settings
+            .settings
+            .apply(settings::Action::ToggleThirdPartyCookies);
+        browser.handle_settings_action(&settings::Action::ToggleThirdPartyCookies);
+        assert!(!browser.cookies.with(|jar| jar.accepts_third_party()));
+
+        // And a browser built from preferences that already say so starts that
+        // way, rather than only after somebody presses the switch again.
+        let mut settings = crate::settings::Settings::default();
+        settings.block_third_party_cookies = true;
+        let started = Browser::with_fetcher(crate::fetcher::Fetcher::spawn(NoNetwork), settings);
+        assert!(!started.cookies.with(|jar| jar.accepts_third_party()));
     }
 
     /// A blank tab has no address, and a bookmark that opens nowhere is worse than

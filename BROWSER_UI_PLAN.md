@@ -191,12 +191,26 @@ What slice 3 inherits from it:
   set does. `Browser::pump` flushes; a site resetting a session cookie on every
   response costs no disk.
 
-- [ ] **What the reader can see and do about it.** A page in the browser's own
-  surfaces listing what is kept and by whom, with a way to throw it away — per
-  site and altogether — and the settings switch that refuses third-party ones.
-  `Cookie::site()` is the grouping, `Jar::clear_site` and `Jar::clear` are the
-  actions, and the switch is a `Context` the loader refuses to send on rather
-  than a filter over the jar.
+`about:cookies` is built, and the feature is done. Two things it settled that
+the next surface should not have to rediscover:
+
+- **A row may rename the control inside it.** `Named::instead_of_its_own`
+  replaces a control's own name in the accessibility tree, where `Named::new`
+  only fills an empty one. Four buttons all reading *Remove*, each in a card that
+  says which site it belongs to, are four identical buttons to anything that
+  cannot see the cards — and the card is what knows which is which.
+- **A display list holds glyph identifiers, not the string they were shaped
+  from.** So *what a surface paints* is not readable back out of one: the
+  accessibility tree and the outline snapshots both miss it, and a golden PNG is
+  the only thing that catches text appearing where it should not. The cookies
+  goldens carry values for exactly that reason.
+
+The third-party switch lives on the jar rather than on the loader — the loader is
+built once and the switch moves, and the surfaces have to be able to show what is
+in force. `Browser::sync_cookie_policy` is what keeps the preference and the jar
+from being two answers; it runs unconditionally rather than under the one action
+that needs it, so the next preference that reaches something other than the
+preferences file is not forgotten.
 
 ## Priority 5 — Design system and fast UI authoring
 

@@ -449,7 +449,7 @@ impl Loader {
             };
 
             let (response, request_headers) = self.send(&url, body.clone(), context, now).await?;
-            self.take_cookies(&response, &url, now);
+            self.take_cookies(&response, &url, context, now);
 
             match Self::redirect_from(&response, &url)? {
                 // Not a redirect, or one with nowhere to go — which a server does
@@ -603,7 +603,13 @@ impl Loader {
     /// Every hop, including the redirects — which is the point of walking the
     /// chain here. A sign-in sets its session on the hop that redirects, and a
     /// client that handed back only the last response never showed it to anyone.
-    fn take_cookies(&self, response: &reqwest::Response, url: &Url, now: std::time::SystemTime) {
+    fn take_cookies(
+        &self,
+        response: &reqwest::Response,
+        url: &Url,
+        context: crate::cookie::Context,
+        now: std::time::SystemTime,
+    ) {
         let Some(jar) = self.jar.as_ref() else {
             return;
         };
@@ -623,7 +629,7 @@ impl Loader {
 
         let mut jar = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for line in lines {
-            if let Err(refused) = jar.set(url, line, now) {
+            if let Err(refused) = jar.set_in(url, line, context, now) {
                 // Named rather than swallowed: this is what a person debugging
                 // their own site needs to see, and what the inspector will show.
                 tracing::debug!(%url, %refused, "a cookie was refused");

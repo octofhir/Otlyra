@@ -233,6 +233,10 @@ pub enum Refused {
     /// repeated by anything that only sees names and values.
     #[error("the {0} prefix promises more than this cookie keeps")]
     BrokenPrefix(&'static str),
+
+    /// The reader has said no to cookies a page on another site asks for.
+    #[error("this browser refuses cookies from another site")]
+    ThirdParty,
 }
 
 /// A jar of cookies.
@@ -241,7 +245,7 @@ pub enum Refused {
 /// what this holds — a few hundred cookies, and a request that has to sort them
 /// anyway — and an index by domain is a thing to add when a profile asks for it
 /// rather than because a list looks slow written down.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Jar {
     cookies: Vec<Cookie>,
     capacity: Capacity,
@@ -251,6 +255,25 @@ pub struct Jar {
     /// so a site that resets one on every response — which is most of them — must
     /// not be able to make the browser write a file on every response.
     kept_revision: u64,
+    /// Bumped whenever anything at all changes. What a surface listing cookies
+    /// keys its cache on, since a cookie replaced by one with another value
+    /// leaves the count where it was.
+    revision: u64,
+    /// Whether a page on one site may set and send cookies for another.
+    ///
+    /// The reader's switch. Kept here rather than in the loader because it is one
+    /// answer for the whole browser and this is the one thing the loader and the
+    /// surfaces both already hold.
+    third_party: bool,
+}
+
+impl Default for Jar {
+    /// Derived would be wrong here, and quietly: a `bool` defaults to `false`,
+    /// and the one on this struct means *accept a cookie from another site*.
+    /// There is one construction path for that reason.
+    fn default() -> Self {
+        Self::with_capacity(Capacity::default())
+    }
 }
 
 impl Jar {
@@ -265,6 +288,34 @@ impl Jar {
             cookies: Vec::new(),
             capacity,
             kept_revision: 0,
+            revision: 0,
+            third_party: true,
+        }
+    }
+
+    /// A number that changes whenever anything in the jar does.
+    ///
+    /// What a surface compares to decide whether to draw again. Not a count: a
+    /// cookie replaced by one with a different value leaves the count alone and
+    /// changes what a person is looking at.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether a page on one site may set and send cookies belonging to another.
+    pub fn accepts_third_party(&self) -> bool {
+        self.third_party
+    }
+
+    /// Say whether a page on one site may set and send another's cookies.
+    ///
+    /// Turning it off refuses them from here on and leaves what is already kept
+    /// alone: the two are different requests, and a switch that also emptied the
+    /// jar would sign the reader out of things they did not ask to leave.
+    pub fn set_accepts_third_party(&mut self, accepts: bool) {
+        if self.third_party != accepts {
+            self.third_party = accepts;
+            self.revision += 1;
         }
     }
 
@@ -278,6 +329,7 @@ impl Jar {
 
     /// Note that the persistent set changed, if it did.
     fn kept_changed(&mut self, before: u64) {
+        self.revision += 1;
         let after = self.cookies.iter().filter(|c| c.is_persistent()).count() as u64;
         if after != before {
             self.kept_revision += 1;
@@ -341,6 +393,7 @@ impl Jar {
     pub fn clear_session_cookies(&mut self) -> usize {
         let before = self.cookies.len();
         self.cookies.retain(Cookie::is_persistent);
+        self.revision += 1;
         before - self.cookies.len()
     }
 
@@ -350,6 +403,25 @@ impl Jar {
     /// specification's: what the line says is read first, then whether the site
     /// that sent it was entitled to say it.
     pub fn set(&mut self, url: &Url, line: &str, now: SystemTime) -> Result<(), Refused> {
+        self.set_in(url, line, Context::SameSite, now)
+    }
+
+    /// The same, for a response to a request `context` describes.
+    ///
+    /// The context is only read by the third-party switch: everything else about
+    /// a cookie is decided by the response that set it and not by what caused the
+    /// request. [`Jar::set`] is this with [`Context::SameSite`], which is what a
+    /// caller with no other site involved means.
+    pub fn set_in(
+        &mut self,
+        url: &Url,
+        line: &str,
+        context: Context,
+        now: SystemTime,
+    ) -> Result<(), Refused> {
+        if !self.third_party && context == Context::CrossSite {
+            return Err(Refused::ThirdParty);
+        }
         let parsed = SetCookie::parse(line).map_err(Refused::Unreadable)?;
         self.store(url, parsed, now)
     }
@@ -365,6 +437,7 @@ impl Jar {
         if cookie.is_persistent() {
             self.kept_revision += 1;
         }
+        self.revision += 1;
         self.cookies.push(cookie);
     }
 
@@ -497,6 +570,7 @@ impl Jar {
         if touched_the_kept {
             self.kept_revision += 1;
         }
+        self.revision += 1;
 
         Ok(())
     }
@@ -513,6 +587,10 @@ impl Jar {
         };
         let path = url.path();
         let secure = is_secure(url);
+
+        if !self.third_party && context == Context::CrossSite {
+            return Vec::new();
+        }
 
         let mut chosen: Vec<&Cookie> = self
             .cookies
@@ -540,6 +618,9 @@ impl Jar {
     /// Takes the jar mutably because sending a cookie is using it, and what was
     /// used last is what decides who is evicted when the jar is full.
     pub fn header_for(&mut self, url: &Url, context: Context, now: SystemTime) -> Option<String> {
+        if !self.third_party && context == Context::CrossSite {
+            return None;
+        }
         let host = url.host_str().map(str::to_ascii_lowercase)?;
         let path = url.path().to_owned();
         let secure = is_secure(url);
@@ -1434,6 +1515,106 @@ mod tests {
             ),
             Context::CrossSite
         );
+    }
+
+    // --- the reader's own switch ------------------------------------------
+
+    /// Refusing another site's cookies refuses both halves: a page on one site
+    /// cannot set a cookie for another, and cannot cause one to be sent either.
+    #[test]
+    fn refusing_third_party_cookies_refuses_both_directions() {
+        let mut jar = Jar::new();
+        assert!(
+            jar.accepts_third_party(),
+            "on unless a reader says otherwise"
+        );
+        set(
+            &mut jar,
+            "https://tracker.test/",
+            "id=1; SameSite=None; Secure",
+        );
+        assert_eq!(
+            jar.matching(&url("https://tracker.test/"), Context::CrossSite, now())
+                .len(),
+            1
+        );
+
+        jar.set_accepts_third_party(false);
+        // Nothing already kept is thrown away: that is a different request, and a
+        // switch that emptied the jar would sign the reader out of things they
+        // did not ask to leave.
+        assert_eq!(jar.len(), 1);
+        // It simply stops travelling on another site's requests.
+        assert!(
+            jar.matching(&url("https://tracker.test/"), Context::CrossSite, now())
+                .is_empty()
+        );
+        assert_eq!(
+            jar.header_for(&url("https://tracker.test/"), Context::CrossSite, now()),
+            None
+        );
+        // And is still the reader's own cookie when they go to the site itself.
+        assert_eq!(
+            jar.header_for(&url("https://tracker.test/"), Context::SameSite, now()),
+            Some("id=1".into())
+        );
+        // Nothing new may be set from another site's page.
+        assert_eq!(
+            jar.set_in(
+                &url("https://tracker.test/"),
+                "second=2; SameSite=None; Secure",
+                Context::CrossSite,
+                now()
+            ),
+            Err(Refused::ThirdParty)
+        );
+        assert_eq!(jar.len(), 1);
+    }
+
+    /// A top-level navigation to another site is the reader arriving there, not a
+    /// third party. Refusing it would sign somebody out by following a link.
+    #[test]
+    fn a_navigation_to_another_site_is_not_a_third_party() {
+        let mut jar = Jar::new();
+        set(&mut jar, "https://mail.test/", "a=1");
+        jar.set_accepts_third_party(false);
+        assert_eq!(
+            jar.header_for(
+                &url("https://mail.test/"),
+                Context::CrossSiteNavigation,
+                now()
+            ),
+            Some("a=1".into())
+        );
+        assert!(
+            jar.set_in(
+                &url("https://mail.test/"),
+                "b=2",
+                Context::CrossSiteNavigation,
+                now()
+            )
+            .is_ok()
+        );
+    }
+
+    /// A surface listing cookies redraws when the jar changes, and a replacement
+    /// is a change however unchanged the count is.
+    #[test]
+    fn the_revision_moves_on_every_change() {
+        let mut jar = Jar::new();
+        let mut seen = jar.revision();
+        let mut moved = |jar: &Jar, what: &str| {
+            assert_ne!(jar.revision(), seen, "{what}");
+            seen = jar.revision();
+        };
+        set(&mut jar, "https://x.test/", "a=1");
+        moved(&jar, "a cookie set");
+        set(&mut jar, "https://x.test/", "a=2");
+        moved(&jar, "the same cookie with another value");
+        jar.set_accepts_third_party(false);
+        moved(&jar, "the switch");
+        jar.clear();
+        moved(&jar, "everything thrown away");
     }
 
     /// A host is compared canonically, so the case a server wrote does not make a

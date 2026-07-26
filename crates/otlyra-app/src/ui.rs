@@ -578,6 +578,8 @@ pub enum SystemPage {
     Bookmarks,
     /// What was fetched to disk.
     Downloads,
+    /// What sites are keeping here.
+    Cookies,
     /// What this program is.
     About,
 }
@@ -590,7 +592,12 @@ impl SystemPage {
     pub fn available(self) -> bool {
         matches!(
             self,
-            Self::Settings | Self::History | Self::Bookmarks | Self::Downloads | Self::About
+            Self::Settings
+                | Self::History
+                | Self::Bookmarks
+                | Self::Downloads
+                | Self::Cookies
+                | Self::About
         )
     }
 
@@ -607,6 +614,7 @@ impl SystemPage {
             Self::History => "about:history",
             Self::Bookmarks => "about:bookmarks",
             Self::Downloads => "about:downloads",
+            Self::Cookies => "about:cookies",
             Self::About => "about:otlyra",
         }
     }
@@ -626,6 +634,7 @@ impl SystemPage {
             "history" => Self::History,
             "bookmarks" => Self::Bookmarks,
             "downloads" => Self::Downloads,
+            "cookies" => Self::Cookies,
             // `about:` on its own is the browser talking about itself, which is
             // what every other browser does with it too.
             "otlyra" | "about" | "version" | "" => Self::About,
@@ -640,6 +649,7 @@ impl SystemPage {
             Self::History => "History",
             Self::Bookmarks => "Bookmarks",
             Self::Downloads => "Downloads",
+            Self::Cookies => "Cookies",
             Self::About => "About Otlyra",
         }
     }

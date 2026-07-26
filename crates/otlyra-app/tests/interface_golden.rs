@@ -163,6 +163,87 @@ impl Painter for SettingsFrame {
     fn on_event(&mut self, _event: PlatformEvent) {}
 }
 
+/// The cookies surface under the toolbar, with a jar somebody has been browsing
+/// with.
+///
+/// The addresses and the values are invented and fixed, so the picture is the
+/// same on every machine — and the values are here at all only to pin that they
+/// do *not* appear: a golden is the one test that would catch a value getting
+/// drawn.
+struct CookiesFrame {
+    ui: BrowserUi,
+    surface: otlyra_app::cookies::CookiesSurface,
+    store: otlyra_app::cookies::CookieStore,
+    text: TextEngine,
+}
+
+impl CookiesFrame {
+    fn new() -> Self {
+        let mut ui = BrowserUi::new();
+        ui.address.set_text("about:cookies");
+        let store = otlyra_app::cookies::CookieStore::in_memory();
+        // A fixed instant, so an expiry is the same distance away every run.
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        store.with(|jar| {
+            for (address, line) in [
+                ("https://www.example.com/app/x", "session=abc123; HttpOnly"),
+                ("https://www.example.com/", "theme=dark; Max-Age=600"),
+                (
+                    "https://api.example.com/",
+                    "token=xyz789; Domain=example.com",
+                ),
+                (
+                    "https://analytics.test/",
+                    "visitor=0f3d; Max-Age=600; Secure; SameSite=None",
+                ),
+                ("https://news.test/", "consent=yes; Max-Age=600"),
+            ] {
+                jar.set(&url::Url::parse(address).expect("a url"), line, now)
+                    .expect("kept");
+            }
+        });
+        Self {
+            ui,
+            surface: otlyra_app::cookies::CookiesSurface::new(),
+            store,
+            text: TextEngine::isolated(),
+        }
+    }
+
+    fn dark() -> Self {
+        let mut frame = Self::new();
+        frame.ui.set_theme(Theme::dark());
+        frame.surface.set_theme(Theme::dark());
+        frame
+    }
+}
+
+impl Painter for CookiesFrame {
+    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        let (width, height) = (viewport.logical_width(), viewport.logical_height());
+        let mut list = DisplayList::new();
+        self.surface.build_display_list(
+            Rect::new(0.0, UI_HEIGHT, width, (height - UI_HEIGHT).max(0.0)),
+            &self.store,
+            &mut self.text,
+            &mut list,
+        );
+        list.append(&self.ui.build_display_list(
+            width,
+            height,
+            &tabs(&[("Cookies", false)]),
+            0,
+            (true, false),
+            None,
+            &mut self.text,
+        ));
+        list.transform(Affine::scale(viewport.scale_factor));
+        otlyra_gfx::render(&list, target);
+    }
+
+    fn on_event(&mut self, _event: PlatformEvent) {}
+}
+
 fn assert_frame_matches(name: &str, frame: &mut dyn Painter, width: f64, height: f64) {
     for scale in SCALES {
         let viewport = Viewport::new(
@@ -200,4 +281,14 @@ fn the_dark_toolbar_matches_its_goldens_at_both_scales() {
 #[test]
 fn the_dark_settings_match_their_goldens_at_both_scales() {
     assert_frame_matches("settings-dark", &mut SettingsFrame::dark(), 900.0, 700.0);
+}
+
+#[test]
+fn the_cookies_match_their_goldens_at_both_scales() {
+    assert_frame_matches("cookies", &mut CookiesFrame::new(), 900.0, 700.0);
+}
+
+#[test]
+fn the_dark_cookies_match_their_goldens_at_both_scales() {
+    assert_frame_matches("cookies-dark", &mut CookiesFrame::dark(), 900.0, 700.0);
 }

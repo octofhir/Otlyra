@@ -833,6 +833,8 @@ pub struct Described {
 pub struct Named<A> {
     child: Child<A>,
     name: String,
+    /// Whether `name` replaces a name the child already gave itself.
+    instead: bool,
 }
 
 impl<A> Named<A> {
@@ -841,6 +843,21 @@ impl<A> Named<A> {
         Self {
             child,
             name: name.into(),
+            instead: false,
+        }
+    }
+
+    /// `child`, named `name` *instead of* whatever it calls itself.
+    ///
+    /// For a control whose own words are right on the screen and wrong off it:
+    /// four buttons reading "Remove", each in a card that says which site it
+    /// belongs to, are four identical buttons to anything that cannot see the
+    /// cards. The row is what knows which is which, and this is the row saying so.
+    pub fn instead_of_its_own(name: impl Into<String>, child: Child<A>) -> Self {
+        Self {
+            child,
+            name: name.into(),
+            instead: true,
         }
     }
 }
@@ -870,13 +887,16 @@ impl<A> Widget<A> for Named<A> {
         let first = out.len();
         self.child.describe(out);
         for described in &mut out[first..] {
-            if described.label.is_empty() {
+            if self.instead || described.label.is_empty() {
                 described.label.clone_from(&self.name);
             }
         }
     }
 
     fn label_text(&self) -> Option<String> {
+        if self.instead {
+            return Some(self.name.clone());
+        }
         self.child.label_text().or_else(|| Some(self.name.clone()))
     }
 }
