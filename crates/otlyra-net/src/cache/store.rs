@@ -51,6 +51,31 @@ impl Stored {
             .map(|(_, value)| value.as_str())
     }
 
+    /// This entry as the response it was.
+    ///
+    /// The request headers are empty rather than invented: what was sent was sent
+    /// on a request that is over, and a pane showing this one's headers would be
+    /// showing a request nobody made. That a response came from here is the
+    /// interesting fact, and it is the caller's to report.
+    pub fn as_resource(&self) -> crate::LoadedResource {
+        let header = |name: &str| {
+            self.headers
+                .iter()
+                .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        crate::LoadedResource {
+            final_url: self.final_url.clone(),
+            status: self.status,
+            content_type: header("content-type"),
+            nosniff: header("x-content-type-options")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("nosniff")),
+            request_headers: Vec::new(),
+            response_headers: self.headers.clone(),
+            body: self.body.clone(),
+        }
+    }
+
     /// Whether there is anything to ask the server with.
     ///
     /// An `ETag` or a `Last-Modified`. Without one there is no such thing as

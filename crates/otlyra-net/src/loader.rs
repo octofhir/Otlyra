@@ -251,6 +251,29 @@ pub enum NetError {
     },
 }
 
+/// The `Date` a response carried, if it carried a readable one.
+///
+/// Read with the cookie date reader, which takes the three HTTP formats and the
+/// several shapes servers send that are none of them.
+fn header_date(headers: &[(String, String)]) -> Option<std::time::SystemTime> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .and_then(|(_, value)| crate::cookie::date::parse(value))
+}
+
+/// How long a response had already spent in caches upstream.
+///
+/// Zero where there is no `Age`, which is the specification's own default and is
+/// the right one: a response that says nothing has been nowhere.
+fn header_age(headers: &[(String, String)]) -> std::time::Duration {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("age"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_secs)
+}
+
 /// Where a redirect points, and whether the request keeps its body getting there.
 struct Hop {
     /// The address, already resolved against the one that answered.
@@ -281,7 +304,16 @@ pub struct Loader {
     blocking: std::sync::OnceLock<tokio::runtime::Runtime>,
     limits: Limits,
     jar: Option<SharedJar>,
+    cache: Option<SharedCache>,
 }
+
+/// The one cache, shared by everything that fetches and everything that shows a
+/// reader what has been kept.
+///
+/// A `std::sync::Mutex` and never held across an `await`, for the reason
+/// [`SharedJar`] is one: what is done under it is a hash lookup and a memcpy, and
+/// an async mutex would be a scheduling point with nothing to schedule.
+pub type SharedCache = std::sync::Arc<std::sync::Mutex<crate::cache::Cache>>;
 
 /// The one jar, shared by everything that sends a request and everything that
 /// shows the reader what is kept.
@@ -324,6 +356,7 @@ impl Loader {
             blocking: std::sync::OnceLock::new(),
             limits,
             jar: None,
+            cache: None,
         })
     }
 
@@ -340,6 +373,21 @@ impl Loader {
     /// The jar this loader sends from, if it has one.
     pub fn jar(&self) -> Option<&SharedJar> {
         self.jar.as_ref()
+    }
+
+    /// The same loader, answering out of `cache` where it can.
+    ///
+    /// Optional and off by default, like the jar: a one-shot `--url` fetch and
+    /// most of this crate's tests want the network every time, and a test that
+    /// silently answered out of a cache would be a test of the cache.
+    pub fn with_cache(mut self, cache: SharedCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The cache this loader answers out of, if it has one.
+    pub fn cache(&self) -> Option<&SharedCache> {
+        self.cache.as_ref()
     }
 
     /// The limits this loader enforces.
@@ -417,6 +465,59 @@ impl Loader {
         // hop and the last is one the chain was decided against inconsistently,
         // and asking the clock four times is how that happens.
         let now = std::time::SystemTime::now();
+        // What the cache is asked about, and answers under: the address the
+        // reader asked for rather than the one the chain ends at. A later request
+        // is made for the first of those and never for the second, so an entry
+        // under the last hop is an entry nothing looks up — and the response it
+        // holds already says where it came from.
+        let key = started_at.clone();
+        // The headers a `Vary` could name that are not the same on every request
+        // this client makes. `Cookie` is the one: `User-Agent`, `Accept` and
+        // `Accept-Encoding` are constants here, so an entry stored under them
+        // matches every later request by construction.
+        let varying: Vec<(String, String)> = self
+            .cookie_header(
+                &url,
+                crate::cookie::Context::of(
+                    &url,
+                    request.initiator.as_ref(),
+                    request.navigation && body.is_none(),
+                ),
+                now,
+            )
+            .map(|value| vec![("cookie".to_owned(), value)])
+            .unwrap_or_default();
+
+        // Answered without a request at all where the stored copy is still good,
+        // and with a conditional one where it is not. Only a `GET`: a request with
+        // a body changes something, and nothing here would reuse the answer.
+        let mut conditions: Vec<(&'static str, String)> = Vec::new();
+        if body.is_none()
+            && let Some(cache) = self.cache.as_ref()
+        {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match cache.look_up(&key, &varying, now) {
+                Some((stored, crate::cache::Use::Fresh)) => {
+                    tracing::debug!(%key, "answered from the cache");
+                    return Ok(stored.as_resource());
+                }
+                // A validator belongs to the address that sent it. Where the
+                // entry was stored under one address and answered by another —
+                // a redirect chain, which is kept whole under the address the
+                // reader asked for — its `ETag` is the last hop's and asking the
+                // first hop about it would be asking one resource whether it
+                // matches another's. A server that said yes would hand back the
+                // wrong body, so nothing is asked and the chain runs again.
+                Some((stored, _)) if stored.final_url == key => {
+                    conditions = stored.conditions();
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
+
         // `SameSite` across a chain is the whole chain's answer, not each hop's:
         // once a redirect has left the initiator's site, everything after it was
         // caused by that departure however same-site the last two hops look. A
@@ -448,13 +549,47 @@ impl Loader {
                 crate::cookie::Context::CrossSite
             };
 
-            let (response, request_headers) = self.send(&url, body.clone(), context, now).await?;
+            // The conditions go on the first hop only: they are about the entry
+            // stored under the address the reader asked for, and a redirect is a
+            // different resource with different validators.
+            let asking = if hop == 0 { conditions.as_slice() } else { &[] };
+            let (response, request_headers) =
+                self.send(&url, body.clone(), context, now, asking).await?;
             self.take_cookies(&response, &url, context, now);
+
+            // The server saying nothing changed. The body was never sent, so the
+            // one that answers is the one already held.
+            if response.status().as_u16() == 304
+                && let Some(cache) = self.cache.as_ref()
+            {
+                let headers = headers_to_pairs(response.headers());
+                let times = crate::cache::Times {
+                    requested: now,
+                    received: std::time::SystemTime::now(),
+                    date: header_date(&headers).unwrap_or(now),
+                    age: header_age(&headers),
+                };
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cache.refresh(&key, &headers, times) {
+                    tracing::debug!(%key, "the server said nothing changed");
+                    if let Some((stored, _)) = cache.look_up(&key, &varying, now) {
+                        return Ok(stored.as_resource());
+                    }
+                }
+            }
 
             match Self::redirect_from(&response, &url)? {
                 // Not a redirect, or one with nowhere to go — which a server does
                 // send, and which every browser renders as an ordinary response.
-                None => return self.receive(response, url, request_headers).await,
+                None => {
+                    let resource = self.receive(response, url, request_headers).await?;
+                    if body.is_none() {
+                        self.keep(&key, &varying, &resource, now);
+                    }
+                    return Ok(resource);
+                }
                 Some(next) => {
                     // The chain is only ever http and https. A `Location` naming
                     // anything else — `file:` above all — is refused here, because
@@ -487,6 +622,7 @@ impl Loader {
         body: Option<Body>,
         context: crate::cookie::Context,
         now: std::time::SystemTime,
+        conditions: &[(&'static str, String)],
     ) -> Result<(reqwest::Response, Vec<(String, String)>), NetError> {
         let shown = url.to_string();
         let built = match body {
@@ -511,6 +647,13 @@ impl Loader {
             && let Ok(value) = reqwest::header::HeaderValue::from_str(&header)
         {
             built.headers_mut().insert(reqwest::header::COOKIE, value);
+        }
+        for (name, written) in conditions {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(written)
+            {
+                built.headers_mut().insert(name, value);
+            }
         }
         let built = built;
         let request_headers = headers_to_pairs(built.headers());
@@ -635,6 +778,61 @@ impl Loader {
                 tracing::debug!(%url, %refused, "a cookie was refused");
             }
         }
+    }
+
+    /// Keep a response, if the rules say it may be kept.
+    fn keep(
+        &self,
+        key: &str,
+        varying: &[(String, String)],
+        resource: &LoadedResource,
+        requested: std::time::SystemTime,
+    ) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let received = std::time::SystemTime::now();
+        let times = crate::cache::Times {
+            requested,
+            received,
+            date: header_date(&resource.response_headers).unwrap_or(received),
+            age: header_age(&resource.response_headers),
+        };
+        let directives = crate::cache::Directives::parse(
+            resource
+                .response_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+                .map(|(_, value)| value.as_str()),
+        );
+        let header = |name: &str| {
+            resource
+                .response_headers
+                .iter()
+                .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        let lifetime = crate::cache::lifetime(
+            directives,
+            header("expires"),
+            header("last-modified"),
+            times,
+        );
+        let stored = crate::cache::Stored {
+            status: resource.status,
+            headers: resource.response_headers.clone(),
+            body: resource.body.clone(),
+            final_url: resource.final_url.clone(),
+            directives,
+            lifetime,
+            times,
+            varied: Vec::new(),
+            varies_on_everything: false,
+        };
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.store(key, "GET", stored, varying);
     }
 
     /// Where a response says to go next, and what to carry there.
