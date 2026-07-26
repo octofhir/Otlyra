@@ -131,49 +131,36 @@ are the two consumers they were written from.
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
 
-## Next large feature — page zoom
+## Next large feature — cookies, and the state a site keeps
 
-Find in page is done, and what it left behind is worth knowing before the next
-thing is built on it. `PageScene::scroll_to_rect` moves the page and not a box
-inside it, which needs the rectangle in the box's own coordinates rather than
-the page's; the inspector's reveal will want that version. The find bar is the
-first popup that is a *mode* rather than a choice — it declares a focus scope,
-carries no sheet, and is not dismissed by a press or an accelerator elsewhere —
-so `Popup::transient` is the question every dismissal now asks. Its field takes
-the keyboard during the build that claims its id, which is the only way a
-control can be focused in the same frame it first appears in.
+Page zoom is done: the factor, the three ways to reach it, one remembered per
+site, and the reader's place held across the relayout. What it left behind is
+worth knowing. `PageScene::hold_the_reader_s_place` records a position in the
+text and puts the page back at it after the next layout — the same trick a
+selection uses, and the thing every relayout wants, not only a zoom: a resize
+still throws the reader down the page. `Browser::in_page` is the one conversion
+from window coordinates to the page's; anything new that asks the page about a
+point goes through it. `PlatformEvent::Scroll` carries modifiers now.
 
-Page zoom is next, over cookies/cache and the half-drawn controls: it is
-entirely ours, it needs nothing from a script engine, and it is the one setting
-a reader changes on a page they are already reading. Three slices:
+Cookies are next, over the half-drawn controls and the HTTP cache. A browser
+without them cannot stay logged in to anything, which is the largest single
+thing between this and being usable — and none of it needs a script engine:
+`Set-Cookie` and `Cookie` are headers, and the parts that matter are the rules
+about who may read what. Three slices:
 
-The factor is in. `Browser::zoom`/`set_zoom` makes the CSS pixel itself larger
-for the page: it lays out in the fewer of them the window now holds and its
-display list is scaled back up, so a zoomed page *reflows* — its media queries
-and viewport units answer to the new width — rather than being magnified. The
-chrome is untouched, which is what separates a zoom from the device scale the
-compositor carries and from the reader's text size, which moves only the root
-font. Every question a pointer asks the page goes through `Browser::in_page`,
-because a press answered in a coordinate system it did not land in is a link
-that opens when the pointer was somewhere else. `--zoom` sets it for a
-screenshot. What is left:
-
-Reaching it is in too: ⌘+, ⌘− and ⌘0, the View menu's own three, the wheel with
-the accelerator held, and a row on the browser menu reading *Zoom — 125%* which
-is the only place a reader is told — the native menu bar is built once at
-startup and cannot be relabelled. The stops are the ladder every browser uses,
-because repeated multiplication lands on factors like 121% that no menu can
-name. `PlatformEvent::Scroll` carries the modifiers now; it could not say
-whether a wheel was a scroll or a zoom before. What is left:
-
-- [ ] **Remembering it, per origin.** One factor for the whole browser today.
-  It belongs to the site: a reader who needs 125% on one needs it every time
-  they go back, and needs the next site left alone. That means the preferences
-  store, and a zoom that follows the active tab rather than the window.
-- [ ] **Keeping the reader's place across a zoom.** The scroll offset is in the
-  page's own pixels and survives, but the content around it is a different
-  height, so where a reader was looking drifts. What browsers keep is the point
-  in the document at the top of the window, restored after the relayout.
+- [ ] **The jar.** Parse `Set-Cookie` — name, value, `Domain`, `Path`,
+  `Expires`/`Max-Age`, `Secure`, `HttpOnly`, `SameSite` — and answer *which
+  cookies go on this request*. The matching rules are the whole of it and they
+  are unforgiving: a domain match is not a suffix match (`evil-example.com`
+  must not match `example.com`), a path match is not a prefix match, and the
+  public-suffix rule is what stops a site setting a cookie for `.co.uk`. That
+  list needs a source; decide whether to vendor one and say so.
+- [ ] **On the wire, and on disk.** The jar attached to the fetcher, sent and
+  received per request, with a session jar that dies with the process and a
+  persistent one that does not. Redirects carry cookies set on the way.
+- [ ] **What the reader can see and do about it.** A page in the browser's own
+  surfaces listing what is kept and by whom, with a way to throw it away — per
+  site and altogether — and the settings switch that refuses third-party ones.
 
 ## Priority 5 — Design system and fast UI authoring
 

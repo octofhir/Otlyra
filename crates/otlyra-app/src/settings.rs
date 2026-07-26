@@ -123,6 +123,15 @@ pub struct Settings {
     pub focus: Option<FocusId>,
     /// How far the surface is scrolled.
     pub scroll: f64,
+    /// How much larger than its own pixels each site's pages are drawn, by
+    /// origin, for the sites a reader has said something about.
+    ///
+    /// By origin because that is what a zoom belongs to: a reader who needs
+    /// 125% on one site needs it every time they go back to it and needs the
+    /// next site left alone. Absent means the page's own size, which is why
+    /// this is a map rather than a number per site — a browser should not carry
+    /// an entry for every place anyone has ever been.
+    pub zoom: std::collections::BTreeMap<String, f32>,
     overflow: Overflow,
 }
 
@@ -141,6 +150,7 @@ impl Default for Settings {
             download_directory: String::new(),
             focus: None,
             scroll: 0.0,
+            zoom: std::collections::BTreeMap::new(),
             overflow: Overflow::default(),
         }
     }

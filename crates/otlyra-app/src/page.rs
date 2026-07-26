@@ -104,6 +104,14 @@ pub struct PageScene {
     /// A place in the text rather than a rectangle on the screen: the same
     /// rectangle means different words once the page has been laid out again.
     selection: Option<otlyra_layout::Selection>,
+    /// The place in the text that was at the top of the window, to be put back
+    /// there once the page has been laid out again.
+    ///
+    /// A relayout moves everything: the same offset in pixels points at
+    /// different words once the lines have broken elsewhere, which is what a
+    /// zoom does to a page a reader is half way down. A position in the text
+    /// survives it, the way a selection does.
+    anchor: Option<otlyra_layout::TextPosition>,
     /// What the reader is looking for on the page, and where it is.
     ///
     /// The query is kept beside the answers because the answers do not survive a
@@ -375,6 +383,7 @@ impl PageScene {
             background_pictures: std::collections::HashMap::new(),
             viewport_height: 0.0,
             selection: None,
+            anchor: None,
             find: None,
             damage: Damage::STYLE,
             painted: None,
@@ -441,8 +450,10 @@ impl PageScene {
             self.layout = Some((width, tree));
             self.layout_stale = false;
             // Every path to a new layout comes through here, which is what makes
-            // this the one place a search has to be asked again.
+            // this the one place a search has to be asked again — and the one
+            // place the reader can be put back where they were.
             self.find_again();
+            self.restore_the_reader_s_place();
         }
         &self.layout.as_ref().expect("just laid out").1
     }
@@ -3051,6 +3062,35 @@ impl PageScene {
         let at = found.at.get(found.current)?;
         let (_, tree) = self.layout.as_ref()?;
         Some(otlyra_layout::selection::text(tree, *at))
+    }
+
+    /// Remember the place at the top of the window, to be put back after the
+    /// next relayout.
+    ///
+    /// What browsers call scroll anchoring, and what a reader means by *keep my
+    /// place*: the pixel offset is meaningless across a relayout, and the words
+    /// at the top of the window are not.
+    pub fn hold_the_reader_s_place(&mut self) {
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return;
+        };
+        self.anchor = otlyra_layout::selection::position_at(tree, 0.0, self.scroll);
+    }
+
+    /// Put the page back where the anchor is, once it has been laid out again.
+    fn restore_the_reader_s_place(&mut self) {
+        let Some(anchor) = self.anchor.take() else {
+            return;
+        };
+        let Some((_, tree)) = self.layout.as_ref() else {
+            return;
+        };
+        let Some(rect) = otlyra_layout::selection::caret_rect(tree, anchor) else {
+            return;
+        };
+        let content = tree.content_height();
+        let max = (content - self.viewport_height).max(0.0);
+        self.scroll = rect.y.clamp(0.0, max);
     }
 
     /// Search the page again, because the page has been laid out again.

@@ -115,7 +115,7 @@ pub fn to_text(settings: &Settings) -> String {
          appearance = \"{}\"\n\
          text_scale = {}\n\
          download_ask = {}\n\
-         download_directory = \"{}\"\n",
+         download_directory = \"{}\"\n{}",
         match settings.on_start {
             OnStart::Blank => "blank",
             OnStart::Home => "home",
@@ -145,6 +145,19 @@ pub fn to_text(settings: &Settings) -> String {
             .download_directory
             .replace('\\', "\\\\")
             .replace('"', "\\\""),
+        // One line per site, sorted, so a file written twice from the same
+        // preferences is the same file — a diff of a preferences file should be
+        // what changed and not what a map felt like ordering itself as.
+        settings
+            .zoom
+            .iter()
+            .map(|(origin, factor)| {
+                format!(
+                    "zoom.\"{}\" = {factor}\n",
+                    origin.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<String>(),
     )
 }
 
@@ -170,6 +183,23 @@ pub fn from_text(text: &str) -> Settings {
         let flag = || value.parse::<bool>().ok();
 
         match key {
+            key if key.starts_with("zoom.") => {
+                // `zoom."example.com" = 1.25`. The site is in the key rather
+                // than in a table because the file is read a line at a time and
+                // a line that carries both is a line that can be read on its
+                // own.
+                let origin = key["zoom.".len()..]
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|origin| origin.strip_suffix('"'))
+                    .map(|origin| origin.replace("\\\"", "\"").replace("\\\\", "\\"));
+                match (origin, value.parse::<f32>()) {
+                    (Some(origin), Ok(factor)) if !origin.is_empty() && factor > 0.0 => {
+                        settings.zoom.insert(origin, factor);
+                    }
+                    _ => tracing::warn!(line, "a zoom line that names no site or no factor"),
+                }
+            }
             "on_start" => {
                 settings.on_start = match text().as_deref() {
                     Some("home") => OnStart::Home,
@@ -311,5 +341,39 @@ mod tests {
             path.ends_with(std::path::Path::new(FOLDER).join(FILE)),
             "{path:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    /// A zoom per site survives being written and read back, and a site left at
+    /// its own size leaves nothing behind.
+    #[test]
+    fn zooms_round_trip_through_the_file() {
+        let mut settings = Settings::default();
+        settings.zoom.insert("https://example.com".to_owned(), 1.25);
+        settings
+            .zoom
+            .insert("http://other.example".to_owned(), 0.75);
+
+        let text = to_text(&settings);
+        assert!(
+            text.contains("zoom.\"https://example.com\" = 1.25"),
+            "{text}"
+        );
+
+        let read = from_text(&text);
+        assert_eq!(read.zoom, settings.zoom);
+
+        // Written twice from the same preferences, the file is the same file: a
+        // diff of one should be what changed rather than what a map felt like
+        // ordering itself as.
+        assert_eq!(to_text(&read), text);
+
+        // A line naming no site or no factor is dropped rather than taken.
+        let broken = from_text("zoom.\"\" = 1.5\nzoom.\"a.example\" = nonsense\n");
+        assert!(broken.zoom.is_empty());
     }
 }

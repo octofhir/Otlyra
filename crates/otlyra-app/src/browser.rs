@@ -690,10 +690,65 @@ impl Browser {
         if (zoom - self.zoom).abs() < f32::EPSILON {
             return;
         }
+        // Before the factor changes, because it is the layout being left that
+        // knows where the reader was.
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.hold_the_reader_s_place();
+        }
         self.zoom = zoom;
         self.ui.zoom = zoom;
+        // Remembered against the site rather than the tab or the window: a
+        // reader who needs a factor on one site needs it every time they go
+        // back, and needs the next site left alone. Its own size is the absence
+        // of an entry rather than an entry saying one, so that a browser does
+        // not carry a line for every place anyone has ever been.
+        if let Some(origin) = self.active_origin() {
+            let before = self.settings.settings.clone();
+            if (zoom - 1.0).abs() < f32::EPSILON {
+                self.settings.settings.zoom.remove(&origin);
+            } else {
+                self.settings.settings.zoom.insert(origin, zoom);
+            }
+            self.save_preferences_if_changed(&before);
+        }
         // Everything below the zoom is a function of it: the page lays out in a
         // viewport of a different size, so it has to be laid out again.
+        if let Some(page) = self.tabs[self.active].page.as_mut() {
+            page.invalidate_layout();
+        }
+    }
+
+    /// The site the active tab is on, as a zoom is remembered against it.
+    ///
+    /// Scheme and host, so `http` and `https` are two sites — which they are,
+    /// to everything else a browser keeps — and every page of one site is one
+    /// site. `None` for a tab showing nothing, one of the browser's own pages,
+    /// or an address that is not one.
+    fn active_origin(&self) -> Option<String> {
+        let tab = self.tabs.get(self.active)?;
+        if tab.system.is_some() {
+            return None;
+        }
+        let url = otlyra_net::normalize(&tab.url).ok()?;
+        let host = url.host_str()?;
+        Some(format!("{}://{host}", url.scheme()))
+    }
+
+    /// Put the zoom back to whatever this site was left at.
+    ///
+    /// Called wherever the address is synchronized, because the site is a
+    /// property of the address: a tab coming to the front and a navigation are
+    /// the same question asked twice.
+    fn restore_zoom(&mut self) {
+        let wanted = self
+            .active_origin()
+            .and_then(|origin| self.settings.settings.zoom.get(&origin).copied())
+            .unwrap_or(1.0);
+        if (wanted - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom = wanted;
+        self.ui.zoom = wanted;
         if let Some(page) = self.tabs[self.active].page.as_mut() {
             page.invalidate_layout();
         }
@@ -2129,7 +2184,7 @@ impl Browser {
             crate::ui::Bookmarked::No
         };
         self.ui.address.set_text(url);
-        self.ui.zoom = self.zoom;
+        self.restore_zoom();
         self.sync_find();
     }
 
@@ -7986,6 +8041,113 @@ mod tests {
             press(&mut browser, '-');
         }
         assert_eq!(browser.zoom(), 0.25);
+    }
+
+    /// A zoom is remembered against the site, and only against the site the
+    /// reader set it on.
+    #[test]
+    fn a_zoom_belongs_to_the_site_it_was_set_on() {
+        let mut browser = browser();
+        go(&mut browser, "one.example");
+        browser.step_zoom(ZoomStep::In);
+        assert_eq!(browser.zoom(), 1.1);
+
+        // Another site is another zoom, which is the whole reason this is not
+        // one number for the browser.
+        go(&mut browser, "two.example");
+        assert_eq!(browser.zoom(), 1.0, "the next site is left alone");
+
+        go(&mut browser, "one.example");
+        assert_eq!(browser.zoom(), 1.1, "and the first is as it was left");
+
+        // Every page of a site is the site: a zoom set on one page is the zoom
+        // on the next.
+        go(&mut browser, "https://one.example/deep/page");
+        assert_eq!(browser.zoom(), 1.1);
+
+        // Back to its own size and the site stops being one this browser knows
+        // anything about — a preferences file should not carry a line for every
+        // place anyone has ever been.
+        browser.step_zoom(ZoomStep::Reset);
+        assert!(browser.settings.settings.zoom.is_empty());
+    }
+
+    /// A zoom keeps the reader where they were reading.
+    ///
+    /// The scroll is in the page's own pixels and survives, but the content
+    /// around it is a different height once the lines have broken elsewhere —
+    /// so the same offset points at different words. What is held is the place
+    /// in the text at the top of the window.
+    #[test]
+    fn a_zoom_keeps_the_reader_where_they_were_reading() {
+        struct LongPage;
+
+        impl Loader for LongPage {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                // Long enough that a tenth off the width breaks them
+                // differently, which is what makes the offset in pixels stop
+                // meaning what it meant.
+                let paragraphs = (0..60)
+                    .map(|n| {
+                        format!(
+                            "<p>paragraph number {n} with a great many words in it so that \
+                             taking a tenth off the width it is laid out in breaks its lines \
+                             somewhere else entirely and the pixels stop lining up</p>"
+                        )
+                    })
+                    .collect::<String>();
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: format!("<title>T</title><body style='margin:0'>{paragraphs}")
+                        .into_bytes(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: format!("https://{url}/"),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(LongPage);
+        go(&mut browser, "long.example");
+        let draw = |browser: &mut Browser| {
+            let mut target = otlyra_gfx::RecordingPainter::default();
+            browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+        };
+        draw(&mut browser);
+
+        // Half way down, and read what is at the top of the window.
+        // What is at the top of the window: `select_word_at` takes a window
+        // point and a top inset and adds the scroll itself, so the top of the
+        // window is `y == top`.
+        let words = |browser: &mut Browser| {
+            let page = browser.tabs[browser.active].page.as_mut().expect("a page");
+            page.select_word_at(40.0, 0.0, 0.0);
+            page.selected_text()
+        };
+        if let Some(page) = browser.tabs[browser.active].page.as_mut() {
+            page.set_scroll(700.0);
+        }
+        draw(&mut browser);
+        let before = words(&mut browser);
+        assert!(before.is_some(), "there are words at the top of the window");
+
+        browser.step_zoom(ZoomStep::In);
+        draw(&mut browser);
+        let after = browser.tabs[browser.active]
+            .page
+            .as_ref()
+            .expect("a page")
+            .scroll();
+        assert_ne!(
+            after, 700.0,
+            "the page moved to keep the reader's place rather than staying at an \
+             offset that now points at other words"
+        );
+        assert_eq!(
+            words(&mut browser),
+            before,
+            "and the same words are at the top of the window"
+        );
     }
 
     /// A press lands where the reader aimed it, whatever the zoom.
