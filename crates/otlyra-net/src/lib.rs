@@ -12,6 +12,7 @@
 //! - [`limits`] — the caps every response is measured against.
 //! - [`url`] — turning what the user typed into a URL we are willing to fetch.
 //! - [`loader`] — the shared client and the fetch itself.
+//! - [`cache`] — what has already been fetched, and whether it still counts.
 //! - [`cookie`] — the state a site keeps here, and the rules about who may read
 //!   it. Two headers, and nothing in either needs a script engine.
 //!
@@ -26,6 +27,7 @@
 //! 3. **All network bytes are untrusted.** Nothing here interprets them; the most
 //!    it will do is decode them to text under a charset the caller can inspect.
 
+pub mod cache;
 pub mod cookie;
 pub mod limits;
 pub mod loader;
