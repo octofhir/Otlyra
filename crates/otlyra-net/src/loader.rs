@@ -191,6 +191,15 @@ pub enum NetError {
         limit: usize,
     },
 
+    /// A redirect pointed somewhere that is not an address.
+    #[error("{url} redirected to something that is not an address: {location}")]
+    BadRedirect {
+        /// The URL that answered with the redirect.
+        url: String,
+        /// What its `Location` said, as far as it can be shown.
+        location: String,
+    },
+
     /// The body is, or claims to be, larger than we will hold.
     #[error("{url} body exceeds the {limit} byte limit")]
     BodyTooLarge {
@@ -209,6 +218,15 @@ pub enum NetError {
         #[source]
         source: reqwest::Error,
     },
+}
+
+/// Where a redirect points, and whether the request keeps its body getting there.
+struct Hop {
+    /// The address, already resolved against the one that answered.
+    to: Url,
+    /// Whether the next request is the same request. `false` turns a `POST` into
+    /// a `GET` of where it was pointed.
+    keeps_the_body: bool,
 }
 
 /// Identifies us to servers. Deliberately honest rather than imitating a browser
@@ -247,10 +265,16 @@ impl Loader {
         let startup =
             |source: Box<dyn std::error::Error + Send + Sync>| NetError::Startup { source };
 
+        // The client follows nothing. Every hop is ours, because a redirect is
+        // where several of a browser's rules apply and a client that walks the
+        // chain by itself applies none of them: a `Set-Cookie` on the way is
+        // invisible, the `Cookie` for the hop after it is never asked for, and a
+        // `Location` naming a `file:` URL is followed rather than refused. The
+        // limit that was this line's argument is enforced in [`Loader::fetch`].
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(limits.timeout)
-            .redirect(reqwest::redirect::Policy::limited(limits.max_redirects))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| startup(Box::new(error)))?;
 
@@ -292,11 +316,19 @@ impl Loader {
         runtime.block_on(self.fetch(request))
     }
 
-    /// Fetch one resource on the caller's runtime.
+    /// Fetch one resource on the caller's runtime, following redirects.
     ///
     /// The whole transport: `data:` read out of the address, scheme policy, the
-    /// declared and the arriving body caps, and the headers as sent and as received.
-    /// Nothing here knows what the bytes mean.
+    /// redirect chain, the declared and the arriving body caps, and the headers as
+    /// sent and as received. Nothing here knows what the bytes mean.
+    ///
+    /// **The chain is walked here rather than by the client**, which is what makes
+    /// a hop a place rules can be applied. A client following redirects internally
+    /// hands back only the last response: what a server set on the way is gone,
+    /// what should have been sent on the hop after it was never asked for, and a
+    /// `Location` naming a scheme this crate does not fetch is followed rather
+    /// than refused. A sign-in is almost always a redirect, so none of that is an
+    /// edge case.
     pub async fn fetch(&self, request: LoadRequest) -> Result<LoadedResource, NetError> {
         // A `data:` URL is not a request at all: the resource is written into the
         // address, and reading it is decoding rather than fetching. Answered here
@@ -320,33 +352,89 @@ impl Loader {
             });
         }
 
-        let url = request.url.to_string();
-        let limit = self.limits.max_body_bytes;
+        let started_at = request.url.to_string();
+        let mut url = request.url;
+        let mut body = request.body;
 
-        // Built rather than sent in one call, so the headers the client is about
-        // to write can be read back and shown: an inspector's *Request* pane is
-        // the headers we actually sent, and this is where they become knowable.
-        let built = match request.body {
-            // A body is held in memory rather than streamed, which is what lets the
-            // client replay it: a redirect that keeps the method — 307, 308 — has to
-            // send the same bytes again, and a body it could only read once would
-            // arrive empty the second time.
+        for hop in 0.. {
+            if hop > self.limits.max_redirects {
+                return Err(NetError::TooManyRedirects {
+                    url: started_at,
+                    limit: self.limits.max_redirects,
+                });
+            }
+
+            let (response, request_headers) = self.send(&url, body.clone()).await?;
+
+            match Self::redirect_from(&response, &url)? {
+                // Not a redirect, or one with nowhere to go — which a server does
+                // send, and which every browser renders as an ordinary response.
+                None => return self.receive(response, url, request_headers).await,
+                Some(next) => {
+                    // The chain is only ever http and https. A `Location` naming
+                    // anything else — `file:` above all — is refused here, because
+                    // a page from the internet reaching the filesystem through a
+                    // redirect is the oldest browser vulnerability there is.
+                    if !crate::is_fetchable(&next.to) {
+                        return Err(NetError::UnsupportedScheme {
+                            scheme: next.to.scheme().to_owned(),
+                        });
+                    }
+                    if !next.keeps_the_body {
+                        body = None;
+                    }
+                    url = next.to;
+                }
+            }
+        }
+        // `0..` is not empty, so the loop returns or diverges.
+        unreachable!("the redirect loop returns from inside")
+    }
+
+    /// One hop: build it, send it, and say what was actually put on it.
+    ///
+    /// Built rather than sent in one call, so the headers the client is about to
+    /// write can be read back and shown: an inspector's *Request* pane is the
+    /// headers we actually sent, and this is where they become knowable.
+    async fn send(
+        &self,
+        url: &Url,
+        body: Option<Body>,
+    ) -> Result<(reqwest::Response, Vec<(String, String)>), NetError> {
+        let shown = url.to_string();
+        let built = match body {
+            // A body is held in memory rather than streamed, which is what lets it
+            // be replayed: a redirect that keeps the method — 307, 308 — has to
+            // send the same bytes again, and a body that could only be read once
+            // would arrive empty the second time.
             Some(body) => self
                 .client
-                .post(request.url)
+                .post(url.clone())
                 .header(reqwest::header::CONTENT_TYPE, body.content_type)
                 .body(body.bytes),
-            None => self.client.get(request.url),
+            None => self.client.get(url.clone()),
         }
         .build()
-        .map_err(|error| self.classify(error, &url))?;
+        .map_err(|error| self.classify(error, &shown))?;
         let request_headers = headers_to_pairs(built.headers());
 
         let response = self
             .client
             .execute(built)
             .await
-            .map_err(|error| self.classify(error, &url))?;
+            .map_err(|error| self.classify(error, &shown))?;
+        Ok((response, request_headers))
+    }
+
+    /// Read a response that is the end of the chain.
+    async fn receive(
+        &self,
+        response: reqwest::Response,
+        url: Url,
+        request_headers: Vec<(String, String)>,
+    ) -> Result<LoadedResource, NetError> {
+        let shown = url.to_string();
+        let limit = self.limits.max_body_bytes;
 
         let status = response.status().as_u16();
         let response_headers = headers_to_pairs(response.headers());
@@ -367,7 +455,7 @@ impl Loader {
         if let Some(declared) = response.content_length()
             && declared > limit
         {
-            return Err(NetError::BodyTooLarge { url, limit });
+            return Err(NetError::BodyTooLarge { url: shown, limit });
         }
 
         // And again as it arrives, because `Content-Length` is a claim by the same
@@ -377,10 +465,10 @@ impl Loader {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|error| self.classify(error, &url))?
+            .map_err(|error| self.classify(error, &shown))?
         {
             if body.len() as u64 + chunk.len() as u64 > limit {
-                return Err(NetError::BodyTooLarge { url, limit });
+                return Err(NetError::BodyTooLarge { url: shown, limit });
             }
             body.extend_from_slice(&chunk);
         }
@@ -396,6 +484,41 @@ impl Loader {
             response_headers,
             body,
         })
+    }
+
+    /// Where a response says to go next, and what to carry there.
+    ///
+    /// `None` when the response is the end of the chain — either it is not a
+    /// redirect, or it is one with no `Location`, which servers do send and which
+    /// every browser renders as an ordinary response rather than as an error.
+    fn redirect_from(response: &reqwest::Response, from: &Url) -> Result<Option<Hop>, NetError> {
+        let status = response.status().as_u16();
+        // What each code does to the method is not what the specification first
+        // said, and browsers are what servers are written against. 303 was always
+        // *go and GET this instead*. 301 and 302 are supposed to preserve the
+        // method and never did: a body re-sent to an address that did not ask for
+        // it is a second submission, so a redirected POST becomes a GET of where
+        // it was pointed. 307 and 308 exist precisely to say *no, really, send it
+        // again*.
+        let keeps_the_body = match status {
+            301..=303 => false,
+            307 | 308 => true,
+            _ => return Ok(None),
+        };
+
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Ok(None);
+        };
+        let bad = || NetError::BadRedirect {
+            url: from.to_string(),
+            location: String::from_utf8_lossy(location.as_bytes()).into_owned(),
+        };
+        // Relative against the address that answered, which is the common form:
+        // `Location: /login` is most of the redirects on the web.
+        let to = from
+            .join(location.to_str().map_err(|_| bad())?)
+            .map_err(|_| bad())?;
+        Ok(Some(Hop { to, keeps_the_body }))
     }
 
     /// Give a transport failure the name the user needs to hear.
