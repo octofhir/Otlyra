@@ -1801,13 +1801,29 @@ impl Browser {
     /// Pictures are not on this list. They are not render-blocking anywhere, and
     /// a page held back for a photograph is a page nobody can start reading.
     fn blocked_on_style(&self, index: usize) -> bool {
-        self.tabs[index].pending.as_ref().is_some_and(|pending| {
-            pending
-                .outstanding
-                .values()
-                .flatten()
-                .any(|resource| matches!(resource, PendingResource::Stylesheet(_)))
-        })
+        let Some(pending) = self.tabs[index].pending.as_ref() else {
+            return false;
+        };
+        let document = self.tabs[index].page.as_ref().map(PageScene::document);
+        let viewport = self.picture_viewport();
+        pending
+            .outstanding
+            .values()
+            .flatten()
+            .any(|resource| match resource {
+                PendingResource::Stylesheet(node) => {
+                    // A sheet written for another medium blocks nothing: a
+                    // print-only one holds the screen for a page it will never
+                    // style. What it says it is for is asked of the same matcher
+                    // the cascade uses, so the two cannot come to disagree.
+                    document.is_none_or(|document| {
+                        crate::media_of_link(document, *node).is_none_or(|media| {
+                            otlyra_css::cascade::media_condition_matches(&media, viewport)
+                        })
+                    })
+                }
+                PendingResource::Image(..) => false,
+            })
     }
 
     /// Everything the page asked for has arrived or failed: build it for real.
@@ -7686,6 +7702,58 @@ mod tests {
         assert!(
             paragraph(&mut browser),
             "and it was drawn once the stylesheet was in"
+        );
+    }
+
+    /// A sheet written for another medium holds nothing back.
+    ///
+    /// The rule that stops a frame is *this page cannot be drawn right yet*, and
+    /// a print-only sheet is never going to draw any of it. Holding the screen
+    /// for one is holding it for nothing.
+    #[test]
+    fn a_print_stylesheet_does_not_hold_the_screen() {
+        struct PrintSheet;
+
+        impl Loader for PrintSheet {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                if url.ends_with(".css") {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    return Ok(Loaded {
+                        content_type: Some("text/css".to_owned()),
+                        bytes: b"p { color: #008000 }".to_vec(),
+                        charset: Some("utf-8".to_owned()),
+                        final_url: url.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes:
+                        b"<title>T</title><link rel=stylesheet media=print href=/p.css><body><p>text"
+                            .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: format!("https://{url}/"),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(PrintSheet);
+        browser.navigate("print.example");
+        browser.wait_for_load(std::time::Duration::from_millis(120));
+        let active = browser.active;
+        assert!(
+            !browser.blocked_on_style(active),
+            "a print-only sheet held the screen"
+        );
+
+        let mut target = otlyra_gfx::RecordingPainter::default();
+        browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+        assert!(
+            target.ops().iter().any(|op| {
+                matches!(op, otlyra_gfx::PaintOp::DrawGlyphs { glyphs, .. } if glyphs.len() == 4)
+            }),
+            "the document was drawn while the print sheet was still coming"
         );
     }
 

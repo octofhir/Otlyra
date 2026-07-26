@@ -107,3 +107,21 @@ pub fn write_screenshot(
     tracing::info!(path = %path.display(), bytes = png.len(), "screenshot written");
     Ok(())
 }
+
+/// What a `<link>` says it is for, where it says anything.
+///
+/// `None` for a link with no `media` attribute, which is every medium — the
+/// same answer as a condition that matches, and a different one from a
+/// condition that does not.
+pub(crate) fn media_of_link(
+    document: &otlyra_dom::Document,
+    node: otlyra_dom::NodeId,
+) -> Option<String> {
+    let element = document.get(node)?.element()?;
+    element
+        .attrs
+        .iter()
+        .find(|attribute| attribute.name.local.as_ref() == "media")
+        .map(|attribute| attribute.value.to_string())
+        .filter(|media| !media.trim().is_empty())
+}

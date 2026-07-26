@@ -769,7 +769,18 @@ fn author_stylesheets(
                         }
                     }
                     if !source.trim().is_empty() {
-                        sheets.push((None, source));
+                        // A `media` attribute applies to the whole block, the way
+                        // it does on a `<link>`: a sheet written for print styles
+                        // nothing on a screen.
+                        // A `media` attribute applies to the whole block, the way
+                        // it does on a `<link>`: a sheet written for print styles
+                        // nothing on a screen.
+                        match attribute(document, id, "media").filter(|q| !q.trim().is_empty()) {
+                            Some(query) => {
+                                sheets.push((None, format!("@media {query} {{\n{source}\n}}")));
+                            }
+                            None => sheets.push((None, source)),
+                        }
                     }
                 }
                 "link" => {
@@ -808,6 +819,9 @@ pub struct StylesheetLink {
     /// The address, exactly as the attribute spells it — resolving it against the
     /// document's own needs the document's address, which this crate does not know.
     pub href: String,
+    /// What the link says it is for, if it says. Empty means every medium, which
+    /// is what a `<link>` without the attribute means.
+    pub media: String,
 }
 
 /// Every `<link rel=stylesheet>` in the document, in tree order.
@@ -834,7 +848,12 @@ pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
                 && let Some(href) = attribute(document, id, "href")
                 && !href.trim().is_empty()
             {
-                links.push(StylesheetLink { node: id, href });
+                let media = attribute(document, id, "media").unwrap_or_default();
+                links.push(StylesheetLink {
+                    node: id,
+                    href,
+                    media,
+                });
             }
         }
         stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
@@ -1785,5 +1804,82 @@ mod tests {
             16.0,
             "the rule does not apply below its breakpoint"
         );
+    }
+}
+
+#[cfg(test)]
+mod media_attribute_tests {
+    use super::*;
+
+    fn paragraph_is_red(html: &str, width: f32) -> bool {
+        let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+        let styles = style_document(
+            &parsed.document,
+            Viewport {
+                width,
+                height: 600.0,
+                scale: 1.0,
+                text_scale: 1.0,
+                color_scheme: Default::default(),
+            },
+        );
+        let node = crate::stylo_dom::select(&parsed.document, "p")
+            .expect("the selector parses")
+            .into_iter()
+            .next()
+            .expect("a paragraph");
+        let style = styles.style_of(node).expect("a styled paragraph");
+        let colour = style
+            .clone_color()
+            .to_color_space(style::color::ColorSpace::Srgb);
+        let channel = |value: f32| (value * 255.0).round() as u8;
+        (
+            channel(colour.components.0),
+            channel(colour.components.1),
+            channel(colour.components.2),
+        ) == (255, 0, 0)
+    }
+
+    /// `media` on a `<style>` block is what it says on a `<link>`: the block is
+    /// for that medium and for no other. Without this a sheet an author wrote
+    /// for the printer styles the screen.
+    #[test]
+    fn a_style_block_written_for_print_does_not_style_the_screen() {
+        assert!(
+            !paragraph_is_red(
+                "<style media=print>p { color: #ff0000 }</style><body><p>x",
+                800.0
+            ),
+            "the print block reached the screen"
+        );
+        // The same block with no attribute does apply, so the case above is
+        // about the attribute rather than about the block being dropped.
+        assert!(paragraph_is_red(
+            "<style>p { color: #ff0000 }</style><body><p>x",
+            800.0
+        ));
+        // And a condition that does match is honoured, in both directions.
+        assert!(paragraph_is_red(
+            "<style media='(min-width: 500px)'>p { color: #ff0000 }</style><body><p>x",
+            800.0
+        ));
+        assert!(!paragraph_is_red(
+            "<style media='(min-width: 500px)'>p { color: #ff0000 }</style><body><p>x",
+            400.0
+        ));
+    }
+
+    /// And a link carries what it says it is for, so the browser can decide
+    /// whether to wait for it.
+    #[test]
+    fn a_link_reports_the_medium_it_names() {
+        let parsed = otlyra_html::parse(
+            b"<link rel=stylesheet href=a.css><link rel=stylesheet media=print href=b.css>",
+            Some("utf-8"),
+        );
+        let links = stylesheet_links(&parsed.document);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].media, "");
+        assert_eq!(links[1].media, "print");
     }
 }
