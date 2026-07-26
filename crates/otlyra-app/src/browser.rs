@@ -1789,6 +1789,27 @@ impl Browser {
         }
     }
 
+    /// Whether a tab is still waiting for a stylesheet it cannot be drawn without.
+    ///
+    /// A `<link rel=stylesheet>` in the head is render-blocking, and that is not
+    /// a detail: a document painted before its stylesheet arrives is painted in
+    /// the wrong fonts, at the wrong widths, in the wrong colours, and then
+    /// jumps. Every browser holds the frame instead, and what a reader sees on a
+    /// slow load is the last page or nothing — never the author's markup with
+    /// none of the author's design on it.
+    ///
+    /// Pictures are not on this list. They are not render-blocking anywhere, and
+    /// a page held back for a photograph is a page nobody can start reading.
+    fn blocked_on_style(&self, index: usize) -> bool {
+        self.tabs[index].pending.as_ref().is_some_and(|pending| {
+            pending
+                .outstanding
+                .values()
+                .flatten()
+                .any(|resource| matches!(resource, PendingResource::Stylesheet(_)))
+        })
+    }
+
     /// Everything the page asked for has arrived or failed: build it for real.
     fn finish_load(&mut self, index: usize) {
         // A new page names its own backgrounds; what the last one asked for is not
@@ -2936,7 +2957,7 @@ impl Browser {
             }
             list.transform(g.scale);
             Arc::new(list)
-        } else if self.tabs[self.active].page.is_some() {
+        } else if self.tabs[self.active].page.is_some() && !self.blocked_on_style(self.active) {
             // Told before the frame is built, because it decides what `medium`
             // computes to and every element that inherited a size inherited that.
             let logical = {
@@ -7591,6 +7612,81 @@ mod tests {
             boxes.node(id).style.color == otlyra_gfx::peniko::Color::from_rgb8(0, 128, 0)
         });
         assert!(coloured, "the fetched sheet reached the box tree");
+    }
+
+    /// A document is not drawn before the stylesheet it links.
+    ///
+    /// It was, and what a reader saw on any page with an external sheet was the
+    /// author's markup in none of the author's design, replaced a moment later
+    /// by the real thing. That reads as the CSS arriving slowly; it is the frame
+    /// arriving early. A picture is not on the list — nothing holds a page back
+    /// for a photograph.
+    #[test]
+    fn a_document_is_not_drawn_before_the_stylesheet_it_links() {
+        /// A loader that answers the document and never the sheet, which is what
+        /// a slow server looks like from here.
+        struct SlowSheet;
+
+        impl Loader for SlowSheet {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                if url.ends_with(".css") {
+                    // Long enough that the frame below is built while it is still
+                    // outstanding, short enough that the test does not hang.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    return Ok(Loaded {
+                        content_type: Some("text/css".to_owned()),
+                        bytes: b"p { color: #008000 }".to_vec(),
+                        charset: Some("utf-8".to_owned()),
+                        final_url: url.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<title>T</title><link rel=stylesheet href=/s.css><body><p>text"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    // Absolute, so the `<link>` beside it has something to
+                    // resolve against.
+                    final_url: format!("https://{url}/"),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(SlowSheet);
+        browser.navigate("slow.example");
+        // The document itself is in; the sheet is not.
+        browser.wait_for_load(std::time::Duration::from_millis(120));
+        let active = browser.active;
+        assert!(
+            browser.blocked_on_style(active),
+            "the sheet is still outstanding"
+        );
+
+        // The document's one paragraph is four letters, and nothing the chrome
+        // or the blank page draws is a run of exactly four. Counting runs alone
+        // would prove nothing: the blank page draws a line of its own, so the
+        // number is the same either way and only *which* run is there differs.
+        let paragraph = |browser: &mut Browser| {
+            let mut target = otlyra_gfx::RecordingPainter::default();
+            browser.paint(&mut target, Viewport::new(800, 600, 1.0));
+            target.ops().iter().any(|op| {
+                matches!(op, otlyra_gfx::PaintOp::DrawGlyphs { glyphs, .. } if glyphs.len() == 4)
+            })
+        };
+
+        assert!(
+            !paragraph(&mut browser),
+            "the document was drawn before its stylesheet arrived"
+        );
+
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+        assert!(!browser.blocked_on_style(active), "the sheet arrived");
+        assert!(
+            paragraph(&mut browser),
+            "and it was drawn once the stylesheet was in"
+        );
     }
 
     /// A page from the network asking for a stylesheet on disk is the rule that
