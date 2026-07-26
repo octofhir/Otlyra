@@ -158,16 +158,22 @@ because a press answered in a coordinate system it did not land in is a link
 that opens when the pointer was somewhere else. `--zoom` sets it for a
 screenshot. What is left:
 
-- [ ] **Reaching it.** ⌘+, ⌘− and ⌘0, a row in the browser menu showing the
-  current factor, and the wheel with the accelerator held. The menu's `ZoomIn`,
-  `ZoomOut` and `ActualSize` exist and are greyed out, so this is mostly
-  handing them to `set_zoom` in steps a reader recognizes — and deciding what
-  the steps are. Where the page was scrolled to has to survive a zoom, which
-  means restoring it against content of a different height.
+Reaching it is in too: ⌘+, ⌘− and ⌘0, the View menu's own three, the wheel with
+the accelerator held, and a row on the browser menu reading *Zoom — 125%* which
+is the only place a reader is told — the native menu bar is built once at
+startup and cannot be relabelled. The stops are the ladder every browser uses,
+because repeated multiplication lands on factors like 121% that no menu can
+name. `PlatformEvent::Scroll` carries the modifiers now; it could not say
+whether a wheel was a scroll or a zoom before. What is left:
+
 - [ ] **Remembering it, per origin.** One factor for the whole browser today.
   It belongs to the site: a reader who needs 125% on one needs it every time
   they go back, and needs the next site left alone. That means the preferences
   store, and a zoom that follows the active tab rather than the window.
+- [ ] **Keeping the reader's place across a zoom.** The scroll offset is in the
+  page's own pixels and survives, but the content around it is a different
+  height, so where a reader was looking drifts. What browsers keep is the point
+  in the document at the top of the window, restored after the relayout.
 
 ## Priority 5 — Design system and fast UI authoring
 

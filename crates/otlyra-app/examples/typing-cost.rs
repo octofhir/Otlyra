@@ -280,6 +280,7 @@ fn main() {
                     x: 0.0,
                     y: 40.0,
                     source: otlyra_platform::ScrollSource::Wheel,
+                    modifiers: otlyra_platform::Modifiers::default(),
                 },
             );
             let event = started.elapsed();

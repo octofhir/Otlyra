@@ -458,6 +458,8 @@ pub enum UiAction {
     /// state, like the menu, and whether the page is still searched is answered
     /// by asking the bar rather than by being told.
     CloseFind,
+    /// Put the page back to its own size.
+    ResetZoom,
 }
 
 /// What the find bar says about what it found.
@@ -705,6 +707,8 @@ struct Appearance {
     /// of *keep this* and *stop keeping this* a press will do, and either saying the
     /// wrong one would be the interface lying about what a press does.
     bookmark: Bookmarked,
+    /// Shown on the menu, so it belongs to what the frame is a function of.
+    zoom: f32,
     tab_scroll: f64,
 }
 
@@ -939,6 +943,12 @@ pub struct BrowserUi {
     /// property of the address. The interface keeps it only to draw with: the star
     /// in the toolbar and the words on the menu are the same fact twice.
     pub bookmark: Bookmarked,
+    /// How much larger than its own pixels the page is drawn.
+    ///
+    /// The browser's, written here to be shown: a reader whose page is stuck at
+    /// 125% with nothing saying so has no way to find out but by pressing keys
+    /// until it looks right again.
+    pub zoom: f32,
     /// Every colour and measurement the interface is drawn from.
     pub theme: Theme,
     /// Which control has the keyboard, if any.
@@ -1063,6 +1073,7 @@ impl BrowserUi {
             focus_granted: std::cell::Cell::new(None),
             popup: None,
             bookmark: Bookmarked::Impossible,
+            zoom: 1.0,
             theme: Theme::light(),
             focused: None,
             popup_return: None,
@@ -2178,6 +2189,7 @@ impl BrowserUi {
                 .tooltip()
                 .map(|(label, anchor)| (label.to_owned(), anchor)),
             bookmark: self.bookmark,
+            zoom: self.zoom,
             tab_scroll: self.tab_scroll,
         };
 
@@ -2524,7 +2536,7 @@ impl BrowserUi {
             Popup::Menu => Box::new(crate::widget::Anchored::from_right(
                 theme.inset,
                 UI_HEIGHT - 2.0,
-                reported(menu(&theme, &focus, self.bookmark)),
+                reported(menu(&theme, &focus, self.bookmark, self.zoom)),
             )),
             // Under the field, as wide as the field, because it is a longer
             // answer to what is in it — a panel of another width would read as
@@ -2780,7 +2792,7 @@ fn chevron_button(theme: &Theme, focus: &Focus, forward: bool, enabled: bool) ->
 
 /// The menu behind the cogwheel: everything the browser is, as opposed to
 /// everything a page is.
-fn menu(theme: &Theme, focus: &Focus, bookmark: Bookmarked) -> Child<UiAction> {
+fn menu(theme: &Theme, focus: &Focus, bookmark: Bookmarked, zoom: f32) -> Child<UiAction> {
     use SystemPage::{About, Bookmarks, Downloads, History, Settings};
 
     let row = |page: SystemPage,
@@ -2824,6 +2836,19 @@ fn menu(theme: &Theme, focus: &Focus, bookmark: Bookmarked) -> Child<UiAction> {
                     "Bookmark this page"
                 },
                 Some("⌘D"),
+            ),
+            // What the page is drawn at, and the way back to its own size. The
+            // only place a reader is told: the native menu bar is built once at
+            // startup and cannot be relabelled, so a page left at 125% would
+            // otherwise say so nowhere at all.
+            controls::menu_item(
+                theme,
+                focus,
+                UiAction::ResetZoom,
+                (zoom - 1.0).abs() > f32::EPSILON,
+                icon::page,
+                format!("Zoom — {}%", (zoom * 100.0).round() as i32),
+                Some("⌘0"),
             ),
             controls::menu_item(
                 theme,

@@ -675,6 +675,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // past the interface and over the page.
     let mut menu = toolbar("menu", tabs(&[("Otlyra", false)]), 0, (true, false), None);
     menu.ui.address.set_text("https://example.com/");
+    // A page left at a zoom, because the row that says so is the only place a
+    // reader is told and the state worth looking at is the one it is live in.
+    menu.ui.zoom = 1.25;
     menu.ui.open_menu();
     frames.push(menu);
 

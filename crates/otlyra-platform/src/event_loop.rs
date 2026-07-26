@@ -1020,7 +1020,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.viewport().scale_factor;
-                self.deliver(scroll_event(delta, scale));
+                self.deliver(scroll_event(delta, scale, self.modifiers));
             }
             WindowEvent::RedrawRequested => match self.redraw() {
                 Err(error) => self.fail(event_loop, error),
@@ -1120,7 +1120,11 @@ fn startup_report_json(
 /// On macOS the natural-scrolling preference has already been applied to the
 /// delta by the system, to a wheel and a trackpad alike, so the one negation
 /// serves both and neither device needs a case of its own.
-fn scroll_event(delta: winit::event::MouseScrollDelta, scale: f64) -> PlatformEvent {
+fn scroll_event(
+    delta: winit::event::MouseScrollDelta,
+    scale: f64,
+    modifiers: crate::Modifiers,
+) -> PlatformEvent {
     let (x, y, source) = match delta {
         // A notch, not a distance. What it is worth in pixels is a platform
         // convention; 40 is the figure browsers settled on.
@@ -1142,6 +1146,7 @@ fn scroll_event(delta: winit::event::MouseScrollDelta, scale: f64) -> PlatformEv
         x: -x,
         y: -y,
         source,
+        modifiers,
     }
 }
 
@@ -1204,13 +1209,18 @@ mod tests {
     fn a_wheel_notch_is_worth_a_notch_and_says_it_was_a_wheel() {
         // Winit's positive is the content moving down, which is the reader going
         // up the page, so the event that comes out is negative.
-        let event = scroll_event(MouseScrollDelta::LineDelta(0.0, 1.0), 1.0);
+        let event = scroll_event(
+            MouseScrollDelta::LineDelta(0.0, 1.0),
+            1.0,
+            crate::Modifiers::default(),
+        );
         assert_eq!(
             event,
             PlatformEvent::Scroll {
                 x: 0.0,
                 y: -LINE_SCROLL,
                 source: crate::ScrollSource::Wheel,
+                modifiers: Default::default(),
             }
         );
     }
@@ -1222,6 +1232,7 @@ mod tests {
         let event = scroll_event(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 24.0)),
             2.0,
+            crate::Modifiers::default(),
         );
         assert_eq!(
             event,
@@ -1229,6 +1240,7 @@ mod tests {
                 x: 0.0,
                 y: -12.0,
                 source: crate::ScrollSource::Trackpad,
+                modifiers: Default::default(),
             }
         );
     }
@@ -1237,10 +1249,15 @@ mod tests {
     fn both_devices_agree_about_which_way_is_down() {
         // The whole point of one negation in one place: a gesture and a notch
         // that winit reports the same way come out of here the same way too.
-        let wheel = scroll_event(MouseScrollDelta::LineDelta(0.0, -1.0), 1.0);
+        let wheel = scroll_event(
+            MouseScrollDelta::LineDelta(0.0, -1.0),
+            1.0,
+            crate::Modifiers::default(),
+        );
         let trackpad = scroll_event(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -1.0)),
             1.0,
+            crate::Modifiers::default(),
         );
         let down = |event| match event {
             PlatformEvent::Scroll { y, .. } => y > 0.0,

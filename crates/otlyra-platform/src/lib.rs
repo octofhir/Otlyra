@@ -166,6 +166,12 @@ pub enum PlatformEvent {
         y: f64,
         /// What the reader scrolled with.
         source: ScrollSource,
+        /// What was held down while they did.
+        ///
+        /// A wheel with the platform's accelerator held is a zoom rather than a
+        /// scroll, everywhere, and a scroll that did not say what was held could
+        /// not be told which it was.
+        modifiers: Modifiers,
     },
     /// The pointer moved to this position, in logical pixels from the top left of
     /// the drawable.

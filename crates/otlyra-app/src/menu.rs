@@ -133,6 +133,9 @@ impl Command {
                 | Self::ToggleBookmark
                 | Self::ShowBookmarks
                 | Self::ToggleDevTools
+                | Self::ZoomIn
+                | Self::ZoomOut
+                | Self::ActualSize
                 | Self::Cut
                 | Self::Copy
                 | Self::Paste

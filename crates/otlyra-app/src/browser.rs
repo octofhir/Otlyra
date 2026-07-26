@@ -52,6 +52,17 @@ struct PendingLoad {
     outstanding: HashMap<u64, Vec<PendingResource>>,
 }
 
+/// Which way a zoom is being taken.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ZoomStep {
+    /// One stop larger.
+    In,
+    /// One stop smaller.
+    Out,
+    /// Back to the page's own size.
+    Reset,
+}
+
 /// What a subresource is for once it lands.
 enum PendingResource {
     /// The `<link>` whose stylesheet this is.
@@ -680,11 +691,43 @@ impl Browser {
             return;
         }
         self.zoom = zoom;
+        self.ui.zoom = zoom;
         // Everything below the zoom is a function of it: the page lays out in a
         // viewport of a different size, so it has to be laid out again.
         if let Some(page) = self.tabs[self.active].page.as_mut() {
             page.invalidate_layout();
         }
+    }
+
+    /// Take the zoom one step along the ladder, or back to where it started.
+    ///
+    /// A ladder rather than a multiplier, because a reader presses the key until
+    /// the page looks right and the stops have to be the ones they recognize —
+    /// and because repeated multiplication lands on factors like 121% that no
+    /// menu can name. This is the one every browser uses.
+    pub fn step_zoom(&mut self, step: ZoomStep) {
+        /// The stops, smallest first.
+        const LADDER: &[f32] = &[
+            0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0,
+            5.0,
+        ];
+
+        let current = self.zoom;
+        let wanted = match step {
+            ZoomStep::Reset => 1.0,
+            ZoomStep::In => LADDER
+                .iter()
+                .copied()
+                .find(|stop| *stop > current + f32::EPSILON)
+                .unwrap_or(current),
+            ZoomStep::Out => LADDER
+                .iter()
+                .copied()
+                .rev()
+                .find(|stop| *stop < current - f32::EPSILON)
+                .unwrap_or(current),
+        };
+        self.set_zoom(wanted);
     }
 
     /// A point in the window, in the page's own coordinates.
@@ -2086,6 +2129,7 @@ impl Browser {
             crate::ui::Bookmarked::No
         };
         self.ui.address.set_text(url);
+        self.ui.zoom = self.zoom;
         self.sync_find();
     }
 
@@ -2360,6 +2404,7 @@ impl Browser {
             | UiAction::DismissPopup
             | UiAction::ScrollTabs(_) => {}
             UiAction::FindStep(forward) => self.step_match(forward),
+            UiAction::ResetZoom => self.step_zoom(ZoomStep::Reset),
             UiAction::ToggleInspector => self.toggle_inspector(),
             UiAction::ToggleBookmark => self.toggle_bookmark(),
             // Chosen from the menu, a browser page opens beside what you were
@@ -3689,6 +3734,20 @@ impl Painter for Browser {
                     self.toggle_inspector();
                     return;
                 }
+                // The zoom, before anything else reads the key: it belongs to
+                // the page whatever holds the keyboard, which is the whole point
+                // of being able to reach it while reading.
+                if modifiers.is_accelerator()
+                    && let Some(step) = match key {
+                        Key::Character('=' | '+') => Some(ZoomStep::In),
+                        Key::Character('-' | '_') => Some(ZoomStep::Out),
+                        Key::Character('0') => Some(ZoomStep::Reset),
+                        _ => None,
+                    }
+                {
+                    self.step_zoom(step);
+                    return;
+                }
                 // The panel takes the keys that walk its tree, but only while it
                 // is the thing being looked at — and a caret in the address
                 // field means the field is, however open the panel may be.
@@ -3948,7 +4007,20 @@ impl Painter for Browser {
             // negates it. The event already says which way the reader went, and
             // a consumer that decided that for itself is how the settings came
             // to scroll the opposite way from a document.
-            PlatformEvent::Scroll { x, y, .. } => {
+            PlatformEvent::Scroll {
+                x, y, modifiers, ..
+            } => {
+                // The wheel with the platform's own modifier held is a zoom
+                // rather than a scroll, everywhere. One notch a step, so that a
+                // hand on a trackpad does not run the whole ladder in a flick:
+                // the delta says how far, and what a reader wants from this is
+                // which way.
+                if modifiers.is_accelerator() {
+                    if y.abs() > f64::EPSILON {
+                        self.step_zoom(if y < 0.0 { ZoomStep::In } else { ZoomStep::Out });
+                    }
+                    return;
+                }
                 if self.ui.owns_pointer() {
                     // The tab strip is a thing under the pointer like any other,
                     // and a strip with more tabs than it can show is a strip the
@@ -4017,6 +4089,9 @@ impl Painter for Browser {
                 }
                 Some(crate::menu::Command::ToggleBookmark) => self.toggle_bookmark(),
                 Some(crate::menu::Command::ToggleDevTools) => self.toggle_inspector(),
+                Some(crate::menu::Command::ZoomIn) => self.step_zoom(ZoomStep::In),
+                Some(crate::menu::Command::ZoomOut) => self.step_zoom(ZoomStep::Out),
+                Some(crate::menu::Command::ActualSize) => self.step_zoom(ZoomStep::Reset),
                 Some(crate::menu::Command::NewTab) => self.new_tab(),
                 Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
                 // The editing four are the keystroke they carry, delivered as
@@ -5499,6 +5574,7 @@ mod tests {
             x: 0.0,
             y: 50.0,
             source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: Default::default(),
         });
 
         let active = browser.active;
@@ -5524,6 +5600,7 @@ mod tests {
             x: 0.0,
             y: 100.0,
             source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: Default::default(),
         });
         assert_eq!(browser.tabs[0].page.as_ref().expect("page").scroll(), 0.0);
     }
@@ -7039,6 +7116,7 @@ mod tests {
             x: 0.0,
             y: 120.0,
             source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: Default::default(),
         });
         let page = browser.tabs[0].page.as_ref().expect("a page").scroll();
         assert!(page > 0.0, "a positive delta goes down the document");
@@ -7049,6 +7127,7 @@ mod tests {
             x: 0.0,
             y: 120.0,
             source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: Default::default(),
         });
         assert!(
             browser.settings.settings.scroll > 0.0,
@@ -7073,6 +7152,7 @@ mod tests {
             x: 0.0,
             y: 3.0,
             source: otlyra_platform::ScrollSource::Trackpad,
+            modifiers: Default::default(),
         });
         assert_eq!(browser.tabs[0].page.as_ref().expect("a page").scroll(), 3.0);
     }
@@ -7837,6 +7917,77 @@ mod tests {
         assert_eq!(browser.zoom(), 0.25);
     }
 
+    /// The zoom is reached the three ways a reader reaches it, and lands on the
+    /// stops a menu can name.
+    #[test]
+    fn the_zoom_steps_along_a_ladder_from_the_keyboard_the_menu_and_the_wheel() {
+        let accelerator = Modifiers {
+            command: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        let mut browser = browser();
+        go(&mut browser, "example.com");
+
+        let press = |browser: &mut Browser, character: char| {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Character(character),
+                modifiers: accelerator,
+            });
+        };
+
+        press(&mut browser, '=');
+        assert_eq!(browser.zoom(), 1.1, "one stop up, not one and a bit");
+        press(&mut browser, '=');
+        assert_eq!(browser.zoom(), 1.25);
+        press(&mut browser, '-');
+        assert_eq!(browser.zoom(), 1.1);
+        press(&mut browser, '0');
+        assert_eq!(browser.zoom(), 1.0, "and back to the page's own size");
+
+        // The menu reaches the same ladder.
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ZoomIn.id(),
+        ));
+        assert_eq!(browser.zoom(), 1.1);
+        browser.on_event(PlatformEvent::MenuCommand(
+            crate::menu::Command::ActualSize.id(),
+        ));
+        assert_eq!(browser.zoom(), 1.0);
+
+        // And the wheel, but only with the modifier held: without it the page
+        // scrolls, which is what a wheel is for.
+        let wheel = |browser: &mut Browser, y: f64, modifiers: Modifiers| {
+            browser.on_event(PlatformEvent::Scroll {
+                x: 0.0,
+                y,
+                source: otlyra_platform::ScrollSource::Wheel,
+                modifiers,
+            });
+        };
+        wheel(&mut browser, -40.0, accelerator);
+        assert_eq!(browser.zoom(), 1.1, "away from the reader is larger");
+        wheel(&mut browser, 40.0, accelerator);
+        assert_eq!(browser.zoom(), 1.0);
+        wheel(&mut browser, -40.0, Modifiers::default());
+        assert_eq!(
+            browser.zoom(),
+            1.0,
+            "a bare wheel scrolls and does not zoom"
+        );
+
+        // The ends of the ladder are ends, not a wrap: a reader holding the key
+        // down stops at the largest rather than starting again at the smallest.
+        for _ in 0..40 {
+            press(&mut browser, '=');
+        }
+        assert_eq!(browser.zoom(), 5.0);
+        for _ in 0..40 {
+            press(&mut browser, '-');
+        }
+        assert_eq!(browser.zoom(), 0.25);
+    }
+
     /// A press lands where the reader aimed it, whatever the zoom.
     ///
     /// The page is laid out in its own pixels, so a pointer arriving in the
@@ -8059,6 +8210,7 @@ mod tests {
             x: 0.0,
             y: 200.0,
             source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: Default::default(),
         });
         let scrolled = browser.tabs[0].page.as_ref().expect("page").scroll();
         assert!(scrolled > 0.0);

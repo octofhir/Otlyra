@@ -862,6 +862,7 @@ impl Session {
                     x: delta("deltaX"),
                     y: delta("deltaY"),
                     source: otlyra_platform::ScrollSource::Wheel,
+                    modifiers: Default::default(),
                 });
                 Ok(())
             }
