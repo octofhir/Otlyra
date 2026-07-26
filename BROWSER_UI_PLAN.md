@@ -149,12 +149,15 @@ The two the last one was picked over, either of which is the obvious next:
 - **The half-drawn controls.** `range`, `progress`, `meter`, `date`, `time`,
   `color` and `file` are a shape and no behaviour. A page that asks for a slider
   gets something a person cannot move.
-- **The HTTP cache on disk.** It is built, attached and driven by the two reload
-  modes, and it lives for the life of the process. Surviving a restart is a
-  different problem — a format, a size budget against a real disk, two windows
-  writing at once — and it is what would make a cold start fast rather than a
-  second navigation.
-
+- **The HTTP cache on disk.** Built, attached, and driven by the two reload
+  modes; it lives for the life of the process. Surviving a restart is what would
+  make a *cold start* fast rather than a second navigation, and it is a different
+  problem: a format, a size budget measured against a real disk, and an answer to
+  two windows writing at once. Not sealed, unlike the cookie file — Chrome and
+  Firefox both keep their caches in the clear, and the thing in it is content the
+  reader has already seen rather than a credential. Say so out loud when it
+  lands, because "the cookies are sealed and the cache is not" is a sentence
+  somebody will otherwise have to reconstruct.
 
 What the finished ones left behind, which is work and not history:
 
