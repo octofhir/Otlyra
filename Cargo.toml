@@ -271,6 +271,14 @@ rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-r
 # WHATWG URL. Hand-rolling this is how CVE-2024-12224 happened.
 url = "=2.5.8"
 
+# IDNA, for reading the public suffix list. The list writes a name in its own
+# script — `公司.cn`, `рф` — and a host arrives from `Url` in punycode, so the two
+# have to be made to meet on the ASCII side. This is `url`'s own dependency at
+# `url`'s own version, so naming it here costs no package and cannot pull a second
+# copy; it is named because we need the conversion directly and a transitive
+# dependency is not an API we may reach through.
+idna = "=1.1.0"
+
 # WHATWG encodings. The legacy index tables are not writable by hand.
 encoding_rs = "=0.8.35"
 

@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 encoding_rs.workspace = true
+idna.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

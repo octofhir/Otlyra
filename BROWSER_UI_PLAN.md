@@ -148,19 +148,58 @@ thing between this and being usable — and none of it needs a script engine:
 `Set-Cookie` and `Cookie` are headers, and the parts that matter are the rules
 about who may read what. Three slices:
 
-- [ ] **The jar.** Parse `Set-Cookie` — name, value, `Domain`, `Path`,
-  `Expires`/`Max-Age`, `Secure`, `HttpOnly`, `SameSite` — and answer *which
-  cookies go on this request*. The matching rules are the whole of it and they
-  are unforgiving: a domain match is not a suffix match (`evil-example.com`
-  must not match `example.com`), a path match is not a prefix match, and the
-  public-suffix rule is what stops a site setting a cookie for `.co.uk`. That
-  list needs a source; decide whether to vendor one and say so.
+The jar is built — `otlyra_net::cookie`, and the rules rather than the parsing
+are what is in it. What it settled that the next two slices inherit:
+
+- **The clock is a parameter.** Nothing in `cookie` reads `SystemTime::now()`. One
+  request is decided against one instant, and a test states the instant instead of
+  sleeping toward it. Whatever attaches the jar passes the time in.
+- **A refusal is named.** `Refused` says which rule dropped a cookie —
+  `PublicSuffix`, `NotOurDomain`, `BrokenPrefix`, and the rest. That is what an
+  inspector shows and what slice 3 has to be able to render; do not collapse it to
+  a bool on the way through.
+- **`Context` is the caller's answer, not the jar's.** `SameSite` needs to know
+  what caused a request, and only the caller knows. `CrossSiteNavigation` means a
+  top-level navigation *by a method that changes nothing*; a cross-site form post
+  is `CrossSite` however top-level it is. Getting this generous is the CSRF hole
+  the attribute exists to close.
+- The public suffix list is vendored, at `crates/otlyra-net/data/`, with the
+  reasoning and the refresh procedure in `BROWSER_RESEARCH_PLAN.md`.
+
 - [ ] **On the wire, and on disk.** The jar attached to the fetcher, sent and
   received per request, with a session jar that dies with the process and a
-  persistent one that does not. Redirects carry cookies set on the way.
+  persistent one that does not.
+
+  **The redirect fork, which is a decision and not a detail.** `reqwest` follows
+  redirects inside `execute` — `Policy::limited(max_redirects)` in
+  `crates/otlyra-net/src/loader.rs` — so a `Set-Cookie` on an intermediate hop
+  never reaches us, and neither does the chance to put a `Cookie` on the hop
+  after it. A sign-in is almost always a redirect, so this is not an edge: with
+  it unresolved the first real scenario does not work at all. Two ways out, and
+  they are not equivalent:
+
+  - *Give the jar to `reqwest`* by enabling its `cookies` feature and handing it
+    a store. Cheapest, and it puts the rules we just wrote behind a second
+    implementation of them — `reqwest`'s store answers domain and path matching
+    itself, has no public-suffix rule, and is not reachable from a browser
+    surface. It also means two jars disagreeing about what is kept.
+  - *Take the redirects ourselves*: `Policy::none()`, and a loop in `Loader` that
+    reads the `Location`, applies the jar to each hop, and enforces the hop limit
+    that `Policy::limited` enforces today. More code, and it is the code that
+    already has to exist for anything else that is per-hop — `may_navigate` across
+    a redirect into `file:`, the referrer, and the same-site context that decides
+    which cookies a hop carries. `LoadedResource::final_url` already says the
+    chain ended somewhere else, so callers do not change shape.
+
+  Take the second. Slice 2 states the hop limit it enforces and keeps the
+  `TooManyRedirects` error meaning what it means today.
+
 - [ ] **What the reader can see and do about it.** A page in the browser's own
   surfaces listing what is kept and by whom, with a way to throw it away — per
   site and altogether — and the settings switch that refuses third-party ones.
+  `Cookie::site()` is the grouping, `Jar::clear_site` and `Jar::clear` are the
+  actions, and the switch is a `Context` the loader refuses to send on rather
+  than a filter over the jar.
 
 ## Priority 5 — Design system and fast UI authoring
 

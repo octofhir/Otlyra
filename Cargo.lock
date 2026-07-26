@@ -2830,6 +2830,7 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "encoding_rs",
+ "idna",
  "percent-encoding",
  "reqwest",
  "rustls",

@@ -12,6 +12,8 @@
 //! - [`limits`] — the caps every response is measured against.
 //! - [`url`] — turning what the user typed into a URL we are willing to fetch.
 //! - [`loader`] — the shared client and the fetch itself.
+//! - [`cookie`] — the state a site keeps here, and the rules about who may read
+//!   it. Two headers, and nothing in either needs a script engine.
 //!
 //! ## Invariants
 //!
@@ -24,11 +26,13 @@
 //! 3. **All network bytes are untrusted.** Nothing here interprets them; the most
 //!    it will do is decode them to text under a charset the caller can inspect.
 
+pub mod cookie;
 pub mod limits;
 pub mod loader;
 pub mod mime;
 pub mod url;
 
+pub use cookie::{Cookie, Jar, SameSite, SetCookie};
 pub use limits::Limits;
 pub use loader::{Body, LoadRequest, LoadedResource, Loader, NetError};
 pub use mime::{Sniffed, sniff};
