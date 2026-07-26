@@ -149,14 +149,14 @@ The two the last one was picked over, either of which is the obvious next:
 - **The half-drawn controls.** `range`, `progress`, `meter`, `date`, `time`,
   `color` and `file` are a shape and no behaviour. A page that asks for a slider
   gets something a person cannot move.
-- **The HTTP cache, wired to the browser.** The rules, the store and the wire are
-  built and tested in `otlyra_net::cache`; nothing in the app has one. Attaching
-  it is one slice and it **cannot ship without reload**: with a cache and no
-  reload handling, ⌘R on a page with a `max-age` serves the stored copy and
-  appears to do nothing. Chrome sends `Cache-Control: max-age=0` on a plain
-  reload and skips the cache entirely on a hard one, so `LoadRequest` needs a
-  mode — default, revalidate, bypass — and `Command::Reload` and
-  `Command::ReloadIgnoringCache` are its two consumers. Do them together.
+- **The HTTP cache on disk.** It is built, attached and driven by the two reload
+  modes, and it lives for the life of the process. Surviving a restart is a
+  different problem — a format, a size budget against a real disk, two windows
+  writing at once — and it is what would make a cold start fast rather than a
+  second navigation.
+- **A page listing what is cached, and a way to empty it.** `about:cookies` is
+  the shape; `Cache::counts` and `Cache::clear` are the parts. Today the only way
+  to empty the cache is ⌘⇧R.
 
 What the finished ones left behind, which is work and not history:
 
