@@ -1105,6 +1105,49 @@ fn inline_blocks_share_a_baseline() {
     }
 }
 
+/// A line holding an empty field is no taller than one holding a filled one.
+///
+/// The rule for an inline-block with no line boxes is that it sits on its bottom
+/// margin edge, and for an empty `<div>` that is right. A field is the exception:
+/// the box it types into is there whether or not anything has been typed, so its
+/// baseline is where its text *would* sit. Without that, the line reserves the
+/// whole field above the baseline plus the text's descender below it and comes out
+/// several pixels too tall — on every line of every form, and cumulatively down
+/// the page.
+#[test]
+fn an_empty_field_does_not_make_its_line_taller() {
+    // How far down the page the *second* paragraph's text landed, which is how
+    // tall the first paragraph turned out to be. Measured at the baseline of the
+    // lowest run of text, so nothing about box edges or margins is in it.
+    let second_line = |markup: &str| {
+        let tree = lay_out_styled(markup, 800.0);
+        tree.iter()
+            .filter_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(run) => Some(fragment.rect.y + run.glyphs.first()?.y),
+                _ => None,
+            })
+            .fold(f32::MIN, f32::max)
+    };
+
+    let filled = second_line("<body><p>Ab <input value='Xy'> Ab</p><p>Ab</p>");
+    let empty = second_line("<body><p>Ab <input> Ab</p><p>Ab</p>");
+    assert!(
+        (filled - empty).abs() < 0.01,
+        "an empty field takes the same line as a filled one: {filled} against {empty}"
+    );
+
+    // And the rule it is an exception to still holds: an empty inline-block with
+    // no line boxes really does hang from its own bottom edge, so a line with one
+    // on it *is* taller.
+    let box_line = second_line(
+        "<body><p>Ab <span style='display: inline-block; width: 40px; height: 40px'></span> Ab</p>         <p>Ab</p>",
+    );
+    assert!(
+        box_line > empty + 10.0,
+        "an empty inline-block still sits on its bottom edge: {box_line} against {empty}"
+    );
+}
+
 /// A collapsed table draws its grid itself, once: the cells leave room for the
 /// lines and paint none of them, and the line that is drawn is the one that won
 /// the edge.

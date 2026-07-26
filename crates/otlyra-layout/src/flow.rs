@@ -4117,6 +4117,39 @@ impl<'a> Flow<'a> {
     }
 
     /// The strut of one style: how far its font reaches above and below.
+    /// Where the baseline of a control with nothing written in it sits.
+    ///
+    /// `None` for a box that is not a control, which keeps CSS's own rule for
+    /// everything else: an inline-block with no line boxes really does sit on its
+    /// bottom margin edge, and an empty `<div>` must go on doing so.
+    ///
+    /// A control is different because the box its text goes in is there whether or
+    /// not there is any text — a field one has never typed into still has a line to
+    /// type on, and that line has a baseline. Measured from the box's own top edge,
+    /// so it is the same number `baseline_of` would have answered the moment a
+    /// letter arrived.
+    fn empty_control_baseline(
+        &mut self,
+        id: crate::box_tree::BoxId,
+        style: &Arc<ComputedStyle>,
+        containing_width: f32,
+    ) -> Option<f32> {
+        let control = self.tree.node(id).control.as_ref()?;
+        // Only the ones that hold text of their own. A checkbox has no line and no
+        // business pretending to; a bar and a slider are drawn shapes.
+        if !matches!(
+            control.kind,
+            ControlKind::Field | ControlKind::Area | ControlKind::DropDown | ControlKind::ListBox
+        ) {
+            return None;
+        }
+        let border = resolve_border(style);
+        let padding = resolve_padding(style, containing_width);
+        let stack = self.font_stack(style);
+        let strut = self.strut_of(style, &stack)?;
+        Some(border.top + padding.top + strut.ascent)
+    }
+
     fn strut_of(&mut self, style: &ComputedStyle, stack: &FontStack) -> Option<otlyra_text::Strut> {
         let mut strut = self
             .text
@@ -4337,7 +4370,20 @@ impl<'a> Flow<'a> {
                     // Its own last baseline, or its bottom edge when it has no line
                     // of text in it at all — which is what CSS says an empty one
                     // and one that hides its overflow both sit on.
-                    let baseline = baseline_of(&fragment).unwrap_or(height);
+                    //
+                    // A control is the exception, and it is not a small one. An
+                    // empty field has no text, so it has no line to take a baseline
+                    // from, and the rule above hangs it from its own bottom edge:
+                    // the line then reserves the whole field above the baseline and
+                    // the text's descender below it, and comes out about four
+                    // pixels taller than it should be. Every line with an empty
+                    // field on it, which is most of the lines on most forms. Both
+                    // references put the baseline where the field's own text would
+                    // sit whether or not any is there, because the box a field
+                    // types into exists empty, and that is what this does.
+                    let baseline = baseline_of(&fragment)
+                        .or_else(|| self.empty_control_baseline(child, &style, containing_width))
+                        .unwrap_or(height);
                     replaced.push(ReplacedBox {
                         id: child,
                         style,
