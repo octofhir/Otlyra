@@ -18,6 +18,15 @@ event model, text stack, display-list format, rasterizer, and compositor.
   `FrameRequest`, coalesced redraws, deadlines, keyed render nodes, retained
   tab/toolbar/inspector/popup boundaries, per-layer damage, `UiSurfaceId`
   routing, and focus scopes all exist and are covered by tests.
+- Nor the focus scopes, the popup lifecycle or the shared dismissal rules, which
+  are in place and documented in `docs/interface.md`. The browser menu and the
+  context menu are the two consumers they were written from; the find bar is what
+  taught them that a popup may be a *mode* rather than a choice.
+- A display list holds glyph identifiers and not the string they were shaped
+  from, so **what a surface paints cannot be read back out of one**. The
+  accessibility tree holds only controls and the outline snapshots hold only
+  geometry, so a golden PNG is the only thing that catches text appearing where
+  it should not.
 - Zed/GPUI and the Chromium compositor are design references, not dependencies:
   keep stable identity plus a GPU scene, not the crate.
 - The CPU backend stays the screenshot, deterministic-test and fallback path
@@ -100,10 +109,6 @@ tree for an unrelated visual change.
 
 ## Priority 4 — Surfaces, focus, and popups
 
-Focus scopes, the popup lifecycle and the shared dismissal rules are in place
-and are documented in `docs/interface.md`; the browser menu and the context menu
-are the two consumers they were written from.
-
 - [ ] Put the inspector in the traversal order. Chrome and page hand the
   keyboard to each other at either end and `tabindex` is read; the panel is
   still reachable only by pressing into it. It needs a stated place in the
@@ -120,7 +125,13 @@ are the two consumers they were written from.
   platform window.
 - [ ] Give the other surfaces tooltips. The chrome names what the pointer rests
   on, scheduled through the frame deadline the caret already uses; the settings,
-  history, downloads and inspector surfaces do not.
+  history, downloads, bookmarks, cookies and inspector surfaces do not.
+- [ ] Put plain text in the accessibility tree. Only controls are described, so
+  a heading, a hint and an empty state are invisible to a screen reader on every
+  browser-owned page — `about:cookies` says *No site is keeping anything here*
+  and nothing hears it. `Named::instead_of_its_own` is how a row renames the
+  control inside it; what is missing is a `Described` for a label that is not a
+  control at all.
 - [ ] Build the surfaces that should be on the popup contract and are not built
   at all: a dropdown, and permission prompts (which need something that asks for
   a permission first). Omnibox suggestions are on it, and are what taught the
@@ -131,86 +142,29 @@ are the two consumers they were written from.
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
 
-## Next large feature — cookies, and the state a site keeps
+## Next large feature — not chosen yet
 
-Page zoom is done: the factor, the three ways to reach it, one remembered per
-site, and the reader's place held across the relayout. What it left behind is
-worth knowing. `PageScene::hold_the_reader_s_place` records a position in the
-text and puts the page back at it after the next layout — the same trick a
-selection uses, and the thing every relayout wants, not only a zoom: a resize
-still throws the reader down the page. `Browser::in_page` is the one conversion
-from window coordinates to the page's; anything new that asks the page about a
-point goes through it. `PlatformEvent::Scroll` carries modifiers now.
+The two the last one was picked over, either of which is the obvious next:
 
-Cookies are next, over the half-drawn controls and the HTTP cache. A browser
-without them cannot stay logged in to anything, which is the largest single
-thing between this and being usable — and none of it needs a script engine:
-`Set-Cookie` and `Cookie` are headers, and the parts that matter are the rules
-about who may read what. Three slices:
+- **The half-drawn controls.** `range`, `progress`, `meter`, `date`, `time`,
+  `color` and `file` are a shape and no behaviour. A page that asks for a slider
+  gets something a person cannot move.
+- **The HTTP cache.** Every navigation is a fresh fetch, including going back to
+  a page that has not changed and reloading one that says it never will.
 
-The jar is built — `otlyra_net::cookie`, and the rules rather than the parsing
-are what is in it. What it settled that the next two slices inherit:
+What the finished ones left behind, which is work and not history:
 
-- **The clock is a parameter.** Nothing in `cookie` reads `SystemTime::now()`. One
-  request is decided against one instant, and a test states the instant instead of
-  sleeping toward it. Whatever attaches the jar passes the time in.
-- **A refusal is named.** `Refused` says which rule dropped a cookie —
-  `PublicSuffix`, `NotOurDomain`, `BrokenPrefix`, and the rest. That is what an
-  inspector shows and what slice 3 has to be able to render; do not collapse it to
-  a bool on the way through.
-- **`Context` is the caller's answer, not the jar's.** `SameSite` needs to know
-  what caused a request, and only the caller knows. `CrossSiteNavigation` means a
-  top-level navigation *by a method that changes nothing*; a cross-site form post
-  is `CrossSite` however top-level it is. Getting this generous is the CSRF hole
-  the attribute exists to close.
-- The public suffix list is vendored, at `crates/otlyra-net/data/`, with the
-  reasoning and the refresh procedure in `BROWSER_RESEARCH_PLAN.md`.
-
-The wire and the disk are done too. **The redirect fork was resolved by taking
-the chain ourselves** — `Policy::none()` and a loop in `Loader` — rather than by
-handing `reqwest` a store through its `cookies` feature. The second would have
-been cheaper and would have put the rules just written behind a second
-implementation of them: `reqwest`'s store answers domain and path matching
-itself, has no public-suffix rule, and is not reachable from a browser surface.
-It would also have been two jars disagreeing about what is kept. What the loop
-bought beyond cookies is where the rest of the per-hop work now goes: a
-`Location` naming a scheme we do not fetch is refused, and the method rewriting
-that turns a redirected `POST` into a `GET` is ours and is tested.
-
-What slice 3 inherits from it:
-
-- `LoadRequest` carries `initiator` and `navigation`, and the loader turns the
-  two into a `Context` per hop. Once a chain leaves the initiator's site it stays
-  away for the rest of the chain, which is the rule a per-hop answer gets wrong.
-- `crate::cookies::CookieStore` is the browser's half: one `SharedJar` handed to
-  the loader before the browser exists, and a file attached later by
-  `Browser::persist_cookies`. **The jar is never replaced** — the loader is
-  already holding it — so anything that wants to change what is kept changes the
-  contents.
-- Writing is driven by `Jar::kept_revision`, which moves only when the persistent
-  set does. `Browser::pump` flushes; a site resetting a session cookie on every
-  response costs no disk.
-
-`about:cookies` is built, and the feature is done. Two things it settled that
-the next surface should not have to rediscover:
-
-- **A row may rename the control inside it.** `Named::instead_of_its_own`
-  replaces a control's own name in the accessibility tree, where `Named::new`
-  only fills an empty one. Four buttons all reading *Remove*, each in a card that
-  says which site it belongs to, are four identical buttons to anything that
-  cannot see the cards — and the card is what knows which is which.
-- **A display list holds glyph identifiers, not the string they were shaped
-  from.** So *what a surface paints* is not readable back out of one: the
-  accessibility tree and the outline snapshots both miss it, and a golden PNG is
-  the only thing that catches text appearing where it should not. The cookies
-  goldens carry values for exactly that reason.
-
-The third-party switch lives on the jar rather than on the loader — the loader is
-built once and the switch moves, and the surfaces have to be able to show what is
-in force. `Browser::sync_cookie_policy` is what keeps the preference and the jar
-from being two answers; it runs unconditionally rather than under the one action
-that needs it, so the next preference that reaches something other than the
-preferences file is not forgotten.
+- [ ] Hold the reader's place across a *resize*, not only across a zoom.
+  `PageScene::hold_the_reader_s_place` records a position in the text and puts
+  the page back at it after the next layout; the zoom uses it and a resize does
+  not, so dragging a window edge still throws the reader down the page. Every
+  relayout wants this, not only the two that have it.
+- [ ] Send a `Referer`, under a policy. Nothing sends one, and a redirect hop is
+  where a policy would be applied — `Loader`'s chain is the place, now that the
+  chain is ours.
+- [ ] Show a refused cookie in the inspector. `otlyra_net::cookie::Refused` names
+  which rule dropped it, which is exactly what a person debugging their own site
+  needs and nothing currently displays.
 
 ## Priority 5 — Design system and fast UI authoring
 
