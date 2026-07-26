@@ -149,8 +149,14 @@ The two the last one was picked over, either of which is the obvious next:
 - **The half-drawn controls.** `range`, `progress`, `meter`, `date`, `time`,
   `color` and `file` are a shape and no behaviour. A page that asks for a slider
   gets something a person cannot move.
-- **The HTTP cache.** Every navigation is a fresh fetch, including going back to
-  a page that has not changed and reloading one that says it never will.
+- **The HTTP cache, wired to the browser.** The rules, the store and the wire are
+  built and tested in `otlyra_net::cache`; nothing in the app has one. Attaching
+  it is one slice and it **cannot ship without reload**: with a cache and no
+  reload handling, ⌘R on a page with a `max-age` serves the stored copy and
+  appears to do nothing. Chrome sends `Cache-Control: max-age=0` on a plain
+  reload and skips the cache entirely on a hard one, so `LoadRequest` needs a
+  mode — default, revalidate, bypass — and `Command::Reload` and
+  `Command::ReloadIgnoringCache` are its two consumers. Do them together.
 
 What the finished ones left behind, which is work and not history:
 
