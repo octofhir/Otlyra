@@ -682,6 +682,8 @@ struct NetLoader {
     /// shows it. Handed in rather than made here, because the loader is built
     /// before the browser and both have to end up holding the same one.
     jar: otlyra_net::SharedJar,
+    /// What has already been fetched, shared for the same reason.
+    cache: otlyra_net::SharedCache,
 }
 
 /// A browser and the loader that fills its jar.
@@ -691,13 +693,26 @@ struct NetLoader {
 /// `Browser::persist_cookies`.
 fn browser(settings: otlyra_app::settings::Settings) -> Browser {
     let cookies = otlyra_app::cookies::CookieStore::in_memory();
+    let cache = browser_cache();
     let loader = NetLoader {
         loader: std::sync::OnceLock::new(),
         jar: cookies.jar(),
+        cache: std::sync::Arc::clone(&cache),
     };
     let mut browser = Browser::with_async_loader(loader, settings);
     browser.set_cookie_store(cookies);
+    browser.set_cache(cache);
     browser
+}
+
+/// The one HTTP cache, made here because the loader needs it before the browser
+/// exists and the two have to hold the same one.
+///
+/// In memory for the life of the process. It survives no restart, which is worth
+/// saying because the win it is here for does not need it to: what a reader
+/// notices is the second request for the same picture on the same page.
+fn browser_cache() -> otlyra_net::SharedCache {
+    std::sync::Arc::new(std::sync::Mutex::new(otlyra_net::cache::Cache::new()))
 }
 
 /// The `file:` URL an input names, if it names one.
@@ -770,6 +785,7 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
         self: std::sync::Arc<Self>,
         input: String,
         body: Option<otlyra_net::Body>,
+        cache: otlyra_net::CacheMode,
     ) -> otlyra_app::fetcher::Fetching {
         Box::pin(async move {
             // A path typed into the address bar becomes the `file:` URL it names, so
@@ -811,7 +827,8 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
             if self.loader.get().is_none() {
                 let built = otlyra_net::Loader::new()
                     .map_err(|error| error.to_string())?
-                    .with_jar(std::sync::Arc::clone(&self.jar));
+                    .with_jar(std::sync::Arc::clone(&self.jar))
+                    .with_cache(std::sync::Arc::clone(&self.cache));
                 let _ = self.loader.set(built);
             }
             let loader = self.loader.get().expect("the loader was just built");
@@ -819,7 +836,8 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
             let request = match body {
                 Some(body) => otlyra_net::LoadRequest::post(url, body),
                 None => otlyra_net::LoadRequest::new(url),
-            };
+            }
+            .caching(cache);
             // The transport on the browser's own runtime: no thread is held while
             // the server thinks, and no runtime is created to wait for it.
             let resource = loader

@@ -415,6 +415,12 @@ pub struct Browser {
     bookmarks: crate::bookmarks::BookmarkStore,
     /// The one jar. In memory until a shell asks for it: see `persist_cookies`.
     cookies: crate::cookies::CookieStore,
+    /// What the cache may do about the next navigation. Set by a reload and
+    /// cleared by the navigation it was set for.
+    next_cache_mode: otlyra_net::CacheMode,
+    /// What has already been fetched. `None` for a browser whose loader has no
+    /// cache either, which is every test and every canned loader.
+    cache: Option<otlyra_net::SharedCache>,
     /// The surface that shows them.
     bookmarks_page: crate::bookmarks::BookmarksSurface,
     cookies_page: crate::cookies::CookiesSurface,
@@ -538,6 +544,8 @@ impl Browser {
             // `persist_bookmarks`.
             bookmarks: crate::bookmarks::BookmarkStore::default(),
             cookies: crate::cookies::CookieStore::in_memory(),
+            next_cache_mode: otlyra_net::CacheMode::Default,
+            cache: None,
             bookmarks_page: crate::bookmarks::BookmarksSurface::new(),
             cookies_page: crate::cookies::CookiesSurface::new(),
             scheme: otlyra_platform::ColorScheme::Light,
@@ -1051,8 +1059,46 @@ impl Browser {
 
         let url = tab.url.clone();
         let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        // A reload is the reader saying they think it changed, so the stored copy
+        // is not the answer however fresh it still is. It is still worth
+        // consulting: the server may say nothing changed, and a reload that costs
+        // a header rather than a body is the difference between a page that
+        // reappears and a page that loads again.
+        self.next_cache_mode = otlyra_net::CacheMode::Revalidate;
         // Reload keeps the entry it is on: a page loaded twice is one place, and
         // going back from it must reach where you were before it, not itself.
+        self.start_load(&url, false, false, scroll);
+    }
+
+    /// Load the page again without consulting the cache at all.
+    ///
+    /// What ⌘⇧R means, and the difference from an ordinary reload is the whole
+    /// reason there are two: this one does not ask whether anything changed, it
+    /// fetches. What comes back is still kept — the point is a new copy, not the
+    /// end of having one — and every subresource the page then asks for is
+    /// fetched afresh too, which is what makes it the answer to a stylesheet a
+    /// server is serving stale.
+    pub fn reload_ignoring_cache(&mut self) {
+        if let Some(cache) = self.cache.as_ref() {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+        self.next_cache_mode = otlyra_net::CacheMode::Bypass;
+        self.reload_keeping_the_mode();
+    }
+
+    /// The body of [`Browser::reload`], without setting a mode of its own.
+    fn reload_keeping_the_mode(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.url.is_empty() {
+            return;
+        }
+        let url = tab.url.clone();
+        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
         self.start_load(&url, false, false, scroll);
     }
 
@@ -1223,6 +1269,16 @@ impl Browser {
         self.start_send(url, user_initiated, record, restore_scroll, None);
     }
 
+    /// What the cache is allowed to do about the navigation now being started.
+    ///
+    /// Set for the one navigation and cleared by it, because a reload is an
+    /// instruction about *this* fetch: leaving it on would make every later
+    /// click behave like a reload, and a browser that never answers from its
+    /// cache is a browser with no cache.
+    fn take_cache_mode(&mut self) -> otlyra_net::CacheMode {
+        std::mem::take(&mut self.next_cache_mode)
+    }
+
     /// Ask for `url` with a body, and leave the tab waiting for it.
     ///
     /// The same navigation as any other in every respect but the method: the same
@@ -1267,7 +1323,8 @@ impl Browser {
         }
 
         let previous_url = self.tabs[self.active].url.clone();
-        let id = self.fetcher.send(url, ResourceKind::Document, body);
+        let cache = self.take_cache_mode();
+        let id = self.fetcher.fetch(url, ResourceKind::Document, body, cache);
         self.load_started = std::time::Instant::now();
 
         let tab = &mut self.tabs[self.active];
@@ -2377,6 +2434,19 @@ impl Browser {
     /// The jar, to list and to empty.
     pub fn cookies_mut(&mut self) -> &mut crate::cookies::CookieStore {
         &mut self.cookies
+    }
+
+    /// Use `cache` as this browser's HTTP cache.
+    ///
+    /// The same shape as the jar, and for the same reason: the loader is built
+    /// before the browser and both have to hold the one cache.
+    pub fn set_cache(&mut self, cache: otlyra_net::SharedCache) {
+        self.cache = Some(cache);
+    }
+
+    /// What has already been fetched, for a surface that lists it or empties it.
+    pub fn cache(&self) -> Option<&otlyra_net::SharedCache> {
+        self.cache.as_ref()
     }
 
     /// Use `store` as this browser's jar.
@@ -4231,9 +4301,8 @@ impl Painter for Browser {
             // The menu and the keyboard reach the same commands: one definition of
             // what each means, invoked from wherever the user found it.
             PlatformEvent::MenuCommand(id) => match crate::menu::Command::from_id(id) {
-                Some(crate::menu::Command::Reload | crate::menu::Command::ReloadIgnoringCache) => {
-                    self.reload();
-                }
+                Some(crate::menu::Command::Reload) => self.reload(),
+                Some(crate::menu::Command::ReloadIgnoringCache) => self.reload_ignoring_cache(),
                 Some(crate::menu::Command::Stop) => self.stop(),
                 Some(crate::menu::Command::Back) => self.go_back(),
                 Some(crate::menu::Command::Forward) => self.go_forward(),
@@ -5195,6 +5264,72 @@ mod system_page_tests {
         assert!(!browser.is_bookmarked());
         assert_eq!(browser.ui().bookmark, crate::ui::Bookmarked::No);
         assert!(browser.bookmarks.is_empty());
+    }
+
+    /// A hard reload empties the cache, which is what makes it the answer to a
+    /// stylesheet a server is serving stale: the page and everything it then asks
+    /// for are all fetched afresh.
+    #[test]
+    fn a_hard_reload_empties_the_cache_and_an_ordinary_one_does_not() {
+        let cache: otlyra_net::SharedCache =
+            std::sync::Arc::new(std::sync::Mutex::new(otlyra_net::cache::Cache::new()));
+        let mut browser = Browser::new(NoNetwork);
+        browser.set_cache(std::sync::Arc::clone(&cache));
+        browser.navigate("https://example.test/");
+
+        let put = |cache: &otlyra_net::SharedCache| {
+            let stored = otlyra_net::cache::Stored {
+                status: 200,
+                headers: vec![("cache-control".to_owned(), "max-age=3600".to_owned())],
+                body: b"body".to_vec(),
+                final_url: "https://example.test/a".to_owned(),
+                directives: otlyra_net::cache::Directives::parse(["max-age=3600"]),
+                lifetime: otlyra_net::cache::Lifetime::Stated(std::time::Duration::from_secs(3600)),
+                times: otlyra_net::cache::Times {
+                    requested: std::time::SystemTime::now(),
+                    received: std::time::SystemTime::now(),
+                    date: std::time::SystemTime::now(),
+                    age: std::time::Duration::ZERO,
+                },
+                varied: Vec::new(),
+                varies_on_everything: false,
+            };
+            cache
+                .lock()
+                .expect("not poisoned")
+                .store("https://example.test/a", "GET", stored, &[]);
+        };
+
+        put(&cache);
+        assert_eq!(cache.lock().expect("not poisoned").len(), 1);
+        browser.reload();
+        assert_eq!(
+            cache.lock().expect("not poisoned").len(),
+            1,
+            "an ordinary reload asks about what is kept rather than throwing it away"
+        );
+
+        browser.reload_ignoring_cache();
+        assert!(
+            cache.lock().expect("not poisoned").is_empty(),
+            "and a hard one starts over"
+        );
+    }
+
+    /// The mode is an instruction about one navigation. Left set, every later
+    /// click would behave like a reload and the cache would answer nothing.
+    #[test]
+    fn a_reload_does_not_make_every_later_click_a_reload() {
+        let mut browser = Browser::new(NoNetwork);
+        browser.navigate("https://example.test/");
+        browser.reload();
+        assert_eq!(
+            browser.next_cache_mode,
+            otlyra_net::CacheMode::Default,
+            "the navigation it was set for took it"
+        );
+        browser.reload_ignoring_cache();
+        assert_eq!(browser.next_cache_mode, otlyra_net::CacheMode::Default);
     }
 
     /// The cookies page is reachable the three ways every browser page is: by

@@ -45,6 +45,29 @@ pub struct LoadRequest {
     /// safe one is *not* asked here: it is [`LoadRequest::body`], which the
     /// loader reads itself and which a redirect can change on the way.
     pub navigation: bool,
+    /// What the cache is allowed to do about this one.
+    pub cache: CacheMode,
+}
+
+/// What a request is allowed to take from the cache.
+///
+/// The reader's own instruction, which is what makes this the caller's to say
+/// rather than something the loader works out. A reload means *check*, and a
+/// reload holding shift means *do not even look* — and a browser where those two
+/// do the same thing as an ordinary click is a browser whose reload button
+/// appears not to work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Answer from the cache where it may, ask where it must, fetch otherwise.
+    #[default]
+    Default,
+    /// Never serve without asking the server, even where the stored copy is
+    /// still fresh. What ⌘R means: the reader is saying they think it changed.
+    Revalidate,
+    /// Do not look at the cache at all. What ⌘⇧R means. The answer is still
+    /// stored, because the point is to get a new copy rather than to stop having
+    /// one.
+    Bypass,
 }
 
 impl LoadRequest {
@@ -55,6 +78,7 @@ impl LoadRequest {
             body: None,
             initiator: None,
             navigation: false,
+            cache: CacheMode::Default,
         }
     }
 
@@ -75,6 +99,12 @@ impl LoadRequest {
     /// The same request, marked as a top-level navigation.
     pub fn navigating(mut self) -> Self {
         self.navigation = true;
+        self
+    }
+
+    /// The same request, with what the cache may do about it.
+    pub fn caching(mut self, cache: CacheMode) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -493,13 +523,19 @@ impl Loader {
         // a body changes something, and nothing here would reuse the answer.
         let mut conditions: Vec<(&'static str, String)> = Vec::new();
         if body.is_none()
+            && request.cache != CacheMode::Bypass
             && let Some(cache) = self.cache.as_ref()
         {
             let mut cache = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match cache.look_up(&key, &varying, now) {
-                Some((stored, crate::cache::Use::Fresh)) => {
+                // A fresh entry is the answer — unless the reader has just said
+                // they think it changed, which is what a reload is. Then it is
+                // still worth having: the server may say nothing changed, and a
+                // reload that costs a header instead of a body is the difference
+                // between a page that reappears and a page that loads again.
+                Some((stored, crate::cache::Use::Fresh)) if request.cache == CacheMode::Default => {
                     tracing::debug!(%key, "answered from the cache");
                     return Ok(stored.as_resource());
                 }

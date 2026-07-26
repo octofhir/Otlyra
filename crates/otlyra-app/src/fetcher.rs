@@ -27,7 +27,7 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-pub use otlyra_net::Body;
+pub use otlyra_net::{Body, CacheMode};
 use otlyra_platform::Waker;
 
 /// What a fetch is for.
@@ -229,7 +229,7 @@ pub trait AsyncLoader: Send + Sync + 'static {
     /// Owned arguments rather than borrowed: what is returned is a future that
     /// outlives this call, and a borrow of the caller's string would not survive
     /// being spawned.
-    fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching;
+    fn fetch(self: Arc<Self>, url: String, body: Option<Body>, cache: CacheMode) -> Fetching;
 }
 
 /// A blocking [`Loader`] made to look like an [`AsyncLoader`].
@@ -241,7 +241,11 @@ pub trait AsyncLoader: Send + Sync + 'static {
 struct Blocking<L: Loader>(L);
 
 impl<L: Loader> AsyncLoader for Blocking<L> {
-    fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching {
+    fn fetch(self: Arc<Self>, url: String, body: Option<Body>, cache: CacheMode) -> Fetching {
+        // A canned loader has nothing to cache and nothing to bypass. Taken
+        // rather than ignored silently, so a test that meant to assert on the
+        // mode is not quietly given a loader that cannot see it.
+        let _ = cache;
         Box::pin(async move {
             tokio::task::spawn_blocking(move || self.0.send(&url, body))
                 .await
@@ -344,6 +348,21 @@ impl Fetcher {
     /// Ask for `url`, sending `body` with it. The number returned is what the
     /// result will carry.
     pub fn send(&mut self, url: &str, kind: ResourceKind, body: Option<Body>) -> u64 {
+        self.fetch(url, kind, body, CacheMode::Default)
+    }
+
+    /// The same, saying what the cache may do about it.
+    ///
+    /// The reader's instruction, which is why it comes from here rather than
+    /// being worked out below: a reload means *check*, and only the thing that
+    /// saw the reload knows one happened.
+    pub fn fetch(
+        &mut self,
+        url: &str,
+        kind: ResourceKind,
+        body: Option<Body>,
+        cache: CacheMode,
+    ) -> u64 {
         self.next += 1;
         let id = self.next;
         let method = if body.is_some() { "POST" } else { "GET" };
@@ -380,7 +399,7 @@ impl Fetcher {
                 return;
             };
             let started = std::time::Instant::now();
-            let result = loader.fetch(url.clone(), body).await;
+            let result = loader.fetch(url.clone(), body, cache).await;
             let fetched = Fetched {
                 id,
                 kind,
@@ -568,7 +587,12 @@ mod tests {
         }
 
         impl AsyncLoader for Suspending {
-            fn fetch(self: Arc<Self>, url: String, body: Option<Body>) -> Fetching {
+            fn fetch(
+                self: Arc<Self>,
+                url: String,
+                body: Option<Body>,
+                _cache: CacheMode,
+            ) -> Fetching {
                 Box::pin(async move {
                     assert!(body.is_none(), "nothing here posts");
                     let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;

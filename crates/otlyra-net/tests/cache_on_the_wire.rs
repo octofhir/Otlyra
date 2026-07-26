@@ -424,3 +424,55 @@ fn a_condition_does_not_follow_a_redirect_that_appeared_later() {
         "and what it redirected to is not"
     );
 }
+
+/// The two things a reload button means, and the reason they are not one.
+#[test]
+fn a_reload_asks_and_a_hard_reload_does_not_even_look() {
+    let server = serve(|request| {
+        if request.header("if-none-match") == Some("\"v1\"") {
+            return respond("304 Not Modified", &["Cache-Control: max-age=3600"], "");
+        }
+        respond(
+            "200 OK",
+            &["Cache-Control: max-age=3600", "ETag: \"v1\""],
+            "body",
+        )
+    });
+
+    let (loader, _cache) = cached();
+    let at = |mode| {
+        let url = otlyra_net::normalize(&server.url("/a")).expect("url");
+        loader
+            .fetch_blocking(LoadRequest::new(url).caching(mode))
+            .expect("fetch")
+    };
+
+    assert_eq!(at(otlyra_net::CacheMode::Default).decode_text(), "body");
+    assert_eq!(server.paths().len(), 1);
+
+    // Fresh for an hour, so an ordinary request asks nothing.
+    assert_eq!(at(otlyra_net::CacheMode::Default).decode_text(), "body");
+    assert_eq!(server.paths().len(), 1, "the cache answered it");
+
+    // A reload asks anyway — and the server saying nothing changed means the
+    // body never crosses. This is the whole reason a reload is not a bypass.
+    assert_eq!(at(otlyra_net::CacheMode::Revalidate).decode_text(), "body");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].header("if-none-match"), Some("\"v1\""));
+
+    // A hard reload does not look at all, so it asks unconditionally.
+    assert_eq!(at(otlyra_net::CacheMode::Bypass).decode_text(), "body");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].header("if-none-match"),
+        None,
+        "nothing was consulted, so there was nothing to ask with"
+    );
+
+    // And what a bypass fetched is still kept: the point is a new copy, not the
+    // end of having one.
+    assert_eq!(at(otlyra_net::CacheMode::Default).decode_text(), "body");
+    assert_eq!(server.paths().len(), 3, "answered from the cache again");
+}
