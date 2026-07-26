@@ -10,6 +10,20 @@
 //! what makes closing the browser end a session. A persistent one has an expiry
 //! the server asked for, and that is what goes to disk.
 //!
+//! # The file is sealed
+//!
+//! This one is not written in the clear, and it is the only store here that is
+//! not. A cookie file is somebody's signed-in sessions: in plain text it is
+//! readable by every process running as that person, by anything that later reads
+//! the disk, and by whatever a backup copies it into. Chrome and Firefox both
+//! seal theirs, and the reasoning — including what it does *not* protect against
+//! — is in [`crate::secret`].
+//!
+//! With no key there is no file. A platform with nowhere safe to keep one keeps
+//! cookies in memory for the run and says so, because writing them in the clear
+//! instead would be the browser deciding, on a person's behalf, that their
+//! sessions are worth less than the convenience.
+//!
 //! # When it is written
 //!
 //! Not on every change, and not on a timer. The jar keeps a revision that moves
@@ -44,14 +58,34 @@ use crate::widget::{
 };
 
 /// What the cookie file is called inside the browser's own directory.
-const FILE: &str = "cookies.tsv";
+///
+/// Not `.tsv`: what is in it is tab-separated and what is *on the disk* is a
+/// sealed blob, and a name that promised text would be the wrong thing to tell
+/// somebody looking at their own directory.
+const FILE: &str = "cookies.dat";
+
+/// What the file was called while it was written in the clear.
+///
+/// Read once, moved into the sealed one, and then removed — leaving it behind
+/// would keep a plain copy of the very thing this change exists to stop being
+/// plain.
+const PLAIN_FILE: &str = "cookies.tsv";
+
+/// What the sealed file is bound to, so it cannot be handed over where another
+/// of the browser's sealed files was expected.
+const PURPOSE: &[u8] = b"cookies";
 
 /// The jar, and where it is kept.
 pub struct CookieStore {
     jar: SharedJar,
-    /// Where to write. `None` in a test and on a platform with nowhere to write,
-    /// which turns persistence off rather than turning cookies off.
+    /// Where to write. `None` in a test, on a platform with nowhere to keep a
+    /// key, and whenever the keychain refuses — which turns persistence off
+    /// rather than turning cookies off.
     file: Option<PathBuf>,
+    /// What the file is sealed with. Present exactly when `file` is: a store that
+    /// could not get a key does not get a path either, so there is no state in
+    /// which something could be written unsealed.
+    key: Option<crate::secret::Key>,
     /// The revision last written, so a flush with nothing to say costs nothing.
     written: u64,
 }
@@ -71,6 +105,7 @@ impl CookieStore {
         Self {
             jar: Arc::new(Mutex::new(Jar::new())),
             file: None,
+            key: None,
             written: 0,
         }
     }
@@ -87,15 +122,40 @@ impl CookieStore {
     /// in with; a file that cannot be read is a warning and an empty jar, because
     /// refusing to start over a cookie file would be refusing to start.
     pub fn persist(&mut self) {
-        let Some(file) = file_path() else {
+        let Some(file) = file_path(FILE) else {
             tracing::warn!("nowhere to keep cookies; sessions will not survive this run");
             return;
         };
+        // The key first. Without one there is no file: a store that fell back to
+        // plain text here would be the whole point of the exercise undone at the
+        // one moment nobody is watching.
+        let Some(key) = crate::secret::Key::from_keychain() else {
+            tracing::warn!("no key to seal cookies with; sessions will not survive this run");
+            return;
+        };
+
         let now = SystemTime::now();
-        // A file that is not there is not a warning: a browser nobody has signed in
-        // with has none, and saying so on every launch would be noise about the
-        // ordinary case.
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = match std::fs::read(&file) {
+            // A file that is not there is not a warning: a browser nobody has
+            // signed in with has none, and saying so on every launch would be
+            // noise about the ordinary case.
+            Err(_) => String::new(),
+            Ok(sealed) => match key.open(PURPOSE, &sealed) {
+                Some(plain) => String::from_utf8(plain).unwrap_or_default(),
+                None if crate::secret::is_sealed(&sealed) => {
+                    // Sealed, and not with this key — a keychain that was reset, a
+                    // file from another account. Not repairable and not a reason
+                    // to refuse to start; the sessions in it are simply gone.
+                    tracing::warn!("the cookie file was sealed with another key; starting empty");
+                    String::new()
+                }
+                None => {
+                    tracing::warn!("the cookie file is not one of ours; starting empty");
+                    String::new()
+                }
+            },
+        };
+
         let read = store::from_text(&text, Capacity::default(), now);
         let revision = self.with(|jar| {
             for cookie in read.all() {
@@ -107,6 +167,73 @@ impl CookieStore {
         // to do.
         self.written = revision;
         self.file = Some(file);
+        self.key = Some(key);
+        self.take_over_from_a_plain_file();
+    }
+
+    /// Move what an older build wrote in the clear into the sealed file, and then
+    /// be rid of the plain one.
+    ///
+    /// The order matters and is the whole of this function: read, seal, write,
+    /// and only then remove. A removal before a successful write would lose the
+    /// sessions; leaving the plain file behind would keep a readable copy of
+    /// exactly what was just sealed.
+    fn take_over_from_a_plain_file(&mut self) {
+        let Some(plain) = file_path(PLAIN_FILE) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&plain) else {
+            return;
+        };
+        let read = store::from_text(&text, Capacity::default(), SystemTime::now());
+        tracing::info!(
+            cookies = read.len(),
+            "sealing what an earlier build kept in the clear"
+        );
+        self.with(|jar| {
+            for cookie in read.all() {
+                jar.put(cookie.clone());
+            }
+        });
+        if !self.flush() {
+            tracing::warn!("could not seal them; the plain file is left where it is");
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&plain) {
+            tracing::warn!(%error, path = %plain.display(), "the plain cookie file is still there");
+        }
+    }
+
+    /// A store sealed with `key` and written to `file`, for a test that must
+    /// touch neither the machine's keychain nor a person's own directory.
+    #[cfg(test)]
+    fn sealed_at(file: PathBuf, key: crate::secret::Key) -> Self {
+        Self {
+            jar: Arc::new(Mutex::new(Jar::new())),
+            file: Some(file),
+            key: Some(key),
+            written: 0,
+        }
+    }
+
+    /// Read `file` back into this store, the way [`CookieStore::persist`] does
+    /// once it has a key.
+    #[cfg(test)]
+    fn reopen(&mut self) {
+        let (Some(file), Some(key)) = (self.file.clone(), self.key.as_ref()) else {
+            return;
+        };
+        let sealed = std::fs::read(&file).unwrap_or_default();
+        let text = key
+            .open(PURPOSE, &sealed)
+            .and_then(|plain| String::from_utf8(plain).ok())
+            .unwrap_or_default();
+        let read = store::from_text(&text, Capacity::default(), SystemTime::now());
+        self.with(|jar| {
+            for cookie in read.all() {
+                jar.put(cookie.clone());
+            }
+        });
     }
 
     /// The jar itself, to give to a loader.
@@ -136,38 +263,46 @@ impl CookieStore {
     ///
     /// Cheap to call often, which is the point: the caller does not have to know
     /// whether a fetch set a cookie, only that one finished.
-    pub fn flush(&mut self) {
-        let Some(file) = self.file.clone() else {
-            return;
+    /// Answers whether anything reached the disk, which is what the migration
+    /// needs before it removes the plain file it read from.
+    pub fn flush(&mut self) -> bool {
+        let (Some(file), Some(key)) = (self.file.clone(), self.key.as_ref()) else {
+            return false;
         };
         let now = SystemTime::now();
         let (revision, text) = self.with(|jar| (jar.kept_revision(), store::to_text(jar, now)));
         if revision == self.written {
-            return;
+            return true;
         }
+        let Some(sealed) = key.seal(PURPOSE, text.as_bytes()) else {
+            tracing::warn!("could not seal the cookies; nothing was written");
+            return false;
+        };
         self.written = revision;
 
         if let Some(directory) = file.parent()
             && let Err(error) = std::fs::create_dir_all(directory)
         {
             tracing::warn!(%error, path = %directory.display(), "could not make the browser's directory");
-            return;
+            return false;
         }
-        let temporary = file.with_extension("tsv.writing");
-        if let Err(error) = std::fs::write(&temporary, text) {
+        let temporary = file.with_extension("dat.writing");
+        if let Err(error) = std::fs::write(&temporary, sealed) {
             tracing::warn!(%error, path = %temporary.display(), "could not write the cookies");
-            return;
+            return false;
         }
         if let Err(error) = std::fs::rename(&temporary, &file) {
             tracing::warn!(%error, path = %file.display(), "could not replace the cookies");
             let _ = std::fs::remove_file(&temporary);
+            return false;
         }
+        true
     }
 }
 
-/// Where the cookie file lives, when there is anywhere.
-fn file_path() -> Option<PathBuf> {
-    Some(crate::preferences::directory()?.join(FILE))
+/// Where one of the browser's own files lives, when there is anywhere.
+fn file_path(name: &str) -> Option<PathBuf> {
+    Some(crate::preferences::directory()?.join(name))
 }
 
 /// What the cookies surface reports.
@@ -689,6 +824,86 @@ mod tests {
             .expect("kept");
         });
         assert_ne!(store.with(|jar| jar.kept_revision()), before);
+    }
+
+    /// The file on disk is sealed, and what comes back out of it is what went in.
+    #[test]
+    fn what_reaches_the_disk_is_sealed_and_comes_back() {
+        let file = std::env::temp_dir().join("otlyra-cookie-seal-test.dat");
+        let _ = std::fs::remove_file(&file);
+
+        let mut store =
+            CookieStore::sealed_at(file.clone(), crate::secret::Key::from_bytes([3u8; 32]));
+        store.with(|jar| {
+            jar.set(
+                &url("https://bank.test/"),
+                "session=s3cret; Max-Age=600",
+                SystemTime::now(),
+            )
+            .expect("kept");
+        });
+        assert!(store.flush(), "it wrote");
+
+        // What is actually on the disk holds neither the name nor the value.
+        let bytes = std::fs::read(&file).expect("the file is there");
+        assert!(crate::secret::is_sealed(&bytes));
+        for plain in [&b"s3cret"[..], b"session", b"bank.test"] {
+            assert!(
+                !bytes.windows(plain.len()).any(|window| window == plain),
+                "{} is in the file",
+                String::from_utf8_lossy(plain)
+            );
+        }
+
+        // And the same key reads it back.
+        let mut reopened =
+            CookieStore::sealed_at(file.clone(), crate::secret::Key::from_bytes([3u8; 32]));
+        reopened.reopen();
+        assert_eq!(reopened.with(|jar| jar.len()), 1);
+        assert_eq!(reopened.with(|jar| jar.all()[0].value.clone()), "s3cret");
+
+        // Another key reads nothing rather than reading nonsense.
+        let mut stranger =
+            CookieStore::sealed_at(file.clone(), crate::secret::Key::from_bytes([4u8; 32]));
+        stranger.reopen();
+        assert!(stranger.with(|jar| jar.is_empty()));
+
+        std::fs::remove_file(&file).expect("remove the test-owned file");
+    }
+
+    /// A flush with nothing new to say writes nothing — which is what keeps a
+    /// site resetting a session cookie from costing a disk write per response.
+    #[test]
+    fn a_flush_with_nothing_to_say_writes_nothing() {
+        let file = std::env::temp_dir().join("otlyra-cookie-quiet-test.dat");
+        let _ = std::fs::remove_file(&file);
+
+        let mut store =
+            CookieStore::sealed_at(file.clone(), crate::secret::Key::from_bytes([5u8; 32]));
+        store.with(|jar| {
+            jar.set(
+                &url("https://x.test/"),
+                "a=1; Max-Age=600",
+                SystemTime::now(),
+            )
+            .expect("kept");
+        });
+        assert!(store.flush());
+        let first = std::fs::read(&file).expect("written");
+
+        // A session cookie, which never reaches a disk.
+        store.with(|jar| {
+            jar.set(&url("https://x.test/"), "b=2", SystemTime::now())
+                .expect("kept");
+        });
+        assert!(store.flush());
+        assert_eq!(
+            std::fs::read(&file).expect("still there"),
+            first,
+            "a session cookie must not make the browser write a file"
+        );
+
+        std::fs::remove_file(&file).expect("remove the test-owned file");
     }
 
     // --- the surface ------------------------------------------------------

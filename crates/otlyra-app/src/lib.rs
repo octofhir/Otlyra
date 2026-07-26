@@ -61,6 +61,7 @@ pub mod observability;
 pub mod page;
 pub mod preferences;
 pub mod scene;
+pub mod secret;
 pub mod settings;
 pub mod ui;
 pub mod widget;

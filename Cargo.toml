@@ -268,6 +268,21 @@ tokio = { version = "=1.53.0", features = [
 # `ClientConfig::builder()` panics; being explicit turns that into our decision.
 rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-rs"] }
 
+# AES-256-GCM and the system generator, for sealing the browser's own files. This
+# is rustls's own provider at rustls's own version, so it costs no package and
+# cannot pull a second copy of the C library it wraps — which is the expensive one
+# in this tree. Named here because a cookie file is somebody's signed-in sessions
+# and a second cryptography crate for one file would be a second thing to keep
+# audited.
+aws-lc-rs = "=1.17.3"
+
+# The macOS keychain, which is where the key that seals those files lives. Also
+# already in the graph, through `rustls-platform-verifier`. Apple only: there is
+# no fallback on other platforms and deliberately none — a key in a file beside
+# the thing it locks is not a key, so a platform with nowhere safe to put one
+# keeps cookies in memory for the run and says so.
+security-framework = "=3.7.0"
+
 # WHATWG URL. Hand-rolling this is how CVE-2024-12224 happened.
 url = "=2.5.8"
 

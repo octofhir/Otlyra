@@ -23,6 +23,7 @@ otlyra-dom.workspace = true
 otlyra-gfx.workspace = true
 otlyra-html.workspace = true
 otlyra-layout.workspace = true
+aws-lc-rs.workspace = true
 otlyra-net.workspace = true
 url.workspace = true
 otlyra-paint.workspace = true
@@ -44,6 +45,9 @@ tokio.workspace = true
 # to choose a file simply goes unanswered, and the control says no file was chosen.
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 rfd.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
 
 [dev-dependencies]
 otlyra-text.workspace = true
