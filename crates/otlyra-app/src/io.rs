@@ -19,6 +19,13 @@
 //! can be outstanding. Concurrency limits belong to whoever is asking — the fetcher
 //! keeps its own [`crate::fetcher::FETCH_CONCURRENCY`] semaphore — because "how many
 //! sockets a page may point at a server" is a browser policy and not a thread count.
+//!
+//! Two holds only because nothing that blocks runs on them. A worker parked in a
+//! syscall is every fetch it drives parked with it, so the count would have to be
+//! guessed against how many such calls might overlap — which is sizing a pool
+//! around a bug. The blocking work is named instead: a canned [`crate::fetcher::Loader`]
+//! and a read of a cache entry go to `spawn_blocking`, and the cache's writing has
+//! a thread of its own. Anything added here that blocks belongs in one of those.
 
 use std::sync::OnceLock;
 

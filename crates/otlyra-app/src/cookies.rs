@@ -82,10 +82,22 @@ pub struct CookieStore {
     /// key, and whenever the keychain refuses — which turns persistence off
     /// rather than turning cookies off.
     file: Option<PathBuf>,
-    /// What the file is sealed with. Present exactly when `file` is: a store that
-    /// could not get a key does not get a path either, so there is no state in
-    /// which something could be written unsealed.
+    /// What the file is sealed with, once there has been a reason to ask for it.
+    ///
+    /// # Why this is fetched late
+    ///
+    /// Asking the keychain is not free and it is not silent: on macOS the first
+    /// read by a given binary puts a dialog in front of whoever is starting the
+    /// browser, and a development build is a new binary — so a run that never
+    /// touches a cookie was still costing a prompt. Nothing needs a key until
+    /// there is either a file to open or something worth writing, and until then
+    /// there is no reason to have asked.
+    ///
+    /// `None` also means *there is no key*, which is why `asked` is separate: a
+    /// keychain that refused must not be asked again on every flush.
     key: Option<crate::secret::Key>,
+    /// Whether the keychain has been consulted, whatever it said.
+    asked: bool,
     /// The revision last written, so a flush with nothing to say costs nothing.
     written: u64,
 }
@@ -106,6 +118,7 @@ impl CookieStore {
             jar: Arc::new(Mutex::new(Jar::new())),
             file: None,
             key: None,
+            asked: false,
             written: 0,
         }
     }
@@ -126,21 +139,35 @@ impl CookieStore {
             tracing::warn!("nowhere to keep cookies; sessions will not survive this run");
             return;
         };
-        // The key first. Without one there is no file: a store that fell back to
-        // plain text here would be the whole point of the exercise undone at the
-        // one moment nobody is watching.
-        let Some(key) = crate::secret::Key::from_keychain() else {
+        // What is on disk decides whether a key is needed *now*. A browser nobody
+        // has signed in with has no file to open, and asking the keychain to
+        // unlock nothing is a dialog in front of somebody for no reason. The key
+        // is fetched by the first flush that has something to write.
+        let existing = std::fs::read(&file).ok();
+        let plain_to_take_over = file_path(PLAIN_FILE).is_some_and(|plain| plain.exists());
+        if existing.is_none() && !plain_to_take_over {
+            self.file = Some(file);
+            return;
+        }
+        // Without one there is no file: a store that fell back to plain text here
+        // would be the whole point of the exercise undone at the one moment
+        // nobody is watching.
+        if self.unlock().is_none() {
             tracing::warn!("no key to seal cookies with; sessions will not survive this run");
             return;
-        };
+        }
+        // Taken out for the read below and put back after: `open` needs the key
+        // and the reads around it need the store, and the two borrows do not
+        // overlap in fact — only in the checker's view of them.
+        let key = self.key.take().expect("just unlocked");
 
         let now = SystemTime::now();
-        let text = match std::fs::read(&file) {
+        let text = match existing {
             // A file that is not there is not a warning: a browser nobody has
             // signed in with has none, and saying so on every launch would be
             // noise about the ordinary case.
-            Err(_) => String::new(),
-            Ok(sealed) => match key.open(PURPOSE, &sealed) {
+            None => String::new(),
+            Some(sealed) => match key.open(PURPOSE, &sealed) {
                 Some(plain) => String::from_utf8(plain).unwrap_or_default(),
                 None if crate::secret::is_sealed(&sealed) => {
                     // Sealed, and not with this key — a keychain that was reset, a
@@ -169,6 +196,18 @@ impl CookieStore {
         self.file = Some(file);
         self.key = Some(key);
         self.take_over_from_a_plain_file();
+    }
+
+    /// The key, fetched from the keychain the first time anything needs it.
+    ///
+    /// Asked once per run whatever the answer, so a keychain that refused — or a
+    /// platform with none — costs one attempt rather than one per flush.
+    fn unlock(&mut self) -> Option<&crate::secret::Key> {
+        if !self.asked {
+            self.asked = true;
+            self.key = crate::secret::Key::from_keychain();
+        }
+        self.key.as_ref()
     }
 
     /// Move what an older build wrote in the clear into the sealed file, and then
@@ -212,6 +251,7 @@ impl CookieStore {
             jar: Arc::new(Mutex::new(Jar::new())),
             file: Some(file),
             key: Some(key),
+            asked: true,
             written: 0,
         }
     }
@@ -266,14 +306,21 @@ impl CookieStore {
     /// Answers whether anything reached the disk, which is what the migration
     /// needs before it removes the plain file it read from.
     pub fn flush(&mut self) -> bool {
-        let (Some(file), Some(key)) = (self.file.clone(), self.key.as_ref()) else {
+        let Some(file) = self.file.clone() else {
             return false;
         };
         let now = SystemTime::now();
         let (revision, text) = self.with(|jar| (jar.kept_revision(), store::to_text(jar, now)));
+        // Before the key: a flush with nothing to say must not be the thing that
+        // puts a keychain prompt on the screen, and most flushes have nothing to
+        // say. This is what makes the ask happen at the first sign-in rather than
+        // at startup.
         if revision == self.written {
             return true;
         }
+        let Some(key) = self.unlock() else {
+            return false;
+        };
         let Some(sealed) = key.seal(PURPOSE, text.as_bytes()) else {
             tracing::warn!("could not seal the cookies; nothing was written");
             return false;

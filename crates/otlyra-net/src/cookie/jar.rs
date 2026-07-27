@@ -383,6 +383,22 @@ impl Jar {
         before - self.cookies.len()
     }
 
+    /// Throw away every cookie `wanted` says yes to. Answers how many went.
+    ///
+    /// The general form the two above are special cases of, for a caller that
+    /// names cookies some other way — a driver deleting by name and domain, which
+    /// is the shape `storage.deleteCookies` takes. Kept next to them so all four
+    /// ways of removing a cookie account for the persistent set the same way: a
+    /// removal that forgot to would leave the file on disk disagreeing with the
+    /// jar until something else happened to write it.
+    pub fn remove(&mut self, wanted: impl Fn(&Cookie) -> bool) -> usize {
+        let kept = self.kept_count();
+        let before = self.cookies.len();
+        self.cookies.retain(|cookie| !wanted(cookie));
+        self.kept_changed(kept);
+        before - self.cookies.len()
+    }
+
     /// Drop what has expired. Answers how many went.
     pub fn purge_expired(&mut self, now: SystemTime) -> usize {
         let kept = self.kept_count();

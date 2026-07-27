@@ -62,6 +62,157 @@ fn a_fresh_response_is_answered_without_a_request() {
     assert_eq!(again.final_url, server.url("/a"));
 }
 
+/// What a person notices, as opposed to what a profile notices: the site they
+/// open every morning is not fetched from nothing every morning.
+#[test]
+fn what_a_restart_finds_is_what_the_last_run_left() {
+    let server = serve(|_| {
+        respond(
+            "200 OK",
+            &["Cache-Control: max-age=3600", "Content-Type: text/plain"],
+            "the logo",
+        )
+    });
+    let directory = std::env::temp_dir().join(format!("otlyra-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+
+    // One run.
+    {
+        otlyra_net::install_crypto_provider();
+        let disk = otlyra_net::cache::Disk::open(&directory, 1024 * 1024).expect("opened");
+        let cache: SharedCache = Arc::new(Mutex::new(Cache::new().with_disk(disk)));
+        let loader = Loader::with_limits(LIMITS)
+            .expect("loader")
+            .with_cache(cache);
+        assert_eq!(
+            get(&loader, &server.url("/logo.png")).decode_text(),
+            "the logo"
+        );
+    }
+
+    // Another, with nothing in memory carried over — which is what closing the
+    // browser and opening it again is.
+    {
+        let disk = otlyra_net::cache::Disk::open(&directory, 1024 * 1024).expect("reopened");
+        assert_eq!(disk.len(), 1, "the last run left nothing behind");
+        let cache: SharedCache = Arc::new(Mutex::new(Cache::new().with_disk(disk)));
+        let loader = Loader::with_limits(LIMITS)
+            .expect("loader")
+            .with_cache(cache);
+        let again = get(&loader, &server.url("/logo.png"));
+        assert_eq!(again.decode_text(), "the logo");
+        assert_eq!(again.served, otlyra_net::Served::Cache);
+    }
+
+    // The server was asked once, across two runs. That is the whole claim.
+    assert_eq!(server.paths(), ["/logo.png"]);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A header the caller wrote reaches the server, and replaces what the loader
+/// would have sent rather than sitting beside it.
+#[test]
+fn a_caller_may_write_the_headers_on_its_own_request() {
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    let seen: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+    let recorder = StdArc::clone(&seen);
+    let server = serve(move |request| {
+        recorder.lock().expect("not poisoned").push(
+            request
+                .header("accept-language")
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        respond("200 OK", &[], "ok")
+    });
+
+    otlyra_net::install_crypto_provider();
+    let loader = Loader::with_limits(LIMITS).expect("loader");
+    let url = otlyra_net::normalize(&server.url("/a")).expect("url");
+    loader
+        .fetch_blocking(
+            LoadRequest::new(url)
+                .with_headers(vec![("Accept-Language".to_owned(), "cy-GB".to_owned())]),
+        )
+        .expect("fetch");
+
+    assert_eq!(seen.lock().expect("not poisoned").as_slice(), ["cy-GB"]);
+}
+
+/// The one header a caller may not write.
+///
+/// The jar decides what a site is entitled to be sent. A caller that could set
+/// this directly could send one site's session to another.
+#[test]
+fn a_caller_may_not_write_the_cookie_header() {
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    let seen: StdArc<StdMutex<Vec<Option<String>>>> = StdArc::new(StdMutex::new(Vec::new()));
+    let recorder = StdArc::clone(&seen);
+    let server = serve(move |request| {
+        recorder
+            .lock()
+            .expect("not poisoned")
+            .push(request.header("cookie").map(str::to_owned));
+        respond("200 OK", &[], "ok")
+    });
+
+    otlyra_net::install_crypto_provider();
+    let loader = Loader::with_limits(LIMITS).expect("loader");
+    let url = otlyra_net::normalize(&server.url("/a")).expect("url");
+    loader
+        .fetch_blocking(
+            LoadRequest::new(url)
+                .with_headers(vec![("Cookie".to_owned(), "session=stolen".to_owned())]),
+        )
+        .expect("fetch");
+
+    assert_eq!(seen.lock().expect("not poisoned").as_slice(), [None]);
+}
+
+/// A cache that works is invisible, and that is the problem: a hit and a fast
+/// server look the same from outside, so *is this being cached* is unanswerable
+/// unless the loader says which happened. It says.
+#[test]
+fn a_response_says_whether_the_network_was_touched() {
+    let server = serve(|request| {
+        if request.header("if-none-match") == Some("\"v1\"") {
+            return respond("304 Not Modified", &["Cache-Control: max-age=0"], "");
+        }
+        respond(
+            "200 OK",
+            &["Cache-Control: max-age=0", "ETag: \"v1\""],
+            "the body",
+        )
+    });
+    let (loader, _cache) = cached();
+
+    // Nothing to answer it with the first time.
+    assert_eq!(
+        get(&loader, &server.url("/a")).served,
+        otlyra_net::Served::Network
+    );
+    // Stale with a validator: the server was asked and said no, so the body is
+    // the cache's and only the headers crossed the wire. Neither *cached* nor
+    // *fetched* on its own is true of that, which is why there are three states.
+    assert_eq!(
+        get(&loader, &server.url("/a")).served,
+        otlyra_net::Served::Revalidated
+    );
+
+    let fresh = serve(|_| respond("200 OK", &["Cache-Control: max-age=3600"], "x"));
+    let (loader, _cache) = cached();
+    assert_eq!(
+        get(&loader, &fresh.url("/b")).served,
+        otlyra_net::Served::Network
+    );
+    assert_eq!(
+        get(&loader, &fresh.url("/b")).served,
+        otlyra_net::Served::Cache
+    );
+}
+
 /// Stale, with something to ask with: one conditional request, and the body is
 /// not sent again.
 #[test]

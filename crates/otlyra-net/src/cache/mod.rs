@@ -24,8 +24,10 @@
 //! 3. **This is a private cache**, one reader's own, which is what makes
 //!    `private` storable and `s-maxage` none of its business.
 
+pub mod disk;
 pub mod policy;
 pub mod store;
 
+pub use disk::Disk;
 pub use policy::{Directives, Lifetime, Times, Use, lifetime, may_store, use_of};
 pub use store::{Cache, Capacity, Stored};

@@ -951,6 +951,21 @@ pub struct BrowserUi {
     find_takes_keyboard: std::cell::Cell<bool>,
     /// The id the build moved the keyboard to, for the build to adopt afterwards.
     focus_granted: std::cell::Cell<Option<FocusId>>,
+    /// Whether the address bar has been asked for the keyboard and has not been
+    /// given it against a frame yet.
+    ///
+    /// # Why an intention and not an id
+    ///
+    /// A [`FocusId`] is a *position* in the ring the last frame built. Opening a
+    /// tab changes which controls that frame has — a blank tab has nothing to go
+    /// back to and nothing to reload — so the position the address field had is
+    /// somebody else's the moment the toolbar is rebuilt, and the caret set
+    /// before the rebuild lands on a button after it. That is the bug this exists
+    /// to fix: ⌘T focused the field and the very next frame took it away.
+    ///
+    /// So the request outlives one build and is resolved against the ring that
+    /// build produced, where the answer is right by construction.
+    address_wanted: bool,
     /// The panel drawn over everything, if one is open.
     popup: Option<Popup>,
     /// Whether the page in the active tab is one the reader kept.
@@ -1087,6 +1102,7 @@ impl BrowserUi {
             find_status: FindStatus::default(),
             find_takes_keyboard: std::cell::Cell::new(false),
             focus_granted: std::cell::Cell::new(None),
+            address_wanted: false,
             popup: None,
             bookmark: Bookmarked::Impossible,
             zoom: 1.0,
@@ -1445,10 +1461,14 @@ impl BrowserUi {
     /// keystroke replaces it. Nothing happens before the first frame, because
     /// until then no field has been drawn for the caret to be in.
     pub fn focus_address(&mut self) {
+        // Now, against the ring as it stands, so a caller that never draws a
+        // frame still sees the caret where it asked for it — and again after the
+        // next build, which is the one that decides where the field really is.
         if let Some(id) = self.focus.first_text() {
             self.focused = Some(id);
-            self.address.select_all();
         }
+        self.address.select_all();
+        self.address_wanted = true;
     }
 
     /// What a press at `x`, `y` would report, without reporting it.
@@ -2280,6 +2300,16 @@ impl BrowserUi {
         );
 
         self.root = Some(root);
+        // The address bar, asked for before this ring existed. Resolved here,
+        // against the ring this build just filled, because that is the first
+        // moment the answer is a position that means anything.
+        if self.address_wanted {
+            self.address_wanted = false;
+            if let Some(id) = self.focus.first_text() {
+                self.focused = Some(id);
+                appearance.focus = Some(id);
+            }
+        }
         // A field that took the keyboard as it was built. The key is corrected
         // rather than left alone: it says what this list was drawn from, and a
         // key claiming the keyboard was elsewhere would let this frame — the one

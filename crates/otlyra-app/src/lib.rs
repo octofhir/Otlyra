@@ -51,6 +51,7 @@ pub mod browser;
 pub mod cache;
 pub mod clipboard;
 pub mod cookies;
+pub mod digest;
 pub mod downloads;
 pub mod fetcher;
 pub mod history;

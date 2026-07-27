@@ -47,6 +47,19 @@ pub struct LoadRequest {
     pub navigation: bool,
     /// What the cache is allowed to do about this one.
     pub cache: CacheMode,
+    /// Headers the caller wants on the request, over and above the ones the
+    /// loader puts there itself.
+    ///
+    /// # Whose headers win
+    ///
+    /// These are written *last*, so a caller may replace what the loader would
+    /// have sent — which is the point: a driver rewriting `Accept-Language` or
+    /// adding an `Authorization` is doing so because the ordinary value is not
+    /// the one it wants. `Cookie` is the exception and is not replaceable here:
+    /// the jar decides what a site is entitled to be sent, and a caller that
+    /// could write that header directly could send one site's session to
+    /// another.
+    pub headers: Vec<(String, String)>,
 }
 
 /// What a request is allowed to take from the cache.
@@ -79,6 +92,7 @@ impl LoadRequest {
             initiator: None,
             navigation: false,
             cache: CacheMode::Default,
+            headers: Vec::new(),
         }
     }
 
@@ -105,6 +119,12 @@ impl LoadRequest {
     /// The same request, with what the cache may do about it.
     pub fn caching(mut self, cache: CacheMode) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// The same request, carrying `headers` as well.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -138,6 +158,34 @@ pub struct LoadedResource {
     pub response_headers: Vec<(String, String)>,
     /// The body, decompressed but otherwise untouched.
     pub body: Vec<u8>,
+    /// Where this answer actually came from.
+    pub served: Served,
+}
+
+/// Where a response came from.
+///
+/// # Why this is a fact and not an inference
+///
+/// A cache that works is invisible: the page appears, and nothing anywhere says
+/// whether a byte crossed the network. That is fine until somebody asks *is this
+/// being cached* — and then the only honest answers are a stopwatch and a guess,
+/// because a fast fetch and a cache hit look the same from outside.
+///
+/// So the loader, which is the one thing that knows, says. Three states rather
+/// than a boolean because the middle one is the interesting one: a revalidation
+/// did touch the network and did not send a body, and calling it either *cached*
+/// or *fetched* would be wrong in a way that hides the most valuable thing a
+/// cache does.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Served {
+    /// Fetched. Nothing in the cache answered it.
+    #[default]
+    Network,
+    /// Answered out of the cache without asking anybody.
+    Cache,
+    /// Asked, and the server said nothing had changed — so the body is the
+    /// cache's and only the headers crossed the network.
+    Revalidated,
 }
 
 impl LoadedResource {
@@ -478,6 +526,10 @@ impl Loader {
                 request_headers: Vec::new(),
                 response_headers: Vec::new(),
                 body,
+                // A `data:` URL was never fetched and is never cached: the bytes
+                // were in the address. Reported as network because that is the
+                // one of the three that means *not out of the cache*.
+                served: Served::Network,
             });
         }
 
@@ -526,6 +578,49 @@ impl Loader {
             && request.cache != CacheMode::Bypass
             && let Some(cache) = self.cache.as_ref()
         {
+            // Nothing in memory, but perhaps from a previous run. The index says
+            // which file under the lock; the file is read with the lock dropped,
+            // because a `read` there would be the one cache mutex held across a
+            // syscall on a two-worker runtime. Taken in three steps for that
+            // reason and no other.
+            let wanted = {
+                let cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.disk_file(&key).filter(|_| !cache.holds(&key))
+            };
+            if let Some(file) = wanted {
+                // On the blocking pool rather than here. This runs on a worker
+                // thread of the shared runtime, and a `read` on one of those is
+                // that worker — the reactor, the timers, and every other fetch it
+                // drives — stopped for as long as the disk takes. Which worker
+                // threads there are is the caller's business and not something to
+                // be sized around one blocking call.
+                let read = tokio::task::spawn_blocking(move || crate::cache::Disk::read_at(&file))
+                    .await
+                    .unwrap_or_else(|error| {
+                        // A cache that could not be read is a cache that missed.
+                        tracing::warn!(%error, "the cache read did not finish");
+                        None
+                    });
+                match read {
+                    // The address inside the file is the one that decides: two
+                    // that hash alike would otherwise be one entry answering for
+                    // the other.
+                    Some((under, stored)) if under == key => cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .adopt(&key, stored),
+                    _ => {
+                        tracing::debug!(%key, "a cache file did not answer for its address");
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .disown(&key);
+                    }
+                }
+            }
+
             let mut cache = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -537,7 +632,7 @@ impl Loader {
                 // between a page that reappears and a page that loads again.
                 Some((stored, crate::cache::Use::Fresh)) if request.cache == CacheMode::Default => {
                     tracing::debug!(%key, "answered from the cache");
-                    return Ok(stored.as_resource());
+                    return Ok(stored.as_resource(Served::Cache));
                 }
                 // A validator belongs to the address that sent it. Where the
                 // entry was stored under one address and answered by another —
@@ -589,8 +684,9 @@ impl Loader {
             // stored under the address the reader asked for, and a redirect is a
             // different resource with different validators.
             let asking = if hop == 0 { conditions.as_slice() } else { &[] };
-            let (response, request_headers) =
-                self.send(&url, body.clone(), context, now, asking).await?;
+            let (response, request_headers) = self
+                .send(&url, body.clone(), context, now, asking, &request.headers)
+                .await?;
             self.take_cookies(&response, &url, context, now);
 
             // The server saying nothing changed. The body was never sent, so the
@@ -611,7 +707,7 @@ impl Loader {
                 if cache.refresh(&key, &headers, times) {
                     tracing::debug!(%key, "the server said nothing changed");
                     if let Some((stored, _)) = cache.look_up(&key, &varying, now) {
-                        return Ok(stored.as_resource());
+                        return Ok(stored.as_resource(Served::Revalidated));
                     }
                 }
             }
@@ -659,6 +755,7 @@ impl Loader {
         context: crate::cookie::Context,
         now: std::time::SystemTime,
         conditions: &[(&'static str, String)],
+        extra: &[(String, String)],
     ) -> Result<(reqwest::Response, Vec<(String, String)>), NetError> {
         let shown = url.to_string();
         let built = match body {
@@ -685,6 +782,20 @@ impl Loader {
             built.headers_mut().insert(reqwest::header::COOKIE, value);
         }
         for (name, written) in conditions {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(written)
+            {
+                built.headers_mut().insert(name, value);
+            }
+        }
+        // The caller's own, last, so they replace rather than sit beside what is
+        // already there — except `Cookie`, which is the jar's to decide: a caller
+        // that could write it could send one site's session to another.
+        for (name, written) in extra {
+            if name.eq_ignore_ascii_case("cookie") {
+                tracing::warn!(%name, "a caller may not write the cookie header");
+                continue;
+            }
             if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 && let Ok(value) = reqwest::header::HeaderValue::from_str(written)
             {
@@ -759,6 +870,7 @@ impl Loader {
             request_headers,
             response_headers,
             body,
+            served: Served::Network,
         })
     }
 
@@ -938,6 +1050,7 @@ mod tests {
             request_headers: Vec::new(),
             response_headers: Vec::new(),
             body: body.to_vec(),
+            served: Served::Network,
         }
     }
 

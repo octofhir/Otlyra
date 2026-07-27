@@ -37,7 +37,7 @@ pub mod url;
 pub use cookie::{Cookie, Jar, SameSite, SetCookie};
 pub use limits::Limits;
 pub use loader::{
-    Body, CacheMode, LoadRequest, LoadedResource, Loader, NetError, SharedCache, SharedJar,
+    Body, CacheMode, LoadRequest, LoadedResource, Loader, NetError, Served, SharedCache, SharedJar,
 };
 pub use mime::{Sniffed, sniff};
 pub use url::{is_fetchable, may_navigate, normalize, read_data_url, resolve};

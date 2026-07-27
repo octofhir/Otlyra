@@ -97,7 +97,19 @@ cargo run -- --file page.html --inspector --screenshot shot.png
 
 `--bidi` answers WebDriver BiDi on a loopback port; `--mcp` answers the Model
 Context Protocol on stdin and stdout, so an agent can drive the browser with no
-client library at all. Adding `--window` drives the browser's *whole window*
+client library at all.
+
+Scripting is not wired up, so neither surface has `script.evaluate` — and neither
+needs it to be useful. A caller reads the page as Markdown, asks for everything on
+it that can be clicked or typed into, and acts on what it read by the handle it
+was given: no screenshot per turn and no selector guessed. Both readings come off
+the accessibility tree rather than off the DOM, so what an agent is told and what
+a screen reader is told cannot drift apart. Elements can be found by selector, by
+the words they show, or by the role and name a reader would announce; cookies,
+the request log and what the engine said about itself are all readable the same
+way.
+
+Adding `--window` drives the browser's *whole window*
 rather than the page: input arrives the way a window delivers it, and
 `otlyra:captureWindow` — `browser_window` to an agent — hands back the composited
 window, chrome and all, with what the frame redrew beside it. That is what it

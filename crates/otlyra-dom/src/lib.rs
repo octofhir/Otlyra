@@ -37,6 +37,7 @@ pub mod node;
 pub mod sink;
 pub mod submit;
 pub mod tree;
+pub mod xpath;
 
 pub use form::{Control, FormState, InputKind};
 pub use limits::DomLimits;
@@ -45,6 +46,7 @@ pub use node::{ElementData, Node, NodeData, NodeId, node_id_from_u64, node_id_to
 pub use sink::DomSink;
 pub use submit::{Encoding, Method, Submission};
 pub use tree::Document;
+pub use xpath::{XPathError, select as xpath_select};
 
 #[cfg(test)]
 mod tests {

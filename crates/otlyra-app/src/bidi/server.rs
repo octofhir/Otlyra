@@ -95,19 +95,43 @@ impl Server {
                     _ => continue,
                 };
 
-                let reply = answer(session, &text);
-                if !send(&mut socket, &reply) {
+                // `None` for a command that was started and cannot be answered
+                // yet. Its reply comes out of `resolve` below, on whichever turn
+                // of this loop the browser gets far enough — which is the whole
+                // reason a driver can send a second command while the first is
+                // still loading.
+                if let Some(reply) = start(session, &text)
+                    && !send(&mut socket, &reply)
+                {
                     break;
                 }
             }
 
-            // After the answer, so a command that causes an event — a navigation
-            // causes several — is answered before the events it caused arrive.
+            // Take in whatever the fetch threads finished, so a parked command
+            // has something new to be measured against and the events below have
+            // something to report.
+            session.pump();
+
             let mut failed = false;
-            for event in session.drain_events() {
-                if !send(&mut socket, &event) {
+            for (id, answer) in session.resolve() {
+                let reply = match answer {
+                    Ok(result) => success(id, result),
+                    Err(error) => error.to_message(Some(id)),
+                };
+                if !send(&mut socket, &reply) {
                     failed = true;
                     break;
+                }
+            }
+
+            // After the answers, so a command that causes an event — a navigation
+            // causes several — is answered before the events it caused arrive.
+            if !failed {
+                for event in session.drain_events() {
+                    if !send(&mut socket, &event) {
+                        failed = true;
+                        break;
+                    }
                 }
             }
             if failed {
@@ -115,6 +139,11 @@ impl Server {
             }
         }
 
+        // Whatever this client set up goes with it. Above all its intercepts: the
+        // gate lives on the browser and would otherwise stay installed with
+        // nobody left to answer it, so every address it matches would be held
+        // forever — including for the client that connects next.
+        session.disconnected();
         tracing::info!(%peer, "the driver went away");
         Ok(())
     }
@@ -145,15 +174,33 @@ fn send(socket: &mut tungstenite::WebSocket<std::net::TcpStream>, message: &Valu
         .is_ok()
 }
 
-/// Turn one message into one reply.
+/// Start one message, and hand back a reply if there is one yet.
 ///
-/// Apart from the socket so it can be tested without one: what a protocol gets
-/// wrong is almost never the framing.
-pub(super) fn answer(session: &mut Session, text: &str) -> Value {
+/// `None` means the command was started and parked — its reply will come out of
+/// [`Session::resolve`] under the same id. Apart from the socket so it can be
+/// tested without one: what a protocol gets wrong is almost never the framing.
+pub(super) fn start(session: &mut Session, text: &str) -> Option<Value> {
     let command = match Command::parse(text) {
         Ok(command) => command,
         // A message with no id cannot be answered with an error carrying its id,
         // because it has none. The specification says to send one anyway.
+        Err(error) => return Some(error.to_message(None)),
+    };
+    match session.begin(&command) {
+        Ok(super::Outcome::Done(result)) => Some(success(command.id, result)),
+        Ok(super::Outcome::Parked) => None,
+        Err(error) => Some(error.to_message(Some(command.id))),
+    }
+}
+
+/// The same, waiting for a parked command rather than leaving it.
+///
+/// What a test uses, and nothing else: the loop above must not wait, and this
+/// exists so a case can be written as one message in and one message out.
+#[cfg(test)]
+pub(super) fn answer(session: &mut Session, text: &str) -> Value {
+    let command = match Command::parse(text) {
+        Ok(command) => command,
         Err(error) => return error.to_message(None),
     };
     match session.dispatch(&command) {

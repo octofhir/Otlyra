@@ -55,12 +55,27 @@ struct Drawn {
     rect: Rect,
     entries: usize,
     bytes: usize,
+    /// What the disk is holding, which a restart does not empty.
+    kept: (usize, usize),
     scroll: f64,
     pointer: (f64, f64),
     focus: Option<FocusId>,
 }
 
+/// How much is held, where, and how much good it has done — the three numbers
+/// the summary is drawn from, together because they are read together.
+#[derive(Clone, Copy)]
+struct Held {
+    /// Bytes in memory.
+    bytes: usize,
+    /// Entries and bytes on the disk.
+    kept: (usize, usize),
+    /// Hits and misses.
+    counts: (u64, u64),
+}
+
 /// One site, and everything held for it.
+#[derive(Debug)]
 struct Site {
     name: String,
     bytes: usize,
@@ -233,21 +248,25 @@ impl CacheSurface {
         out: &mut DisplayList,
     ) {
         // Read out from under the lock once: how much is held, and what of.
-        let (entries, bytes, sites, hits, misses) = match store {
+        let (entries, bytes, kept, sites, hits, misses) = match store {
             Some(store) => {
                 let held = store
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let (hits, misses) = held.counts();
-                (held.len(), held.bytes(), by_site(&held), hits, misses)
+                let kept = held
+                    .disk()
+                    .map_or((0, 0), |disk| (disk.len(), disk.bytes()));
+                (held.len(), held.bytes(), kept, by_site(&held), hits, misses)
             }
-            None => (0, 0, Vec::new(), 0, 0),
+            None => (0, 0, (0, 0), Vec::new(), 0, 0),
         };
 
         let drawn = Drawn {
             rect,
             entries,
             bytes,
+            kept,
             scroll: self.scroll,
             pointer: self.pointer,
             focus: self.focused,
@@ -275,8 +294,11 @@ impl CacheSurface {
             &theme,
             rect.width,
             &sites,
-            bytes,
-            (hits, misses),
+            Held {
+                bytes,
+                kept,
+                counts: (hits, misses),
+            },
             &self.focus,
         );
         root.measure(Size::new(rect.width, rect.height), &mut cx);
@@ -295,12 +317,16 @@ impl CacheSurface {
         theme: &Theme,
         width: f64,
         sites: &[Site],
-        bytes: usize,
-        counts: (u64, u64),
+        held: Held,
         focus: &Focus,
     ) -> Child<Action> {
+        let Held {
+            bytes,
+            kept,
+            counts,
+        } = held;
         let mut rows: Vec<Child<Action>> = Vec::new();
-        if sites.is_empty() {
+        if sites.is_empty() && kept.0 == 0 {
             rows.push(Box::new(Padding::new(
                 Insets::all(theme.inset * 2.0),
                 Box::new(Align::centre(Box::new(Label::new(
@@ -310,7 +336,7 @@ impl CacheSurface {
                 )))),
             )));
         } else {
-            rows.push(self.summary(theme, bytes, counts));
+            rows.push(self.summary(theme, bytes, kept, counts));
             for site in sites {
                 rows.push(self.site_card(theme, focus, site));
             }
@@ -347,9 +373,27 @@ impl CacheSurface {
     /// The second half is the point of showing either. A cache's whole effect is
     /// invisible — it is the request that was not made — so without the count a
     /// reader has no way to tell a cache that is working from one that is not.
-    fn summary(&self, theme: &Theme, bytes: usize, (hits, misses): (u64, u64)) -> Child<Action> {
+    fn summary(
+        &self,
+        theme: &Theme,
+        bytes: usize,
+        (entries, kept): (usize, usize),
+        (hits, misses): (u64, u64),
+    ) -> Child<Action> {
+        // Both tiers, because they answer different questions and one standing
+        // for the other is how this page came to say *nothing has been kept* to
+        // somebody whose disk held a thousand things. What is in memory is what
+        // this run has touched; what is on disk is what survives closing the
+        // browser, and that is the number a person means by *is it caching*.
         let held: Child<Action> = Box::new(Align::left(Box::new(Label::new(
-            format!("{} held", in_bytes(bytes)),
+            match entries {
+                0 => format!("{} held", in_bytes(bytes)),
+                _ => format!(
+                    "{} held, and {} of it kept between runs",
+                    in_bytes(bytes.max(kept)),
+                    in_bytes(kept)
+                ),
+            },
             theme.font_size,
             theme.ink,
         ))));
@@ -497,18 +541,36 @@ fn in_bytes(bytes: usize) -> String {
 
 /// What is held, grouped by the site it came from, alphabetically, with each
 /// site's own addresses sorted so the list does not reshuffle as they are used.
+///
+/// Both tiers, unioned by address. An entry read back from the disk this run is
+/// in memory *and* on the disk, and counting it twice would have the page report
+/// a site holding twice what it holds. Memory wins where both have it, because
+/// that copy is the one being served.
 fn by_site(cache: &Cache) -> Vec<Site> {
     let mut sites: Vec<Site> = Vec::new();
-    for (url, stored) in cache.entries() {
+    let in_memory: std::collections::HashSet<&str> = cache.entries().map(|(url, _)| url).collect();
+    let held: Vec<(&str, usize)> = cache
+        .entries()
+        .map(|(url, stored)| (url, stored.body.len()))
+        .chain(
+            cache
+                .disk()
+                .into_iter()
+                .flat_map(otlyra_net::cache::Disk::held)
+                .filter(|(url, _)| !in_memory.contains(url)),
+        )
+        .collect();
+
+    for (url, bytes) in held {
         let name = otlyra_net::cache::store::site_of(url).unwrap_or_else(|| url.to_owned());
         match sites.iter_mut().find(|site| site.name == name) {
             Some(site) => {
-                site.bytes += stored.body.len();
+                site.bytes += bytes;
                 site.addresses.push(url.to_owned());
             }
             None => sites.push(Site {
                 name,
-                bytes: stored.body.len(),
+                bytes,
                 addresses: vec![url.to_owned()],
             }),
         }
@@ -529,6 +591,26 @@ mod tests {
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    /// One response, kept for an hour, with `body` in it.
+    fn stored(body: &[u8]) -> Stored {
+        Stored {
+            status: 200,
+            headers: vec![("cache-control".to_owned(), "max-age=3600".to_owned())],
+            body: body.to_vec(),
+            final_url: "https://a.example/x".to_owned(),
+            directives: otlyra_net::cache::Directives::parse(["max-age=3600"]),
+            lifetime: otlyra_net::cache::Lifetime::Stated(Duration::from_secs(3600)),
+            times: otlyra_net::cache::Times {
+                requested: now(),
+                received: now(),
+                date: now(),
+                age: Duration::ZERO,
+            },
+            varied: Vec::new(),
+            varies_on_everything: false,
+        }
     }
 
     fn filled() -> SharedCache {
@@ -696,6 +778,57 @@ mod tests {
     }
 
     /// A size a person reads rather than counts.
+    #[test]
+    fn what_survived_the_last_run_is_listed_even_though_memory_is_empty() {
+        // The bug this exists to stop coming back: the page read the memory tier
+        // only, so a browser that had just started said "nothing has been kept"
+        // to somebody whose disk held a thousand things.
+        let directory =
+            std::env::temp_dir().join(format!("otlyra-cache-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let disk = otlyra_net::cache::Disk::open(&directory, 1024 * 1024).expect("opened");
+        let mut cache = Cache::new().with_disk(disk);
+        cache.store(
+            "https://kept.example/logo.png",
+            "GET",
+            stored(b"pretend this is a picture"),
+            &[],
+        );
+        // The writing happens on a thread of its own so that the cache lock is
+        // never held over a syscall, so a test that goes and looks at the
+        // directory says when it wants it to have landed.
+        cache.settle();
+        // What a restart is: the disk as it was, and nothing in memory.
+        let reopened = otlyra_net::cache::Disk::open(&directory, 1024 * 1024).expect("reopened");
+        let cold = Cache::new().with_disk(reopened);
+        assert!(cold.is_empty(), "memory should start empty");
+
+        let sites = by_site(&cold);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].name, "kept.example");
+        assert_eq!(sites[0].addresses, ["https://kept.example/logo.png"]);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_entry_in_both_tiers_is_counted_once() {
+        let directory =
+            std::env::temp_dir().join(format!("otlyra-cache-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let disk = otlyra_net::cache::Disk::open(&directory, 1024 * 1024).expect("opened");
+        let mut cache = Cache::new().with_disk(disk);
+        cache.store("https://a.example/x", "GET", stored(b"1234"), &[]);
+
+        // It is in memory and on the disk at once, which is the ordinary state of
+        // anything just fetched. Counting both copies would report a site holding
+        // twice what it holds.
+        let sites = by_site(&cache);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].addresses.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].bytes, 4);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn a_size_is_said_in_words() {
         assert_eq!(in_bytes(0), "nothing");

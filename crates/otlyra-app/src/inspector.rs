@@ -2534,6 +2534,16 @@ impl Inspector {
             vec!["Waited (ask to done)".to_owned(), waited],
             vec!["Queued (before transport)".to_owned(), queue],
             vec!["Transport (took)".to_owned(), took],
+            vec![
+                "Served from".to_owned(),
+                match exchange.served {
+                    otlyra_net::Served::Network => "the network".to_owned(),
+                    otlyra_net::Served::Cache => "the cache, without asking".to_owned(),
+                    otlyra_net::Served::Revalidated => {
+                        "the cache, after the server said it had not changed".to_owned()
+                    }
+                },
+            ],
         ];
         Box::new(Table::new(
             vec!["stage".to_owned(), "time".to_owned()],
@@ -2865,10 +2875,19 @@ fn net_row(
                         code,
                         exchange.method.to_owned(),
                         kind_short(exchange.kind).to_owned(),
-                        match &exchange.status {
-                            crate::fetcher::Status::Ok(bytes) => bytes_read(*bytes),
-                            crate::fetcher::Status::Pending => String::new(),
-                            crate::fetcher::Status::Failed(_) => String::new(),
+                        match (&exchange.status, exchange.served) {
+                            // Where the bytes came from, in the column that would
+                            // otherwise say how many. A cache that works is
+                            // invisible, and *is this being cached* is the one
+                            // question a list of sizes and times cannot answer.
+                            (crate::fetcher::Status::Ok(_), otlyra_net::Served::Cache) => {
+                                "cache".to_owned()
+                            }
+                            (crate::fetcher::Status::Ok(_), otlyra_net::Served::Revalidated) => {
+                                "304".to_owned()
+                            }
+                            (crate::fetcher::Status::Ok(bytes), _) => bytes_read(*bytes),
+                            _ => String::new(),
                         },
                         short_url(&exchange.url),
                         tone,

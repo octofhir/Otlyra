@@ -37,6 +37,13 @@ const SURFACE_INSPECTOR: UiSurfaceId = UiSurfaceId::new(4);
 struct PendingLoad {
     /// The request the document itself was asked for under.
     document: u64,
+    /// Whether that request has come back.
+    ///
+    /// The line between *this tab has a document to look at* and *this tab has
+    /// everything it asked for*, which is the line WebDriver draws between
+    /// `interactive` and `complete` — and the only reason a driver can be
+    /// answered before the last picture arrives.
+    document_arrived: bool,
     /// Where the tab was before, which decides whether this is a new place.
     previous_url: String,
     /// Whether arriving should add a history entry. A reload and a step through
@@ -127,6 +134,12 @@ pub struct Tab {
     pub system: Option<SystemPage>,
     /// The load in flight, if one is.
     pending: Option<PendingLoad>,
+    /// What the most recent navigation in this tab is called.
+    ///
+    /// Kept after the load ends rather than dropped with `pending`, because the
+    /// events that report a load *finishing* carry the name of the navigation
+    /// that finished — and by then there is no pending load to read it from.
+    pub navigation: Option<u64>,
     /// Where this tab has been, oldest first.
     ///
     /// A list and a position rather than two stacks: going back and then somewhere
@@ -152,6 +165,30 @@ fn next_tab_id() -> TabId {
     TabId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The next navigation's name, from the same kind of counter and for the same
+/// reason: a driver holds it across commands and two of them must never collide.
+fn next_navigation_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How far a tab's load has got.
+///
+/// The three states WebDriver lets a caller wait for, and the reason a driver
+/// need not wait for the slowest picture on the page before it can act: a
+/// document that has been parsed can be clicked, and everything this browser
+/// fetches after that is decoration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Readiness {
+    /// A load is in flight and its document has not arrived.
+    Started,
+    /// The document is parsed and laid out; subresources are still coming.
+    Interactive,
+    /// Nothing is outstanding.
+    Complete,
+}
+
 impl Tab {
     /// A blank tab.
     pub fn blank() -> Self {
@@ -163,6 +200,7 @@ impl Tab {
             error: None,
             system: None,
             pending: None,
+            navigation: None,
             history: Vec::new(),
             position: 0,
         }
@@ -1333,8 +1371,10 @@ impl Browser {
         tab.url = url.to_owned();
         tab.error = None;
         tab.title = url.to_owned();
+        tab.navigation = Some(next_navigation_id());
         tab.pending = Some(PendingLoad {
             document: id,
+            document_arrived: false,
             previous_url,
             record,
             restore_scroll,
@@ -1439,6 +1479,14 @@ impl Browser {
             || !self.font_fetches.is_empty()
             || !self.picture_fetches.is_empty()
         {
+            // Everything left is stopped at the gate, waiting for a driver — and
+            // the driver is answered by this thread. Waiting here would be waiting
+            // for a command nobody is left to read, which is a deadlock and not a
+            // slow page. The frame goes out with what arrived.
+            if self.only_held_remains() {
+                tracing::debug!("a driver is holding everything this frame was waiting for");
+                return;
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 tracing::warn!("gave up waiting for a background picture or a font");
@@ -1455,6 +1503,51 @@ impl Browser {
         self.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
     }
 
+    /// Draw a frame from what has already arrived, waiting for nothing.
+    ///
+    /// What a command loop uses. [`Browser::prepare_frame`] waits for the
+    /// pictures and the fonts a frame asked for, which is right for a screenshot
+    /// and wrong for anything that also has a socket to read: the wait is on the
+    /// network, and a thread inside it is a thread not answering commands.
+    pub fn draw_frame(&mut self, viewport: Viewport) {
+        self.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
+    }
+
+    /// Whether everything still outstanding is stopped at the gate.
+    ///
+    /// `false` when nothing is outstanding at all, because *nothing to wait for*
+    /// is the loop's own condition and not this one's.
+    fn only_held_remains(&self) -> bool {
+        let mut any = false;
+        for id in self
+            .background_fetches
+            .keys()
+            .chain(self.font_fetches.keys())
+            .chain(self.picture_fetches.keys())
+        {
+            any = true;
+            if !self.fetcher.is_held(*id) {
+                return false;
+            }
+        }
+        any
+    }
+
+    /// How far the tab at `index` has got.
+    ///
+    /// Read rather than pushed, like everything else a driver asks about: the
+    /// browser is driven from one thread and its state is already here, so the
+    /// protocol reads it between events instead of the loader calling into a
+    /// socket. A tab with nothing in flight is complete however little is in it —
+    /// a blank tab has arrived everywhere it was going.
+    pub fn readiness(&self, index: usize) -> Readiness {
+        match self.tabs.get(index).and_then(|tab| tab.pending.as_ref()) {
+            None => Readiness::Complete,
+            Some(pending) if pending.document_arrived => Readiness::Interactive,
+            Some(_) => Readiness::Started,
+        }
+    }
+
     /// Wait for the tab to finish loading, for callers with no event loop.
     ///
     /// The window never calls this — it is woken instead. A screenshot and a test
@@ -1462,6 +1555,17 @@ impl Browser {
     pub fn wait_for_load(&mut self, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
         while self.tabs.iter().any(|tab| tab.loading()) {
+            // The document itself is stopped at the gate. Only a driver can let it
+            // go, and a driver is answered by whichever thread called this — so
+            // the wait would be for a command that cannot be read until it ends.
+            if self.tabs.iter().all(|tab| {
+                tab.pending
+                    .as_ref()
+                    .is_none_or(|pending| self.fetcher.is_held(pending.document))
+            }) {
+                tracing::debug!("a driver is holding the document this wait was for");
+                return;
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 tracing::warn!("gave up waiting for a load");
@@ -1738,6 +1842,9 @@ impl Browser {
     /// have been asked for: a page that is readable now and styled a moment later
     /// beats a blank window for the length of the slowest thing it links to.
     fn receive_document(&mut self, index: usize, fetched: Fetched) -> bool {
+        if let Some(pending) = self.tabs[index].pending.as_mut() {
+            pending.document_arrived = true;
+        }
         let interface = self.interface;
         let loaded = match fetched.result {
             Ok(loaded) => loaded,
@@ -2980,6 +3087,36 @@ impl Browser {
     ///
     /// The fetcher's own list, which is what the inspector's network pane reads:
     /// one account of what was asked for, however it is being looked at.
+    /// Hold every request whose address `gate` says yes to, before it is sent.
+    ///
+    /// Only a driver sets this, and only while it has said it wants to intercept:
+    /// a browser nobody is driving holds nothing, and a request held with nobody
+    /// to let it go is a page that never loads. See [`crate::fetcher::Fetcher`].
+    pub fn hold_requests(&mut self, gate: Option<crate::fetcher::Gate>) {
+        self.fetcher.set_gate(gate);
+    }
+
+    /// The requests being held, oldest first.
+    pub fn held(&self) -> &[crate::fetcher::Held] {
+        self.fetcher.held()
+    }
+
+    /// Let a held request go, with whatever was changed about it.
+    pub fn resume_request(&mut self, id: u64, change: crate::fetcher::Change) -> bool {
+        self.fetcher.resume(id, change)
+    }
+
+    /// Answer a held request with a response nobody sent.
+    pub fn fulfil_request(&mut self, id: u64, response: crate::fetcher::Loaded) -> bool {
+        self.fetcher.fulfil(id, response)
+    }
+
+    /// End a held request as a failure, which is what blocking one means.
+    pub fn fail_request(&mut self, id: u64, why: &str) -> bool {
+        self.fetcher.fail(id, why)
+    }
+
+    /// Every request this browser has made, oldest first.
     pub fn exchanges(&self) -> &[crate::fetcher::Exchange] {
         self.fetcher.exchanges()
     }
@@ -3004,6 +3141,55 @@ impl Browser {
     /// a protocol with a temporary directory in its contract.
     pub fn screenshot(&mut self, viewport: Viewport) -> Result<Vec<u8>, String> {
         otlyra_platform::render_offscreen(self, viewport).map_err(|error| error.to_string())
+    }
+
+    /// A picture of one rectangle of what the frame would have drawn.
+    ///
+    /// # Why this is not a crop
+    ///
+    /// The obvious way to answer *photograph this element* is to render the whole
+    /// frame and cut the rectangle out of the pixels. That means decoding a PNG
+    /// to cut it and encoding another — a dependency this crate does not have —
+    /// and it rasterizes a page's worth of glyphs to keep a button.
+    ///
+    /// This composes the same lists the frame is made of, moves them so the
+    /// rectangle's corner is the origin, and rasterizes into a surface the size
+    /// of the rectangle. Nothing outside it is drawn at all, so a clip of a
+    /// hundred pixels costs a hundred pixels. `clip` is in the same logical
+    /// coordinates every other geometry here is in.
+    pub fn screenshot_clipped(
+        &mut self,
+        viewport: Viewport,
+        clip: otlyra_layout::Rect,
+    ) -> Result<Vec<u8>, String> {
+        let scale = viewport.scale_factor;
+        let width = (f64::from(clip.width) * scale).round().max(1.0) as u32;
+        let height = (f64::from(clip.height) * scale).round().max(1.0) as u32;
+
+        // The frame, as `paint` composes it, in one list rather than four
+        // renders: a list can be moved and four `render` calls cannot.
+        let geom = self.frame_geom(viewport);
+        let mut whole = otlyra_gfx::DisplayList::new();
+        whole.append(&self.page_list(&geom));
+        if let Some(highlight) = self.highlight_list(&geom) {
+            whole.append(&highlight);
+        }
+        if self.interface {
+            if geom.dock > 0.0 {
+                whole.append(&self.inspector_list(&geom));
+            }
+            whole.append(&self.chrome_list(&geom));
+        }
+        self.after_frame();
+
+        whole.transform(otlyra_gfx::kurbo::Affine::scale(scale).then_translate(
+            otlyra_gfx::kurbo::Vec2::new(-f64::from(clip.x) * scale, -f64::from(clip.y) * scale),
+        ));
+
+        let mut target = otlyra_gfx::SkiaPainter::new_raster(width, height)
+            .map_err(|error| error.to_string())?;
+        otlyra_gfx::render(&whole, &mut target);
+        target.encode_png().map_err(|error| error.to_string())
     }
 
     /// The inspector, for whoever is driving the browser rather than using it.
@@ -4749,6 +4935,37 @@ mod system_page_tests {
     fn press(browser: &mut Browser, x: f64, y: f64) {
         browser.on_event(PlatformEvent::PointerMoved { x, y });
         browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    }
+
+    /// A new tab is opened to type an address into, and the caret has to still be
+    /// there once the toolbar has been drawn for it.
+    ///
+    /// The frame in the middle is the whole test. Focus is a position in the ring
+    /// the last frame built, and a blank tab's toolbar is not the previous tab's:
+    /// without the request outliving the rebuild, ⌘T put the caret in the field
+    /// and the very next frame moved it to a button, so the first thing typed
+    /// went nowhere.
+    #[test]
+    fn a_new_tab_is_ready_to_be_typed_into_after_it_has_been_drawn() {
+        let mut browser = Browser::new(NoNetwork);
+        frame(&mut browser, 900.0, 700.0);
+        browser.navigate("https://a.example/");
+        browser.wait_for_load(std::time::Duration::from_secs(2));
+        frame(&mut browser, 900.0, 700.0);
+
+        browser.new_tab();
+        frame(&mut browser, 900.0, 700.0);
+        assert!(
+            browser.ui().address_focused(),
+            "the caret left the field when the toolbar was rebuilt"
+        );
+
+        browser.on_event(PlatformEvent::TextInput('x'));
+        assert_eq!(
+            browser.ui().address.text(),
+            "x",
+            "what was typed did not reach the address bar"
+        );
     }
 
     /// Draw one frame at `width` by `height`, which is what gives the interface
@@ -8177,6 +8394,49 @@ mod tests {
         assert_eq!(
             browser.tabs[browser.active].url, "https://site.example/save",
             "and the tab is where the form sent it"
+        );
+    }
+
+    /// A frame must not wait on a request only a driver can release.
+    ///
+    /// The deadlock this guards: the gate holds a picture the page asked for,
+    /// `prepare_frame` waits for it, and the command that would let it go arrives
+    /// on the thread now sitting inside `prepare_frame`. Waiting there is waiting
+    /// for oneself, and it used to cost a full load timeout every frame.
+    #[test]
+    fn a_frame_does_not_wait_for_a_picture_a_driver_is_holding() {
+        struct WithPicture;
+
+        impl Loader for WithPicture {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><img src=held.png><p>text".to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut browser = Browser::new(WithPicture);
+        browser.hold_requests(Some(Box::new(|url: &str| url.ends_with(".png"))));
+        go(&mut browser, "https://pictures.example/");
+
+        let started = std::time::Instant::now();
+        browser.prepare_frame(
+            Viewport::new(800, 600, 1.0),
+            std::time::Duration::from_secs(10),
+        );
+        let took = started.elapsed();
+
+        assert!(
+            !browser.held().is_empty(),
+            "the picture should have been held, or this proves nothing"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the frame waited {took:?} for a request only a driver could release"
         );
     }
 

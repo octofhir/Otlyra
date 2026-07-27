@@ -57,7 +57,7 @@ impl Stored {
     /// on a request that is over, and a pane showing this one's headers would be
     /// showing a request nobody made. That a response came from here is the
     /// interesting fact, and it is the caller's to report.
-    pub fn as_resource(&self) -> crate::LoadedResource {
+    pub fn as_resource(&self, served: crate::Served) -> crate::LoadedResource {
         let header = |name: &str| {
             self.headers
                 .iter()
@@ -73,6 +73,7 @@ impl Stored {
             request_headers: Vec::new(),
             response_headers: self.headers.clone(),
             body: self.body.clone(),
+            served,
         }
     }
 
@@ -222,6 +223,19 @@ pub struct Cache {
     held: usize,
     hits: u64,
     misses: u64,
+    /// Where entries go so that closing the browser does not lose them.
+    ///
+    /// # Why the two tiers are not one
+    ///
+    /// This one is in front. A page of forty pictures asks for the same handful
+    /// over and over within one frame, and answering those off a disk would be
+    /// forty file reads for bytes already in hand. The disk answers the *other*
+    /// question — the one a person notices — which is the site they open every
+    /// morning being fetched from nothing every morning.
+    ///
+    /// `None` is a cache that forgets on exit, which is what every test and every
+    /// browser with nowhere to write gets.
+    disk: Option<super::disk::Disk>,
 }
 
 impl Default for Cache {
@@ -245,7 +259,36 @@ impl Cache {
             held: 0,
             hits: 0,
             misses: 0,
+            disk: None,
         }
+    }
+
+    /// Keep what is stored here on `disk` as well, and answer out of it.
+    ///
+    /// Handed in rather than opened here for the same reason the cookie file is:
+    /// where a browser may write is the shell's to decide, and a cache that chose
+    /// its own directory would be a library writing to somebody's disk because it
+    /// was linked.
+    pub fn with_disk(mut self, disk: super::disk::Disk) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
+    /// The same, to a cache that is already being used.
+    ///
+    /// What opening the disk somewhere other than the startup path needs: reading
+    /// the headers of a thousand files is a thousand short reads, and doing them
+    /// before the first frame is a browser that opens slowly because it once
+    /// cached something. Whatever was fetched before this landed simply missed
+    /// the disk tier, which is a cache doing its worse job for a moment and not a
+    /// wrong answer.
+    pub fn attach_disk(&mut self, disk: super::disk::Disk) {
+        self.disk = Some(disk);
+    }
+
+    /// What is being kept on the disk, if anything is.
+    pub fn disk(&self) -> Option<&super::disk::Disk> {
+        self.disk.as_ref()
     }
 
     /// How many bodies are held, and how many bytes of them.
@@ -256,6 +299,12 @@ impl Cache {
     /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether the memory tier has an entry for `url`, whatever it is good for.
+    #[must_use]
+    pub fn holds(&self, url: &str) -> bool {
+        self.entries.contains_key(url)
     }
 
     /// Bytes of body held.
@@ -294,11 +343,20 @@ impl Cache {
         for url in doomed {
             self.remove(&url);
         }
-        count
+        // And whatever this site left on the disk that was never read back into
+        // memory this run — which is most of it, and is the half a person means
+        // when they ask for a site to be forgotten.
+        match self.disk.as_mut() {
+            Some(disk) => count.max(disk.forget_site(site)),
+            None => count,
+        }
     }
 
     /// Throw everything away.
     pub fn clear(&mut self) {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.clear();
+        }
         self.entries.clear();
         self.order.clear();
         self.held = 0;
@@ -308,6 +366,10 @@ impl Cache {
     /// carry.
     ///
     /// Counted: this is the one place a hit and a miss can be told apart.
+    /// Looks in memory only. The disk tier is reached through
+    /// [`Cache::disk_file`] and [`Cache::adopt`], which are apart from this so
+    /// that the file read happens with this cache's lock dropped — see
+    /// [`super::disk::Disk`] for why nothing here may touch a disk.
     pub fn look_up(
         &mut self,
         url: &str,
@@ -336,6 +398,55 @@ impl Cache {
         // Used is used, whether it was served or only asked about.
         self.touch(url);
         self.entries.get(url).map(|stored| (stored, use_))
+    }
+
+    /// Which file the disk tier keeps its answer for `url` in, if any.
+    ///
+    /// A hash lookup, and the whole of what a caller may do about the disk while
+    /// holding this cache's lock. The read itself is
+    /// [`super::disk::Disk::read_at`], and belongs outside it.
+    #[must_use]
+    pub fn disk_file(&self, url: &str) -> Option<std::path::PathBuf> {
+        self.disk.as_ref()?.file_for(url)
+    }
+
+    /// Take an entry read off the disk into the memory tier.
+    ///
+    /// The other half of [`Cache::disk_file`]: what came back from the file, put
+    /// in front where the next ask for it costs nothing.
+    pub fn adopt(&mut self, url: &str, stored: Stored) {
+        if self.entries.contains_key(url) {
+            // Somebody else got there while the file was being read. Theirs is no
+            // older than this and is already accounted for.
+            return;
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.mark_used(url);
+        }
+        self.held += stored.body.len();
+        self.entries.insert(url.to_owned(), stored);
+        self.order.push(url.to_owned());
+        self.make_room_keeping_the_disk();
+    }
+
+    /// Drop a disk entry whose file did not answer for the address it was under.
+    ///
+    /// What a hash collision, or a write a crash cut in half, looks like from the
+    /// reading side.
+    pub fn disown(&mut self, url: &str) {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.forget(url);
+        }
+    }
+
+    /// Wait until the disk tier has written everything it was given.
+    ///
+    /// For a caller about to look at the directory itself — a test, and shutdown.
+    /// Nothing on the loading path waits for this.
+    pub fn settle(&self) {
+        if let Some(disk) = self.disk.as_ref() {
+            disk.settle();
+        }
     }
 
     /// Keep a response, if it is one worth keeping.
@@ -387,10 +498,13 @@ impl Cache {
         }
 
         self.remove(url);
+        if let Some(disk) = self.disk.as_mut() {
+            disk.write(url, &stored);
+        }
         self.held += stored.body.len();
         self.entries.insert(url.to_owned(), stored);
         self.order.push(url.to_owned());
-        self.make_room();
+        self.make_room_keeping_the_disk();
         true
     }
 
@@ -400,6 +514,13 @@ impl Cache {
             return false;
         };
         stored.refresh(headers, times);
+        let stored = stored.clone();
+        if let Some(disk) = self.disk.as_mut() {
+            // The server has just said how long this is good for *now*, and an
+            // entry on the disk still carrying the old answer would be asked
+            // about again on the next run for no reason.
+            disk.write(url, &stored);
+        }
         self.hits += 1;
         self.touch(url);
         true
@@ -407,6 +528,19 @@ impl Cache {
 
     /// Forget one address.
     pub fn remove(&mut self, url: &str) -> bool {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.forget(url);
+        }
+        self.forget_in_memory(url)
+    }
+
+    /// Drop an entry from memory without touching the disk.
+    ///
+    /// What eviction does. The two budgets are separate on purpose: memory is
+    /// full long before the disk is, and letting a memory eviction delete the
+    /// file would make the disk cache exactly as small as the memory one and
+    /// pointless.
+    fn forget_in_memory(&mut self, url: &str) -> bool {
         let Some(stored) = self.entries.remove(url) else {
             return false;
         };
@@ -421,12 +555,13 @@ impl Cache {
     }
 
     /// Evict until the cache is inside its capacity, least recently used first.
-    fn make_room(&mut self) {
+    /// Evict from memory until the memory budget is met, leaving the disk alone.
+    fn make_room_keeping_the_disk(&mut self) {
         while self.held > self.capacity.bytes {
             let Some(oldest) = self.order.first().cloned() else {
                 break;
             };
-            if !self.remove(&oldest) {
+            if !self.forget_in_memory(&oldest) {
                 // The order and the entries disagreed, which cannot happen — but
                 // looping forever over it could, so the stale name goes.
                 self.order.retain(|held| *held != oldest);

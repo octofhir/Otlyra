@@ -70,6 +70,44 @@ pub struct Loaded {
     pub response_headers: Vec<(String, String)>,
     /// The address it actually came from, after redirects.
     pub final_url: String,
+    /// Whether the network was touched at all, and how much of it.
+    pub served: otlyra_net::Served,
+}
+
+/// The question *should this request be held*, asked of an address.
+///
+/// A named type because it is passed through three layers, and because what it
+/// is matters more than its shape: the fetcher's job is to be stoppable, and
+/// *which* requests are worth stopping is decided where a driver is understood.
+pub type Gate = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// A request held before it was sent, waiting for a driver to say what to do.
+///
+/// It exists between [`Fetcher::fetch`] and the socket, which is the only stretch
+/// where a request can still be changed, answered from nothing, or stopped.
+#[derive(Debug)]
+pub struct Held {
+    /// The number it was made under, and the number a driver names it by.
+    pub id: u64,
+    /// What it is for.
+    pub kind: ResourceKind,
+    /// Where it was going before anybody interfered.
+    pub url: String,
+    /// The method it would have been sent with.
+    pub method: &'static str,
+    body: Option<Body>,
+    cache: CacheMode,
+}
+
+/// What a driver changed about a held request before letting it go.
+#[derive(Debug, Default)]
+pub struct Change {
+    /// Somewhere else to send it.
+    pub url: Option<String>,
+    /// A different body — which is also what turns a `GET` into a `POST`.
+    pub body: Option<Body>,
+    /// Headers to put on it, replacing what the transport would have sent.
+    pub headers: Vec<(String, String)>,
 }
 
 /// A finished fetch, good or bad.
@@ -148,6 +186,12 @@ pub struct Exchange {
     /// How long from the ask to the browser noticing, which includes the wait
     /// for a free slot in the pool.
     pub waited: Option<std::time::Duration>,
+    /// Where the answer came from.
+    ///
+    /// The one thing a request list cannot be read off a stopwatch: a cache hit
+    /// and a fast server look the same from outside, so *is this being cached* is
+    /// unanswerable unless the loader says. It says.
+    pub served: otlyra_net::Served,
     asked_at: std::time::Instant,
 }
 
@@ -170,6 +214,7 @@ impl Exchange {
             body_complete: true,
             took: None,
             waited: None,
+            served: otlyra_net::Served::Network,
             asked_at: std::time::Instant::now(),
         }
     }
@@ -177,6 +222,14 @@ impl Exchange {
 
 /// How many requests the list keeps before the oldest goes.
 const EXCHANGE_LIMIT: usize = 300;
+
+/// How many requests may be held for a driver at once.
+///
+/// A bound rather than a policy: a driver that intercepts everything and answers
+/// promptly never reaches it, and one that stopped answering is the case this
+/// exists for. Generous enough that a page of subresources behind a pattern is
+/// all held at once, which is what interception is for.
+const HELD_LIMIT: usize = 64;
 
 /// How a tab gets its bytes, when getting them blocks.
 ///
@@ -229,7 +282,17 @@ pub trait AsyncLoader: Send + Sync + 'static {
     /// Owned arguments rather than borrowed: what is returned is a future that
     /// outlives this call, and a borrow of the caller's string would not survive
     /// being spawned.
-    fn fetch(self: Arc<Self>, url: String, body: Option<Body>, cache: CacheMode) -> Fetching;
+    ///
+    /// `headers` are what a caller wants on the request over and above what the
+    /// transport puts there itself. Empty for everything the browser fetches on
+    /// its own; a driver rewriting a held request is what fills it.
+    fn fetch(
+        self: Arc<Self>,
+        url: String,
+        body: Option<Body>,
+        cache: CacheMode,
+        headers: Vec<(String, String)>,
+    ) -> Fetching;
 }
 
 /// A blocking [`Loader`] made to look like an [`AsyncLoader`].
@@ -241,11 +304,18 @@ pub trait AsyncLoader: Send + Sync + 'static {
 struct Blocking<L: Loader>(L);
 
 impl<L: Loader> AsyncLoader for Blocking<L> {
-    fn fetch(self: Arc<Self>, url: String, body: Option<Body>, cache: CacheMode) -> Fetching {
-        // A canned loader has nothing to cache and nothing to bypass. Taken
-        // rather than ignored silently, so a test that meant to assert on the
-        // mode is not quietly given a loader that cannot see it.
-        let _ = cache;
+    fn fetch(
+        self: Arc<Self>,
+        url: String,
+        body: Option<Body>,
+        cache: CacheMode,
+        headers: Vec<(String, String)>,
+    ) -> Fetching {
+        // A canned loader has nothing to cache and nothing to bypass, and no
+        // socket to put a header on. Taken rather than ignored silently, so a
+        // test that meant to assert on either is not quietly given a loader that
+        // cannot see them.
+        let _ = (cache, headers);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || self.0.send(&url, body))
                 .await
@@ -288,6 +358,10 @@ pub struct Fetcher {
     /// finished load can ask for a frame. `None` in a test, where there is no loop
     /// to wake and nothing to draw.
     waker: Arc<Mutex<Option<Waker>>>,
+    /// Which requests to hold rather than send. See [`Fetcher::set_gate`].
+    gate: Option<Gate>,
+    /// The requests being held, oldest first.
+    held: Vec<Held>,
     next: u64,
 }
 
@@ -329,6 +403,8 @@ impl Fetcher {
             finished,
             results,
             waker: Arc::new(Mutex::new(None)),
+            gate: None,
+            held: Vec::new(),
             next: 0,
         }
     }
@@ -383,13 +459,157 @@ impl Fetcher {
             body_complete: false,
             took: None,
             waited: None,
+            served: otlyra_net::Served::Network,
             asked_at: std::time::Instant::now(),
         });
+
+        // The one place a request can still be stopped. After this it is on a
+        // task, on a socket, and nothing here can reach it.
+        if self.gate.as_ref().is_some_and(|gate| gate(url)) {
+            // A held request is one nobody may have answered yet, and a driver
+            // that stopped answering — or went away mid-page — must not be able
+            // to grow this without bound. The oldest is failed rather than the
+            // newest refused: a driver working through a list is answering the
+            // old ones, and the page has been waiting on them longest.
+            while self.held.len() >= HELD_LIMIT {
+                let oldest = self.held.remove(0);
+                tracing::warn!(url = %oldest.url, id = oldest.id, "held too long; failing it");
+                self.deliver(Fetched {
+                    id: oldest.id,
+                    kind: oldest.kind,
+                    url: oldest.url,
+                    took: std::time::Duration::ZERO,
+                    result: Err("held for a driver that did not answer".to_owned()),
+                });
+            }
+            tracing::debug!(%url, id, "held for a driver");
+            self.held.push(Held {
+                id,
+                kind,
+                url: url.to_owned(),
+                method,
+                body,
+                cache,
+            });
+            return id;
+        }
+
+        self.launch(id, kind, url.to_owned(), body, cache, Vec::new());
+        id
+    }
+
+    /// Which requests to hold before sending them.
+    ///
+    /// A predicate rather than a list of patterns, because *which* is the
+    /// protocol's question and not the pool's: the fetcher's job is to be
+    /// stoppable, and what a driver considers worth stopping is written where the
+    /// driver is understood. `None` holds nothing, which is every browser nobody
+    /// is driving.
+    pub fn set_gate(&mut self, gate: Option<Gate>) {
+        self.gate = gate;
+    }
+
+    /// The requests being held, oldest first.
+    pub fn held(&self) -> &[Held] {
+        &self.held
+    }
+
+    /// Whether this request is one being held rather than one in flight.
+    ///
+    /// What a caller asks before deciding to wait for it. A held request is
+    /// waiting on a driver, and a driver is answered by the thread that would be
+    /// doing the waiting — so waiting for one is waiting for oneself.
+    pub fn is_held(&self, id: u64) -> bool {
+        self.held.iter().any(|held| held.id == id)
+    }
+
+    /// Send a held request, with whatever the driver changed about it.
+    ///
+    /// Answers whether there was one to send: a driver naming a request that has
+    /// already been let go is a driver working from a stale list, and telling it
+    /// so beats silently doing nothing.
+    pub fn resume(&mut self, id: u64, change: Change) -> bool {
+        let Some(index) = self.held.iter().position(|held| held.id == id) else {
+            return false;
+        };
+        let held = self.held.remove(index);
+        let url = change.url.unwrap_or(held.url);
+        let body = change.body.or(held.body);
+        // The list a person reads has to say where the request actually went, not
+        // where it was going before the driver moved it.
+        if let Some(exchange) = self.exchanges.iter_mut().find(|one| one.id == id) {
+            exchange.url.clone_from(&url);
+            exchange.method = if body.is_some() { "POST" } else { "GET" };
+        }
+        self.launch(id, held.kind, url, body, held.cache, change.headers);
+        true
+    }
+
+    /// Answer a held request with a response the driver wrote, without sending
+    /// anything.
+    ///
+    /// The mocking case, and the reason interception is worth having at all: a
+    /// page can be given a server that does not exist, so a state that takes a
+    /// broken backend to reach can be tested without one.
+    pub fn fulfil(&mut self, id: u64, response: Loaded) -> bool {
+        let Some(index) = self.held.iter().position(|held| held.id == id) else {
+            return false;
+        };
+        let held = self.held.remove(index);
+        self.deliver(Fetched {
+            id,
+            kind: held.kind,
+            url: held.url,
+            took: std::time::Duration::ZERO,
+            result: Ok(response),
+        });
+        true
+    }
+
+    /// End a held request as a failure, which is what blocking one means.
+    pub fn fail(&mut self, id: u64, why: &str) -> bool {
+        let Some(index) = self.held.iter().position(|held| held.id == id) else {
+            return false;
+        };
+        let held = self.held.remove(index);
+        self.deliver(Fetched {
+            id,
+            kind: held.kind,
+            url: held.url,
+            took: std::time::Duration::ZERO,
+            result: Err(why.to_owned()),
+        });
+        true
+    }
+
+    /// Put a result on the queue as though a task had produced it.
+    ///
+    /// Through the same channel every real fetch uses, so a mocked response and a
+    /// fetched one arrive by one path and nothing downstream can tell them apart
+    /// — which is the whole point of mocking one.
+    fn deliver(&self, fetched: Fetched) {
+        if self.finished.send(fetched).is_err() {
+            return;
+        }
+        if let Some(waker) = self.waker.lock().ok().and_then(|waker| waker.clone()) {
+            waker.wake();
+        }
+    }
+
+    /// Put one request on the pool.
+    fn launch(
+        &self,
+        id: u64,
+        kind: ResourceKind,
+        url: String,
+        body: Option<Body>,
+        cache: CacheMode,
+        headers: Vec<(String, String)>,
+    ) {
         let loader = Arc::clone(&self.loader);
         let permits = Arc::clone(&self.permits);
         let finished = self.finished.clone();
         let waker = Arc::clone(&self.waker);
-        let url = url.to_owned();
         crate::io::shared().spawn(async move {
             // The queue is the wait for a permit, and it is deliberately outside the
             // timing below: `took` is how slow the transport was and `waited` is how
@@ -399,7 +619,7 @@ impl Fetcher {
                 return;
             };
             let started = std::time::Instant::now();
-            let result = loader.fetch(url.clone(), body, cache).await;
+            let result = loader.fetch(url.clone(), body, cache, headers).await;
             let fetched = Fetched {
                 id,
                 kind,
@@ -417,7 +637,6 @@ impl Fetcher {
                 waker.wake();
             }
         });
-        id
     }
 
     /// Every request made, oldest first.
@@ -462,6 +681,7 @@ impl Fetcher {
             exchange.response_headers = loaded.response_headers.clone();
             exchange.body_complete = loaded.bytes.len() <= BODY_KEPT;
             exchange.body = loaded.bytes[..loaded.bytes.len().min(BODY_KEPT)].to_vec();
+            exchange.served = loaded.served;
         }
         exchange.took = Some(fetched.took);
         exchange.waited = Some(exchange.asked_at.elapsed());
@@ -592,6 +812,7 @@ mod tests {
                 url: String,
                 body: Option<Body>,
                 _cache: CacheMode,
+                _headers: Vec<(String, String)>,
             ) -> Fetching {
                 Box::pin(async move {
                     assert!(body.is_none(), "nothing here posts");
@@ -700,6 +921,33 @@ mod tests {
 
         assert_eq!(*seen.lock().expect("no panic"), vec![Some(body)]);
         assert_eq!(fetcher.exchanges()[0].method, "POST");
+    }
+
+    /// A driver that stops answering must not be able to grow the held list
+    /// without bound. Each held request keeps its body, and a gate matching a
+    /// common pattern on a page that keeps asking is unbounded memory with
+    /// nobody left to drain it.
+    #[test]
+    fn a_driver_that_never_answers_cannot_hold_everything() {
+        let mut fetcher = Fetcher::spawn(SlowLoader {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            highest: Arc::new(AtomicUsize::new(0)),
+        });
+        fetcher.set_gate(Some(Box::new(|_: &str| true)));
+
+        for index in 0..HELD_LIMIT * 3 {
+            fetcher.request(
+                &format!("https://example.test/{index}"),
+                ResourceKind::Image,
+            );
+        }
+
+        assert_eq!(fetcher.held().len(), HELD_LIMIT);
+        // The ones that went are failed rather than forgotten: a page waiting on
+        // a request that quietly stopped existing never finishes.
+        let finished = fetcher.poll();
+        assert_eq!(finished.len(), HELD_LIMIT * 2);
+        assert!(finished.iter().all(|one| one.result.is_err()));
     }
 
     /// Every reply carries the number it was asked under, which is what makes an

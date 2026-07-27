@@ -23,13 +23,29 @@
 //! `script.evaluate` needs M12's script engine. Stock Playwright leans on it for
 //! almost everything, so it will connect and then fail; that is stated rather
 //! than worked around. Everything that does not need a page script — tabs,
-//! navigation and history, viewports, finding nodes by selector, input,
-//! screenshots, the log, the network — does not wait for it, and is enough for
-//! an agent to do real work.
+//! navigation and history, viewports, finding nodes three ways, input,
+//! screenshots, cookies, the log, the network — does not wait for it, and is
+//! enough for an agent to do real work.
 //!
-//! Nor is there a cookie jar or a second user context, so `storage.*` and
-//! `browser.createUserContext` answer *unknown command* rather than answering
-//! emptily: a client told there are no cookies would believe it.
+//! There is one user context and one jar, so `storage.*` answers about the jar
+//! there is and `browser.createUserContext` answers *unknown command*. What a
+//! client sends as a partition key is answered with the one partition, rather
+//! than refused: a client that sent the default meant this one.
+//!
+//! The response phase of network interception is the gap left in what does not
+//! need a script: pausing between the headers and the body would mean a loader
+//! that hands a response back in two pieces, and ours returns one finished
+//! resource. It says so rather than accepting an intercept it would never
+//! report.
+//!
+//! # What a caller with no eyes reads
+//!
+//! `otlyra:readPage` and `otlyra:snapshot` are the two commands an agent leans
+//! on, and both come off the accessibility tree rather than off the DOM — see
+//! [`crate::digest`] for why that is the one honest source for *what is on this
+//! page*. Between them a caller can read a page, find the thing it wants and
+//! click it without ever having written a selector, which is the sequence that
+//! otherwise costs a screenshot and a guess per turn.
 //!
 //! # A context is a tab
 //!
@@ -46,14 +62,44 @@
 //! protocol *is* here: a second way to ask the questions the inspector already
 //! asks, answered from the same place. A second source of truth for what the
 //! page is would be the one bug this whole design exists to avoid.
+//!
+//! # Nothing waits inside a command
+//!
+//! A navigation takes as long as the network does, and the thread that runs it is
+//! the thread that reads the socket. So a command that cannot be answered yet is
+//! *started* and parked — [`Session::begin`] hands back [`Outcome::Parked`], and
+//! [`Session::resolve`] answers it under the same id once the browser has got
+//! where the client asked. Between the two, the loop keeps reading: a driver can
+//! ask about anything else, is sent its events on time, and — when request
+//! interception arrives — can answer a request the load is still waiting on,
+//! which a command that waited inside itself could never do.
+//!
+//! `wait` is the specification's, with the specification's default: `none`
+//! answers once the load has begun, `interactive` once the document is parsed,
+//! `complete` once nothing is outstanding. The three are one enum in the browser
+//! ([`crate::browser::Readiness`]) rather than three ad-hoc checks, because they
+//! are also what the lifecycle events report.
+//!
+//! [`Session::dispatch`] still waits, and is what a test and the tool surface in
+//! [`crate::mcp`] use — both have one message outstanding at a time and nothing
+//! to do with an answer that arrives later.
+//!
+//! # The lifecycle, per tab
+//!
+//! `browsingContext.navigationStarted`, `domContentLoaded` and `load`, each
+//! carrying the navigation it belongs to, so a client that started two can tell
+//! which finished. Diffed out of the browser's own state rather than pushed from
+//! the loader, which keeps the protocol at the edge — see
+//! [`Session::context_events`].
 
+pub mod intercept;
 mod server;
 
 pub use server::{Server, listen};
 
 use serde_json::{Value, json};
 
-use crate::browser::Browser;
+use crate::browser::{Browser, Readiness};
 
 /// What the protocol calls this implementation.
 pub const NAME: &str = "otlyra";
@@ -196,12 +242,33 @@ pub struct Session {
     /// place in either stream.
     announced: std::collections::HashSet<u64>,
     completed: std::collections::HashSet<u64>,
-    /// Which tabs this client has been told about, and where each was.
+    /// Which tabs this client has been told about, and what it was told.
     ///
-    /// Both halves in one map, because the two questions a lifecycle event
-    /// answers — is this tab new, and has it been anywhere — are asked of the
-    /// same list at the same moment.
-    known: std::collections::HashMap<crate::browser::TabId, String>,
+    /// One entry per tab because every lifecycle question — is this tab new, has
+    /// it started going somewhere, is its document ready, has it finished — is
+    /// asked of the same list at the same moment, and answering them from
+    /// separate records is how two of them come to disagree.
+    known: std::collections::HashMap<crate::browser::TabId, Seen>,
+    /// What this client has asked to have held before it is sent.
+    ///
+    /// On the session rather than on the browser because it is one client's
+    /// instruction: a driver that goes away must leave a browser that loads
+    /// pages, and a held request with nobody to release it is a page that never
+    /// finishes. See [`intercept`].
+    intercepts: Vec<intercept::Intercept>,
+    /// The next intercept's name.
+    next_intercept: u64,
+    /// Which held requests this client has already been told about.
+    blocked: std::collections::HashSet<u64>,
+    /// Commands that have been started and cannot be answered yet.
+    ///
+    /// The whole of what makes this non-blocking. A `navigate` that waited inside
+    /// `dispatch` would hold the read loop for the length of the load, so a
+    /// driver could not subscribe, could not ask about anything else, and — once
+    /// there is request interception — could not answer the very request the load
+    /// is waiting on. Parked here instead, and answered by [`Session::resolve`]
+    /// once the browser has got far enough.
+    waiting: Vec<Waiting>,
     /// The window this session drives, when it drives one.
     ///
     /// Present for a [`Session::windowed`] session and absent otherwise. It is
@@ -211,6 +278,73 @@ pub struct Session {
     /// at. Without it, the browser is driven with no window at all and a picture
     /// is one offscreen `paint` of the page.
     window: Option<otlyra_platform::FramePump>,
+}
+
+/// How far a client asked a navigation to get before it is answered.
+///
+/// The specification's own three, and its own default: a client that says
+/// nothing means `complete`, which is what a person means by *open this page*.
+/// `none` is the one that matters for anything clever — it answers the moment the
+/// load has started, which is what a driver that wants to watch the load, or to
+/// intercept a request the load makes, has to have.
+fn readiness_asked_for(command: &Command) -> Result<Readiness, Error> {
+    match command
+        .params
+        .get("wait")
+        .and_then(Value::as_str)
+        .unwrap_or("complete")
+    {
+        "none" => Ok(Readiness::Started),
+        "interactive" => Ok(Readiness::Interactive),
+        "complete" => Ok(Readiness::Complete),
+        other => Err(Error::invalid(format!(
+            "{other:?} is not a readiness state: it is none, interactive or complete"
+        ))),
+    }
+}
+
+/// What a readiness is called on the wire.
+fn readiness_word(readiness: Readiness) -> &'static str {
+    match readiness {
+        Readiness::Started => "none",
+        Readiness::Interactive => "interactive",
+        Readiness::Complete => "complete",
+    }
+}
+
+/// What a client has last been told about one tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Seen {
+    /// Where it was.
+    url: String,
+    /// Which navigation that was.
+    navigation: Option<u64>,
+    /// How far that navigation had got.
+    readiness: Readiness,
+}
+
+/// A command that has been started and is waiting on the browser.
+struct Waiting {
+    /// The client's number for it, which is what the answer is sent under.
+    id: u64,
+    /// The tab it is about.
+    tab: crate::browser::TabId,
+    /// How far that tab's load has to get before it can be answered.
+    until: Readiness,
+    /// When to answer anyway.
+    ///
+    /// A driver waiting forever on a page that never finishes is a driver that
+    /// has hung, and *it took too long* is a fact it can act on.
+    deadline: std::time::Instant,
+}
+
+/// What starting a command produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// It is finished; here is the result.
+    Done(Value),
+    /// It has been started and will be answered out of [`Session::resolve`].
+    Parked,
 }
 
 /// The context id the one tab is known by.
@@ -286,6 +420,10 @@ impl Session {
             announced: std::collections::HashSet::new(),
             completed: std::collections::HashSet::new(),
             known: std::collections::HashMap::new(),
+            intercepts: Vec::new(),
+            next_intercept: 0,
+            blocked: std::collections::HashSet::new(),
+            waiting: Vec::new(),
             window,
         }
     }
@@ -300,12 +438,234 @@ impl Session {
         })
     }
 
-    /// Answer one command.
+    /// Answer one command, waiting for it if it needs waiting for.
+    ///
+    /// The blocking door, kept for the callers that have nothing else to do while
+    /// they wait: a test, and the tool surface in [`crate::mcp`], which speaks a
+    /// protocol with one message outstanding at a time and so cannot use the
+    /// answer that arrives later anyway.
+    ///
+    /// The socket does *not* come through here — see [`Session::begin`].
+    pub fn dispatch(&mut self, command: &Command) -> Result<Value, Error> {
+        match self.begin(command)? {
+            Outcome::Done(value) => Ok(value),
+            Outcome::Parked => {
+                loop {
+                    self.pump();
+                    for (id, answer) in self.resolve() {
+                        if id == command.id {
+                            return answer;
+                        }
+                    }
+                    if self.waiting.is_empty() {
+                        // Parked and then resolved under another id, which cannot
+                        // happen — but answering nothing would hang the caller.
+                        return Ok(json!({}));
+                    }
+                    // A short sleep rather than a spin: the fetch threads are
+                    // doing the work and this thread has nothing to add.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// Advance the browser by whatever has finished, without waiting for
+    /// anything.
+    ///
+    /// One call per turn of a loop that also has a socket to read. Everything
+    /// that takes time here happens on the fetch threads; this is the moment
+    /// their results become the browser's state.
+    pub fn pump(&mut self) -> bool {
+        let changed = self.browser.pump();
+        if changed {
+            self.draw_frame();
+        }
+        changed
+    }
+
+    /// Answer every parked command the browser has caught up with.
+    ///
+    /// Paired with [`Session::begin`]: what that parked, this hands back, under
+    /// the id it was asked with. A command whose deadline passed is answered with
+    /// a timeout rather than left parked, because a driver waiting on a reply
+    /// that is never coming is worse served than one told the page was slow.
+    pub fn resolve(&mut self) -> Vec<(u64, Result<Value, Error>)> {
+        let now = std::time::Instant::now();
+        let mut answers = Vec::new();
+        let mut still = Vec::new();
+
+        for waiting in std::mem::take(&mut self.waiting) {
+            let Some(index) = self.browser.tab_index(waiting.tab) else {
+                // The tab went away under it. Not an error the client caused, and
+                // not something to keep waiting on.
+                answers.push((
+                    waiting.id,
+                    Err(Error::no_such_context(&context_name(waiting.tab))),
+                ));
+                continue;
+            };
+            let readiness = self.browser.readiness(index);
+            if readiness >= waiting.until {
+                self.draw_frame();
+                answers.push((waiting.id, Ok(self.navigation_result(index))));
+                continue;
+            }
+            if now >= waiting.deadline {
+                answers.push((
+                    waiting.id,
+                    Err(Error {
+                        code: "unknown error",
+                        message: format!(
+                            "the page had not reached {} when the wait ran out",
+                            readiness_word(waiting.until)
+                        ),
+                    }),
+                ));
+                continue;
+            }
+            still.push(waiting);
+        }
+
+        self.waiting = still;
+        answers
+    }
+
+    /// What a navigation answers with, once it has got far enough.
+    fn navigation_result(&self, index: usize) -> Value {
+        let tab = &self.browser.tabs()[index];
+        json!({
+            "navigation": tab.navigation.map(|id| id.to_string()),
+            "url": tab.url,
+        })
+    }
+
+    /// Park a command until the tab at `index` reaches `until`.
+    fn park(&mut self, command: &Command, index: usize, until: Readiness) -> Outcome {
+        // Already there — a blank tab, a system page, anything served from the
+        // cache within the same turn. Answered now rather than parked for a turn
+        // of the loop, so a fast load costs no round trip.
+        if self.browser.readiness(index) >= until {
+            self.draw_frame();
+            return Outcome::Done(self.navigation_result(index));
+        }
+        let timeout = command
+            .params
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .map_or(LOAD_TIMEOUT, std::time::Duration::from_millis);
+        self.waiting.push(Waiting {
+            id: command.id,
+            tab: self.browser.tabs()[index].id,
+            until,
+            deadline: std::time::Instant::now() + timeout,
+        });
+        Outcome::Parked
+    }
+
+    /// Start one command.
     ///
     /// The result is the `result` object of a success message; the caller wraps
     /// it. Errors come back as [`Error`] and are wrapped the same way, so there
     /// is one place that knows the message envelope.
-    pub fn dispatch(&mut self, command: &Command) -> Result<Value, Error> {
+    ///
+    /// # Why some commands do not finish here
+    ///
+    /// A navigation takes as long as the network does, and this thread is also
+    /// the one reading the socket. Finishing it here would mean a driver that
+    /// cannot ask anything else, cannot be sent an event, and cannot answer a
+    /// request the load itself is waiting on. So a navigation is *started* and
+    /// [`Outcome::Parked`], and [`Session::resolve`] answers it when the browser
+    /// has got where the client asked it to get to.
+    pub fn begin(&mut self, command: &Command) -> Result<Outcome, Error> {
+        // Everything that finishes at once goes through the match below and is
+        // wrapped; the three that may not are handled first.
+        match command.method.as_str() {
+            "browsingContext.navigate" => {
+                let url = command.string("url")?.to_owned();
+                self.check_context(command)?;
+                let until = readiness_asked_for(command)?;
+                self.browser.navigate(&url);
+                // One pump before parking: a load served from the cache or from a
+                // canned loader can already be finished, and answering it in the
+                // same turn is a round trip a driver does not have to make.
+                self.pump();
+                let index = self.browser.active();
+                Ok(self.park(command, index, until))
+            }
+            "browsingContext.reload" => {
+                self.check_context(command)?;
+                let until = readiness_asked_for(command)?;
+                self.browser.reload();
+                self.pump();
+                let index = self.browser.active();
+                Ok(self.park(command, index, until))
+            }
+            // A step through the history is a load like any other, and it used to
+            // be the one command that waited for one on this thread — once per
+            // step, so a `delta` of five was five load timeouts with the socket
+            // unread. Started and parked like the other two.
+            "browsingContext.traverseHistory" => {
+                self.check_context(command)?;
+                let delta = command
+                    .params
+                    .get("delta")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::invalid("traverseHistory needs a delta"))?;
+                // One step at a time, and it stops where the history does: a
+                // delta past either end is as far as it goes rather than an
+                // error, which is what going back twice from one entry means.
+                for _ in 0..delta.unsigned_abs() {
+                    if delta > 0 {
+                        if !self.browser.can_go_forward() {
+                            break;
+                        }
+                        self.browser.go_forward();
+                    } else {
+                        if !self.browser.can_go_back() {
+                            break;
+                        }
+                        self.browser.go_back();
+                    }
+                    // Each step's load is started here and left to the pump; only
+                    // the last one is what the client is told about.
+                    self.pump();
+                }
+                let index = self.browser.active();
+                Ok(self.park(command, index, Readiness::Complete))
+            }
+            _ => self.dispatch_now(command).map(Outcome::Done),
+        }
+    }
+
+    /// Forget everything one connection asked for.
+    ///
+    /// A driver that goes away must leave a browser that loads pages. Its
+    /// intercepts go with it — otherwise the gate stays installed with nobody
+    /// left to answer it, and every address it matches is held forever — and so
+    /// does what it was told and what it was waiting for, because the next client
+    /// on this socket is a different client and neither is its to inherit.
+    pub fn disconnected(&mut self) {
+        let held: Vec<u64> = self.browser.held().iter().map(|one| one.id).collect();
+        self.intercepts.clear();
+        self.apply_intercepts();
+        // The gate is down, but these were stopped while it was up and nothing
+        // will ask for them again. Failed rather than left: a page waiting on a
+        // request nobody holds any more is a page that never finishes.
+        for id in held {
+            self.browser.fail_request(id, "the driver went away");
+        }
+        self.blocked.clear();
+        self.waiting.clear();
+        // What the next client has been told is nothing, whatever this one heard.
+        self.events.clear();
+        self.known.clear();
+        self.announced.clear();
+        self.completed.clear();
+        self.open = false;
+    }
+
+    fn dispatch_now(&mut self, command: &Command) -> Result<Value, Error> {
         match command.method.as_str() {
             // --- session ---------------------------------------------------
             "session.status" => Ok(json!({
@@ -433,57 +793,34 @@ impl Session {
                 self.prepare_frame();
                 Ok(json!({}))
             }
-            "browsingContext.traverseHistory" => {
-                self.check_context(command)?;
-                let delta = command
-                    .params
-                    .get("delta")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| Error::invalid("traverseHistory needs a delta"))?;
-                // One step at a time, and it stops where the history does: a
-                // delta past either end is as far as it goes rather than an
-                // error, which is what going back twice from one entry means.
-                for _ in 0..delta.unsigned_abs() {
-                    if delta > 0 {
-                        if !self.browser.can_go_forward() {
-                            break;
-                        }
-                        self.browser.go_forward();
-                    } else {
-                        if !self.browser.can_go_back() {
-                            break;
-                        }
-                        self.browser.go_back();
-                    }
-                    self.browser.wait_for_load(LOAD_TIMEOUT);
-                }
-                self.prepare_frame();
-                Ok(json!({}))
-            }
-            "browsingContext.navigate" => {
-                let url = command.string("url")?.to_owned();
-                self.check_context(command)?;
-                self.browser.navigate(&url);
-                self.browser.wait_for_load(LOAD_TIMEOUT);
-                self.prepare_frame();
-                Ok(json!({
-                    "navigation": Value::Null,
-                    "url": self.browser.url(),
-                }))
-            }
-            "browsingContext.reload" => {
-                self.check_context(command)?;
-                self.browser.reload();
-                self.browser.wait_for_load(LOAD_TIMEOUT);
-                self.prepare_frame();
-                Ok(json!({
-                    "navigation": Value::Null,
-                    "url": self.browser.url(),
-                }))
-            }
+            // All three of these are started in `begin` and answered out of
+            // `resolve`. Reaching them here would mean a caller went round the
+            // front door.
+            "browsingContext.navigate"
+            | "browsingContext.reload"
+            | "browsingContext.traverseHistory" => Err(Error {
+                code: "unknown error",
+                message: format!("{} is started rather than dispatched", command.method),
+            }),
             "browsingContext.captureScreenshot" => {
                 self.check_context(command)?;
-                let png = self.picture()?;
+                // The one place waiting for a picture or a font is right: this
+                // command *is* the request for a settled frame. The loop's own
+                // turns no longer wait, so a driver that never asks for a picture
+                // never pays for one — and this wait gives up on anything the
+                // gate is holding, because releasing that would be this thread's
+                // own job.
+                self.prepare_frame();
+                let png = match self.clip_of(command)? {
+                    Some(clip) => self
+                        .browser
+                        .screenshot_clipped(self.viewport(), clip)
+                        .map_err(|message| Error {
+                            code: "unable to capture screen",
+                            message,
+                        })?,
+                    None => self.picture()?,
+                };
                 Ok(json!({ "data": base64(&png) }))
             }
 
@@ -546,6 +883,50 @@ impl Session {
                     }))
                     .collect::<Vec<_>>(),
             })),
+            "otlyra:readPage" => {
+                self.check_context(command)?;
+                self.read_page()
+            }
+            "otlyra:snapshot" => {
+                self.check_context(command)?;
+                self.snapshot(command)
+            }
+            "otlyra:waitFor" => {
+                self.check_context(command)?;
+                self.wait_for(command)
+            }
+            "otlyra:console" => Ok(json!({ "entries": self.console() })),
+            "otlyra:network" => Ok(json!({
+                "requests": self
+                    .browser
+                    .exchanges()
+                    .iter()
+                    .map(exchange_json)
+                    .collect::<Vec<_>>(),
+            })),
+
+            // --- network interception --------------------------------------
+            "network.addIntercept" => self.add_intercept(command),
+            "network.removeIntercept" => self.remove_intercept(command),
+            "network.continueRequest" => self.continue_request(command),
+            "network.provideResponse" => self.provide_response(command),
+            "network.failRequest" => self.fail_request(command),
+            "network.continueResponse" | "network.continueWithAuth" => Err(Error::not_yet(
+                &command.method,
+                "a response phase, which needs a loader that hands a response back \
+                 in two pieces",
+            )),
+
+            // --- storage ---------------------------------------------------
+            //
+            // There is one jar and it is the browser's, not a context's: this
+            // engine has no second user context to keep a second one in. So the
+            // `partition` a client sends is answered with the one partition there
+            // is rather than refused, which is what a client that sent the
+            // default would expect anyway.
+            "storage.getCookies" => self.get_cookies(command),
+            "storage.setCookie" => self.set_cookie(command),
+            "storage.deleteCookies" => self.delete_cookies(command),
 
             // --- what waits on a script engine -----------------------------
             method if method.starts_with("script.") => {
@@ -570,12 +951,70 @@ impl Session {
             self.log_cursor = cursor;
             events.extend(records.into_iter().map(log_entry));
         }
+        // Held requests first, and whether or not the client subscribed: a
+        // driver that asked for an intercept has said it wants these, and a
+        // request stopped with nobody told about it is a page that hangs.
+        if !self.intercepts.is_empty() {
+            events.extend(self.held_events());
+        }
         if self.subscribed("network.beforeRequestSent")
             || self.subscribed("network.responseCompleted")
         {
             events.extend(self.network_events());
         }
         events.extend(self.context_events());
+        events
+    }
+
+    /// Requests being held that this client has not been told about.
+    ///
+    /// Reported as `beforeRequestSent` with `isBlocked`, which is the
+    /// specification's way of saying *this one is stopped and waiting for you*.
+    /// Told once: a held request stays held until a command releases it, and
+    /// repeating it every turn of the loop would be a driver drowning in the
+    /// news that nothing has changed.
+    fn held_events(&mut self) -> Vec<Value> {
+        let context = context_name(self.browser.active_id());
+        let held: Vec<(u64, String, &'static str)> = self
+            .browser
+            .held()
+            .iter()
+            .filter(|held| !self.blocked.contains(&held.id))
+            .map(|held| (held.id, held.url.clone(), held.method))
+            .collect();
+
+        let mut events = Vec::new();
+        for (id, url, method) in held {
+            self.blocked.insert(id);
+            let intercepts: Vec<String> = self
+                .intercepts
+                .iter()
+                .filter(|one| one.matches(&url))
+                .map(|one| one.id.clone())
+                .collect();
+            events.push(event(
+                "network.beforeRequestSent",
+                json!({
+                    "context": context,
+                    "isBlocked": true,
+                    "intercepts": intercepts,
+                    "navigation": Value::Null,
+                    "redirectCount": 0,
+                    "timestamp": now(),
+                    "request": {
+                        "request": id.to_string(),
+                        "url": url,
+                        "method": method,
+                        "headers": [],
+                        "cookies": [],
+                        "bodySize": 0,
+                        "headersSize": 0,
+                        "timings": {},
+                    },
+                    "initiator": { "type": "other" },
+                }),
+            ));
+        }
         events
     }
 
@@ -606,17 +1045,44 @@ impl Session {
         events
     }
 
-    /// Tabs that have opened or closed since this client was last told.
+    /// What has happened to the tabs since this client was last told.
     ///
     /// Diffed rather than pushed, for the reason every other event here is: the
     /// browser is driven from one thread and what it has is readable, so the
-    /// protocol stays at the edge instead of reaching into `new_tab`.
+    /// protocol stays at the edge instead of reaching into `new_tab` and into the
+    /// loader.
+    ///
+    /// # The lifecycle, per tab
+    ///
+    /// Three events, and each one is a *transition* rather than a state, which is
+    /// why the last thing said about each tab is kept: a client is told a document
+    /// became ready, not that it is ready, and a poll that saw the same state
+    /// twice must not say it twice.
+    ///
+    /// - `navigationStarted` — this tab began going somewhere new.
+    /// - `domContentLoaded` — its document is parsed and laid out. Everything
+    ///   still outstanding is a stylesheet or a picture, and a driver that only
+    ///   needs to click something can act on this one.
+    /// - `load` — nothing is outstanding.
+    ///
+    /// All three carry the navigation they belong to, so a client that started
+    /// two navigations can tell which finished.
     fn context_events(&mut self) -> Vec<Value> {
-        let open: Vec<(crate::browser::TabId, String)> = self
+        let open: Vec<(crate::browser::TabId, Seen)> = self
             .browser
             .tabs()
             .iter()
-            .map(|tab| (tab.id, tab.url.clone()))
+            .enumerate()
+            .map(|(index, tab)| {
+                (
+                    tab.id,
+                    Seen {
+                        url: tab.url.clone(),
+                        navigation: tab.navigation,
+                        readiness: self.browser.readiness(index),
+                    },
+                )
+            })
             .collect();
         let mut events = Vec::new();
 
@@ -646,21 +1112,49 @@ impl Session {
                 }
             }
         }
-        // A tab whose address changed has been somewhere. There is one signal
-        // for arriving and none for the document being ready before its
-        // subresources are, so `load` is what is reported and
-        // `domContentLoaded` is not — a client waiting on an event that never
-        // comes is worse served than one told the event does not exist.
-        if self.subscribed("browsingContext.load") {
-            for (index, (id, url)) in open.iter().enumerate() {
-                let moved = self.known.get(id).is_some_and(|last| last != url);
-                if moved && !url.is_empty() {
-                    let mut payload = self.context_of(index);
-                    payload["navigation"] = Value::Null;
-                    payload["timestamp"] = json!(now());
-                    events.push(event("browsingContext.load", payload));
-                }
+
+        for (index, (id, now_at)) in open.iter().enumerate() {
+            let before = self.known.get(id);
+            let lifecycle = |method: &str, state: &Seen| {
+                let mut payload = json!({
+                    "context": context_name(*id),
+                    "navigation": state.navigation.map(|id| id.to_string()),
+                    "timestamp": now(),
+                    "url": state.url,
+                });
+                payload["userContext"] = json!("default");
+                event(method, payload)
+            };
+
+            // A new navigation is one this client has not been told the name of.
+            let started = now_at.navigation.is_some()
+                && before.is_none_or(|before| before.navigation != now_at.navigation);
+            if started && self.subscribed("browsingContext.navigationStarted") {
+                events.push(lifecycle("browsingContext.navigationStarted", now_at));
             }
+
+            // A readiness this navigation had not reached when the client was
+            // last told. A new navigation resets what it had reached, which is
+            // what makes going somewhere else report its own ready and load
+            // rather than staying silent because the tab before it was complete.
+            //
+            // A tab that has never navigated reports neither, however complete
+            // it is: a blank tab has not loaded a document, and saying it did
+            // would have a client waiting for the *next* one hear about this one.
+            let reached = |state: Readiness| {
+                now_at.navigation.is_some()
+                    && now_at.readiness >= state
+                    && (started || before.is_none_or(|before| before.readiness < state))
+            };
+            if reached(Readiness::Interactive)
+                && self.subscribed("browsingContext.domContentLoaded")
+            {
+                events.push(lifecycle("browsingContext.domContentLoaded", now_at));
+            }
+            if reached(Readiness::Complete) && self.subscribed("browsingContext.load") {
+                events.push(lifecycle("browsingContext.load", now_at));
+            }
+            let _ = index;
         }
 
         self.known = open.into_iter().collect();
@@ -763,36 +1257,647 @@ impl Session {
     /// — so a client that asks for `.card` is told about the same elements a
     /// stylesheet would have styled. A second matcher would be a second answer
     /// to *what does this selector mean*.
+    /// What rectangle a screenshot was asked for, if it named one.
+    ///
+    /// The specification's two: a box in the page's own coordinates, and an
+    /// element — which is answered from where the last frame actually *drew* it,
+    /// the same rectangle a click is tested against. That is the point of naming
+    /// an element rather than a box: the caller does not have to know the layout
+    /// and cannot disagree with it.
+    fn clip_of(&mut self, command: &Command) -> Result<Option<otlyra_layout::Rect>, Error> {
+        let Some(clip) = command.params.get("clip") else {
+            return Ok(None);
+        };
+        match clip.get("type").and_then(Value::as_str) {
+            Some("box") => {
+                let number = |name: &str| {
+                    clip.get(name)
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| Error::invalid(format!("a box clip needs a {name}")))
+                };
+                let (x, y, width, height) = (
+                    number("x")?,
+                    number("y")?,
+                    number("width")?,
+                    number("height")?,
+                );
+                if width <= 0.0 || height <= 0.0 {
+                    return Err(Error::invalid(
+                        "a clip needs a width and a height above zero",
+                    ));
+                }
+                Ok(Some(otlyra_layout::Rect::new(
+                    x as f32,
+                    y as f32,
+                    width as f32,
+                    height as f32,
+                )))
+            }
+            Some("element") => {
+                let shared = clip
+                    .get("element")
+                    .and_then(|element| element.get("sharedId"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::invalid("an element clip needs a sharedId"))?;
+                let node = node_of(shared)
+                    .ok_or_else(|| Error::no_such_node(&format!("{shared} names no node")))?;
+                // A frame first: an element that has not been drawn has no
+                // rectangle, and one drawn before the last command is not where
+                // it is now.
+                self.prepare_frame();
+                let facts = self
+                    .browser
+                    .box_facts(node)
+                    .ok_or_else(|| Error::no_such_node(&format!("{shared} was not drawn")))?;
+                let border = facts.border;
+                Ok(Some(otlyra_layout::Rect::new(
+                    border.x as f32,
+                    border.y as f32,
+                    (border.width as f32).max(1.0),
+                    (border.height as f32).max(1.0),
+                )))
+            }
+            other => Err(Error::invalid(format!(
+                "{:?} is not a clip type: it is box or element",
+                other.unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// The page as prose.
+    ///
+    /// A caller with no eyes and no script engine still has to be able to answer
+    /// *what does this page say*, and the two ways it could have got there are
+    /// both worse: a picture costs a picture per turn and cannot be read back,
+    /// and a DOM dump is markup rather than content. This is the accessibility
+    /// tree read as Markdown — see [`crate::digest`] for why that tree and not a
+    /// walk of the document.
+    fn read_page(&mut self) -> Result<Value, Error> {
+        // A frame first: the tree is built from the *boxes*, so a page that has
+        // not been laid out since it arrived has nothing to describe.
+        self.prepare_frame();
+        let page = self
+            .browser
+            .active_page()
+            .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
+        let title = crate::page::title_of(page.document());
+        let items = crate::a11y::describe_page(page);
+        Ok(json!({
+            "url": self.browser.url(),
+            "title": title,
+            "text": crate::digest::text(&items, title.as_deref()),
+        }))
+    }
+
+    /// Everything on the page that can be named, and which of it can be acted on.
+    ///
+    /// The companion to [`Session::read_page`]: that one answers *what does this
+    /// say*, this one answers *what can I do here*, and both come off the one
+    /// tree. Every row carries the handle every other command takes, so a caller
+    /// goes from reading the page to clicking on it without ever having guessed
+    /// a selector — which is the step an agent gets wrong.
+    fn snapshot(&mut self, command: &Command) -> Result<Value, Error> {
+        let filter = crate::digest::Filter {
+            interactive_only: command
+                .params
+                .get("interactiveOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            max_depth: command
+                .params
+                .get("maxDepth")
+                .and_then(Value::as_u64)
+                .map(|depth| depth as usize),
+        };
+
+        self.prepare_frame();
+        let page = self
+            .browser
+            .active_page()
+            .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
+        let rows = crate::digest::outline(&crate::a11y::describe_page(page), filter);
+        Ok(json!({
+            "url": self.browser.url(),
+            "title": crate::page::title_of(page.document()),
+            "nodes": rows.iter().map(row_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Wait until the page is in the state a caller is waiting for.
+    ///
+    /// # What waiting can and cannot mean here
+    ///
+    /// With no script engine, nothing changes a loaded document. So a wait for a
+    /// selector is a wait for the *load*, and then one look: a selector that is
+    /// not there when the load finished will not appear later, and a command that
+    /// slept five seconds to discover that would be five seconds of an agent's
+    /// time spent proving something already known. The timeout is therefore spent
+    /// on the load and not on a poll, and the answer says which it was.
+    ///
+    /// This is the one command here whose meaning will change at M12, and it is
+    /// written so the change is additive: the shape of the answer is already
+    /// *found or not, and how long it took*.
+    fn wait_for(&mut self, command: &Command) -> Result<Value, Error> {
+        let timeout = command
+            .params
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .map_or(LOAD_TIMEOUT, std::time::Duration::from_millis);
+        let started = std::time::Instant::now();
+        self.browser.wait_for_load(timeout);
+        self.prepare_frame();
+
+        let selector = command
+            .params
+            .get("locator")
+            .and_then(|locator| locator.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let matched = match &selector {
+            None => None,
+            Some(selector) => {
+                let page = self
+                    .browser
+                    .active_page()
+                    .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
+                Some(
+                    otlyra_css::stylo_dom::select(page.document(), selector).map_err(|error| {
+                        Error::invalid(format!("{selector:?} is not a selector: {error}"))
+                    })?,
+                )
+            }
+        };
+
+        Ok(json!({
+            "loading": self.browser.tabs().iter().any(crate::browser::Tab::loading),
+            "took": started.elapsed().as_secs_f64() * 1000.0,
+            "found": matched.as_ref().map_or(Value::Null, |nodes| json!(!nodes.is_empty())),
+            "nodes": matched.map_or_else(Vec::new, |nodes| {
+                let document = self.browser.active_page().map(crate::page::PageScene::document);
+                document.map_or_else(Vec::new, |document| {
+                    nodes.into_iter().map(|node| node_value(document, node)).collect()
+                })
+            }),
+        }))
+    }
+
+    /// What the browser has said about itself, as a list rather than as events.
+    ///
+    /// The same records `log.entryAdded` carries, for a caller that asks rather
+    /// than subscribes — which is every caller over a request-and-answer
+    /// transport, and so every agent. Read from the same journal, so the two
+    /// cannot disagree.
+    fn console(&self) -> Vec<Value> {
+        crate::observability::journal()
+            .records()
+            .into_iter()
+            .map(|record| {
+                json!({
+                    "level": record.level.as_str().to_lowercase(),
+                    "source": record.target,
+                    "text": record.message,
+                })
+            })
+            .collect()
+    }
+
+    /// Start holding requests this client wants to see before they are sent.
+    fn add_intercept(&mut self, command: &Command) -> Result<Value, Error> {
+        intercept::check_phases(command.params.get("phases"))?;
+        let patterns = match command.params.get("urlPatterns") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(patterns)) => patterns
+                .iter()
+                .map(intercept::Pattern::parse)
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(Error::invalid("urlPatterns has to be a list")),
+        };
+
+        self.next_intercept += 1;
+        let id = format!("otlyra-intercept-{}", self.next_intercept);
+        self.intercepts.push(intercept::Intercept {
+            id: id.clone(),
+            patterns,
+        });
+        self.apply_intercepts();
+        Ok(json!({ "intercept": id }))
+    }
+
+    /// Stop holding what one intercept was about.
+    fn remove_intercept(&mut self, command: &Command) -> Result<Value, Error> {
+        let id = command.string("intercept")?.to_owned();
+        let before = self.intercepts.len();
+        self.intercepts.retain(|one| one.id != id);
+        if self.intercepts.len() == before {
+            return Err(Error {
+                code: "no such intercept",
+                message: format!("{id} names no intercept of this session's"),
+            });
+        }
+        self.apply_intercepts();
+        Ok(json!({}))
+    }
+
+    /// Hand the browser the question *should this be held*, as one predicate.
+    ///
+    /// Rebuilt whenever the list changes rather than consulted through a shared
+    /// handle: the gate runs on the browser's own thread inside `fetch`, and a
+    /// lock there would put the protocol's state on the loading path.
+    fn apply_intercepts(&mut self) {
+        if self.intercepts.is_empty() {
+            // Nothing held, so a driver that removed its last intercept — or went
+            // away — leaves a browser that loads pages.
+            self.browser.hold_requests(None);
+            return;
+        }
+        let intercepts = self.intercepts.clone();
+        self.browser.hold_requests(Some(Box::new(move |url: &str| {
+            intercepts.iter().any(|one| one.matches(url))
+        })));
+    }
+
+    /// The held request a command names, checked before anything is done to it.
+    fn held_named(&self, command: &Command) -> Result<u64, Error> {
+        let name = command.string("request")?;
+        let id = name.parse::<u64>().map_err(|_| Error {
+            code: "no such request",
+            message: format!("{name} is not a request handle"),
+        })?;
+        if !self.browser.held().iter().any(|held| held.id == id) {
+            // A driver working from a stale list, which is worth saying: doing
+            // nothing quietly would have it wait for a load that already went.
+            return Err(Error {
+                code: "no such request",
+                message: format!("{name} is not a request being held"),
+            });
+        }
+        Ok(id)
+    }
+
+    /// Let a held request go, with whatever the driver changed about it.
+    fn continue_request(&mut self, command: &Command) -> Result<Value, Error> {
+        let id = self.held_named(command)?;
+        // Cookies are not a driver's to write. The jar decides what a site is
+        // entitled to be sent, and a command that could set the header directly
+        // could send one site's session to another — which is the one thing an
+        // automation protocol must not let a page's own script do either.
+        if command.params.get("cookies").is_some() {
+            return Err(Error::not_yet(
+                "continueRequest with cookies",
+                "a way to write the cookie header that the jar still decides, \
+                 which would be a cookie jar with a second door",
+            ));
+        }
+        let change = crate::fetcher::Change {
+            headers: command
+                .params
+                .get("headers")
+                .and_then(Value::as_array)
+                .map(|headers| {
+                    headers
+                        .iter()
+                        .filter_map(|header| {
+                            let name = header.get("name").and_then(Value::as_str)?;
+                            let value = header.get("value").and_then(body_text)?;
+                            Some((name.to_owned(), value))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            url: command
+                .params
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            body: command
+                .params
+                .get("body")
+                .and_then(body_of)
+                .map(|bytes| otlyra_net::Body {
+                    content_type: "application/octet-stream".to_owned(),
+                    bytes,
+                }),
+        };
+        self.browser.resume_request(id, change);
+        self.blocked.remove(&id);
+        Ok(json!({}))
+    }
+
+    /// Answer a held request with a response nobody sent.
+    fn provide_response(&mut self, command: &Command) -> Result<Value, Error> {
+        let id = self.held_named(command)?;
+        let headers: Vec<(String, String)> = command
+            .params
+            .get("headers")
+            .and_then(Value::as_array)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|header| {
+                        let name = header.get("name").and_then(Value::as_str)?;
+                        let value = header.get("value").and_then(body_text)?;
+                        Some((name.to_owned(), value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone());
+        let url = self
+            .browser
+            .held()
+            .iter()
+            .find(|held| held.id == id)
+            .map(|held| held.url.clone())
+            .unwrap_or_default();
+
+        let response = crate::fetcher::Loaded {
+            bytes: command
+                .params
+                .get("body")
+                .and_then(body_of)
+                .unwrap_or_default(),
+            charset: None,
+            content_type,
+            nosniff: false,
+            // A response with no status named is a `200`: a driver writing one
+            // by hand means *this worked*, and making it say so is a required
+            // field nobody would ever vary.
+            status: Some(
+                command
+                    .params
+                    .get("statusCode")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200) as u16,
+            ),
+            request_headers: Vec::new(),
+            response_headers: headers,
+            final_url: url,
+            // Written rather than fetched, and rather than cached. Saying
+            // `network` would have the request list claim a socket was opened.
+            served: otlyra_net::Served::Network,
+        };
+        self.browser.fulfil_request(id, response);
+        self.blocked.remove(&id);
+        Ok(json!({}))
+    }
+
+    /// Stop a held request, which is what blocking one means.
+    fn fail_request(&mut self, command: &Command) -> Result<Value, Error> {
+        let id = self.held_named(command)?;
+        self.browser.fail_request(id, "blocked by a driver");
+        self.blocked.remove(&id);
+        Ok(json!({}))
+    }
+
+    /// The cookies the jar is holding, filtered the way the specification says.
+    fn get_cookies(&mut self, command: &Command) -> Result<Value, Error> {
+        let filter = command.params.get("filter");
+        let want = |key: &str| {
+            filter
+                .and_then(|filter| filter.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let (name, domain, path) = (want("name"), want("domain"), want("path"));
+
+        let cookies: Vec<Value> = self.browser.cookies().with(|jar| {
+            jar.all()
+                .iter()
+                .filter(|cookie| {
+                    name.as_ref().is_none_or(|name| &cookie.name == name)
+                        && domain.as_ref().is_none_or(|domain| {
+                            // A host-only cookie matches its host and a domain
+                            // cookie matches any host under it, which is the same
+                            // rule that decides whether it is sent.
+                            cookie.domain == *domain
+                                || (!cookie.host_only
+                                    && domain.ends_with(&format!(".{}", cookie.domain)))
+                        })
+                        && path.as_ref().is_none_or(|path| &cookie.path == path)
+                })
+                .map(cookie_json)
+                .collect()
+        });
+        Ok(json!({ "cookies": cookies, "partitionKey": { "userContext": "default" } }))
+    }
+
+    /// Put one cookie in the jar, as if a response had set it.
+    ///
+    /// Through the jar's own storage rules rather than around them: a driver that
+    /// could write a cookie the browser would never have accepted could put the
+    /// page in a state no server can produce, which is the one thing an
+    /// automation protocol must not allow.
+    fn set_cookie(&mut self, command: &Command) -> Result<Value, Error> {
+        let cookie = command
+            .params
+            .get("cookie")
+            .ok_or_else(|| Error::invalid("setCookie needs a cookie"))?;
+        let text = |key: &str| cookie.get(key).and_then(Value::as_str);
+        let name = text("name").ok_or_else(|| Error::invalid("a cookie needs a name"))?;
+        let domain = text("domain").ok_or_else(|| Error::invalid("a cookie needs a domain"))?;
+        // The specification carries a value as `{type, value}` so it can also be
+        // sent base64; the string form is what every client actually sends.
+        let value = cookie
+            .get("value")
+            .and_then(|value| {
+                value
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .or(value.as_str())
+            })
+            .ok_or_else(|| Error::invalid("a cookie needs a value"))?;
+
+        let mut line = format!("{name}={value}");
+        line.push_str(&format!("; Domain={domain}"));
+        line.push_str(&format!("; Path={}", text("path").unwrap_or("/")));
+        if cookie.get("secure").and_then(Value::as_bool) == Some(true) {
+            line.push_str("; Secure");
+        }
+        if cookie.get("httpOnly").and_then(Value::as_bool) == Some(true) {
+            line.push_str("; HttpOnly");
+        }
+        if let Some(same_site) = text("sameSite") {
+            line.push_str(&format!("; SameSite={same_site}"));
+        }
+        if let Some(expiry) = cookie.get("expiry").and_then(Value::as_u64) {
+            line.push_str(&format!("; Max-Age={}", expiry.saturating_sub(now())));
+        }
+
+        // Stored against the cookie's own domain, because there is no response
+        // here to have arrived from one.
+        let scheme = if cookie.get("secure").and_then(Value::as_bool) == Some(true) {
+            "https"
+        } else {
+            "http"
+        };
+        let host = domain.trim_start_matches('.');
+        let url = otlyra_net::url::normalize(&format!("{scheme}://{host}/"))
+            .map_err(|error| Error::invalid(format!("{domain:?} is not a domain: {error}")))?;
+
+        self.browser
+            .cookies_mut()
+            .with(|jar| jar.set(&url, &line, std::time::SystemTime::now()))
+            .map_err(|refused| Error::invalid(format!("the jar refused it: {refused:?}")))?;
+        Ok(json!({ "partitionKey": { "userContext": "default" } }))
+    }
+
+    /// Take cookies out of the jar. Answers how many went.
+    fn delete_cookies(&mut self, command: &Command) -> Result<Value, Error> {
+        let filter = command.params.get("filter");
+        let want = |key: &str| {
+            filter
+                .and_then(|filter| filter.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let (name, domain, path) = (want("name"), want("domain"), want("path"));
+        // A delete with no filter at all empties the jar, which is what the
+        // specification says and what a driver clearing state between runs means.
+        let removed = self.browser.cookies_mut().with(|jar| {
+            jar.remove(|cookie| {
+                name.as_ref().is_none_or(|name| &cookie.name == name)
+                    && domain
+                        .as_ref()
+                        .is_none_or(|domain| &cookie.domain == domain)
+                    && path.as_ref().is_none_or(|path| &cookie.path == path)
+            })
+        });
+        Ok(json!({
+            "removed": removed,
+            "partitionKey": { "userContext": "default" },
+        }))
+    }
+
+    /// Find nodes, by any of the three ways the specification has of naming one.
+    ///
+    /// `css` is the selector engine and `xpath` is [`otlyra_dom::xpath`]. The
+    /// other two are questions about what a page *presents* rather than about how
+    /// it is written — the words a person would click on, and the role and name a
+    /// reader would announce — and both are answered from the accessibility tree,
+    /// which is the browser's one account of that.
     fn locate(&mut self, command: &Command) -> Result<Value, Error> {
         let locator = command
             .params
             .get("locator")
-            .ok_or_else(|| Error::invalid("locateNodes needs a locator"))?;
-        let kind = locator.get("type").and_then(Value::as_str).unwrap_or("css");
-        if kind != "css" {
-            // `innerText` and `accessibility` are in the specification and are
-            // not here yet. Saying which is missing beats a silent empty list,
-            // which reads as *nothing matched*.
-            return Err(Error::not_yet(
-                &format!("locateNodes with a {kind} locator"),
-                "a locator this implementation does not have yet",
-            ));
-        }
-        let selector = locator
-            .get("value")
+            .ok_or_else(|| Error::invalid("locateNodes needs a locator"))?
+            .clone();
+        let kind = locator
+            .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::invalid("a css locator needs a value"))?;
+            .unwrap_or("css")
+            .to_owned();
+        let limit = command
+            .params
+            .get("maxNodeCount")
+            .and_then(Value::as_u64)
+            .map_or(usize::MAX, |count| count as usize);
+
+        // The two presentational locators need the boxes, and the boxes need a
+        // frame. Done before the borrow below rather than inside it.
+        if kind != "css" {
+            self.prepare_frame();
+        }
 
         let page = self
             .browser
             .active_page()
             .ok_or_else(|| Error::no_such_node("nothing is loaded in this context"))?;
         let document = page.document();
-        let matched = otlyra_css::stylo_dom::select(document, selector)
-            .map_err(|error| Error::invalid(format!("{selector:?} is not a selector: {error}")))?;
+
+        let matched: Vec<otlyra_dom::NodeId> = match kind.as_str() {
+            "css" => {
+                let selector = locator
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::invalid("a css locator needs a value"))?;
+                otlyra_css::stylo_dom::select(document, selector).map_err(|error| {
+                    Error::invalid(format!("{selector:?} is not a selector: {error}"))
+                })?
+            }
+            "innerText" => {
+                let wanted = locator
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::invalid("an innerText locator needs a value"))?;
+                // The specification's own defaults: an exact match, case
+                // sensitive, unless the client says otherwise.
+                let partial = locator.get("matchType").and_then(Value::as_str) == Some("partial");
+                let fold = locator.get("ignoreCase").and_then(Value::as_bool) == Some(true);
+                let depth = locator
+                    .get("maxDepth")
+                    .and_then(Value::as_u64)
+                    .map(|depth| depth as usize);
+
+                crate::digest::outline(
+                    &crate::a11y::describe_page(page),
+                    crate::digest::Filter {
+                        interactive_only: false,
+                        max_depth: depth,
+                    },
+                )
+                .into_iter()
+                .filter(|row| {
+                    row.name
+                        .as_deref()
+                        .is_some_and(|name| matches_text(name, wanted, partial, fold))
+                })
+                .filter_map(|row| row.node)
+                .collect()
+            }
+            "accessibility" => {
+                let value = locator
+                    .get("value")
+                    .ok_or_else(|| Error::invalid("an accessibility locator needs a value"))?;
+                let role = value.get("role").and_then(Value::as_str);
+                let name = value.get("name").and_then(Value::as_str);
+                if role.is_none() && name.is_none() {
+                    return Err(Error::invalid(
+                        "an accessibility locator needs a role, a name, or both",
+                    ));
+                }
+                crate::digest::outline(
+                    &crate::a11y::describe_page(page),
+                    crate::digest::Filter::default(),
+                )
+                .into_iter()
+                .filter(|row| {
+                    // A role is compared with the underscores a client sends
+                    // rather than the words a reader speaks: `list item` here is
+                    // `listitem` in ARIA.
+                    role.is_none_or(|role| same_role(row.role, role))
+                        && name.is_none_or(|name| row.name.as_deref() == Some(name))
+                })
+                .filter_map(|row| row.node)
+                .collect()
+            }
+            "xpath" => {
+                let expression = locator
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::invalid("an xpath locator needs a value"))?;
+                otlyra_dom::xpath::select(document, expression).map_err(|error| {
+                    // An expression that does not parse is the client's mistake
+                    // and is named as one, with the place in it: an empty list
+                    // would have read as *nothing on this page matched*.
+                    Error::invalid(format!("{expression:?} is not valid XPath: {error}"))
+                })?
+            }
+            other => {
+                // Saying which locator is missing beats a silent empty list,
+                // which reads as *nothing matched*.
+                return Err(Error::not_yet(
+                    &format!("locateNodes with a {other} locator"),
+                    "a locator this implementation does not have yet",
+                ));
+            }
+        };
 
         let nodes: Vec<Value> = matched
             .into_iter()
+            .take(limit)
             .map(|node| node_value(document, node))
             .collect();
         Ok(json!({ "nodes": nodes }))
@@ -1025,6 +2130,22 @@ impl Session {
         }
     }
 
+    /// Draw a frame from what has arrived, waiting for nothing.
+    ///
+    /// What the command loop uses. [`Self::prepare_frame`] waits on the network
+    /// for the pictures and fonts a frame asked for, and this thread is the one
+    /// that reads commands — including the command that would release the very
+    /// request it is waiting on. Settling belongs to the commands that mean
+    /// *give me a finished picture*, and nowhere else.
+    fn draw_frame(&mut self) {
+        self.browser.draw_frame(self.viewport());
+        if let Some(window) = self.window.as_mut()
+            && let Err(error) = window.frame(&mut self.browser)
+        {
+            tracing::error!(%error, "the driven window could not draw a frame");
+        }
+    }
+
     /// Draw the frames the browser asked for after an interaction, and nothing
     /// else.
     ///
@@ -1205,7 +2326,10 @@ fn response_event(context: &str, exchange: &crate::fetcher::Exchange) -> Value {
                 "status": status,
                 "statusText": text,
                 "bytesReceived": bytes,
-                "fromCache": false,
+                // The specification's own field, and it was hardcoded to `false`
+                // — which made a cache that worked indistinguishable from one
+                // that did nothing, for a client and for whoever wrote it.
+                "fromCache": exchange.served != otlyra_net::Served::Network,
                 "headers": headers_json(&exchange.response_headers),
                 "mimeType": exchange.content_type.clone().map_or(Value::Null, Value::from),
                 "protocol": Value::Null,
@@ -1215,6 +2339,10 @@ fn response_event(context: &str, exchange: &crate::fetcher::Exchange) -> Value {
             // transport was, and how long the request waited for a thread.
             "otlyra:took": exchange.took.map(|took| took.as_secs_f64() * 1000.0),
             "otlyra:waited": exchange.waited.map(|waited| waited.as_secs_f64() * 1000.0),
+            // `fromCache` cannot tell a hit apart from a revalidation, and the
+            // difference is the most useful thing a cache does: a request that
+            // asked and was told nothing changed still crossed the network.
+            "otlyra:served": served_word(exchange.served),
         }),
     )
 }
@@ -1268,6 +2396,178 @@ fn node_value(document: &otlyra_dom::Document, node: otlyra_dom::NodeId) -> Valu
         "sharedId": shared_id(node),
         "value": value,
     })
+}
+
+/// Whether a node's text is what an `innerText` locator asked for.
+fn matches_text(name: &str, wanted: &str, partial: bool, fold: bool) -> bool {
+    // Whitespace is collapsed on both sides: the words a page presents are what
+    // is being matched, and a line break in the markup is not one of them.
+    let tidy = |text: &str| {
+        let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if fold { joined.to_lowercase() } else { joined }
+    };
+    let (name, wanted) = (tidy(name), tidy(wanted));
+    if partial {
+        name.contains(&wanted)
+    } else {
+        name == wanted
+    }
+}
+
+/// Whether the word a reader uses for a role is the one a client asked for.
+///
+/// A client sends ARIA's spelling — `listitem`, `checkbox` — and the tree holds
+/// the words a reader speaks, which have spaces in them. Compared with the spaces
+/// taken out rather than with a table of both spellings, which would be a second
+/// list to keep in step with the first.
+fn same_role(spoken: &str, asked: &str) -> bool {
+    let bare = |role: &str| role.replace([' ', '-', '_'], "").to_lowercase();
+    bare(spoken) == bare(asked)
+}
+
+/// One row of a snapshot, as a client reads it.
+///
+/// `sharedId` is the same handle `locateNodes` hands back, which is the whole
+/// point of the command: what a caller reads and what it acts on are one name.
+fn row_json(row: &crate::digest::Row) -> Value {
+    let mut value = json!({
+        "depth": row.depth,
+        "role": row.role,
+        "interactive": row.interactive,
+    });
+    if let Some(node) = row.node {
+        value["sharedId"] = json!(shared_id(node));
+    }
+    if let Some(name) = &row.name {
+        value["name"] = json!(name);
+    }
+    if let Some(text) = &row.value {
+        value["value"] = json!(text);
+    }
+    if let Some(url) = &row.url {
+        value["url"] = json!(url);
+    }
+    if let Some((x, y, width, height)) = row.bounds {
+        value["bounds"] = json!({ "x": x, "y": y, "width": width, "height": height });
+    }
+    if row.disabled {
+        value["disabled"] = json!(true);
+    }
+    if let Some(checked) = row.checked {
+        value["checked"] = json!(checked);
+    }
+    value
+}
+
+/// One cookie, spelled the way the specification spells one.
+fn cookie_json(cookie: &otlyra_net::cookie::Cookie) -> Value {
+    json!({
+        "name": cookie.name,
+        "value": { "type": "string", "value": cookie.value },
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "size": cookie.name.len() + cookie.value.len(),
+        "httpOnly": cookie.http_only,
+        "secure": cookie.secure,
+        "sameSite": format!("{:?}", cookie.same_site).to_lowercase(),
+        "expiry": cookie.expires.and_then(|expires| {
+            expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        }),
+    })
+}
+
+/// One request the browser made, as a list entry rather than as two events.
+///
+/// The same facts `network.beforeRequestSent` and `network.responseCompleted`
+/// carry, in one object, for a caller that asks instead of subscribing. Headers
+/// and bodies are left out: a list of forty requests with every header on each is
+/// a wall, and the pane that wants them has them.
+fn exchange_json(exchange: &crate::fetcher::Exchange) -> Value {
+    use crate::fetcher::Status;
+
+    json!({
+        "id": exchange.id,
+        "method": exchange.method,
+        "url": exchange.url,
+        "kind": format!("{:?}", exchange.kind).to_lowercase(),
+        "status": exchange.code,
+        "contentType": exchange.content_type,
+        "state": match &exchange.status {
+            Status::Pending => "pending",
+            Status::Ok(_) => "complete",
+            Status::Failed(_) => "failed",
+        },
+        "bytes": match &exchange.status {
+            Status::Ok(bytes) => json!(bytes),
+            _ => Value::Null,
+        },
+        "error": match &exchange.status {
+            Status::Failed(why) => json!(why),
+            _ => Value::Null,
+        },
+        "took": exchange.took.map(|took| took.as_secs_f64() * 1000.0),
+        // What no timing can tell a caller: whether the network was touched.
+        "served": served_word(exchange.served),
+        "fromCache": exchange.served != otlyra_net::Served::Network,
+    })
+}
+
+/// The bytes of a `BytesValue`, which the specification carries two ways.
+///
+/// `{type: "string", value}` for text and `{type: "base64", value}` for anything
+/// else. A bare string is accepted too, because clients send one and refusing it
+/// would be refusing to work over a shape nobody misunderstands.
+fn body_of(value: &Value) -> Option<Vec<u8>> {
+    if let Some(text) = value.as_str() {
+        return Some(text.as_bytes().to_vec());
+    }
+    let inner = value.get("value").and_then(Value::as_str)?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("base64") => unbase64(inner),
+        _ => Some(inner.as_bytes().to_vec()),
+    }
+}
+
+/// The same, as text, for a header value.
+fn body_text(value: &Value) -> Option<String> {
+    String::from_utf8(body_of(value)?).ok()
+}
+
+/// Standard base64, the other way round from [`base64`].
+///
+/// Written out for the same reason that one is: it is twenty lines, it is used
+/// here and nowhere else, and a crate for it would be a crate to keep up to date
+/// for as long as this program exists.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut held: u32 = 0;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = ALPHABET.iter().position(|one| *one == byte)? as u32;
+        held = (held << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((held >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Where a response came from, as a client reads it.
+fn served_word(served: otlyra_net::Served) -> &'static str {
+    match served {
+        otlyra_net::Served::Network => "network",
+        otlyra_net::Served::Cache => "cache",
+        otlyra_net::Served::Revalidated => "revalidated",
+    }
 }
 
 /// The handle a client holds a node by.
@@ -1907,12 +3207,110 @@ mod tests {
             .dispatch(&command(
                 2,
                 "browsingContext.locateNodes",
-                json!({"locator": {"type": "innerText", "value": "hello"}}),
+                json!({"locator": {"type": "context", "value": {"context": "x"}}}),
             ))
             .unwrap_err();
         // An empty list would have read as *nothing matched*, which is a
         // different fact and would send a driver looking at its selector.
         assert_eq!(error.code, "unsupported operation");
+    }
+
+    #[test]
+    fn an_element_can_be_found_by_xpath() {
+        let mut session = opened();
+        let found = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "xpath", "value": "//p[@id='greeting']"}}),
+            ))
+            .expect("a match");
+
+        let nodes = found["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1, "{found:#}");
+        assert_eq!(nodes[0]["value"]["localName"], json!("p"));
+
+        // The expression every driver writes, and the one a CSS selector cannot.
+        let by_text = session
+            .dispatch(&command(
+                3,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "xpath", "value": "//p[text()='hello']"}}),
+            ))
+            .expect("a match");
+        assert_eq!(by_text["nodes"].as_array().expect("nodes").len(), 1);
+    }
+
+    #[test]
+    fn an_xpath_that_does_not_parse_says_where_rather_than_matching_nothing() {
+        let mut session = opened();
+        let error = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "xpath", "value": "//p["}}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, "invalid argument");
+        assert!(error.message.contains("XPath"), "{}", error.message);
+    }
+
+    #[test]
+    fn an_element_can_be_found_by_the_words_it_shows() {
+        let mut session = opened();
+        let found = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "innerText", "value": "hello"}}),
+            ))
+            .expect("a match");
+
+        // The point of this locator: a caller that can read the page can find
+        // what it read without having worked out a selector for it.
+        let nodes = found["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1, "{found:#}");
+        assert_eq!(nodes[0]["value"]["localName"], json!("p"));
+    }
+
+    #[test]
+    fn an_element_can_be_found_by_the_role_and_name_a_reader_would_announce() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://roles.example/"}),
+            ))
+            .expect("navigated");
+        let found = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {
+                    "type": "accessibility",
+                    "value": {"role": "paragraph"},
+                }}),
+            ))
+            .expect("a match");
+
+        assert!(
+            !found["nodes"].as_array().expect("nodes").is_empty(),
+            "{found:#}"
+        );
+    }
+
+    #[test]
+    fn asking_for_at_most_one_node_gets_at_most_one() {
+        let mut session = opened();
+        let found = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "css", "value": "*"}, "maxNodeCount": 1}),
+            ))
+            .expect("a match");
+        assert_eq!(found["nodes"].as_array().expect("nodes").len(), 1);
     }
 
     #[test]
@@ -2292,9 +3690,823 @@ mod tests {
         assert!(error.message.contains("M12"), "{}", error.message);
 
         let unknown = session
-            .dispatch(&command(2, "storage.getCookies", json!({})))
+            .dispatch(&command(2, "browser.createUserContext", json!({})))
             .unwrap_err();
         assert_eq!(unknown.code, "unknown command");
+    }
+
+    /// A loader that takes long enough that a load is still in flight when the
+    /// command that started it is answered.
+    ///
+    /// Without one of these, every test here would be a test of a load that had
+    /// already finished — which is exactly the case that cannot tell a blocking
+    /// navigation from a parked one.
+    struct Slow;
+
+    impl Loader for Slow {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<title>Slow</title><body><p>eventually".to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: url.to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A loader with enough on the page to read and to act on.
+    struct Site;
+
+    impl Loader for Site {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: br#"<title>Catalogue</title><body>
+                    <h1>Catalogue</h1>
+                    <p>Two things we have.</p>
+                    <ul><li>A thing</li><li>Another thing</li></ul>
+                    <a href="https://next.example/">Onwards</a>
+                    <label for=q>Search</label><input id=q value=cats>
+                    <button id=go>Go</button>"#
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: url.to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn site() -> Session {
+        let mut session = Session::new(Browser::new(Site), (800, 600));
+        session
+            .dispatch(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://catalogue.example/"}),
+            ))
+            .expect("navigated");
+        session
+    }
+
+    #[test]
+    fn the_page_can_be_read_without_a_script_engine_and_without_a_picture() {
+        let mut session = site();
+        let read = session
+            .dispatch(&command(2, "otlyra:readPage", json!({})))
+            .expect("a reading");
+
+        let text = read["text"].as_str().expect("text");
+        assert_eq!(read["title"], json!("Catalogue"));
+        // The four shapes an agent needs off a page: its headings, its prose, its
+        // lists, and where its links go.
+        assert!(text.contains("# Catalogue"), "{text}");
+        assert!(text.contains("Two things we have."), "{text}");
+        assert!(text.contains("- A thing"), "{text}");
+        assert!(text.contains("https://next.example/"), "{text}");
+    }
+
+    #[test]
+    fn a_snapshot_hands_back_handles_the_other_commands_take() {
+        let mut session = site();
+        let snapshot = session
+            .dispatch(&command(
+                2,
+                "otlyra:snapshot",
+                json!({"interactiveOnly": true}),
+            ))
+            .expect("a snapshot");
+
+        let nodes = snapshot["nodes"].as_array().expect("nodes");
+        assert!(!nodes.is_empty(), "{snapshot:#}");
+        let button = nodes
+            .iter()
+            .find(|node| node["role"] == json!("button"))
+            .unwrap_or_else(|| panic!("{snapshot:#}"));
+
+        // The whole point of the command: what was read is what can be acted on,
+        // with no selector guessed in between.
+        let shared = button["sharedId"].as_str().expect("a handle").to_owned();
+        session
+            .dispatch(&command(
+                3,
+                "input.performActions",
+                json!({"actions": [{
+                    "type": "pointer",
+                    "id": "mouse",
+                    "actions": [
+                        {"type": "pointerMove", "x": 0, "y": 0,
+                         "origin": {"type": "element", "element": {"sharedId": shared}}},
+                        {"type": "pointerDown", "button": 0},
+                        {"type": "pointerUp", "button": 0},
+                    ],
+                }]}),
+            ))
+            .expect("clicked");
+    }
+
+    #[test]
+    fn asking_only_for_what_can_be_acted_on_is_shorter_than_the_whole_page() {
+        let mut session = site();
+        let whole = session
+            .dispatch(&command(2, "otlyra:snapshot", json!({})))
+            .expect("a snapshot");
+        let acting = session
+            .dispatch(&command(
+                3,
+                "otlyra:snapshot",
+                json!({"interactiveOnly": true}),
+            ))
+            .expect("a snapshot");
+
+        let count = |value: &Value| value["nodes"].as_array().map_or(0, Vec::len);
+        assert!(count(&acting) < count(&whole), "{acting:#}");
+        assert!(
+            acting["nodes"]
+                .as_array()
+                .expect("nodes")
+                .iter()
+                .all(|node| node["interactive"] == json!(true))
+        );
+    }
+
+    #[test]
+    fn waiting_answers_whether_what_was_waited_for_is_there() {
+        let mut session = site();
+        let found = session
+            .dispatch(&command(
+                2,
+                "otlyra:waitFor",
+                json!({"locator": {"type": "css", "value": "button#go"}}),
+            ))
+            .expect("waited");
+        assert_eq!(found["found"], json!(true));
+        assert_eq!(found["loading"], json!(false));
+
+        let missing = session
+            .dispatch(&command(
+                3,
+                "otlyra:waitFor",
+                json!({"locator": {"type": "css", "value": ".nowhere"}, "timeout": 50}),
+            ))
+            .expect("waited");
+        // Answered rather than refused: *it is not there* is a fact a caller can
+        // act on, and it is not an error.
+        assert_eq!(missing["found"], json!(false));
+    }
+
+    #[test]
+    fn the_network_can_be_listed_by_a_caller_that_cannot_subscribe() {
+        let mut session = site();
+        let listed = session
+            .dispatch(&command(2, "otlyra:network", json!({})))
+            .expect("a list");
+
+        let requests = listed["requests"].as_array().expect("requests");
+        assert!(!requests.is_empty(), "{listed:#}");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["url"] == json!("https://catalogue.example/")),
+            "{listed:#}"
+        );
+    }
+
+    #[test]
+    fn a_cookie_can_be_set_read_back_and_deleted() {
+        let mut session = site();
+        session
+            .dispatch(&command(
+                2,
+                "storage.setCookie",
+                json!({"cookie": {
+                    "name": "session",
+                    "value": {"type": "string", "value": "abc"},
+                    "domain": "catalogue.example",
+                    "path": "/",
+                }}),
+            ))
+            .expect("set");
+
+        let read = session
+            .dispatch(&command(
+                3,
+                "storage.getCookies",
+                json!({"filter": {"name": "session"}}),
+            ))
+            .expect("read");
+        assert_eq!(read["cookies"][0]["value"]["value"], json!("abc"));
+
+        let deleted = session
+            .dispatch(&command(
+                4,
+                "storage.deleteCookies",
+                json!({"filter": {"name": "session"}}),
+            ))
+            .expect("deleted");
+        assert_eq!(deleted["removed"], json!(1));
+
+        let after = session
+            .dispatch(&command(5, "storage.getCookies", json!({})))
+            .expect("read");
+        assert!(after["cookies"].as_array().expect("cookies").is_empty());
+    }
+
+    #[test]
+    fn a_navigation_that_waits_for_nothing_is_answered_before_it_arrives() {
+        let mut session = Session::new(Browser::new(Slow), (800, 600));
+        let started = std::time::Instant::now();
+        let outcome = session
+            .begin(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://slow.example/", "wait": "none"}),
+            ))
+            .expect("started");
+
+        // The point of `wait: none`: the answer is here while the load is not.
+        // Without it a driver cannot watch a load, and cannot answer anything the
+        // load itself is waiting on.
+        assert!(
+            matches!(outcome, Outcome::Done(_)),
+            "should not have parked"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(
+            session.browser.readiness(session.browser.active()),
+            Readiness::Started
+        );
+    }
+
+    #[test]
+    fn a_navigation_that_waits_is_parked_rather_than_holding_the_loop() {
+        let mut session = Session::new(Browser::new(Slow), (800, 600));
+        let outcome = session
+            .begin(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://slow.example/"}),
+            ))
+            .expect("started");
+        assert!(matches!(outcome, Outcome::Parked));
+
+        // While it is parked the session still answers: this is the whole
+        // difference between a driver that can work during a load and one that
+        // has to sit through it.
+        let status = session
+            .dispatch(&command(2, "session.status", json!({})))
+            .expect("answered");
+        assert!(status["ready"].is_boolean());
+
+        // And the parked one is answered when the browser gets there.
+        let answer = loop {
+            session.pump();
+            if let Some((id, answer)) = session.resolve().pop() {
+                assert_eq!(id, 1);
+                break answer.expect("navigated");
+            }
+        };
+        assert_eq!(answer["url"], json!("https://slow.example/"));
+        assert!(answer["navigation"].is_string());
+    }
+
+    #[test]
+    fn a_readiness_a_client_does_not_have_a_word_for_is_refused() {
+        let mut session = session();
+        let error = session
+            .begin(&command(
+                1,
+                "browsingContext.navigate",
+                json!({"url": "https://a.example/", "wait": "eventually"}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, "invalid argument");
+    }
+
+    #[test]
+    fn a_tab_reports_starting_becoming_ready_and_finishing() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({"events": ["browsingContext"]}),
+            ))
+            .expect("subscribed");
+        session.drain_events();
+
+        session
+            .dispatch(&command(
+                2,
+                "browsingContext.navigate",
+                json!({"url": "https://a.example/"}),
+            ))
+            .expect("navigated");
+
+        let names: Vec<String> = session
+            .drain_events()
+            .into_iter()
+            .map(|event| event["method"].as_str().unwrap_or_default().to_owned())
+            .collect();
+
+        // All three, in the order a load goes through them. A driver waiting on
+        // the middle one — the document is there, the pictures are not — is the
+        // one this browser can now serve.
+        assert!(
+            names.contains(&"browsingContext.navigationStarted".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"browsingContext.domContentLoaded".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"browsingContext.load".to_owned()),
+            "{names:?}"
+        );
+        let place = |method: &str| names.iter().position(|name| name == method);
+        assert!(place("browsingContext.navigationStarted") < place("browsingContext.load"));
+
+        // And nothing is said twice about a load that has already been reported.
+        assert!(session.drain_events().is_empty());
+    }
+
+    #[test]
+    fn every_lifecycle_event_names_the_navigation_it_belongs_to() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({"events": ["browsingContext.load"]}),
+            ))
+            .expect("subscribed");
+        session.drain_events();
+
+        let answer = session
+            .dispatch(&command(
+                2,
+                "browsingContext.navigate",
+                json!({"url": "https://a.example/"}),
+            ))
+            .expect("navigated");
+        let events = session.drain_events();
+        let load = events
+            .iter()
+            .find(|event| event["method"] == json!("browsingContext.load"))
+            .unwrap_or_else(|| panic!("{events:#?}"));
+
+        // A client that started two navigations tells them apart by this, so the
+        // event and the command it came from have to agree.
+        assert_eq!(load["params"]["navigation"], answer["navigation"]);
+        assert!(load["params"]["navigation"].is_string());
+    }
+
+    #[test]
+    fn going_somewhere_else_reports_its_own_load_rather_than_staying_quiet() {
+        let mut session = session();
+        session
+            .dispatch(&command(
+                1,
+                "session.subscribe",
+                json!({"events": ["browsingContext.load"]}),
+            ))
+            .expect("subscribed");
+        session.drain_events();
+
+        let mut loads = Vec::new();
+        for (id, url) in [(2, "https://one.example/"), (3, "https://two.example/")] {
+            session
+                .dispatch(&command(
+                    id,
+                    "browsingContext.navigate",
+                    json!({ "url": url }),
+                ))
+                .expect("navigated");
+            loads.extend(
+                session
+                    .drain_events()
+                    .into_iter()
+                    .filter(|event| event["method"] == json!("browsingContext.load")),
+            );
+        }
+
+        // Two loads, under two names. Reporting only the first is what a
+        // readiness diff does if a new navigation does not reset it.
+        assert_eq!(loads.len(), 2, "{loads:#?}");
+        assert_ne!(
+            loads[0]["params"]["navigation"],
+            loads[1]["params"]["navigation"]
+        );
+    }
+
+    /// Add an intercept, start a navigation without waiting for it, and hand
+    /// back the handle of the request that is now being held.
+    ///
+    /// `wait: none` is the whole shape of interception: the navigation is
+    /// answered while its request is stopped, and the command that releases it
+    /// arrives afterwards. A navigation that waited would be waiting for a
+    /// command that could not be sent.
+    fn intercepted(session: &mut Session, url: &str, patterns: Value) -> String {
+        session
+            .dispatch(&command(
+                1,
+                "network.addIntercept",
+                json!({ "phases": ["beforeRequestSent"], "urlPatterns": patterns }),
+            ))
+            .expect("intercept added");
+        session
+            .dispatch(&command(
+                2,
+                "browsingContext.navigate",
+                json!({ "url": url, "wait": "none" }),
+            ))
+            .expect("started");
+
+        let events = session.drain_events();
+        let blocked = events
+            .iter()
+            .find(|event| event["method"] == json!("network.beforeRequestSent"))
+            .unwrap_or_else(|| panic!("nothing was held: {events:#?}"));
+        assert_eq!(blocked["params"]["isBlocked"], json!(true));
+        blocked["params"]["request"]["request"]
+            .as_str()
+            .expect("a handle")
+            .to_owned()
+    }
+
+    /// A driver that goes away must leave a browser that loads pages.
+    ///
+    /// The gate lives on the browser and outlives the connection that installed
+    /// it. Left there, every address it matches is held forever — and the next
+    /// client is never told about them either, because they were already
+    /// announced to the client that vanished.
+    #[test]
+    fn a_driver_that_goes_away_takes_its_intercepts_with_it() {
+        let mut session = session();
+        intercepted(
+            &mut session,
+            "https://held.example/",
+            json!([{ "type": "pattern", "hostname": "held.example" }]),
+        );
+        assert!(
+            !session.browser.held().is_empty(),
+            "nothing was held, so this proves nothing"
+        );
+
+        session.disconnected();
+
+        assert!(
+            session.browser.held().is_empty(),
+            "a held request outlived the driver that was going to answer it"
+        );
+        // And the gate is down: the same address loads rather than stopping.
+        session
+            .dispatch(&command(
+                9,
+                "browsingContext.navigate",
+                json!({ "url": "https://held.example/" }),
+            ))
+            .expect("navigated");
+        assert!(
+            session.browser.held().is_empty(),
+            "the gate was still installed with nobody left to answer it"
+        );
+    }
+
+    /// A step through the history is a load, and a load is parked rather than
+    /// waited for. It used to wait on this thread once per step, so a `delta` of
+    /// five was five load timeouts with the socket unread.
+    #[test]
+    fn a_step_through_the_history_is_started_rather_than_waited_for() {
+        let mut session = session();
+        for (id, url) in [(1, "https://one.example/"), (2, "https://two.example/")] {
+            session
+                .dispatch(&command(
+                    id,
+                    "browsingContext.navigate",
+                    json!({ "url": url }),
+                ))
+                .expect("navigated");
+        }
+
+        // Answered through the same door as a navigation: `begin` starts it, and
+        // `resolve` says when it arrived.
+        let back = session
+            .dispatch(&command(
+                3,
+                "browsingContext.traverseHistory",
+                json!({ "delta": -1 }),
+            ))
+            .expect("stepped back");
+        assert_eq!(back["url"], json!("https://one.example/"), "{back:#?}");
+
+        // And reaching it the other way round is refused rather than run twice.
+        let round_the_back = session.dispatch_now(&command(
+            4,
+            "browsingContext.traverseHistory",
+            json!({ "delta": -1 }),
+        ));
+        assert!(round_the_back.is_err());
+    }
+
+    #[test]
+    fn a_screenshot_can_be_asked_for_one_element_rather_than_the_page() {
+        let mut session = site();
+        let found = session
+            .dispatch(&command(
+                2,
+                "browsingContext.locateNodes",
+                json!({"locator": {"type": "css", "value": "button#go"}}),
+            ))
+            .expect("a match");
+        let shared = found["nodes"][0]["sharedId"]
+            .as_str()
+            .expect("a handle")
+            .to_owned();
+
+        let whole = session
+            .dispatch(&command(3, "browsingContext.captureScreenshot", json!({})))
+            .expect("a picture");
+        let button = session
+            .dispatch(&command(
+                4,
+                "browsingContext.captureScreenshot",
+                json!({"clip": {"type": "element", "element": {"sharedId": shared}}}),
+            ))
+            .expect("a picture");
+
+        // Both are PNGs, and the one of a button is smaller than the one of the
+        // page — which is the whole claim: nothing outside the rectangle was
+        // rasterized, so a clip of a hundred pixels costs a hundred pixels.
+        for picture in [&whole, &button] {
+            assert!(
+                picture["data"]
+                    .as_str()
+                    .is_some_and(|data| data.starts_with("iVBORw0KGgo")),
+                "{picture:#}"
+            );
+        }
+        let size = |picture: &Value| picture["data"].as_str().unwrap_or_default().len();
+        assert!(
+            size(&button) < size(&whole),
+            "{} vs {}",
+            size(&button),
+            size(&whole)
+        );
+    }
+
+    #[test]
+    fn a_box_clip_is_taken_in_the_page_own_coordinates() {
+        let mut session = site();
+        let picture = session
+            .dispatch(&command(
+                2,
+                "browsingContext.captureScreenshot",
+                json!({"clip": {"type": "box", "x": 0, "y": 0, "width": 40, "height": 20}}),
+            ))
+            .expect("a picture");
+        assert!(
+            picture["data"]
+                .as_str()
+                .is_some_and(|data| data.starts_with("iVBORw0KGgo"))
+        );
+
+        // A rectangle with nothing in it is a mistake worth naming: a picture of
+        // it would be zero pixels wide, which no reader can look at.
+        let refused = session
+            .dispatch(&command(
+                3,
+                "browsingContext.captureScreenshot",
+                json!({"clip": {"type": "box", "x": 0, "y": 0, "width": 0, "height": 20}}),
+            ))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid argument");
+    }
+
+    #[test]
+    fn a_held_request_can_be_answered_with_a_response_nobody_sent() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://mocked.example/",
+            json!([{ "type": "pattern", "hostname": "mocked.example" }]),
+        );
+
+        session
+            .dispatch(&command(
+                3,
+                "network.provideResponse",
+                json!({
+                    "request": held,
+                    "statusCode": 200,
+                    "headers": [{ "name": "Content-Type", "value": {"type": "string", "value": "text/html"} }],
+                    "body": { "type": "string", "value": "<title>Made up</title><p>invented" },
+                }),
+            ))
+            .expect("provided");
+
+        // The page is the one the driver wrote. No server answered it, and there
+        // is no server to answer it — which is the case this exists for.
+        while session.browser.readiness(session.browser.active()) != Readiness::Complete {
+            session.pump();
+        }
+        let read = session
+            .dispatch(&command(4, "otlyra:readPage", json!({})))
+            .expect("a reading");
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invented"),
+            "{read:#}"
+        );
+    }
+
+    #[test]
+    fn a_held_request_can_be_stopped() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://blocked.example/",
+            json!([{ "type": "pattern", "hostname": "blocked.example" }]),
+        );
+        session
+            .dispatch(&command(
+                3,
+                "network.failRequest",
+                json!({ "request": held }),
+            ))
+            .expect("failed");
+
+        while session.browser.readiness(session.browser.active()) != Readiness::Complete {
+            session.pump();
+        }
+        // Blocked is not *pending forever*: the load ended, and it ended badly,
+        // which is what a page whose script was refused has to be able to see.
+        let listed = session
+            .dispatch(&command(4, "otlyra:network", json!({})))
+            .expect("a list");
+        let request = &listed["requests"][0];
+        assert_eq!(request["state"], json!("failed"), "{listed:#}");
+    }
+
+    #[test]
+    fn a_held_request_can_be_sent_somewhere_else() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://original.example/",
+            json!([{ "type": "pattern", "hostname": "original.example" }]),
+        );
+        session
+            .dispatch(&command(
+                3,
+                "network.continueRequest",
+                json!({ "request": held, "url": "https://fixture.example/" }),
+            ))
+            .expect("continued");
+
+        while session.browser.readiness(session.browser.active()) != Readiness::Complete {
+            session.pump();
+        }
+        // The list says where it actually went, not where it was going before
+        // the driver moved it.
+        let listed = session
+            .dispatch(&command(4, "otlyra:network", json!({})))
+            .expect("a list");
+        assert_eq!(
+            listed["requests"][0]["url"],
+            json!("https://fixture.example/"),
+            "{listed:#}"
+        );
+    }
+
+    #[test]
+    fn a_held_request_can_be_let_go_with_headers_the_driver_wrote() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://a.example/",
+            json!([{ "type": "pattern", "hostname": "a.example" }]),
+        );
+        session
+            .dispatch(&command(
+                3,
+                "network.continueRequest",
+                json!({
+                    "request": held,
+                    "headers": [{
+                        "name": "Accept-Language",
+                        "value": {"type": "string", "value": "cy-GB"},
+                    }],
+                }),
+            ))
+            .expect("continued");
+
+        while session.browser.readiness(session.browser.active()) != Readiness::Complete {
+            session.pump();
+        }
+        assert_eq!(
+            session.browser.exchanges()[0].url,
+            "https://a.example/",
+            "the address was not the thing being changed"
+        );
+    }
+
+    #[test]
+    fn a_cookie_a_driver_wrote_is_refused_rather_than_sent() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://a.example/",
+            json!([{ "type": "pattern", "hostname": "a.example" }]),
+        );
+        let error = session
+            .dispatch(&command(
+                3,
+                "network.continueRequest",
+                json!({
+                    "request": held,
+                    "cookies": [{"name": "session", "value": {"type": "string", "value": "x"}}],
+                }),
+            ))
+            .unwrap_err();
+
+        // The jar decides what a site is entitled to be sent. A command that could
+        // write this could send one site's session to another.
+        assert_eq!(error.code, "unsupported operation");
+    }
+
+    #[test]
+    fn nothing_is_held_once_the_last_intercept_is_gone() {
+        let mut session = session();
+        let added = session
+            .dispatch(&command(
+                1,
+                "network.addIntercept",
+                json!({ "phases": ["beforeRequestSent"] }),
+            ))
+            .expect("added");
+        let id = added["intercept"].as_str().expect("a name").to_owned();
+        session
+            .dispatch(&command(
+                2,
+                "network.removeIntercept",
+                json!({ "intercept": id }),
+            ))
+            .expect("removed");
+
+        // A driver that removed its last intercept — or went away — has to leave
+        // a browser that loads pages.
+        session
+            .dispatch(&command(
+                3,
+                "browsingContext.navigate",
+                json!({ "url": "https://a.example/" }),
+            ))
+            .expect("navigated");
+        assert!(session.browser.held().is_empty());
+    }
+
+    #[test]
+    fn a_request_that_is_no_longer_held_says_so_rather_than_doing_nothing() {
+        let mut session = session();
+        let held = intercepted(
+            &mut session,
+            "https://a.example/",
+            json!([{ "type": "pattern", "hostname": "a.example" }]),
+        );
+        session
+            .dispatch(&command(
+                3,
+                "network.failRequest",
+                json!({ "request": held.clone() }),
+            ))
+            .expect("failed");
+
+        let again = session
+            .dispatch(&command(
+                4,
+                "network.failRequest",
+                json!({ "request": held }),
+            ))
+            .unwrap_err();
+        // Quietly doing nothing would leave the driver waiting for a load that
+        // already ended.
+        assert_eq!(again.code, "no such request");
+    }
+
+    #[test]
+    fn base64_survives_a_round_trip_through_a_provided_body() {
+        // A driver mocking a picture sends base64, and a body decoded wrongly is
+        // a picture that will not decode with nothing saying why.
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let round = unbase64(&base64(&bytes)).expect("decoded");
+        assert_eq!(round, bytes);
+        assert_eq!(unbase64(&base64(b"a")).expect("decoded"), b"a");
+        assert_eq!(unbase64(&base64(b"ab")).expect("decoded"), b"ab");
     }
 
     #[test]

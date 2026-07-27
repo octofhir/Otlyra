@@ -22,11 +22,20 @@
 //! Thirty-two bytes from the system's own generator, made once and kept in the
 //! login keychain under [`SERVICE`]. The browser never writes it anywhere else.
 //!
-//! **A rebuilt binary is a different application to the keychain**, so a
-//! development build asks permission the first time each new binary reads the
-//! key. *Always Allow* answers it for that build. This is the keychain working:
-//! the alternative is an item any program may read, which is a key kept beside
-//! the lock.
+//! **The keychain decides by code signature, and an unsigned binary has none.**
+//! So every `cargo build` produces something the keychain has never seen, and it
+//! asks again — which is the keychain working exactly as it should, and is also
+//! a dialog between a developer and the thing they are trying to run. A shipping
+//! browser is asked about once because it is signed once, with an identity that
+//! does not change when the bytes inside it do.
+//!
+//! `just sign` makes such an identity and signs the built binaries with it, after
+//! which *Always Allow* is answered for good. `just run` does it as part of
+//! building. Nothing about the cookies changes: the point is to be asked once,
+//! not to stop keeping them.
+//!
+//! The key is also fetched *late* — see [`crate::cookies::CookieStore`] — so a
+//! run with no cookie file to open and nothing worth writing never asks at all.
 //!
 //! ## Everywhere else
 //!
@@ -155,6 +164,17 @@ mod platform {
 
     /// The key in the login keychain, made on first use.
     pub fn load_or_create() -> Option<Key> {
+        // The way out for whoever is rebuilding this all day. Each rebuilt binary
+        // is a different application to the keychain, so each one is asked about
+        // once — which is the keychain working, and is still a dialog between a
+        // developer and the thing they are trying to run. With this set there is
+        // no key, so there is no file, so the cookies last one run. Stated as an
+        // absence rather than a fallback: a key kept beside the lock would be
+        // worse than no key at all.
+        if std::env::var_os("OTLYRA_NO_KEYCHAIN").is_some() {
+            tracing::info!("OTLYRA_NO_KEYCHAIN is set; cookies will not survive this run");
+            return None;
+        }
         if let Ok(found) = security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
             match <[u8; 32]>::try_from(found.as_slice()) {
                 Ok(bytes) => return Some(Key(bytes)),

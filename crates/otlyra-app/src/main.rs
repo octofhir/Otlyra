@@ -708,12 +708,69 @@ fn browser(settings: otlyra_app::settings::Settings) -> Browser {
 /// The one HTTP cache, made here because the loader needs it before the browser
 /// exists and the two have to hold the same one.
 ///
-/// In memory for the life of the process. It survives no restart, which is worth
-/// saying because the win it is here for does not need it to: what a reader
-/// notices is the second request for the same picture on the same page.
+/// Two tiers. The one in memory answers the second request for the same picture
+/// on the same page; the one on disk answers the thing a person actually notices,
+/// which is that the site they open every morning was fetched from nothing every
+/// morning. Where it is written is decided here rather than in the library, for
+/// the same reason the cookie file is: a crate that chose a directory on somebody's
+/// disk because it was linked would be a crate doing something nobody asked for.
+///
+/// With nowhere to write — a platform that will not say where a program's files
+/// go, or a directory that cannot be made — the memory tier is the whole of it,
+/// and the browser says so rather than failing to start over a cache.
 fn browser_cache() -> otlyra_net::SharedCache {
-    std::sync::Arc::new(std::sync::Mutex::new(otlyra_net::cache::Cache::new()))
+    let cache: otlyra_net::SharedCache =
+        std::sync::Arc::new(std::sync::Mutex::new(otlyra_net::cache::Cache::new()));
+    let Some(directory) =
+        otlyra_app::preferences::directory().map(|directory| directory.join(CACHE_FOLDER))
+    else {
+        tracing::warn!("nowhere to keep a cache between runs");
+        return cache;
+    };
+
+    // Opening it reads the headers of every file in there, which for a cache of a
+    // few thousand entries is a few thousand short reads — and the startup budget
+    // is measured to the first frame, which fetches nothing. So the browser starts
+    // and the disk tier arrives when it arrives. Anything fetched before then
+    // missed a cache, which costs a request and is never a wrong answer.
+    let attaching = std::sync::Arc::clone(&cache);
+    if let Err(error) = std::thread::Builder::new()
+        .name("otlyra-cache-open".to_owned())
+        .spawn(
+            move || match otlyra_net::cache::Disk::open(&directory, DISK_CACHE_BYTES) {
+                Ok(disk) => {
+                    tracing::info!(
+                        at = %directory.display(),
+                        entries = disk.len(),
+                        bytes = disk.bytes(),
+                        "the cache on disk was opened"
+                    );
+                    attaching
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .attach_disk(disk);
+                }
+                Err(error) => {
+                    tracing::warn!(at = %directory.display(), %error, "no cache on disk this run");
+                }
+            },
+        )
+    {
+        tracing::warn!(%error, "no thread to open the cache on; this run keeps nothing");
+    }
+    cache
 }
+
+/// What the cache directory is called inside the browser's own directory.
+const CACHE_FOLDER: &str = "cache";
+
+/// How much of somebody's disk this may take.
+///
+/// A quarter of a gigabyte, which is a fraction of what a shipping browser takes
+/// and is enough for the pictures, stylesheets and fonts of every site a person
+/// visits regularly. A cache that has to be explained to whoever finds it is too
+/// large.
+const DISK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The `file:` URL an input names, if it names one.
 ///
@@ -786,6 +843,7 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
         input: String,
         body: Option<otlyra_net::Body>,
         cache: otlyra_net::CacheMode,
+        headers: Vec<(String, String)>,
     ) -> otlyra_app::fetcher::Fetching {
         Box::pin(async move {
             // A path typed into the address bar becomes the `file:` URL it names, so
@@ -837,7 +895,8 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
                 Some(body) => otlyra_net::LoadRequest::post(url, body),
                 None => otlyra_net::LoadRequest::new(url),
             }
-            .caching(cache);
+            .caching(cache)
+            .with_headers(headers);
             // The transport on the browser's own runtime: no thread is held while
             // the server thinks, and no runtime is created to wait for it.
             let resource = loader
@@ -854,6 +913,7 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
                 request_headers: resource.request_headers,
                 response_headers: resource.response_headers,
                 final_url: resource.final_url,
+                served: resource.served,
             })
         })
     }
