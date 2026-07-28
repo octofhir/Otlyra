@@ -10,6 +10,7 @@ members = [
     "crates/otlyra-net",
     "crates/otlyra-paint",
     "crates/otlyra-platform",
+    "crates/otlyra-script",
     "crates/otlyra-text",
 ]
 
@@ -31,6 +32,7 @@ otlyra-layout = { path = "crates/otlyra-layout", version = "0.0.0" }
 otlyra-net = { path = "crates/otlyra-net", version = "0.0.0" }
 otlyra-paint = { path = "crates/otlyra-paint", version = "0.0.0" }
 otlyra-platform = { path = "crates/otlyra-platform", version = "0.0.0" }
+otlyra-script = { path = "crates/otlyra-script", version = "0.0.0" }
 otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
 
 # Windowing and GPU surface. Both are wrapped by otlyra-platform: neither may

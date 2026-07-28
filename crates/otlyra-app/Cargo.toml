@@ -28,6 +28,7 @@ otlyra-net.workspace = true
 url.workspace = true
 otlyra-paint.workspace = true
 otlyra-platform.workspace = true
+otlyra-script.workspace = true
 otlyra-text.workspace = true
 arboard.workspace = true
 dirs.workspace = true

@@ -29,13 +29,66 @@ fn is_alpha(byte: u8) -> bool {
 /// Run the prescan over at most the first [`PRESCAN_LIMIT`] bytes.
 pub fn prescan(bytes: &[u8]) -> Option<&'static Encoding> {
     let bytes = &bytes[..bytes.len().min(PRESCAN_LIMIT)];
-    let mut scanner = Scanner { bytes, at: 0 };
+    let mut scanner = Scanner {
+        bytes,
+        at: 0,
+        fold_values: true,
+    };
     scanner.run()
 }
+
+/// Every address a `<script src>` names, in document order, without repeats.
+///
+/// The second prescan, and for the same reason as the first: something has to be
+/// known about a document before it is parsed. A `<script src>` blocks the parse
+/// at the point it appears — everything after it is supposed to see what it did —
+/// and a browser that only learns of it *at* that point can either stop and wait
+/// on the network or run it late. Running it late is what `defer` means, and a
+/// page whose inline scripts call into a bundle breaks under it. So the addresses
+/// are read out of the bytes first, asked for at once, and the parse starts with
+/// them already in hand.
+///
+/// This walks bytes rather than text because it runs beside [`prescan`], before
+/// the encoding is settled. An address that is not ASCII in an ASCII-compatible
+/// encoding is out of its reach, as it is out of the encoding prescan's; the
+/// parser still finds those scripts, and they load the old way, late.
+///
+/// Being ahead of the parser, this sees things the parser will not: a `<script
+/// src>` inside a `<template>`, or one the tree builder drops. The cost of that
+/// is a request nobody uses. The other direction — a script this misses — costs
+/// nothing but the lateness we already have.
+pub fn prescan_scripts(bytes: &[u8]) -> Vec<String> {
+    let mut scanner = Scanner {
+        bytes,
+        at: 0,
+        fold_values: false,
+    };
+    scanner.scripts()
+}
+
+/// The elements whose contents are text rather than markup.
+///
+/// A `<script src>` spelled inside one of them is not an element and must not be
+/// fetched. `<script>` is on the list too, and handled separately because its
+/// `src` is the thing we came for.
+const RAW_TEXT: [&[u8]; 7] = [
+    b"style",
+    b"textarea",
+    b"title",
+    b"xmp",
+    b"iframe",
+    b"noembed",
+    b"noframes",
+];
 
 struct Scanner<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// Whether attribute values are lowercased as they are read.
+    ///
+    /// The encoding scan wants them folded — it compares them against labels.
+    /// The script scan must not: an address is case-sensitive after the host.
+    fold_values: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -47,6 +100,15 @@ impl<'a> Scanner<'a> {
         self.bytes
             .get(self.at..self.at + prefix.len())
             .is_some_and(|window| window.eq_ignore_ascii_case(prefix))
+    }
+
+    /// One byte of an attribute value, folded or not as the scan wants.
+    fn fold(&self, byte: u8) -> u8 {
+        if self.fold_values {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        }
     }
 
     fn skip_spaces(&mut self) {
@@ -95,6 +157,73 @@ impl<'a> Scanner<'a> {
             }
         }
         None
+    }
+
+    /// Whether the cursor is on a start tag named `name`.
+    fn tag_named(&self, name: &[u8]) -> bool {
+        if self.peek() != Some(b'<') {
+            return false;
+        }
+        let after = self.at + 1 + name.len();
+        self.bytes
+            .get(self.at + 1..after)
+            .is_some_and(|window| window.eq_ignore_ascii_case(name))
+            && self
+                .bytes
+                .get(after)
+                .is_none_or(|&byte| is_space(byte) || byte == b'/' || byte == b'>')
+    }
+
+    /// The whole-document walk behind [`prescan_scripts`].
+    fn scripts(&mut self) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        while self.at < self.bytes.len() {
+            if self.starts_with_ignore_ascii_case(b"<!--") {
+                self.at += 2;
+                self.skip_past(b"-->");
+            } else if self.tag_named(b"script") {
+                self.at += 1 + b"script".len();
+                let src = self.tag_attribute(b"src");
+                // Whatever is between here and the close tag is source, not
+                // markup, and a `<script src=…>` written inside it is a string.
+                self.skip_past(b"</script");
+                if let Some(src) = src
+                    && !src.is_empty()
+                    && !found.contains(&src)
+                {
+                    found.push(src);
+                }
+            } else if let Some(name) = RAW_TEXT.iter().find(|name| self.tag_named(name)) {
+                self.at += 1 + name.len();
+                let mut close = b"</".to_vec();
+                close.extend_from_slice(name);
+                self.skip_past(&close);
+            } else if self.looks_like_a_tag() {
+                self.skip_tag();
+            } else if self.starts_with_ignore_ascii_case(b"<!")
+                || self.starts_with_ignore_ascii_case(b"</")
+                || self.starts_with_ignore_ascii_case(b"<?")
+            {
+                self.skip_past(b">");
+            } else {
+                self.at += 1;
+            }
+        }
+        found
+    }
+
+    /// Read a tag's attributes and return the value of `name`, trimmed.
+    ///
+    /// The cursor is left past the tag either way: the attributes have to be read
+    /// through in any case, because `>` inside a quoted value is not the end.
+    fn tag_attribute(&mut self, wanted: &[u8]) -> Option<String> {
+        let mut value: Option<String> = None;
+        while let Some((name, found)) = self.attribute() {
+            if name == wanted && value.is_none() {
+                value = Some(String::from_utf8_lossy(&found).trim().to_owned());
+            }
+        }
+        value
     }
 
     fn looks_like_a_tag(&self) -> bool {
@@ -217,18 +346,18 @@ impl<'a> Scanner<'a> {
                     if byte == quote {
                         break;
                     }
-                    value.push(byte.to_ascii_lowercase());
+                    value.push(self.fold(byte));
                 }
             }
             Some(b'>') => {}
             Some(byte) => {
-                value.push(byte.to_ascii_lowercase());
+                value.push(self.fold(byte));
                 self.at += 1;
                 while let Some(byte) = self.peek() {
                     if is_space(byte) || byte == b'>' {
                         break;
                     }
-                    value.push(byte.to_ascii_lowercase());
+                    value.push(self.fold(byte));
                     self.at += 1;
                 }
             }
@@ -300,5 +429,79 @@ pub fn apply_overrides(encoding: &'static Encoding) -> &'static Encoding {
         encoding_rs::WINDOWS_1252
     } else {
         encoding
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scripts(html: &str) -> Vec<String> {
+        prescan_scripts(html.as_bytes())
+    }
+
+    #[test]
+    fn the_scan_finds_every_src_in_document_order() {
+        assert_eq!(
+            scripts(
+                "<head><script src=one.js></script></head><body>text\
+                 <script SRC='/two.js' async></script>\
+                 <script src=\"http://x/Three.js\" defer></script>"
+            ),
+            ["one.js", "/two.js", "http://x/Three.js"]
+        );
+    }
+
+    #[test]
+    fn a_src_keeps_its_case() {
+        assert_eq!(scripts("<script src=/A/b/C.JS></script>"), ["/A/b/C.JS"]);
+    }
+
+    #[test]
+    fn an_inline_script_is_not_one_and_its_contents_are_not_markup() {
+        assert!(scripts("<script>var s = '<script src=fake.js></script>';").is_empty());
+    }
+
+    #[test]
+    fn the_same_address_twice_is_asked_for_once() {
+        assert_eq!(
+            scripts("<script src=a.js></script><script src=a.js></script>"),
+            ["a.js"]
+        );
+    }
+
+    #[test]
+    fn a_script_in_a_comment_or_in_text_content_is_not_one() {
+        assert!(
+            scripts(
+                "<!-- <script src=commented.js></script> -->\
+                 <textarea><script src=typed.js></script></textarea>\
+                 <title><script src=titled.js></script></title>"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_empty_or_missing_src_is_not_an_address() {
+        assert!(
+            scripts("<script src></script><script src=''></script><script></script>").is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_markup_does_not_hang_or_panic() {
+        for input in [
+            "<script",
+            "<script src",
+            "<script src=",
+            "<script src=a.js",
+            "<script src=a.js>",
+            "<textarea><script src=a.js>",
+            "<!-- <script",
+            "<script src=a.js></script".repeat(200).as_str(),
+        ] {
+            let _ = scripts(input);
+        }
     }
 }

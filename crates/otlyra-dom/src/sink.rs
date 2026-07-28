@@ -6,7 +6,7 @@
 //! replaced this file is what gets deleted, not the DOM.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::StrTendril;
@@ -65,6 +65,26 @@ impl DomSink {
     /// How many parse errors the tokenizer and tree builder reported.
     pub fn parse_errors(&self) -> usize {
         self.parse_errors.get()
+    }
+
+    /// The document as it stands, mid-parse.
+    ///
+    /// A parser stopped at a `<script>` has to read the tree it has built so
+    /// far — the script's own text is in it — before it can run anything. The
+    /// borrow is the same per-call borrow every `TreeSink` method takes, so it
+    /// must not be held across a call back into the tree builder.
+    pub fn document(&self) -> Ref<'_, Document> {
+        self.document.borrow()
+    }
+
+    /// The document as it stands, to change.
+    ///
+    /// What a script does at a script point: the tree is half-built and the
+    /// script may add to it, so this is the same document the tree builder will
+    /// carry on appending to afterwards. Same rule as [`Self::document`] — the
+    /// borrow must not be held across a call back into the tree builder.
+    pub fn document_mut(&self) -> RefMut<'_, Document> {
+        self.document.borrow_mut()
     }
 
     /// The `<selectedcontent>` that should mirror `option`, if there is one.

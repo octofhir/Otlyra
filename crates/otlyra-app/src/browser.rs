@@ -57,6 +57,43 @@ struct PendingLoad {
     picture_sources: HashMap<NodeId, (String, f32)>,
     /// What each outstanding request will feed once it arrives.
     outstanding: HashMap<u64, Vec<PendingResource>>,
+    /// The document, held back while the scripts it names are fetched.
+    ///
+    /// Present only for the stretch between the bytes arriving and the parse
+    /// starting. Nothing else in the load happens during it: the parse is what
+    /// finds the stylesheets and the pictures.
+    prefetch: Option<ScriptPrefetch>,
+    /// The `<script src>` elements, in the order the document names them.
+    script_order: Vec<NodeId>,
+    /// The source of each of those that has arrived.
+    scripts: HashMap<NodeId, String>,
+    /// The page's script world, kept alive from the parse until the external
+    /// scripts have run in it.
+    runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
+}
+
+/// A document waiting for the scripts it links to, before it is parsed at all.
+///
+/// A `<script src>` is supposed to stop the parse where it stands and run before
+/// anything after it is parsed. A browser that only learns of one when the parser
+/// reaches it can either block the parse on the network — which blocks the whole
+/// browser, here — or run it afterwards, which is `defer` and breaks any page
+/// whose inline scripts call into a bundle. So the addresses are read out of the
+/// bytes first (`otlyra_html::prescan_scripts`), asked for at once, and the parse
+/// begins once they are in hand and runs every script in document order.
+///
+/// The wait costs the tab nothing it was not already spending: it is loading, it
+/// has no document yet either way, and the requests go out in parallel.
+struct ScriptPrefetch {
+    /// The response the document came in, kept until there is something to parse
+    /// it with.
+    loaded: crate::fetcher::Loaded,
+    /// The source of each script, keyed by `src` as the document spells it.
+    ///
+    /// One that failed to load is in here as an empty string rather than absent:
+    /// absent means *not asked for yet* and would have the parser defer it into a
+    /// second request for a file that is not there.
+    sources: otlyra_html::ExternalSources,
 }
 
 /// Which way a zoom is being taken.
@@ -78,6 +115,13 @@ enum PendingResource {
     /// markup spells it, and that candidate's density — which is what the file's
     /// own size is divided by.
     Image(NodeId, String, f32),
+    /// The `<script src>` whose source this is.
+    Script(NodeId),
+    /// A script asked for before the parse, named by the `src` that asked for it.
+    ///
+    /// There is no node to hang it on yet — the document it is in has not been
+    /// parsed, which is the point.
+    ScriptSource(String),
 }
 
 /// Note in the log when a document asked for more than the limit allows.
@@ -242,6 +286,19 @@ const STYLESHEET_LIMIT: usize = 32;
 /// How many pictures one document may pull in, for the same reason.
 const IMAGE_LIMIT: usize = 64;
 
+/// How many scripts one page may link to.
+///
+/// A page with more than this many is not a page we refuse; it is a page whose
+/// hundredth script we decline to fetch, the way the stylesheet and picture
+/// limits work.
+const SCRIPT_LIMIT: usize = 32;
+
+/// How many navigations in a row page script may ask for.
+///
+/// Long enough for a real bounce chain — a shortener into a sign-in into the
+/// page — and short enough that a loop stops.
+const SCRIPT_HOP_LIMIT: u8 = 8;
+
 /// How many fonts one document may bring with it.
 ///
 /// A page that ships a family ships a handful of faces of it; one that names
@@ -374,6 +431,12 @@ pub struct Browser {
     images: ImageCache,
     /// Background pictures asked for, so none is asked for twice.
     background_requests: HashMap<String, usize>,
+    /// How many navigations in a row page script has asked for.
+    ///
+    /// A redirector page sends the reader on, and the page it sends them to may
+    /// send them on again — that is what a sign-in bounce is. A page that does
+    /// it forever is a loop, and this is where it stops being our problem.
+    script_hops: u8,
     /// Background fetches in flight, by request number.
     background_fetches: HashMap<u64, (usize, String)>,
     /// Fetches for a picture an element chose again, by request number, with the
@@ -553,6 +616,7 @@ impl Browser {
             interface: true,
             images: ImageCache::default(),
             background_requests: HashMap::new(),
+            script_hops: 0,
             background_fetches: HashMap::new(),
             picture_fetches: HashMap::new(),
             picture_window: None,
@@ -1295,6 +1359,9 @@ impl Browser {
     }
 
     fn navigate_from(&mut self, url: &str, user_initiated: bool) {
+        if user_initiated {
+            self.script_hops = 0;
+        }
         self.remember_scroll();
         self.start_load(url, user_initiated, true, 0.0);
     }
@@ -1382,6 +1449,10 @@ impl Browser {
             images: Images::default(),
             picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
+            prefetch: None,
+            script_order: Vec::new(),
+            scripts: HashMap::new(),
+            runner: None,
         });
         // Through `sync_address` rather than straight into the field: the address
         // and whether this page is one the reader kept are two things the toolbar
@@ -1829,7 +1900,7 @@ impl Browser {
 
         match fetched.kind {
             ResourceKind::Document => self.receive_document(index, fetched),
-            ResourceKind::Stylesheet | ResourceKind::Image => {
+            ResourceKind::Stylesheet | ResourceKind::Image | ResourceKind::Script => {
                 self.receive_subresource(index, fetched);
                 true
             }
@@ -1842,10 +1913,6 @@ impl Browser {
     /// have been asked for: a page that is readable now and styled a moment later
     /// beats a blank window for the length of the slowest thing it links to.
     fn receive_document(&mut self, index: usize, fetched: Fetched) -> bool {
-        if let Some(pending) = self.tabs[index].pending.as_mut() {
-            pending.document_arrived = true;
-        }
-        let interface = self.interface;
         let loaded = match fetched.result {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -1917,6 +1984,81 @@ impl Browser {
             return true;
         }
 
+        // A document's scripts are asked for here, before it is parsed, so that
+        // the parse can run each of them where the document names it. See
+        // [`ScriptPrefetch`] for why that is worth a wait.
+        if otlyra_net::sniff(
+            loaded.content_type.as_deref(),
+            loaded.nosniff,
+            &loaded.bytes,
+        )
+        .is_document()
+            && self.prefetch_scripts(index, &loaded)
+        {
+            let Some(pending) = self.tabs[index].pending.as_mut() else {
+                return true;
+            };
+            pending.prefetch = Some(ScriptPrefetch {
+                loaded,
+                sources: otlyra_html::ExternalSources::new(),
+            });
+            return true;
+        }
+
+        self.build_document(index, loaded, otlyra_html::ExternalSources::new())
+    }
+
+    /// Ask for every script a document's bytes name, before parsing them.
+    ///
+    /// Returns whether anything was asked for: nothing to wait on means the parse
+    /// can start now.
+    fn prefetch_scripts(&mut self, index: usize, loaded: &crate::fetcher::Loaded) -> bool {
+        let srcs = otlyra_html::prescan_scripts(&loaded.bytes);
+        report_limit(srcs.len(), SCRIPT_LIMIT, "scripts");
+        let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
+        self.request_subresources(
+            &mut outstanding,
+            &loaded.final_url,
+            srcs.into_iter().take(SCRIPT_LIMIT).map(|src| {
+                (
+                    src.clone(),
+                    PendingResource::ScriptSource(src),
+                    ResourceKind::Script,
+                )
+            }),
+        );
+        if outstanding.is_empty() {
+            return false;
+        }
+        let Some(pending) = self.tabs[index].pending.as_mut() else {
+            return false;
+        };
+        tracing::debug!(
+            target: "page.script",
+            requests = outstanding.len(),
+            url = %loaded.final_url,
+            "scripts asked for ahead of the parse"
+        );
+        pending.outstanding = outstanding;
+        true
+    }
+
+    /// Parse a document that has everything it needed to be parsed with, and put
+    /// it in the tab.
+    ///
+    /// `sources` is what the scripts it links to turned out to hold, keyed by the
+    /// `src` that named them; the parse runs each of them at its own point.
+    fn build_document(
+        &mut self,
+        index: usize,
+        loaded: crate::fetcher::Loaded,
+        sources: otlyra_html::ExternalSources,
+    ) -> bool {
+        if let Some(pending) = self.tabs[index].pending.as_mut() {
+            pending.document_arrived = true;
+        }
+        let interface = self.interface;
+
         // What the response is, from what the server said and from the bytes: a
         // picture is shown as one and text is shown as text, rather than everything
         // being fed to the HTML parser and rendering as whatever that makes of it.
@@ -1927,9 +2069,21 @@ impl Browser {
         );
         let final_url = loaded.final_url;
         tracing::debug!(kind = sniffed.essence(), url = %final_url, "response sniffed");
+        // The page's script world, kept from the parse until the scripts it
+        // links to have been fetched and run in it.
+        let mut page_scripts: Option<Box<dyn otlyra_html::ScriptRunner>> = None;
         let parsed = match &sniffed {
             kind if kind.is_document() => {
-                otlyra_html::parse(&loaded.bytes, loaded.charset.as_deref())
+                // The page's own code runs here, at the parser's script points,
+                // in an isolate of this document's own with no capabilities.
+                let (parsed, runner) = otlyra_html::parse_with_scripts(
+                    &loaded.bytes,
+                    loaded.charset.as_deref(),
+                    Some(Box::new(otlyra_script::PageScripts::new(final_url.clone()))),
+                    sources,
+                );
+                page_scripts = runner;
+                parsed
             }
             otlyra_net::Sniffed::Image(_) => {
                 otlyra_html::parse(image_document(&final_url).as_bytes(), Some("utf-8"))
@@ -1992,6 +2146,36 @@ impl Browser {
             })
             .collect();
         self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
+
+        // The scripts the parse could not run where they stood: ones the script
+        // prescan did not see, because the markup that names them was written by
+        // another script or spelled in a way bytes alone cannot read. They are
+        // fetched like everything else and run when they arrive, which makes
+        // each of them a `defer` — late, but in the order the document names
+        // them, which is what a page depends on.
+        let scripts: Vec<(NodeId, String)> = parsed
+            .deferred_scripts
+            .iter()
+            .filter_map(|node| {
+                let src = parsed
+                    .document
+                    .get(*node)?
+                    .element()?
+                    .attr("src")?
+                    .trim()
+                    .to_owned();
+                (!src.is_empty()).then_some((*node, src))
+            })
+            .take(SCRIPT_LIMIT)
+            .collect();
+        let script_order: Vec<NodeId> = scripts.iter().map(|(node, _)| *node).collect();
+        self.request_subresources(
+            &mut outstanding,
+            &final_url,
+            scripts
+                .into_iter()
+                .map(|(node, src)| (src, PendingResource::Script(node), ResourceKind::Script)),
+        );
         report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
         report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
 
@@ -2011,6 +2195,8 @@ impl Browser {
         };
         pending.outstanding = outstanding;
         pending.images.extend(ready);
+        pending.script_order = script_order;
+        pending.runner = page_scripts;
         let record = pending.record;
         let previous = pending.previous_url.clone();
 
@@ -2089,6 +2275,16 @@ impl Browser {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
                             pending.sheets.insert(node, source);
                         }
+                        PendingResource::Script(node) => {
+                            let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
+                            pending.scripts.insert(node, source);
+                        }
+                        PendingResource::ScriptSource(src) => {
+                            let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
+                            if let Some(prefetch) = pending.prefetch.as_mut() {
+                                prefetch.sources.insert(src, source);
+                            }
+                        }
                         PendingResource::Image(node, src, density) => match decoded.as_ref() {
                             Some(image) => {
                                 pending.images.insert(
@@ -2109,11 +2305,30 @@ impl Browser {
             }
             Err(error) => {
                 tracing::warn!(url = %fetched.url, %error, "subresource failed to load");
+                // A script asked for ahead of the parse and not delivered is
+                // recorded as empty rather than left out: left out reads as
+                // *not asked for*, and the parse would ask again.
+                for resource in wanted {
+                    if let (PendingResource::ScriptSource(src), Some(prefetch)) =
+                        (resource, pending.prefetch.as_mut())
+                    {
+                        prefetch.sources.insert(src, String::new());
+                    }
+                }
             }
         }
 
-        if pending.outstanding.is_empty() {
-            self.finish_load(index);
+        if !pending.outstanding.is_empty() {
+            return;
+        }
+        // Everything asked for has landed. If what was outstanding was the
+        // document's own scripts, the document has yet to be parsed; otherwise
+        // this is the last of a parsed page's subresources.
+        match pending.prefetch.take() {
+            Some(prefetch) => {
+                self.build_document(index, prefetch.loaded, prefetch.sources);
+            }
+            None => self.finish_load(index),
         }
     }
 
@@ -2150,7 +2365,9 @@ impl Browser {
                         })
                     })
                 }
-                PendingResource::Image(..) => false,
+                PendingResource::Image(..)
+                | PendingResource::Script(..)
+                | PendingResource::ScriptSource(..) => false,
             })
     }
 
@@ -2164,15 +2381,29 @@ impl Browser {
             return;
         };
         let scroll = pending.restore_scroll;
+        let mut pending = pending;
         let tab = &mut self.tabs[index];
 
-        // The document is already on screen, unstyled; rebuilding it with what
-        // arrived is what turns it into the page the author wrote.
-        if (!pending.sheets.is_empty() || !pending.images.is_empty())
-            && let Some(page) = tab.page.take()
-        {
+        // The scripts the page linked to, in the order it named them, then the
+        // load events that were waiting for them. This happens before the scene
+        // is rebuilt, so whatever they did to the document is in the first frame
+        // the reader sees rather than in a second one after a flash.
+        let mut document = tab.page.take().map(PageScene::into_document);
+        if let (Some(document), Some(runner)) = (document.as_mut(), pending.runner.as_mut()) {
+            for node in &pending.script_order {
+                if let Some(source) = pending.scripts.get(node) {
+                    runner.run_external(source, *node, document);
+                }
+            }
+            runner.document_finished(document, false);
+        }
+        // The isolate goes with the load for now: there are no timers and no
+        // input events reaching script yet, so nothing could wake it again.
+        pending.runner = None;
+
+        if let Some(document) = document {
             tab.page = Some(PageScene::with_resources(
-                page.into_document(),
+                document,
                 pending.sheets,
                 pending.images,
                 pending.picture_sources,
@@ -2180,6 +2411,64 @@ impl Browser {
         }
         if let Some(page) = tab.page.as_mut() {
             page.set_scroll(scroll);
+        }
+
+        self.follow_script_navigation(index);
+    }
+
+    /// Go where the page's script said to go.
+    ///
+    /// A redirector page is a page whose whole content is an instruction to be
+    /// somewhere else — a sign-in bounce, a shortener, an old address. Script
+    /// asks; the browser decides, and decides here rather than inside the
+    /// isolate, because the isolate is holding the document a navigation
+    /// destroys.
+    fn follow_script_navigation(&mut self, index: usize) {
+        let Some(request) = otlyra_script::dom::take_navigation() else {
+            return;
+        };
+        if index != self.active {
+            // A background tab redirecting itself is a real thing and not this
+            // change: everything below aims at the tab the reader is looking at.
+            tracing::debug!(?request, "a background tab's script asked to navigate");
+            return;
+        }
+        if self.script_hops >= SCRIPT_HOP_LIMIT {
+            tracing::warn!(
+                hops = self.script_hops,
+                "page script is navigating in a loop"
+            );
+            return;
+        }
+        self.script_hops += 1;
+
+        let here = self.tabs[index].url.clone();
+        match request {
+            otlyra_script::dom::Navigation::Reload => {
+                self.start_load(&here, false, false, 0.0);
+            }
+            otlyra_script::dom::Navigation::Url { href, replace } => {
+                let target = otlyra_net::url::resolve(&here, &href).unwrap_or(href);
+                if target == here {
+                    // `location.href = location.href` is a reload, and a page
+                    // that does it on every load is the loop above.
+                    tracing::debug!(url = %target, "script navigated to where it already is");
+                }
+                self.remember_scroll();
+                // A replacing navigation is the same fetch without the history
+                // entry, which is exactly what a redirector wants: back should
+                // go past it, not to it.
+                self.start_load(&target, false, !replace, 0.0);
+            }
+            otlyra_script::dom::Navigation::Submit { form } => {
+                let staged = self.tabs[index]
+                    .page
+                    .as_mut()
+                    .is_some_and(|page| page.submit_from_script(form));
+                if staged {
+                    self.follow_submission();
+                }
+            }
         }
     }
 

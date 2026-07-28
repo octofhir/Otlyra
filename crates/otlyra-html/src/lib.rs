@@ -26,11 +26,11 @@ pub mod driver;
 pub mod encoding;
 pub mod prescan;
 
-pub use driver::HtmlParser;
+pub use driver::{ExternalSources, HtmlParser, ScriptRunner};
 pub use encoding::{DEFAULT_ENCODING, EncodingDecision, EncodingSource, determine};
-pub use prescan::prescan;
+pub use prescan::{prescan, prescan_scripts};
 
-use otlyra_dom::Document;
+use otlyra_dom::{Document, NodeId};
 
 /// A parsed document, and how its bytes were read.
 #[derive(Debug)]
@@ -39,6 +39,15 @@ pub struct ParsedDocument {
     pub document: Document,
     /// The encoding used, and why.
     pub encoding: EncodingDecision,
+    /// The `<script src>` elements, in document order.
+    pub external_scripts: Vec<NodeId>,
+    /// Those of them the parse could not run where they stood, for want of
+    /// their source, in document order.
+    ///
+    /// Fetching these is the caller's, and so is running them once the bytes
+    /// arrive — which is late, and is what the script prescan exists to keep
+    /// this list short.
+    pub deferred_scripts: Vec<NodeId>,
 }
 
 /// One decode-and-parse pass, and what the document said about its own encoding
@@ -46,6 +55,8 @@ pub struct ParsedDocument {
 struct Pass {
     document: Document,
     indicator: Option<String>,
+    external_scripts: Vec<NodeId>,
+    deferred_scripts: Vec<NodeId>,
 }
 
 impl Pass {
@@ -57,15 +68,31 @@ impl Pass {
 }
 
 /// Decode `bytes` under `decision` and run the parser over the result.
-fn parse_with(bytes: &[u8], decision: EncodingDecision) -> Pass {
+fn parse_with(
+    bytes: &[u8],
+    decision: EncodingDecision,
+    runner: Option<Box<dyn ScriptRunner>>,
+    sources: &ExternalSources,
+) -> (Pass, Option<Box<dyn ScriptRunner>>) {
     let (text, _actual, _had_errors) = decision.encoding.decode(bytes);
-    let mut parser = HtmlParser::new();
+    let mut parser = HtmlParser::new().with_external_sources(sources.clone());
+    if let Some(runner) = runner {
+        parser = parser.with_script_runner(runner);
+    }
     parser.feed(text.as_ref().into());
     let indicator = parser.encoding_indicator().map(str::to_owned);
-    Pass {
-        document: parser.finish(),
-        indicator,
-    }
+    let external_scripts = parser.external_scripts().to_vec();
+    let deferred_scripts = parser.deferred_scripts().to_vec();
+    let runner = parser.take_script_runner();
+    (
+        Pass {
+            document: parser.finish(),
+            indicator,
+            external_scripts,
+            deferred_scripts,
+        },
+        runner,
+    )
 }
 
 /// Parse `html` as the contents of a `context` element, the way `innerHTML` does.
@@ -100,11 +127,29 @@ pub fn parse_fragment(html: &str, context: &str) -> Document {
 /// we already hold. Incremental decode belongs with incremental delivery, and that
 /// arrives with navigation.
 pub fn parse(bytes: &[u8], transport_charset: Option<&str>) -> ParsedDocument {
+    parse_with_scripts(bytes, transport_charset, None, ExternalSources::new()).0
+}
+
+/// Parse a byte stream, running the scripts in it.
+///
+/// The runner comes back out, because the isolate outlives the parse: a page
+/// keeps running after its last byte, and the timers and event handlers its
+/// scripts registered are in there.
+///
+/// A document parsed twice — see [`parse`] — resets the runner between passes.
+/// The first pass's tree is thrown away for having been decoded wrongly, and
+/// what its scripts did to the world has to go with it.
+pub fn parse_with_scripts(
+    bytes: &[u8],
+    transport_charset: Option<&str>,
+    runner: Option<Box<dyn ScriptRunner>>,
+    sources: ExternalSources,
+) -> (ParsedDocument, Option<Box<dyn ScriptRunner>>) {
     let span = tracing::info_span!("parse_html", bytes = bytes.len());
     let _entered = span.enter();
 
     let mut decision = determine(bytes, transport_charset);
-    let mut document = parse_with(bytes, decision);
+    let (mut document, mut runner) = parse_with(bytes, decision, runner, &sources);
 
     // A `<meta>` the prescan never saw — past 1024 bytes, or only spelled out once
     // character references were resolved. If we were guessing, the document knows
@@ -118,9 +163,14 @@ pub fn parse(bytes: &[u8], transport_charset: Option<&str>) -> ParsedDocument {
             encoding,
             source: EncodingSource::TokenizerIndicator,
         };
-        document = parse_with(bytes, decision);
+        if let Some(runner) = runner.as_mut() {
+            runner.reset();
+        }
+        (document, runner) = parse_with(bytes, decision, runner, &sources);
     }
 
+    let external_scripts = document.external_scripts;
+    let deferred_scripts = document.deferred_scripts;
     let document = document.document;
 
     tracing::debug!(
@@ -130,10 +180,15 @@ pub fn parse(bytes: &[u8], transport_charset: Option<&str>) -> ParsedDocument {
         "parsed"
     );
 
-    ParsedDocument {
-        document,
-        encoding: decision,
-    }
+    (
+        ParsedDocument {
+            document,
+            encoding: decision,
+            external_scripts,
+            deferred_scripts,
+        },
+        runner,
+    )
 }
 
 #[cfg(test)]

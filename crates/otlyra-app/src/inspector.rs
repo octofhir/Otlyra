@@ -2983,6 +2983,7 @@ fn kind_short(kind: crate::fetcher::ResourceKind) -> &'static str {
         ResourceKind::Document => "doc",
         ResourceKind::Stylesheet => "css",
         ResourceKind::Image => "img",
+        ResourceKind::Script => "js",
     }
 }
 

@@ -1,0 +1,46 @@
+[package]
+name = "otlyra-script"
+description = "Otlyra's script engine seam: one Otter isolate per page, and the rules it runs under."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The JavaScript engine. A path dependency, and deliberately: Otter is
+# pre-stability and breaks freely, so the only honest way to depend on it is to
+# build both trees together and find out at compile time rather than at
+# resolution time. `otter-runtime` is the entry point its own AGENTS.md names;
+# `otter-vm` is reached only through what that crate re-exports.
+otter-runtime = { path = "../../../otter/crates/otter-runtime" }
+# The declarative binding layer. Every path its macros generate is
+# `::otter_vm::…`, which is why the crate root aliases `otter_runtime` to that
+# name — see the `extern crate` in `lib.rs`.
+otter-macros = { path = "../../../otter/crates/otter-macros" }
+# Named because the generated binding glue reaches for it by name at the crate
+# root. It is already in the graph through the runtime, so this costs no
+# package.
+otter-gc = { path = "../../../otter/crates/otter-gc" }
+# The web platform Otter already implements: `URL`, `Event`, `performance`,
+# `TextEncoder`, `structuredClone`, `crypto`, `fetch`. Reimplementing any of it
+# here would be duplication; what a browser has to write itself is the part
+# that knows about a document, which is this crate.
+otter-web = { path = "../../../otter/crates/otter-web" }
+
+# The document the scripts will reach into at M13, and the parser's script
+# point they are called from. Neither depends on this crate: the parser knows
+# when a script runs and nothing about how, which is what `ScriptRunner` is.
+otlyra-dom.workspace = true
+otlyra-html.workspace = true
+# Selector matching, for `querySelector`. The engine is written once, in the
+# crate the cascade already uses it from.
+otlyra-css.workspace = true
+
+html5ever.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -43,6 +43,8 @@ pub enum ResourceKind {
     Stylesheet,
     /// A picture the page asks for.
     Image,
+    /// A script the page links to with `<script src>`.
+    Script,
 }
 
 /// What one fetch returned.

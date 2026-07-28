@@ -1856,6 +1856,30 @@ impl PageScene {
     ///
     /// Taken rather than read: a submission happens once, and leaving it here for a
     /// second frame to find would send the form twice.
+    /// Send a form because script called `submit()` on it.
+    ///
+    /// The reader did not press anything, so there is no submitter button and
+    /// no validation: `form.submit()` skips constraint validation on the
+    /// platform too, which is the difference between it and `requestSubmit()`.
+    pub fn submit_from_script(&mut self, form: otlyra_dom::NodeId) -> bool {
+        if self
+            .document
+            .get(form)
+            .and_then(|node| node.element())
+            .is_none()
+        {
+            return false;
+        }
+        self.pending_submit = Some(otlyra_dom::submit::submission(
+            &self.document,
+            &self.form,
+            form,
+            None,
+        ));
+        true
+    }
+
+    /// The form the page has just sent, if it has sent one.
     pub fn take_submission(&mut self) -> Option<otlyra_dom::Submission> {
         self.pending_submit.take()
     }

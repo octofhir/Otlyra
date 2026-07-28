@@ -45,7 +45,7 @@ pub use mutator::DocumentMutator;
 pub use node::{ElementData, Node, NodeData, NodeId, node_id_from_u64, node_id_to_u64};
 pub use sink::DomSink;
 pub use submit::{Encoding, Method, Submission};
-pub use tree::Document;
+pub use tree::{Document, DocumentId};
 pub use xpath::{XPathError, select as xpath_select};
 
 #[cfg(test)]

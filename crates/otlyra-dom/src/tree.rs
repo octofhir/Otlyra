@@ -1,10 +1,31 @@
 //! The arena, and everything you can ask it without changing it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use html5ever::interface::QuirksMode;
 use slotmap::SlotMap;
 
 use crate::limits::DomLimits;
 use crate::node::{Node, NodeData, NodeId};
+
+/// Which document a node belongs to.
+///
+/// One number per document, never reused within a run. It exists so that a
+/// handle to a node can say *whose* node it is: a script's wrapper carries one,
+/// and a wrapper from another page finds nothing rather than finding the node
+/// that happens to share its index here. Between two open pages that is a
+/// security property, not a tidiness one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    /// The next one. Wrapping is not a concern: a browser that opened one
+    /// document per nanosecond would take five hundred years to get there.
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// A parsed document: one arena of nodes, plus the handful of facts that belong to
 /// the document rather than to any node in it.
@@ -15,6 +36,7 @@ use crate::node::{Node, NodeData, NodeId};
 /// tree, so replacing the parser later does not mean rewriting the DOM.
 #[derive(Debug)]
 pub struct Document {
+    id: DocumentId,
     nodes: SlotMap<NodeId, Node>,
     root: NodeId,
     quirks_mode: QuirksMode,
@@ -33,12 +55,18 @@ impl Document {
         let mut nodes = SlotMap::with_key();
         let root = nodes.insert(Node::new(NodeData::Document));
         Self {
+            id: DocumentId::next(),
             nodes,
             root,
             quirks_mode: QuirksMode::NoQuirks,
             limits,
             refused: 0,
         }
+    }
+
+    /// Which document this is.
+    pub fn id(&self) -> DocumentId {
+        self.id
     }
 
     /// The document node. Never removed, so this handle is valid for the lifetime
