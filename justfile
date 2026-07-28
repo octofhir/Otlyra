@@ -56,6 +56,33 @@ echo-server:
 test-pages:
     @ls tests/pages/*.html | xargs -n1 basename | sed 's/\.html$//'
 
+# Copy a live page and its assets into `target/mirrors/<name>`, ready to compare.
+#
+# A live page is not the same page tomorrow, and a headless reference pointed at
+# one renders whatever the network gave *it*. The mirror freezes one page for
+# both halves of the comparison. The scripts are stripped, so the number is about
+# boxes and text rather than about which engine ran what — `tools/mirror.py`
+# says the rest.
+mirror url name:
+    @python3 tools/mirror.py {{url}} target/mirrors/{{name}}
+    @echo "compare it with: just reference target/mirrors/{{name}}/index.html 1280 900"
+
+# A mirrored page against both references, at the widths the plan records.
+#
+# One width proves one width: a layout that switches to a column somewhere is
+# right on either side of the switch and wrong at it, and a single number would
+# never say so.
+mirror-sweep name *WIDTHS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    widths="{{WIDTHS}}"
+    for width in ${widths:-1440 1280 1100 1000 900 800 700}; do
+      printf '%5s  ' "$width"
+      just reference "target/mirrors/{{name}}/index.html" "$width" 900 2>/dev/null \
+        | grep -E '^(chrome|firefox|between)' | tr '\n' ' '
+      echo
+    done
+
 # Render a page twice — through us, and through whatever browser
 # $OTLYRA_REFERENCE points at — so the two can be put side by side.
 #
@@ -188,8 +215,10 @@ bundle: release
 # next run asks one last time; answer *Always Allow* and it is answered for good,
 # because the identity stays the same across every rebuild after it.
 #
-# `just run` does this for you. Cookies keep working throughout — the point is to
-# be asked once, not to stop keeping them.
+# `just run` does this for you, and `tools/sign-and-run.sh` — wired in as cargo's
+# `runner` — does it for every `cargo run`, because the build cargo does first
+# replaces the signature this recipe put on. Cookies keep working throughout: the
+# point is to be asked once, not to stop keeping them.
 sign:
     #!/usr/bin/env bash
     set -euo pipefail
