@@ -730,6 +730,29 @@ fn resolve<'a>(
         .resolve_primary_style(parent.map(|style| &**style), parent.map(|style| &**style));
 
         let style = resolved.style.0;
+
+        // `rem` is the *root element's* font size, and the engine reads it from
+        // the device rather than from the tree — so somebody has to put it there
+        // once the root has been cascaded. Servo does it inside the traversal it
+        // owns; we drive the resolver ourselves, so it happens here.
+        //
+        // Left unset it stays at sixteen pixels, and a page that sets its own
+        // root size — `html { font-size: 1.25em }`, which is most of the modern
+        // web — has every length it wrote in `rem` come out a fifth too small.
+        // That is not a subtle wrong: it is every padding, every radius and every
+        // font on the page, and it looks like a browser that cannot lay out.
+        //
+        // Before the children, because the root's size is what they are resolved
+        // against. The root's own `rem` lengths were computed a line ago against
+        // whatever it was before, which is what the specification says for
+        // `font-size` on the root and near enough for the rest.
+        if depth == 0 {
+            let device = context.shared.stylist.device();
+            let size = style.get_font().clone_font_size().computed_size();
+            device.set_root_font_size(style.effective_zoom.unzoom(size.px()));
+            device.set_root_style(&style);
+        }
+
         styles.insert(node, style.clone());
         Some(style)
     } else {
@@ -1660,6 +1683,56 @@ mod tests {
                 "code"
             ),
             32.0
+        );
+    }
+
+    /// `rem` is the root element's font size, not sixteen pixels. A page that
+    /// sets its own — which is most of the modern web, usually to make every
+    /// length in the design one round number — has every `rem` on it wrong
+    /// otherwise, and wrong by the same fraction everywhere, which looks less
+    /// like a unit bug than like a browser that cannot lay out.
+    #[test]
+    fn rem_is_the_root_elements_font_size_and_not_the_initial_one() {
+        let size = |html: &str, selector: &str| {
+            computed(html, selector).clone_font_size().used_size().px()
+        };
+
+        // Without a root size of its own, `rem` is the initial sixteen.
+        assert_eq!(
+            size("<style>p { font-size: 2rem }</style><body><p>x", "p"),
+            32.0
+        );
+        // With one, it is that.
+        assert_eq!(
+            size(
+                "<style>html { font-size: 20px } p { font-size: 2rem }</style><body><p>x",
+                "p"
+            ),
+            40.0
+        );
+        // Including when the root names its own size relatively, which is how a
+        // page usually does it: `1.25em` of the initial sixteen is twenty.
+        assert_eq!(
+            size(
+                "<style>html { font-size: 1.25em } p { font-size: 2rem }</style><body><p>x",
+                "p"
+            ),
+            40.0
+        );
+    }
+
+    /// And it reaches lengths that are not font sizes, which is most of what a
+    /// page writes in `rem`.
+    #[test]
+    fn rem_reaches_every_length_and_not_only_the_font() {
+        let styled = computed(
+            "<style>html { font-size: 20px } div { width: 10rem }</style><body><div>x",
+            "div",
+        );
+        let width = format!("{:?}", styled.clone_width());
+        assert!(
+            width.contains("200"),
+            "ten rem of a twenty-pixel root: {width}"
         );
     }
 

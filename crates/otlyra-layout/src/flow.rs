@@ -347,11 +347,15 @@ struct FlexItem {
 
 impl FlexItem {
     /// The margins that take room along the main axis.
-    /// Which of this item's main-axis margins are `auto`, leading then trailing.
-    fn auto_margin_sides(&self, row: bool) -> (bool, bool) {
+    /// Which of this item's margins along one axis are `auto`, leading then
+    /// trailing.
+    ///
+    /// `horizontal` names the axis rather than the container's direction, so the
+    /// cross axis is asked for by passing the opposite of `row`.
+    fn auto_margin_sides(&self, horizontal: bool) -> (bool, bool) {
         use otlyra_css::LengthOrAuto::Auto;
         let margin = &self.style.margin;
-        if row {
+        if horizontal {
             (margin.left == Auto, margin.right == Auto)
         } else {
             (margin.top == Auto, margin.bottom == Auto)
@@ -2788,6 +2792,20 @@ impl<'a> Flow<'a> {
         let mut items: Vec<FlexItem> = Vec::with_capacity(children.len());
         for &child in &children {
             let item_style = Arc::clone(&self.tree.node(child).style);
+
+            // A box that has left the flow is not a flex item. It takes no room
+            // on the line, nothing is shared out with it, and it is placed
+            // against its containing block like any other positioned box — which
+            // is also where it picks up the clipping and the layer its own style
+            // asks for. Treated as an item it was laid out by a path that knows
+            // nothing about either, which is how a heading hidden in the way
+            // every accessibility helper hides one — a one-pixel box with its
+            // overflow cut off — came out as three lines of text across the page.
+            if item_style.position.is_out_of_flow() {
+                let fragment = self.layout_positioned(child, y);
+                out.push(fragment);
+                continue;
+            }
             let fragment = self.layout_block(child, width, x, y);
             let margin = resolve_margin(&item_style, width);
 
@@ -2834,16 +2852,34 @@ impl<'a> Flow<'a> {
                 item_style.min_height.resolve(width)
             };
 
+            // Across the line, an item with an `auto` margin on that side is an
+            // item the free space belongs to — so it cannot also be the item that
+            // filled the line. Laid out on its own it took the whole width, the
+            // way a block does; what it is owed is the width its content wants,
+            // and the margin gets the rest.
+            let cross_auto_margin = !row
+                && (item_style.margin.left == LengthOrAuto::Auto
+                    || item_style.margin.right == LengthOrAuto::Auto)
+                && item_style.width.resolve(width).is_none();
+            let cross = if row {
+                fragment.rect.height
+            } else if cross_auto_margin {
+                clamp(
+                    self.max_content_width(child, width).min(width),
+                    item_style.min_width,
+                    item_style.max_width,
+                    width,
+                )
+            } else {
+                fragment.rect.width
+            };
+
             items.push(FlexItem {
                 id: child,
                 floor,
                 base: basis,
                 main: basis,
-                cross: if row {
-                    fragment.rect.height
-                } else {
-                    fragment.rect.width
-                },
+                cross,
                 grow: item_style.flex_grow,
                 shrink: item_style.flex_shrink,
                 margin,
@@ -3109,20 +3145,34 @@ impl<'a> Flow<'a> {
             } else {
                 item.style.width.resolve(inner).is_some()
             };
+            // An `auto` margin across the line takes the room first, and takes it
+            // from both `stretch` and `align-self`: `margin: 0 auto` on a column
+            // of content is how a page is centred, and a container that handed
+            // that space to the alignment instead left the whole page against the
+            // left edge. Flexbox §8.1, and the reason the same declaration means
+            // *centre me* in a block and in a flex item alike.
+            let (cross_lead_auto, cross_trail_auto) = item.auto_margin_sides(!row);
+            let cross_autos = usize::from(cross_lead_auto) + usize::from(cross_trail_auto);
             let cross_size = match align {
-                AlignItems::Stretch if !definite => {
+                AlignItems::Stretch if !definite && cross_autos == 0 => {
                     (line_cross - item.margin_cross(row)).max(item.cross)
                 }
                 _ => item.cross,
             };
+            let free_cross = line_cross - cross_size - item.margin_cross(row);
             let cross_offset = cross_start
-                + match align {
-                    AlignItems::End => line_cross - cross_size - item.margin_cross(row),
-                    AlignItems::Center => (line_cross - cross_size - item.margin_cross(row)) / 2.0,
-                    // `baseline` needs a baseline to align on, which a box does not
-                    // carry yet; it lays out as `start`, which is where it would be
-                    // for a single line of text anyway.
-                    _ => 0.0,
+                + if cross_autos > 0 {
+                    let share = free_cross.max(0.0) / cross_autos as f32;
+                    if cross_lead_auto { share } else { 0.0 }
+                } else {
+                    match align {
+                        AlignItems::End => free_cross,
+                        AlignItems::Center => free_cross / 2.0,
+                        // `baseline` needs a baseline to align on, which a box does
+                        // not carry yet; it lays out as `start`, which is where it
+                        // would be for a single line of text anyway.
+                        _ => 0.0,
+                    }
                 };
 
             // An `auto` margin on the leading side pushes this item along; one on
@@ -6169,6 +6219,65 @@ mod tests {
         let div = rect_of(&tree, &boxes, "div");
         assert_eq!(div.x, 100.0);
         assert_eq!(div.width, 200.0);
+    }
+
+    /// The same declaration inside a flex container, which is how a modern page
+    /// centres itself: a column of `display: flex` whose content is one child
+    /// with a width and `margin: 0 auto`. Handing that space to `align-items`
+    /// instead leaves the whole page against the left edge.
+    #[test]
+    fn two_auto_margins_centre_a_flex_item_across_the_line() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } main { display: flex; flex-direction: column }\
+             div { width: 200px; margin: 0 auto }</style><main><div>x</div></main>",
+            400.0,
+        );
+        let div = rect_of(&tree, &boxes, "div");
+        assert_eq!(div.x, 100.0);
+        assert_eq!(div.width, 200.0);
+    }
+
+    /// And one of them, which is the *push it to the far side* idiom across the
+    /// line rather than along it.
+    #[test]
+    fn one_auto_cross_margin_pushes_a_flex_item_to_the_far_side() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } main { display: flex; flex-direction: column }\
+             div { width: 200px; margin-left: auto }</style><main><div>x</div></main>",
+            400.0,
+        );
+        assert_eq!(rect_of(&tree, &boxes, "div").x, 200.0);
+    }
+
+    /// An `auto` margin across the line also stops the stretch: the free space is
+    /// the margin's, so there is none left to grow into.
+    #[test]
+    fn an_auto_cross_margin_stops_a_flex_item_stretching() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } main { display: flex; flex-direction: column }\
+             div { margin-left: auto }</style><main><div>x</div></main>",
+            400.0,
+        );
+        let div = rect_of(&tree, &boxes, "div");
+        assert!(div.width < 400.0, "it stretched anyway: {}", div.width);
+    }
+
+    /// A positioned box inside a flex container is not a flex item: it takes no
+    /// room on the line and its siblings lay out as though it were not there.
+    #[test]
+    fn an_absolutely_positioned_child_is_not_a_flex_item() {
+        let (tree, boxes) = laid_out(
+            "<style>body { margin: 0 } main { display: flex } \
+             a { position: absolute; top: 0; width: 50px } \
+             p { width: 100px; margin: 0 }</style>\
+             <main><a>a</a><p>b</p></main>",
+            400.0,
+        );
+        assert_eq!(
+            rect_of(&tree, &boxes, "p").x,
+            0.0,
+            "the item was laid out after the positioned box instead of in its place"
+        );
     }
 
     /// One `auto` margin takes the whole of the leftover, which pushes a box to an
