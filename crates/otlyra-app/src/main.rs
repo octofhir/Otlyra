@@ -70,6 +70,22 @@ struct Cli {
     #[arg(long)]
     no_interface: bool,
 
+    /// Touch nothing this machine keeps: no cookie file, no bookmarks, no
+    /// keychain.
+    ///
+    /// A run that renders a page and exits has no business holding somebody's
+    /// signed-in sessions, and asking the keychain for the key to them puts a
+    /// dialog in front of whoever started it — on macOS, once per rebuilt
+    /// binary, because the keychain decides by code signature and a fresh build
+    /// has a fresh one.
+    ///
+    /// `--screenshot` never persists anything either way, and `--no-interface`
+    /// implies this: with the browser's own interface hidden there is no way to
+    /// see or add a bookmark, so keeping them is cost with nothing on the other
+    /// side of it.
+    #[arg(long)]
+    no_secrets: bool,
+
     /// Which rasterizer to use.
     #[arg(long, value_enum, default_value_t = Renderer::Skia)]
     renderer: Renderer,
@@ -660,8 +676,16 @@ fn window_config(cli: &Cli) -> WindowConfig {
 /// Every headless mode keeps the in-memory default.
 fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppError> {
     browser.set_clipboard(Box::new(otlyra_app::clipboard::System::new()));
-    // And the bookmarks the last run kept, for the same reason: a window means a
-    // person, and what they chose to keep outlives the process.
+    if cli.no_secrets || cli.no_interface {
+        // A window opened to look at one page. It gets the in-memory stores, so
+        // it can neither read nor overwrite what a real session kept — and it
+        // never asks the keychain, which is the difference between a rebuild
+        // that opens and one that opens a dialog first.
+        tracing::info!("keeping nothing from this run: no cookie file, no bookmarks, no keychain");
+        return run_window(window_config(cli), browser);
+    }
+    // The bookmarks the last run kept: a window means a person, and what they
+    // chose to keep outlives the process.
     browser.persist_bookmarks();
     // And the sessions the last run was signed in with, for the same reason and
     // one degree more so: this file is what makes closing the browser not mean

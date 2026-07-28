@@ -1,0 +1,12 @@
+# `cargo run` signs the browser before running it, on macOS.
+#
+# The keychain decides what may read a key by code signature, and a `cargo
+# build` leaves an ad-hoc one that changes with every build — so a developer is
+# asked about the cookie key on every rebuild. `tools/sign-and-run.sh` puts the
+# stable identity back on and then runs the binary; see it and `just sign` for
+# the rest.
+#
+# A runner applies to everything cargo runs, tests included; the script signs
+# only the browser and hands the rest straight through.
+[target.'cfg(target_os = "macos")']
+runner = "tools/sign-and-run.sh"

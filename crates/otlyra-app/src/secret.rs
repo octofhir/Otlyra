@@ -31,11 +31,16 @@
 //!
 //! `just sign` makes such an identity and signs the built binaries with it, after
 //! which *Always Allow* is answered for good. `just run` does it as part of
-//! building. Nothing about the cookies changes: the point is to be asked once,
-//! not to stop keeping them.
+//! building, and `tools/sign-and-run.sh` — cargo's `runner` — puts it back after
+//! every `cargo run`, because the build that follows `just sign` undoes it.
+//! Nothing about the cookies changes: the point is to be asked once, not to stop
+//! keeping them.
 //!
 //! The key is also fetched *late* — see [`crate::cookies::CookieStore`] — so a
 //! run with no cookie file to open and nothing worth writing never asks at all.
+//! And a run that was never going to keep anything does not have a file to fetch
+//! it for: a screenshot, `--no-interface`, `--no-secrets` and every headless mode
+//! keep the in-memory jar, so there is no key to ask for and no dialog.
 //!
 //! ## Everywhere else
 //!
