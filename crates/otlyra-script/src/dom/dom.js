@@ -147,11 +147,12 @@
   // Listener registration. The callbacks live in a JavaScript map keyed by the
   // target object, so the collector traces them; nothing about a listener is
   // held on the Rust side, where it would be invisible to it.
-  // A strong Map rather than a WeakMap, for two reasons. The engine will not
-  // take a host object as a WeakMap key, and wrappers have no identity yet, so
-  // a weak table keyed on them would drop every listener the moment the wrapper
-  // that registered it went away. Both are fixed by the same work — wrapper
-  // identity — and until then the table lives as long as the page does.
+  //
+  // A strong Map rather than a WeakMap because the engine will not take a host
+  // object as a WeakMap key. Wrappers do have identity now — the same node is
+  // the same object every time it is handed out — which is what makes a table
+  // keyed on them work at all: a listener registered through one lookup is
+  // found through any other.
   const listeners = new Map();
 
   const listenersFor = (target, type, create) => {
@@ -170,46 +171,171 @@
     return list;
   };
 
+  // The engine's `Event` keeps its state under registered symbols so that a
+  // host which owns the tree can dispatch through it — see
+  // `otter-web/src/web_bootstrap.js`. Reading them is how this knows a page
+  // called `stopPropagation`; writing them is how `event.target` reports what
+  // the event was aimed at rather than what is currently handling it.
+  const kStop = Symbol.for('otter.event.stopPropagation');
+  const kStopImmediate = Symbol.for('otter.event.stopImmediate');
+  const kTarget = Symbol.for('otter.event.target');
+  const kDispatch = Symbol.for('otter.event.dispatching');
+
+  const CAPTURING_PHASE = 1;
+  const AT_TARGET = 2;
+  const BUBBLING_PHASE = 3;
+
+  // `capture` may be a boolean or an options object, and the two spellings are
+  // the same listener: `addEventListener(t, f, true)` and `{capture: true}`
+  // remove each other.
+  const optionOf = (options, name) => {
+    if (typeof options === 'boolean') return name === 'capture' ? options : false;
+    return Boolean(options && typeof options === 'object' && options[name]);
+  };
+
+  // Everything an event travels through, target first, window last.
+  //
+  // Built from `parentNode`, so it is the tree as it stands at dispatch — which
+  // is what the specification says, and why a listener that moves the target
+  // still sees the path it was dispatched into.
+  const propagationPath = (target) => {
+    const path = [target];
+    if (target === globalThis) return path;
+    let node = target;
+    // A bounded walk: a tree with a cycle in it is a bug elsewhere, and this is
+    // not the place to hang because of one.
+    for (let step = 0; step < 4096; step++) {
+      const parent = node.parentNode;
+      if (!parent || path.includes(parent)) break;
+      path.push(parent);
+      node = parent;
+    }
+    if (!path.includes(globalThis)) path.push(globalThis);
+    return path;
+  };
+
+  // Call the listeners one target has for this event, in registration order.
+  //
+  // The list is copied first: a listener that adds another must not have the
+  // new one run for the event already in flight, and one that removes a later
+  // listener must stop it running — which is why the copy is consulted for the
+  // order and the live list for whether an entry is still there.
+  const fire = (target, event, capturing) => {
+    const list = listenersFor(target, event.type, false);
+    if (!list || list.length === 0) return;
+    event.currentTarget = target;
+    for (const entry of list.slice()) {
+      if (entry.capture !== capturing) continue;
+      if (!list.includes(entry)) continue;
+      if (entry.once) removeEntry(target, event.type, entry);
+      const handler =
+        typeof entry.callback === 'function' ? entry.callback : entry.callback.handleEvent;
+      if (typeof handler !== 'function') continue;
+      try {
+        handler.call(target, event);
+      } catch (error) {
+        console.error(error);
+      }
+      if (event[kStopImmediate]) return;
+    }
+  };
+
+  const removeEntry = (target, type, entry) => {
+    const list = listenersFor(target, type, false);
+    if (!list) return;
+    const at = list.indexOf(entry);
+    if (at !== -1) list.splice(at, 1);
+  };
+
   const eventTarget = {
     addEventListener(type, callback, options) {
       if (!callback) return;
+      const capture = optionOf(options, 'capture');
       const list = listenersFor(this, String(type), true);
-      const once = Boolean(options && typeof options === 'object' && options.once);
-      if (!list.some((entry) => entry.callback === callback)) {
-        list.push({ callback, once });
+      // The identity of a listener is target, type, callback and capture
+      // together: the same function may be registered once for each phase, and
+      // registering it twice for one phase does nothing.
+      if (!list.some((entry) => entry.callback === callback && entry.capture === capture)) {
+        list.push({ callback, capture, once: optionOf(options, 'once') });
       }
     },
 
-    removeEventListener(type, callback) {
+    removeEventListener(type, callback, options) {
+      const capture = optionOf(options, 'capture');
       const list = listenersFor(this, String(type), false);
       if (!list) return;
-      const at = list.findIndex((entry) => entry.callback === callback);
+      const at = list.findIndex(
+        (entry) => entry.callback === callback && entry.capture === capture,
+      );
       if (at !== -1) list.splice(at, 1);
     },
 
+    // The three phases, over the path from the window down to the target and
+    // back. This is the whole reason a page can put one listener on a container
+    // and hear about every button in it, which is how every list, menu and grid
+    // on the web is written.
     dispatchEvent(event) {
       if (!event || typeof event.type !== 'string') {
         throw new TypeError('dispatchEvent expects an Event');
       }
-      const list = listenersFor(this, event.type, false);
-      if (!list) return true;
-      try {
-        Object.defineProperty(event, 'target', { value: this, configurable: true });
-        Object.defineProperty(event, 'currentTarget', { value: this, configurable: true });
-      } catch (_) {
-        // A frozen event object is still dispatchable; the listeners simply see
-        // whatever it says about itself.
+      if (event[kDispatch]) {
+        throw new TypeError('the event is already being dispatched');
       }
-      for (const entry of list.slice()) {
-        if (entry.once) this.removeEventListener(event.type, entry.callback);
-        const handler =
-          typeof entry.callback === 'function' ? entry.callback : entry.callback.handleEvent;
-        try {
-          handler.call(this, event);
-        } catch (error) {
-          console.error(error);
+
+      const path = propagationPath(this);
+      event[kDispatch] = true;
+      event[kStop] = false;
+      event[kStopImmediate] = false;
+      event[kTarget] = this;
+      event.defaultPrevented = false;
+      // The path as it was, for as long as this dispatch lasts: the engine's own
+      // `composedPath` answers with the target alone, which is right for an
+      // event target that is not in a tree and wrong for one that is.
+      const composed = path.slice();
+      const ownComposedPath = Object.getOwnPropertyDescriptor(event, 'composedPath');
+      Object.defineProperty(event, 'composedPath', {
+        value: () => (event[kDispatch] ? composed.slice() : []),
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+
+      try {
+        // Down: the window first, the target's parent last.
+        event.eventPhase = CAPTURING_PHASE;
+        for (let index = path.length - 1; index > 0; index--) {
+          if (event[kStop]) break;
+          fire(path[index], event, true);
+        }
+
+        // At the target both kinds run, capture listeners first, and neither
+        // counts as capturing or bubbling.
+        if (!event[kStop]) {
+          event.eventPhase = AT_TARGET;
+          fire(this, event, true);
+          if (!event[kStopImmediate]) fire(this, event, false);
+        }
+
+        // Up, if the event says it does. One that does not is heard only where
+        // it landed.
+        if (event.bubbles) {
+          event.eventPhase = BUBBLING_PHASE;
+          for (let index = 1; index < path.length; index++) {
+            if (event[kStop]) break;
+            fire(path[index], event, false);
+          }
+        }
+      } finally {
+        event.eventPhase = 0;
+        event.currentTarget = null;
+        event[kDispatch] = false;
+        if (ownComposedPath) {
+          Object.defineProperty(event, 'composedPath', ownComposedPath);
+        } else {
+          delete event.composedPath;
         }
       }
+
       return !event.defaultPrevented;
     },
   };
@@ -259,6 +385,8 @@
     }
     const handle = nextFrameHandle++;
     frameCallbacks.set(handle, callback);
+    // So the browser knows a frame is owed without asking the isolate.
+    Document.__frameRequested();
     return handle;
   });
 
@@ -266,60 +394,37 @@
     frameCallbacks.delete(handle);
   });
 
-  const timers = new Map();
-  let nextTimerHandle = 1;
+  // `setTimeout` and its family are the engine's own, and they work because a
+  // scheduler is installed under them — see `crates/otlyra-script/src/timers.rs`.
+  // There is nothing to shim here: what was once a map and a single flush is a
+  // wheel the browser turns, so a page's deferred work happens when the page
+  // asked for it rather than all at once when the parse ends.
+  //
+  // `setImmediate` is Node's rather than the web's, and the engine ships it on
+  // the same scheduler. A page that feature-detects it will find it; nothing on
+  // the web depends on that.
 
-  const schedule = (callback, delay, args, repeating) => {
-    if (typeof callback !== 'function') return 0;
-    const handle = nextTimerHandle++;
-    timers.set(handle, { callback, args, delay: Number(delay) || 0, repeating });
-    return handle;
-  };
-
-  defineGlobal('setTimeout', function setTimeout(callback, delay, ...args) {
-    return schedule(callback, delay, args, false);
-  });
-  defineGlobal('setInterval', function setInterval(callback, delay, ...args) {
-    return schedule(callback, delay, args, true);
-  });
-  defineGlobal('clearTimeout', function clearTimeout(handle) {
-    timers.delete(handle);
-  });
-  defineGlobal('clearInterval', function clearInterval(handle) {
-    timers.delete(handle);
-  });
-  // `setImmediate` is Node's, and the engine ships one that wants a scheduler
-  // the host has not installed — so a page that reaches for it gets a throw
-  // rather than a missing global to feature-detect. It belongs on this queue
-  // with the rest: a zero-delay one-shot is what it is.
-  defineGlobal('setImmediate', function setImmediate(callback, ...args) {
-    return schedule(callback, 0, args, false);
-  });
-  defineGlobal('clearImmediate', function clearImmediate(handle) {
-    timers.delete(handle);
-  });
-
-  // The host's one call into all of the above. Deliberately bounded: a page
-  // whose timer schedules another timer would otherwise keep this running for
-  // as long as it liked, and this is not the place to give it that.
-  const FLUSH_LIMIT = 256;
-
+  // The host's one call into what is left: the two load events, and the frames
+  // a page asked for before there was a frame loop to give it one.
   let loadEventsFired = false;
 
   defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEvents) {
     let ran = 0;
 
-    // The two events every page waits for. They come first because everything
-    // a page defers is registered from one of them — and they happen once, when
+    // The two events every page waits for. They come first because everything a
+    // page defers is registered from one of them — and they happen once, when
     // the host says every script that was going to arrive has arrived.
     if (fireLoadEvents && !loadEventsFired) {
       loadEventsFired = true;
-      for (const [target, type] of [
-        [document, 'DOMContentLoaded'],
-        [globalThis, 'load'],
+      // `DOMContentLoaded` bubbles and `load` does not, which is not a detail:
+      // half the pages on the web listen for the first one on `window`, and
+      // they hear it only because it travels up from the document.
+      for (const [target, type, bubbles] of [
+        [document, 'DOMContentLoaded', true],
+        [globalThis, 'load', false],
       ]) {
         try {
-          target.dispatchEvent(new Event(type));
+          target.dispatchEvent(new Event(type, { bubbles }));
         } catch (error) {
           console.error(error);
         }
@@ -327,35 +432,29 @@
       }
     }
 
+    return ran + __otlyraRunFrame(0);
+  });
+
+  // One turn of the frame loop: every callback registered up to now, and none
+  // registered by them — a callback that asks for another frame is asking for
+  // the *next* one, and running it here would be a loop with no display in it.
+  defineGlobal('__otlyraRunFrame', function __otlyraRunFrame(timestamp) {
     const frames = [...frameCallbacks.entries()];
     frameCallbacks.clear();
     for (const [, callback] of frames) {
       try {
-        callback(0);
+        callback(Number(timestamp) || 0);
       } catch (error) {
         console.error(error);
       }
-      ran++;
     }
+    return frames.length;
+  });
 
-    // Sorted by the delay each asked for, which is the only ordering we can
-    // honour without a clock: two timers with the same delay run in the order
-    // they were registered, because a Map iterates in insertion order.
-    const due = [...timers.entries()].sort((a, b) => a[1].delay - b[1].delay);
-    for (const [handle, timer] of due) {
-      if (ran >= FLUSH_LIMIT) break;
-      if (!timers.has(handle)) continue;
-      // Intervals run once here. A repeating timer in a flush with no clock is
-      // a loop, and a page is not owed one.
-      timers.delete(handle);
-      try {
-        timer.callback(...timer.args);
-      } catch (error) {
-        console.error(error);
-      }
-      ran++;
-    }
-    return ran;
+  // Whether a frame is owed, for a host deciding whether to enter the isolate
+  // at all.
+  defineGlobal('__otlyraFramesPending', function __otlyraFramesPending() {
+    return frameCallbacks.size;
   });
 
   // The attributes a page sets as properties. `element.value = 'x'` is not a
