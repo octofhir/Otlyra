@@ -57,12 +57,12 @@ struct PendingLoad {
     picture_sources: HashMap<NodeId, (String, f32)>,
     /// What each outstanding request will feed once it arrives.
     outstanding: HashMap<u64, Vec<PendingResource>>,
-    /// The document, held back while the scripts it names are fetched.
+    /// The parse, when it is stopped part way at a script it is waiting for.
     ///
-    /// Present only for the stretch between the bytes arriving and the parse
-    /// starting. Nothing else in the load happens during it: the parse is what
-    /// finds the stylesheets and the pictures.
-    prefetch: Option<ScriptPrefetch>,
+    /// A page whose parser is stopped is already on screen: everything before
+    /// the script is in the tree the tab is showing. What is here is the state
+    /// that carries on tokenizing once the script's bytes arrive.
+    parse: Option<otlyra_html::HtmlParser>,
     /// The `<script src>` elements, in the order the document names them.
     script_order: Vec<NodeId>,
     /// The source of each of those that has arrived.
@@ -70,30 +70,6 @@ struct PendingLoad {
     /// The page's script world, kept alive from the parse until the external
     /// scripts have run in it.
     runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
-}
-
-/// A document waiting for the scripts it links to, before it is parsed at all.
-///
-/// A `<script src>` is supposed to stop the parse where it stands and run before
-/// anything after it is parsed. A browser that only learns of one when the parser
-/// reaches it can either block the parse on the network — which blocks the whole
-/// browser, here — or run it afterwards, which is `defer` and breaks any page
-/// whose inline scripts call into a bundle. So the addresses are read out of the
-/// bytes first (`otlyra_html::prescan_scripts`), asked for at once, and the parse
-/// begins once they are in hand and runs every script in document order.
-///
-/// The wait costs the tab nothing it was not already spending: it is loading, it
-/// has no document yet either way, and the requests go out in parallel.
-struct ScriptPrefetch {
-    /// The response the document came in, kept until there is something to parse
-    /// it with.
-    loaded: crate::fetcher::Loaded,
-    /// The source of each script, keyed by `src` as the document spells it.
-    ///
-    /// One that failed to load is in here as an empty string rather than absent:
-    /// absent means *not asked for yet* and would have the parser defer it into a
-    /// second request for a file that is not there.
-    sources: otlyra_html::ExternalSources,
 }
 
 /// Which way a zoom is being taken.
@@ -105,6 +81,16 @@ pub enum ZoomStep {
     Out,
     /// Back to the page's own size.
     Reset,
+}
+
+/// A tree and what the parse still owes it, whether or not the parse has ended.
+///
+/// The tail of a load reads the same three things whether the document is
+/// finished or stopped at a script, so both paths hand it this.
+struct ParsedSoFar {
+    document: otlyra_dom::Document,
+    /// The `<script src>` the parse went past without running.
+    deferred_scripts: Vec<NodeId>,
 }
 
 /// What a subresource is for once it lands.
@@ -123,6 +109,14 @@ enum PendingResource {
     /// parsed, which is the point.
     ScriptSource(String),
 }
+
+/// How long a page's own deferred work may run before the first frame.
+///
+/// Not a policy about timers — the loop runs those — but about *this* moment:
+/// the frame the reader is about to see. A page that hydrates and then paints
+/// from a zero-delay timer should paint into that frame; one that has scheduled
+/// a second of animation should not hold it.
+const SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Note in the log when a document asked for more than the limit allows.
 fn report_limit(asked: usize, limit: usize, what: &str) {
@@ -168,6 +162,14 @@ pub struct Tab {
     pub title: String,
     /// The document, absent for a blank tab or one whose load failed.
     pub page: Option<PageScene>,
+    /// The page's script world, kept for as long as the page is on screen.
+    ///
+    /// A page does not stop when its last byte is parsed: its timers come due,
+    /// its animation frames are owed, and its listeners are waiting. Dropping
+    /// the isolate at the end of the load would be a browser that runs a page
+    /// once. It goes when the tab navigates away or closes, which is when the
+    /// document it holds goes.
+    scripts: Option<Box<dyn otlyra_html::ScriptRunner>>,
     /// What went wrong, if anything.
     pub error: Option<String>,
     /// The browser's own page this tab is showing, if it is showing one.
@@ -241,6 +243,7 @@ impl Tab {
             url: String::new(),
             title: "New tab".to_owned(),
             page: None,
+            scripts: None,
             error: None,
             system: None,
             pending: None,
@@ -421,6 +424,9 @@ pub struct Browser {
     fetcher: Fetcher,
     /// When the current load started, so the spinner has something to turn by.
     load_started: std::time::Instant,
+    /// When this browser started, which is the zero of the clock every page's
+    /// animation integrates against.
+    started: std::time::Instant,
     /// Whether the browser's own interface is drawn at all.
     ///
     /// Off is for a screenshot that is going to be compared against another
@@ -613,6 +619,7 @@ impl Browser {
             active: 0,
             fetcher,
             load_started: std::time::Instant::now(),
+            started: std::time::Instant::now(),
             interface: true,
             images: ImageCache::default(),
             background_requests: HashMap::new(),
@@ -1449,7 +1456,7 @@ impl Browser {
             images: Images::default(),
             picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
-            prefetch: None,
+            parse: None,
             script_order: Vec::new(),
             scripts: HashMap::new(),
             runner: None,
@@ -1513,6 +1520,8 @@ impl Browser {
         for fetched in finished {
             changed |= self.receive(fetched);
         }
+        changed |= self.run_due_timers();
+        changed |= self.run_frame_callbacks();
         // A fetch that finished is the only moment cookies can have changed, so
         // this is where the file catches up. Cheap when nothing did: the store
         // compares a revision before it writes anything.
@@ -1532,6 +1541,74 @@ impl Browser {
             }
         }
         changed
+    }
+
+    /// Run every page's timers that have come due.
+    ///
+    /// Called once a frame, and the frame is scheduled for the next deadline —
+    /// see `next_frame` — so a page's `setTimeout` wakes the loop rather than
+    /// waiting for something else to.
+    ///
+    /// Every open tab, not only the visible one: a background tab's clock does
+    /// not stop, and a page that polls in one is a page that expects to have
+    /// polled when the reader comes back to it.
+    fn run_due_timers(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let (Some(scripts), Some(page)) = (tab.scripts.as_mut(), tab.page.as_mut()) else {
+                continue;
+            };
+            if scripts.next_deadline().is_none_or(|deadline| deadline > now) {
+                continue;
+            }
+            let ran = page.with_document(|document| scripts.run_due_timers(document));
+            if ran > 0 {
+                // The tree may be different now, so everything style and layout
+                // made of it is stale. Asked of the page rather than guessed at:
+                // a timer that only read the document changes nothing.
+                page.document_changed();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Give every page that asked for an animation frame the one being built.
+    ///
+    /// `requestAnimationFrame` means *before the next paint*, so this runs on
+    /// the way into a frame rather than after one. The timestamp is the page's
+    /// own clock — milliseconds since the browser started, which is what
+    /// `performance.now` reports and what every animation on the web integrates
+    /// against.
+    ///
+    /// A page with no frame outstanding costs nothing here: the question is
+    /// answered from a counter the bindings keep, not by entering the isolate.
+    fn run_frame_callbacks(&mut self) -> bool {
+        let timestamp = self.started.elapsed().as_secs_f64() * 1000.0;
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let (Some(scripts), Some(page)) = (tab.scripts.as_mut(), tab.page.as_mut()) else {
+                continue;
+            };
+            if !scripts.frames_pending() {
+                continue;
+            }
+            let ran = page.with_document(|document| scripts.run_frame(document, timestamp));
+            if ran > 0 {
+                page.document_changed();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// When the loop must wake for a page's timers, if it must.
+    fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.scripts.as_ref()?.next_deadline())
+            .min()
     }
 
     /// Paint one frame nobody sees, so that everything a frame *asks for* has been
@@ -1984,25 +2061,20 @@ impl Browser {
             return true;
         }
 
-        // A document's scripts are asked for here, before it is parsed, so that
-        // the parse can run each of them where the document names it. See
-        // [`ScriptPrefetch`] for why that is worth a wait.
+        // The scripts this document names are asked for here, before it is
+        // parsed — see [`prefetch_scripts`]. The parse does *not* wait for
+        // them: a browser shows what it has parsed and stops only at the script
+        // it has actually reached. What arrives before the parse reaches it
+        // runs in place; the rest is run after, which is the `defer` shape and
+        // is what these still are until the parser can suspend.
         if otlyra_net::sniff(
             loaded.content_type.as_deref(),
             loaded.nosniff,
             &loaded.bytes,
         )
         .is_document()
-            && self.prefetch_scripts(index, &loaded)
         {
-            let Some(pending) = self.tabs[index].pending.as_mut() else {
-                return true;
-            };
-            pending.prefetch = Some(ScriptPrefetch {
-                loaded,
-                sources: otlyra_html::ExternalSources::new(),
-            });
-            return true;
+            self.prefetch_scripts(index, &loaded);
         }
 
         self.build_document(index, loaded, otlyra_html::ExternalSources::new())
@@ -2010,8 +2082,11 @@ impl Browser {
 
     /// Ask for every script a document's bytes name, before parsing them.
     ///
-    /// Returns whether anything was asked for: nothing to wait on means the parse
-    /// can start now.
+    /// This is the preload scan, and it is the whole of what a browser does
+    /// ahead of its parser: read the raw bytes for what will be needed and put
+    /// the requests on the wire now, so that by the time the parser reaches a
+    /// `<script src>` its bytes are already coming. It does not decide when
+    /// anything runs.
     fn prefetch_scripts(&mut self, index: usize, loaded: &crate::fetcher::Loaded) -> bool {
         let srcs = otlyra_html::prescan_scripts(&loaded.bytes);
         report_limit(srcs.len(), SCRIPT_LIMIT, "scripts");
@@ -2069,33 +2144,62 @@ impl Browser {
         );
         let final_url = loaded.final_url;
         tracing::debug!(kind = sniffed.essence(), url = %final_url, "response sniffed");
-        // The page's script world, kept from the parse until the scripts it
-        // links to have been fetched and run in it.
-        let mut page_scripts: Option<Box<dyn otlyra_html::ScriptRunner>> = None;
+        // The page's own code runs at the parser's script points, in an isolate
+        // of this document's own with no capabilities. The parse begins here and
+        // may not end here: a `<script src>` whose bytes have not arrived stops
+        // it, and what has been parsed so far goes on screen while the rest of
+        // the document waits for that script — which is what a browser does and
+        // is the whole reason a page appears before its bundles have landed.
+        let mut parser = None;
         let parsed = match &sniffed {
             kind if kind.is_document() => {
-                // The page's own code runs here, at the parser's script points,
-                // in an isolate of this document's own with no capabilities.
-                let (parsed, runner) = otlyra_html::parse_with_scripts(
+                let started = otlyra_html::start_parse(
                     &loaded.bytes,
                     loaded.charset.as_deref(),
                     Some(Box::new(otlyra_script::PageScripts::new(final_url.clone()))),
                     sources,
                 );
-                page_scripts = runner;
-                parsed
+                parser = Some(started.parser);
+                started.document
             }
             otlyra_net::Sniffed::Image(_) => {
-                otlyra_html::parse(image_document(&final_url).as_bytes(), Some("utf-8"))
+                otlyra_html::parse(image_document(&final_url).as_bytes(), Some("utf-8")).document
             }
             _ => {
                 let text = decode_text(&loaded.bytes, loaded.charset.as_deref());
-                otlyra_html::parse(text_document(&text).as_bytes(), Some("utf-8"))
+                otlyra_html::parse(text_document(&text).as_bytes(), Some("utf-8")).document
             }
+        };
+        // Nothing that is not a document has a parser, and nothing without a
+        // parser can be blocked; both of those finish here.
+        let mut page_scripts: Option<Box<dyn otlyra_html::ScriptRunner>> = None;
+        let mut parsed = parsed;
+        let blocked = match parser.as_mut() {
+            Some(parser) => parser.blocked_on().is_some(),
+            None => false,
+        };
+        let deferred_scripts = match parser.as_mut() {
+            Some(parser) => parser.deferred_scripts().to_vec(),
+            None => Vec::new(),
+        };
+        if !blocked && let Some(parser) = parser.take() {
+            page_scripts = parser.finish(&mut parsed);
+        }
+        let parsed = ParsedSoFar {
+            document: parsed,
+            deferred_scripts,
         };
 
         // What the page asks for, decided here and fetched on the other thread.
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
+        // What the preload scan already put on the wire, taken back so this
+        // load's own table does not overwrite it.
+        let preloaded: HashMap<u64, Vec<PendingResource>> = self.tabs[index]
+            .pending
+            .as_mut()
+            .map(|pending| std::mem::take(&mut pending.outstanding))
+            .unwrap_or_default();
+        let mut preloaded = preloaded;
         // Pictures that were decoded for an earlier page and are still here.
         let mut ready = Images::default();
         let links = otlyra_css::cascade::stylesheet_links(&parsed.document);
@@ -2147,12 +2251,9 @@ impl Browser {
             .collect();
         self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
 
-        // The scripts the parse could not run where they stood: ones the script
-        // prescan did not see, because the markup that names them was written by
-        // another script or spelled in a way bytes alone cannot read. They are
-        // fetched like everything else and run when they arrive, which makes
-        // each of them a `defer` — late, but in the order the document names
-        // them, which is what a page depends on.
+        // The scripts the parse did not run where they stood, because their
+        // bytes were not in yet. They run after it, in document order, which is
+        // `defer` — late, and the thing the parser learning to suspend will fix.
         let scripts: Vec<(NodeId, String)> = parsed
             .deferred_scripts
             .iter()
@@ -2169,13 +2270,42 @@ impl Browser {
             .take(SCRIPT_LIMIT)
             .collect();
         let script_order: Vec<NodeId> = scripts.iter().map(|(node, _)| *node).collect();
-        self.request_subresources(
-            &mut outstanding,
-            &final_url,
-            scripts
-                .into_iter()
-                .map(|(node, src)| (src, PendingResource::Script(node), ResourceKind::Script)),
-        );
+        // The preload scan already asked for most of these, and those requests
+        // are in flight now. Asking again would be a second request for a file
+        // already coming: what the scan started is adopted here instead, by
+        // naming the node its bytes belong to.
+        let mut wanted = Vec::new();
+        // The script the parse is *stopped* at comes first and is not one of
+        // the deferred ones: nothing after it exists yet, so it is the only
+        // thing standing between this page and the rest of itself.
+        let stopped_at = parser
+            .as_ref()
+            .and_then(otlyra_html::HtmlParser::blocked_on)
+            .and_then(|node| {
+                let src = parsed
+                    .document
+                    .get(node)?
+                    .element()?
+                    .attr("src")?
+                    .trim()
+                    .to_owned();
+                (!src.is_empty()).then_some((node, src))
+            });
+        for (node, src) in stopped_at.into_iter().chain(scripts) {
+            let mut adopted = false;
+            for resource in preloaded.values_mut() {
+                if resource.iter().any(|held| matches!(held, PendingResource::ScriptSource(held) if *held == src)) {
+                    resource.push(PendingResource::Script(node));
+                    adopted = true;
+                    break;
+                }
+            }
+            if !adopted {
+                wanted.push((src, PendingResource::Script(node), ResourceKind::Script));
+            }
+        }
+        outstanding.extend(preloaded);
+        self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
         report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
         report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
 
@@ -2197,6 +2327,10 @@ impl Browser {
         pending.images.extend(ready);
         pending.script_order = script_order;
         pending.runner = page_scripts;
+        // A parse that is stopped keeps its parser here. The page above is
+        // already on screen; this is what carries on tokenizing into it when
+        // the script it is waiting for arrives.
+        pending.parse = parser;
         let record = pending.record;
         let previous = pending.previous_url.clone();
 
@@ -2249,6 +2383,8 @@ impl Browser {
         let Some(wanted) = pending.outstanding.remove(&fetched.id) else {
             return;
         };
+        // Whether a script the parse might be waiting for has landed.
+        let mut resumed = false;
 
         match fetched.result {
             Ok(loaded) => {
@@ -2278,12 +2414,16 @@ impl Browser {
                         PendingResource::Script(node) => {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
                             pending.scripts.insert(node, source);
+                            resumed = true;
                         }
                         PendingResource::ScriptSource(src) => {
-                            let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
-                            if let Some(prefetch) = pending.prefetch.as_mut() {
-                                prefetch.sources.insert(src, source);
-                            }
+                            // The preload scan's own entry. It answers a node
+                            // only once the parse has run and told us which
+                            // node that is — see `build_document`, which adds
+                            // a `Script(node)` beside this one. Before then
+                            // there is nothing to give the bytes to, and after
+                            // then this entry has nothing left to do.
+                            tracing::trace!(target: "page.script", %src, "a preloaded script arrived");
                         }
                         PendingResource::Image(node, src, density) => match decoded.as_ref() {
                             Some(image) => {
@@ -2305,30 +2445,121 @@ impl Browser {
             }
             Err(error) => {
                 tracing::warn!(url = %fetched.url, %error, "subresource failed to load");
-                // A script asked for ahead of the parse and not delivered is
-                // recorded as empty rather than left out: left out reads as
-                // *not asked for*, and the parse would ask again.
-                for resource in wanted {
-                    if let (PendingResource::ScriptSource(src), Some(prefetch)) =
-                        (resource, pending.prefetch.as_mut())
-                    {
-                        prefetch.sources.insert(src, String::new());
-                    }
-                }
             }
         }
 
-        if !pending.outstanding.is_empty() {
+        if resumed {
+            self.resume_parse(index);
+        }
+
+        if self
+            .tabs[index]
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.outstanding.is_empty())
+        {
+            self.finish_load(index);
+        }
+    }
+
+    /// Carry on parsing a document that was stopped at a script, now that the
+    /// script has arrived.
+    ///
+    /// The tree is the tab's and the parser borrows it back, so the page the
+    /// reader is looking at grows rather than being replaced. It may stop again
+    /// at the next script — a page with five bundles in its head stops five
+    /// times — and each stop is another piece of the document on screen.
+    fn resume_parse(&mut self, index: usize) {
+        loop {
+            let Some(pending) = self.tabs[index].pending.as_mut() else {
+                return;
+            };
+            let Some(parser) = pending.parse.as_mut() else {
+                return;
+            };
+            let Some(blocked) = parser.blocked_on() else {
+                return;
+            };
+            // The bytes, or the knowledge that they will not come: a fetch that
+            // failed must not stop the page for ever.
+            let source = pending.scripts.get(&blocked).cloned();
+            let Some(source) = source else {
+                let failed = !pending.outstanding.values().flatten().any(
+                    |resource| matches!(resource, PendingResource::Script(node) if *node == blocked),
+                );
+                if !failed {
+                    return;
+                }
+                tracing::debug!(target: "page.script", "the script the parse waited for never came");
+                let mut parser = pending.parse.take().expect("just borrowed");
+                self.step_parse(index, |document| parser.skip_script(document));
+                self.after_parse_step(index, parser);
+                continue;
+            };
+
+            let mut parser = pending.parse.take().expect("just borrowed");
+            self.step_parse(index, |document| parser.supply_script(document, &source));
+            self.after_parse_step(index, parser);
+        }
+    }
+
+    /// Run one step of a stopped parse over the tab's own tree.
+    fn step_parse(&mut self, index: usize, run: impl FnOnce(&mut otlyra_dom::Document)) {
+        if let Some(page) = self.tabs[index].page.as_mut() {
+            page.with_document(run);
+            // The tree is longer than it was, so everything style and layout
+            // made of it is out of date.
+            page.document_changed();
+        }
+    }
+
+    /// Put the parser back, or finish the parse if it has nothing left to wait
+    /// for.
+    fn after_parse_step(&mut self, index: usize, parser: otlyra_html::HtmlParser) {
+        if parser.blocked_on().is_some() {
+            // Stopped again, at the next script. Ask for that one.
+            let src = self.tabs[index].page.as_ref().and_then(|page| {
+                let node = parser.blocked_on()?;
+                let src = page
+                    .document()
+                    .get(node)?
+                    .element()?
+                    .attr("src")?
+                    .trim()
+                    .to_owned();
+                (!src.is_empty()).then_some((node, src))
+            });
+            if let Some((node, src)) = src {
+                let base = self.tabs[index].url.clone();
+                let mut outstanding = HashMap::new();
+                self.request_subresources(
+                    &mut outstanding,
+                    &base,
+                    std::iter::once((src, PendingResource::Script(node), ResourceKind::Script)),
+                );
+                if let Some(pending) = self.tabs[index].pending.as_mut() {
+                    for (id, resources) in outstanding {
+                        pending.outstanding.entry(id).or_default().extend(resources);
+                    }
+                }
+            }
+            if let Some(pending) = self.tabs[index].pending.as_mut() {
+                pending.parse = Some(parser);
+            }
             return;
         }
-        // Everything asked for has landed. If what was outstanding was the
-        // document's own scripts, the document has yet to be parsed; otherwise
-        // this is the last of a parsed page's subresources.
-        match pending.prefetch.take() {
-            Some(prefetch) => {
-                self.build_document(index, prefetch.loaded, prefetch.sources);
-            }
-            None => self.finish_load(index),
+
+        // Nothing left to wait for: the last byte is parsed and the load events
+        // are due.
+        let mut runner = None;
+        if let Some(page) = self.tabs[index].page.as_mut() {
+            page.with_document(|document| runner = parser.finish(document));
+            page.document_changed();
+        }
+        if let Some(pending) = self.tabs[index].pending.as_mut()
+            && let Some(runner) = runner
+        {
+            pending.runner = Some(runner);
         }
     }
 
@@ -2397,9 +2628,20 @@ impl Browser {
             }
             runner.document_finished(document, false);
         }
-        // The isolate goes with the load for now: there are no timers and no
-        // input events reaching script yet, so nothing could wake it again.
-        pending.runner = None;
+        // The page's own deferred work, up to a bounded budget. A page that
+        // paints from a `setTimeout(…, 0)` — which is most of what a framework
+        // does after hydrating — has done it by the time the first frame is
+        // built, rather than in a second frame after a flash. What it schedules
+        // beyond the budget waits for the loop, which is where a timer belongs.
+        if let (Some(document), Some(runner)) = (document.as_mut(), pending.runner.as_mut()) {
+            let ran = runner.settle(document, SETTLE_BUDGET);
+            if ran > 0 {
+                tracing::debug!(target: "page.script", ran, "the page settled");
+            }
+        }
+        // The isolate stays with the tab: its timers are still coming due and
+        // its listeners are still waiting.
+        tab.scripts = pending.runner.take();
 
         if let Some(document) = document {
             tab.page = Some(PageScene::with_resources(
@@ -4061,6 +4303,11 @@ impl Painter for Browser {
         if tab.loading() {
             return FrameRequest::Vsync;
         }
+        // A page mid-animation asks for the next frame at display pace, which
+        // is what `requestAnimationFrame` is.
+        if tab.scripts.as_ref().is_some_and(|scripts| scripts.frames_pending()) {
+            return FrameRequest::Vsync;
+        }
         // The caret's next half-second and the pause before a control is named:
         // whichever comes first, because one wake serves both and a loop told
         // about the later one would sleep through the earlier.
@@ -4069,10 +4316,17 @@ impl Painter for Browser {
             .as_ref()
             .and_then(crate::page::PageScene::next_caret_frame);
         let tooltip = self.ui.next_tooltip_frame();
-        match (caret, tooltip) {
-            (Some(caret), Some(tooltip)) => FrameRequest::At(caret.min(tooltip)),
-            (Some(at), None) | (None, Some(at)) => FrameRequest::At(at),
-            (None, None) => FrameRequest::None,
+        // And whatever any page put on the clock: a timer is a reason to wake
+        // exactly as an animation is, and a browser that only woke for its own
+        // interface would run a page's `setTimeout` the next time the reader
+        // happened to move the pointer.
+        match [caret, tooltip, self.next_timer_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            Some(at) => FrameRequest::At(at),
+            None => FrameRequest::None,
         }
     }
 

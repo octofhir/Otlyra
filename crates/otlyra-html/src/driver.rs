@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 
-use html5ever::interface::TreeSink;
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{Tokenizer, TokenizerOpts};
 use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts, create_element};
@@ -53,6 +52,44 @@ pub trait ScriptRunner {
         let _ = (source, element, document);
     }
 
+    /// When the page's next timer comes due, if it has one.
+    ///
+    /// This and the three below are the event loop's, not the parser's. They
+    /// are on this trait because the runner outlives the parse — a page keeps
+    /// running after its last byte — and whoever drives the parse is left
+    /// holding it as a `dyn ScriptRunner`. A parser with no engine attached
+    /// answers all of them with nothing, which is what a browser with scripting
+    /// disabled does.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Run the timers that are due now, in order; returns how many ran.
+    fn run_due_timers(&mut self, document: &mut Document) -> usize {
+        let _ = document;
+        0
+    }
+
+    /// Whether the page has asked for an animation frame and not had one.
+    fn frames_pending(&self) -> bool {
+        false
+    }
+
+    /// Run the animation-frame callbacks the page asked for.
+    fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
+        let _ = (document, timestamp);
+        0
+    }
+
+    /// Run the page's deferred work to a standstill, or until `budget` is spent.
+    ///
+    /// For a caller with no event loop to be woken from: a screenshot, a dump,
+    /// a test.
+    fn settle(&mut self, document: &mut Document, budget: std::time::Duration) -> usize {
+        let _ = (document, budget);
+        0
+    }
+
     /// Throw away everything script has done and start again.
     ///
     /// Called when the document is about to be parsed a second time because
@@ -87,6 +124,12 @@ pub struct HtmlParser {
     deferred_scripts: Vec<NodeId>,
     /// The sources that were.
     external_sources: ExternalSources,
+    /// The `<script src>` the parse is stopped at, if it is stopped at one.
+    ///
+    /// This is the parser-blocking script, and it is the whole of what makes a
+    /// browser show half a page: everything before it is in the tree and can be
+    /// painted, and nothing after it is even tokenized until it has run.
+    blocked: Option<NodeId>,
     encoding_indicator: Option<String>,
     script_runner: Option<Box<dyn ScriptRunner>>,
 }
@@ -110,6 +153,7 @@ impl HtmlParser {
             external_scripts: Vec::new(),
             deferred_scripts: Vec::new(),
             external_sources: ExternalSources::new(),
+            blocked: None,
             encoding_indicator: None,
             script_runner: None,
         }
@@ -142,6 +186,7 @@ impl HtmlParser {
             external_scripts: Vec::new(),
             deferred_scripts: Vec::new(),
             external_sources: ExternalSources::new(),
+            blocked: None,
             encoding_indicator: None,
             // A fragment parser never runs script: `innerHTML` parses its input
             // with scripting off, and a `<script>` in it becomes an element and
@@ -150,10 +195,84 @@ impl HtmlParser {
         }
     }
 
-    /// Feed decoded text that arrived over the network.
-    pub fn feed(&mut self, text: StrTendril) {
+    /// Feed decoded text that arrived over the network, into `document`.
+    ///
+    /// The arena is the caller's and is lent for the pump. It comes back
+    /// holding everything parsed so far — including when the parse stopped part
+    /// way, at a `<script src>` whose bytes have not arrived: see
+    /// [`Self::blocked_on`], which is what a caller checks afterwards.
+    pub fn feed(&mut self, document: &mut Document, text: StrTendril) {
         self.network_input.push_back(text);
-        self.pump();
+        self.with_arena(document, Self::pump);
+    }
+
+    /// Lend `document` to the tree builder for one call.
+    ///
+    /// Moved in and moved back, so a caller still holding it cannot reach it
+    /// while the parser can. The restoring is a `Drop`, because a tree builder
+    /// that panics mid-token must still give the tree back rather than leave
+    /// the caller with an empty one.
+    fn with_arena<R>(&mut self, document: &mut Document, run: impl FnOnce(&mut Self) -> R) -> R {
+        let taken = std::mem::take(document);
+        let placeholder = self.tokenizer.sink.sink.lend(taken);
+        drop(placeholder);
+
+        struct Restore<'a, 'b> {
+            parser: &'a mut HtmlParser,
+            document: &'b mut Document,
+        }
+        impl Drop for Restore<'_, '_> {
+            fn drop(&mut self) {
+                *self.document = self.parser.tokenizer.sink.sink.reclaim();
+            }
+        }
+
+        let restore = Restore { parser: self, document };
+        run(restore.parser)
+    }
+
+    /// Take the arena this parser was built over.
+    ///
+    /// For a caller that did not supply one — a fragment parser builds its
+    /// context element into a document of its own, and that document is the one
+    /// the fragment must be parsed into.
+    pub fn take_document(&mut self) -> Document {
+        self.tokenizer.sink.sink.reclaim()
+    }
+
+    /// The `<script src>` the parse is stopped at, if it is stopped at one.
+    pub fn blocked_on(&self) -> Option<NodeId> {
+        self.blocked
+    }
+
+    /// Run the script the parse is stopped at, and carry on tokenizing.
+    ///
+    /// This is the moment a browser has been waiting for: the bytes of the
+    /// parser-blocking script arrived, it runs against the half-built tree, and
+    /// everything it did is in the document before the next token is seen —
+    /// which is the whole difference between a script and a `defer`.
+    pub fn supply_script(&mut self, document: &mut Document, source: &str) {
+        let Some(element) = self.blocked.take() else {
+            return;
+        };
+        self.with_arena(document, |parser| {
+            if !source.trim().is_empty()
+                && let Some(runner) = parser.script_runner.as_mut()
+            {
+                parser.scripts_run += 1;
+                let mut document = parser.tokenizer.sink.sink.document_mut();
+                runner.run_external(source, element, &mut document);
+            }
+            parser.pump();
+        });
+    }
+
+    /// Carry on without running it: its fetch failed, or it is not ours to run.
+    pub fn skip_script(&mut self, document: &mut Document) {
+        if let Some(element) = self.blocked.take() {
+            self.deferred_scripts.push(element);
+            self.with_arena(document, Self::pump);
+        }
     }
 
     /// Splice text in ahead of the network bytes, as `document.write` does.
@@ -161,9 +280,9 @@ impl HtmlParser {
     /// Unused until script runs at M12; it is here because it is the reason the
     /// queues are separate, and a driver with one queue cannot grow this later
     /// without being rewritten.
-    pub fn write(&mut self, text: StrTendril) {
+    pub fn write(&mut self, document: &mut Document, text: StrTendril) {
         self.script_input.push_front(text);
-        self.pump();
+        self.with_arena(document, Self::pump);
     }
 
     /// Attach the thing that runs scripts.
@@ -253,12 +372,16 @@ impl HtmlParser {
                 let src = src.trim().to_owned();
                 self.external_scripts.push(element);
                 let Some(source) = self.external_sources.get(&src) else {
+                    // The parser-blocking case: the bytes are not here, so
+                    // nothing after this script may be tokenized until they
+                    // are. The parse stops where it stands and the caller is
+                    // told which script it is waiting on.
                     tracing::debug!(
                         target: "page.script",
                         %src,
-                        "an external script whose source was not in hand: deferred"
+                        "the parse is blocked on a script"
                     );
-                    self.deferred_scripts.push(element);
+                    self.blocked = Some(element);
                     return;
                 };
                 external = true;
@@ -321,16 +444,24 @@ impl HtmlParser {
         self.encoding_indicator.as_deref()
     }
 
-    /// Finish parsing and take the document.
-    pub fn finish(mut self) -> Document {
-        self.pump();
-        self.tokenizer.end();
-        if let Some(runner) = self.script_runner.as_mut() {
-            let more_coming = !self.deferred_scripts.is_empty();
-            let mut document = self.tokenizer.sink.sink.document_mut();
-            runner.document_finished(&mut document, more_coming);
-        }
-        self.tokenizer.sink.sink.finish()
+    /// Finish parsing and take the document, and the runner with it.
+    ///
+    /// Both, because the two are needed together and in this order: the last
+    /// byte is what makes the load events due, and the isolate that runs them
+    /// keeps running afterwards — its timers, its listeners and its frames are
+    /// in there. A caller that took the runner back *before* finishing would
+    /// get a document whose load events never fired.
+    pub fn finish(mut self, document: &mut Document) -> Option<Box<dyn ScriptRunner>> {
+        self.with_arena(document, |parser| {
+            parser.pump();
+            parser.tokenizer.end();
+            if let Some(runner) = parser.script_runner.as_mut() {
+                let more_coming = !parser.deferred_scripts.is_empty();
+                let mut document = parser.tokenizer.sink.sink.document_mut();
+                runner.document_finished(&mut document, more_coming);
+            }
+        });
+        self.script_runner.take()
     }
 
     /// Run the tokenizer until both queues are empty.
@@ -355,6 +486,12 @@ impl HtmlParser {
                     // browser with scripting disabled does.
                     self.scripts_seen += 1;
                     self.execute(element);
+                    // A script whose bytes have not arrived stops the parse
+                    // here. Everything before it is in the tree and can be
+                    // painted; nothing after it exists yet.
+                    if self.blocked.is_some() {
+                        return;
+                    }
                 }
                 TokenizerResult::EncodingIndicator(label) => {
                     // The other half of html5ever's discarded FIXME: a `<meta>` the

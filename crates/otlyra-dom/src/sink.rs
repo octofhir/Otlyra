@@ -62,6 +62,28 @@ impl DomSink {
         }
     }
 
+    /// Put an arena in for the parser to work on, taking out whatever was there.
+    ///
+    /// The tree belongs to whoever is showing it — a tab, a test — and the
+    /// parser is a machine over it, not its owner. That is the arrangement
+    /// every browser has: the document owns its nodes and the parser holds a
+    /// pointer, which is what lets a page be painted while it is still being
+    /// parsed. Here the pointer is a move, because the tree builder's `&self`
+    /// methods need the arena reachable without a borrow that outlives a call.
+    ///
+    /// Safe to do between pumps and never during one: the tree builder holds
+    /// only [`NodeId`]s — its stack of open elements, its insertion points, its
+    /// active formatting list — so its state means the same thing after the
+    /// arena has been out and back.
+    pub fn lend(&self, document: Document) -> Document {
+        std::mem::replace(&mut self.document.borrow_mut(), document)
+    }
+
+    /// Take the arena back out, leaving an empty one behind.
+    pub fn reclaim(&self) -> Document {
+        std::mem::take(&mut *self.document.borrow_mut())
+    }
+
     /// How many parse errors the tokenizer and tree builder reported.
     pub fn parse_errors(&self) -> usize {
         self.parse_errors.get()

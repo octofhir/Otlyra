@@ -79,14 +79,28 @@ fn parse_with(
     if let Some(runner) = runner {
         parser = parser.with_script_runner(runner);
     }
-    parser.feed(text.as_ref().into());
+    // The arena is this function's, and the parser works on it. That is the
+    // arrangement a browser has, and it is what lets a caller with an event
+    // loop paint what has been parsed while the parse is stopped.
+    let mut document = Document::new();
+    parser.feed(&mut document, text.as_ref().into());
+    // Nothing here has a network, so a parse stopped on a script it does not
+    // hold is a parse that stays stopped. Let it past — the script becomes a
+    // deferred one, which is what the caller will fetch and run afterwards.
+    // A caller that *can* fetch drives this loop itself and supplies the bytes.
+    while parser.blocked_on().is_some() {
+        parser.skip_script(&mut document);
+    }
     let indicator = parser.encoding_indicator().map(str::to_owned);
     let external_scripts = parser.external_scripts().to_vec();
     let deferred_scripts = parser.deferred_scripts().to_vec();
-    let runner = parser.take_script_runner();
+    // The runner comes back out of `finish`, not before it: the load events are
+    // due at the last byte, and taking it first would mean nobody was there to
+    // run them.
+    let runner = parser.finish(&mut document);
     (
         Pass {
-            document: parser.finish(),
+            document,
             indicator,
             external_scripts,
             deferred_scripts,
@@ -114,8 +128,13 @@ pub fn parse_fragment(html: &str, context: &str) -> Document {
     let name = QualName::new(None, namespace, LocalName::from(local));
 
     let mut parser = HtmlParser::for_fragment(Document::new(), name, Vec::new());
-    parser.feed(html.into());
-    parser.finish()
+    // The context element was built into the parser's own arena, so that arena
+    // is the one the fragment is parsed into — a fresh one would have the
+    // context's id pointing at nothing.
+    let mut document = parser.take_document();
+    parser.feed(&mut document, html.into());
+    parser.finish(&mut document);
+    document
 }
 
 /// Parse a complete byte stream into a document.
@@ -128,6 +147,59 @@ pub fn parse_fragment(html: &str, context: &str) -> Document {
 /// arrives with navigation.
 pub fn parse(bytes: &[u8], transport_charset: Option<&str>) -> ParsedDocument {
     parse_with_scripts(bytes, transport_charset, None, ExternalSources::new()).0
+}
+
+/// A parse that has begun: the tree so far, and the parser that is building it.
+///
+/// What a caller with a network gets instead of a finished document. The parse
+/// runs until it either ends or stops at a parser-blocking `<script src>` —
+/// [`HtmlParser::blocked_on`] says which — and everything parsed up to that
+/// point is in `document` and can be styled, laid out and painted. That is what
+/// makes a browser show half a page while the rest of it is still coming.
+pub struct StartedParse {
+    /// The tree as it stands. It is the caller's; the parser borrows it back
+    /// for each pump.
+    pub document: Document,
+    /// The parser, to be driven until it is done.
+    pub parser: HtmlParser,
+    /// The encoding used, and why.
+    pub encoding: EncodingDecision,
+}
+
+/// Begin parsing `bytes`, and stop at the first script that blocks the parse.
+///
+/// The caller drives the rest: fetch what [`HtmlParser::blocked_on`] names,
+/// [`HtmlParser::supply_script`] it — or [`HtmlParser::skip_script`] when the
+/// fetch failed — and [`HtmlParser::finish`] when nothing is left.
+///
+/// Unlike [`parse_with_scripts`] this does not decode twice for a `<meta>` the
+/// prescan did not reach. A second pass throws away the first one's tree and
+/// everything its scripts did, and a parse that has already stopped at a script
+/// has a tree somebody may already be looking at. The prescan and the transport
+/// between them name the encoding of essentially every page that has scripts in
+/// it at all.
+pub fn start_parse(
+    bytes: &[u8],
+    transport_charset: Option<&str>,
+    runner: Option<Box<dyn ScriptRunner>>,
+    sources: ExternalSources,
+) -> StartedParse {
+    let span = tracing::info_span!("start_parse", bytes = bytes.len());
+    let _entered = span.enter();
+
+    let decision = determine(bytes, transport_charset);
+    let (text, _actual, _had_errors) = decision.encoding.decode(bytes);
+    let mut parser = HtmlParser::new().with_external_sources(sources);
+    if let Some(runner) = runner {
+        parser = parser.with_script_runner(runner);
+    }
+    let mut document = Document::new();
+    parser.feed(&mut document, text.as_ref().into());
+    StartedParse {
+        document,
+        parser,
+        encoding: decision,
+    }
 }
 
 /// Parse a byte stream, running the scripts in it.
@@ -367,6 +439,76 @@ mod tests {
 
         assert_eq!(parsed.encoding.source, EncodingSource::TransportCharset);
         assert_eq!(parsed.encoding.encoding, encoding_rs::UTF_8);
+    }
+
+    /// The parser-blocking script: the parse stops at it, everything before it
+    /// is in the tree and can be painted, and nothing after it exists until the
+    /// bytes arrive. This is the whole reason a browser shows half a page.
+    #[test]
+    fn the_parse_stops_at_a_script_whose_bytes_have_not_arrived() {
+        use otlyra_dom::Document;
+
+        let mut parser = HtmlParser::new().with_script_runner(Box::new(CountingRunner::default()));
+        let mut document = Document::new();
+        parser.feed(
+            &mut document,
+            "<body><p>before</p><script src=app.js></script><p>after</p>".into(),
+        );
+
+        let blocked = parser.blocked_on().expect("the parse stopped at the script");
+        let tree = dump::serialize(&document);
+        assert!(tree.contains("\"before\""), "what came first is in the tree:\n{tree}");
+        assert!(
+            !tree.contains("\"after\""),
+            "nothing past the script was tokenized:\n{tree}"
+        );
+
+        // The bytes arrive. The script runs against the half-built tree, and
+        // the rest of the document is parsed after it.
+        parser.supply_script(&mut document, "/* the bundle */");
+        assert_eq!(parser.blocked_on(), None, "the parse carried on");
+        parser.finish(&mut document);
+        let tree = dump::serialize(&document);
+        assert!(tree.contains("\"after\""), "the rest was parsed:\n{tree}");
+        let _ = blocked;
+    }
+
+    /// A script whose fetch failed does not stop the page for ever.
+    #[test]
+    fn a_script_that_never_arrives_can_be_stepped_over() {
+        use otlyra_dom::Document;
+
+        let mut parser = HtmlParser::new().with_script_runner(Box::new(CountingRunner::default()));
+        let mut document = Document::new();
+        parser.feed(
+            &mut document,
+            "<body><script src=gone.js></script><p>after</p>".into(),
+        );
+        assert!(parser.blocked_on().is_some());
+        parser.skip_script(&mut document);
+        parser.finish(&mut document);
+        assert!(dump::serialize(&document).contains("\"after\""));
+    }
+
+    /// A runner that does nothing, so a parse can be driven without an engine.
+    #[derive(Default)]
+    struct CountingRunner {
+        ran: usize,
+    }
+
+    impl ScriptRunner for CountingRunner {
+        fn run(&mut self, _source: &str, _element: NodeId, _document: &mut otlyra_dom::Document) {
+            self.ran += 1;
+        }
+
+        fn run_external(
+            &mut self,
+            _source: &str,
+            _element: NodeId,
+            _document: &mut otlyra_dom::Document,
+        ) {
+            self.ran += 1;
+        }
     }
 
     #[test]

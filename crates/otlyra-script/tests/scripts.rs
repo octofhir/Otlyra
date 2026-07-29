@@ -158,10 +158,101 @@ fn parse_and_dump(html: &str) -> (Vec<String>, usize, usize, String) {
         "https://example.com/",
         handle,
     )));
-    parser.feed(html.into());
+    let mut document = otlyra_dom::Document::new();
+    parser.feed(&mut document, html.into());
+    // A test has no network, so a parse stopped on a script it does not hold
+    // stays stopped. Step over it, as the parse-once helper does.
+    while parser.blocked_on().is_some() {
+        parser.skip_script(&mut document);
+    }
     let (seen, run) = (parser.scripts_seen(), parser.scripts_run());
-    let tree = otlyra_dom::dump::serialize(&parser.finish());
+    let mut runner = parser.finish(&mut document);
+    // What the page put on the clock. A test has no event loop to be woken
+    // from, so it lets the page settle the way a screenshot does — bounded, or
+    // a `setInterval` would keep it here.
+    if let Some(runner) = runner.as_mut() {
+        runner.settle(&mut document, Duration::from_millis(250));
+    }
+    let tree = otlyra_dom::dump::serialize(&document);
     (lines(&sink), seen, run, tree)
+}
+
+/// Timers run when the page asked for them, in that order, and an interval
+/// keeps coming back until it is stopped.
+#[test]
+fn timers_run_in_the_order_their_deadlines_fall_due() {
+    let (output, ..) = parse_running_scripts(
+        "<script>\
+           setTimeout(() => console.log('third'), 40);\
+           setTimeout(() => console.log('first'), 0);\
+           setTimeout(() => console.log('second'), 20);\
+           const cancelled = setTimeout(() => console.log('never'), 10);\
+           clearTimeout(cancelled);\
+           let ticks = 0;\
+           const every = setInterval(() => {\
+             ticks++;\
+             console.log('tick', ticks);\
+             if (ticks === 3) clearInterval(every);\
+           }, 5);\
+         </script>",
+    );
+    // The interval's ticks interleave with the one-shots by deadline, so what is
+    // asserted is that each ran, that the one-shots kept their order, and that
+    // the interval stopped when it was told to.
+    assert!(output.contains(&"Log: first".to_owned()));
+    let order: Vec<&String> = output
+        .iter()
+        .filter(|line| line.ends_with("first") || line.ends_with("second") || line.ends_with("third"))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["Log: first", "Log: second", "Log: third"],
+        "one-shots run by deadline: {output:?}"
+    );
+    assert_eq!(
+        output.iter().filter(|line| line.starts_with("Log: tick")).count(),
+        3,
+        "the interval stopped when it cleared itself: {output:?}"
+    );
+    assert!(
+        !output.iter().any(|line| line.ends_with("never")),
+        "a cleared timer does not run: {output:?}"
+    );
+}
+
+/// A timer that schedules another gets it: the wheel is turned until the page
+/// stops asking, not once.
+#[test]
+fn a_timer_may_schedule_another() {
+    let (output, ..) = parse_running_scripts(
+        "<script>\
+           let left = 3;\
+           const again = () => {\
+             console.log('step', left);\
+             if (--left > 0) setTimeout(again, 1);\
+           };\
+           setTimeout(again, 1);\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec![
+            "Log: step 3".to_owned(),
+            "Log: step 2".to_owned(),
+            "Log: step 1".to_owned(),
+        ],
+    );
+}
+
+/// A timer callback reaches the document, and what it changes is seen as a
+/// change — the page is restyled and laid out again because of it.
+#[test]
+fn a_timer_may_change_the_document() {
+    let (_output, _seen, _run, tree) = parse_and_dump(
+        "<body><p id=x>before</p>\
+         <script>setTimeout(() => { document.getElementById('x').textContent = 'after'; }, 1);</script>",
+    );
+    assert!(tree.contains("\"after\""), "the timer rewrote the node:\n{tree}");
 }
 
 /// A node has one wrapper, and the page is handed that one every time.
@@ -195,6 +286,149 @@ fn one_node_has_one_wrapper() {
             "Log: set 1".to_owned(),
             "Log: kept 7".to_owned(),
         ],
+    );
+}
+
+/// An event goes down to its target and back up, and a listener on a container
+/// hears about what happened inside it. Every list, menu and grid on the web is
+/// written this way.
+#[test]
+fn an_event_captures_down_to_its_target_and_bubbles_back_up() {
+    let (output, ..) = parse_running_scripts(
+        "<body><div id=outer><div id=inner><button id=go></button></div></div>\
+         <script>\
+           const outer = document.getElementById('outer');\
+           const inner = document.getElementById('inner');\
+           const go = document.getElementById('go');\
+           const seen = [];\
+           const note = (name) => (event) => seen.push(name + ':' + event.eventPhase);\
+           window.addEventListener('click', note('window-capture'), true);\
+           outer.addEventListener('click', note('outer-capture'), true);\
+           inner.addEventListener('click', note('inner-capture'), { capture: true });\
+           go.addEventListener('click', note('target-capture'), true);\
+           go.addEventListener('click', note('target'));\
+           inner.addEventListener('click', note('inner-bubble'));\
+           outer.addEventListener('click', note('outer-bubble'));\
+           window.addEventListener('click', note('window-bubble'));\
+           go.dispatchEvent(new Event('click', { bubbles: true }));\
+           console.log(seen.join(' '));\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec![
+            [
+                "Log: window-capture:1 outer-capture:1 inner-capture:1",
+                "target-capture:2 target:2",
+                "inner-bubble:3 outer-bubble:3 window-bubble:3",
+            ]
+            .join(" ")
+        ],
+    );
+}
+
+/// An event that does not bubble is heard where it landed and nowhere else,
+/// and one that is stopped goes no further.
+#[test]
+fn a_non_bubbling_event_stops_at_its_target_and_stopping_ends_the_walk() {
+    let (output, ..) = parse_running_scripts(
+        "<body><div id=box><span id=leaf></span></div>\
+         <script>\
+           const box = document.getElementById('box');\
+           const leaf = document.getElementById('leaf');\
+           let heard = [];\
+           box.addEventListener('focus', () => heard.push('box'));\
+           leaf.addEventListener('focus', () => heard.push('leaf'));\
+           leaf.dispatchEvent(new Event('focus'));\
+           console.log('quiet', heard.join(','));\
+\
+           heard = [];\
+           box.addEventListener('ping', () => heard.push('box'));\
+           leaf.addEventListener('ping', (event) => { heard.push('leaf'); event.stopPropagation(); });\
+           leaf.dispatchEvent(new Event('ping', { bubbles: true }));\
+           console.log('stopped', heard.join(','));\
+\
+           heard = [];\
+           leaf.addEventListener('pong', (event) => { heard.push('one'); event.stopImmediatePropagation(); });\
+           leaf.addEventListener('pong', () => heard.push('two'));\
+           box.addEventListener('pong', () => heard.push('box'));\
+           leaf.dispatchEvent(new Event('pong', { bubbles: true }));\
+           console.log('immediate', heard.join(','));\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec![
+            "Log: quiet leaf".to_owned(),
+            "Log: stopped leaf".to_owned(),
+            "Log: immediate one".to_owned(),
+        ],
+    );
+}
+
+/// What a listener is handed while it runs, and what the event says afterwards.
+#[test]
+fn an_event_reports_its_target_its_path_and_whether_it_was_cancelled() {
+    let (output, ..) = parse_running_scripts(
+        "<body><div id=box><span id=leaf></span></div>\
+         <script>\
+           const box = document.getElementById('box');\
+           const leaf = document.getElementById('leaf');\
+           box.addEventListener('tap', (event) => {\
+             console.log('target', event.target === leaf);\
+             console.log('current', event.currentTarget === box);\
+             console.log('path', event.composedPath()[0] === leaf,\
+                          event.composedPath().includes(window));\
+             event.preventDefault();\
+           });\
+           const went = leaf.dispatchEvent(new Event('tap', { bubbles: true, cancelable: true }));\
+           console.log('cancelled', went === false);\
+           const plain = new Event('tap', { bubbles: true });\
+           console.log('uncancelable', leaf.dispatchEvent(plain) === true);\
+           console.log('after', plain.currentTarget === null, plain.eventPhase === 0);\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec![
+            "Log: target true".to_owned(),
+            "Log: current true".to_owned(),
+            "Log: path true true".to_owned(),
+            "Log: cancelled true".to_owned(),
+            "Log: target true".to_owned(),
+            "Log: current true".to_owned(),
+            "Log: path true true".to_owned(),
+            "Log: uncancelable true".to_owned(),
+            "Log: after true true".to_owned(),
+        ],
+    );
+}
+
+/// A `once` listener runs once whichever phase it is in, and removing one that
+/// has not run yet stops it running.
+#[test]
+fn once_removes_a_listener_and_a_removal_mid_dispatch_is_honoured() {
+    let (output, ..) = parse_running_scripts(
+        "<body><div id=box><span id=leaf></span></div>\
+         <script>\
+           const box = document.getElementById('box');\
+           const leaf = document.getElementById('leaf');\
+           let count = 0;\
+           box.addEventListener('tick', () => count++, { once: true });\
+           leaf.dispatchEvent(new Event('tick', { bubbles: true }));\
+           leaf.dispatchEvent(new Event('tick', { bubbles: true }));\
+           console.log('once', count);\
+\
+           const later = () => console.log('should not run');\
+           box.addEventListener('tock', () => box.removeEventListener('tock', later));\
+           box.addEventListener('tock', later);\
+           box.dispatchEvent(new Event('tock'));\
+           console.log('removed');\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec!["Log: once 1".to_owned(), "Log: removed".to_owned()],
     );
 }
 
