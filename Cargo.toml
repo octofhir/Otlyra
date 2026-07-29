@@ -315,3 +315,21 @@ undocumented_unsafe_blocks = "warn"
 lto = "thin"
 codegen-units = 16
 strip = "debuginfo"
+
+# The engine, built from the checkout beside this one.
+#
+# `otlyra-script` depends on Otter by revision so that a clone of this
+# repository alone builds. This points that dependency at `../otter` instead,
+# which is what makes the two trees one build: a change to the engine is
+# compiled by the browser in the same `cargo build` that finds out whether it
+# fits, rather than at the next `rev` bump.
+#
+# **Remove or comment this out to build against the pinned revision** — with no
+# `../otter` beside this directory, cargo refuses the patch and the build stops
+# before it starts. That is the trade for having the local checkout win by
+# default, and it is the right way round for whoever is changing both.
+[patch."https://github.com/octofhir/otter"]
+otter-runtime = { path = "../otter/crates/otter-runtime" }
+otter-macros = { path = "../otter/crates/otter-macros" }
+otter-gc = { path = "../otter/crates/otter-gc" }
+otter-web = { path = "../otter/crates/otter-web" }
