@@ -415,6 +415,25 @@ impl PageScene {
         &self.document
     }
 
+    /// Let script change the document in place, and note what it did.
+    ///
+    /// The alternative is taking the document out and building the whole page
+    /// again, which is what a load does and what a timer must not: a page with a
+    /// `setInterval` would rebuild itself several times a second, and every
+    /// scroll position and selection in it would go with each rebuild.
+    ///
+    /// `changed` is the binding layer's answer to *did script touch the tree*.
+    /// Only then is the style and layout it produced out of date.
+    pub fn with_document<R>(&mut self, run: impl FnOnce(&mut Document) -> R) -> R {
+        run(&mut self.document)
+    }
+
+    /// Everything style and layout produced for this document is out of date,
+    /// because script rewrote the tree under it.
+    pub fn document_changed(&mut self) {
+        self.invalidate_styles();
+    }
+
     /// Take the document back out, to build the page again with more of what it
     /// asked for — a stylesheet that has since arrived, a picture that has decoded.
     /// Parsing it twice would be the alternative, and the bytes are gone by then.

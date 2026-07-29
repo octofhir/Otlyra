@@ -39,6 +39,7 @@ extern crate otter_runtime as otter_vm;
 pub mod capabilities;
 pub mod console;
 pub mod dom;
+pub mod timers;
 pub mod host;
 pub mod page;
 

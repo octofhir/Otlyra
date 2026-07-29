@@ -472,6 +472,17 @@ impl DocumentRef {
         super::request_navigation(Navigation::Reload);
     }
 
+    /// Note that the page asked for an animation frame.
+    ///
+    /// Not part of the platform: `requestAnimationFrame` keeps its callbacks in
+    /// JavaScript, where the collector can see them, and tells this so the
+    /// browser can ask whether a frame is owed without entering the isolate to
+    /// find out.
+    #[static_method(name = "__frameRequested")]
+    fn js_frame_requested() {
+        super::note_frame_request();
+    }
+
     #[getter(name = "documentElement")]
     fn js_document_element(&self) -> Result<Option<Wrapped<ElementRef>>, JsError> {
         with_document(self.doc(), |document| {

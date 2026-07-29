@@ -23,7 +23,11 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use otter_runtime::{ConsoleSinkHandle, InterruptHandle, OtterError, Runtime, SourceInput};
+use otter_runtime::{
+    ConsoleSinkHandle, InterruptHandle, OtterError, Runtime, SourceInput, TimerFireOutcome,
+};
+
+use crate::timers::TimerWheel;
 
 use crate::capabilities::{DenyPageCapabilities, page_capabilities};
 use crate::console::tracing_console;
@@ -112,6 +116,10 @@ pub struct ScriptOutcome {
 pub struct ScriptHost {
     runtime: Runtime,
     watchdog: Watchdog,
+    /// The deadlines this page's `setTimeout` and `setInterval` are waiting on.
+    /// Held here because the engine only knows the callbacks; when they are due
+    /// is the browser's question.
+    wheel: TimerWheel,
 }
 
 impl ScriptHost {
@@ -145,11 +153,56 @@ impl ScriptHost {
         // The web platform Otter already has, then the part of it that knows
         // what a document is, which is ours. Order matters only in that both
         // are registered before the first script runs.
-        let runtime = otter_web::with_web_apis(builder)
+        let mut runtime = otter_web::with_web_apis(builder)
             .extension(&crate::dom::DOM_EXTENSION)
             .build()?;
+        // Without a scheduler the engine refuses `setTimeout` outright, which
+        // is the right refusal — a callback it accepted and never ran would be
+        // worse. The wheel is ours and the browser turns it, so every callback
+        // lands on the thread the isolate is pinned to.
+        let wheel = TimerWheel::new();
+        runtime.install_timer_scheduler(std::sync::Arc::new(wheel.clone()));
         let watchdog = Watchdog::spawn(runtime.interrupt_handle(), SCRIPT_TIME_LIMIT);
-        Ok(Self { runtime, watchdog })
+        Ok(Self {
+            runtime,
+            watchdog,
+            wheel,
+        })
+    }
+
+    /// The deadlines this page is waiting on.
+    ///
+    /// The browser reads it to decide how long it may wait for the next event,
+    /// and hands back the tokens that came due.
+    #[must_use]
+    pub fn timers(&self) -> &TimerWheel {
+        &self.wheel
+    }
+
+    /// Run the callback a token names, then take the microtask checkpoint.
+    ///
+    /// A token that names nothing — cancelled between coming due and being run,
+    /// which a callback earlier in the same batch can do — is not an error and
+    /// not a task.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the callback threw past every handler, or the watchdog stopping
+    /// it. Neither is fatal to the page: the next timer still runs.
+    pub fn fire_timer(&mut self, token: u64) -> Result<bool, ScriptError> {
+        let guard = self.watchdog.begin();
+        let fired = self.runtime.fire_timer(token);
+        let drained = self.runtime.run_microtasks();
+        let interrupted = guard.finish();
+
+        let outcome = fired.and_then(|outcome| {
+            drained.map(|()| matches!(outcome, TimerFireOutcome::Fired { .. }))
+        });
+        outcome.map_err(|source| ScriptError {
+            specifier: "<timer>".to_owned(),
+            interrupted,
+            source,
+        })
     }
 
     /// Run one classic script, then take the microtask checkpoint.

@@ -6,6 +6,8 @@
 //! a failing script does not fail a document — a browser that stopped parsing
 //! at the first exception would render almost nothing on the modern web.
 
+use std::time::{Duration, Instant};
+
 use otlyra_dom::{Document, NodeId};
 use otlyra_html::ScriptRunner;
 use otter_runtime::ConsoleSinkHandle;
@@ -126,6 +128,110 @@ impl PageScripts {
         }
     }
 
+    /// When the browser must wake to run this page's next timer, if ever.
+    ///
+    /// Read between events: it is what turns "wait for the next window event"
+    /// into "wait for the next window event, or until this page's `setTimeout`
+    /// comes due, whichever is sooner".
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.host.as_ref()?.timers().next_deadline()
+    }
+
+    /// Run every timer this page has that is due, in order.
+    ///
+    /// Returns how many callbacks ran. A callback that throws is reported and
+    /// the next one still runs, which is what the event loop does: one task's
+    /// exception is not the next task's business.
+    pub fn run_due_timers(&mut self, document: &mut Document) -> usize {
+        let Some(host) = self.host.as_mut() else {
+            return 0;
+        };
+        let due = host.timers().due(Instant::now());
+        if due.is_empty() {
+            return 0;
+        }
+        let mut ran = 0;
+        crate::dom::loan(document, || {
+            for token in due {
+                match host.fire_timer(token) {
+                    // A token that named nothing was cancelled between coming
+                    // due and being run, which the callback before it may have
+                    // done. Not a task and not an error.
+                    Ok(fired) => ran += usize::from(fired),
+                    Err(error) => {
+                        self.failed += 1;
+                        tracing::error!(target: "page.script", %error, "a timer callback failed");
+                    }
+                }
+            }
+        });
+        self.mutated |= crate::dom::take_dirty();
+        ran
+    }
+
+    /// Run the animation-frame callbacks the page has asked for.
+    ///
+    /// `timestamp` is what `requestAnimationFrame` hands its callback: the time
+    /// the frame is being drawn for, in milliseconds since the page began.
+    /// Callbacks registered *by* these run in the next frame, not this one — a
+    /// frame that ran them would be a loop with no display in it.
+    pub fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
+        let Some(host) = self.host.as_mut() else {
+            return 0;
+        };
+        let outcome = crate::dom::loan(document, || {
+            host.run_classic_script(&format!("__otlyraRunFrame({timestamp})"), "<frame>")
+        });
+        self.mutated |= crate::dom::take_dirty();
+        match outcome {
+            Ok(outcome) => outcome.completion.parse().unwrap_or(0),
+            Err(error) => {
+                self.failed += 1;
+                tracing::error!(target: "page.script", %error, "a frame callback failed");
+                0
+            }
+        }
+    }
+
+    /// Whether the page has asked for an animation frame it has not been given.
+    ///
+    /// Read once a frame, and answered without entering the isolate: a frame is
+    /// drawn sixty times a second and almost none of them are owed a callback.
+    #[must_use]
+    pub fn frames_pending(&self) -> bool {
+        self.host.is_some() && crate::dom::frames_pending()
+    }
+
+    /// Run this page's deferred work to a standstill, or until `budget` is
+    /// spent.
+    ///
+    /// For a caller with no event loop to be woken from — a screenshot, a test,
+    /// a dump. It sleeps until the next deadline, which is exactly what a
+    /// browser must never do and exactly what those callers mean by "let the
+    /// page settle".
+    ///
+    /// Returns how many callbacks ran. A page that keeps scheduling more work
+    /// stops at the budget rather than holding the process: `setInterval` is a
+    /// loop, and a screenshot is not owed all of it.
+    pub fn settle(&mut self, document: &mut Document, budget: Duration) -> usize {
+        let deadline = Instant::now() + budget;
+        let mut ran = 0;
+        loop {
+            ran += self.run_due_timers(document);
+            let Some(next) = self.next_deadline() else {
+                break;
+            };
+            if next >= deadline {
+                break;
+            }
+            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        ran
+    }
+
     /// Run an external script whose bytes have arrived.
     ///
     /// It runs in the same isolate and sees everything the inline scripts left
@@ -216,6 +322,26 @@ impl ScriptRunner for PageScripts {
         // page's `DOMContentLoaded` listeners are mostly registered by them, and
         // an event fired before its listener exists is an event nobody heard.
         PageScripts::document_finished(self, document, !more_scripts_coming);
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        PageScripts::next_deadline(self)
+    }
+
+    fn run_due_timers(&mut self, document: &mut Document) -> usize {
+        PageScripts::run_due_timers(self, document)
+    }
+
+    fn frames_pending(&self) -> bool {
+        PageScripts::frames_pending(self)
+    }
+
+    fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
+        PageScripts::run_frame(self, document, timestamp)
+    }
+
+    fn settle(&mut self, document: &mut Document, budget: Duration) -> usize {
+        PageScripts::settle(self, document, budget)
     }
 
     fn run_external(&mut self, source: &str, element: NodeId, document: &mut Document) {

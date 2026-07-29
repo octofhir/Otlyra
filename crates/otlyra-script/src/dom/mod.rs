@@ -118,6 +118,33 @@ pub fn take_navigation() -> Option<Navigation> {
     NAVIGATION.with(|slot| slot.borrow_mut().take())
 }
 
+thread_local! {
+    /// How many animation frames this page has asked for and not been given.
+    ///
+    /// Kept on this side so a browser can ask *whether a frame is owed* without
+    /// entering the isolate. A frame is drawn sixty times a second and almost
+    /// none of them are owed a callback; a turn per frame to find that out is a
+    /// turn per frame for nothing.
+    static FRAMES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The page asked for an animation frame.
+pub(crate) fn note_frame_request() {
+    FRAMES.with(|frames| frames.set(frames.get().saturating_add(1)));
+}
+
+/// Whether any are outstanding.
+#[must_use]
+pub fn frames_pending() -> bool {
+    FRAMES.with(Cell::get) > 0
+}
+
+/// Forget them: the frame that would have run them is being run now, or the
+/// page they belong to is going.
+pub fn clear_frame_requests() {
+    FRAMES.with(|frames| frames.set(0));
+}
+
 /// Say whether the document has finished parsing.
 ///
 /// One bit, because that is all `readyState` is worth until there is a real
