@@ -19,6 +19,36 @@ use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts, create_element};
 use html5ever::{Attribute, QualName, TokenizerResult, buffer_queue::BufferQueue};
 use otlyra_dom::{Document, DomSink, NodeData, NodeId};
 
+/// Somewhere a page's script asked to go.
+///
+/// Script cannot navigate: it can only say so, and the browser decides. That is
+/// not politeness — the isolate holds the document for the length of one turn
+/// and the navigation replaces the document, so a binding that navigated where
+/// it stands would be destroying the thing it is standing on.
+///
+/// It lives beside [`ScriptRunner`] rather than in the engine crate because it
+/// is what the script point reports back, and the browser reads it from a
+/// `dyn ScriptRunner` without knowing which engine is under it.
+#[derive(Debug, Clone)]
+pub enum Navigation {
+    /// `location.href = …`, `location.assign`, `location.replace`.
+    Url {
+        /// Where to, as the page spelled it. Resolving it against the
+        /// document's own address is the browser's.
+        href: String,
+        /// Whether this replaces the current history entry.
+        replace: bool,
+    },
+    /// `form.submit()`.
+    Submit {
+        /// The `<form>` element. Its fields and its `action` are read from the
+        /// document, which is where they are.
+        form: NodeId,
+    },
+    /// `location.reload()`.
+    Reload,
+}
+
 /// Something that can execute a script the parser stopped at.
 ///
 /// The parser knows *when* a script runs — that is the whole of its job at a
@@ -73,6 +103,24 @@ pub trait ScriptRunner {
     /// Whether the page has asked for an animation frame and not had one.
     fn frames_pending(&self) -> bool {
         false
+    }
+
+    /// Whether script changed the document since this was last asked.
+    ///
+    /// Asked after every turn the browser gives the page, and answered by
+    /// taking: what the caller wants to know is whether *this* turn made the
+    /// style, layout and paint built from the document stale, not whether any
+    /// turn ever did.
+    fn take_mutated(&mut self) -> bool {
+        false
+    }
+
+    /// Where *this page's* script asked to go, if it asked.
+    ///
+    /// Asked of the page rather than of the thread: with two tabs open, a
+    /// navigation one of them requested must not be answered by the other.
+    fn take_navigation(&mut self) -> Option<Navigation> {
+        None
     }
 
     /// Run the animation-frame callbacks the page asked for.
@@ -227,7 +275,10 @@ impl HtmlParser {
             }
         }
 
-        let restore = Restore { parser: self, document };
+        let restore = Restore {
+            parser: self,
+            document,
+        };
         run(restore.parser)
     }
 

@@ -26,7 +26,7 @@ pub mod driver;
 pub mod encoding;
 pub mod prescan;
 
-pub use driver::{ExternalSources, HtmlParser, ScriptRunner};
+pub use driver::{ExternalSources, HtmlParser, Navigation, ScriptRunner};
 pub use encoding::{DEFAULT_ENCODING, EncodingDecision, EncodingSource, determine};
 pub use prescan::{prescan, prescan_scripts};
 
@@ -455,9 +455,14 @@ mod tests {
             "<body><p>before</p><script src=app.js></script><p>after</p>".into(),
         );
 
-        let blocked = parser.blocked_on().expect("the parse stopped at the script");
+        let blocked = parser
+            .blocked_on()
+            .expect("the parse stopped at the script");
         let tree = dump::serialize(&document);
-        assert!(tree.contains("\"before\""), "what came first is in the tree:\n{tree}");
+        assert!(
+            tree.contains("\"before\""),
+            "what came first is in the tree:\n{tree}"
+        );
         assert!(
             !tree.contains("\"after\""),
             "nothing past the script was tokenized:\n{tree}"

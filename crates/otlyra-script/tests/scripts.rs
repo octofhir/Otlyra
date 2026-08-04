@@ -202,7 +202,9 @@ fn timers_run_in_the_order_their_deadlines_fall_due() {
     assert!(output.contains(&"Log: first".to_owned()));
     let order: Vec<&String> = output
         .iter()
-        .filter(|line| line.ends_with("first") || line.ends_with("second") || line.ends_with("third"))
+        .filter(|line| {
+            line.ends_with("first") || line.ends_with("second") || line.ends_with("third")
+        })
         .collect();
     assert_eq!(
         order,
@@ -210,7 +212,10 @@ fn timers_run_in_the_order_their_deadlines_fall_due() {
         "one-shots run by deadline: {output:?}"
     );
     assert_eq!(
-        output.iter().filter(|line| line.starts_with("Log: tick")).count(),
+        output
+            .iter()
+            .filter(|line| line.starts_with("Log: tick"))
+            .count(),
         3,
         "the interval stopped when it cleared itself: {output:?}"
     );
@@ -252,7 +257,10 @@ fn a_timer_may_change_the_document() {
         "<body><p id=x>before</p>\
          <script>setTimeout(() => { document.getElementById('x').textContent = 'after'; }, 1);</script>",
     );
-    assert!(tree.contains("\"after\""), "the timer rewrote the node:\n{tree}");
+    assert!(
+        tree.contains("\"after\""),
+        "the timer rewrote the node:\n{tree}"
+    );
 }
 
 /// A node has one wrapper, and the page is handed that one every time.

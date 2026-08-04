@@ -194,6 +194,14 @@ pub struct Tab {
     history: Vec<HistoryEntry>,
     /// Which entry is showing. Meaningless while the history is empty.
     position: usize,
+    /// The page's build count when its subresources were last swept for.
+    ///
+    /// Asking a page what pictures and fonts it wants walks its whole box tree
+    /// and its whole document, and the answer cannot change while the display
+    /// list it was built from is being reused. Without this the walk happened
+    /// for every open tab on every frame — sixty full document walks a second,
+    /// per tab, to be told nothing new each time.
+    swept_at_build: Option<u64>,
 }
 
 /// What names a tab for as long as it is open.
@@ -250,6 +258,7 @@ impl Tab {
             navigation: None,
             history: Vec::new(),
             position: 0,
+            swept_at_build: None,
         }
     }
 
@@ -1503,9 +1512,18 @@ impl Browser {
     /// A function of how long the load has been going rather than of a counter
     /// somewhere: a frame that arrives late then draws where the spinner should be
     /// now, not where the last frame left it.
+    /// Any tab, not the active one. The strip draws a mark per tab and turns the
+    /// ones that are loading, so a background tab's spinner needs a phase — and
+    /// with the phase taken from the active tab alone, a tab loading behind a
+    /// finished one drew a still dot.
+    ///
+    /// One clock for all of them rather than one each: several tabs loading at
+    /// once turn together, which reads as one browser working rather than as
+    /// several unrelated things.
     fn spinner_phase(&self) -> Option<f32> {
-        self.tabs[self.active]
-            .loading()
+        self.tabs
+            .iter()
+            .any(Tab::loading)
             .then(|| self.load_started.elapsed().as_secs_f32() * 4.0)
     }
 
@@ -1559,17 +1577,22 @@ impl Browser {
             let (Some(scripts), Some(page)) = (tab.scripts.as_mut(), tab.page.as_mut()) else {
                 continue;
             };
-            if scripts.next_deadline().is_none_or(|deadline| deadline > now) {
+            if scripts
+                .next_deadline()
+                .is_none_or(|deadline| deadline > now)
+            {
                 continue;
             }
             let ran = page.with_document(|document| scripts.run_due_timers(document));
-            if ran > 0 {
-                // The tree may be different now, so everything style and layout
-                // made of it is stale. Asked of the page rather than guessed at:
-                // a timer that only read the document changes nothing.
+            // The tree may be different now, so everything style and layout
+            // made of it is stale. Asked of the page rather than guessed at:
+            // a timer that only read the document changes nothing, and a page
+            // that polls on an interval is otherwise a page that re-cascades
+            // itself several times a second for nothing.
+            if scripts.take_mutated() {
                 page.document_changed();
-                changed = true;
             }
+            changed |= ran > 0;
         }
         changed
     }
@@ -1595,10 +1618,15 @@ impl Browser {
                 continue;
             }
             let ran = page.with_document(|document| scripts.run_frame(document, timestamp));
-            if ran > 0 {
+            // Whether the callback *changed* anything, not whether it ran. An
+            // animation frame that only reads — measuring, polling, deciding it
+            // has nothing to do this frame — is most of what a
+            // `requestAnimationFrame` loop does, and restyling the document for
+            // one is how a page that draws nothing costs a whole frame.
+            if scripts.take_mutated() {
                 page.document_changed();
-                changed = true;
             }
+            changed |= ran > 0;
         }
         changed
     }
@@ -1730,11 +1758,11 @@ impl Browser {
     /// A background is named by a rule, so what a page wants is known only once it
     /// has been styled — which happens on the way to a frame. This is called after
     /// one, and the pictures arrive for the frame after that.
-    fn fetch_backgrounds(&mut self) {
+    fn fetch_backgrounds(&mut self, tabs: &[usize]) {
         if !self.settings.settings.load_images {
             return;
         }
-        for index in 0..self.tabs.len() {
+        for &index in tabs {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
             };
@@ -1839,11 +1867,20 @@ impl Browser {
     /// The address is resolved against the sheet the rule was written in, not
     /// against the page: a sheet in a directory of its own names its fonts beside
     /// itself.
-    fn fetch_fonts(&mut self) {
-        for index in 0..self.tabs.len() {
+    fn fetch_fonts(&mut self, tabs: &[usize]) {
+        for &index in tabs {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
             };
+            // The faces first: they come from the styler's own rules, and most
+            // pages have none. Resolving the sheets is a walk of the whole
+            // document, and there is no reason to walk it to place addresses
+            // nothing asked for.
+            let faces: Vec<otlyra_css::cascade::FontFace> =
+                page.wanted_fonts().into_iter().take(FONT_LIMIT).collect();
+            if faces.is_empty() {
+                continue;
+            }
             let base = self.tabs[index].url.clone();
             let sheets: HashMap<otlyra_dom::NodeId, String> =
                 otlyra_css::cascade::stylesheet_links(page.document())
@@ -1851,7 +1888,7 @@ impl Browser {
                     .filter_map(|link| Some((link.node, Self::subresource_url(&base, &link.href)?)))
                     .collect();
 
-            for face in page.wanted_fonts().into_iter().take(FONT_LIMIT) {
+            for face in faces {
                 // The first address that resolves, which is as far as the order in
                 // the rule is honoured: what the rest of the list is for is formats
                 // this cannot read, and there is no telling which those are until
@@ -2294,7 +2331,10 @@ impl Browser {
         for (node, src) in stopped_at.into_iter().chain(scripts) {
             let mut adopted = false;
             for resource in preloaded.values_mut() {
-                if resource.iter().any(|held| matches!(held, PendingResource::ScriptSource(held) if *held == src)) {
+                if resource
+                    .iter()
+                    .any(|held| matches!(held, PendingResource::ScriptSource(held) if *held == src))
+                {
                     resource.push(PendingResource::Script(node));
                     adopted = true;
                     break;
@@ -2452,8 +2492,7 @@ impl Browser {
             self.resume_parse(index);
         }
 
-        if self
-            .tabs[index]
+        if self.tabs[index]
             .pending
             .as_ref()
             .is_some_and(|pending| pending.outstanding.is_empty())
@@ -2666,7 +2705,14 @@ impl Browser {
     /// isolate, because the isolate is holding the document a navigation
     /// destroys.
     fn follow_script_navigation(&mut self, index: usize) {
-        let Some(request) = otlyra_script::dom::take_navigation() else {
+        // This tab's, not the thread's. A navigation asked for by one tab was
+        // once answerable by whichever tab was being pumped when it was noticed.
+        let Some(request) = self
+            .tabs
+            .get_mut(index)
+            .and_then(|tab| tab.scripts.as_mut())
+            .and_then(|scripts| scripts.take_navigation())
+        else {
             return;
         };
         if index != self.active {
@@ -4124,10 +4170,29 @@ impl Browser {
     /// The picture and font work that follows a frame, once the rules that name
     /// them have been computed on the way to one.
     fn after_frame(&mut self) {
-        self.fetch_backgrounds();
-        self.fetch_fonts();
+        // Which tabs have anything new to be asked about. A page whose display
+        // list was reused cannot want a picture or a font it did not want
+        // before: the rules that name them are computed on the way to a list,
+        // and no list was built. Asking anyway walks the whole box tree and the
+        // whole document, per tab, per frame.
+        let sweep: Vec<usize> = (0..self.tabs.len())
+            .filter(|&index| {
+                let Some(page) = self.tabs[index].page.as_ref() else {
+                    return false;
+                };
+                self.tabs[index].swept_at_build != Some(page.builds())
+            })
+            .collect();
+        if !sweep.is_empty() {
+            self.fetch_backgrounds(&sweep);
+            self.fetch_fonts(&sweep);
+            for index in sweep {
+                let built = self.tabs[index].page.as_ref().map(PageScene::builds);
+                self.tabs[index].swept_at_build = built;
+            }
+        }
         // Last, because it is a question about the window this frame was drawn
-        // for: the answer is for the next one.
+        // for: the answer is for the next one. It has a guard of its own.
         self.rechoose_pictures();
     }
 
@@ -4294,18 +4359,24 @@ impl Painter for Browser {
         self.pump();
     }
 
-    /// Continue only visible animation. Background tabs wake the loop when their
-    /// model changes; they do not drive the active window at display pace.
+    /// Continue only visible animation — but a loading background tab *is*
+    /// visible: its mark in the strip turns. Everything else about a background
+    /// tab wakes the loop when its model changes rather than driving the window
+    /// at display pace.
     fn next_frame(&self) -> FrameRequest {
         let Some(tab) = self.tabs.get(self.active) else {
             return FrameRequest::None;
         };
-        if tab.loading() {
+        if self.tabs.iter().any(Tab::loading) {
             return FrameRequest::Vsync;
         }
         // A page mid-animation asks for the next frame at display pace, which
         // is what `requestAnimationFrame` is.
-        if tab.scripts.as_ref().is_some_and(|scripts| scripts.frames_pending()) {
+        if tab
+            .scripts
+            .as_ref()
+            .is_some_and(|scripts| scripts.frames_pending())
+        {
             return FrameRequest::Vsync;
         }
         // The caret's next half-second and the pause before a control is named:
@@ -6027,6 +6098,73 @@ mod system_page_tests {
         assert!(browser.tabs()[0].error.is_none());
     }
 
+    /// An animation frame that only reads costs a frame, not a restyle.
+    ///
+    /// A `requestAnimationFrame` loop that measures something and decides it has
+    /// nothing to do this frame is most of what such loops are; treating "a
+    /// callback ran" as "the document changed" re-cascaded the whole document
+    /// and rebuilt its box tree sixty times a second for it.
+    #[test]
+    fn an_animation_frame_that_changes_nothing_rebuilds_nothing() {
+        struct Page;
+
+        impl Loader for Page {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: br#"<title>Reading</title><p id=p>hello</p><script>
+                        let seen = 0;
+                        function tick() {
+                          // Reads, and only reads.
+                          seen += document.getElementById('p').textContent.length;
+                          requestAnimationFrame(tick);
+                        }
+                        requestAnimationFrame(tick);
+                    </script>"#
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let viewport = Viewport::new(800, 600, 1.0);
+        let mut browser = Browser::new(Page);
+        browser.navigate("https://example.test/raf");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+        browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
+
+        let builds = browser.tabs[browser.active]
+            .page
+            .as_ref()
+            .expect("the page is loaded")
+            .builds();
+        assert!(
+            browser.next_frame() == FrameRequest::Vsync,
+            "a page with a frame callback outstanding asks for the next frame"
+        );
+
+        for _ in 0..10 {
+            browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
+        }
+
+        let page = browser.tabs[browser.active]
+            .page
+            .as_ref()
+            .expect("the page is still loaded");
+        assert_eq!(
+            page.builds(),
+            builds,
+            "ten frames of a read-only animation loop rebuilt the page's display list"
+        );
+        assert_eq!(
+            browser.next_frame(),
+            FrameRequest::Vsync,
+            "and the loop is still running, so the frames must keep coming"
+        );
+    }
+
     /// ⌘D keeps the page, and ⌘D again stops keeping it. One command both ways,
     /// because that is what one key can mean.
     #[test]
@@ -6547,8 +6685,16 @@ mod tests {
         );
     }
 
+    /// A loading tab turns its mark in the strip whether or not it is the tab
+    /// being read, so a loading tab anywhere keeps the frames coming.
+    ///
+    /// This used to be the active tab only, and the strip drew a background
+    /// tab's spinner once and then left it standing still — which reads as a
+    /// tab that has stopped rather than one that is working. A frame while a
+    /// load is in flight costs a chrome rebuild and no page work, which is
+    /// already what the active tab's own spinner costs.
     #[test]
-    fn only_the_active_loading_tab_drives_vsync() {
+    fn any_loading_tab_drives_vsync() {
         let mut browser = browser();
         browser.navigate("example.com");
         assert_eq!(browser.next_frame(), FrameRequest::Vsync);
@@ -6556,9 +6702,23 @@ mod tests {
         browser.new_tab();
         assert_eq!(
             browser.next_frame(),
-            FrameRequest::None,
-            "a background load wakes on model changes instead of repainting continuously"
+            FrameRequest::Vsync,
+            "the first tab is still loading, and its mark in the strip is still turning"
         );
+        assert!(
+            browser.spinner_phase().is_some(),
+            "so the strip is given a phase to turn it by"
+        );
+    }
+
+    /// And with nothing loading anywhere, nothing asks for frames.
+    #[test]
+    fn no_loading_tab_drives_no_frames() {
+        let mut browser = browser();
+        browser.navigate("example.com");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
+        assert_eq!(browser.next_frame(), FrameRequest::None);
+        assert!(browser.spinner_phase().is_none());
     }
 
     #[test]

@@ -77,7 +77,10 @@ impl TimerWheel {
     /// When the browser must wake to run the next one, if there is one.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        let state = self.state.lock().expect("the timer wheel is never poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("the timer wheel is never poisoned");
         state.pending.keys().next().map(|(at, _)| *at)
     }
 
@@ -114,7 +117,10 @@ impl TimerWheel {
     /// calls, and every engine coalesces this way.
     #[must_use]
     pub fn due(&self, now: Instant) -> Vec<u64> {
-        let mut state = self.state.lock().expect("the timer wheel is never poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("the timer wheel is never poisoned");
         let mut due = Vec::new();
         while let Some((&key, &timer)) = state.pending.iter().next() {
             if key.0 > now {
@@ -144,7 +150,10 @@ impl TimerWheel {
 
 impl TimerScheduler for TimerWheel {
     fn schedule(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64 {
-        let mut state = self.state.lock().expect("the timer wheel is never poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("the timer wheel is never poisoned");
         state.next_token += 1;
         let token = state.next_token;
         let sequence = state.next_sequence;
@@ -155,14 +164,20 @@ impl TimerScheduler for TimerWheel {
             token,
             // A repeat of zero would be a loop with no gap in it. One
             // millisecond is what every engine clamps it to.
-            repeat: repeat_ms.map(|ms| Duration::from_millis(ms).clamp(Duration::from_millis(1), LONGEST)),
+            repeat: repeat_ms
+                .map(|ms| Duration::from_millis(ms).clamp(Duration::from_millis(1), LONGEST)),
         };
-        state.pending.insert((Instant::now() + delay, sequence), timer);
+        state
+            .pending
+            .insert((Instant::now() + delay, sequence), timer);
         token
     }
 
     fn cancel(&self, token: u64) -> bool {
-        let mut state = self.state.lock().expect("the timer wheel is never poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("the timer wheel is never poisoned");
         let found = state
             .pending
             .iter()
@@ -222,7 +237,10 @@ mod tests {
         let now = Instant::now();
         assert!(wheel.due(now).is_empty());
         assert_eq!(wheel.due(now + Duration::from_millis(60)), vec![token]);
-        assert!(wheel.is_empty(), "a one-shot leaves the wheel when it fires");
+        assert!(
+            wheel.is_empty(),
+            "a one-shot leaves the wheel when it fires"
+        );
     }
 
     /// Two timers due at once run in the order they were asked for, which is

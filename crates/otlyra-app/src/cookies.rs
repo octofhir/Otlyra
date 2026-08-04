@@ -309,15 +309,21 @@ impl CookieStore {
         let Some(file) = self.file.clone() else {
             return false;
         };
-        let now = SystemTime::now();
-        let (revision, text) = self.with(|jar| (jar.kept_revision(), store::to_text(jar, now)));
-        // Before the key: a flush with nothing to say must not be the thing that
-        // puts a keychain prompt on the screen, and most flushes have nothing to
-        // say. This is what makes the ask happen at the first sign-in rather than
-        // at startup.
+        // The revision alone first, under the lock, and the text only if it has
+        // moved. This is called once per frame — the whole jar was being
+        // serialized to text sixty times a second so that the next line could
+        // decide it had nothing to write.
+        //
+        // Before the key, too: a flush with nothing to say must not be the thing
+        // that puts a keychain prompt on the screen, and most flushes have
+        // nothing to say. This is what makes the ask happen at the first sign-in
+        // rather than at startup.
+        let revision = self.with(|jar| jar.kept_revision());
         if revision == self.written {
             return true;
         }
+        let now = SystemTime::now();
+        let text = self.with(|jar| store::to_text(jar, now));
         let Some(key) = self.unlock() else {
             return false;
         };

@@ -32,6 +32,12 @@ pub struct PageScripts {
     failed: usize,
     /// Whether any of them changed the document.
     mutated: bool,
+    /// What this page's turns write down: whether the document changed, whether
+    /// a frame is owed, where the page thinks it is, where it asked to go.
+    ///
+    /// This page's, not the thread's — it is lent to the isolate alongside the
+    /// document, for exactly as long.
+    state: crate::dom::PageState,
 }
 
 impl PageScripts {
@@ -48,9 +54,6 @@ impl PageScripts {
     }
 
     fn build(document_url: String, console: Option<ConsoleSinkHandle>) -> Self {
-        // What `location` is built from, and what a relative navigation is
-        // resolved against.
-        crate::dom::set_document_url(&document_url);
         // The wrapper table is this thread's, and a new page on the same thread
         // inherits it otherwise: entries naming a document nobody will lend
         // again, and roots belonging to an isolate that is gone.
@@ -72,6 +75,9 @@ impl PageScripts {
             }
         };
         Self {
+            // What `location` is built from, and what a relative navigation is
+            // resolved against.
+            state: crate::dom::PageState::new(document_url.clone()),
             document_url,
             host,
             console,
@@ -81,13 +87,27 @@ impl PageScripts {
         }
     }
 
-    /// Whether script changed the document while it ran.
+    /// Take back what the turn that just ended wrote into the page's state.
     ///
-    /// The page asks after the parse: a document script has rewritten needs its
-    /// style, layout and paint run again, and a document it only read does not.
+    /// Every entry into the isolate ends here. The state came back with the
+    /// document when the loan ended; this folds the one flag the page keeps
+    /// across turns out of it.
+    fn absorb_turn(&mut self) {
+        self.mutated |= self.state.take_dirty();
+    }
+
+    /// Whether script changed the document since this was last asked, clearing
+    /// the answer.
+    ///
+    /// The page asks after the parse and again after every timer and animation
+    /// frame: a document script has rewritten needs its style, layout and paint
+    /// run again, and a document it only read does not. Taking rather than
+    /// reading is what makes the second question about the second turn — a
+    /// sticky flag would make every frame after the first mutation expensive
+    /// forever.
     #[must_use]
-    pub fn mutated(&self) -> bool {
-        self.mutated
+    pub fn take_mutated(&mut self) -> bool {
+        std::mem::take(&mut self.mutated)
     }
 
     /// How many scripts ran, and how many of those failed.
@@ -108,12 +128,13 @@ impl PageScripts {
     /// most of what it does to itself in exactly those, so a browser that never
     /// ran them would render every scripted page as its skeleton.
     pub fn document_finished(&mut self, document: &mut Document, fire_load_events: bool) {
-        crate::dom::set_ready(true);
-        let Some(host) = self.host.as_mut() else {
+        self.state.set_ready(true);
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
             return;
         };
-        let outcome = crate::dom::loan(document, || host.flush_deferred(fire_load_events));
-        self.mutated |= crate::dom::take_dirty();
+        let outcome = crate::dom::loan(document, state, || host.flush_deferred(fire_load_events));
+        self.absorb_turn();
         match outcome {
             Ok(outcome) => tracing::debug!(
                 target: "page.script",
@@ -144,7 +165,16 @@ impl PageScripts {
     /// the next one still runs, which is what the event loop does: one task's
     /// exception is not the next task's business.
     pub fn run_due_timers(&mut self, document: &mut Document) -> usize {
-        let Some(host) = self.host.as_mut() else {
+        // Destructured so the state can be lent while the isolate and the
+        // failure tally are still reachable: they are three disjoint fields, and
+        // borrowing `self` whole would make them one.
+        let Self {
+            host,
+            state,
+            failed,
+            ..
+        } = self;
+        let Some(host) = host.as_mut() else {
             return 0;
         };
         let due = host.timers().due(Instant::now());
@@ -152,7 +182,7 @@ impl PageScripts {
             return 0;
         }
         let mut ran = 0;
-        crate::dom::loan(document, || {
+        crate::dom::loan(document, state, || {
             for token in due {
                 match host.fire_timer(token) {
                     // A token that named nothing was cancelled between coming
@@ -160,13 +190,13 @@ impl PageScripts {
                     // done. Not a task and not an error.
                     Ok(fired) => ran += usize::from(fired),
                     Err(error) => {
-                        self.failed += 1;
+                        *failed += 1;
                         tracing::error!(target: "page.script", %error, "a timer callback failed");
                     }
                 }
             }
         });
-        self.mutated |= crate::dom::take_dirty();
+        self.absorb_turn();
         ran
     }
 
@@ -177,13 +207,19 @@ impl PageScripts {
     /// Callbacks registered *by* these run in the next frame, not this one — a
     /// frame that ran them would be a loop with no display in it.
     pub fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
-        let Some(host) = self.host.as_mut() else {
+        // Cleared before the callbacks rather than after them: the frame they
+        // asked for is the one being drawn now, and a callback that asks again
+        // is asking for the next one. Clearing afterwards would throw that
+        // second ask away and stop the loop dead.
+        self.state.clear_frames_owed();
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
             return 0;
         };
-        let outcome = crate::dom::loan(document, || {
+        let outcome = crate::dom::loan(document, state, || {
             host.run_classic_script(&format!("__otlyraRunFrame({timestamp})"), "<frame>")
         });
-        self.mutated |= crate::dom::take_dirty();
+        self.absorb_turn();
         match outcome {
             Ok(outcome) => outcome.completion.parse().unwrap_or(0),
             Err(error) => {
@@ -200,7 +236,15 @@ impl PageScripts {
     /// drawn sixty times a second and almost none of them are owed a callback.
     #[must_use]
     pub fn frames_pending(&self) -> bool {
-        self.host.is_some() && crate::dom::frames_pending()
+        self.host.is_some() && self.state.frames_owed()
+    }
+
+    /// Where this page's script asked to go, if it asked.
+    ///
+    /// Asked of the page rather than of the thread: with two tabs open, a
+    /// navigation requested by one of them must not be answered by the other.
+    pub fn take_navigation(&mut self) -> Option<crate::dom::Navigation> {
+        self.state.take_navigation()
     }
 
     /// Run this page's deferred work to a standstill, or until `budget` is
@@ -252,8 +296,9 @@ impl PageScripts {
                 || format!("{} (external script {})", self.document_url, self.seen),
                 str::to_owned,
             );
-        let outcome = crate::dom::loan(document, || self.execute(source, &specifier));
-        self.mutated |= crate::dom::take_dirty();
+        let Self { host, state, .. } = self;
+        let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
+        self.absorb_turn();
         match outcome {
             None => self.failed += 1,
             Some(Ok(())) => {}
@@ -272,8 +317,15 @@ impl PageScripts {
 
     /// Run one script and report the outcome. The name is what diagnostics
     /// attribute it to. `None` means there was no engine to run it in.
-    fn execute(&mut self, source: &str, specifier: &str) -> Option<Result<(), ScriptError>> {
-        let host = self.host.as_mut()?;
+    ///
+    /// Takes the isolate rather than the whole page, so that a caller can lend
+    /// the page's state to that isolate at the same time.
+    fn execute(
+        host: &mut Option<ScriptHost>,
+        source: &str,
+        specifier: &str,
+    ) -> Option<Result<(), ScriptError>> {
+        let host = host.as_mut()?;
         Some(host.run_classic_script(source, specifier).map(|outcome| {
             tracing::debug!(
                 target: "page.script",
@@ -295,8 +347,9 @@ impl ScriptRunner for PageScripts {
         // The document is the isolate's for exactly this turn. Anything the
         // script changed in it comes back with it, and the flag says whether
         // there was anything.
-        let outcome = crate::dom::loan(document, || self.execute(source, &specifier));
-        self.mutated |= crate::dom::take_dirty();
+        let Self { host, state, .. } = self;
+        let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
+        self.absorb_turn();
         match outcome {
             None => self.failed += 1,
             Some(Ok(())) => {}
@@ -336,6 +389,14 @@ impl ScriptRunner for PageScripts {
         PageScripts::frames_pending(self)
     }
 
+    fn take_mutated(&mut self) -> bool {
+        PageScripts::take_mutated(self)
+    }
+
+    fn take_navigation(&mut self) -> Option<crate::dom::Navigation> {
+        PageScripts::take_navigation(self)
+    }
+
     fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
         PageScripts::run_frame(self, document, timestamp)
     }
@@ -351,9 +412,10 @@ impl ScriptRunner for PageScripts {
     fn reset(&mut self) {
         // A fresh isolate, because the document this one was scripting is being
         // thrown away. Reusing it would leave the second pass's scripts looking
-        // at globals the first pass's set.
-        crate::dom::set_ready(false);
-        // And the wrappers with it: they name nodes in the tree that is going,
+        // at globals the first pass's set. The state goes with it — `build`
+        // makes a new one, back to `readyState: "loading"`.
+        //
+        // And the wrappers too: they name nodes in the tree that is going,
         // and their roots belong to the isolate that is going.
         crate::dom::forget_wrappers();
         *self = Self::build(self.document_url.clone(), self.console.clone());

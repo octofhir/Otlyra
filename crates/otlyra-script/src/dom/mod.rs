@@ -44,141 +44,151 @@
 mod identity;
 mod node;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
-use otlyra_dom::{Document, DocumentId, NodeId};
+use otlyra_dom::{Document, DocumentId};
 use otter_runtime::marshal::JsError;
 
 pub use identity::{Wrapped, forget_all as forget_wrappers, wrapper_count};
 pub use node::{DOM_EXTENSION, DocumentRef, ElementRef, NodeRef, TextRef};
+/// Where script asked to go. Declared beside the parser's script point, because
+/// that is the seam the browser reads it across.
+pub use otlyra_html::Navigation;
 
 thread_local! {
     /// The document this thread's isolate is currently allowed to touch.
     static LOANED: RefCell<Option<Document>> = const { RefCell::new(None) };
-    /// Whether script has changed the document since the flag was last read.
-    static DIRTY: Cell<bool> = const { Cell::new(false) };
+    /// The page state that goes with it.
+    static STATE: RefCell<Option<PageState>> = const { RefCell::new(None) };
+}
+
+/// What one page's script turn reads and writes, besides the document.
+///
+/// Owned by the page, lent to the isolate for the length of a turn exactly as
+/// the document is. It is not a thread-local because a thread has several pages
+/// on it: a counter of owed animation frames kept per thread would put every
+/// tab into its isolate because one of them animates, and an address kept per
+/// thread would make `location.href` in an old tab report the address of
+/// whichever tab loaded last.
+///
+/// A binding reaches it through [`with_state`] / [`with_state_mut`], which is
+/// how it reaches the document too.
+#[derive(Debug, Default)]
+pub struct PageState {
+    /// Whether script has changed the document since the browser last asked.
+    dirty: bool,
+    /// Whether an animation frame has been asked for and not yet given.
+    frames_owed: bool,
     /// Whether the parser has finished, which is what `readyState` reports.
-    static READY: Cell<bool> = const { Cell::new(false) };
+    ready: bool,
+    /// Where the page's script thinks it is. `location` is built from it.
+    document_url: String,
+    /// Where script asked to go, if it asked.
+    navigation: Option<Navigation>,
 }
 
-/// Somewhere a page's script asked to go.
-///
-/// Script cannot navigate: it can only say so, and the browser decides. That is
-/// not politeness — the isolate holds the document for the length of one turn
-/// and the navigation replaces the document, so a binding that navigated where
-/// it stands would be destroying the thing it is standing on.
-#[derive(Debug, Clone)]
-pub enum Navigation {
-    /// `location.href = …`, `location.assign`, `location.replace`.
-    Url {
-        /// Where to, as the page spelled it. Resolving it against the
-        /// document's own address is the browser's.
-        href: String,
-        /// Whether this replaces the current history entry.
-        replace: bool,
-    },
-    /// `form.submit()`.
-    Submit {
-        /// The `<form>` element. Its fields and its `action` are read from the
-        /// document, which is where they are.
-        form: NodeId,
-    },
-    /// `location.reload()`.
-    Reload,
+impl PageState {
+    /// The state of a page at `document_url`, before any of its script has run.
+    #[must_use]
+    pub fn new(document_url: String) -> Self {
+        Self {
+            document_url,
+            ..Self::default()
+        }
+    }
+
+    /// Whether script changed the document, clearing the answer.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Whether an animation frame is owed.
+    #[must_use]
+    pub fn frames_owed(&self) -> bool {
+        self.frames_owed
+    }
+
+    /// Forget the frames owed: the frame that would run them is being run now.
+    pub fn clear_frames_owed(&mut self) {
+        self.frames_owed = false;
+    }
+
+    /// Say whether the document has finished parsing.
+    pub fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+    }
+
+    /// Where script asked to go, if it asked.
+    pub fn take_navigation(&mut self) -> Option<Navigation> {
+        self.navigation.take()
+    }
 }
 
-// Where the page's script thinks it is, and where it asked to go.
-thread_local! {
-    static DOCUMENT_URL: RefCell<String> = const { RefCell::new(String::new()) };
-    static NAVIGATION: RefCell<Option<Navigation>> = const { RefCell::new(None) };
+/// Read the lent page state. A binding running outside a turn — our bug, not a
+/// page's — sees a default one rather than a panic.
+pub(crate) fn with_state<R>(read: impl FnOnce(&PageState) -> R) -> R {
+    STATE.with(|slot| match slot.borrow().as_ref() {
+        Some(state) => read(state),
+        None => read(&PageState::default()),
+    })
 }
 
-/// Tell the isolate what this document's address is.
-///
-/// `location` is built from it, and a relative navigation is resolved against
-/// it by the browser afterwards.
-pub fn set_document_url(url: impl Into<String>) {
-    DOCUMENT_URL.with(|slot| *slot.borrow_mut() = url.into());
+/// Change the lent page state, if there is one.
+pub(crate) fn with_state_mut(change: impl FnOnce(&mut PageState)) {
+    STATE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            change(state);
+        }
+    });
 }
 
 pub(crate) fn document_url() -> String {
-    DOCUMENT_URL.with(|slot| slot.borrow().clone())
+    with_state(|state| state.document_url.clone())
 }
 
 pub(crate) fn request_navigation(navigation: Navigation) {
     // Last one wins. A script that sets `location.href` twice in a turn has
     // changed its mind, and a browser goes where it ended up.
-    NAVIGATION.with(|slot| *slot.borrow_mut() = Some(navigation));
-}
-
-/// Where script asked to go, if it asked.
-///
-/// Read after a turn, by whoever is able to navigate.
-pub fn take_navigation() -> Option<Navigation> {
-    NAVIGATION.with(|slot| slot.borrow_mut().take())
-}
-
-thread_local! {
-    /// How many animation frames this page has asked for and not been given.
-    ///
-    /// Kept on this side so a browser can ask *whether a frame is owed* without
-    /// entering the isolate. A frame is drawn sixty times a second and almost
-    /// none of them are owed a callback; a turn per frame to find that out is a
-    /// turn per frame for nothing.
-    static FRAMES: Cell<u64> = const { Cell::new(0) };
+    with_state_mut(|state| state.navigation = Some(navigation));
 }
 
 /// The page asked for an animation frame.
 pub(crate) fn note_frame_request() {
-    FRAMES.with(|frames| frames.set(frames.get().saturating_add(1)));
-}
-
-/// Whether any are outstanding.
-#[must_use]
-pub fn frames_pending() -> bool {
-    FRAMES.with(Cell::get) > 0
-}
-
-/// Forget them: the frame that would have run them is being run now, or the
-/// page they belong to is going.
-pub fn clear_frame_requests() {
-    FRAMES.with(|frames| frames.set(0));
-}
-
-/// Say whether the document has finished parsing.
-///
-/// One bit, because that is all `readyState` is worth until there is a real
-/// document lifecycle: everything before the last byte is `"loading"` and
-/// everything after it is `"complete"`.
-pub fn set_ready(ready: bool) {
-    READY.with(|flag| flag.set(ready));
+    with_state_mut(|state| state.frames_owed = true);
 }
 
 pub(crate) fn is_ready() -> bool {
-    READY.with(Cell::get)
+    with_state(|state| state.ready)
 }
 
-/// Lend `document` to the isolate for the duration of `run`.
+/// Lend `document` and `state` to the isolate for the duration of `run`.
 ///
-/// The document is moved in and moved back; a caller still holding `&mut
-/// Document` cannot reach it while script can, which is the whole point.
+/// Both are moved in and moved back; a caller still holding `&mut Document`
+/// cannot reach it while script can, which is the whole point. The state goes
+/// with the document because it is the same loan: what a turn writes about the
+/// page — that it changed the document, that it wants a frame, where it asked
+/// to go — belongs to the page whose turn it is, and that page is the one whose
+/// document is lent.
 ///
 /// Loans do not nest. A second one while the first is live would take an empty
 /// slot, and script would run against a document with no nodes in it — so it
 /// panics instead, on our own bug rather than on a page's.
-pub fn loan<R>(document: &mut Document, run: impl FnOnce() -> R) -> R {
+pub fn loan<R>(document: &mut Document, state: &mut PageState, run: impl FnOnce() -> R) -> R {
     let taken = std::mem::take(document);
+    let taken_state = std::mem::take(state);
     LOANED.with(|slot| {
         let mut slot = slot.borrow_mut();
         assert!(slot.is_none(), "a document is already lent to this isolate");
         *slot = Some(taken);
     });
+    STATE.with(|slot| *slot.borrow_mut() = Some(taken_state));
 
     // The restoring is a `Drop` so that a panicking script — or a native that
     // unwinds — still gives the document back rather than leaving the page
     // holding an empty one.
     struct Restore<'a> {
         document: &'a mut Document,
+        state: &'a mut PageState,
     }
 
     impl Drop for Restore<'_> {
@@ -186,16 +196,14 @@ pub fn loan<R>(document: &mut Document, run: impl FnOnce() -> R) -> R {
             if let Some(document) = LOANED.with(|slot| slot.borrow_mut().take()) {
                 *self.document = document;
             }
+            if let Some(state) = STATE.with(|slot| slot.borrow_mut().take()) {
+                *self.state = state;
+            }
         }
     }
 
-    let _restore = Restore { document };
+    let _restore = Restore { document, state };
     run()
-}
-
-/// Whether script changed the document, clearing the flag.
-pub fn take_dirty() -> bool {
-    DIRTY.with(|dirty| dirty.replace(false))
 }
 
 /// Read the lent document.
@@ -220,7 +228,7 @@ pub(crate) fn with_document_mut<R>(
 ) -> Result<R, JsError> {
     LOANED.with(|slot| match slot.borrow_mut().as_mut() {
         Some(document) if document.id() == owner => {
-            DIRTY.with(|dirty| dirty.set(true));
+            with_state_mut(|state| state.dirty = true);
             Ok(change(document))
         }
         _ => Err(detached()),

@@ -148,6 +148,19 @@ impl ScriptHost {
             .capabilities(page_capabilities())
             .capability_hook(DenyPageCapabilities)
             .console_sink(console)
+            // The engine's own direct-mode timeout, off. Not because a runaway
+            // script is acceptable — `Watchdog` below stops one, sooner, with a
+            // budget we chose — but because of what the engine's version costs.
+            // Without a task spawner the engine enforces its timeout by
+            // spawning an OS thread and joining it around *every* entry point,
+            // and `run_classic_script` is two of them: `run_script` and the
+            // microtask checkpoint. Measured on an M-series laptop that is
+            // 51 µs of the 56 µs a trivial script turn takes — 92% of the turn,
+            // spent on thread creation, on the thread that draws. A page with a
+            // `requestAnimationFrame` loop paid it 120 times a second.
+            //
+            // `Duration::ZERO` is the engine's own spelling of "do not".
+            .timeout(Duration::ZERO)
             .max_heap_bytes(MAX_HEAP_BYTES)
             .max_stack_depth(MAX_STACK_DEPTH);
         // The web platform Otter already has, then the part of it that knows
