@@ -705,10 +705,7 @@ impl Browser {
         let tab = &mut self.tabs[index];
         tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
         tab.url = final_url.clone();
-        tab.page = Some(PageScene::new(parsed.document));
-        if !interface && let Some(page) = tab.page.as_mut() {
-            page.hide_scrollbars();
-        }
+        tab.page = Some(shown(PageScene::new(parsed.document), interface));
         if index == self.active {
             self.sync_address();
         }
@@ -1005,6 +1002,7 @@ impl Browser {
         };
         let scroll = pending.restore_scroll;
         let mut pending = pending;
+        let interface = self.interface;
         let tab = &mut self.tabs[index];
 
         // The scripts the page linked to, in the order it named them, then the
@@ -1036,11 +1034,14 @@ impl Browser {
         tab.scripts = pending.runner.take();
 
         if let Some(document) = document {
-            tab.page = Some(PageScene::with_resources(
-                document,
-                pending.sheets,
-                pending.images,
-                pending.picture_sources,
+            tab.page = Some(shown(
+                PageScene::with_resources(
+                    document,
+                    pending.sheets,
+                    pending.images,
+                    pending.picture_sources,
+                ),
+                interface,
             ));
         }
         if let Some(page) = tab.page.as_mut() {
@@ -1130,4 +1131,17 @@ impl Browser {
         }
         Some(url)
     }
+}
+
+/// A page scene the way this browser shows it.
+///
+/// With the interface hidden the picture is going to be put beside another
+/// browser's, taken with its scrollbars hidden, so ours are hidden too — on every
+/// scene a load builds, not only the first: the one the reader ends up with is the
+/// scene rebuilt once everything arrived, and it used to draw them again.
+fn shown(mut page: PageScene, interface: bool) -> PageScene {
+    if !interface {
+        page.hide_scrollbars();
+    }
+    page
 }

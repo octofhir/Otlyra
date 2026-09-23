@@ -71,7 +71,7 @@ struct Cli {
     no_interface: bool,
 
     /// Touch nothing this machine keeps: no cookie file, no bookmarks, no
-    /// keychain.
+    /// keychain, and none of the saved preferences.
     ///
     /// A run that renders a page and exits has no business holding somebody's
     /// signed-in sessions, and asking the keychain for the key to them puts a
@@ -201,9 +201,18 @@ struct Cli {
 
 impl Cli {
     /// The preferences to start from: what is saved, with what the command line
-    /// overrides applied on top.
+    /// overrides applied on top — or the defaults, for a run that keeps nothing.
+    ///
+    /// A preference is somebody's choice about how *they* read, and a run whose
+    /// picture is going to be put beside another browser's is not them reading.
+    /// With a saved text scale of 105% applied, every `rem` on a mirrored page came
+    /// out a twentieth larger than the reference's, and the difference was charged
+    /// to layout.
     fn settings(&self) -> otlyra_app::settings::Settings {
-        let mut settings = otlyra_app::preferences::load();
+        let mut settings = match self.keeps_nothing() {
+            true => otlyra_app::settings::Settings::default(),
+            false => otlyra_app::preferences::load(),
+        };
         if let Some(palette) = self.color_scheme {
             settings.appearance = match palette {
                 Palette::Light => otlyra_app::settings::Appearance::Light,
@@ -211,6 +220,20 @@ impl Cli {
             };
         }
         settings
+    }
+
+    /// Whether this run reads nothing this machine keeps: the renders and dumps,
+    /// and the window `--no-interface` and `--no-secrets` open.
+    fn keeps_nothing(&self) -> bool {
+        self.no_secrets
+            || self.no_interface
+            || self.screenshot.is_some()
+            || self.dump_display_list.is_some()
+            || self.dump_source
+            || self.dump_dom.is_some()
+            || self.dump_boxes
+            || self.dump_fragments
+            || self.dump_selectors.is_some()
     }
 
     /// The protocol session this command line asks for: the whole window, or the

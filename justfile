@@ -98,7 +98,14 @@ reference page width="820" height="900":
     out="{{screenshot_dir}}/reference"
     mkdir -p "$out"
     name="$(basename {{page}} .html)"
+    # A mirror is always `index.html`; name it after its directory, or every
+    # mirror's pictures overwrite the last one's.
+    if [ "$name" = index ]; then name="$(basename "$(dirname {{page}})")"; fi
     url="file://$(cd "$(dirname {{page}})" && pwd)/$(basename {{page}})"
+    # Every browser in the comparison answers `prefers-color-scheme` with light.
+    # Ours does unless told otherwise; a reference follows the machine it runs
+    # on, so on a Mac set to dark it would draw a page's dark theme against our
+    # light one and the difference would be the whole page.
     # Without our own interface: the page has to start at the top of the picture,
     # or every comparison is a comparison of two toolbars.
     cargo run --quiet -- --file {{page}} --no-interface --screenshot "$out/$name.ours.png" \
@@ -113,7 +120,7 @@ reference page width="820" height="900":
         # while writing the picture at one, so a page that chooses by density
         # chooses differently in each half of the comparison.
         "$OTLYRA_REFERENCE" --headless --disable-gpu --hide-scrollbars \
-            --force-device-scale-factor=1 \
+            --force-device-scale-factor=1 --blink-settings=preferredColorScheme=1 \
             --window-size={{width}},{{height}} \
             --screenshot="$out/$name.reference.png" "$url" >/dev/null 2>&1
         printf 'chrome  '
@@ -124,9 +131,15 @@ reference page width="820" height="900":
     # the two disagree, neither is the answer and the specification is; where they
     # agree and we do not, the page is ours to fix.
     if [ -n "${OTLYRA_REFERENCE_ALT:-}" ]; then
+        # A profile of its own, which is where the light palette is set — and
+        # which keeps the run off whatever profile the machine's owner has open.
+        profile="$(pwd)/target/reference-profile"
+        mkdir -p "$profile"
+        echo 'user_pref("ui.systemUsesDarkTheme", 0);' > "$profile/user.js"
         # An absolute path: this one resolves a relative one against somewhere of
         # its own choosing and writes the picture where nobody is looking.
-        "$OTLYRA_REFERENCE_ALT" --headless --window-size={{width}},{{height}} \
+        "$OTLYRA_REFERENCE_ALT" --headless -no-remote -profile "$profile" \
+            --window-size={{width}},{{height}} \
             --screenshot "$(pwd)/$out/$name.alternate.png" "$url" >/dev/null 2>&1
         printf 'firefox '
         cargo run --quiet -p otlyra-gfx --example compare -- \
