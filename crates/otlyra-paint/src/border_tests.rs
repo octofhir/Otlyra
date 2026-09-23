@@ -2,7 +2,7 @@
 //! and its inset shadows — tested from the styled page they come from.
 
 use otlyra_css::cascade::{Viewport as StyleViewport, style_document};
-use otlyra_layout::{Viewport, build_styled_box_tree, layout};
+use otlyra_layout::{Viewport, build_box_tree, layout};
 use otlyra_text::TextEngine;
 
 use super::border::shades;
@@ -12,7 +12,7 @@ use super::*;
 fn list_for(html: &str) -> DisplayList {
     let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
     let styles = style_document(&document, StyleViewport::default());
-    let mut boxes = build_styled_box_tree(&document, &styles);
+    let mut boxes = build_box_tree(&document, &styles);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,
@@ -193,7 +193,7 @@ fn every_background_layer_is_drawn_in_the_order_it_was_written() {
     )
     .document;
     let styles = style_document(&document, StyleViewport::default());
-    let mut boxes = build_styled_box_tree(&document, &styles);
+    let mut boxes = build_box_tree(&document, &styles);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,

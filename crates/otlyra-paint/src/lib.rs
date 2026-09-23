@@ -8,7 +8,13 @@
 //!
 //! ## Contents
 //!
-//! - [`build_display_list`] — the whole crate.
+//! - [`build_display_list`] — the entry point, and the walk over the fragment
+//!   tree that decides what is drawn in what order.
+//! - `effects` — the groups a stacking context is composited through.
+//! - `background`, `gradient`, `border`, `shadow` and `shape` — what is drawn
+//!   for a box: its layers, its edges and the rounded outline both follow.
+//! - `scrollbar` — where a scroll port's thumb is, for drawing it and for
+//!   deciding what a press landed on.
 //! - `widget` — what a form control looks like, drawn rather than asked of the
 //!   operating system.
 //!
@@ -390,11 +396,11 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
 
 /// The content box inside a border box, by the style's own edges.
 fn content_box_of(rect: Rect, style: &otlyra_css::ComputedStyle) -> Rect {
-    let length = |value: otlyra_css::Length| value.resolve(0.0);
-    let left = length(style.padding.left) + style.border.left.width;
-    let right = length(style.padding.right) + style.border.right.width;
-    let top = length(style.padding.top) + style.border.top.width;
-    let bottom = length(style.padding.bottom) + style.border.bottom.width;
+    let length = |value: &otlyra_css::Length| value.resolve(0.0);
+    let left = length(&style.padding.left) + style.border.left.width;
+    let right = length(&style.padding.right) + style.border.right.width;
+    let top = length(&style.padding.top) + style.border.top.width;
+    let bottom = length(&style.padding.bottom) + style.border.bottom.width;
     Rect::new(
         rect.x + left,
         rect.y + top,
@@ -722,7 +728,7 @@ fn object_fit_rect(
         }
     };
 
-    let position = style.object_position;
+    let position = &style.object_position;
     Placed {
         x: position.x.resolve(box_width - width),
         y: position.y.resolve(box_height - height),

@@ -6,12 +6,11 @@
 
 use std::sync::Arc;
 
-use otlyra_css::LengthOrAuto;
-
 use crate::box_tree::BoxId;
 use crate::fragment::Fragment;
 
 use super::Flow;
+use super::intrinsic::Wanted;
 
 /// The column a grid line names.
 ///
@@ -85,7 +84,7 @@ impl<'a> Flow<'a> {
                 1
             };
             for _ in 0..times {
-                template.extend(pattern.iter().copied());
+                template.extend(pattern.iter().cloned());
             }
         }
 
@@ -179,11 +178,18 @@ impl<'a> Flow<'a> {
         // What each column has to hold, which is what an `auto` track is measured
         // from: the widest item in it, and an item spanning several tracks counts
         // towards none of them on its own.
+        //
+        // An item's percentage width is of its grid area, which is what is being
+        // measured, so CSS makes it cyclic (CSS Sizing 3 §5.2.1) and counts on the
+        // `auto` tracks then stretching to fill the container (CSS Grid §11.8) to
+        // give the item its share. That step is not taken here, so the
+        // container's width stands in for the area — which is what it comes to in
+        // the one-column grid a search box or a stack of cards is written as.
         let mut column_content = vec![0.0f32; count];
         for (index, &child) in children.iter().enumerate() {
             let (_, column, span) = cells[index];
             if span == 1 {
-                let wanted = self.max_content_width(child, width);
+                let wanted = self.contribution(child, width, Some(width), Wanted::Widest);
                 column_content[column] = column_content[column].max(wanted);
             }
         }
@@ -269,7 +275,9 @@ impl<'a> Flow<'a> {
                 // Stretched to the row, which is `align-items: stretch` and is what
                 // makes a row of cards the same height.
                 let id = fragment.box_id.expect("a grid item came from a box");
-                let has_height = self.tree.node(id).style.height != LengthOrAuto::Auto;
+                let has_height = self
+                    .asked_height(&self.tree.node(id).style, fragment.rect.width)
+                    .is_some();
                 if !has_height && fragment.rect.height < height {
                     fragment.rect.height = height;
                 }

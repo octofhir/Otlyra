@@ -5,7 +5,7 @@
 //! measured in a system font breaks somewhere else on someone else's laptop.
 
 use otlyra_layout::selection;
-use otlyra_layout::{FragmentTree, Viewport, build_styled_box_tree, find, layout};
+use otlyra_layout::{FragmentTree, Viewport, build_box_tree, find, layout};
 use otlyra_text::TextEngine;
 
 /// Lay out `html` at `width` logical pixels, with the document's own stylesheets
@@ -22,7 +22,7 @@ fn lay_out(html: &str, width: f32) -> FragmentTree {
             color_scheme: Default::default(),
         },
     );
-    let mut boxes = build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     let mut text = TextEngine::isolated();
     assert!(text.has_family(otlyra_text::TEST_FAMILY));
     layout(

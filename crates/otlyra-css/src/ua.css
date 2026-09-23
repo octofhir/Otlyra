@@ -1,9 +1,10 @@
-/* The user-agent stylesheet, as CSS.
+/* The user-agent stylesheet.
  *
- * This is the same set of decisions the hardcoded table made, written in the
- * language they belong to: one rule per selector, values in CSS units, and the
- * cascade — not a `match` arm — deciding what wins. The source for the values is
- * the HTML standard's rendering chapter.
+ * The only one: every box on every page is styled through the cascade, with
+ * these rules in the user-agent origin beneath the page's own, so a page can see
+ * and override every default it gets. One rule per selector, values in CSS
+ * units, and the cascade deciding what wins. The source for the values is the
+ * HTML standard's rendering chapter (HTML §15).
  */
 
 html, body, div, center, section, article, aside, header, footer, main, nav,
@@ -39,8 +40,10 @@ details:not([open]) > *:not(summary) { display: none; }
 dialog { display: none; margin: auto; padding: 1em; border: solid; }
 
 /* A table is a formatting context of its own: rows and cells are placed into a
-   grid whose columns are sized by what is in them, not stacked as blocks. */
-table { display: table; border-spacing: 2px; border-collapse: separate; }
+   grid whose columns are sized by what is in them, not stacked as blocks. Its
+   width is measured across its border, as HTML's rendering section has it and
+   both references do: `<table border width="100%">` fits the page. */
+table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box; }
 thead { display: table-header-group; }
 tbody { display: table-row-group; }
 tfoot { display: table-footer-group; }

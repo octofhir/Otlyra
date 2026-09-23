@@ -8,15 +8,16 @@
 use std::sync::Arc;
 
 use otlyra_css::{
-    AlignItems, ComputedStyle, FlexWrap, JustifyContent, Length, LengthOrAuto, Sides,
+    AlignItems, ComputedStyle, FlexBasis, FlexWrap, JustifyContent, LengthOrAuto, Sides, Size,
 };
 
 use crate::box_tree::{BoxId, BoxKind};
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::fragment::{Fragment, Rect};
 
 use super::Flow;
-use super::box_model::{clamp, resolve_border, resolve_margin, resolve_padding};
-use super::replaced::{replaced_edges, replaced_fragment};
+use super::box_model::{resolve_border, resolve_margin, resolve_padding};
+use super::replaced::{replaced_fragment, replaced_height};
+use super::sizing::{Frame, InlineRoom, Limits, Sizes, content_length};
 
 /// How far a laid-out flex line reached, on each axis.
 #[derive(Copy, Clone)]
@@ -37,9 +38,37 @@ struct FlexLine {
     inner: f32,
     /// Where the line starts across the container.
     cross_start: f32,
-    /// A cross size the line is at least as big as, which is how a lone line fills
-    /// a container that has a height of its own.
-    cross_floor: Option<f32>,
+    /// How big the line is across.
+    cross: LineCross,
+}
+
+/// How big a flex line is across the container.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum LineCross {
+    /// As big as its biggest item, and at least this: the line of a container
+    /// as big across as what it holds, and each of the lines a wrapped container
+    /// shares its own cross size out between.
+    AtLeast(f32),
+    /// Exactly this: the one line of a container that cannot wrap and has a
+    /// cross size of its own (CSS Flexbox §9.4, step 8). An item bigger than
+    /// that overflows the line rather than growing it — which is how a sidebar
+    /// in a row as tall as the window is as tall as the window, and scrolls.
+    Exactly(f32),
+}
+
+/// The height a flex item is laid out to, as the container decided it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ItemHeight {
+    /// As tall as what it holds at the width it was given, held between its own
+    /// minimum and maximum, and at least this: an item the line does not
+    /// stretch, and one being measured before there is a line to stretch it to.
+    AtLeast(f32),
+    /// Exactly this, as a border box, whatever it holds: what a line stretched
+    /// it to, and down a column what the sharing out left it. `definite` is
+    /// whether a percentage inside it has that height to be of (CSS Flexbox
+    /// §9.8) — a stretched item's does, and a column item's does when the
+    /// container had a height of its own to share out.
+    Exactly { height: f32, definite: bool },
 }
 
 /// One child of a flex container, with the sizes the container needs to place it.
@@ -54,6 +83,9 @@ struct FlexItem {
     main: f32,
     /// Its size across.
     cross: f32,
+    /// Its minimum and maximum across, as a border box: what `stretch` is held
+    /// between.
+    cross_limits: Limits,
     grow: f32,
     shrink: f32,
     margin: Sides<f32>,
@@ -98,6 +130,20 @@ impl FlexItem {
             self.margin.left + self.margin.right
         }
     }
+}
+
+/// One item as it came out laid out on its own, with what its sizing properties
+/// asked for: what the base size and the floor of it are worked out from.
+struct Measured<'s> {
+    id: BoxId,
+    style: &'s ComputedStyle,
+    /// Its border box, laid out as a block in the container's width.
+    laid_out: Rect,
+    frame: Frame,
+    /// The container's width, less the item's own margins.
+    room: InlineRoom,
+    /// What `width`, `min-width` and `max-width` came to.
+    widths: Sizes,
 }
 
 /// How a wrapped container's `align-content` shares `leftover` between `count`
@@ -152,6 +198,14 @@ impl<'a> Flow<'a> {
         // establishes a formatting context of its own.
         let outer_floats = std::mem::take(&mut self.floats);
 
+        // A container with a height of its own has a definite cross size when it
+        // is a row and a definite main size when it is a column: either way it is
+        // the size the items are fitted into rather than one they add up to. It
+        // is the height whoever laid the container out settled before its
+        // contents — its own `height`, or the one a flex line gave it — which is
+        // the height a percentage inside it is of.
+        let definite_height = self.containing_height;
+
         // The base size every item starts at, measured by laying it out on its own.
         let mut items: Vec<FlexItem> = Vec::with_capacity(children.len());
         for &child in &children {
@@ -170,51 +224,25 @@ impl<'a> Flow<'a> {
                 out.push(fragment);
                 continue;
             }
+            // Laid out on its own to be measured, and thrown away: a box inside
+            // it that scrolls is a scroll port once, where it is laid out for
+            // good, and not again where it was measured.
+            let ports = self.scroll_ports.len();
             let fragment = self.layout_block(child, width, x, y);
+            self.scroll_ports.truncate(ports);
             let margin = resolve_margin(&item_style, width);
-
-            // The base size: `flex-basis` if it says, then the item's own size, and
-            // for an auto width along a row the size its content wants — a flex
-            // item is not a block, and does not fill the line it is on.
-            let basis = match item_style.flex_basis.and_then(|basis| basis.resolve(width)) {
-                Some(basis) => basis,
-                None if row => match item_style.width.resolve(width) {
-                    Some(_) => fragment.rect.width,
-                    None => {
-                        let content = self.max_content_width(child, width);
-                        clamp(
-                            content.min(width),
-                            item_style.min_width,
-                            item_style.max_width,
-                            width,
-                        )
-                    }
-                },
-                None => fragment.rect.height,
+            let room = InlineRoom::within(&item_style, width);
+            let frame = Frame::of(&item_style, width);
+            let measured = Measured {
+                id: child,
+                style: &item_style,
+                laid_out: fragment.rect,
+                frame,
+                room,
+                widths: self.inline_sizes(child, &item_style, room, frame.inline),
             };
-
-            // A flex item's automatic minimum size: it may be shrunk, but not past
-            // the point where its own content spills out of it. An item that says
-            // `min-width` or `overflow` of its own would override this; neither is
-            // read yet, so the content is the floor.
-            //
-            // Down a column that floor is the item's own height, and it is not a
-            // nicety: `flex-basis: 0` down a column whose container has no height
-            // of its own leaves every item with a base of nothing and no free
-            // space to grow into, so a stack of cards came out as a stack of
-            // nothing. `min-height: auto` is what CSS calls the rule that stops
-            // it.
-            let floor = if row {
-                if item_style.min_width == Length::ZERO {
-                    self.min_content_width(child, width, true).min(basis)
-                } else {
-                    item_style.min_width.resolve(width)
-                }
-            } else if item_style.min_height == Length::ZERO {
-                fragment.rect.height
-            } else {
-                item_style.min_height.resolve(width)
-            };
+            let basis = self.base_size(&measured, row, definite_height);
+            let floor = self.main_floor(&measured, row, basis);
 
             // Across the line, an item with an `auto` margin on that side is an
             // item the free space belongs to — so it cannot also be the item that
@@ -224,18 +252,21 @@ impl<'a> Flow<'a> {
             let cross_auto_margin = !row
                 && (item_style.margin.left == LengthOrAuto::Auto
                     || item_style.margin.right == LengthOrAuto::Auto)
-                && item_style.width.resolve(width).is_none();
+                && measured.widths.preferred.is_none();
             let cross = if row {
                 fragment.rect.height
             } else if cross_auto_margin {
-                clamp(
-                    self.max_content_width(child, width).min(width),
-                    item_style.min_width,
-                    item_style.max_width,
-                    width,
-                )
+                self.wanted_width(&measured)
             } else {
                 fragment.rect.width
+            };
+            let cross_limits = if row {
+                let content = (fragment.rect.height - frame.block).max(0.0);
+                self.block_sizes_of(&item_style, width, Some(content))
+                    .limits
+                    .outer(frame.block)
+            } else {
+                measured.widths.limits.outer(frame.inline)
             };
 
             items.push(FlexItem {
@@ -244,6 +275,7 @@ impl<'a> Flow<'a> {
                 base: basis,
                 main: basis,
                 cross,
+                cross_limits,
                 grow: item_style.flex_grow,
                 shrink: item_style.flex_shrink,
                 margin,
@@ -265,12 +297,6 @@ impl<'a> Flow<'a> {
             items.sort_by_key(|item| item.style.order);
         }
 
-        // A container with a height of its own has a definite cross size when it
-        // is a row and a definite main size when it is a column: either way it is
-        // the size the items are fitted into rather than one they add up to.
-        let definite_height = self
-            .asked_height(&style)
-            .map(|height| clamp(height, style.min_height, style.max_height, width));
         let inner = if row {
             width
         } else {
@@ -342,7 +368,11 @@ impl<'a> Flow<'a> {
                     gap,
                     inner,
                     cross_start: cross_cursor,
-                    cross_floor: (container_cross.is_some()).then(|| wanted[number] + stretch),
+                    cross: match container_cross {
+                        Some(cross) if unwrapped => LineCross::Exactly(cross),
+                        Some(_) => LineCross::AtLeast(wanted[number] + stretch),
+                        None => LineCross::AtLeast(0.0),
+                    },
                 },
                 (x, y),
                 out,
@@ -365,6 +395,91 @@ impl<'a> Flow<'a> {
         if row { cross_cursor } else { main_extent }
     }
 
+    /// What an item's content wants of the row, as a border box held between its
+    /// limits: the base size of an item with nothing to say about its own width,
+    /// and the width of one that is pushed about by an `auto` margin rather than
+    /// stretched. Never more than the row, which is where the shrinking starts.
+    fn wanted_width(&mut self, item: &Measured<'_>) -> f32 {
+        let row = item.room.measure;
+        item.widths
+            .limits
+            .outer(item.frame.inline)
+            .clamp(self.max_content_size(item.id, row).min(row))
+    }
+
+    /// An item's base size along the main axis (CSS Flexbox §9.2.3), as a border
+    /// box.
+    ///
+    /// `flex-basis` if it names a size, measured across the box `box-sizing` says
+    /// as a width is; then the item's own size, and for an `auto` width along a
+    /// row the size its content wants — a flex item is not a block, and does not
+    /// fill the line it is on. A percentage basis down a column whose height is
+    /// not known is `content` (CSS Flexbox §7.2.3), and so are the content
+    /// keywords there, which down a column are the height the item came to.
+    fn base_size(&mut self, item: &Measured<'_>, row: bool, main_height: Option<f32>) -> f32 {
+        let named = match &item.style.flex_basis {
+            FlexBasis::Content | FlexBasis::Size(Size::Auto) => None,
+            FlexBasis::Size(size) if row => self
+                .preferred_width(item.id, item.style, size, item.room, item.frame.inline)
+                .map(|basis| basis + item.frame.inline),
+            FlexBasis::Size(Size::Length(length)) => {
+                content_length(length, main_height, item.style.box_sizing, item.frame.block)
+                    .map(|basis| basis + item.frame.block)
+            }
+            FlexBasis::Size(Size::Intrinsic(_) | Size::Stretch) => None,
+        };
+        match (named, &item.style.flex_basis) {
+            (Some(basis), _) => basis,
+            (None, FlexBasis::Content) if row => self.wanted_width(item),
+            (None, _) if row => match item.widths.preferred {
+                Some(_) => item.laid_out.width,
+                None => self.wanted_width(item),
+            },
+            (None, _) => item.laid_out.height,
+        }
+    }
+
+    /// How far an item may be shrunk along the main axis, as a border box.
+    ///
+    /// A minimum of its own is that. `auto` is the automatic minimum (CSS
+    /// Flexbox §4.5), which is taken as the content here: the item may be shrunk,
+    /// but not past the point where its own content spills out of it, nor past
+    /// the base size it started from. `overflow` does not relax that yet.
+    ///
+    /// The content is its min-content size, held to its maximum where it has one
+    /// (§4.5 again): a picture is as narrow as it is, and `img { max-width: 100% }`
+    /// is what brings that down to the row rather than to nothing.
+    ///
+    /// Down a column that floor is the item's own height, and it is not a
+    /// nicety: `flex-basis: 0` down a column whose container has no height of its
+    /// own leaves every item with a base of nothing and no free space to grow
+    /// into, so a stack of cards came out as a stack of nothing.
+    fn main_floor(&mut self, item: &Measured<'_>, row: bool, basis: f32) -> f32 {
+        if row {
+            return match &item.style.min_width {
+                Size::Auto => {
+                    let maximum = item.widths.limits.outer(item.frame.inline).max;
+                    self.min_content_size(item.id, item.room.measure)
+                        .min(maximum)
+                        .min(basis)
+                }
+                Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => {
+                    item.widths.limits.min + item.frame.inline
+                }
+            };
+        }
+        match &item.style.min_height {
+            Size::Auto => item.laid_out.height,
+            Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => {
+                let content = (item.laid_out.height - item.frame.block).max(0.0);
+                self.block_sizes_of(item.style, item.room.measure, Some(content))
+                    .limits
+                    .min
+                    + item.frame.block
+            }
+        }
+    }
+
     /// One line of a flex container: the main axis shared out, the cross axis
     /// aligned, and every item placed.
     ///
@@ -384,7 +499,7 @@ impl<'a> Flow<'a> {
             gap,
             inner,
             cross_start,
-            cross_floor,
+            cross,
         } = geometry;
         let count = line.len();
         if count == 0 {
@@ -436,22 +551,28 @@ impl<'a> Flow<'a> {
                 // whatever width it ended up at, and the first measurement
                 // already said so. Asking again with no height to give it would
                 // be asking what it is worth without the thing it declared.
-                if self.asked_height(&items[index].style).is_some() {
+                if self.asked_height(&items[index].style, inner).is_some() {
                     continue;
                 }
                 let (id, main) = (items[index].id, items[index].main);
-                items[index].cross = self.layout_item(id, 0.0, 0.0, main, 0.0).rect.height;
+                items[index].cross = self
+                    .layout_item(id, 0.0, 0.0, main, ItemHeight::AtLeast(0.0))
+                    .rect
+                    .height;
             }
             self.scroll_ports.truncate(ports);
             self.floats = floats;
         }
 
-        // The cross axis: the line is as big as its largest item, and `stretch`
-        // makes the rest of them match it.
-        let line_cross = items[line.clone()]
-            .iter()
-            .map(|item| item.cross + item.margin_cross(row))
-            .fold(cross_floor.unwrap_or(0.0), f32::max);
+        // The cross axis: the line is as big as its largest item unless the
+        // container settled it, and `stretch` makes the rest of them match it.
+        let line_cross = match cross {
+            LineCross::Exactly(size) => size,
+            LineCross::AtLeast(floor) => items[line.clone()]
+                .iter()
+                .map(|item| item.cross + item.margin_cross(row))
+                .fold(floor, f32::max),
+        };
 
         let content_main: f32 = items[line.clone()]
             .iter()
@@ -505,9 +626,9 @@ impl<'a> Flow<'a> {
             // is the initial value, so stretching over a declared height would
             // make every `height` in a flex container a suggestion.
             let definite = if row {
-                self.asked_height(&item.style).is_some()
+                self.asked_height(&item.style, inner).is_some()
             } else {
-                item.style.width.resolve(inner).is_some()
+                item.style.width != Size::Auto
             };
             // An `auto` margin across the line takes the room first, and takes it
             // from both `stretch` and `align-self`: `margin: 0 auto` on a column
@@ -517,11 +638,16 @@ impl<'a> Flow<'a> {
             // *centre me* in a block and in a flex item alike.
             let (cross_lead_auto, cross_trail_auto) = item.auto_margin_sides(!row);
             let cross_autos = usize::from(cross_lead_auto) + usize::from(cross_trail_auto);
-            let cross_size = match align {
-                AlignItems::Stretch if !definite && cross_autos == 0 => {
-                    (line_cross - item.margin_cross(row)).max(item.cross)
-                }
-                _ => item.cross,
+            // Stretched, an item is the line less its margins, held between its
+            // own minimum and maximum across (CSS Flexbox §9.4, step 11) — not
+            // as big as its content, which a line of a set size may be smaller
+            // than.
+            let stretched = align == AlignItems::Stretch && !definite && cross_autos == 0;
+            let cross_size = if stretched {
+                item.cross_limits
+                    .clamp((line_cross - item.margin_cross(row)).max(0.0))
+            } else {
+                item.cross
             };
             let free_cross = line_cross - cross_size - item.margin_cross(row);
             let cross_offset = cross_start
@@ -545,19 +671,35 @@ impl<'a> Flow<'a> {
             let lead = if lead_auto { per_auto } else { 0.0 };
             let trail = if trail_auto { per_auto } else { 0.0 };
 
+            // Along a row the height is the line's business: exactly what
+            // `stretch` made of it, or what the item holds. Down a column it is
+            // what the sharing out left the item, whatever that holds — an item
+            // with `min-height: 0` is let shrink past its content so that the
+            // content can overflow it, and scroll, rather than push past the
+            // item and over whatever the container put after it.
             let (item_x, item_y, item_width, item_height) = if row {
                 (
                     x + cursor + item.margin.left + lead,
                     y + cross_offset + item.margin.top,
                     item.main,
-                    cross_size,
+                    if stretched {
+                        ItemHeight::Exactly {
+                            height: cross_size,
+                            definite: true,
+                        }
+                    } else {
+                        ItemHeight::AtLeast(cross_size)
+                    },
                 )
             } else {
                 (
                     x + cross_offset + item.margin.left,
                     y + cursor + item.margin.top + lead,
                     cross_size,
-                    item.main,
+                    ItemHeight::Exactly {
+                        height: item.main,
+                        definite: inner.is_finite(),
+                    },
                 )
             };
 
@@ -577,45 +719,104 @@ impl<'a> Flow<'a> {
     }
 
     /// One flex item, laid out at the size the container decided for it.
-    fn layout_item(&mut self, id: BoxId, x: f32, y: f32, width: f32, height: f32) -> Fragment {
+    fn layout_item(
+        &mut self,
+        id: BoxId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: ItemHeight,
+    ) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
 
         // A picture is its own content: the container decided its size, and there is
         // nothing inside it to lay out.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
             // The container decided the outer size; the frame comes out of it.
-            let (extra_x, extra_y) = replaced_edges(&style, width);
+            // A height the line left open is what the width makes of the
+            // picture through its ratio.
+            let frame = Frame::of(&style, width);
+            let inner_width = (width - frame.inline).max(0.0);
+            let inner_height = match height {
+                ItemHeight::Exactly { height, .. } => (height - frame.block).max(0.0),
+                ItemHeight::AtLeast(floor) => {
+                    replaced_height(&style, content, inner_width, width, self.containing_height)
+                        .max(floor - frame.block)
+                }
+            };
             return replaced_fragment(
                 id,
                 &style,
                 content.image.clone(),
                 (x, y),
-                ((width - extra_x).max(0.0), (height - extra_y).max(0.0)),
+                (inner_width, inner_height),
                 width,
             );
         }
 
         let padding = resolve_padding(&style, width);
         let border = resolve_border(&style);
+        let frame = Frame::new(padding, border);
 
-        let content_width =
-            (width - padding.left - padding.right - border.left - border.right).max(0.0);
+        let content_width = (width - frame.inline).max(0.0);
         let content_x = x + border.left + padding.left;
         let content_y = y + border.top + padding.top;
 
-        let mut children = Vec::new();
-        let content_height =
-            self.layout_inside(id, content_width, content_x, content_y, &mut children);
-
         // A height of its own is the height it gets, whatever it holds — an item
-        // that overflows the size it asked for is what CSS says happens. Without
-        // one, the container's figure is a floor rather than the answer: it is
-        // where `stretch` put it, and content taller than that still fits.
-        let outer_height = match self.asked_height(&style) {
-            Some(_) => height,
-            None => height
-                .max(content_height + padding.top + padding.bottom + border.top + border.bottom),
+        // that overflows the size it asked for is what CSS says happens — and a
+        // percentage inside it is of that height.
+        let height = match height {
+            ItemHeight::AtLeast(floor) => match self.asked_height(&style, width) {
+                Some(_) => ItemHeight::Exactly {
+                    height: floor,
+                    definite: true,
+                },
+                None => ItemHeight::AtLeast(floor),
+            },
+            exactly @ ItemHeight::Exactly { .. } => exactly,
         };
+        let definite = match height {
+            ItemHeight::Exactly {
+                height,
+                definite: true,
+            } => Some((height - frame.block).max(0.0)),
+            ItemHeight::Exactly {
+                definite: false, ..
+            }
+            | ItemHeight::AtLeast(_) => None,
+        };
+        let mut children = Vec::new();
+        let content_height = self.layout_inside(
+            id,
+            content_width,
+            content_x,
+            content_y,
+            definite,
+            &mut children,
+        );
+        let outer_height = match height {
+            ItemHeight::Exactly { height, .. } => height,
+            ItemHeight::AtLeast(floor) => {
+                let content_height = self.content_height(id, content_height);
+                let held = self
+                    .block_sizes_of(&style, width, Some(content_height))
+                    .used(content_height);
+                floor.max(held + frame.block)
+            }
+        };
+
+        // What does not fit is cut off at the padding edge, and scrolls, when
+        // `overflow` says so — which down a column that has shared out a
+        // height of its own is most of what `min-height: 0` is written for.
+        if style.overflow == otlyra_css::Overflow::Clip {
+            let padding_box = Rect::new(
+                x + border.left,
+                y + border.top,
+                (width - border.left - border.right).max(0.0),
+                (outer_height - border.top - border.bottom).max(0.0),
+            );
+            self.clip_overflow(id, padding_box, padding, &mut children);
+        }
 
         Fragment {
             used: Some(crate::UsedEdges {
@@ -623,17 +824,7 @@ impl<'a> Flow<'a> {
                 border,
                 padding,
             }),
-            box_id: Some(id),
-            rect: Rect::new(x, y, width, outer_height),
-            kind: FragmentKind::Box,
-            style,
-            widget: None,
-            fixed: false,
-            scroll_port: None,
-            clip: None,
-            sticky: None,
-            layer: Layer::default(),
-            children,
+            ..Fragment::for_box(id, Rect::new(x, y, width, outer_height), style, children)
         }
     }
 }

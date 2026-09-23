@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use otlyra_layout::{Viewport, build_styled_box_tree, layout};
+use otlyra_layout::{Viewport, build_box_tree, layout};
 use otlyra_text::TextEngine;
 
 /// How many frames after the first to time.
@@ -72,7 +72,7 @@ fn main() {
     );
 
     let started = Instant::now();
-    let mut boxes = build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     println!("box tree     first {:>9.2?}", started.elapsed());
 
     let mut text = TextEngine::new();

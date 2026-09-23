@@ -3127,43 +3127,36 @@ fn round(value: f64) -> String {
 /// cascade is Stylo's and it knows, but it does not hand the winning declaration
 /// back with the value, so a pane that showed an origin would be inventing one.
 pub fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)> {
-    use otlyra_css::{Length, LengthOrAuto};
-
-    let length = |value: Length| match value {
-        Length::Px(px) => format!("{px}px"),
-        Length::Percent(percent) => format!("{}%", percent * 100.0),
-    };
-    let auto = |value: LengthOrAuto| match value {
-        LengthOrAuto::Px(px) => format!("{px}px"),
-        LengthOrAuto::Percent(percent) => format!("{}%", percent * 100.0),
-        LengthOrAuto::Auto => "auto".to_owned(),
-    };
-    let four = |sides: &otlyra_css::Sides<LengthOrAuto>| {
-        format!(
-            "{} {} {} {}",
-            auto(sides.top),
-            auto(sides.right),
-            auto(sides.bottom),
-            auto(sides.left)
-        )
-    };
-    let four_length = |sides: &otlyra_css::Sides<Length>| {
-        format!(
-            "{} {} {} {}",
-            length(sides.top),
-            length(sides.right),
-            length(sides.bottom),
-            length(sides.left)
-        )
+    // Every value is written the way a stylesheet writes it — a `calc()` as the
+    // expression, a keyword as the keyword — which is what the value types
+    // print themselves as.
+    let four = |sides: [&dyn std::fmt::Display; 4]| {
+        format!("{} {} {} {}", sides[0], sides[1], sides[2], sides[3])
     };
 
     let mut rows = vec![
         ("display", format!("{:?}", style.display).to_lowercase()),
         ("position", format!("{:?}", style.position).to_lowercase()),
-        ("width", auto(style.width)),
-        ("height", auto(style.height)),
-        ("margin", four(&style.margin)),
-        ("padding", four_length(&style.padding)),
+        ("width", style.width.to_string()),
+        ("height", style.height.to_string()),
+        (
+            "margin",
+            four([
+                &style.margin.top,
+                &style.margin.right,
+                &style.margin.bottom,
+                &style.margin.left,
+            ]),
+        ),
+        (
+            "padding",
+            four([
+                &style.padding.top,
+                &style.padding.right,
+                &style.padding.bottom,
+                &style.padding.left,
+            ]),
+        ),
         (
             "border-width",
             format!(
@@ -3225,10 +3218,7 @@ pub fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)
         style.display,
         otlyra_css::Display::Flex | otlyra_css::Display::Grid
     ) {
-        rows.push((
-            "gap",
-            format!("{} {}", length(style.gap.0), length(style.gap.1)),
-        ));
+        rows.push(("gap", format!("{} {}", style.gap.0, style.gap.1)));
     }
     rows
 }
@@ -3241,10 +3231,7 @@ pub fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)
 /// stylesheet, which is most of what a computed value is for.
 fn tracks(template: &[otlyra_css::Track], fill: Option<&[otlyra_css::Track]>) -> String {
     let one = |track: &otlyra_css::Track| match track {
-        otlyra_css::Track::Fixed(otlyra_css::Length::Px(px)) => format!("{px}px"),
-        otlyra_css::Track::Fixed(otlyra_css::Length::Percent(fraction)) => {
-            format!("{}%", fraction * 100.0)
-        }
+        otlyra_css::Track::Fixed(length) => length.to_string(),
         otlyra_css::Track::Fraction(share) => format!("{share}fr"),
         otlyra_css::Track::Auto => "auto".to_owned(),
     };
@@ -3411,25 +3398,19 @@ impl BoxEdges {
     /// side, vertically as well, which is what CSS says and what surprises
     /// everyone once.
     pub fn of(style: &otlyra_css::ComputedStyle, containing: Option<f64>) -> Self {
-        use otlyra_css::{Length, LengthOrAuto};
-        let percent = |fraction: f32| containing.unwrap_or(0.0) * f64::from(fraction);
-        let length = |value: Length| match value {
-            Length::Px(px) => f64::from(px),
-            Length::Percent(fraction) => percent(fraction),
-        };
+        // The style carries single precision, and a percentage of nothing known
+        // is taken against nothing.
+        let basis = containing.unwrap_or(0.0) as f32;
+        let length = |value: &otlyra_css::Length| f64::from(value.resolve(basis));
         // `auto` is resolved during layout and is not on the style. Nothing is
         // drawn for it rather than a number nobody computed.
-        let auto = |value: LengthOrAuto| match value {
-            LengthOrAuto::Px(px) => f64::from(px),
-            LengthOrAuto::Percent(fraction) => percent(fraction),
-            LengthOrAuto::Auto => 0.0,
-        };
+        let auto = |value: &otlyra_css::LengthOrAuto| value.resolve(basis).map_or(0.0, f64::from);
         Self {
             margin: (
-                auto(style.margin.left),
-                auto(style.margin.top),
-                auto(style.margin.right),
-                auto(style.margin.bottom),
+                auto(&style.margin.left),
+                auto(&style.margin.top),
+                auto(&style.margin.right),
+                auto(&style.margin.bottom),
             ),
             border: (
                 f64::from(style.border.left.width),
@@ -3438,10 +3419,10 @@ impl BoxEdges {
                 f64::from(style.border.bottom.width),
             ),
             padding: (
-                length(style.padding.left),
-                length(style.padding.top),
-                length(style.padding.right),
-                length(style.padding.bottom),
+                length(&style.padding.left),
+                length(&style.padding.top),
+                length(&style.padding.right),
+                length(&style.padding.bottom),
             ),
         }
     }
@@ -3817,10 +3798,7 @@ mod tests {
             })
         );
         assert_eq!(
-            document
-                .get(paragraph)
-                .and_then(|node| node.element())
-                .and_then(|element| element.attr("id")),
+            document.attr(paragraph, "id"),
             Some("one"),
             "the panel reads; setting it is the browser's"
         );

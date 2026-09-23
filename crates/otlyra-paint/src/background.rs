@@ -131,7 +131,7 @@ fn background_extent(
     let (own_width, own_height) = own;
     let ratio = own_width / own_height.max(1.0);
 
-    match layer.size {
+    match &layer.size {
         otlyra_css::BackgroundSize::Auto => (own_width, own_height),
         otlyra_css::BackgroundSize::Fixed(width, height) => {
             (width.resolve(area.width), height.resolve(area.height))

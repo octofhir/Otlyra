@@ -1,8 +1,11 @@
 //! Computed values: what an element's style is once every question is answered.
 
+use std::fmt;
 use std::sync::Arc;
 
 use peniko::Color;
+
+pub use crate::calc::Calc;
 
 /// The `display` values we model.
 ///
@@ -145,49 +148,194 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
-/// A length, or `auto`.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum LengthOrAuto {
+/// A `<length-percentage>`: what padding, a border radius, a gap and every
+/// sizing property that names a size come to once the cascade has done what it
+/// can.
+///
+/// The cascade settles every absolute unit and every `em`; what it cannot settle
+/// is a percentage, because what it is a percentage *of* is decided by layout. A
+/// value that mixes the two — `calc(100% - 16px)`, `min(100%, 18rem)` — is kept as
+/// the expression, and resolved the same way a bare percentage is: against a
+/// basis, when layout has one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Length {
     /// An absolute length in CSS pixels.
     Px(f32),
-    /// A fraction of the containing block, 0–1 rather than 0–100.
+    /// A fraction of the basis, 0–1 rather than 0–100. For padding and margins
+    /// that is the containing block's *width*, as CSS requires even vertically.
     Percent(f32),
+    /// A math function with a percentage in it.
+    Calc(Calc),
+}
+
+impl Length {
+    /// Zero.
+    pub const ZERO: Self = Self::Px(0.0);
+
+    /// Resolve against a basis — the size a percentage is of.
+    pub fn resolve(&self, basis: f32) -> f32 {
+        match self {
+            Self::Px(px) => *px,
+            Self::Percent(fraction) => fraction * basis,
+            Self::Calc(calc) => calc.resolve(basis),
+        }
+    }
+
+    /// Resolve against a basis that may not be known yet, or `None` when this
+    /// needs one and there is none.
+    ///
+    /// The one rule behind two that CSS states separately. A percentage height
+    /// against a containing block whose height depends on its content computes to
+    /// `auto` (CSS 2.2 §10.5); and while a box's intrinsic size is being measured,
+    /// a percentage of the size being measured is *cyclic* and the property is
+    /// taken as its initial value (CSS Sizing 3 §5.2.1). Both are a percentage of
+    /// something that is not known, and a `calc()` with a percentage anywhere in
+    /// it is one — which is why this asks whether the value needs a basis rather
+    /// than whether it is a bare percentage.
+    pub fn definite(&self, basis: Option<f32>) -> Option<f32> {
+        match self {
+            Self::Px(px) => Some(*px),
+            Self::Percent(_) | Self::Calc(_) => basis.map(|basis| self.resolve(basis)),
+        }
+    }
+}
+
+impl fmt::Display for Length {
+    /// The value as a stylesheet would write it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Px(px) => write!(formatter, "{px}px"),
+            Self::Percent(fraction) => write!(formatter, "{}%", fraction * 100.0),
+            Self::Calc(calc) => calc.fmt(formatter),
+        }
+    }
+}
+
+/// A length, or `auto`: a margin or an inset.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LengthOrAuto {
+    /// A length or a percentage of the containing block.
+    Length(Length),
     /// `auto`: the used value is worked out during layout.
     Auto,
 }
 
 impl LengthOrAuto {
+    /// Zero, which is where a margin starts.
+    pub const ZERO: Self = Self::Length(Length::ZERO);
+
     /// Resolve against a containing-block size, or `None` for `auto`.
-    pub fn resolve(self, containing: f32) -> Option<f32> {
+    pub fn resolve(&self, containing: f32) -> Option<f32> {
         match self {
-            Self::Px(px) => Some(px),
-            Self::Percent(fraction) => Some(fraction * containing),
+            Self::Length(length) => Some(length.resolve(containing)),
             Self::Auto => None,
         }
     }
 }
 
-/// A length that cannot be `auto` — padding and borders.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Length {
-    /// An absolute length in CSS pixels.
-    Px(f32),
-    /// A fraction of the containing block's *width*, as CSS requires even
-    /// vertically.
-    Percent(f32),
-}
-
-impl Length {
-    /// Resolve against a containing-block size.
-    pub fn resolve(self, containing: f32) -> f32 {
+impl fmt::Display for LengthOrAuto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Px(px) => px,
-            Self::Percent(fraction) => fraction * containing,
+            Self::Length(length) => length.fmt(formatter),
+            Self::Auto => formatter.write_str("auto"),
         }
     }
+}
 
-    /// Zero.
-    pub const ZERO: Self = Self::Px(0.0);
+/// The sizes CSS Sizing 3 §3.2 takes from a box's own content rather than from
+/// a number: what `min-content`, `max-content` and `fit-content` ask for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Intrinsic {
+    /// As narrow as the box can be without its content spilling: its longest
+    /// word, its widest picture.
+    MinContent,
+    /// As wide as its content is with nothing wrapped.
+    MaxContent,
+    /// Its max-content size where that fits, its min-content size where even that
+    /// does not, and the room in between otherwise. `None` is the keyword, which
+    /// fits into the room available; `Some` is `fit-content(<length-percentage>)`,
+    /// which fits into the length it names instead.
+    FitContent(Option<Length>),
+}
+
+impl fmt::Display for Intrinsic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MinContent => formatter.write_str("min-content"),
+            Self::MaxContent => formatter.write_str("max-content"),
+            Self::FitContent(None) => formatter.write_str("fit-content"),
+            Self::FitContent(Some(limit)) => write!(formatter, "fit-content({limit})"),
+        }
+    }
+}
+
+/// `width`, `height`, `min-width` and `min-height`, in every value CSS Sizing 3
+/// gives them.
+///
+/// One type for the preferred size and the minimum, because CSS gives them one
+/// grammar. What `auto` *means* is the difference: a preferred size of `auto` is
+/// worked out by the formatting context, and a minimum of `auto` is the
+/// automatic minimum — zero for almost every box, and for a flex item the size
+/// its content cannot go below (CSS Flexbox §4.5). Keeping `auto` apart from a
+/// length of zero is what lets `min-width: 0` turn that minimum off.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Size {
+    /// `auto`.
+    Auto,
+    /// A length or a percentage, measured across the box `box-sizing` names.
+    Length(Length),
+    /// A size taken from the content.
+    Intrinsic(Intrinsic),
+    /// `stretch`, and its older spelling `-webkit-fill-available`: as large as
+    /// the containing block allows once the box's own margins are taken out
+    /// (CSS Sizing 4).
+    Stretch,
+}
+
+impl fmt::Display for Size {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::Length(length) => length.fmt(formatter),
+            Self::Intrinsic(keyword) => keyword.fmt(formatter),
+            Self::Stretch => formatter.write_str("stretch"),
+        }
+    }
+}
+
+/// `max-width` and `max-height`, where `none` is no limit at all rather than a
+/// very large one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MaxSize {
+    /// `none`.
+    None,
+    /// A length or a percentage, measured across the box `box-sizing` names.
+    Length(Length),
+    /// A limit taken from the content.
+    Intrinsic(Intrinsic),
+    /// `stretch`: no larger than the containing block allows.
+    Stretch,
+}
+
+impl fmt::Display for MaxSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => formatter.write_str("none"),
+            Self::Length(length) => length.fmt(formatter),
+            Self::Intrinsic(keyword) => keyword.fmt(formatter),
+            Self::Stretch => formatter.write_str("stretch"),
+        }
+    }
+}
+
+/// `flex-basis`: the size a flex item starts from before the line is shared out.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlexBasis {
+    /// `content`: the size of what is in the item, whatever its `width` says.
+    Content,
+    /// Anything `width` can be. `auto` is not a size of its own here: it defers
+    /// to the item's `width` or `height`, whichever is along the main axis.
+    Size(Size),
 }
 
 /// The four sides of a box, in CSS order.
@@ -203,24 +351,14 @@ pub struct Sides<T> {
     pub left: T,
 }
 
-impl<T: Copy> Sides<T> {
+impl<T: Clone> Sides<T> {
     /// The same value on all four sides.
-    pub const fn all(value: T) -> Self {
+    pub fn all(value: T) -> Self {
         Self {
-            top: value,
-            right: value,
-            bottom: value,
+            top: value.clone(),
+            right: value.clone(),
+            bottom: value.clone(),
             left: value,
-        }
-    }
-
-    /// Vertical and horizontal, as the two-value CSS shorthand.
-    pub const fn axes(vertical: T, horizontal: T) -> Self {
-        Self {
-            top: vertical,
-            right: horizontal,
-            bottom: vertical,
-            left: horizontal,
         }
     }
 }
@@ -317,7 +455,7 @@ pub enum BorderCollapse {
 /// Kept as the steps rather than multiplied into one matrix, because a percentage
 /// in a `translate()` is of the box's own size and the box is not measured until
 /// layout has run. The rasterizer resolves them against the box it is drawing.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TransformOp {
     /// Move, each axis a length or a fraction of the box's own size.
     Translate(Length, Length),
@@ -332,7 +470,7 @@ pub enum TransformOp {
 }
 
 /// Where a `transform` is applied from: the point the box turns and grows about.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TransformOrigin {
     /// Across the box.
     pub x: Length,
@@ -363,7 +501,7 @@ pub enum TextAlign {
 
 /// `background-size`, in the three shapes that mean something without a full
 /// two-value model behind them.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BackgroundSize {
     /// The picture's own size.
     Auto,
@@ -381,7 +519,7 @@ pub enum BackgroundSize {
 /// box on the line has been placed — and where they are placed depends on how tall
 /// the line is. Resolving that needs a second pass over the line, so they are left
 /// on the baseline rather than guessed at.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum VerticalAlign {
     /// On the parent's baseline. The initial value, and almost every box.
     Baseline,
@@ -389,10 +527,10 @@ pub enum VerticalAlign {
     Sub,
     /// Raised to where it puts a superscript.
     Super,
-    /// Raised by a length of its own, in CSS pixels; negative lowers.
-    Length(f32),
-    /// Raised by a fraction of the element's own `line-height`.
-    Percent(f32),
+    /// Raised by a length of its own; negative lowers. A percentage in it is of
+    /// the element's own `line-height`, which is the one place a percentage in
+    /// CSS is not of the containing block.
+    Shift(Length),
     /// Top edge against the line box's top edge.
     Top,
     /// Bottom edge against the line box's bottom edge.
@@ -414,7 +552,7 @@ impl VerticalAlign {
     /// five are worked out once, where the fonts are already in hand, and read
     /// back when the glyphs are placed — so nothing works them out twice and
     /// gets two answers.
-    pub fn resolved_while_levelling(self) -> bool {
+    pub fn resolved_while_levelling(&self) -> bool {
         matches!(
             self,
             Self::Top | Self::Bottom | Self::Middle | Self::TextTop | Self::TextBottom
@@ -520,60 +658,34 @@ impl BackgroundRepeat {
     };
 }
 
-/// One axis of `background-position`: a fraction of the room the picture leaves
-/// in its box, plus a length.
+/// `background-position`, one length per axis.
 ///
-/// Both parts at once, because CSS needs both: `50%` is half of what is left over
-/// rather than half the box, and `right 10px` computes to a percentage *and* an
-/// offset. A percentage of nothing left over is nothing, which is why a picture as
-/// large as its box sits at the same place whatever the position says.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Anchor {
-    /// The fraction of the leftover room, 0–1 rather than 0–100.
-    pub fraction: f32,
-    /// A length added to it, in CSS pixels.
-    pub offset: f32,
-}
-
-impl Anchor {
-    /// The start edge, which is the initial value on both axes.
-    pub const START: Self = Self {
-        fraction: 0.0,
-        offset: 0.0,
-    };
-
-    /// Where the picture's own edge goes, given how much room it leaves.
-    pub fn resolve(self, free: f32) -> f32 {
-        self.fraction * free + self.offset
-    }
-}
-
-/// `background-position`, one anchor per axis.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Each is a length measured from the start edge, and a percentage in it is of
+/// the room the picture *leaves* in its box rather than of the box: `50%` is half
+/// of what is left over, and `right 10px` computes to `calc(100% - 10px)`. A
+/// percentage of nothing left over is nothing, which is why a picture as large as
+/// its box sits at the same place whatever the position says. So the value is
+/// resolved against that leftover room, and a `calc()` in it — `min()` and
+/// `clamp()` included — is resolved exactly as it is anywhere else.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackgroundPosition {
     /// Across.
-    pub x: Anchor,
+    pub x: Length,
     /// Down.
-    pub y: Anchor,
+    pub y: Length,
 }
 
 impl BackgroundPosition {
     /// The initial value: the box's own top left corner.
     pub const START: Self = Self {
-        x: Anchor::START,
-        y: Anchor::START,
+        x: Length::Percent(0.0),
+        y: Length::Percent(0.0),
     };
 
     /// The middle of the box, which is where `object-position` starts.
     pub const CENTER: Self = Self {
-        x: Anchor {
-            fraction: 0.5,
-            offset: 0.0,
-        },
-        y: Anchor {
-            fraction: 0.5,
-            offset: 0.0,
-        },
+        x: Length::Percent(0.5),
+        y: Length::Percent(0.5),
     };
 }
 
@@ -659,7 +771,7 @@ impl Placement {
 }
 
 /// One track of a grid: a column's width or a row's height.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Track {
     /// A length or a percentage of the container.
     Fixed(Length),
@@ -670,7 +782,7 @@ pub enum Track {
 }
 
 /// The four corner radii of a box, in CSS order.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Corners {
     /// Top left.
     pub top_left: Length,
@@ -694,12 +806,12 @@ impl Corners {
     /// Whether any corner is rounded.
     pub fn any(&self) -> bool {
         [
-            self.top_left,
-            self.top_right,
-            self.bottom_right,
-            self.bottom_left,
+            &self.top_left,
+            &self.top_right,
+            &self.bottom_right,
+            &self.bottom_left,
         ]
-        .iter()
+        .into_iter()
         .any(|corner| *corner != Length::ZERO)
     }
 }
@@ -828,16 +940,6 @@ impl TextDecoration {
     pub const NONE: Self = Self {
         underline: false,
         line_through: false,
-    };
-    /// `underline`.
-    pub const UNDERLINE: Self = Self {
-        underline: true,
-        line_through: false,
-    };
-    /// `line-through`.
-    pub const LINE_THROUGH: Self = Self {
-        underline: false,
-        line_through: true,
     };
 
     /// Whether anything is drawn.
@@ -975,19 +1077,18 @@ pub struct ComputedStyle {
     /// cannot express yet (`text-decoration: none` on a child).
     pub text_decoration: TextDecoration,
     /// `width`.
-    pub width: LengthOrAuto,
+    pub width: Size,
     /// `height`.
-    pub height: LengthOrAuto,
+    pub height: Size,
     /// `min-width`, which floors whatever `width` resolves to.
-    pub min_width: Length,
-    /// `max-width`, or `None` for `none`. This is what holds a page's text column
-    /// to a readable measure, so it is the one of the four that shows on nearly
-    /// every real page.
-    pub max_width: Option<Length>,
+    pub min_width: Size,
+    /// `max-width`. This is what holds a page's text column to a readable
+    /// measure, so it is the one of the four that shows on nearly every real page.
+    pub max_width: MaxSize,
     /// `min-height`.
-    pub min_height: Length,
-    /// `max-height`, or `None` for `none`.
-    pub max_height: Option<Length>,
+    pub min_height: Size,
+    /// `max-height`.
+    pub max_height: MaxSize,
     /// `float`.
     pub float: Float,
     /// `clear`.
@@ -1038,8 +1139,8 @@ pub struct ComputedStyle {
     pub flex_grow: f32,
     /// `flex-shrink`.
     pub flex_shrink: f32,
-    /// `flex-basis`, or `None` for `auto` — take the item's own size.
-    pub flex_basis: Option<LengthOrAuto>,
+    /// `flex-basis`.
+    pub flex_basis: FlexBasis,
     /// `row-gap` and `column-gap`, which a flex container puts between its items.
     pub gap: (Length, Length),
 }
@@ -1079,16 +1180,16 @@ impl Default for ComputedStyle {
             white_space: WhiteSpace::Collapse,
             text_wrap: TextWrap::Wrap,
             text_decoration: TextDecoration::NONE,
-            margin: Sides::all(LengthOrAuto::Px(0.0)),
+            margin: Sides::all(LengthOrAuto::ZERO),
             padding: Sides::all(Length::ZERO),
             border: Sides::all(Border::NONE),
             text_align: TextAlign::Start,
-            width: LengthOrAuto::Auto,
-            height: LengthOrAuto::Auto,
-            min_width: Length::ZERO,
-            max_width: None,
-            min_height: Length::ZERO,
-            max_height: None,
+            width: Size::Auto,
+            height: Size::Auto,
+            min_width: Size::Auto,
+            max_width: MaxSize::None,
+            min_height: Size::Auto,
+            max_height: MaxSize::None,
             float: Float::None,
             clear: Clear::None,
             position: Position::Static,
@@ -1110,7 +1211,7 @@ impl Default for ComputedStyle {
             order: 0,
             flex_grow: 0.0,
             flex_shrink: 1.0,
-            flex_basis: None,
+            flex_basis: FlexBasis::Size(Size::Auto),
             gap: (Length::ZERO, Length::ZERO),
         }
     }
@@ -1120,9 +1221,10 @@ impl ComputedStyle {
     /// A style that inherits from `parent` everything CSS says is inherited, and
     /// takes the initial value for everything else.
     ///
-    /// This is the whole of inheritance for now: there is no cascade to inherit
-    /// *through* until M8, but a heading inside a body still has to know what
-    /// colour and font it sits in.
+    /// For the boxes no element generated: an anonymous box has no style of its
+    /// own for the cascade to have computed, and inherits what it can from the
+    /// box around it (CSS 2 §9.2.1.1). An element's style is the cascade's, which
+    /// does its own inheriting.
     pub fn inheriting_from(parent: &Self) -> Self {
         Self {
             text_shadows: parent.text_shadows.clone(),
@@ -1169,7 +1271,7 @@ mod tests {
             color: Color::from_rgb8(1, 2, 3),
             font_size: 24.0,
             display: Display::Block,
-            margin: Sides::all(LengthOrAuto::Px(10.0)),
+            margin: Sides::all(LengthOrAuto::Length(Length::Px(10.0))),
             ..ComputedStyle::default()
         };
 
@@ -1179,7 +1281,7 @@ mod tests {
         assert_eq!(child.display, Display::Inline, "display does not inherit");
         assert_eq!(
             child.margin.top,
-            LengthOrAuto::Px(0.0),
+            LengthOrAuto::ZERO,
             "margin does not inherit"
         );
     }
@@ -1195,9 +1297,24 @@ mod tests {
 
     #[test]
     fn percentages_resolve_against_the_containing_block() {
-        assert_eq!(LengthOrAuto::Percent(0.5).resolve(200.0), Some(100.0));
-        assert_eq!(LengthOrAuto::Px(30.0).resolve(200.0), Some(30.0));
+        assert_eq!(
+            LengthOrAuto::Length(Length::Percent(0.5)).resolve(200.0),
+            Some(100.0)
+        );
+        assert_eq!(
+            LengthOrAuto::Length(Length::Px(30.0)).resolve(200.0),
+            Some(30.0)
+        );
         assert_eq!(LengthOrAuto::Auto.resolve(200.0), None);
         assert_eq!(Length::Percent(0.25).resolve(200.0), 50.0);
+    }
+
+    /// A length needs no basis, and a percentage of a size nobody knows is no
+    /// size at all — which is the whole of what `definite` decides.
+    #[test]
+    fn a_percentage_of_an_unknown_size_is_not_a_size() {
+        assert_eq!(Length::Px(30.0).definite(None), Some(30.0));
+        assert_eq!(Length::Percent(0.5).definite(None), None);
+        assert_eq!(Length::Percent(0.5).definite(Some(300.0)), Some(150.0));
     }
 }

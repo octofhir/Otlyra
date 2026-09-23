@@ -103,13 +103,20 @@ pub struct Control {
     pub level: Level,
     /// The colour a colour well holds, which is the whole of what it shows.
     pub swatch: Option<[u8; 3]>,
-    /// Whether the widget's own size has already been written into the style.
+    /// The size the widget takes when nothing says otherwise, once layout has
+    /// worked it out: `None` until then, and for a control that is not drawn as a
+    /// widget.
     ///
-    /// Layout runs many times over one box tree — every resize, every scroll that
-    /// needs one — and the room a drop-down leaves for its arrow is *added* to the
-    /// padding rather than replacing it. Without this it is added again on every
-    /// pass, and the control grows twenty pixels a frame.
-    pub sized: bool,
+    /// Kept as well as written into the style, because a `width` of `auto` is not
+    /// the only thing that asks for it: `min-content`, `max-content` and
+    /// `fit-content` are a control's natural size too (CSS Sizing 3 §5.1), as a
+    /// size and as a limit alike, and what its text children come to is not.
+    ///
+    /// And settled once: layout runs many times over one box tree — every resize,
+    /// every scroll that needs one — and the room a drop-down leaves for its arrow
+    /// is *added* to the padding rather than replacing it. Worked out again on
+    /// every pass, it is added again, and the control grows twenty pixels a frame.
+    pub natural: Option<NaturalSize>,
     /// How far the text inside has been slid out of sight, left and up.
     ///
     /// A field is one line long however much is typed into it and a text area is
@@ -118,6 +125,20 @@ pub struct Control {
     /// only the thing holding the caret knows — so it is written in from outside
     /// rather than worked out here.
     pub scroll: (f32, f32),
+}
+
+/// The size a widget prefers when nothing has said otherwise: what CSS calls its
+/// natural size, in CSS pixels across its content box.
+///
+/// `None` along an axis the widget has no opinion about. A button is as wide as
+/// its label and a drop-down as its option, so those are measured from what they
+/// hold like any other box.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NaturalSize {
+    /// Across.
+    pub width: Option<f32>,
+    /// Down.
+    pub height: Option<f32>,
 }
 
 /// The part of a control's state that changes what is drawn.
@@ -238,6 +259,16 @@ impl BoxNode {
             )
     }
 
+    /// The size a widget takes when nothing says otherwise, along whichever axes
+    /// it has one: none at all for a box that is not a widget, or whose widget
+    /// layout has not sized yet.
+    pub fn natural_size(&self) -> NaturalSize {
+        self.control
+            .as_ref()
+            .and_then(|control| control.natural)
+            .unwrap_or_default()
+    }
+
     /// Whether this box is inline-level.
     pub fn is_inline_level(&self) -> bool {
         match &self.kind {
@@ -323,14 +354,31 @@ pub struct BoxTree {
     columns: SecondaryMap<BoxId, Vec<Arc<ComputedStyle>>>,
 }
 
-impl BoxTree {
-    /// A tree with a single root box carrying `style`.
-    pub fn new(style: Arc<ComputedStyle>) -> Self {
+/// The style of the root box, which no element generated.
+///
+/// The initial containing block is not an element, so nothing cascades onto it
+/// and there is nothing above it to inherit from: it has the initial value of
+/// every property, and is a block because a containing block is one (CSS 2
+/// §10.1). What a page's text inherits comes from `<html>`, which the cascade
+/// did style — and what is drawn behind the page is the canvas, which paint
+/// takes from the root element rather than from here.
+fn initial_containing_block() -> ComputedStyle {
+    ComputedStyle {
+        display: otlyra_css::Display::Block,
+        ..ComputedStyle::default()
+    }
+}
+
+impl Default for BoxTree {
+    /// A tree with nothing in it but its root, the initial containing block:
+    /// what every tree is built up from, and all a document has before any of it
+    /// has been styled.
+    fn default() -> Self {
         let mut boxes = SlotMap::with_key();
         let root = boxes.insert(BoxNode {
             kind: BoxKind::Block,
             control: None,
-            style,
+            style: Arc::new(initial_containing_block()),
             node: None,
             tag: None,
             anonymous: false,
@@ -346,7 +394,9 @@ impl BoxTree {
             columns: SecondaryMap::new(),
         }
     }
+}
 
+impl BoxTree {
     /// Record how far a table cell reaches.
     pub fn set_span(&mut self, id: BoxId, span: CellSpan) {
         self.spans.insert(id, span);
@@ -481,12 +531,12 @@ impl BoxTree {
         })
     }
 
-    /// Note that a control's widget size has been settled.
-    pub fn mark_sized(&mut self, id: BoxId) {
+    /// Keep the natural size a control's widget was settled at.
+    pub fn set_natural_size(&mut self, id: BoxId, natural: NaturalSize) {
         if let Some(node) = self.boxes.get_mut(id)
             && let Some(control) = node.control.as_mut()
         {
-            control.sized = true;
+            control.natural = Some(natural);
         }
     }
 

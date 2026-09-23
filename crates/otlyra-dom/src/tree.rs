@@ -90,6 +90,24 @@ impl Document {
         &self.nodes[id]
     }
 
+    /// One attribute of the element `id`, by local name, in no namespace.
+    ///
+    /// `None` when `id` is stale, is not an element, or has no such attribute.
+    /// No namespace, because that is where every attribute HTML defines is. A
+    /// prefixed one — `xlink:href`, `xml:lang` — is put in a namespace of its own
+    /// by the parser (HTML §13.2.6.1, "adjust foreign attributes") and is a
+    /// different attribute that shares a local name, which a lookup by local
+    /// name alone would mistake for the one asked for.
+    pub fn attr(&self, id: NodeId, local_name: &str) -> Option<&str> {
+        self.get(id)?.element()?.attr(local_name)
+    }
+
+    /// Where the element `id` links to, if it is a link; see
+    /// [`ElementData::link_href`](crate::node::ElementData::link_href).
+    pub fn link_href(&self, id: NodeId) -> Option<&str> {
+        self.get(id)?.element()?.link_href()
+    }
+
     /// How many nodes the document holds.
     pub fn len(&self) -> usize {
         self.nodes.len()

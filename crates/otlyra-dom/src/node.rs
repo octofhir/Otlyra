@@ -89,10 +89,32 @@ pub fn node_id_from_u64(raw: u64) -> NodeId {
 impl ElementData {
     /// One attribute's value, by local name, in no namespace.
     pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attr_in(&html5ever::ns!(), name)
+    }
+
+    /// One attribute's value, by namespace and local name — for the few a
+    /// document writes with a prefix, such as `xlink:href`.
+    pub fn attr_in(&self, namespace: &html5ever::Namespace, name: &str) -> Option<&str> {
         self.attrs
             .iter()
-            .find(|attr| attr.name.ns == html5ever::ns!() && attr.name.local.as_ref() == name)
+            .find(|attr| attr.name.ns == *namespace && attr.name.local.as_ref() == name)
             .map(|attr| attr.value.as_ref())
+    }
+
+    /// Where the element links to, if it is a link.
+    ///
+    /// An HTML `<a>` or `<area>` with an `href` (HTML §4.6.1), and an SVG `<a>`
+    /// with one — as `href` (SVG 2 §16.2) or as `xlink:href`, the SVG 1.1
+    /// spelling every drawing program still exports. An `<a>` without one is a
+    /// place in the page rather than a way out of it, and is not a link.
+    pub fn link_href(&self) -> Option<&str> {
+        match (&self.name.ns, self.name.local.as_ref()) {
+            (&html5ever::ns!(html), "a" | "area") => self.attr("href"),
+            (&html5ever::ns!(svg), "a") => self
+                .attr("href")
+                .or_else(|| self.attr_in(&html5ever::ns!(xlink), "href")),
+            _ => None,
+        }
     }
 
     /// The element's `id`, if it has one.

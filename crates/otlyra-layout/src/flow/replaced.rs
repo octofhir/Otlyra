@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
-use otlyra_css::ComputedStyle;
+use otlyra_css::{ComputedStyle, Size};
 
-use crate::box_tree::BoxId;
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::box_tree::{BoxId, Replaced};
+use crate::fragment::{Fragment, FragmentKind, Rect};
 
-use super::box_model::{clamp, content_from, content_height_from, resolve_border, resolve_padding};
+use super::box_model::{resolve_border, resolve_padding};
+use super::sizing::{
+    Frame, InlineRoom, Limits, OwnWidth, Sizes, block_sizes_in, content_box, replaced_widths,
+};
 
 /// The size a replaced box is drawn at: its *content* box, which is the picture
 /// and not the frame around it.
@@ -25,52 +28,212 @@ use super::box_model::{clamp, content_from, content_height_from, resolve_border,
 /// the ratio is applied to what is left: a hundred-pixel box with a ten-pixel
 /// border holds eighty pixels of picture, and a two-to-one picture is forty tall
 /// rather than fifty. The presentational `width` attribute goes through the same
-/// door, because it is a rule setting `width` and nothing more.
+/// door, because it is a rule setting `width` and nothing more; and so do the
+/// minimum and the maximum, which hold the picture rather than its frame.
+///
+/// The sizing properties are read as they are for any box (see
+/// [`replaced_widths`] for what is particular to a picture), and a given
+/// dimension is held between its limits *before* the other is taken from it, so
+/// a maximum narrows a picture rather than squashing it. `containing_height` is
+/// what a percentage `height` is of, when there is one.
 pub(super) fn replaced_size(
     style: &ComputedStyle,
-    content: &crate::box_tree::Replaced,
-    containing: f32,
+    content: &Replaced,
+    room: InlineRoom,
+    containing_height: Option<f32>,
 ) -> (f32, f32) {
-    let intrinsic = content.intrinsic;
-    let ratio = intrinsic.and_then(|(width, height)| (height > 0.0).then(|| width / height));
-    let padding = resolve_padding(style, containing);
-    let border = resolve_border(style);
-
-    // A stylesheet first, then the attribute that stands in for one. Either way
-    // a dimension that is given takes the other from the ratio below, so naming
-    // one never squashes the picture.
-    let width = style
-        .width
-        .resolve(containing)
-        .or(content.hint.0)
-        .map(|width| content_from(width, style, padding, border));
-    let height = style
-        .height
-        .resolve(containing)
-        .or(content.hint.1)
-        .map(|height| content_height_from(height, style, padding, border));
-
-    let (width, height) = match (width, height) {
-        (Some(width), Some(height)) => (width, height),
-        (Some(width), None) => (width, ratio.map_or(0.0, |ratio| width / ratio)),
-        (None, Some(height)) => (ratio.map_or(0.0, |ratio| height * ratio), height),
-        (None, None) => intrinsic.unwrap_or((0.0, 0.0)),
+    let frame = Frame::of(style, room.measure);
+    let heights = picture_heights(style, content, room.measure, containing_height);
+    let own = OwnWidth {
+        natural: width_from(content, heights),
+        hint: content.hint.0,
     };
+    let widths = replaced_widths(style, room, frame.inline, own);
+    drawn_size(content, widths, heights)
+}
 
-    (
-        clamp(width, style.min_width, style.max_width, containing),
-        clamp(height, style.min_height, style.max_height, containing),
+/// The content-box width a picture comes to with nothing said about its width:
+/// its own, or what its heights make of it through its ratio — which is its
+/// min-content and its max-content size alike (CSS Sizing 3 §5.1).
+///
+/// Measured without a containing block's height, since nobody measuring a
+/// width is asking about one: a percentage height is `auto` here.
+pub(super) fn natural_width(
+    style: &ComputedStyle,
+    content: &Replaced,
+    containing_width: f32,
+) -> f32 {
+    width_from(
+        content,
+        picture_heights(style, content, containing_width, None),
     )
 }
 
-/// How much wider and taller a replaced element's border box is than its picture.
-pub(super) fn replaced_edges(style: &ComputedStyle, containing: f32) -> (f32, f32) {
-    let padding = resolve_padding(style, containing);
-    let border = resolve_border(style);
-    (
-        padding.left + padding.right + border.left + border.right,
-        padding.top + padding.bottom + border.top + border.bottom,
-    )
+/// The content-box height of a picture drawn `width` wide, where the width is
+/// one its container settled rather than one the picture's own sizing
+/// properties asked for: a float or a positioned box that shrank to it, a grid
+/// cell, a flex line.
+///
+/// The height follows the width through the ratio and is held between its own
+/// limits (CSS 2.2 §10.6.2). Asking the picture's width percentages again
+/// would resolve them against the width they already came to — half of a
+/// picture that is already half of its column — and the height taken from that
+/// answer would squash the picture into a box it was never drawn to fill.
+pub(super) fn replaced_height(
+    style: &ComputedStyle,
+    content: &Replaced,
+    width: f32,
+    containing_width: f32,
+    containing_height: Option<f32>,
+) -> f32 {
+    let heights = picture_heights(style, content, containing_width, containing_height);
+    height_at(content, width, heights)
+}
+
+/// What `height`, `min-height` and `max-height` ask of a picture, as content-box
+/// heights, with a `height` attribute standing in for an `auto` height — and
+/// only for `auto`, since any height a stylesheet names outranks a hint.
+fn picture_heights(
+    style: &ComputedStyle,
+    content: &Replaced,
+    containing_width: f32,
+    containing_height: Option<f32>,
+) -> Sizes {
+    let (_, natural_height) = content.intrinsic.unwrap_or_default();
+    let heights = block_sizes_in(
+        style,
+        containing_width,
+        containing_height,
+        Some(natural_height),
+    );
+    match style.height {
+        Size::Auto => Sizes {
+            preferred: content.hint.1.map(|hint| {
+                content_box(
+                    hint,
+                    style.box_sizing,
+                    Frame::of(style, containing_width).block,
+                )
+            }),
+            ..heights
+        },
+        Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => heights,
+    }
+}
+
+/// A picture's width over its height, when it has both sides to take one from.
+fn ratio(content: &Replaced) -> Option<f32> {
+    content
+        .intrinsic
+        .and_then(|(width, height)| (width > 0.0 && height > 0.0).then_some(width / height))
+}
+
+/// The width a picture comes to when nothing is said about its width, from
+/// what is said about its height.
+fn width_from(content: &Replaced, heights: Sizes) -> f32 {
+    drawn_size(content, Sizes::AUTO, heights).0
+}
+
+/// The content-box height a picture drawn `width` wide comes to: what it asked
+/// for, or the width over its ratio, or its own height when it has no ratio —
+/// held between its limits.
+fn height_at(content: &Replaced, width: f32, heights: Sizes) -> f32 {
+    let (_, natural_height) = content.intrinsic.unwrap_or_default();
+    heights.used(ratio(content).map_or(natural_height, |ratio| width / ratio))
+}
+
+/// The content-box size a picture is drawn at, once its width and its height
+/// have been asked what they want.
+fn drawn_size(content: &Replaced, widths: Sizes, heights: Sizes) -> (f32, f32) {
+    let natural = content.intrinsic.unwrap_or_default();
+    match (widths.preferred, heights.preferred, ratio(content)) {
+        // CSS 2.2 §10.3.2: an `auto` width is the used height times the ratio —
+        // the height once its own limits have had their say.
+        (None, Some(height), Some(ratio)) => {
+            let height = heights.limits.clamp(height);
+            (widths.limits.clamp(height * ratio), height)
+        }
+        (None, None, Some(_)) => within_keeping_ratio(natural, widths.limits, heights.limits),
+        // And §10.6.2 the other way about: a width that is given, or one that
+        // is the picture's own because it has no ratio to take one from, is
+        // held between its limits before the height is taken from it.
+        (Some(_), _, _) | (None, _, None) => {
+            let width = widths.used(natural.0);
+            (width, height_at(content, width, heights))
+        }
+    }
+}
+
+/// Where a size stands against one dimension's limits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Against {
+    /// Wider or taller than the maximum.
+    Over,
+    /// Narrower or shorter than the minimum.
+    Under,
+    /// Between the two.
+    Within,
+}
+
+impl Against {
+    fn of(size: f32, limits: Limits) -> Self {
+        if size > limits.max {
+            Self::Over
+        } else if size < limits.min {
+            Self::Under
+        } else {
+            Self::Within
+        }
+    }
+}
+
+/// A picture whose `width` and `height` are both `auto`, held between its
+/// limits without losing its shape: the table in CSS 2.2 §10.4.
+///
+/// Held one dimension at a time, `img { max-width: 100% }` — the first rule of
+/// nearly every stylesheet on the web — draws an 800-by-400 picture in a
+/// 400-pixel column at 400 by 400. Taken through the ratio instead, the
+/// dimension that is out of bounds is brought in and the other follows it,
+/// unless following it would take *that* one out of its own bounds, where its
+/// limit wins and the shape gives. Where both are out of bounds the one that
+/// has further to go decides. A maximum below its minimum is the minimum, as it
+/// is everywhere else.
+///
+/// `natural` is the picture's own size, both sides of it above zero: that is
+/// what having a ratio means.
+fn within_keeping_ratio(natural: (f32, f32), widths: Limits, heights: Limits) -> (f32, f32) {
+    let (width, height) = natural;
+    let widths = Limits {
+        max: widths.max.max(widths.min),
+        ..widths
+    };
+    let heights = Limits {
+        max: heights.max.max(heights.min),
+        ..heights
+    };
+    // The height a width brings with it, and the width a height does.
+    let height_for = |across: f32| across * height / width;
+    let width_for = |down: f32| down * width / height;
+    let narrowed = || (widths.max, height_for(widths.max).max(heights.min));
+    let widened = || (widths.min, height_for(widths.min).min(heights.max));
+    let shortened = || (width_for(heights.max).max(widths.min), heights.max);
+    let lengthened = || (width_for(heights.min).min(widths.max), heights.min);
+
+    match (Against::of(width, widths), Against::of(height, heights)) {
+        (Against::Within, Against::Within) => natural,
+        (Against::Over, Against::Within) => narrowed(),
+        (Against::Under, Against::Within) => widened(),
+        (Against::Within, Against::Over) => shortened(),
+        (Against::Within, Against::Under) => lengthened(),
+        (Against::Over, Against::Over) if widths.max / width <= heights.max / height => narrowed(),
+        (Against::Over, Against::Over) => shortened(),
+        (Against::Under, Against::Under) if widths.min / width <= heights.min / height => {
+            lengthened()
+        }
+        (Against::Under, Against::Under) => widened(),
+        (Against::Under, Against::Over) => (widths.min, heights.max),
+        (Against::Over, Against::Under) => (widths.max, heights.min),
+    }
 }
 
 /// The fragment a replaced box becomes: a box the size of its border box, with
@@ -94,42 +257,28 @@ pub(super) fn replaced_fragment(
     let ((x, y), (width, height)) = (origin, content);
     let padding = resolve_padding(style, containing);
     let border = resolve_border(style);
-    let (extra_x, extra_y) = replaced_edges(style, containing);
+    let frame = Frame::new(padding, border);
 
-    let picture = image.map(|image| Fragment {
-        used: None,
-        // The element's own box carries the hit test; a second one over the
-        // picture would put two of them on the same element.
-        box_id: None,
-        rect: Rect::new(
-            x + border.left + padding.left,
-            y + border.top + padding.top,
-            width,
-            height,
-        ),
-        kind: FragmentKind::Image(image),
-        style: Arc::clone(style),
-        widget: None,
-        fixed: false,
-        scroll_port: None,
-        clip: None,
-        sticky: None,
-        layer: Layer::default(),
-        children: Vec::new(),
+    let picture = image.map(|image| {
+        Fragment::new(
+            // The element's own box carries the hit test; a second one over the
+            // picture would put two of them on the same element.
+            None,
+            Rect::new(
+                x + border.left + padding.left,
+                y + border.top + padding.top,
+                width,
+                height,
+            ),
+            FragmentKind::Image(image),
+            Arc::clone(style),
+        )
     });
 
-    Fragment {
-        used: None,
-        box_id: Some(id),
-        rect: Rect::new(x, y, width + extra_x, height + extra_y),
-        kind: FragmentKind::Box,
-        style: Arc::clone(style),
-        widget: None,
-        fixed: false,
-        scroll_port: None,
-        clip: None,
-        sticky: None,
-        layer: Layer::default(),
-        children: picture.into_iter().collect(),
-    }
+    Fragment::for_box(
+        id,
+        Rect::new(x, y, width + frame.inline, height + frame.block),
+        Arc::clone(style),
+        picture.into_iter().collect(),
+    )
 }

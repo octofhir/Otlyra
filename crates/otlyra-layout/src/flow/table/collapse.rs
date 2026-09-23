@@ -11,7 +11,7 @@ use otlyra_css::{ComputedStyle, Sides};
 
 use crate::box_tree::BoxId;
 use crate::flow::Flow;
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::fragment::{Fragment, FragmentKind, Rect};
 
 use super::Cell;
 
@@ -94,20 +94,12 @@ fn line_fragment(border: otlyra_css::Border, rect: Rect) -> Option<Fragment> {
         border: Sides::all(otlyra_css::Border::NONE),
         ..ComputedStyle::default()
     };
-    Some(Fragment {
-        used: None,
-        box_id: None,
+    Some(Fragment::new(
+        None,
         rect,
-        kind: FragmentKind::Box,
-        style: Arc::new(style),
-        widget: None,
-        fixed: false,
-        scroll_port: None,
-        clip: None,
-        sticky: None,
-        layer: Layer::default(),
-        children: Vec::new(),
-    })
+        FragmentKind::Box,
+        Arc::new(style),
+    ))
 }
 
 impl<'a> Flow<'a> {

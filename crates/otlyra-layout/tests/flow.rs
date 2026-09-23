@@ -8,9 +8,10 @@ use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree};
 use otlyra_layout::{Viewport, build_box_tree, dump, layout};
 use otlyra_text::{FontStack, TextEngine};
 
-/// Lay out `html` at `width` logical pixels, with the document's own stylesheets
-/// applied — which is what a `style=` attribute in a fixture needs.
-fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
+/// Lay out `html` at `width` logical pixels, styled by the cascade — the
+/// user-agent stylesheet and the document's own, which is what a `style=`
+/// attribute in a fixture needs.
+fn lay_out(html: &str, width: f32) -> FragmentTree {
     let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
     let styles = otlyra_css::cascade::style_document(
         &parsed.document,
@@ -22,22 +23,7 @@ fn lay_out_styled(html: &str, width: f32) -> FragmentTree {
             color_scheme: Default::default(),
         },
     );
-    let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
-    let mut text = isolated_engine();
-    layout(
-        &mut boxes,
-        &mut text,
-        Viewport {
-            width,
-            height: 600.0,
-        },
-    )
-}
-
-/// Lay out `html` at `width` logical pixels.
-fn lay_out(html: &str, width: f32) -> FragmentTree {
-    let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-    let mut boxes = build_box_tree(&parsed.document);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     let mut text = isolated_engine();
     layout(
         &mut boxes,
@@ -162,7 +148,8 @@ fn a_margin_separates_two_paragraphs() {
 
 #[test]
 fn padding_moves_content_inward_and_makes_the_box_larger() {
-    // <ul> is the one element in the UA table with padding: 40px on the left.
+    // <ul> is the one element here the user-agent stylesheet pads: 40px on the
+    // left, as HTML §15.3.7 has it.
     let tree = lay_out("<body><ul><li>item", 800.0);
     let list = tree
         .iter()
@@ -311,7 +298,7 @@ fn text_still_shapes_when_the_named_family_is_missing() {
 #[test]
 fn only_the_line_a_tall_thing_is_on_is_tall() {
     let paragraph = |markup: &str| {
-        let tree = lay_out_styled(
+        let tree = lay_out(
             &format!(
                 "<body style='margin:0'><p style='width:300px;margin:0;line-height:1.5'>\
                  one two three four five six seven {markup} eight nine ten eleven twelve \
@@ -526,7 +513,7 @@ fn cells_of(tree: &FragmentTree) -> Vec<&Fragment> {
 #[test]
 fn a_column_gives_its_width_and_its_background_to_the_column() {
     let widths = |markup: &str| {
-        let tree = lay_out_styled(
+        let tree = lay_out(
             &format!(
                 "<body><table style='border-collapse: collapse'>{markup}\
                  <tr><td>a</td><td>b</td><td>cccccccccccccccc</td></tr></table>"
@@ -560,7 +547,7 @@ fn a_column_gives_its_width_and_its_background_to_the_column() {
     // Where the content *can* break, the column is the width it was told and the
     // text wraps inside it — a cap rather than a floor, which is the half a
     // reference had to settle.
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse'><col><col style='width:60px'>         <tr><td>a</td><td>one two three four</td></tr></table>",
         800.0,
     );
@@ -572,7 +559,7 @@ fn a_column_gives_its_width_and_its_background_to_the_column() {
     );
 
     // A `<colgroup>` with no columns in it describes as many as its own `span`.
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse'>\
          <colgroup span=2 style='background: rgb(0,255,0)'></colgroup>\
          <colgroup><col style='background: rgb(255,0,0)'></colgroup>\
@@ -723,7 +710,7 @@ fn a_span_wider_than_its_columns_shares_the_difference_out() {
 /// cell has a gap beside it.
 #[test]
 fn collapsed_cells_share_an_edge() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse; border-spacing: 10px'>\
          <tr><td style='border: 1px solid'>a</td><td style='border: 1px solid'>b</td></tr>\
          </table>",
@@ -752,7 +739,7 @@ fn collapsed_cells_share_an_edge() {
 /// draw half of it.
 #[test]
 fn the_wider_collapsed_border_wins() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse'>\
          <tr><td style='border: 1px solid'>a</td><td style='border: 4px solid'>b</td></tr>\
          </table>",
@@ -812,7 +799,7 @@ fn a_caption_widens_the_table_under_it() {
 /// exactly as a box in the flow is: `width` is the content box.
 #[test]
 fn a_positioned_box_adds_its_padding_to_its_width() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><div style='position: relative; height: 100px'>\
          <div id=box style='position: absolute; left: 0; top: 0; width: 160px; \
          height: 90px; padding: 4px'>x</div></div>",
@@ -835,7 +822,7 @@ fn a_positioned_box_adds_its_padding_to_its_width() {
 /// rather than adding them outside it.
 #[test]
 fn a_border_box_measures_across_its_edges() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'>\
          <div id=a style='box-sizing: border-box; width: 200px; height: 100px; \
          padding: 20px; border: 5px solid'>a</div>\
@@ -864,7 +851,7 @@ fn a_border_box_measures_across_its_edges() {
 /// down a column is the height rather than the width.
 #[test]
 fn a_column_shares_out_its_height() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'><div style='width: 400px; height: 300px'>\
          <div style='display: flex; flex-direction: column; height: 100%'>\
          <div style='height: 40px'>head</div>\
@@ -887,7 +874,7 @@ fn a_column_shares_out_its_height() {
 /// means nothing at all against one that is as tall as its own contents.
 #[test]
 fn a_percentage_height_is_of_a_height() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'>\
          <div style='width: 300px'><div id=a style='height: 100%'>x</div></div>\
          <div style='width: 300px; height: 200px'><div id=b style='height: 50%'>x</div></div>",
@@ -897,8 +884,10 @@ fn a_percentage_height_is_of_a_height() {
     let boxes: Vec<&Fragment> = boxes_of(&tree)
         .into_iter()
         .filter(|fragment| {
-            fragment.style.height != otlyra_css::LengthOrAuto::Auto
-                && matches!(fragment.style.height, otlyra_css::LengthOrAuto::Percent(_))
+            matches!(
+                fragment.style.height,
+                otlyra_css::Size::Length(otlyra_css::Length::Percent(_))
+            )
         })
         .collect();
     assert_eq!(boxes.len(), 2, "both boxes ask for a percentage");
@@ -920,7 +909,7 @@ fn a_percentage_height_is_of_a_height() {
 fn a_word_and_a_paragraph_are_what_the_second_and_third_click_take() {
     use otlyra_layout::selection;
 
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><p>one two-part <b>thr</b>ee</p><p>four five</p>",
         800.0,
     );
@@ -1055,7 +1044,7 @@ fn a_selection_reads_the_words_it_covers() {
 /// the size it was given, and what is in it is laid out as a block.
 #[test]
 fn inline_blocks_sit_in_one_line() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><p><span id=a style='display: inline-block; width: 90px; height: 70px'>a</span>\
          <span id=b style='display: inline-block; width: 60px; height: 30px'>b</span></p>",
         800.0,
@@ -1083,7 +1072,7 @@ fn inline_blocks_sit_in_one_line() {
 /// baselines line up, which is what makes a row of buttons read as a row of words.
 #[test]
 fn inline_blocks_share_a_baseline() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><p><span style='display: inline-block; padding: 20px 4px'>tall</span>\
          <span style='display: inline-block; padding: 4px'>short</span></p>",
         800.0,
@@ -1120,7 +1109,7 @@ fn an_empty_field_does_not_make_its_line_taller() {
     // tall the first paragraph turned out to be. Measured at the baseline of the
     // lowest run of text, so nothing about box edges or margins is in it.
     let second_line = |markup: &str| {
-        let tree = lay_out_styled(markup, 800.0);
+        let tree = lay_out(markup, 800.0);
         tree.iter()
             .filter_map(|fragment| match &fragment.kind {
                 FragmentKind::Text(run) => Some(fragment.rect.y + run.glyphs.first()?.y),
@@ -1153,7 +1142,7 @@ fn an_empty_field_does_not_make_its_line_taller() {
 /// the edge.
 #[test]
 fn a_collapsed_table_draws_the_line_that_won() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse'>\
          <tr><td style='border: 1px solid rgb(0,0,0)'>a</td>\
          <td style='border: 4px solid rgb(255,0,0)'>b</td></tr></table>",
@@ -1201,7 +1190,7 @@ fn a_collapsed_table_draws_the_line_that_won() {
 #[test]
 fn a_collapsed_border_is_settled_by_style_where_the_widths_agree() {
     let colour = |css: &str| {
-        let tree = lay_out_styled(
+        let tree = lay_out(
             &format!(
                 "<body><table style='border-collapse: collapse'>\
                  <tr><td style='border: 3px solid rgb(0,0,255)'>a</td>\
@@ -1241,7 +1230,7 @@ fn a_collapsed_border_is_settled_by_style_where_the_widths_agree() {
 /// inside a `colspan`.
 #[test]
 fn a_collapsed_line_is_not_drawn_through_a_span() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='border-collapse: collapse'>\
          <tr><td colspan=2 style='border: 1px solid rgb(0,0,0)'>wide</td></tr>\
          <tr><td style='border: 1px solid rgb(0,0,0)'>a</td>\
@@ -1284,7 +1273,7 @@ fn a_collapsed_line_is_not_drawn_through_a_span() {
 /// A table told how wide to be fills that width rather than sitting narrow in it.
 #[test]
 fn a_table_with_a_width_fills_it() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table style='width: 400px'><tr><td>a</td><td>b</td></tr></table>",
         800.0,
     );
@@ -1305,7 +1294,7 @@ fn a_table_with_a_width_fills_it() {
 /// has disappeared.
 #[test]
 fn a_clip_travels_with_the_inline_block_it_belongs_to() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><p>before <span style='display: inline-block; overflow: hidden; \
          width: 60px'>inside</span>",
         800.0,
@@ -1329,7 +1318,7 @@ fn a_clip_travels_with_the_inline_block_it_belongs_to() {
 /// the rows had no height to keep them apart.
 #[test]
 fn a_table_cell_contains_the_floats_inside_it() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body><table><tr><td id=label>label</td>\
          <td id=links><ul><li style='float: left'>one</li>\
          <li style='float: left'>two</li></ul></td></tr>\
@@ -1387,7 +1376,7 @@ fn a_table_cell_contains_the_floats_inside_it() {
 /// of it, hiding the canvas and the root element's background behind it.
 #[test]
 fn a_percentage_min_height_needs_an_ancestor_that_has_one() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<html style='min-height: 100%'><body style='min-height: 100%; margin: 0'>\
          <p style='margin: 0'>short</p></body></html>",
         600.0,
@@ -1409,7 +1398,7 @@ fn a_percentage_min_height_needs_an_ancestor_that_has_one() {
     );
 
     // And one whose ancestor *does* have a height still takes its share of it.
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'><div style='height: 400px'>\
          <div id=half style='min-height: 50%; background: #eee'>x</div></div>",
         600.0,
@@ -1432,7 +1421,7 @@ fn a_percentage_min_height_needs_an_ancestor_that_has_one() {
 /// one of them is a column that puts every link on a line of its own.
 #[test]
 fn floated_siblings_are_measured_side_by_side() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'><table><tr><td id=cell>\
          <ul style='margin: 0; padding: 0'>\
          <li style='list-style: none; float: left'>alpha</li>\
@@ -1464,7 +1453,7 @@ fn floated_siblings_are_measured_side_by_side() {
 /// height, and the tallest of them grew out of the bottom of the row.
 #[test]
 fn flex_items_are_measured_at_the_width_they_end_up_with() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'><div style='display: flex; flex-direction: row'>\
          <div style='flex-grow: 1; flex-basis: 0'>one two three four five six seven \
          eight nine ten eleven twelve thirteen fourteen fifteen sixteen</div>\
@@ -1510,7 +1499,7 @@ fn flex_items_are_measured_at_the_width_they_end_up_with() {
 /// came out as three empty lines.
 #[test]
 fn a_column_of_zero_basis_items_is_as_tall_as_what_is_in_it() {
-    let tree = lay_out_styled(
+    let tree = lay_out(
         "<body style='margin: 0'><div style='display: flex; flex-direction: column'>\
          <div style='flex-grow: 1; flex-basis: 0'>one</div>\
          <div style='flex-grow: 1; flex-basis: 0'>two<br>three</div></div>",

@@ -121,11 +121,8 @@ pub(crate) fn media_of_link(
     document: &otlyra_dom::Document,
     node: otlyra_dom::NodeId,
 ) -> Option<String> {
-    let element = document.get(node)?.element()?;
-    element
-        .attrs
-        .iter()
-        .find(|attribute| attribute.name.local.as_ref() == "media")
-        .map(|attribute| attribute.value.to_string())
+    document
+        .attr(node, "media")
         .filter(|media| !media.trim().is_empty())
+        .map(str::to_owned)
 }

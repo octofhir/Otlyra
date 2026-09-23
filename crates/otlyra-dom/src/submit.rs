@@ -190,7 +190,11 @@ pub fn entry_list(
             _ => continue,
         }
 
-        let Some(name) = attribute(document, field, "name").filter(|name| !name.is_empty()) else {
+        let Some(name) = document
+            .attr(field, "name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+        else {
             continue;
         };
 
@@ -236,7 +240,7 @@ pub fn entry_list(
             // A checkbox with no value of its own submits `on`, which is HTML's
             // own answer and has been since forms existed.
             Control::Input(kind) if kind.is_checkable() => {
-                attribute(document, field, "value").unwrap_or_else(|| "on".to_owned())
+                document.attr(field, "value").unwrap_or("on").to_owned()
             }
             // A slider always holds a number, so one is always sent: an
             // `<input type=range>` with no `value` submits the middle of its
@@ -265,16 +269,17 @@ pub fn submission(
 ) -> Submission {
     // The button that was pressed may override where the form goes and how, which
     // is what `formaction` and `formmethod` are for.
-    let overridden = |key: &str| submitter.and_then(|button| attribute(document, button, key));
+    let overridden = |key: &str| submitter.and_then(|button| document.attr(button, key));
     let action = overridden("formaction")
-        .or_else(|| attribute(document, form, "action"))
-        .unwrap_or_default();
+        .or_else(|| document.attr(form, "action"))
+        .unwrap_or_default()
+        .to_owned();
     let method = overridden("formmethod")
-        .or_else(|| attribute(document, form, "method"))
-        .map_or(Method::Get, |value| Method::parse(&value));
+        .or_else(|| document.attr(form, "method"))
+        .map_or(Method::Get, Method::parse);
     let encoding = overridden("formenctype")
-        .or_else(|| attribute(document, form, "enctype"))
-        .map_or(Encoding::default(), |value| Encoding::parse(&value));
+        .or_else(|| document.attr(form, "enctype"))
+        .map_or(Encoding::default(), Encoding::parse);
 
     let entries = entry_list(document, state, form, submitter);
     // A `GET` always puts the pairs in the address, whatever the form's `enctype`
@@ -417,11 +422,6 @@ fn percent(value: &str) -> String {
 /// A quotation mark inside a part's name, which would otherwise end it.
 fn escape_quotes(value: &str) -> String {
     value.replace('"', "%22")
-}
-
-/// One attribute of one element.
-fn attribute(document: &Document, id: NodeId, name: &str) -> Option<String> {
-    document.get(id)?.element()?.attr(name).map(str::to_owned)
 }
 
 /// Whether a control is a suggestion inside a `<datalist>` rather than an answer.

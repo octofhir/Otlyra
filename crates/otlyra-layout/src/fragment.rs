@@ -156,6 +156,51 @@ pub struct Fragment {
     pub children: Vec<Fragment>,
 }
 
+impl Fragment {
+    /// A fragment with nothing inside it, where layout first puts one.
+    ///
+    /// Everything that is not the fragment itself starts as the flow's: no
+    /// widget, no clip, no scroll port, not sticky, not fixed, on the flow's
+    /// level, and no used edges. Those are facts about the fragment's ancestors
+    /// or about its box's position, and are written onto it afterwards by what
+    /// knows them — a positioned box sets its layer, a clipping ancestor its
+    /// clip, the paint order its place.
+    pub fn new(
+        box_id: Option<BoxId>,
+        rect: Rect,
+        kind: FragmentKind,
+        style: Arc<ComputedStyle>,
+    ) -> Self {
+        Self {
+            used: None,
+            box_id,
+            rect,
+            kind,
+            style,
+            layer: Layer::flow(),
+            scroll_port: None,
+            clip: None,
+            sticky: None,
+            widget: None,
+            fixed: false,
+            children: Vec::new(),
+        }
+    }
+
+    /// The fragment a box generates around what is laid out inside it.
+    pub fn for_box(
+        id: BoxId,
+        rect: Rect,
+        style: Arc<ComputedStyle>,
+        children: Vec<Fragment>,
+    ) -> Self {
+        Self {
+            children,
+            ..Self::new(Some(id), rect, FragmentKind::Box, style)
+        }
+    }
+}
+
 /// What `position: sticky` needs at paint time.
 ///
 /// Layout knows where the box is and how far it may travel; only paint knows how

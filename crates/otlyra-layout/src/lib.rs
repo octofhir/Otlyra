@@ -10,11 +10,12 @@
 //! ## Contents
 //!
 //! - [`box_tree`] — [`BoxTree`], [`BoxNode`], and the invariant checker.
-//! - [`builder`] — [`build_box_tree`]: DOM plus UA style becomes boxes.
+//! - [`builder`] — [`build_box_tree`]: DOM plus cascaded style becomes boxes.
 //! - [`damage`] — [`Damage`]: how much of the pipeline a change invalidates.
 //! - [`flow`] — [`layout`]: block and inline formatting contexts.
 //! - [`fragment`] — [`FragmentTree`]: boxes once they have a position and a size.
 //! - [`dump`] — the text forms, for `--dump-boxes`, `--dump-fragments` and snapshots.
+//! - [`widget_metrics`] — the widget geometry layout, paint and hit testing share.
 //!
 //! ## Invariants
 //!
@@ -34,6 +35,7 @@ pub mod flow;
 pub mod fragment;
 pub mod selection;
 pub mod srcset;
+pub mod widget_metrics;
 
 pub use box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, InvalidationReason, box_id_from_u64, box_id_to_u64,
@@ -41,7 +43,7 @@ pub use box_tree::{
 };
 pub use builder::{
     ImageSource, Images, Picture, build_box_tree, build_box_tree_with_images, build_page_box_tree,
-    build_styled_box_tree, image_sources, set_generated_text,
+    image_sources, set_generated_text,
 };
 pub use damage::Damage;
 pub use find::PageText;
@@ -59,9 +61,11 @@ mod tests {
 
     use super::*;
 
+    /// The box tree `html` makes, styled by the cascade as a page would be.
     fn tree_of(html: &str) -> BoxTree {
         let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-        build_box_tree(&parsed.document)
+        let styles = otlyra_css::cascade::style_document(&parsed.document, Default::default());
+        build_box_tree(&parsed.document, &styles)
     }
 
     fn dump(html: &str) -> String {
@@ -266,9 +270,7 @@ mod tests {
 
     /// The marker of each list item, in document order.
     fn markers(html: &str) -> Vec<String> {
-        let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-        let styles = otlyra_css::cascade::style_document(&parsed.document, Default::default());
-        let tree = build_styled_box_tree(&parsed.document, &styles);
+        let tree = tree_of(html);
 
         let mut out = Vec::new();
         let mut stack = vec![tree.root()];

@@ -1,32 +1,25 @@
-//! Building the box tree from a DOM and the UA stylesheet.
+//! Building the box tree from a DOM and the styles the cascade computed for it.
+//!
+//! The cascade is the only source of an element's style. There is no second,
+//! built-in table to fall back on: the user-agent stylesheet is CSS, cascaded
+//! with the page's own, and a box tree built without it would be a page styled
+//! by rules no page can see or override.
 
 use std::sync::Arc;
 
+use otlyra_css::ComputedStyle;
+use otlyra_css::Display;
 use otlyra_css::cascade::{StyledDocument, Viewport};
-use otlyra_css::{ComputedStyle, Display, has_renderable_children, initial_style, ua_style};
-use otlyra_dom::{Document, FormState, NodeData, NodeId};
+use otlyra_dom::{Document, ElementData, FormState, NodeData, NodeId};
 
 use crate::box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, CellSpan, Control, ControlKind, ControlState,
 };
 
-/// Build the box tree for `document` from the built-in element styles alone.
-///
-/// No stylesheet is consulted, so `<style>` and `style=` change nothing. This is
-/// what the parts of the browser that ask only "what boxes does this markup make"
-/// want — dumps, tests — and it is the fallback when the cascade has not run.
-pub fn build_box_tree(document: &Document) -> BoxTree {
-    build(document, None, &Images::default(), &FormState::new())
-}
-
-/// Build the box tree for `document` using styles the cascade computed.
-pub fn build_styled_box_tree(document: &Document, styles: &StyledDocument) -> BoxTree {
-    build(
-        document,
-        Some(styles),
-        &Images::default(),
-        &FormState::new(),
-    )
+/// Build the box tree for `document` using the styles the cascade computed for
+/// it.
+pub fn build_box_tree(document: &Document, styles: &StyledDocument) -> BoxTree {
+    build(document, styles, &Images::default(), &FormState::new())
 }
 
 /// Build the box tree with the pictures the document's `<img>` elements asked for
@@ -36,7 +29,7 @@ pub fn build_styled_box_tree(document: &Document, styles: &StyledDocument) -> Bo
 /// its `alt` text — which is what a browser shows while a picture is missing.
 pub fn build_box_tree_with_images(
     document: &Document,
-    styles: Option<&StyledDocument>,
+    styles: &StyledDocument,
     images: &Images,
 ) -> BoxTree {
     build(document, styles, images, &FormState::new())
@@ -49,7 +42,7 @@ pub fn build_box_tree_with_images(
 /// from the markup alone once the page has been used.
 pub fn build_page_box_tree(
     document: &Document,
-    styles: Option<&StyledDocument>,
+    styles: &StyledDocument,
     images: &Images,
     form: &FormState,
 ) -> BoxTree {
@@ -123,15 +116,15 @@ pub fn image_sources(document: &Document, viewport: Viewport) -> Vec<ImageSource
 
 fn build(
     document: &Document,
-    styles: Option<&StyledDocument>,
+    styles: &StyledDocument,
     images: &Images,
     form: &FormState,
 ) -> BoxTree {
     let _span = tracing::info_span!("build_box_tree").entered();
 
-    let root_style = Arc::new(initial_style());
-    let tree = BoxTree::new(Arc::clone(&root_style));
+    let tree = BoxTree::default();
     let root = tree.root();
+    let root_style = Arc::clone(&tree.node(root).style);
 
     let mut builder = Builder {
         document,
@@ -156,7 +149,7 @@ fn build(
 
 struct Builder<'a> {
     document: &'a Document,
-    styles: Option<&'a StyledDocument>,
+    styles: &'a StyledDocument,
     images: &'a Images,
     /// What the reader has typed into the page's controls, which outranks what the
     /// markup says a control holds.
@@ -164,10 +157,6 @@ struct Builder<'a> {
     tree: BoxTree,
 }
 
-/// CSS `white-space: normal` collapsing.
-///
-/// A run of whitespace becomes one space, and a newline in the source is just more
-/// whitespace — `<br>` is what makes a line break, not a line ending in the markup.
 /// Remove the whitespace-only boxes that sit between block-level boxes.
 ///
 /// The space in `</div> <div>` is not a word gap and generating a line box for it
@@ -205,23 +194,6 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
     }
 }
 
-/// CSS white-space processing, over a whole inline formatting context at a time.
-///
-/// The unit is the context and not the text node, which is the whole of why this
-/// is a pass rather than a line in the walk: `<span>a </span> <span>b</span>` is
-/// three text nodes and one space, and no one of them can know that on its own.
-/// Within a context, in document order:
-///
-/// - a run of collapsible spaces, tabs and line endings becomes one space;
-/// - a collapsible space at the start of the context, or straight after a forced
-///   break, is dropped, and so is one at its very end;
-/// - a line ending is a space where `white-space` collapses them and a break
-///   where it preserves them;
-/// - preserved white space is emitted as it stands, and does not collapse what
-///   comes after it.
-///
-/// What is left of a text box that came to nothing is nothing: the box goes,
-/// rather than staying as an empty run for the shaper to be given.
 /// Rewrite the text a control's box shows, as the builder would have written it.
 ///
 /// The one mutation of a built box tree there is, and it exists for one thing: a
@@ -254,6 +226,23 @@ pub fn set_generated_text(tree: &mut BoxTree, id: BoxId, text: &str) -> bool {
     true
 }
 
+/// CSS white-space processing, over a whole inline formatting context at a time.
+///
+/// The unit is the context and not the text node, which is the whole of why this
+/// is a pass rather than a line in the walk: `<span>a </span> <span>b</span>` is
+/// three text nodes and one space, and no one of them can know that on its own.
+/// Within a context, in document order:
+///
+/// - a run of collapsible spaces, tabs and line endings becomes one space;
+/// - a collapsible space at the start of the context, or straight after a forced
+///   break, is dropped, and so is one at its very end;
+/// - a line ending is a space where `white-space` collapses them and a break
+///   where it preserves them;
+/// - preserved white space is emitted as it stands, and does not collapse what
+///   comes after it.
+///
+/// What is left of a text box that came to nothing is nothing: the box goes,
+/// rather than staying as an empty run for the shaper to be given.
 fn collapse_white_space(tree: &mut BoxTree, id: BoxId) {
     let node = tree.node(id);
     // The context belongs to the *block container* whose lines these are. An
@@ -555,16 +544,13 @@ impl Builder<'_> {
         })
     }
 
-    /// The text a replaced or attribute-driven element shows.
-    ///
-    /// `None` for everything whose content is in the tree where it belongs.
     /// The box an open drop-down's list goes in.
     ///
     /// Out of the flow and against the control's own padding box, which is what
     /// makes opening one move nothing on the page behind it — the same way every
     /// menu on the web is built, and for the same reason.
     fn open_list(&mut self, select: BoxId, style: &Arc<ComputedStyle>) -> BoxId {
-        use otlyra_css::{Length, LengthOrAuto, Overflow, Position};
+        use otlyra_css::{Length, LengthOrAuto, MaxSize, Overflow, Position, Size};
 
         // The control itself becomes what the list is placed against. It goes on
         // cutting its own contents off at its edge — a field slides its line under
@@ -578,21 +564,21 @@ impl Builder<'_> {
         list.display = Display::Block;
         list.position = Position::Absolute;
         list.inset = otlyra_css::Sides {
-            top: LengthOrAuto::Percent(1.0),
+            top: LengthOrAuto::Length(Length::Percent(1.0)),
             right: LengthOrAuto::Auto,
             bottom: LengthOrAuto::Auto,
-            left: LengthOrAuto::Px(0.0),
+            left: LengthOrAuto::ZERO,
         };
-        list.width = LengthOrAuto::Auto;
-        list.min_width = Length::Percent(1.0);
-        list.height = LengthOrAuto::Auto;
+        list.width = Size::Auto;
+        list.min_width = Size::Length(Length::Percent(1.0));
+        list.height = Size::Auto;
         list.padding = otlyra_css::Sides::all(Length::Px(0.0));
         list.z_index = Some(1);
         // As tall as it needs and no taller than this: a list of two hundred
         // countries is a list two hundred rows long, and every browser caps it and
         // scrolls what is left. The number is a plain one for the same reason
         // theirs are.
-        list.max_height = Some(Length::Px(300.0));
+        list.max_height = MaxSize::Length(Length::Px(300.0));
         list.overflow = Overflow::Clip;
 
         self.tree.push(
@@ -613,7 +599,7 @@ impl Builder<'_> {
                     level: otlyra_dom::form::Level::default(),
                     swatch: None,
                     open: true,
-                    sized: true,
+                    natural: None,
                     scroll: (0.0, 0.0),
                 }),
                 style: Arc::new(list),
@@ -626,12 +612,6 @@ impl Builder<'_> {
         )
     }
 
-    /// What control this element is, if it is one.
-    ///
-    /// The widget flag is the cascade's answer to `appearance`, and a control the
-    /// page has turned off is still a control — it is still typed into, still
-    /// checked, still submitted. What changes is that nothing is drawn for it and
-    /// that it has no size of its own, which is why the flag travels with the
     /// What control this element is, if it is one.
     ///
     /// The widget flag is the cascade's answer to `appearance`, and a control the
@@ -656,15 +636,10 @@ impl Builder<'_> {
             },
             Semantic::Button => ControlKind::Button,
             Semantic::Textarea => ControlKind::Area,
-            Semantic::Select => {
-                if otlyra_dom::form::is_multiple(self.document, node)
-                    || otlyra_dom::form::display_size(self.document, node) > 1
-                {
-                    ControlKind::ListBox
-                } else {
-                    ControlKind::DropDown
-                }
+            Semantic::Select if otlyra_dom::form::is_list_box(self.document, node) => {
+                ControlKind::ListBox
             }
+            Semantic::Select => ControlKind::DropDown,
             Semantic::Progress => ControlKind::Progress,
             Semantic::Meter => ControlKind::Meter,
             Semantic::Option | Semantic::Optgroup | Semantic::Output | Semantic::Fieldset => {
@@ -672,46 +647,16 @@ impl Builder<'_> {
             }
         };
 
-        // A widget is drawn when the cascade still says `auto` and no author rule
-        // has taken the look away. A checkbox, a radio button and a slider are
-        // never taken away: the specification calls them non-devolvable, and a page
-        // that gives a checkbox a background gets a checkbox with a background.
-        let widget = self.styles.is_none_or(|styles| {
-            let auto = styles
-                .style_of(node)
-                .is_none_or(|values| otlyra_css::appearance::of(values).is_auto());
-            let non_devolvable = matches!(
-                kind,
-                ControlKind::Checkbox | ControlKind::Radio | ControlKind::Range
-            );
-            auto && (non_devolvable || !styles.is_devolved(node))
-        });
-
-        let state = self.styles.map_or_else(ControlState::default, |styles| {
-            let bits = styles.state_of(node);
-            ControlState {
-                checked: bits.contains(otlyra_css::state::ElementState::CHECKED),
-                indeterminate: kind == ControlKind::Checkbox
-                    && bits.contains(otlyra_css::state::ElementState::INDETERMINATE),
-                disabled: bits.contains(otlyra_css::state::ElementState::DISABLED),
-                hovered: bits.contains(otlyra_css::state::ElementState::HOVER),
-                active: bits.contains(otlyra_css::state::ElementState::ACTIVE),
-                focus_ring: bits.contains(otlyra_css::state::ElementState::FOCUSRING),
-            }
-        });
-
         let number = |key: &str| {
             self.document
-                .get(node)
-                .and_then(|inner| inner.element())
-                .and_then(|element| element.attr(key))
+                .attr(node, key)
                 .and_then(|value| value.trim().parse::<u32>().ok())
                 .filter(|&value| value > 0)
         };
 
         Some(Control {
             kind,
-            widget,
+            widget: self.is_widget(node, kind),
             // Twenty characters is what a field is when nothing says otherwise —
             // a number from the specification, not a guess at a pleasant width.
             size: match kind {
@@ -727,7 +672,7 @@ impl Builder<'_> {
             },
             cols: number("cols").unwrap_or(20),
             rows: number("rows").unwrap_or(2),
-            state,
+            state: self.control_state(node, kind),
             // What the widget is filled to. Read here rather than in the painter
             // because it is a question about the document — a `value`, a `max`, an
             // `optimum` — and the painter is given a box and a rectangle.
@@ -752,17 +697,52 @@ impl Builder<'_> {
             // nothing to suggest is not open however hard it is pressed: an empty
             // list is a rectangle over the page with nothing in it.
             open: matches!(kind, ControlKind::DropDown | ControlKind::Field)
-                && self.styles.is_some_and(|styles| {
-                    styles
-                        .state_of(node)
-                        .contains(otlyra_css::state::ElementState::OPEN)
-                })
+                && self
+                    .styles
+                    .state_of(node)
+                    .contains(otlyra_css::state::ElementState::OPEN)
                 && (kind != ControlKind::Field
                     || !otlyra_dom::form::suggestions_for(self.document, self.form, node)
                         .is_empty()),
-            sized: false,
+            natural: None,
             scroll: (0.0, 0.0),
         })
+    }
+
+    /// Whether a control of `kind` is drawn as a widget.
+    ///
+    /// When the cascade still says `appearance: auto` and no author rule has
+    /// taken the look away. A checkbox, a radio button and a slider are never
+    /// taken away: the definition of `appearance` in CSS UI 4 calls them
+    /// non-devolvable, and a page that gives a checkbox a background gets a
+    /// checkbox with a background.
+    fn is_widget(&self, node: NodeId, kind: ControlKind) -> bool {
+        let auto = self
+            .styles
+            .style_of(node)
+            .is_none_or(|values| otlyra_css::appearance::of(values).is_auto());
+        let non_devolvable = matches!(
+            kind,
+            ControlKind::Checkbox | ControlKind::Radio | ControlKind::Range
+        );
+        auto && (non_devolvable || !self.styles.is_devolved(node))
+    }
+
+    /// The state a widget is drawn in: the same bits `:checked` and `:hover`
+    /// were matched on, so the widget and the page's own rules cannot disagree.
+    fn control_state(&self, node: NodeId, kind: ControlKind) -> ControlState {
+        use otlyra_css::state::ElementState;
+
+        let bits = self.styles.state_of(node);
+        ControlState {
+            checked: bits.contains(ElementState::CHECKED),
+            indeterminate: kind == ControlKind::Checkbox
+                && bits.contains(ElementState::INDETERMINATE),
+            disabled: bits.contains(ElementState::DISABLED),
+            hovered: bits.contains(ElementState::HOVER),
+            active: bits.contains(ElementState::ACTIVE),
+            focus_ring: bits.contains(ElementState::FOCUSRING),
+        }
     }
 
     /// How many characters a date or a time field shows, if it is one.
@@ -785,30 +765,17 @@ impl Builder<'_> {
     fn generated_text(&self, name: &str, node: NodeId) -> Option<String> {
         use otlyra_dom::form::{self, InputKind};
 
-        let attribute = |key: &str| {
-            self.document
-                .get(node)?
-                .element()?
-                .attrs
-                .iter()
-                .find(|attr| attr.name.local.as_ref() == key)
-                .map(|attr| attr.value.to_string())
-        };
+        let attribute = |key: &str| self.document.attr(node, key);
 
         match name {
             "input" => {
-                let kind =
-                    attribute("type").map_or(InputKind::Text, |value| InputKind::parse(&value));
+                let kind = attribute("type").map_or(InputKind::Text, InputKind::parse);
                 match kind {
                     // A button-shaped input carries its label in `value`. The two
                     // that have a label without one have it because HTML says so.
-                    InputKind::Submit => {
-                        Some(attribute("value").unwrap_or_else(|| "Submit".to_owned()))
-                    }
-                    InputKind::Reset => {
-                        Some(attribute("value").unwrap_or_else(|| "Reset".to_owned()))
-                    }
-                    InputKind::Button => attribute("value"),
+                    InputKind::Submit => Some(attribute("value").unwrap_or("Submit").to_owned()),
+                    InputKind::Reset => Some(attribute("value").unwrap_or("Reset").to_owned()),
+                    InputKind::Button => attribute("value").map(str::to_owned),
                     // Drawn, not set.
                     InputKind::Checkbox
                     | InputKind::Radio
@@ -833,7 +800,7 @@ impl Builder<'_> {
                     _ => {
                         let held = self.form.value(self.document, node);
                         if held.is_empty() {
-                            attribute("placeholder")
+                            attribute("placeholder").map(str::to_owned)
                         } else {
                             Some(held.to_owned())
                         }
@@ -842,10 +809,7 @@ impl Builder<'_> {
             }
             // A closed drop-down shows one option, and the options themselves
             // generate no boxes — see where the children are walked.
-            "select"
-                if !form::is_multiple(self.document, node)
-                    && form::display_size(self.document, node) <= 1 =>
-            {
+            "select" if !form::is_list_box(self.document, node) => {
                 let state = self.form;
                 let options = form::options_of(self.document, node);
                 let chosen = options
@@ -863,7 +827,10 @@ impl Builder<'_> {
                 if self.text_of(node).trim().is_empty()
                     && form::is_suggestion(self.document, node) =>
             {
-                Some(attribute("label").unwrap_or_else(|| form::option_value(self.document, node)))
+                Some(
+                    attribute("label")
+                        .map_or_else(|| form::option_value(self.document, node), str::to_owned),
+                )
             }
             // A text area's value is its content, so it needs no generated text —
             // until the reader types, after which its content is no longer what it
@@ -871,7 +838,9 @@ impl Builder<'_> {
             "textarea" if self.form.is_dirty(node) => {
                 Some(self.form.value(self.document, node).to_owned())
             }
-            "img" => attribute("alt").filter(|alt| !alt.is_empty()),
+            "img" => attribute("alt")
+                .filter(|alt| !alt.is_empty())
+                .map(str::to_owned),
             _ => None,
         }
     }
@@ -909,20 +878,10 @@ impl Builder<'_> {
         // overrides it and naming only one leaves the other to the aspect ratio.
         // It is *not* the picture's own size, and writing it there would make
         // `width="40"` on a 4×2 picture a picture forty by two.
-        let attribute = |key: &str| -> Option<f32> {
-            self.document
-                .get(node)?
-                .element()?
-                .attrs
-                .iter()
-                .find(|attr| attr.name.local.as_ref() == key)?
-                .value
-                .trim()
-                .parse()
-                .ok()
-        };
+        let dimension =
+            |key: &str| -> Option<f32> { self.document.attr(node, key)?.trim().parse().ok() };
 
-        let hint = (attribute("width"), attribute("height"));
+        let hint = (dimension("width"), dimension("height"));
         // The file's own size divided by the density it was chosen for: a
         // picture picked at two device pixels per CSS pixel is drawn at half its
         // width, which is the whole point of asking for a denser one.
@@ -946,22 +905,12 @@ impl Builder<'_> {
     /// of zero is the exception that means something — every row left in the table
     /// — and is carried through as zero for layout to resolve.
     fn span_of(&self, node: NodeId) -> CellSpan {
-        let attribute = |key: &str| -> Option<usize> {
-            self.document
-                .get(node)?
-                .element()?
-                .attrs
-                .iter()
-                .find(|attr| attr.name.local.as_ref() == key)?
-                .value
-                .trim()
-                .parse::<usize>()
-                .ok()
-        };
+        let number =
+            |key: &str| -> Option<usize> { self.document.attr(node, key)?.trim().parse().ok() };
 
         CellSpan {
-            columns: attribute("colspan").unwrap_or(1).clamp(1, 1000),
-            rows: attribute("rowspan").unwrap_or(1).min(65534),
+            columns: number("colspan").unwrap_or(1).clamp(1, 1000),
+            rows: number("rowspan").unwrap_or(1).min(65534),
         }
     }
 
@@ -972,74 +921,64 @@ impl Builder<'_> {
     /// is not inherited by the columns inside it — they are siblings in the
     /// column list, not boxes inside one another — so a group with columns in it
     /// contributes those and nothing of its own.
-    fn columns_of(&self, table: NodeId, table_style: &ComputedStyle) -> Vec<Arc<ComputedStyle>> {
-        let span_of = |node: NodeId| -> usize {
+    fn columns_of(&self, table: NodeId) -> Vec<Arc<ComputedStyle>> {
+        let named = |node: NodeId, name: &str| {
             self.document
                 .get(node)
                 .and_then(|node| node.element())
-                .and_then(|element| {
-                    element
-                        .attrs
-                        .iter()
-                        .find(|attr| attr.name.local.as_ref() == "span")?
-                        .value
-                        .trim()
-                        .parse::<usize>()
-                        .ok()
-                })
-                .unwrap_or(1)
-                .clamp(1, 1000)
-        };
-
-        let spread = |node: NodeId, style: Arc<ComputedStyle>, into: &mut Vec<_>| {
-            for _ in 0..span_of(node) {
-                into.push(Arc::clone(&style));
-            }
+                .is_some_and(|element| element.name.local.as_ref() == name)
         };
 
         let mut columns = Vec::new();
         for child in self.document.children(table) {
-            match self.document.get(child).and_then(|node| node.element()) {
-                Some(element) if element.name.local.as_ref() == "col" => {
-                    let style = Arc::new(self.style_for(child, "col", table_style));
-                    spread(child, style, &mut columns);
+            if named(child, "col") {
+                self.spread_column(child, &mut columns);
+            } else if named(child, "colgroup") {
+                let inner: Vec<NodeId> = self
+                    .document
+                    .children(child)
+                    .filter(|&node| named(node, "col"))
+                    .collect();
+                if inner.is_empty() {
+                    self.spread_column(child, &mut columns);
                 }
-                Some(element) if element.name.local.as_ref() == "colgroup" => {
-                    let group = self.style_for(child, "colgroup", table_style);
-                    let inner: Vec<NodeId> = self
-                        .document
-                        .children(child)
-                        .filter(|&node| {
-                            self.document
-                                .get(node)
-                                .and_then(|node| node.element())
-                                .is_some_and(|element| element.name.local.as_ref() == "col")
-                        })
-                        .collect();
-                    if inner.is_empty() {
-                        for _ in 0..span_of(child) {
-                            columns.push(Arc::new(group.clone()));
-                        }
-                    } else {
-                        for col in inner {
-                            let style = Arc::new(self.style_for(col, "col", &group));
-                            spread(col, style, &mut columns);
-                        }
-                    }
+                for col in inner {
+                    self.spread_column(col, &mut columns);
                 }
-                _ => {}
             }
         }
         columns
     }
 
-    /// The style of one element: the cascade's answer where there is one, and the
-    /// built-in element style where there is not.
-    fn style_for(&self, node: NodeId, name: &str, parent: &ComputedStyle) -> ComputedStyle {
-        match self.styles.and_then(|styles| styles.style_of(node)) {
-            Some(values) => otlyra_css::computed::to_layout_style(values),
-            None => ua_style(name, parent),
-        }
+    /// The columns one `<col>`, or one `<colgroup>` with none inside it,
+    /// describes: as many as its `span` says, every one in its style.
+    ///
+    /// HTML's own limits, and its own default: a span is between one and a
+    /// thousand, and anything that is not a number at all is one.
+    fn spread_column(&self, node: NodeId, into: &mut Vec<Arc<ComputedStyle>>) {
+        let Some(style) = self.style_for(node) else {
+            return;
+        };
+        let span = self
+            .document
+            .attr(node, "span")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 1000);
+        into.extend(std::iter::repeat_n(Arc::new(style), span));
+    }
+
+    /// The style the cascade computed for one element.
+    ///
+    /// `None` for an element the cascade did not reach — one put into the
+    /// document after its styles were computed — and such an element generates
+    /// no box until the restyle its insertion called for. Nothing is invented in
+    /// its place: a style made up here would be a second user-agent stylesheet,
+    /// and one that no page could see or override.
+    fn style_for(&self, node: NodeId) -> Option<ComputedStyle> {
+        self.styles
+            .style_of(node)
+            .map(|values| otlyra_css::computed::to_layout_style(values))
     }
 
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
@@ -1050,7 +989,10 @@ impl Builder<'_> {
         match &dom.data {
             NodeData::Element(element) => {
                 let name = element.name.local.as_ref();
-                let style = Arc::new(self.style_for(node, name, parent_style));
+                let Some(style) = self.style_for(node) else {
+                    return;
+                };
+                let style = Arc::new(style);
 
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
@@ -1136,7 +1078,7 @@ impl Builder<'_> {
                 // which is not part of this tree — and its style has nowhere else
                 // to go.
                 if name == "table" {
-                    let columns = self.columns_of(node, &style);
+                    let columns = self.columns_of(node);
                     if !columns.is_empty() {
                         self.tree.set_columns(id, columns);
                     }
@@ -1174,7 +1116,7 @@ impl Builder<'_> {
                     for child in contents {
                         self.walk(child, popup, &style);
                     }
-                } else if has_renderable_children(name) && !closed {
+                } else if has_renderable_children(element) && !closed {
                     for child in self.document.children(node) {
                         self.walk(child, id, &style);
                     }
@@ -1210,6 +1152,23 @@ impl Builder<'_> {
             }
         }
     }
+}
+
+/// Whether an element's children are content at all, whatever its style says.
+///
+/// Separate from `display: none` because the reason differs: what is inside a
+/// `<script>` or a `<style>` is program source rather than text, and what is
+/// inside an `<iframe>` or an `<object>` stands in for a document this cannot
+/// show. A rule that makes the element itself visible does not make any of that
+/// prose. HTML's elements only — the names mean this in the HTML namespace and
+/// nothing in any other, so an SVG or MathML element that happens to share one
+/// has children like any other element.
+fn has_renderable_children(element: &ElementData) -> bool {
+    element.name.ns != html5ever::ns!(html)
+        || !matches!(
+            element.name.local.as_ref(),
+            "script" | "style" | "template" | "noscript" | "iframe" | "object"
+        )
 }
 
 /// Wrap runs of inline children in anonymous block boxes, wherever a box has both
@@ -1307,7 +1266,7 @@ mod tests {
     fn styled(html: &str) -> BoxTree {
         let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
         let styles = style_document(&document, Viewport::default());
-        build_styled_box_tree(&document, &styles)
+        build_box_tree(&document, &styles)
     }
 
     fn style_of(tree: &BoxTree, tag: &str) -> Arc<ComputedStyle> {
@@ -1471,19 +1430,43 @@ mod tests {
         );
     }
 
-    /// Without a stylesheet the built-in element styles still apply, so markup
-    /// alone renders the same as it did before the cascade existed.
+    /// An element the cascade has not styled has nothing to be laid out with,
+    /// so it makes no box — rather than one styled by rules no page can see.
     #[test]
-    fn the_unstyled_path_keeps_the_built_in_element_styles() {
-        let document = otlyra_html::parse(b"<h1>title", Some("utf-8")).document;
-        let with_cascade = {
-            let styles = style_document(&document, Viewport::default());
-            build_styled_box_tree(&document, &styles)
-        };
-        let without = build_box_tree(&document);
-        assert_eq!(
-            style_of(&with_cascade, "h1").font_size,
-            style_of(&without, "h1").font_size
+    fn an_element_the_cascade_did_not_reach_makes_no_box() {
+        let mut document = otlyra_html::parse(b"<p>styled", Some("utf-8")).document;
+        let styles = style_document(&document, Viewport::default());
+        let body = document
+            .first_element_child(document.root())
+            .and_then(|html| document.first_element_child(html))
+            .and_then(|head| document.next_element_sibling(head))
+            .expect("the parser made a body");
+        let mut dom = otlyra_dom::DocumentMutator::new(&mut document);
+        let late = dom.create_element(
+            html5ever::QualName::new(None, html5ever::ns!(html), "h1".into()),
+            Vec::new(),
+            None,
+            false,
+        );
+        dom.append(body, late);
+        dom.append_text(late, "late".into());
+
+        let dump = crate::dump::serialize(&build_box_tree(&document, &styles));
+        assert!(dump.contains("styled"), "{dump}");
+        assert!(!dump.contains("h1") && !dump.contains("late"), "{dump}");
+    }
+
+    /// What is inside a `<script>` or an `<object>` is not prose, but only
+    /// HTML's elements of those names mean that: an SVG one is just an element.
+    #[test]
+    fn only_html_elements_hide_their_children() {
+        assert!(
+            !text_of("<p><object>fallback</object>after").contains("fallback"),
+            "an HTML <object> keeps its fallback to itself"
+        );
+        assert!(
+            text_of("<p><svg><object>drawn</object></svg>").contains("drawn"),
+            "an SVG element that shares the name is an element like any other"
         );
     }
 }

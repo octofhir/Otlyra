@@ -9,21 +9,6 @@ use otlyra_text::TextEngine;
 use super::scrollbar::SCROLLBAR_THUMB;
 use super::*;
 
-fn page(html: &str, scroll_y: f32) -> DisplayList {
-    let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
-    let mut boxes = build_box_tree(&parsed.document);
-    let mut text = TextEngine::isolated();
-    let fragments = layout(
-        &mut boxes,
-        &mut text,
-        Viewport {
-            width: 800.0,
-            height: 600.0,
-        },
-    );
-    build_display_list(&fragments, (800.0, 600.0), scroll_y)
-}
-
 /// A page with one picture in it, at `width` by `height` logical pixels.
 fn page_with_image(style: &str, pixels: (u32, u32)) -> DisplayList {
     let html = format!("<style>body {{ margin: 0 }} {style}</style><img src=a.png>");
@@ -55,8 +40,7 @@ fn page_with_image(style: &str, pixels: (u32, u32)) -> DisplayList {
             .into_iter()
             .map(|source| (source.node, otlyra_layout::Picture::new(image.clone())))
             .collect();
-    let mut boxes =
-        otlyra_layout::build_box_tree_with_images(&parsed.document, Some(&styles), &images);
+    let mut boxes = otlyra_layout::build_box_tree_with_images(&parsed.document, &styles, &images);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,
@@ -69,8 +53,9 @@ fn page_with_image(style: &str, pixels: (u32, u32)) -> DisplayList {
     build_display_list(&fragments, (800.0, 600.0), 0.0)
 }
 
-/// A page laid out with its own stylesheet, scrolled to `scroll_y`.
-fn styled_page(html: &str, scroll_y: f32) -> DisplayList {
+/// A page laid out with the user-agent stylesheet and its own, scrolled to
+/// `scroll_y`.
+fn page(html: &str, scroll_y: f32) -> DisplayList {
     let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
     let styles = otlyra_css::cascade::style_document(
         &parsed.document,
@@ -82,7 +67,7 @@ fn styled_page(html: &str, scroll_y: f32) -> DisplayList {
             color_scheme: Default::default(),
         },
     );
-    let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,
@@ -118,7 +103,7 @@ fn a_positioned_box_paints_above_the_flow_and_z_index_moves_it() {
 
     // The positioned box is written first, so document order alone would paint
     // it under the one after it.
-    let over = fill_order(&styled_page(
+    let over = fill_order(&page(
         "<style>body { margin: 0 } div { height: 50px }              .a { position: relative; background: rgb(255, 0, 0) }              .b { background: rgb(0, 0, 255) }</style>             <div class=a></div><div class=b></div>",
         0.0,
     ));
@@ -131,7 +116,7 @@ fn a_positioned_box_paints_above_the_flow_and_z_index_moves_it() {
         "the positioned box painted under the flow"
     );
 
-    let under = fill_order(&styled_page(
+    let under = fill_order(&page(
         "<style>body { margin: 0 } div { height: 50px }              .a { position: relative; z-index: -1; background: rgb(255, 0, 0) }              .b { background: rgb(0, 0, 255) }</style>             <div class=a></div><div class=b></div>",
         0.0,
     ));
@@ -149,7 +134,7 @@ fn a_positioned_box_paints_above_the_flow_and_z_index_moves_it() {
 /// the numbers written inside the same positioned ancestor.
 #[test]
 fn a_large_index_inside_a_small_one_stays_inside_it() {
-    let order = fill_order(&styled_page(
+    let order = fill_order(&page(
         "<style>body { margin: 0 } .box { position: absolute; width: 100px; height: 60px } \
          .outer { left: 0; top: 0; z-index: 1; background: rgb(255, 0, 0) } \
          .inner { left: 20px; top: 20px; z-index: 100; background: rgb(0, 0, 255) } \
@@ -190,7 +175,7 @@ fn a_selection_is_drawn_under_the_text() {
             color_scheme: Default::default(),
         },
     );
-    let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,
@@ -255,7 +240,7 @@ fn a_selection_is_drawn_under_the_text() {
 /// same item with the same transform on it.
 #[test]
 fn a_transform_moves_the_drawing_and_what_is_tested_against_it() {
-    let list = styled_page(
+    let list = page(
         "<style>body { margin: 0 } .card { width: 100px; height: 50px; \
          background: rgb(255, 0, 0) } .moved { transform: translate(200px, 100px) }</style> \
          <div class='card moved'><a href='/somewhere'>a link inside it</a></div>",
@@ -292,12 +277,46 @@ fn a_transform_moves_the_drawing_and_what_is_tested_against_it() {
     );
 }
 
+/// A percentage in a `translate()` is of the box's own size, and a `calc()`
+/// that mixes one with a length keeps both halves: `translate(calc(50% - 10px))`
+/// on a box a hundred wide moves it forty, where folding the percentage away
+/// moved it ten the wrong way.
+#[test]
+fn a_translate_keeps_the_percentage_in_a_calc() {
+    let list = page(
+        "<style>body { margin: 0 } .card { width: 100px; height: 50px; \
+         background: rgb(255, 0, 0); \
+         transform: translate(calc(50% - 10px), calc(-50% + 5px)) }</style>\
+         <div class=card></div>",
+        0.0,
+    );
+    let red = list
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::Fill {
+                brush: Brush::Solid(colour),
+                transform,
+                shape,
+                ..
+            } if *colour == Color::from_rgb8(255, 0, 0) => {
+                Some(transform.transform_rect_bbox(shape.bounding_box()))
+            }
+            _ => None,
+        })
+        .expect("the card");
+    assert!(
+        (red.x0 - 40.0).abs() < 0.01 && (red.y0 + 20.0).abs() < 0.01,
+        "half of a hundred less ten across, and half of fifty less five up: {red:?}"
+    );
+}
+
 /// The steps of a transform apply in the order they were written, and about
 /// the box's own middle unless it says otherwise.
 #[test]
 fn transform_steps_apply_in_order_and_about_the_origin() {
     let corner = |css: &str| {
-        let list = styled_page(
+        let list = page(
             &format!(
                 "<style>body {{ margin: 0 }} .card {{ width: 100px; height: 100px; \
                  background: rgb(255, 0, 0); {css} }}</style><div class=card></div>"
@@ -349,7 +368,7 @@ fn transform_steps_apply_in_order_and_about_the_origin() {
 /// opened before the box and closed after the last thing inside it.
 #[test]
 fn opacity_composites_a_box_and_its_contents_as_one_group() {
-    let list = styled_page(
+    let list = page(
         "<style>body { margin: 0 } .plate { width: 100px; height: 50px; \
          background: rgb(255, 0, 0) } .half { opacity: 0.5 } \
          .over { position: absolute; left: 10px; top: 10px; width: 20px; height: 20px; \
@@ -400,7 +419,7 @@ fn opacity_composites_a_box_and_its_contents_as_one_group() {
 /// and under its content, rather than dropping below the page's flow.
 #[test]
 fn a_negative_index_inside_a_positioned_box_stays_inside_it() {
-    let order = fill_order(&styled_page(
+    let order = fill_order(&page(
         "<style>body { margin: 0 } .flow { height: 80px; background: rgb(0, 255, 0) } \
          .parent { position: absolute; left: 0; top: 0; width: 200px; height: 120px; \
          background: rgb(255, 0, 0) } \
@@ -427,7 +446,7 @@ fn a_negative_index_inside_a_positioned_box_stays_inside_it() {
 /// through layout than a relative one.
 #[test]
 fn an_absolute_box_with_a_negative_z_index_paints_under_the_flow() {
-    let order = fill_order(&styled_page(
+    let order = fill_order(&page(
         "<style>body { margin: 0 } .row { position: relative; height: 90px }              .flow { height: 90px; background: rgb(0, 0, 255) }              .under { position: absolute; left: 20px; top: 20px; width: 100px;              height: 40px; background: rgb(255, 0, 0); z-index: -1 }</style>             <div class=row><div class=flow>flow</div><div class=under>under</div></div>",
         0.0,
     ));
@@ -442,7 +461,7 @@ fn an_absolute_box_with_a_negative_z_index_paints_under_the_flow() {
 /// a second time over whatever a negative `z-index` put below the flow.
 #[test]
 fn the_root_background_is_the_canvas_and_is_painted_once() {
-    let list = styled_page(
+    let list = page(
         "<style>html { background: rgb(0, 128, 0) } \
          .below { position: relative; z-index: -1; background: rgb(255, 0, 0); \
          height: 40px }</style><div class=below>below</div>",
@@ -480,7 +499,7 @@ fn the_root_background_is_the_canvas_and_is_painted_once() {
 /// popped, or everything after it would be clipped too.
 #[test]
 fn a_clipping_box_wraps_its_contents_in_a_layer() {
-    let list = styled_page(
+    let list = page(
         "<style>body { margin: 0 } \
          .card { overflow: hidden; height: 40px; width: 100px } \
          .tall { height: 200px; background: rgb(255, 0, 0) }</style>\
@@ -529,13 +548,13 @@ fn a_scrollbar_shows_where_the_reader_is_and_only_when_there_is_somewhere_to_go(
 
     let short = "<style>body { margin: 0 } p { height: 100px }</style><p>short</p>";
     assert!(
-        thumb(&styled_page(short, 0.0)).is_none(),
+        thumb(&page(short, 0.0)).is_none(),
         "a page that fits was given a scrollbar"
     );
 
     let long = "<style>body { margin: 0 } p { height: 3000px }</style><p>long</p>";
-    let at_top = thumb(&styled_page(long, 0.0)).expect("a scrollbar");
-    let further = thumb(&styled_page(long, 1000.0)).expect("a scrollbar");
+    let at_top = thumb(&page(long, 0.0)).expect("a scrollbar");
+    let further = thumb(&page(long, 1000.0)).expect("a scrollbar");
 
     assert!(
         at_top.y0.abs() < 0.01,
@@ -556,7 +575,7 @@ fn a_rounded_box_is_drawn_round() {
     use otlyra_gfx::kurbo::PathEl;
 
     let curves = |html: &str| -> usize {
-        styled_page(html, 0.0)
+        page(html, 0.0)
             .items()
             .iter()
             .filter_map(|item| match item {
@@ -576,7 +595,7 @@ fn a_rounded_box_is_drawn_round() {
     // A pill: the radius is larger than the box and has to be scaled down, or
     // the corners would overlap and the path would fold over itself.
     let pill = "<style>body { margin: 0 } div { background: rgb(0, 0, 255); height: 40px;                     width: 100px; border-radius: 999px }</style><div></div>";
-    let bounds = styled_page(pill, 0.0)
+    let bounds = page(pill, 0.0)
         .items()
         .iter()
         .find_map(|item| match item {
@@ -601,7 +620,7 @@ fn a_gradient_background_is_painted_as_one() {
             "<style>body {{ margin: 0 }} div {{ height: 100px; width: 200px; \
              background: {css} }}</style><div></div>"
         );
-        styled_page(&html, 0.0)
+        page(&html, 0.0)
             .items()
             .iter()
             .find_map(|item| match item {
@@ -644,7 +663,7 @@ fn a_gradient_background_is_painted_as_one() {
 /// page asked, and a spread grows its corners with it.
 #[test]
 fn a_box_shadow_is_cast_behind_the_box() {
-    let list = styled_page(
+    let list = page(
         "<style>body { margin: 0 } \
          div { height: 40px; width: 100px; background: rgb(0, 128, 0); \
          border-radius: 6px; box-shadow: 4px 8px 12px 2px rgb(0, 0, 0) }</style>\
@@ -688,7 +707,7 @@ fn a_box_shadow_is_cast_behind_the_box() {
 /// A text shadow is the same run drawn behind itself, moved and softened.
 #[test]
 fn text_shadows_are_drawn_behind_the_text() {
-    let list = styled_page(
+    let list = page(
         "<style>body { margin: 0 } \
          p { color: rgb(0, 0, 0); text-shadow: 2px 3px 4px rgb(255, 0, 0) }</style>\
          <p>text</p>",
@@ -743,7 +762,7 @@ fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::Image
             color_scheme: Default::default(),
         },
     );
-    let mut boxes = otlyra_layout::build_styled_box_tree(&parsed.document, &styles);
+    let mut boxes = build_box_tree(&parsed.document, &styles);
     let mut text = TextEngine::isolated();
     let fragments = layout(
         &mut boxes,
@@ -905,7 +924,7 @@ fn a_sticky_box_stops_at_its_inset_and_leaves_with_its_container() {
     let html = "<style>body { margin: 0 }                     section { height: 400px; padding-top: 60px }                     h2 { position: sticky; top: 10px; height: 30px; margin: 0;                     background: rgb(0, 128, 0) }                     p { height: 300px; margin: 0 }</style>                    <section><h2>one</h2><p>body</p></section>                    <section><h2>two</h2><p>body</p></section>";
 
     let heading_tops = |scroll: f32| -> Vec<f64> {
-        styled_page(html, scroll)
+        page(html, scroll)
             .items()
             .iter()
             .filter_map(|item| match item {
@@ -951,12 +970,8 @@ fn a_fixed_box_does_not_move_when_the_page_scrolls() {
             .expect("the fixed bar")
     };
 
-    assert_eq!(top_of(&styled_page(html, 0.0)), 10.0);
-    assert_eq!(
-        top_of(&styled_page(html, 300.0)),
-        10.0,
-        "it moved with the page"
-    );
+    assert_eq!(top_of(&page(html, 0.0)), 10.0);
+    assert_eq!(top_of(&page(html, 300.0)), 10.0, "it moved with the page");
 }
 
 /// Where a picture actually lands: the transform is what decides its size, so
@@ -1104,17 +1119,31 @@ fn scrolling_moves_the_text_up_by_exactly_the_scroll_offset() {
     assert!((y(&unscrolled) - y(&scrolled) - 5.0).abs() < 0.01);
 }
 
+/// A link is the user-agent stylesheet's blue, and an anchor with no address is
+/// not a link: HTML §15.3.4 colours `:link`, which an `<a>` without an `href`
+/// never matches, so it keeps the colour of the text around it.
 #[test]
 fn a_link_is_painted_in_the_ua_stylesheets_blue() {
-    let ops = ops(&page("<body><p><a>link</a>", 0.0));
-    let PaintOp::DrawGlyphs { brush, .. } = ops
-        .iter()
-        .find(|op| matches!(op, PaintOp::DrawGlyphs { .. }))
-        .expect("the link text")
-    else {
-        unreachable!("filtered above")
+    let brush_of = |html: &str| {
+        let ops = ops(&page(html, 0.0));
+        let PaintOp::DrawGlyphs { brush, .. } = ops
+            .iter()
+            .find(|op| matches!(op, PaintOp::DrawGlyphs { .. }))
+            .expect("the link text")
+        else {
+            unreachable!("filtered above")
+        };
+        brush.clone()
     };
-    assert_eq!(*brush, Brush::Solid(Color::from_rgb8(0, 0, 0xee)));
+    assert_eq!(
+        brush_of("<body><p><a href=/somewhere>link</a>"),
+        Brush::Solid(Color::from_rgb8(0, 0, 0xee))
+    );
+    assert_eq!(
+        brush_of("<body><p><a name=here>anchor</a>"),
+        Brush::Solid(Color::from_rgb8(0, 0, 0)),
+        "an anchor with no address was painted as a link"
+    );
 }
 
 #[test]

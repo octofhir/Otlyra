@@ -48,11 +48,7 @@ impl PageScene {
     /// rather than a way out of it, and it is not focusable anywhere else
     /// either.
     fn is_link(&self, node: NodeId) -> bool {
-        self.document
-            .get(node)
-            .and_then(otlyra_dom::Node::element)
-            .is_some_and(|element| element.name.local.as_ref() == "a")
-            && self.attribute(node, "href").is_some()
+        self.document.link_href(node).is_some()
     }
 
     /// What `tabindex` says about a node, if it says anything readable.
@@ -61,7 +57,7 @@ impl PageScene {
     /// ignored, which leaves the element focusable exactly as it would have
     /// been without the attribute.
     fn tabindex_of(&self, node: NodeId) -> Option<i32> {
-        self.attribute(node, "tabindex")?.trim().parse().ok()
+        self.document.attr(node, "tabindex")?.trim().parse().ok()
     }
 
     /// Everything the keyboard may stop on, in the order a reader meets it.
@@ -138,7 +134,7 @@ impl PageScene {
     /// The address the focused element goes to, if it is a link.
     pub fn focused_link(&self) -> Option<String> {
         let node = self.interaction.focus?;
-        self.is_link(node).then(|| self.attribute(node, "href"))?
+        self.document.link_href(node).map(str::to_owned)
     }
 
     /// Whether the focused control takes typing.

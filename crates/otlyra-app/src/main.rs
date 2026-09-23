@@ -819,10 +819,6 @@ const CACHE_FOLDER: &str = "cache";
 /// large.
 const DISK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
-/// The `file:` URL an input names, if it names one.
-///
-/// Accepts both a `file://` URL and a plain path, because both are things people
-/// type; a path is resolved against the working directory, as a shell would.
 /// The box tree a dump should show: the one the window would draw, cascade and all.
 fn styled_boxes(
     document: &otlyra_dom::Document,
@@ -839,9 +835,13 @@ fn styled_boxes(
             color_scheme: otlyra_css::cascade::ColorScheme::Light,
         },
     );
-    otlyra_layout::build_styled_box_tree(document, &styles)
+    otlyra_layout::build_box_tree(document, &styles)
 }
 
+/// The `file:` URL an input names, if it names one.
+///
+/// Accepts both a `file://` URL and a plain path, because both are things people
+/// type; a path is resolved against the working directory, as a shell would.
 fn file_url(input: &str) -> Option<url::Url> {
     if let Ok(url) = url::Url::parse(input)
         && url.scheme() == "file"

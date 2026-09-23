@@ -41,7 +41,7 @@ pub(super) fn shape_with_radii(
         return bounds.to_path(PATH_TOLERANCE);
     }
 
-    let corner = |value: otlyra_css::Length| {
+    let corner = |value: &otlyra_css::Length| {
         let radius = value.resolve(rect.width);
         if radius <= 0.0 {
             // A square corner stays square however far the shadow spreads.
@@ -50,10 +50,10 @@ pub(super) fn shape_with_radii(
         f64::from((radius + spread).max(0.0))
     };
     let mut radii = [
-        corner(style.radius.top_left),
-        corner(style.radius.top_right),
-        corner(style.radius.bottom_right),
-        corner(style.radius.bottom_left),
+        corner(&style.radius.top_left),
+        corner(&style.radius.top_right),
+        corner(&style.radius.bottom_right),
+        corner(&style.radius.bottom_left),
     ];
 
     // Two radii along one edge cannot together be longer than the edge.

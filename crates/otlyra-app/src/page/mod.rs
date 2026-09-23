@@ -23,7 +23,7 @@ pub use field::EditAction;
 use otlyra_css::cascade::ExternalSheets;
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
-use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images, build_box_tree};
+use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images};
 use otlyra_text::TextEngine;
 
 use find::Found;
@@ -313,7 +313,10 @@ impl PageScene {
             sheets,
             images,
             picture_sources,
-            boxes: build_box_tree(&document),
+            // Nothing is styled until the first frame says how wide the page is,
+            // and nothing unstyled has a box: until then the page is its initial
+            // containing block and no more.
+            boxes: BoxTree::default(),
             document,
             targets: Vec::new(),
             layout: None,
@@ -461,12 +464,8 @@ impl PageScene {
             .as_mut()
             .expect("a styler was just made if there was none")
             .style_with(&self.document, &self.form, self.interaction);
-        self.boxes = otlyra_layout::build_page_box_tree(
-            &self.document,
-            Some(&styles),
-            &self.images,
-            &self.form,
-        );
+        self.boxes =
+            otlyra_layout::build_page_box_tree(&self.document, &styles, &self.images, &self.form);
         self.styled_document = Some(styles);
         self.styled = true;
         self.layout_stale = true;
@@ -901,17 +900,6 @@ impl PageScene {
             .iter()
             .find(|fragment| fragment.box_id == Some(id))
             .and_then(|fragment| fragment.used)
-    }
-
-    /// One attribute of an element node.
-    fn attribute(&self, node: NodeId, name: &str) -> Option<String> {
-        self.document
-            .get(node)?
-            .element()?
-            .attrs
-            .iter()
-            .find(|attr| attr.name.local.as_ref() == name)
-            .map(|attr| attr.value.to_string())
     }
 
     /// The background pictures this page names and has not been given.

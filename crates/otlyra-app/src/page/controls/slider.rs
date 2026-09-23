@@ -22,22 +22,16 @@ impl PageScene {
 
     /// Put a slider where the pointer is.
     ///
-    /// The thumb travels between the two ends rather than off them, so the value
-    /// is taken from where the *middle* of the thumb would have to be — which is
-    /// what makes a press at the very left edge give the minimum rather than
-    /// something a little above it.
+    /// By the same mapping the painter drew the thumb with, run backwards: the
+    /// value is the one that would put the middle of the thumb under the pointer.
     pub(in crate::page) fn slide_to(&mut self, node: NodeId, x: f64) -> bool {
-        /// The thumb's width, which the painter draws and layout leaves room for.
-        const THUMB: f32 = 14.0;
-
         let Some(box_id) = self.boxes.box_for(node) else {
             return false;
         };
         let Some(rect) = self.rect_of(box_id) else {
             return false;
         };
-        let travel = (rect.width - THUMB).max(1.0);
-        let along = ((x as f32 - rect.x - THUMB / 2.0) / travel).clamp(0.0, 1.0);
+        let along = otlyra_layout::widget_metrics::position_at(rect, x as f32);
         let (min, max, _) = otlyra_dom::form::range_bounds(&self.document, node);
         let wanted = otlyra_dom::form::snap_to_step(
             &self.document,

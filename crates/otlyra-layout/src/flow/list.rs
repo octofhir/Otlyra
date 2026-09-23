@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use otlyra_css::ComputedStyle;
 
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::fragment::{Fragment, FragmentKind, Rect};
 
 use super::Flow;
 use super::inline::span_for;
@@ -81,19 +81,11 @@ impl<'a> Flow<'a> {
             glyph.y = baseline;
         }
 
-        Some(Fragment {
-            used: None,
-            box_id: None,
-            rect: Rect::new(left, y, room, line.height),
-            kind: FragmentKind::Text(run),
-            style: Arc::clone(&marker.style),
-            widget: None,
-            fixed: false,
-            scroll_port: None,
-            clip: None,
-            sticky: None,
-            layer: Layer::default(),
-            children: Vec::new(),
-        })
+        Some(Fragment::new(
+            None,
+            Rect::new(left, y, room, line.height),
+            FragmentKind::Text(run),
+            Arc::clone(&marker.style),
+        ))
     }
 }

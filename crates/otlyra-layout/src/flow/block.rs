@@ -8,18 +8,18 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{Clear, Float, LengthOrAuto};
+use otlyra_css::{Clear, Float, Sides};
 
 use crate::box_tree::{BoxId, BoxKind};
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect, ScrollPort, Sticky};
+use crate::fragment::{Fragment, Rect, ScrollPort, Sticky};
 
 use super::box_model::{
-    clamp_height, collapse, resolve_border, resolve_horizontal, resolve_margin, resolve_padding,
-    vertical_margin,
+    collapse, resolve_border, resolve_horizontal, resolve_margin, resolve_padding, vertical_margin,
 };
 use super::list::PendingMarker;
 use super::positioned::relative_offset;
-use super::replaced::{replaced_edges, replaced_fragment, replaced_size};
+use super::replaced::{replaced_fragment, replaced_height, replaced_size};
+use super::sizing::{Frame, InlineRoom};
 use super::{
     Flow, is_popup, mark_layer, mark_sticky, offset, set_clip, set_container, set_scroll_port,
     set_sticky_containers, shift,
@@ -200,15 +200,17 @@ impl<'a> Flow<'a> {
         // height comes from its own proportions rather than from anything inside it.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
             // The caller decided the *outer* width, so what is left for the
-            // picture is that less the frame around it.
-            let (extra_x, _) = replaced_edges(&style, width);
-            let (_, height) = replaced_size(&style, content, width);
+            // picture is that less the frame around it, and the height follows
+            // from that.
+            let frame = Frame::of(&style, width);
+            let inner = (width - frame.inline).max(0.0);
+            let height = replaced_height(&style, content, inner, width, self.containing_height);
             return replaced_fragment(
                 id,
                 &style,
                 content.image.clone(),
                 (x, y),
-                ((width - extra_x).max(0.0), height),
+                (inner, height),
                 width,
             );
         }
@@ -224,21 +226,23 @@ impl<'a> Flow<'a> {
         self.table_width = None;
         // What the box's own contents resolve a percentage height against: its
         // height, when it has one to give.
-        let outer_height = self.containing_height;
-        self.containing_height = self.inner_height(&style, padding);
-        let content_height =
-            self.layout_inside(id, content_width, content_x, content_y, &mut children);
-        self.containing_height = outer_height;
+        let inner = self.inner_height(&style, width);
+        let content_height = self.layout_inside(
+            id,
+            content_width,
+            content_x,
+            content_y,
+            inner,
+            &mut children,
+        );
         // A box laid out at a width the caller chose keeps it, table or not — a
         // flex item is as wide as its line gave it. Taken rather than left, so a
         // table inside one does not report its width to the block outside.
         self.table_width = None;
-        let content_height = clamp_height(
-            self.asked_height(&style).unwrap_or(content_height),
-            style.min_height,
-            style.max_height,
-            self.containing_height,
-        );
+        let content_height = self.content_height(id, content_height);
+        let content_height = self
+            .block_sizes_of(&style, width, Some(content_height))
+            .used(content_height);
 
         // A field is one line long however much has been typed into it, so what
         // moves is the line and not the box. Before the clip, because what is slid
@@ -273,24 +277,56 @@ impl<'a> Flow<'a> {
             }
         }
 
-        Fragment {
-            used: None,
-            box_id: Some(id),
-            rect: Rect::new(
+        Fragment::for_box(
+            id,
+            Rect::new(
                 x,
                 y,
                 width,
                 content_height + padding.top + padding.bottom + border.top + border.bottom,
             ),
-            kind: FragmentKind::Box,
             style,
-            widget: None,
-            fixed: false,
-            scroll_port: None,
-            clip: None,
-            sticky: None,
-            layer: Layer::default(),
             children,
+        )
+    }
+
+    /// What `overflow` other than `visible` does to a box once its contents are
+    /// laid out: they are cut off at its padding box, and when they reach further
+    /// down than it shows, the box is a scroll port for them.
+    ///
+    /// The rectangle is handed down rather than pushed as a layer, so a fragment
+    /// carries the one rectangle it is cut off at however deep it is.
+    pub(super) fn clip_overflow(
+        &mut self,
+        id: BoxId,
+        padding_box: Rect,
+        padding: Sides<f32>,
+        children: &mut [Fragment],
+    ) {
+        for child in children.iter_mut() {
+            if !is_popup(self.tree, child) {
+                set_clip(child, padding_box);
+            }
+        }
+
+        // How much there is to see: the furthest any of its contents reaches.
+        // More than the box can show is what makes it a scroll port.
+        let content_top = padding_box.y + padding.top;
+        let reach = children
+            .iter()
+            .filter(|child| !is_popup(self.tree, child))
+            .map(|child| child.rect.bottom())
+            .fold(content_top, f32::max);
+        let inside = reach - content_top + padding.top + padding.bottom;
+        if inside > padding_box.height + 0.5 {
+            self.scroll_ports.push(ScrollPort {
+                id,
+                port: padding_box,
+                content_height: inside,
+            });
+            for child in children.iter_mut() {
+                set_scroll_port(child, id);
+            }
         }
     }
 
@@ -349,8 +385,10 @@ impl<'a> Flow<'a> {
         let border = resolve_border(style);
         let padding = resolve_padding(style, containing_width);
         // A height of its own stops a margin at the bottom edge: the box ends where
-        // it says it does, not where its last child does.
-        let sized = style.height != LengthOrAuto::Auto;
+        // it says it does, not where its last child does. A percentage of a
+        // height nobody knows is not one, and neither is a keyword (CSS 2.2
+        // §8.3.1: the margins meet through a box whose height is `auto`).
+        let sized = self.asked_height(style, containing_width).is_some();
 
         (
             border.top == 0.0 && padding.top == 0.0,
@@ -362,7 +400,7 @@ impl<'a> Flow<'a> {
     /// escaped from its own first children.
     fn collapsed_top(&self, id: BoxId, containing_width: f32) -> f32 {
         let node = self.tree.node(id);
-        let mut margin = vertical_margin(node.style.margin.top, containing_width);
+        let mut margin = vertical_margin(&node.style.margin.top, containing_width);
         if self.open_edges(id, containing_width).0
             && let Some(&first) = node.children.first()
         {
@@ -374,7 +412,7 @@ impl<'a> Flow<'a> {
     /// The margin `id` presents to whatever is below it.
     fn collapsed_bottom(&self, id: BoxId, containing_width: f32) -> f32 {
         let node = self.tree.node(id);
-        let mut margin = vertical_margin(node.style.margin.bottom, containing_width);
+        let mut margin = vertical_margin(&node.style.margin.bottom, containing_width);
         if self.open_edges(id, containing_width).1
             && let Some(&last) = node.children.last()
         {
@@ -411,7 +449,8 @@ impl<'a> Flow<'a> {
         // A block-level picture is its own size and has no children to lay out;
         // everything else about it — margins, borders — is an ordinary block's.
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
-            let (width, height) = replaced_size(&style, content, containing_width);
+            let room = InlineRoom::within(&style, containing_width);
+            let (width, height) = replaced_size(&style, content, room, self.containing_height);
             let image = content.image.clone();
             let margin = resolve_margin(&style, containing_width);
             return replaced_fragment(
@@ -426,7 +465,20 @@ impl<'a> Flow<'a> {
 
         let padding = resolve_padding(&style, containing_width);
         let border = resolve_border(&style);
-        let (margin, content_width) = resolve_horizontal(&style, containing_width, padding, border);
+        let frame = Frame::new(padding, border);
+        let sizes = self.inline_sizes(
+            id,
+            &style,
+            InlineRoom::within(&style, containing_width),
+            frame.inline,
+        );
+        let (margin, content_width) = resolve_horizontal(
+            &style,
+            containing_width,
+            resolve_margin(&style, containing_width),
+            frame.inline,
+            sizes,
+        );
 
         let border_x = x + margin.left;
         let border_y = y;
@@ -435,13 +487,22 @@ impl<'a> Flow<'a> {
 
         let mut children = Vec::new();
         self.table_width = None;
+        // A table with no width of its own shrinks to its columns, but not past
+        // its minimum; the table is told what that is (see `table_floor`).
+        let shrinks = style.display == otlyra_css::Display::Table && sizes.preferred.is_none();
+        self.table_floor = if shrinks { sizes.limits.min } else { 0.0 };
         // What this box's contents resolve a percentage height against: its own
         // height, when it has one to give them.
-        let outer_height = self.containing_height;
-        self.containing_height = self.inner_height(&style, padding);
-        let mut content_height =
-            self.layout_inside(id, content_width, content_x, content_y, &mut children);
-        self.containing_height = outer_height;
+        let inner = self.inner_height(&style, containing_width);
+        let mut content_height = self.layout_inside(
+            id,
+            content_width,
+            content_x,
+            content_y,
+            inner,
+            &mut children,
+        );
+        self.table_floor = 0.0;
         // A root of a formatting context is at least as tall as the floats inside
         // it. Everywhere else a float is out of the flow and adds nothing to the
         // height of what holds it — which is the whole of what floating means —
@@ -459,16 +520,14 @@ impl<'a> Flow<'a> {
         // out to need. One that names a width keeps it, and its columns were
         // stretched to fill it instead.
         let shrunk = self.table_width.take();
-        let content_width = match style.width.resolve(containing_width) {
+        let content_width = match sizes.preferred {
             Some(_) => content_width,
             None => shrunk.unwrap_or(content_width),
         };
-        let content_height = clamp_height(
-            self.asked_height(&style).unwrap_or(content_height),
-            style.min_height,
-            style.max_height,
-            self.containing_height,
-        );
+        let content_height = self.content_height(id, content_height);
+        let content_height = self
+            .block_sizes_of(&style, containing_width, Some(content_height))
+            .used(content_height);
 
         if let Some(floats) = outer_floats {
             self.floats = floats;
@@ -496,9 +555,6 @@ impl<'a> Flow<'a> {
             }
         }
 
-        // `overflow` other than `visible` cuts its contents off at the padding
-        // edge. The rectangle is handed down rather than pushed as a layer, so a
-        // fragment carries the one rectangle it is cut off at however deep it is.
         if style.overflow == otlyra_css::Overflow::Clip {
             let padding_box = Rect::new(
                 border_x + border.left,
@@ -506,56 +562,24 @@ impl<'a> Flow<'a> {
                 content_width + padding.left + padding.right,
                 content_height + padding.top + padding.bottom,
             );
-            for child in &mut children {
-                if !is_popup(self.tree, child) {
-                    set_clip(child, padding_box);
-                }
-            }
-
-            // How much there is to see: the furthest any of its contents reaches.
-            // More than the box can show is what makes it a scroll port.
-            let reach = children
-                .iter()
-                .filter(|child| !is_popup(self.tree, child))
-                .map(|child| child.rect.bottom())
-                .fold(content_y, f32::max);
-            let inside = reach - content_y + padding.top + padding.bottom;
-            if inside > padding_box.height + 0.5 {
-                self.scroll_ports.push(ScrollPort {
-                    id,
-                    port: padding_box,
-                    content_height: inside,
-                });
-                for child in &mut children {
-                    set_scroll_port(child, id);
-                }
-            }
+            self.clip_overflow(id, padding_box, padding, &mut children);
         }
 
+        // The border box: the rectangle a background paints and a border is
+        // drawn on the inside edge of.
+        let border_box = Rect::new(
+            border_x,
+            border_y,
+            content_width + padding.left + padding.right + border.left + border.right,
+            content_height + padding.top + padding.bottom + border.top + border.bottom,
+        );
         Fragment {
             used: Some(crate::UsedEdges {
                 margin,
                 border,
                 padding,
             }),
-            box_id: Some(id),
-            // The border box: the rectangle a background paints and a border is
-            // drawn on the inside edge of.
-            rect: Rect::new(
-                border_x,
-                border_y,
-                content_width + padding.left + padding.right + border.left + border.right,
-                content_height + padding.top + padding.bottom + border.top + border.bottom,
-            ),
-            kind: FragmentKind::Box,
-            style,
-            widget: None,
-            fixed: false,
-            scroll_port: None,
-            clip: None,
-            sticky: None,
-            layer: Layer::default(),
-            children,
+            ..Fragment::for_box(id, border_box, style, children)
         }
     }
 }

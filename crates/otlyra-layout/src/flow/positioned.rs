@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use otlyra_css::{ComputedStyle, LengthOrAuto};
 
-use crate::box_tree::BoxId;
+use crate::box_tree::{BoxId, BoxKind};
 use crate::fragment::{Fragment, Rect};
 
-use super::box_model::{resolve_border, resolve_padding};
-use super::{Flow, mark_fixed, mark_layer, offset};
+use super::box_model::resolve_padding;
+use super::sizing::{Frame, InlineRoom};
+use super::{ContainingBlock, Flow, mark_fixed, mark_layer, offset};
 
 /// How far `relative` moves a box from where the flow put it.
 ///
@@ -44,16 +45,40 @@ impl<'a> Flow<'a> {
     /// Lay out a box's children, making it the containing block for the absolutely
     /// positioned ones if its `position` says so.
     ///
-    /// The height it offers is the height it was given, or the rest of the page
-    /// when it has none of its own: what a percentage inset resolves against is the
-    /// padding box, and a box whose height is its content's is not measured until
-    /// its content — including these very children — has been laid out.
+    /// `content_height` is the box's own height, when it has one before its
+    /// contents are laid out: it is what a percentage height inside the box is
+    /// of (CSS 2.2 §10.5), and a flex container inside it is that tall.
+    ///
+    /// The height a containing block offers a positioned box is that height, or
+    /// the rest of the page when it has none: what a percentage inset resolves
+    /// against is the padding box, and a box whose height is its content's is not
+    /// measured until its content — including these very children — has been
+    /// laid out.
     pub(super) fn layout_inside(
         &mut self,
         id: BoxId,
         content_width: f32,
         content_x: f32,
         content_y: f32,
+        content_height: Option<f32>,
+        out: &mut Vec<Fragment>,
+    ) -> f32 {
+        let outer_height = std::mem::replace(&mut self.containing_height, content_height);
+        let used =
+            self.layout_contents(id, content_width, content_x, content_y, content_height, out);
+        self.containing_height = outer_height;
+        used
+    }
+
+    /// The children of a box, with the box pushed as a containing block while
+    /// they are laid out when its `position` makes it one.
+    fn layout_contents(
+        &mut self,
+        id: BoxId,
+        content_width: f32,
+        content_x: f32,
+        content_y: f32,
+        content_height: Option<f32>,
         out: &mut Vec<Fragment>,
     ) -> f32 {
         let style = Arc::clone(&self.tree.node(id).style);
@@ -62,16 +87,17 @@ impl<'a> Flow<'a> {
         }
 
         let padding = resolve_padding(&style, content_width);
-        let height = style
-            .height
-            .resolve(content_width)
-            .unwrap_or_else(|| (self.viewport.bottom() - content_y).max(0.0));
-        self.containing_blocks.push(Rect::new(
-            content_x - padding.left,
-            content_y - padding.top,
-            content_width + padding.left + padding.right,
-            height + padding.top + padding.bottom,
-        ));
+        let height =
+            content_height.unwrap_or_else(|| (self.viewport.bottom() - content_y).max(0.0));
+        self.containing_blocks.push(ContainingBlock {
+            rect: Rect::new(
+                content_x - padding.left,
+                content_y - padding.top,
+                content_width + padding.left + padding.right,
+                height + padding.top + padding.bottom,
+            ),
+            height: content_height.map(|height| height + padding.top + padding.bottom),
+        });
 
         let used = self.layout_children(id, content_width, content_x, content_y, out);
         self.containing_blocks.pop();
@@ -85,43 +111,53 @@ impl<'a> Flow<'a> {
     /// was and only leaves the flow.
     pub(super) fn layout_positioned(&mut self, id: BoxId, static_y: f32) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
-        let area = if style.position == otlyra_css::Position::Fixed {
-            self.viewport
+        let block = if style.position == otlyra_css::Position::Fixed {
+            ContainingBlock {
+                rect: self.viewport,
+                height: Some(self.viewport.height),
+            }
         } else {
             *self
                 .containing_blocks
                 .last()
                 .expect("the initial containing block is always there")
         };
+        let area = block.rect;
 
-        let inset = |value: LengthOrAuto, against: f32| value.resolve(against);
-        let left = inset(style.inset.left, area.width);
-        let right = inset(style.inset.right, area.width);
-        let top = inset(style.inset.top, area.height);
-        let bottom = inset(style.inset.bottom, area.height);
+        let inset = |value: &LengthOrAuto, against: f32| value.resolve(against);
+        let left = inset(&style.inset.left, area.width);
+        let right = inset(&style.inset.right, area.width);
+        let top = inset(&style.inset.top, area.height);
+        let bottom = inset(&style.inset.bottom, area.height);
 
-        // The width: what it asks for, what its two insets leave between them, or
-        // what its content wants.
-        let width = match (style.width.resolve(area.width), left, right) {
-            // `width` is the *content* box, and what is laid out is the border box:
-            // a positioned box with padding on it is that much wider than the number
-            // it was given, exactly as one in the flow is.
-            (Some(width), _, _) => {
-                let padding = resolve_padding(&style, area.width);
-                let border = resolve_border(&style);
-                width + padding.left + padding.right + border.left + border.right
-            }
-            (None, Some(left), Some(right)) => (area.width - left - right).max(0.0),
-            _ => self
-                .max_content_width(id, area.width)
-                .min(area.width)
-                .max(0.0),
+        // A percentage height is of the box it is placed against, not of the
+        // one it happened to sit in — and so is the width a picture takes from
+        // its height.
+        let outer_height = std::mem::replace(&mut self.containing_height, block.height);
+
+        // The border-box width (CSS 2.2 §10.3.7): what it asks for; with an
+        // `auto` width, what its two insets leave between them, or when an edge
+        // is free what its content wants of what there is; and the minimum and
+        // maximum over either. A picture is its own width between two insets as
+        // anywhere else (§10.3.8), and its margins take up the rest.
+        let frame = Frame::of(&style, area.width).inline;
+        let room = InlineRoom::laid_out(
+            area.width,
+            area.width - left.unwrap_or(0.0) - right.unwrap_or(0.0),
+        );
+        let picture = matches!(self.tree.node(id).kind, BoxKind::Replaced(_));
+        let width = match (left, right) {
+            (Some(left), Some(right)) if !picture => self
+                .inline_sizes(id, &style, room, frame)
+                .used_border_box(frame, || (area.width - left - right).max(0.0)),
+            _ => self.shrink_to_fit_width(id, &style, room, frame),
         };
 
         // A float outside does not reach into a positioned box, and one inside does
         // not reach out.
         let outer_floats = std::mem::take(&mut self.floats);
         let mut fragment = self.layout_sized(id, area.x, area.y, width);
+        self.containing_height = outer_height;
         self.floats = outer_floats;
 
         let x = match (left, right) {

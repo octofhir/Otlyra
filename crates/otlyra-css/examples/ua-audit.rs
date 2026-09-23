@@ -52,8 +52,8 @@ fn main() {
         println!(
             "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             display(style.display),
-            sides_auto(style.margin),
-            sides(style.padding),
+            sides_auto(&style.margin),
+            sides(&style.padding),
             round(style.font_size),
             style.font_weight,
             format_args!("{:?}", style.font_style),
@@ -84,32 +84,35 @@ fn display(value: Display) -> &'static str {
     }
 }
 
-fn sides(value: otlyra_css::Sides<Length>) -> String {
-    let one = |length: Length| match length {
-        Length::Px(px) => round(px),
-        Length::Percent(fraction) => format!("{}%", fraction * 100.0),
-    };
+/// One length, rounded to a tenth of a pixel so it diffs against a reference.
+fn length(value: &Length) -> String {
+    match value {
+        Length::Px(px) => round(*px),
+        Length::Percent(_) | Length::Calc(_) => value.to_string(),
+    }
+}
+
+fn sides(value: &otlyra_css::Sides<Length>) -> String {
     format!(
         "{} {} {} {}",
-        one(value.top),
-        one(value.right),
-        one(value.bottom),
-        one(value.left)
+        length(&value.top),
+        length(&value.right),
+        length(&value.bottom),
+        length(&value.left)
     )
 }
 
-fn sides_auto(value: otlyra_css::Sides<LengthOrAuto>) -> String {
-    let one = |length: LengthOrAuto| match length {
-        LengthOrAuto::Px(px) => round(px),
-        LengthOrAuto::Percent(fraction) => format!("{}%", fraction * 100.0),
+fn sides_auto(value: &otlyra_css::Sides<LengthOrAuto>) -> String {
+    let one = |value: &LengthOrAuto| match value {
+        LengthOrAuto::Length(value) => length(value),
         LengthOrAuto::Auto => "auto".to_owned(),
     };
     format!(
         "{} {} {} {}",
-        one(value.top),
-        one(value.right),
-        one(value.bottom),
-        one(value.left)
+        one(&value.top),
+        one(&value.right),
+        one(&value.bottom),
+        one(&value.left)
     )
 }
 

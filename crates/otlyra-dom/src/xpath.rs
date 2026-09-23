@@ -1635,7 +1635,9 @@ impl<'a> Engine<'a> {
                         .get(node)
                         .and_then(|data| data.element())
                         .and_then(|element| {
-                            element.attr("xml:lang").or_else(|| element.attr("lang"))
+                            element
+                                .attr_in(&html5ever::ns!(xml), "lang")
+                                .or_else(|| element.attr("lang"))
                         })
                     {
                         let found = found.to_lowercase();

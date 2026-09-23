@@ -8,12 +8,13 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{Clear, Float};
+use otlyra_css::{Clear, Float, Size};
 
 use crate::box_tree::BoxId;
 use crate::fragment::{Fragment, Layer, Rect};
 
-use super::box_model::{clamp, resolve_margin};
+use super::box_model::resolve_margin;
+use super::sizing::{Frame, InlineRoom};
 use super::{Flow, offset};
 
 /// A box taken out of the flow and put against an edge.
@@ -76,21 +77,19 @@ impl<'a> Flow<'a> {
 
         // A float with no width of its own shrinks to fit: as wide as its content
         // wants, and never wider than what is left for it. A block would have taken
-        // the whole column, which is the one thing a float must not do.
-        let mut fragment = match style.width.resolve(containing_width) {
-            Some(_) => self.layout_block(id, containing_width, x, y),
-            None => {
+        // the whole column, which is the one thing a float must not do. One that
+        // names a width — a length or a keyword alike — is laid out as a block of
+        // that width.
+        let mut fragment = match &style.width {
+            Size::Auto => {
                 let margin = resolve_margin(&style, containing_width);
-                let available = (containing_width - margin.left - margin.right).max(0.0);
-                let content = self.max_content_width(id, containing_width);
-                let floor = self.min_content_width(id, containing_width, true);
-                let width = clamp(
-                    content.clamp(floor.min(available), available),
-                    style.min_width,
-                    style.max_width,
-                    containing_width,
-                );
+                let frame = Frame::of(&style, containing_width).inline;
+                let room = InlineRoom::within(&style, containing_width);
+                let width = self.shrink_to_fit_width(id, &style, room, frame);
                 self.layout_sized(id, x + margin.left, y, width)
+            }
+            Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => {
+                self.layout_block(id, containing_width, x, y)
             }
         };
         self.floats = outer_floats;

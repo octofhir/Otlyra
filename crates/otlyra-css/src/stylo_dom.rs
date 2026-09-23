@@ -507,10 +507,8 @@ fn fxhash(value: &str) -> u32 {
 fn presentational_css(element: &ElementData) -> String {
     let attribute = |name: &str| {
         element
-            .attrs
-            .iter()
-            .find(|attr| attr.name.local.as_ref() == name)
-            .map(|attr| attr.value.trim())
+            .attr(name)
+            .map(str::trim)
             .filter(|value| !value.is_empty())
     };
 

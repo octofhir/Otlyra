@@ -241,11 +241,7 @@ impl ElementRef {
     fn js_get_attribute(&self, name: String) -> Result<Option<String>, JsError> {
         let id = self.id();
         with_document(self.doc(), |document| {
-            document
-                .get(id)
-                .and_then(|node| node.element())
-                .and_then(|element| element.attr(&name.to_lowercase()))
-                .map(str::to_owned)
+            document.attr(id, &name.to_lowercase()).map(str::to_owned)
         })
     }
 
@@ -359,12 +355,7 @@ impl ElementRef {
     fn attribute(&self, name: &str) -> Result<String, JsError> {
         let id = self.id();
         with_document(self.doc(), |document| {
-            document
-                .get(id)
-                .and_then(|node| node.element())
-                .and_then(|element| element.attr(name))
-                .unwrap_or_default()
-                .to_owned()
+            document.attr(id, name).unwrap_or_default().to_owned()
         })
     }
 
@@ -577,13 +568,7 @@ impl DocumentRef {
     fn js_get_element_by_id(&self, id: String) -> Result<Option<Wrapped<ElementRef>>, JsError> {
         with_document(self.doc(), |document| {
             descendants(document, document.root())
-                .find(|candidate| {
-                    document
-                        .get(*candidate)
-                        .and_then(|node| node.element())
-                        .and_then(|element| element.attr("id"))
-                        == Some(id.as_str())
-                })
+                .find(|&candidate| document.attr(candidate, "id") == Some(id.as_str()))
                 .map(|id| Wrapped(ElementRef::of(document.id(), id)))
         })
     }

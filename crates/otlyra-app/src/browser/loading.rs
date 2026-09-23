@@ -648,13 +648,7 @@ impl Browser {
             .deferred_scripts
             .iter()
             .filter_map(|node| {
-                let src = parsed
-                    .document
-                    .get(*node)?
-                    .element()?
-                    .attr("src")?
-                    .trim()
-                    .to_owned();
+                let src = parsed.document.attr(*node, "src")?.trim().to_owned();
                 (!src.is_empty()).then_some((*node, src))
             })
             .take(SCRIPT_LIMIT)
@@ -672,13 +666,7 @@ impl Browser {
             .as_ref()
             .and_then(otlyra_html::HtmlParser::blocked_on)
             .and_then(|node| {
-                let src = parsed
-                    .document
-                    .get(node)?
-                    .element()?
-                    .attr("src")?
-                    .trim()
-                    .to_owned();
+                let src = parsed.document.attr(node, "src")?.trim().to_owned();
                 (!src.is_empty()).then_some((node, src))
             });
         for (node, src) in stopped_at.into_iter().chain(scripts) {
@@ -909,13 +897,7 @@ impl Browser {
             // Stopped again, at the next script. Ask for that one.
             let src = self.tabs[index].page.as_ref().and_then(|page| {
                 let node = parser.blocked_on()?;
-                let src = page
-                    .document()
-                    .get(node)?
-                    .element()?
-                    .attr("src")?
-                    .trim()
-                    .to_owned();
+                let src = page.document().attr(node, "src")?.trim().to_owned();
                 (!src.is_empty()).then_some((node, src))
             });
             if let Some((node, src)) = src {

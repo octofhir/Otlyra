@@ -10,8 +10,9 @@ mod collapse;
 use std::sync::Arc;
 
 use crate::box_tree::BoxId;
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::fragment::{Fragment, FragmentKind, Rect};
 
+use super::intrinsic::Wanted;
 use super::{Flow, offset};
 
 pub(super) use collapse::TableLines;
@@ -113,6 +114,9 @@ impl<'a> Flow<'a> {
         out: &mut Vec<Fragment>,
     ) -> Option<f32> {
         let style = Arc::clone(&self.tree.node(parent).style);
+        // Taken before anything inside the table is laid out, since a table in a
+        // cell hands over a minimum of its own.
+        let own_floor = std::mem::take(&mut self.table_floor);
         // Collapsed, the cells meet on a line rather than sitting apart on their
         // own edges, and `border-spacing` says nothing at all.
         let (spacing_x, spacing_y) = match style.border_collapse {
@@ -139,13 +143,18 @@ impl<'a> Flow<'a> {
         let gaps = spacing_x * (columns + 1) as f32;
         let available = (width - gaps).max(0.0);
 
+        // A cell's percentage width is of the table, which is the one width a
+        // table has before its columns are measured — so, unlike anywhere else a
+        // box is measured, it resolves rather than being cyclic, and a
+        // `width="30%"` cell asks for a third of the room.
+        let mut measure =
+            |id: BoxId, wanted: Wanted| self.contribution(id, available, Some(available), wanted);
         let mut minimums = vec![0.0f32; columns];
         let mut maximums = vec![0.0f32; columns];
         for cell in cells.iter().flatten().filter(|cell| cell.columns == 1) {
             let column = cell.column;
-            minimums[column] =
-                minimums[column].max(self.min_content_width(cell.id, available, false));
-            maximums[column] = maximums[column].max(self.max_content_width(cell.id, available));
+            minimums[column] = minimums[column].max(measure(cell.id, Wanted::Narrowest));
+            maximums[column] = maximums[column].max(measure(cell.id, Wanted::Widest));
         }
 
         // A cell across several columns asks nothing of any one of them: it asks
@@ -165,8 +174,8 @@ impl<'a> Flow<'a> {
                 let between = spacing_x * (cell.columns - 1) as f32;
                 (
                     covered,
-                    self.min_content_width(cell.id, available, false) - between,
-                    self.max_content_width(cell.id, available) - between,
+                    measure(cell.id, Wanted::Narrowest) - between,
+                    measure(cell.id, Wanted::Widest) - between,
                 )
             })
             .collect();
@@ -187,17 +196,17 @@ impl<'a> Flow<'a> {
         // and one told sixty holding a sixty-two-pixel word is sixty-two.
         let declared = self.tree.columns(parent).to_vec();
         for (column, style) in declared.iter().enumerate().take(columns) {
-            let Some(asked) = style.width.resolve(available) else {
+            let otlyra_css::Size::Length(asked) = &style.width else {
                 continue;
             };
-            maximums[column] = asked.max(minimums[column]);
+            maximums[column] = asked.resolve(available).max(minimums[column]);
         }
 
         let mut widths = share_out(&minimums, &maximums, available);
         // A table told how wide to be fills that width: the columns keep their
         // proportions and share out what is left over, rather than sitting narrow
         // in a box that was asked to be wide.
-        if style.width.resolve(width).is_some() {
+        if matches!(style.width, otlyra_css::Size::Length(_)) {
             let taken: f32 = widths.iter().sum();
             if taken > 0.0 && available > taken {
                 let scale = available / taken;
@@ -209,19 +218,24 @@ impl<'a> Flow<'a> {
         // A caption cannot be narrower than its longest word, and the table cannot
         // be narrower than its caption: a two-letter table under a one-word caption
         // is as wide as the word, with its columns stretched to fill. The floor is
-        // on the table's border box, so its own edges come off it first.
+        // on the table's border box, so its own edges come off it first. Nor can
+        // a table be narrower than its own `min-width`, which is filled the same
+        // way.
         let frame = {
             let style = self.style_of(parent);
             style.border.left.width + style.border.right.width
         };
-        let caption_floor = captions
+        let floor = captions
             .iter()
-            .map(|&caption| self.min_content_width(caption, available, false))
+            .map(|&caption| {
+                self.contribution(caption, available, Some(available), Wanted::Narrowest)
+            })
             .fold(0.0f32, f32::max)
             - frame;
+        let floor = floor.max(own_floor);
         let taken: f32 = widths.iter().sum();
-        if taken > 0.0 && caption_floor - gaps > taken {
-            let scale = (caption_floor - gaps) / taken;
+        if taken > 0.0 && floor - gaps > taken {
+            let scale = (floor - gaps) / taken;
             for column in &mut widths {
                 *column *= scale;
             }
@@ -306,25 +320,17 @@ impl<'a> Flow<'a> {
                 if !paints {
                     continue;
                 }
-                fragments.push(Fragment {
-                    used: None,
-                    box_id: None,
-                    rect: Rect::new(
+                fragments.push(Fragment::new(
+                    None,
+                    Rect::new(
                         offsets[column],
                         first,
                         widths[column],
                         last + height - first,
                     ),
-                    kind: FragmentKind::Box,
-                    style: Arc::clone(style),
-                    widget: None,
-                    fixed: false,
-                    scroll_port: None,
-                    clip: None,
-                    sticky: None,
-                    layer: Layer::default(),
-                    children: Vec::new(),
-                });
+                    FragmentKind::Box,
+                    Arc::clone(style),
+                ));
             }
         }
 
@@ -341,25 +347,17 @@ impl<'a> Flow<'a> {
                     heights[covered].iter().sum::<f32>() + spacing_y * (cell.rows - 1) as f32;
             }
 
-            fragments.push(Fragment {
-                used: None,
-                box_id: Some(*row),
-                rect: Rect::new(
+            fragments.push(Fragment::for_box(
+                *row,
+                Rect::new(
                     x + spacing_x,
                     tops[index],
                     table_width - spacing_x * 2.0,
                     heights[index],
                 ),
-                kind: FragmentKind::Box,
-                style: row_style,
-                widget: None,
-                fixed: false,
-                scroll_port: None,
-                clip: None,
-                sticky: None,
-                layer: Layer::default(),
-                children: laid,
-            });
+                row_style,
+                laid,
+            ));
         }
 
         // The grid, drawn once and last: a collapsed border is the edge between two

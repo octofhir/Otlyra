@@ -13,18 +13,19 @@
 //!
 //! This module holds the two ways in, [`layout`] and [`relayout_contained`], the
 //! engine they both drive, and the walks that move and mark a subtree once it has
-//! been laid out — which every formatting context needs and none of them owns.
-//! The contexts are a module each:
+//! been laid out. The contexts are a module each:
 //!
 //! - `block` stacks boxes and collapses their margins, and hands a container to
 //!   whichever context its `display` names.
 //! - `inline` gathers a paragraph, shapes it and builds its line boxes; `list`
 //!   hangs a list item's marker off the first of them.
 //! - `flex`, `grid` and `table` are the other three containers.
-//! - `float` and `positioned` are the boxes that leave the flow.
+//! - `float` and `positioned` are the boxes placed somewhere other than where the
+//!   flow put them.
 //! - `replaced` sizes a picture, and `widgets` a form control.
-//! - `box_model` resolves margins, borders, padding and the sizes they come to,
-//!   and `intrinsic` measures how wide a box's content wants to be.
+//! - `box_model` resolves margins, borders and padding; `sizing` what `width`,
+//!   `height`, their minimums and maximums and `box-sizing` ask of a box; and
+//!   `intrinsic` measures how wide a box's content wants to be.
 
 mod block;
 mod box_model;
@@ -36,6 +37,7 @@ mod intrinsic;
 mod list;
 mod positioned;
 mod replaced;
+mod sizing;
 mod table;
 mod widgets;
 
@@ -78,11 +80,15 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         font_stacks: std::collections::HashMap::new(),
         line_shifts: std::collections::HashMap::new(),
         floats: Vec::new(),
-        containing_blocks: vec![initial],
+        containing_blocks: vec![ContainingBlock {
+            rect: initial,
+            height: Some(initial.height),
+        }],
         viewport: initial,
         scroll_ports: Vec::new(),
         pending_marker: None,
         table_width: None,
+        table_floor: 0.0,
         collapsed: slotmap::SecondaryMap::new(),
         collapsed_lines: slotmap::SecondaryMap::new(),
         measured: std::collections::HashMap::new(),
@@ -97,22 +103,12 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
     let mut children = Vec::new();
     let height = engine.layout_children(root, viewport.width, 0.0, 0.0, &mut children);
 
-    let root_fragment = Fragment {
-        used: None,
-        box_id: Some(root),
-        rect: Rect::new(0.0, 0.0, viewport.width, height.max(viewport.height)),
-        kind: FragmentKind::Box,
-        style: Arc::clone(&tree.node(root).style),
-        widget: None,
-        fixed: false,
-        scroll_port: None,
-        clip: None,
-        sticky: None,
-        layer: Layer::default(),
+    let mut root_fragment = Fragment::for_box(
+        root,
+        Rect::new(0.0, 0.0, viewport.width, height.max(viewport.height)),
+        Arc::clone(&tree.node(root).style),
         children,
-    };
-
-    let mut root_fragment = root_fragment;
+    );
     // Where every box sits in the painting order, which is a question about its
     // ancestors as much as about itself and so cannot be answered until they are
     // all here.
@@ -158,11 +154,15 @@ pub fn relayout_contained(
         font_stacks: std::collections::HashMap::new(),
         line_shifts: std::collections::HashMap::new(),
         floats: Vec::new(),
-        containing_blocks: vec![content],
+        containing_blocks: vec![ContainingBlock {
+            rect: content,
+            height: None,
+        }],
         viewport: content,
         scroll_ports: Vec::new(),
         pending_marker: None,
         table_width: None,
+        table_floor: 0.0,
         collapsed: slotmap::SecondaryMap::new(),
         collapsed_lines: slotmap::SecondaryMap::new(),
         measured: std::collections::HashMap::new(),
@@ -201,6 +201,20 @@ fn attach_widgets(fragment: &mut Fragment, tree: &BoxTree) {
     }
 }
 
+/// A box that absolutely positioned boxes are placed against.
+#[derive(Copy, Clone, Debug)]
+struct ContainingBlock {
+    /// Its padding box, which is what an inset is measured from.
+    ///
+    /// A box as tall as its contents is not measured until they — these very
+    /// positioned boxes among them — have been laid out, so its height here is
+    /// the rest of the page, standing in for one nobody knows yet.
+    rect: Rect,
+    /// That height, when it was settled before the contents were laid out: what
+    /// a positioned box's own percentage height is of (CSS 2.2 §10.5).
+    height: Option<f32>,
+}
+
 struct Flow<'a> {
     tree: &'a BoxTree,
     text: &'a mut TextEngine,
@@ -225,10 +239,10 @@ struct Flow<'a> {
     /// affects the lines it sits beside, and until block formatting contexts are
     /// told apart, "beside" is a question about the page.
     floats: Vec<FloatBox>,
-    /// The padding box of the nearest positioned ancestor, which is what an
-    /// absolutely positioned box measures its insets against. The first entry is
-    /// the initial containing block, so the stack is never empty.
-    containing_blocks: Vec<Rect>,
+    /// The nearest positioned ancestor, which is what an absolutely positioned
+    /// box measures its insets against. The first entry is the initial
+    /// containing block, so the stack is never empty.
+    containing_blocks: Vec<ContainingBlock>,
     /// The viewport, which is what a fixed box measures against.
     viewport: Rect,
     /// The boxes that cut their contents off and have more than they can show.
@@ -244,6 +258,16 @@ struct Flow<'a> {
     /// the block that holds the table has already committed to one. So it is
     /// reported back here and the block narrows itself to it.
     table_width: Option<f32>,
+    /// How narrow the table about to be laid out may shrink: the other half of
+    /// the same exchange.
+    ///
+    /// A table with no width of its own is as wide as its columns need, but not
+    /// narrower than its `min-width` — and the columns are what have to be
+    /// stretched to fill that, which only the table's own formatting context
+    /// can do. The block that holds the table has resolved the minimum against
+    /// its containing block and hands it over here; the table takes it as it
+    /// starts, and nothing else reads it.
+    table_floor: f32,
     /// What a box's contents needed at their narrowest and at their widest, by the
     /// box and the width it was asked about.
     ///
@@ -407,3 +431,6 @@ fn offset(fragment: &mut Fragment, x: f32, y: f32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sizing_tests;

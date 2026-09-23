@@ -11,12 +11,14 @@ use std::sync::Arc;
 use peniko::Color;
 use style::properties::ComputedValues;
 
+use crate::calc::Calc;
 use crate::style::{
-    AlignContent, AlignItems, Anchor, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
+    AlignContent, AlignItems, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle, Corners,
-    Display, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop, JustifyContent,
-    Length, LengthOrAuto, LineHeight, ObjectFit, Overflow, Placement, Position, Repeat, Shadow,
-    Sides, TextAlign, TextDecoration, TextWrap, Track, TransformOp, TransformOrigin, WhiteSpace,
+    Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
+    Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, MaxSize, ObjectFit, Overflow,
+    Placement, Position, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap, Track,
+    TransformOp, TransformOrigin, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -79,24 +81,24 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         text_wrap: text_wrap(values),
         text_decoration: text_decoration(values),
         margin: Sides {
-            top: length_or_auto(&values.get_margin().margin_top),
-            right: length_or_auto(&values.get_margin().margin_right),
-            bottom: length_or_auto(&values.get_margin().margin_bottom),
-            left: length_or_auto(&values.get_margin().margin_left),
+            top: margin(&values.get_margin().margin_top),
+            right: margin(&values.get_margin().margin_right),
+            bottom: margin(&values.get_margin().margin_bottom),
+            left: margin(&values.get_margin().margin_left),
         },
         padding: Sides {
-            top: length(&values.get_padding().padding_top.0),
-            right: length(&values.get_padding().padding_right.0),
-            bottom: length(&values.get_padding().padding_bottom.0),
-            left: length(&values.get_padding().padding_left.0),
+            top: length_percentage(&values.get_padding().padding_top.0),
+            right: length_percentage(&values.get_padding().padding_right.0),
+            bottom: length_percentage(&values.get_padding().padding_bottom.0),
+            left: length_percentage(&values.get_padding().padding_left.0),
         },
         border: border(values),
         text_align: text_align(values),
         width: size(&values.get_position().width),
         height: size(&values.get_position().height),
-        min_width: min_size(&values.get_position().min_width),
+        min_width: size(&values.get_position().min_width),
         max_width: max_size(&values.get_position().max_width),
-        min_height: min_size(&values.get_position().min_height),
+        min_height: size(&values.get_position().min_height),
         max_height: max_size(&values.get_position().max_height),
         float: float_of(values),
         clear: clear_of(values),
@@ -398,10 +400,11 @@ fn transform(values: &ComputedValues) -> Arc<[TransformOp]> {
                 Op::Matrix(matrix) => TransformOp::Matrix([
                     matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f,
                 ]),
-                Op::Translate(x, y) => TransformOp::Translate(length(x), length(y)),
-                Op::TranslateX(x) => TransformOp::Translate(length(x), Length::ZERO),
-                Op::TranslateY(y) => TransformOp::Translate(Length::ZERO, length(y)),
-                Op::Translate3D(x, y, _) => TransformOp::Translate(length(x), length(y)),
+                Op::Translate(x, y) | Op::Translate3D(x, y, _) => {
+                    TransformOp::Translate(length_percentage(x), length_percentage(y))
+                }
+                Op::TranslateX(x) => TransformOp::Translate(length_percentage(x), Length::ZERO),
+                Op::TranslateY(y) => TransformOp::Translate(Length::ZERO, length_percentage(y)),
                 Op::Scale(x, y) => TransformOp::Scale(*x, *y),
                 Op::ScaleX(x) => TransformOp::Scale(*x, 1.0),
                 Op::ScaleY(y) => TransformOp::Scale(1.0, *y),
@@ -422,8 +425,8 @@ fn transform(values: &ComputedValues) -> Arc<[TransformOp]> {
 fn transform_origin(values: &ComputedValues) -> TransformOrigin {
     let origin = &values.get_box().transform_origin;
     TransformOrigin {
-        x: length(&origin.horizontal),
-        y: length(&origin.vertical),
+        x: length_percentage(&origin.horizontal),
+        y: length_percentage(&origin.vertical),
     }
 }
 
@@ -451,16 +454,12 @@ fn vertical_align(values: &ComputedValues) -> crate::style::VerticalAlign {
     match &values.get_box().baseline_shift {
         BaselineShift::Keyword(Keyword::Sub) => VerticalAlign::Sub,
         BaselineShift::Keyword(Keyword::Super) => VerticalAlign::Super,
-        BaselineShift::Length(value) => match value.to_percentage() {
-            Some(percentage) if percentage.0 != 0.0 => VerticalAlign::Percent(percentage.0),
-            Some(_) => VerticalAlign::Baseline,
-            // The initial value is a zero length rather than a keyword, and a box
-            // that does not move is worth saying so about: everything downstream
-            // can then skip the arithmetic for the common case.
-            None => match value.to_used_value(app_units::Au(0)).to_f32_px() {
-                0.0 => VerticalAlign::Baseline,
-                px => VerticalAlign::Length(px),
-            },
+        // The initial value is a zero length rather than a keyword, and a box
+        // that does not move is worth saying so about: everything downstream can
+        // then skip the arithmetic for the common case.
+        BaselineShift::Length(value) => match length_percentage(value) {
+            Length::Px(0.0) | Length::Percent(0.0) => VerticalAlign::Baseline,
+            shift => VerticalAlign::Shift(shift),
         },
         BaselineShift::Keyword(Keyword::Top) => VerticalAlign::Top,
         BaselineShift::Keyword(Keyword::Bottom) => VerticalAlign::Bottom,
@@ -584,7 +583,7 @@ fn background_size(size: &style::values::computed::BackgroundSize) -> Background
                     style::values::generics::length::GenericLengthPercentageOrAuto::Auto => None,
                     style::values::generics::length::GenericLengthPercentageOrAuto::LengthPercentage(
                         value,
-                    ) => Some(length(&value.0)),
+                    ) => Some(length_percentage(&value.0)),
                 }
             };
             match (side(width), side(height)) {
@@ -624,32 +623,19 @@ fn background_repeat(
 
 /// Where one background layer sits in the box it is behind.
 ///
-/// The computed value is a length, a percentage, or the sum of both — `right 10px`
-/// is `calc(100% - 10px)` by the time it gets here — and all three are the same
-/// affine function of the room the picture leaves. So each is measured rather than
-/// taken apart: what it gives for no room at all is the length, and how much it
-/// moves per unit of room is the fraction. A `calc()` that clamps is not affine and
-/// is the one shape this reads wrongly; none of the keywords produce one.
+/// The computed value is a length, a percentage, or an expression of both —
+/// `right 10px` is `calc(100% - 10px)` by the time it gets here — and a percentage
+/// in it is of the room the picture leaves, which paint resolves it against.
 fn background_position(
     x: Option<&style::values::computed::LengthPercentage>,
     y: Option<&style::values::computed::LengthPercentage>,
 ) -> BackgroundPosition {
-    use style::values::computed::Length;
-
-    let anchor = |value: Option<&style::values::computed::LengthPercentage>| match value {
-        Some(value) => {
-            let offset = value.resolve(Length::new(0.0)).px();
-            Anchor {
-                fraction: value.resolve(Length::new(1.0)).px() - offset,
-                offset,
-            }
-        }
-        None => Anchor::START,
+    let axis = |value: Option<&style::values::computed::LengthPercentage>, start: Length| {
+        value.map_or(start, length_percentage)
     };
-
     BackgroundPosition {
-        x: anchor(x),
-        y: anchor(y),
+        x: axis(x, BackgroundPosition::START.x),
+        y: axis(y, BackgroundPosition::START.y),
     }
 }
 
@@ -667,20 +653,10 @@ fn object_fit(values: &ComputedValues) -> ObjectFit {
 /// `object-position`, which is `background-position`'s arithmetic with a
 /// different starting value.
 fn object_position(values: &ComputedValues) -> BackgroundPosition {
-    use style::values::computed::Length;
-
     let position = &values.get_position().object_position;
-    let anchor = |value: &style::values::computed::LengthPercentage| {
-        let offset = value.resolve(Length::new(0.0)).px();
-        Anchor {
-            fraction: value.resolve(Length::new(1.0)).px() - offset,
-            offset,
-        }
-    };
-
     BackgroundPosition {
-        x: anchor(&position.horizontal),
-        y: anchor(&position.vertical),
+        x: length_percentage(&position.horizontal),
+        y: length_percentage(&position.vertical),
     }
 }
 
@@ -933,17 +909,33 @@ fn auto_repeat(template: &style::values::computed::GridTemplateComponent) -> Opt
 }
 
 /// A computed `<length-percentage>`, as the length layout reads.
+///
+/// Every property that takes one comes through here, so none of them can drop
+/// the percentage out of a `calc()`: a length is a length, a percentage is a
+/// percentage, and anything the engine could not fold to either keeps its whole
+/// expression for layout to resolve against the basis it has (CSS Values 4 §10).
+///
+/// A length is taken as the engine uses it: in whole sixtieths of a pixel, the
+/// unit Servo and Gecko lay out in, which is what every length here has always
+/// been rounded to. Taken as the exact product of an `em` instead, `margin:
+/// 0.67em` moves by a thousandth of a pixel, and the text below it lands on
+/// the other side of a rounding a tenth of a pixel lower on every page that
+/// has a heading.
 fn length_percentage(value: &style::values::computed::LengthPercentage) -> Length {
-    match value.to_percentage() {
-        Some(percentage) => Length::Percent(percentage.0),
-        None => Length::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
+    use style::values::computed::length_percentage::Unpacked;
+
+    match value.unpack() {
+        Unpacked::Length(length) => Length::Px(app_units::Au::from(length).to_f32_px()),
+        Unpacked::Percentage(percentage) => Length::Percent(percentage.0),
+        Unpacked::Calc(tree) => Length::Calc(Calc::new(tree)),
     }
 }
 
 /// `border-radius`, taking the horizontal radius of each corner.
 fn corners(values: &ComputedValues) -> Corners {
     let border = values.get_border();
-    let radius = |corner: &style::values::computed::BorderCornerRadius| length(&corner.0.width.0);
+    let radius =
+        |corner: &style::values::computed::BorderCornerRadius| length_percentage(&corner.0.width.0);
     Corners {
         top_left: radius(&border.border_top_left_radius),
         top_right: radius(&border.border_top_right_radius),
@@ -986,13 +978,13 @@ fn inset(value: &style::values::computed::Inset) -> LengthOrAuto {
     use style::values::generics::position::GenericInset as Generic;
 
     match value {
-        Generic::LengthPercentage(value) => match value.to_percentage() {
-            Some(percentage) => LengthOrAuto::Percent(percentage.0),
-            None => LengthOrAuto::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
-        },
-        // `auto`, and the anchor functions, which need an anchor element to
-        // measure against and are `auto` until there is one.
-        _ => LengthOrAuto::Auto,
+        Generic::LengthPercentage(value) => LengthOrAuto::Length(length_percentage(value)),
+        Generic::Auto => LengthOrAuto::Auto,
+        // The anchor functions, and a `calc()` with one inside, which need an
+        // anchor element to measure against and are `auto` until there is one.
+        Generic::AnchorFunction(_)
+        | Generic::AnchorSizeFunction(_)
+        | Generic::AnchorContainingCalcFunction(_) => LengthOrAuto::Auto,
     }
 }
 
@@ -1084,19 +1076,16 @@ fn gap(value: &style::values::computed::length::NonNegativeLengthPercentageOrNor
 
     match value {
         Generic::Normal => Length::ZERO,
-        Generic::LengthPercentage(length_percentage) => length(&length_percentage.0),
+        Generic::LengthPercentage(value) => length_percentage(&value.0),
     }
 }
 
-fn flex_basis(values: &ComputedValues) -> Option<LengthOrAuto> {
+fn flex_basis(values: &ComputedValues) -> FlexBasis {
     use style::values::generics::flex::FlexBasis as Generic;
 
-    match values.clone_flex_basis() {
-        Generic::Content => None,
-        Generic::Size(value) => match size(&value) {
-            LengthOrAuto::Auto => None,
-            other => Some(other),
-        },
+    match &values.get_position().flex_basis {
+        Generic::Content => FlexBasis::Content,
+        Generic::Size(value) => FlexBasis::Size(size(value)),
     }
 }
 
@@ -1129,67 +1118,63 @@ fn text_decoration(values: &ComputedValues) -> TextDecoration {
     }
 }
 
-fn length_or_auto(value: &style::values::computed::Margin) -> LengthOrAuto {
+/// A margin, which may be `auto`.
+fn margin(value: &style::values::computed::Margin) -> LengthOrAuto {
     use style::values::generics::length::GenericMargin as Generic;
 
     match value {
         Generic::Auto => LengthOrAuto::Auto,
-        Generic::LengthPercentage(value) | Generic::AnchorContainingCalcFunction(value) => {
-            match value.to_percentage() {
-                Some(percentage) => LengthOrAuto::Percent(percentage.0),
-                None => LengthOrAuto::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
-            }
+        Generic::LengthPercentage(value) => LengthOrAuto::Length(length_percentage(value)),
+        // Anchor positioning, which layout does not do: the engine cannot
+        // evaluate an anchor function without an anchor, so neither is kept, and
+        // the margin is its initial zero rather than an `auto` that would centre
+        // the box.
+        Generic::AnchorSizeFunction(_) | Generic::AnchorContainingCalcFunction(_) => {
+            LengthOrAuto::ZERO
         }
-        // Anchor positioning, which layout does not do.
-        Generic::AnchorSizeFunction(_) => LengthOrAuto::Auto,
     }
 }
 
-fn length(value: &style::values::computed::LengthPercentage) -> Length {
-    match value.to_percentage() {
-        Some(percentage) => Length::Percent(percentage.0),
-        None => Length::Px(value.to_used_value(app_units::Au(0)).to_f32_px()),
-    }
-}
-
-fn size(value: &style::values::computed::Size) -> LengthOrAuto {
+/// `width`, `height`, `min-width` and `min-height`.
+///
+/// Every keyword arrives as itself: `min-content` and `fit-content` are sizes
+/// layout measures, not `auto` by another name, and a `min-width` of `auto` is a
+/// different thing from one of zero.
+fn size(value: &style::values::computed::Size) -> Size {
     use style::values::generics::length::GenericSize as Generic;
 
     match value {
-        Generic::Auto => LengthOrAuto::Auto,
-        Generic::LengthPercentage(value) => match value.0.to_percentage() {
-            Some(percentage) => LengthOrAuto::Percent(percentage.0),
-            None => LengthOrAuto::Px(value.0.to_used_value(app_units::Au(0)).to_f32_px()),
-        },
-        // `min-content`, `max-content` and `fit-content` need intrinsic sizing,
-        // which layout does not do; auto is the value it can honour.
-        _ => LengthOrAuto::Auto,
+        Generic::Auto => Size::Auto,
+        Generic::LengthPercentage(value) => Size::Length(length_percentage(&value.0)),
+        Generic::MinContent => Size::Intrinsic(Intrinsic::MinContent),
+        Generic::MaxContent => Size::Intrinsic(Intrinsic::MaxContent),
+        Generic::FitContent => Size::Intrinsic(Intrinsic::FitContent(None)),
+        Generic::FitContentFunction(limit) => {
+            Size::Intrinsic(Intrinsic::FitContent(Some(length_percentage(&limit.0))))
+        }
+        // The same keyword under the name the web learnt it by.
+        Generic::Stretch | Generic::WebkitFillAvailable => Size::Stretch,
+        // Anchor positioning, which layout does not do.
+        Generic::AnchorSizeFunction(_) | Generic::AnchorContainingCalcFunction(_) => Size::Auto,
     }
 }
 
-/// `min-width` and `min-height`. `auto` floors at nothing, which is what it means
-/// outside a flex or grid item.
-fn min_size(value: &style::values::computed::Size) -> Length {
-    match size(value) {
-        LengthOrAuto::Px(px) => Length::Px(px),
-        LengthOrAuto::Percent(fraction) => Length::Percent(fraction),
-        LengthOrAuto::Auto => Length::ZERO,
-    }
-}
-
-/// `max-width` and `max-height`, where `none` is no limit at all rather than a
-/// very large one.
-fn max_size(value: &style::values::computed::MaxSize) -> Option<Length> {
+/// `max-width` and `max-height`.
+fn max_size(value: &style::values::computed::MaxSize) -> MaxSize {
     use style::values::generics::length::GenericMaxSize as Generic;
 
     match value {
-        Generic::None => None,
-        Generic::LengthPercentage(value) => Some(match value.0.to_percentage() {
-            Some(percentage) => Length::Percent(percentage.0),
-            None => Length::Px(value.0.to_used_value(app_units::Au(0)).to_f32_px()),
-        }),
-        // The intrinsic keywords need intrinsic sizing, which layout does not do.
-        _ => None,
+        Generic::None => MaxSize::None,
+        Generic::LengthPercentage(value) => MaxSize::Length(length_percentage(&value.0)),
+        Generic::MinContent => MaxSize::Intrinsic(Intrinsic::MinContent),
+        Generic::MaxContent => MaxSize::Intrinsic(Intrinsic::MaxContent),
+        Generic::FitContent => MaxSize::Intrinsic(Intrinsic::FitContent(None)),
+        Generic::FitContentFunction(limit) => {
+            MaxSize::Intrinsic(Intrinsic::FitContent(Some(length_percentage(&limit.0))))
+        }
+        Generic::Stretch | Generic::WebkitFillAvailable => MaxSize::Stretch,
+        // Anchor positioning, which layout does not do.
+        Generic::AnchorSizeFunction(_) | Generic::AnchorContainingCalcFunction(_) => MaxSize::None,
     }
 }
 
@@ -1231,7 +1216,24 @@ mod tests {
             "p",
         );
         assert_eq!(style.font_size, 30.0);
-        assert_eq!(style.margin.top, LengthOrAuto::Px(60.0));
+        assert_eq!(style.margin.top, LengthOrAuto::Length(Length::Px(60.0)));
+    }
+
+    /// A length arrives as the engine lays it out, in whole sixtieths of a
+    /// pixel: an `em` that does not come to one is rounded to the nearest, as
+    /// every length here always has been, rather than moving what is below it
+    /// by a thousandth of a pixel.
+    #[test]
+    fn a_length_is_in_whole_sixtieths_of_a_pixel() {
+        // 0.67em of 32px is 21.44px, which is 1286.4 sixtieths.
+        let style = layout_style(
+            "<style>h1 { font-size: 32px; margin-top: 0.67em }</style><h1>x</h1>",
+            "h1",
+        );
+        assert_eq!(
+            style.margin.top,
+            LengthOrAuto::Length(Length::Px(1286.0 / 60.0))
+        );
     }
 
     #[test]
@@ -1240,8 +1242,188 @@ mod tests {
             "<style>p { width: 50%; margin-left: auto }</style><p>x",
             "p",
         );
-        assert_eq!(style.width, LengthOrAuto::Percent(0.5));
+        assert_eq!(style.width, Size::Length(Length::Percent(0.5)));
         assert_eq!(style.margin.left, LengthOrAuto::Auto);
+    }
+
+    /// The style of the first `div` in a document with this one rule on it.
+    fn div_with(declarations: &str) -> ComputedStyle {
+        layout_style(
+            &format!("<style>div {{ {declarations} }}</style><div>x</div>"),
+            "div",
+        )
+    }
+
+    /// A `calc()` with a percentage in it is kept whole, rather than folded to
+    /// what it would be against a containing block of nothing: `calc(100% - 16px)`
+    /// was once `-16px`, and every column written that way was no column at all.
+    #[test]
+    fn a_calc_keeps_its_percentage_for_layout() {
+        let Size::Length(width) = div_with("width: calc(100% - 16px)").width else {
+            panic!("a length");
+        };
+        assert!(matches!(width, Length::Calc(_)), "got {width:?}");
+        assert_eq!(width.resolve(200.0), 184.0);
+        assert_eq!(width.to_string(), "calc(100% - 16px)");
+        assert_eq!(width.definite(None), None, "a percentage of nothing known");
+
+        // An `em` inside is settled by the cascade and the percentage is not.
+        let Size::Length(width) = div_with("font-size: 10px; width: calc(100% - 2em)").width else {
+            panic!("a length");
+        };
+        assert_eq!(width.resolve(200.0), 180.0);
+
+        // `width` cannot be negative, and the engine that parsed the expression
+        // is the one that holds it to that when it is resolved.
+        let Size::Length(width) = div_with("width: calc(50% - 400px)").width else {
+            panic!("a length");
+        };
+        assert_eq!(width.resolve(200.0), 0.0);
+
+        // Nesting is the engine's to evaluate, not ours.
+        let Size::Length(width) = div_with("width: calc(50% - calc(10px + 5%))").width else {
+            panic!("a length");
+        };
+        assert_eq!(width.resolve(200.0), 80.0);
+    }
+
+    /// `min()`, `max()` and `clamp()` are not a fraction and an offset: which
+    /// side wins depends on the basis, so the same value is two different
+    /// functions either side of where they cross.
+    #[test]
+    fn min_max_and_clamp_are_evaluated_against_the_basis() {
+        let MaxSize::Length(capped) = div_with("max-width: min(100%, 18rem)").max_width else {
+            panic!("a length");
+        };
+        assert_eq!(capped.resolve(200.0), 200.0);
+        assert_eq!(capped.resolve(400.0), 288.0);
+
+        let Size::Length(clamped) = div_with("width: clamp(100px, 50%, 300px)").width else {
+            panic!("a length");
+        };
+        assert_eq!(clamped.resolve(100.0), 100.0);
+        assert_eq!(clamped.resolve(400.0), 200.0);
+        assert_eq!(clamped.resolve(1000.0), 300.0);
+
+        let Size::Length(larger) = div_with("min-width: max(50%, 120px)").min_width else {
+            panic!("a length");
+        };
+        assert_eq!(larger.resolve(100.0), 120.0);
+        assert_eq!(larger.resolve(400.0), 200.0);
+    }
+
+    /// Every property that takes a `<length-percentage>` keeps the expression,
+    /// not only the sizes: they all go through the one conversion.
+    #[test]
+    fn every_length_property_keeps_a_calc() {
+        let style = div_with(
+            "margin-left: calc(10% + 5px); padding-top: calc(50% - 10px); \
+             position: absolute; top: calc(50% - 10px); \
+             border-radius: calc(50% - 2px); column-gap: calc(10% + 1px); \
+             flex-basis: calc(50% - 8px); transform: translate(calc(50% - 10px), -50%); \
+             transform-origin: calc(100% - 4px) 0",
+        );
+        let at = |length: &Length| length.resolve(200.0);
+
+        assert_eq!(style.margin.left.resolve(200.0), Some(25.0));
+        assert_eq!(at(&style.padding.top), 90.0);
+        assert_eq!(style.inset.top.resolve(200.0), Some(90.0));
+        assert_eq!(at(&style.radius.top_left), 98.0);
+        assert_eq!(at(&style.gap.1), 21.0);
+        assert_eq!(at(&style.transform_origin.x), 196.0);
+        let FlexBasis::Size(Size::Length(basis)) = &style.flex_basis else {
+            panic!("a length, got {:?}", style.flex_basis);
+        };
+        assert_eq!(at(basis), 92.0);
+        let [TransformOp::Translate(x, y)] = &style.transform[..] else {
+            panic!("one translation, got {:?}", style.transform);
+        };
+        assert_eq!((at(x), at(y)), (90.0, -100.0));
+
+        let grid = div_with("display: grid; grid-template-columns: calc(50% - 8px) 1fr");
+        let Some(Track::Fixed(track)) = grid.grid_columns.first() else {
+            panic!("a fixed track, got {:?}", grid.grid_columns);
+        };
+        assert_eq!(at(track), 92.0);
+
+        // A background tile's size, and a shift off the baseline — whose
+        // percentage is of the line height rather than of any box.
+        let painted = div_with(
+            "background-image: linear-gradient(red, blue); \
+             background-size: calc(50% + 1px) 10px; vertical-align: calc(50% + 2px)",
+        );
+        let Some(BackgroundSize::Fixed(width, height)) =
+            painted.backgrounds.first().map(|layer| &layer.size)
+        else {
+            panic!("a sized layer, got {:?}", painted.backgrounds);
+        };
+        assert_eq!((at(width), at(height)), (101.0, 10.0));
+        let crate::style::VerticalAlign::Shift(shift) = &painted.vertical_align else {
+            panic!("a shift, got {:?}", painted.vertical_align);
+        };
+        assert_eq!(at(shift), 102.0);
+    }
+
+    /// The sizing keywords are sizes layout measures, not `auto` by another name.
+    #[test]
+    fn every_sizing_keyword_arrives_as_itself() {
+        assert_eq!(
+            div_with("width: min-content").width,
+            Size::Intrinsic(Intrinsic::MinContent)
+        );
+        assert_eq!(
+            div_with("width: max-content").width,
+            Size::Intrinsic(Intrinsic::MaxContent)
+        );
+        assert_eq!(
+            div_with("width: fit-content").width,
+            Size::Intrinsic(Intrinsic::FitContent(None))
+        );
+        assert_eq!(
+            div_with("width: fit-content(200px)").width,
+            Size::Intrinsic(Intrinsic::FitContent(Some(Length::Px(200.0))))
+        );
+        assert_eq!(div_with("width: stretch").width, Size::Stretch);
+        assert_eq!(
+            div_with("height: -webkit-fill-available").height,
+            Size::Stretch,
+            "the spelling the web learnt it by"
+        );
+        assert_eq!(div_with("").max_width, MaxSize::None);
+        assert_eq!(
+            div_with("max-width: max-content").max_width,
+            MaxSize::Intrinsic(Intrinsic::MaxContent)
+        );
+        assert_eq!(
+            div_with("flex-basis: content").flex_basis,
+            FlexBasis::Content
+        );
+        assert_eq!(
+            div_with("").flex_basis,
+            FlexBasis::Size(Size::Auto),
+            "`auto` defers to the width"
+        );
+        assert_eq!(
+            div_with("width: fit-content(50%)").width.to_string(),
+            "fit-content(50%)"
+        );
+    }
+
+    /// `min-width: auto` is the automatic minimum and `min-width: 0` turns it off:
+    /// the two are different values, and folding both into zero is what left a
+    /// flex item that asked for no minimum with one anyway.
+    #[test]
+    fn a_minimum_of_auto_is_not_a_minimum_of_zero() {
+        assert_eq!(div_with("").min_width, Size::Auto, "the initial value");
+        assert_eq!(div_with("min-width: auto").min_width, Size::Auto);
+        assert_eq!(
+            div_with("min-width: 0").min_width,
+            Size::Length(Length::Px(0.0))
+        );
+        assert_eq!(
+            div_with("min-height: 0").min_height,
+            Size::Length(Length::Px(0.0))
+        );
     }
 
     #[test]
@@ -1353,9 +1535,10 @@ mod tests {
         assert_eq!(align("baseline"), VerticalAlign::Baseline);
         assert_eq!(align("sub"), VerticalAlign::Sub);
         assert_eq!(align("super"), VerticalAlign::Super);
-        assert_eq!(align("4px"), VerticalAlign::Length(4.0));
-        assert_eq!(align("-2px"), VerticalAlign::Length(-2.0));
-        assert_eq!(align("50%"), VerticalAlign::Percent(0.5));
+        assert_eq!(align("4px"), VerticalAlign::Shift(Length::Px(4.0)));
+        assert_eq!(align("-2px"), VerticalAlign::Shift(Length::Px(-2.0)));
+        assert_eq!(align("50%"), VerticalAlign::Shift(Length::Percent(0.5)));
+        assert_eq!(align("0"), VerticalAlign::Baseline);
         // The five that are a position rather than a shift. Three of them —
         // `middle`, `text-top` and `text-bottom` — arrive on
         // `alignment-baseline` rather than on `baseline-shift`, which is how
@@ -1421,10 +1604,8 @@ mod tests {
         );
     }
 
-    /// A position is a fraction of the room the picture leaves plus a length, and
-    /// every spelling CSS allows lands as some combination of the two — including
-    /// the ones that compute to a `calc()`, which is what makes the two-probe
-    /// reading worth having.
+    /// A position is a length whose percentage is of the room the picture leaves,
+    /// and every spelling CSS allows lands as one — the keywords as percentages.
     #[test]
     fn object_fit_and_position_are_read() {
         let style = |declarations: &str| {
@@ -1448,19 +1629,18 @@ mod tests {
         assert_eq!(
             style("object-position: left bottom").object_position,
             BackgroundPosition {
-                x: Anchor::START,
-                y: Anchor {
-                    fraction: 1.0,
-                    offset: 0.0
-                },
+                x: Length::Percent(0.0),
+                y: Length::Percent(1.0),
             }
         );
     }
 
+    /// Where a background lands for a given amount of room left over, on each
+    /// axis — which is what a position means, whichever way it was spelt.
     #[test]
-    fn background_position_reads_both_halves_of_a_calc() {
-        let position = |source: &str| {
-            layout_style(
+    fn background_position_resolves_against_the_room_left_over() {
+        let at = |source: &str, free: f32| {
+            let position = layout_style(
                 &format!("<style>div {{ background-position: {source} }}</style><div>x</div>"),
                 "div",
             )
@@ -1468,48 +1648,21 @@ mod tests {
             .first()
             .expect("a layer, even for `background-image: none`")
             .position
+            .clone();
+            (position.x.resolve(free), position.y.resolve(free))
         };
 
-        assert_eq!(position("0 0"), BackgroundPosition::START);
-        assert_eq!(
-            position("10px 4px"),
-            BackgroundPosition {
-                x: Anchor {
-                    fraction: 0.0,
-                    offset: 10.0
-                },
-                y: Anchor {
-                    fraction: 0.0,
-                    offset: 4.0
-                },
-            }
-        );
-        assert_eq!(
-            position("center"),
-            BackgroundPosition {
-                x: Anchor {
-                    fraction: 0.5,
-                    offset: 0.0
-                },
-                y: Anchor {
-                    fraction: 0.5,
-                    offset: 0.0
-                },
-            }
-        );
-        assert_eq!(
-            position("right 10px bottom 4px"),
-            BackgroundPosition {
-                x: Anchor {
-                    fraction: 1.0,
-                    offset: -10.0
-                },
-                y: Anchor {
-                    fraction: 1.0,
-                    offset: -4.0
-                },
-            }
-        );
+        assert_eq!(at("0 0", 100.0), (0.0, 0.0));
+        assert_eq!(at("10px 4px", 100.0), (10.0, 4.0));
+        assert_eq!(at("center", 100.0), (50.0, 50.0));
+        // `right 10px` is `calc(100% - 10px)`: both halves are kept.
+        assert_eq!(at("right 10px bottom 4px", 100.0), (90.0, 96.0));
+        assert_eq!(at("right 10px bottom 4px", 0.0), (-10.0, -4.0));
+        // And a clamp, which no fraction-and-offset pair can say: thirty pixels
+        // in where there is room for it, and the whole of the room where there is
+        // not.
+        assert_eq!(at("min(100%, 30px) 0", 100.0).0, 30.0);
+        assert_eq!(at("min(100%, 30px) 0", 10.0).0, 10.0);
     }
 
     #[test]
@@ -1571,17 +1724,17 @@ mod tests {
             "table",
         );
         assert_eq!(style.background_color.to_rgba8().r, 255);
-        assert_eq!(style.width, LengthOrAuto::Px(300.0));
+        assert_eq!(style.width, Size::Length(Length::Px(300.0)));
 
         // A percentage is a percentage, and a value that is not a dimension at all
         // contributes nothing rather than being guessed at.
         assert_eq!(
             layout_style("<table width=\"50%\"><tr><td>x", "table").width,
-            LengthOrAuto::Percent(0.5)
+            Size::Length(Length::Percent(0.5))
         );
         assert_eq!(
             layout_style("<table width=\"lots\"><tr><td>x", "table").width,
-            LengthOrAuto::Auto
+            Size::Auto
         );
 
         // A border attribute draws on the table and on its cells.
@@ -1612,7 +1765,7 @@ mod tests {
                 "table"
             )
             .width,
-            LengthOrAuto::Px(100.0)
+            Size::Length(Length::Px(100.0))
         );
         // And they beat the user-agent sheet.
         assert_eq!(

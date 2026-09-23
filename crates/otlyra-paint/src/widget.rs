@@ -22,6 +22,7 @@ use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_layout::box_tree::{Control, ControlKind, ControlState, Level};
 use otlyra_layout::fragment::Rect;
+use otlyra_layout::widget_metrics::{ARROW_STRIP, thumb_centre, thumb_side};
 
 /// Flattening tolerance for the shapes a widget draws.
 const TOLERANCE: f64 = 0.1;
@@ -36,8 +37,6 @@ const INSET: f64 = 0.2;
 const TICK: f64 = 0.16;
 /// How much wider a drop-down's arrow is than it is tall.
 const ARROW_ASPECT: f64 = 2.0;
-/// The strip a drop-down's arrow is drawn in, which layout also leaves for it.
-const ARROW_STRIP: f64 = 20.0;
 
 /// The unfilled face of a box, a field and a list.
 const FIELD: Color = Color::from_rgba8(0xff, 0xff, 0xff, 0xff);
@@ -67,8 +66,6 @@ const METER_SUBOPTIMAL: Color = Color::from_rgba8(0xff, 0xb9, 0x00, 0xff);
 const METER_POOR: Color = Color::from_rgba8(0xd8, 0x3b, 0x01, 0xff);
 /// How thick a slider's track is, whatever the control's height.
 const TRACK_THICKNESS: f32 = 8.0;
-/// How wide a slider's thumb is.
-const THUMB: f32 = 14.0;
 /// The face of a control nothing can do anything with.
 ///
 /// A colour rather than a transparency, because a white field faded against a
@@ -284,7 +281,7 @@ fn button(list: &mut DisplayList, rect: Rect, state: ControlState) {
 
 /// The triangle a drop-down shows on its inline end.
 fn arrow(list: &mut DisplayList, rect: Rect, state: ControlState) {
-    let strip = ARROW_STRIP.min(f64::from(rect.width));
+    let strip = f64::from(ARROW_STRIP).min(f64::from(rect.width));
     let width = (strip / 2.0).min(f64::from(rect.width));
     let height = width / ARROW_ASPECT;
     let centre_x = f64::from(rect.x + rect.width) - strip / 2.0;
@@ -316,11 +313,10 @@ fn slider(list: &mut DisplayList, rect: Rect, position: f32, state: ControlState
     let radius = f64::from(thickness) / 2.0;
     fill(list, &rounded(track, radius), dim(TRACK, state));
 
-    // The thumb travels between the two ends rather than off them, so the filled
-    // part reaches the middle of the thumb and not the pointer.
-    let side = THUMB.min(rect.height).min(rect.width);
-    let travel = (rect.width - side).max(0.0);
-    let centre = rect.x + side / 2.0 + travel * position.clamp(0.0, 1.0);
+    // The filled part reaches the middle of the thumb, which is where the
+    // pointer that moved it reads the value from too.
+    let side = thumb_side(rect);
+    let centre = thumb_centre(rect, position);
 
     let filled = Rect::new(rect.x, track.y, (centre - rect.x).max(0.0), thickness);
     if filled.width > 0.0 {

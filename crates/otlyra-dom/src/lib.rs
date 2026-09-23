@@ -186,6 +186,67 @@ mod tests {
         assert_eq!(element.attrs[1].name.local, local_name!("class"));
     }
 
+    /// A prefixed attribute is a different attribute from the plain one it shares
+    /// a local name with, and a lookup by name finds only the plain one.
+    #[test]
+    fn an_attribute_is_looked_up_in_no_namespace() {
+        let mut document = Document::new();
+        let mut dom = DocumentMutator::new(&mut document);
+        let linked = Attribute {
+            name: QualName::new(
+                Some(html5ever::Prefix::from("xlink")),
+                ns!(xlink),
+                LocalName::from("href"),
+            ),
+            value: StrTendril::from("#far"),
+        };
+        let node = dom.create_element(element("a"), vec![linked, attr("id", "near")], None, false);
+
+        assert_eq!(document.attr(node, "id"), Some("near"));
+        assert_eq!(
+            document.attr(node, "href"),
+            None,
+            "`xlink:href` is not `href`"
+        );
+        assert_eq!(
+            document.attr(document.root(), "id"),
+            None,
+            "the document node is not an element"
+        );
+    }
+
+    /// A link is an `<a>` with somewhere to go: an HTML one by its `href`, and an
+    /// SVG one by `href` or by the `xlink:href` that drawings are exported with.
+    #[test]
+    fn a_link_is_an_a_with_somewhere_to_go_in_either_spelling() {
+        let mut document = Document::new();
+        let mut dom = DocumentMutator::new(&mut document);
+        let xlink = Attribute {
+            name: QualName::new(
+                Some(html5ever::Prefix::from("xlink")),
+                ns!(xlink),
+                LocalName::from("href"),
+            ),
+            value: StrTendril::from("/drawn"),
+        };
+        let svg_a = QualName::new(None, ns!(svg), LocalName::from("a"));
+        let drawn = dom.create_element(svg_a.clone(), vec![xlink], None, false);
+        let plain = dom.create_element(svg_a, vec![attr("href", "/plain")], None, false);
+        let html = dom.create_element(element("a"), vec![attr("href", "/html")], None, false);
+        let anchor = dom.create_element(element("a"), vec![attr("name", "here")], None, false);
+        let div = dom.create_element(element("div"), vec![attr("href", "/no")], None, false);
+
+        assert_eq!(document.link_href(drawn), Some("/drawn"));
+        assert_eq!(document.link_href(plain), Some("/plain"));
+        assert_eq!(document.link_href(html), Some("/html"));
+        assert_eq!(
+            document.link_href(anchor),
+            None,
+            "a named place is not a link"
+        );
+        assert_eq!(document.link_href(div), None, "only an `<a>` links");
+    }
+
     #[test]
     fn a_removed_node_leaves_a_stale_handle_rather_than_an_alias() {
         let mut document = Document::new();

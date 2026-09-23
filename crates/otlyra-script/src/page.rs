@@ -288,14 +288,10 @@ impl PageScripts {
         // fetched bundle belongs to the bundle, and a stack frame that says
         // which file it is in is the difference between a diagnostic and a
         // riddle.
-        let specifier = document
-            .get(element)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr("src"))
-            .map_or_else(
-                || format!("{} (external script {})", self.document_url, self.seen),
-                str::to_owned,
-            );
+        let specifier = document.attr(element, "src").map_or_else(
+            || format!("{} (external script {})", self.document_url, self.seen),
+            str::to_owned,
+        );
         let Self { host, state, .. } = self;
         let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
         self.absorb_turn();

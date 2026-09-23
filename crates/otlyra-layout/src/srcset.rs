@@ -47,22 +47,22 @@ pub fn chosen(document: &Document, img: NodeId, viewport: Viewport) -> Option<Ch
         // reasons to move on to the next source rather than to give up: the
         // alternatives are in order of preference, and the `<img>` at the end is
         // the one every browser can show.
-        if let Some(kind) = attribute(document, source, "type")
-            && !is_decodable_type(&kind)
+        if let Some(kind) = trimmed(document, source, "type")
+            && !is_decodable_type(kind)
         {
             continue;
         }
-        if let Some(media) = attribute(document, source, "media")
-            && !otlyra_css::cascade::media_condition_matches(&media, viewport)
+        if let Some(media) = trimmed(document, source, "media")
+            && !otlyra_css::cascade::media_condition_matches(media, viewport)
         {
             continue;
         }
 
-        let srcset = attribute(document, source, "srcset").unwrap_or_default();
-        let sizes = attribute(document, source, "sizes");
+        let srcset = trimmed(document, source, "srcset").unwrap_or_default();
+        let sizes = trimmed(document, source, "sizes");
         if let Some(chosen) = pick(
-            &parse_srcset(&srcset),
-            sizes.as_deref(),
+            &parse_srcset(srcset),
+            sizes,
             viewport,
             /* fallback = */ None,
         ) {
@@ -70,10 +70,12 @@ pub fn chosen(document: &Document, img: NodeId, viewport: Viewport) -> Option<Ch
         }
     }
 
-    let srcset = attribute(document, img, "srcset").unwrap_or_default();
-    let sizes = attribute(document, img, "sizes");
-    let src = attribute(document, img, "src").filter(|src| !src.is_empty());
-    pick(&parse_srcset(&srcset), sizes.as_deref(), viewport, src)
+    let srcset = trimmed(document, img, "srcset").unwrap_or_default();
+    let sizes = trimmed(document, img, "sizes");
+    let src = trimmed(document, img, "src")
+        .filter(|src| !src.is_empty())
+        .map(str::to_owned);
+    pick(&parse_srcset(srcset), sizes, viewport, src)
 }
 
 /// The `<source>` elements a `<picture>` offers before its `<img>`.
@@ -105,19 +107,10 @@ fn sources_before(document: &Document, img: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// One attribute of an element, trimmed, if it has it.
-fn attribute(document: &Document, node: NodeId, name: &str) -> Option<String> {
-    Some(
-        document
-            .get(node)?
-            .element()?
-            .attrs
-            .iter()
-            .find(|attr| attr.name.local.as_ref() == name)?
-            .value
-            .trim()
-            .to_owned(),
-    )
+/// One attribute of an element with the white space around it gone, which is
+/// how every attribute this module reads is taken.
+fn trimmed<'a>(document: &'a Document, node: NodeId, name: &str) -> Option<&'a str> {
+    document.attr(node, name).map(str::trim)
 }
 
 /// Whether a `type` names a picture format that can be decoded here.

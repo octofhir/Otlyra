@@ -53,17 +53,17 @@ pub(super) fn transform_of(fragment: &Fragment, scroll_y: f32) -> Option<Affine>
     let rect = fragment.rect;
     let mut matrix = Affine::IDENTITY;
     for step in steps.iter() {
-        matrix *= match *step {
+        matrix *= match step {
             otlyra_css::TransformOp::Translate(x, y) => Affine::translate((
                 f64::from(x.resolve(rect.width)),
                 f64::from(y.resolve(rect.height)),
             )),
-            otlyra_css::TransformOp::Scale(x, y) => Affine::scale_non_uniform(x.into(), y.into()),
-            otlyra_css::TransformOp::Rotate(radians) => Affine::rotate(radians.into()),
-            otlyra_css::TransformOp::Skew(x, y) => {
+            &otlyra_css::TransformOp::Scale(x, y) => Affine::scale_non_uniform(x.into(), y.into()),
+            &otlyra_css::TransformOp::Rotate(radians) => Affine::rotate(radians.into()),
+            &otlyra_css::TransformOp::Skew(x, y) => {
                 Affine::new([1.0, f64::from(y).tan(), f64::from(x).tan(), 1.0, 0.0, 0.0])
             }
-            otlyra_css::TransformOp::Matrix([a, b, c, d, e, f]) => {
+            &otlyra_css::TransformOp::Matrix([a, b, c, d, e, f]) => {
                 Affine::new([a.into(), b.into(), c.into(), d.into(), e.into(), f.into()])
             }
         };

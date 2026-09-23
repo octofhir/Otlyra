@@ -15,12 +15,13 @@ use otlyra_css::{ComputedStyle, Sides};
 use otlyra_text::{FontStack, PlacedSpacer, Spacer, TextSpan};
 
 use crate::box_tree::{BoxId, BoxKind};
-use crate::fragment::{Fragment, FragmentKind, Layer, Rect};
+use crate::fragment::{Fragment, FragmentKind, Rect};
 
 use super::Flow;
 use super::box_model::{any_side, resolve_border, resolve_margin, resolve_padding};
 use super::float::band_of;
-use super::replaced::{replaced_edges, replaced_fragment, replaced_size};
+use super::replaced::{replaced_fragment, replaced_size};
+use super::sizing::{Frame, InlineRoom};
 
 use vertical_align::{baseline_of, baseline_shift};
 
@@ -66,6 +67,13 @@ pub(super) struct ReplacedBox {
     /// bar is the reason it has to: both references set a `<progress>` a fifth of
     /// an em below the baseline, and without this it sits on it.
     shift: f32,
+}
+
+impl ReplacedBox {
+    /// The box it stands for: a picture, an inline block or a widget.
+    pub(super) fn id(&self) -> BoxId {
+        self.id
+    }
 }
 
 /// The spacer identifiers for the two edges of the `index`th inline box.
@@ -432,13 +440,12 @@ impl<'a> Flow<'a> {
                         .copied()
                         .unwrap_or_else(|| baseline_shift(&inline.style, &style));
 
-                    Some(Fragment {
-                        used: None,
-                        box_id: Some(inline.id),
+                    Some(Fragment::for_box(
+                        inline.id,
                         // Vertical padding and a horizontal border spill outside
                         // the line box without making it taller: an inline box does
                         // not push its neighbours apart vertically.
-                        rect: Rect::new(
+                        Rect::new(
                             line_x + left,
                             line_y - shift - inline.border.top - inline.padding.top,
                             (right - left).max(0.0),
@@ -448,16 +455,9 @@ impl<'a> Flow<'a> {
                                 + inline.border.bottom
                                 + inline.padding.bottom,
                         ),
-                        kind: FragmentKind::Box,
                         style,
-                        widget: None,
-                        fixed: false,
-                        scroll_port: None,
-                        clip: None,
-                        sticky: None,
-                        layer: Layer::default(),
-                        children: Vec::new(),
-                    })
+                        Vec::new(),
+                    ))
                 })
                 .collect();
 
@@ -496,29 +496,18 @@ impl<'a> Flow<'a> {
                     // the fragment moves them with it. Moving both was moving
                     // everything twice as far as it was asked to go.
 
-                    Fragment {
-                        used: None,
-                        box_id,
-                        // The fragment moves with its glyphs. Shifting only the
-                        // glyphs left the background, the underline and the
-                        // highlight behind on the baseline — invisible on a
-                        // `super` that moves three pixels, and unmissable on a
-                        // `text-top` span set larger than the line it is in.
-                        rect: Rect::new(line_x + run.offset_x, line_y - shift, run.advance, height),
-                        widget: None,
-                        fixed: false,
-                        scroll_port: None,
-                        clip: None,
-                        sticky: None,
-                        layer: Layer::default(),
-                        kind: FragmentKind::Text(run),
-                        // The run's own style, not the paragraph's: the underline
-                        // on a link belongs to the link, and painting from the
-                        // block's style would underline the whole paragraph or
-                        // none of it.
-                        style: run_style,
-                        children: Vec::new(),
-                    }
+                    // The fragment moves with its glyphs. Shifting only the
+                    // glyphs left the background, the underline and the
+                    // highlight behind on the baseline — invisible on a
+                    // `super` that moves three pixels, and unmissable on a
+                    // `text-top` span set larger than the line it is in.
+                    let rect =
+                        Rect::new(line_x + run.offset_x, line_y - shift, run.advance, height);
+                    // The run's own style, not the paragraph's: the underline
+                    // on a link belongs to the link, and painting from the
+                    // block's style would underline the whole paragraph or
+                    // none of it.
+                    Fragment::new(box_id, rect, FragmentKind::Text(run), run_style)
                 })
                 .collect();
             children.extend(runs);
@@ -546,33 +535,28 @@ impl<'a> Flow<'a> {
                 let image = box_.image.clone()?;
                 // The spacer reserved the whole box; the picture fills what the
                 // frame leaves inside it.
-                let (extra_x, extra_y) = replaced_edges(&box_.style, width);
+                let frame = Frame::of(&box_.style, width);
                 Some(replaced_fragment(
                     box_.id,
                     &box_.style,
                     Some(image),
                     at,
                     (
-                        (spacer.width - extra_x).max(0.0),
-                        (spacer.height - extra_y).max(0.0),
+                        (spacer.width - frame.inline).max(0.0),
+                        (spacer.height - frame.block).max(0.0),
                     ),
                     width,
                 ))
             }));
 
             out.push(Fragment {
-                used: None,
-                box_id: Some(parent),
-                rect: Rect::new(line_x, line_y, line.width, height),
-                kind: FragmentKind::Line,
-                style: Arc::clone(&style),
-                widget: None,
-                fixed: false,
-                scroll_port: None,
-                clip: None,
-                sticky: None,
-                layer: Layer::default(),
                 children,
+                ..Fragment::new(
+                    Some(parent),
+                    Rect::new(line_x, line_y, line.width, height),
+                    FragmentKind::Line,
+                    Arc::clone(&style),
+                )
             });
         }
 
@@ -653,9 +637,11 @@ impl<'a> Flow<'a> {
                     // least as tall as it is — and as tall as the border and
                     // padding around it, which take room in a line like any other
                     // part of the box.
-                    let (width, height) = replaced_size(&node.style, content, containing_width);
-                    let (extra_x, extra_y) = replaced_edges(&node.style, containing_width);
-                    let (width, height) = (width + extra_x, height + extra_y);
+                    let room = InlineRoom::within(&node.style, containing_width);
+                    let (width, height) =
+                        replaced_size(&node.style, content, room, self.containing_height);
+                    let frame = Frame::of(&node.style, containing_width);
+                    let (width, height) = (width + frame.inline, height + frame.block);
                     replaced.push(ReplacedBox {
                         id: child,
                         style: Arc::clone(&node.style),
@@ -728,16 +714,12 @@ impl<'a> Flow<'a> {
                     // the origin and moved once the line is broken.
                     let style = Arc::clone(&node.style);
                     let shift_of_box = baseline_shift(&style, &self.tree.node(id).style);
-                    let width = match style.width.resolve(containing_width) {
-                        Some(width) => {
-                            let padding = resolve_padding(&style, containing_width);
-                            let border = resolve_border(&style);
-                            width + padding.left + padding.right + border.left + border.right
-                        }
-                        None => self
-                            .max_content_width(child, containing_width)
-                            .min(containing_width),
-                    };
+                    // Shrink-to-fit, like a float: its own width when it names one,
+                    // what its content wants of the line otherwise, and its minimum
+                    // and maximum over both — as the border box the line holds.
+                    let frame = Frame::of(&style, containing_width).inline;
+                    let room = InlineRoom::within(&style, containing_width);
+                    let width = self.shrink_to_fit_width(child, &style, room, frame);
                     let fragment = self.layout_sized(child, 0.0, 0.0, width);
                     let height = fragment.rect.height;
                     // Its own last baseline, or its bottom edge when it has no line

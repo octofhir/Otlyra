@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sizing</title>
+<style>
+  /* Every row is a fixed height and every line a fixed line height, so the
+     sections land at the same place in every engine and only the widths and
+     offsets being tested can differ. */
+  body { margin: 8px; font: 12px/16px Arial, Helvetica, sans-serif; color: #111; }
+  .h { height: 16px; margin: 10px 0 4px; font-weight: bold; }
+  .track { width: 400px; background: #e4e4e4; margin-bottom: 4px; }
+  .narrow { width: 200px; }
+  .bar { height: 20px; line-height: 20px; color: #fff; white-space: nowrap; overflow: hidden; }
+  .a { background: #c0392b; }
+  .b { background: #2471a3; }
+  .c { background: #1e8449; }
+  .d { background: #7d3c98; }
+  .e { background: #b9770e; }
+  /* The right-hand column: pictures and controls, which size themselves. */
+  .side { position: absolute; left: 560px; top: 8px; width: 252px; }
+  .cell { float: left; width: 120px; height: 84px; margin: 0 12px 4px 0; background: #e4e4e4; }
+  .cell:nth-of-type(2n) { margin-right: 0; }
+  .cell .label { height: 16px; overflow: hidden; white-space: nowrap; }
+  .frame { padding: 2px; }
+  .side img { max-width: 100%; display: block; }
+  .side input, .side textarea { font: 12px/16px Arial, Helvetica, sans-serif; margin: 0; }
+  .control { height: 28px; }
+  .flexrow { display: flex; margin-bottom: 4px; background: #e4e4e4; }
+  .flexrow img { max-width: 100%; }
+  .column { display: flex; flex-direction: column; height: 100px; width: 120px; background: #e4e4e4; }
+</style>
+</head>
+<body>
+
+<div class="h">calc() and the math functions, against a 400px track</div>
+<div class="track"><div class="bar a" style="width: calc(100% - 40px)">calc(100% - 40px) = 360</div></div>
+<div class="track"><div class="bar b" style="font-size: 16px; width: calc(50% + 2em)">50% + 2em = 232</div></div>
+<div class="track"><div class="bar c" style="max-width: min(100%, 300px)">max-width: min(100%, 300px) = 300</div></div>
+<div class="track narrow"><div class="bar c" style="max-width: min(100%, 300px)">in 200: = 200</div></div>
+<div class="track"><div class="bar d" style="width: clamp(100px, 50%, 150px)">clamp = 150</div></div>
+<div class="track"><div class="bar e" style="width: calc(50% - calc(10px + 5%))">nested = 170</div></div>
+
+<div class="h">margin, padding and insets</div>
+<div class="track"><div class="bar a" style="margin-left: calc(10% + 5px); padding-left: calc(5% - 2px)">margin 45, padding 18</div></div>
+<div class="track" style="position: relative; height: 60px">
+  <div class="bar b" style="position: absolute; left: calc(50% - 40px); top: calc(100% - 30px); width: 80px">left/top calc</div>
+</div>
+
+<div class="h">heights: of a 100px parent, and of an auto one</div>
+<div class="track" style="height: 100px; float: left; width: 190px; margin-right: 20px">
+  <div class="bar c" style="height: calc(50% + 10px)">50% + 10px = 60</div>
+</div>
+<div class="track" style="float: left; width: 190px">
+  <div class="bar d" style="height: calc(50% + 10px)">auto: one row</div>
+</div>
+<div style="clear: both"></div>
+
+<div class="h">translate(calc(50% - 10px)) on a 100px box</div>
+<div class="track" style="height: 20px"><div class="bar e" style="width: 100px; transform: translate(calc(50% - 10px))">moved 40</div></div>
+
+<div class="h">content keywords, in a 300px track</div>
+<div class="track" style="width: 300px">
+  <div class="bar a" style="width: min-content; height: auto; white-space: normal">min content box</div>
+  <div class="bar b" style="width: max-content">max-content box</div>
+  <div class="bar c" style="width: fit-content">fit-content box</div>
+  <div class="bar d" style="width: fit-content; margin: 0 auto">centred badge</div>
+  <div class="bar e" style="max-width: max-content">max-width: max-content</div>
+</div>
+<div class="track" style="width: 60px"><div class="bar a" style="min-width: max-content">min-width: max-content</div></div>
+
+<div class="h">box-sizing: border-box against content-box, padding 0 16px and a 4px border</div>
+<div class="track" style="width: 500px">
+  <div class="bar b" style="box-sizing: border-box; max-width: 300px; padding: 0 16px; border: 4px solid #111">border-box max 300 = 300</div>
+  <div class="bar c" style="max-width: 300px; padding: 0 16px; border: 4px solid #111">content-box max 300 = 340</div>
+  <div class="bar d" style="box-sizing: border-box; width: 50px; min-width: 200px; padding: 0 16px">border-box min 200</div>
+  <div class="bar e" style="box-sizing: border-box; height: auto; min-height: 50px; padding: 10px 16px">min-height 50</div>
+</div>
+<div class="track" style="font-size: 0; line-height: 0">
+  <span class="bar a" style="display: inline-block; box-sizing: border-box; width: 50%; padding: 0 10px; font-size: 12px">half</span><span class="bar b" style="display: inline-block; box-sizing: border-box; width: 50%; padding: 0 10px; font-size: 12px">half</span>
+</div>
+
+<div class="h">flex: calc(50% - 8px) with a 16px gap, and a padded basis</div>
+<div class="track" style="display: flex; flex-wrap: wrap; gap: 4px 16px">
+  <div class="bar a" style="flex: 0 0 calc(50% - 8px)">one</div>
+  <div class="bar b" style="flex: 0 0 calc(50% - 8px)">two</div>
+  <div class="bar c" style="flex: 0 0 calc(50% - 8px)">three</div>
+</div>
+<div class="track" style="display: flex">
+  <div class="bar d" style="flex: 0 0 150px; padding: 0 20px">basis 150 + 40</div>
+  <div class="bar e" style="flex: 0 0 150px; padding: 0 20px; box-sizing: border-box">basis 150</div>
+</div>
+<div class="track" style="display: flex; width: 120px">
+  <div class="bar a" style="flex: 0 1 300px; overflow: visible">min-width: auto keeps its text</div>
+</div>
+<div class="track" style="display: flex; width: 120px">
+  <div class="bar b" style="flex: 0 1 300px; overflow: visible; min-width: 0">min-width: 0 lets it shrink past its text</div>
+</div>
+
+<!-- Last, so that a box out of the flow is not the first thing in the body:
+     where its margin meets the first heading's is not what this page tests. -->
+<div class="side">
+  <div class="h">img { max-width: 100% }: 800 by 400, in 120</div>
+  <div class="cell"><div class="label">float</div><div class="frame a" style="float: left"><img src="images/tile-800.png" alt=""></div></div>
+  <div class="cell"><div class="label">table cell</div><table style="border-spacing: 0"><tr><td class="frame b"><img src="images/tile-800.png" alt=""></td></tr></table></div>
+  <div class="cell" style="position: relative"><div class="label">positioned</div><div class="frame c" style="position: absolute; left: 0; top: 16px"><img src="images/tile-800.png" alt=""></div></div>
+  <div class="cell"><div class="label">inline-block</div><div class="frame d" style="display: inline-block"><img src="images/tile-800.png" alt=""></div></div>
+  <div style="clear: both"></div>
+
+  <div class="h">height: 50% of a positioned 80px box</div>
+  <div class="cell" style="position: relative; height: 80px"><div><div class="bar e" style="position: absolute; top: 0; width: 60px; height: 50%">40</div></div></div>
+  <div style="clear: both"></div>
+
+  <div class="h">form controls keep their own size</div>
+  <div class="control"><input style="width: min-content"></div>
+  <div class="control"><input style="width: max-content"></div>
+  <div class="control"><input style="width: fit-content; max-width: min-content"></div>
+  <div class="control"><input type="checkbox" style="width: max-content"> <input type="checkbox"></div>
+  <div><textarea style="height: fit-content"></textarea></div>
+</div>
+
+<!-- Placed on its own, so that where it lands does not hang on how tall each
+     engine draws a text area. -->
+<div class="side" style="top: 540px">
+  <div class="h">flex: a picture is not shrunk past itself</div>
+  <div class="flexrow" style="width: 150px"><img src="images/tile-400.png" alt=""><div class="bar b" style="flex: 0 0 60px">60</div></div>
+  <div class="flexrow" style="width: 240px; align-items: flex-start"><img src="images/tile-100.png" alt=""><div class="bar a" style="flex: 1; height: auto; line-height: 16px; white-space: normal">a heading beside a picture</div></div>
+
+  <div class="h">column 100px: flex: 1 and min-height: 0</div>
+  <div class="column">
+    <div class="bar b" style="flex: none">header</div>
+    <div class="bar c" style="flex: 1; min-height: 0; height: auto; line-height: 16px; white-space: normal">clipped at 60: one<br>two<br>three<br>four<br>five<br>six</div>
+    <div class="bar d" style="flex: none">footer at 80</div>
+  </div>
+
+  <div class="h">table min-width 200; float max-width 50%</div>
+  <table style="min-width: 200px; border-spacing: 0"><tr><td class="bar e" style="padding: 0">x</td></tr></table>
+  <div style="width: 120px; margin-top: 4px"><img src="images/tile-400.png" alt="" style="float: left; max-width: 50%; border: 2px solid #111"></div>
+</div>
+
+</body>
+</html>

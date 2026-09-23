@@ -8,7 +8,6 @@
 
 use otlyra_dom::NodeId;
 
-use super::attribute_of;
 use crate::page::{PageScene, descendants_of};
 
 impl PageScene {
@@ -80,8 +79,8 @@ impl PageScene {
         let Some(form) = otlyra_dom::form::form_owner(&self.document, node) else {
             return false;
         };
-        let skip_checking = attribute_of(&self.document, node, "formnovalidate").is_some()
-            || attribute_of(&self.document, form, "novalidate").is_some();
+        let skip_checking = self.document.attr(node, "formnovalidate").is_some()
+            || self.document.attr(form, "novalidate").is_some();
         if !skip_checking && !self.validate(form) {
             return true;
         }
@@ -138,7 +137,7 @@ impl PageScene {
 
     /// Send a form with no button behind it.
     fn submit_form(&mut self, form: NodeId) -> bool {
-        if attribute_of(&self.document, form, "novalidate").is_none() && !self.validate(form) {
+        if self.document.attr(form, "novalidate").is_none() && !self.validate(form) {
             return true;
         }
         self.pending_submit = Some(otlyra_dom::submit::submission(

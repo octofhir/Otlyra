@@ -619,6 +619,16 @@ impl Styler {
 /// false, `display: grid` is not a display value and every grid on the web lays out
 /// as a block. Set before the first stylesheet is parsed, because a value that did
 /// not parse is not stored anywhere to be reconsidered.
+///
+/// `layout.unimplemented` is one switch for every property Servo parses before it
+/// lays any of them out: `mask` and its longhands (and the `-webkit-` spellings
+/// every page still writes), `backdrop-filter`, `text-overflow`, `counter-reset`
+/// and `counter-increment`, `user-select`, `contain`, `color-scheme`, and a tail
+/// of newer ones (`corner-shape`, `position-area`, `offset-path`, view
+/// transitions, scroll-driven animation). Parsing one does not draw it — each is
+/// read, or not, where it is used — but a declaration that was thrown away at
+/// parse time can never be read at all. `zoom` sits behind the same switch and
+/// stays off: Stylo enables it for the browser's own sheets only.
 fn enable_features() {
     use std::sync::Once;
 
@@ -626,6 +636,7 @@ fn enable_features() {
     ONCE.call_once(|| {
         stylo_static_prefs::set_pref!("layout.grid.enabled", true);
         stylo_static_prefs::set_pref!("layout.variable_fonts.enabled", true);
+        stylo_static_prefs::set_pref!("layout.unimplemented", true);
     });
 }
 
@@ -795,10 +806,7 @@ fn author_stylesheets(
                         // A `media` attribute applies to the whole block, the way
                         // it does on a `<link>`: a sheet written for print styles
                         // nothing on a screen.
-                        // A `media` attribute applies to the whole block, the way
-                        // it does on a `<link>`: a sheet written for print styles
-                        // nothing on a screen.
-                        match attribute(document, id, "media").filter(|q| !q.trim().is_empty()) {
+                        match document.attr(id, "media").filter(|q| !q.trim().is_empty()) {
                             Some(query) => {
                                 sheets.push((None, format!("@media {query} {{\n{source}\n}}")));
                             }
@@ -812,7 +820,7 @@ fn author_stylesheets(
                         // wrapping it is exactly what that means — the queries
                         // inside are then evaluated against the same device as
                         // every other one.
-                        match attribute(document, id, "media").filter(|q| !q.trim().is_empty()) {
+                        match document.attr(id, "media").filter(|q| !q.trim().is_empty()) {
                             Some(query) => {
                                 sheets.push((Some(id), format!("@media {query} {{\n{source}\n}}")));
                             }
@@ -861,21 +869,21 @@ pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
         if let Some(element) = document.get(id).and_then(|node| node.element())
             && element.name.local.as_ref() == "link"
         {
-            let rel = attribute(document, id, "rel").unwrap_or_default();
+            let rel = document.attr(id, "rel").unwrap_or_default();
             let mut keywords = rel.split_ascii_whitespace().map(str::to_ascii_lowercase);
             let is_sheet = keywords.clone().any(|word| word == "stylesheet");
             let alternate = keywords.any(|word| word == "alternate");
 
             if is_sheet
                 && !alternate
-                && let Some(href) = attribute(document, id, "href")
+                && let Some(href) = document.attr(id, "href")
                 && !href.trim().is_empty()
             {
-                let media = attribute(document, id, "media").unwrap_or_default();
+                let media = document.attr(id, "media").unwrap_or_default();
                 links.push(StylesheetLink {
                     node: id,
-                    href,
-                    media,
+                    href: href.to_owned(),
+                    media: media.to_owned(),
                 });
             }
         }
@@ -883,17 +891,6 @@ pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
     }
 
     links
-}
-
-/// One attribute of an element, by local name.
-fn attribute(document: &Document, node: NodeId, name: &str) -> Option<String> {
-    document
-        .get(node)
-        .and_then(|node| node.element())?
-        .attrs
-        .iter()
-        .find(|attribute| attribute.name.local.as_ref() == name)
-        .map(|attribute| attribute.value.to_string())
 }
 
 /// Whether a media condition written outside a stylesheet matches `viewport`.

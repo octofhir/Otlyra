@@ -286,10 +286,8 @@ impl PageScene {
         let mut current = self.box_at(x, y);
         while let Some(id) = current {
             let node = self.boxes.get(id)?;
-            if node.tag.as_ref().is_some_and(|tag| tag.as_ref() == "a")
-                && let Some(href) = node.node.and_then(|node| self.attribute(node, "href"))
-            {
-                return Some(href);
+            if let Some(href) = node.node.and_then(|node| self.document.link_href(node)) {
+                return Some(href.to_owned());
             }
             current = node.parent;
         }
@@ -314,9 +312,6 @@ impl PageScene {
     /// The `href` of a box, if it is a link with one.
     pub fn href_of(&self, id: BoxId) -> Option<String> {
         let node = self.boxes.get(id)?;
-        if node.tag.as_ref().is_none_or(|tag| tag.as_ref() != "a") {
-            return None;
-        }
-        self.attribute(node.node?, "href")
+        self.document.link_href(node.node?).map(str::to_owned)
     }
 }

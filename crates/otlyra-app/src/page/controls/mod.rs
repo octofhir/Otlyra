@@ -17,7 +17,7 @@ mod submit;
 pub use facts::{ControlFacts, Numeric};
 pub use slider::SliderMotion;
 
-use otlyra_dom::{Document, NodeId};
+use otlyra_dom::NodeId;
 
 use super::PageScene;
 
@@ -93,7 +93,9 @@ impl PageScene {
                 return self.reset(form);
             }
             Some(Control::Button)
-                if attribute_of(&self.document, node, "type")
+                if self
+                    .document
+                    .attr(node, "type")
                     .is_some_and(|kind| kind.eq_ignore_ascii_case("reset")) =>
             {
                 let Some(form) = otlyra_dom::form::form_owner(&self.document, node) else {
@@ -158,9 +160,4 @@ pub struct FileRequest {
     pub many: bool,
     /// The hints the page gave about what it wants, exactly as it spelled them.
     pub accept: Vec<String>,
-}
-
-/// One attribute of one element.
-fn attribute_of(document: &Document, id: NodeId, name: &str) -> Option<String> {
-    document.get(id)?.element()?.attr(name).map(str::to_owned)
 }

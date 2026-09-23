@@ -320,10 +320,7 @@ impl FormState {
         if let Some(checked) = self.controls.get(&id).and_then(|value| value.checked) {
             return checked;
         }
-        document
-            .get(id)
-            .and_then(|node| node.element())
-            .is_some_and(|element| element.attr("checked").is_some())
+        document.attr(id, "checked").is_some()
     }
 
     /// Set `id`'s checkedness, and remember that the reader set it.
@@ -350,7 +347,7 @@ impl FormState {
         let Some(select) = owning_select(document, id) else {
             return false;
         };
-        if is_multiple(document, select) || display_size(document, select) > 1 {
+        if is_list_box(document, select) {
             return false;
         }
         // A single-line select always shows something. Its first option that is
@@ -372,10 +369,7 @@ impl FormState {
         if let Some(selected) = self.controls.get(&option).and_then(|value| value.selected) {
             return selected;
         }
-        document
-            .get(option)
-            .and_then(|node| node.element())
-            .is_some_and(|element| element.attr("selected").is_some())
+        document.attr(option, "selected").is_some()
     }
 
     /// Set an `<option>`'s selectedness.
@@ -502,11 +496,7 @@ pub fn is_disabled(document: &Document, id: NodeId) -> bool {
     if !control.can_be_disabled() {
         return false;
     }
-    if document
-        .get(id)
-        .and_then(|node| node.element())
-        .is_some_and(|element| element.attr("disabled").is_some())
-    {
+    if document.attr(id, "disabled").is_some() {
         return true;
     }
     // An `<option>` is disabled by its `<optgroup>` as well.
@@ -515,12 +505,7 @@ pub fn is_disabled(document: &Document, id: NodeId) -> bool {
             .get(id)
             .and_then(|node| node.parent)
             .filter(|&parent| is_element(document, parent, "optgroup"))
-            .is_some_and(|group| {
-                document
-                    .get(group)
-                    .and_then(|node| node.element())
-                    .is_some_and(|element| element.attr("disabled").is_some())
-            })
+            .is_some_and(|group| document.attr(group, "disabled").is_some())
     {
         return true;
     }
@@ -528,11 +513,7 @@ pub fn is_disabled(document: &Document, id: NodeId) -> bool {
     let mut child = id;
     let mut ancestor = document.get(id).and_then(|node| node.parent);
     while let Some(current) = ancestor {
-        if is_element(document, current, "fieldset")
-            && document
-                .get(current)
-                .and_then(|node| node.element())
-                .is_some_and(|element| element.attr("disabled").is_some())
+        if is_element(document, current, "fieldset") && document.attr(current, "disabled").is_some()
         {
             let first_legend = document
                 .children(current)
@@ -565,10 +546,7 @@ pub fn has_readonly_attribute(document: &Document, id: NodeId) -> bool {
     if !control.is_text_entry() {
         return false;
     }
-    document
-        .get(id)
-        .and_then(|node| node.element())
-        .is_some_and(|element| element.attr("readonly").is_some())
+    document.attr(id, "readonly").is_some()
 }
 
 /// Whether `id` matches `:read-write` — a text control the reader may edit, or an
@@ -584,9 +562,7 @@ pub fn is_read_write(document: &Document, id: NodeId) -> bool {
         return is_mutable(document, id);
     }
     document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("contenteditable"))
+        .attr(id, "contenteditable")
         .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
 }
 
@@ -605,11 +581,7 @@ pub fn can_be_required(document: &Document, id: NodeId) -> bool {
 /// Whether `id` is required.
 #[must_use]
 pub fn is_required(document: &Document, id: NodeId) -> bool {
-    can_be_required(document, id)
-        && document
-            .get(id)
-            .and_then(|node| node.element())
-            .is_some_and(|element| element.attr("required").is_some())
+    can_be_required(document, id) && document.attr(id, "required").is_some()
 }
 
 /// Whether `id` is showing its placeholder rather than a value.
@@ -622,9 +594,7 @@ pub fn is_placeholder_shown(document: &Document, state: &FormState, id: NodeId) 
         return false;
     }
     let has_placeholder = document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("placeholder"))
+        .attr(id, "placeholder")
         .is_some_and(|value| !value.is_empty());
     has_placeholder && state.value(document, id).is_empty()
 }
@@ -664,10 +634,7 @@ pub fn is_indeterminate(document: &Document, state: &FormState, id: NodeId) -> b
         Some(Control::Input(InputKind::Radio)) => !radio_group(document, id)
             .into_iter()
             .any(|member| state.checkedness(document, member)),
-        Some(Control::Progress) => document
-            .get(id)
-            .and_then(|node| node.element())
-            .is_some_and(|element| element.attr("value").is_none()),
+        Some(Control::Progress) => document.attr(id, "value").is_none(),
         _ => false,
     }
 }
@@ -683,9 +650,7 @@ pub fn radio_group(document: &Document, id: NodeId) -> Vec<NodeId> {
         return vec![id];
     }
     let name = document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("name"))
+        .attr(id, "name")
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
     let Some(name) = name else {
@@ -711,9 +676,7 @@ pub fn radio_group(document: &Document, id: NodeId) -> Vec<NodeId> {
             continue;
         }
         let matches_name = document
-            .get(node)
-            .and_then(|inner| inner.element())
-            .and_then(|element| element.attr("name"))
+            .attr(node, "name")
             .is_some_and(|other| other == name);
         if matches_name && form_owner(document, node) == owner {
             group.push(node);
@@ -731,11 +694,7 @@ pub fn labeled_control(document: &Document, label: NodeId) -> Option<NodeId> {
     if !is_element(document, label, "label") {
         return None;
     }
-    let target = document
-        .get(label)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("for"))
-        .map(str::to_owned);
+    let target = document.attr(label, "for").map(str::to_owned);
 
     if let Some(target) = target {
         let found = descendants(document, document.root())
@@ -760,11 +719,7 @@ pub fn labeled_control(document: &Document, label: NodeId) -> Option<NodeId> {
 /// The `<form>` that owns `id`, by its `form` attribute or by containment.
 #[must_use]
 pub fn form_owner(document: &Document, id: NodeId) -> Option<NodeId> {
-    let named = document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("form"))
-        .map(str::to_owned);
+    let named = document.attr(id, "form").map(str::to_owned);
     if let Some(named) = named {
         return descendants(document, document.root())
             .into_iter()
@@ -793,9 +748,7 @@ pub fn is_submit_button(document: &Document, id: NodeId) -> bool {
     match Control::of(document, id) {
         Some(Control::Input(kind)) => matches!(kind, InputKind::Submit | InputKind::Image),
         Some(Control::Button) => document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr("type"))
+            .attr(id, "type")
             .is_none_or(|kind| kind.eq_ignore_ascii_case("submit")),
         _ => false,
     }
@@ -838,10 +791,7 @@ pub fn owning_select(document: &Document, option: NodeId) -> Option<NodeId> {
 /// Whether a `<select>` takes more than one answer.
 #[must_use]
 pub fn is_multiple(document: &Document, select: NodeId) -> bool {
-    document
-        .get(select)
-        .and_then(|node| node.element())
-        .is_some_and(|element| element.attr("multiple").is_some())
+    document.attr(select, "multiple").is_some()
 }
 
 /// How many rows a `<select>` shows: its `size`, or one, or four when it takes
@@ -849,12 +799,20 @@ pub fn is_multiple(document: &Document, select: NodeId) -> bool {
 #[must_use]
 pub fn display_size(document: &Document, select: NodeId) -> u32 {
     let declared = document
-        .get(select)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("size"))
+        .attr(select, "size")
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|&size| size > 0);
     declared.unwrap_or(if is_multiple(document, select) { 4 } else { 1 })
+}
+
+/// Whether a `<select>` is a list box rather than a drop-down.
+///
+/// HTML §4.10.7: one that takes more than one answer, or shows more than one
+/// row, is a list box with its options laid out in it; any other is a drop-down
+/// that shows the one option it holds and keeps the rest in a list it opens.
+#[must_use]
+pub fn is_list_box(document: &Document, select: NodeId) -> bool {
+    is_multiple(document, select) || display_size(document, select) > 1
 }
 
 /// Whether a control takes its suggestions from a `<datalist>` as a list.
@@ -879,11 +837,7 @@ pub fn suggestion_list(document: &Document, id: NodeId) -> Option<NodeId> {
     if !takes_suggestions(document, id) {
         return None;
     }
-    let named = document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("list"))
-        .map(str::to_owned)?;
+    let named = document.attr(id, "list").map(str::to_owned)?;
     descendants(document, document.root())
         .into_iter()
         .find(|&node| {
@@ -1061,12 +1015,6 @@ pub fn validity(document: &Document, state: &FormState, id: NodeId) -> Validity 
     let Some(control) = Control::of(document, id) else {
         return validity;
     };
-    let attribute = |key: &str| {
-        document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr(key))
-    };
     let value = state.value(document, id);
 
     // Required and holding nothing. What "nothing" is differs by kind: a checkbox
@@ -1106,8 +1054,12 @@ pub fn validity(document: &Document, state: &FormState, id: NodeId) -> Validity 
                 match value.trim().parse::<f64>() {
                     Err(_) => validity.bad_input = true,
                     Ok(number) => {
-                        let min = attribute("min").and_then(|text| text.trim().parse::<f64>().ok());
-                        let max = attribute("max").and_then(|text| text.trim().parse::<f64>().ok());
+                        let min = document
+                            .attr(id, "min")
+                            .and_then(|text| text.trim().parse::<f64>().ok());
+                        let max = document
+                            .attr(id, "max")
+                            .and_then(|text| text.trim().parse::<f64>().ok());
                         if let Some(min) = min {
                             validity.range_underflow = number < min;
                         }
@@ -1116,7 +1068,7 @@ pub fn validity(document: &Document, state: &FormState, id: NodeId) -> Validity 
                         }
                         // A step of `any` allows everything; the default step for
                         // both of these kinds is one.
-                        let step = attribute("step").map_or(Some(1.0), |text| {
+                        let step = document.attr(id, "step").map_or(Some(1.0), |text| {
                             if text.trim().eq_ignore_ascii_case("any") {
                                 None
                             } else {
@@ -1140,13 +1092,15 @@ pub fn validity(document: &Document, state: &FormState, id: NodeId) -> Validity 
     // doing and is not the reader's to correct.
     if state.is_dirty(id) {
         let characters = value.chars().count();
-        if let Some(most) =
-            attribute("maxlength").and_then(|text| text.trim().parse::<usize>().ok())
+        if let Some(most) = document
+            .attr(id, "maxlength")
+            .and_then(|text| text.trim().parse::<usize>().ok())
         {
             validity.too_long = characters > most;
         }
-        if let Some(least) =
-            attribute("minlength").and_then(|text| text.trim().parse::<usize>().ok())
+        if let Some(least) = document
+            .attr(id, "minlength")
+            .and_then(|text| text.trim().parse::<usize>().ok())
         {
             validity.too_short = characters > 0 && characters < least;
         }
@@ -1223,10 +1177,7 @@ pub fn file_label(state: &FormState, id: NodeId) -> String {
 /// Whether a file picker takes more than one file.
 #[must_use]
 pub fn takes_many_files(document: &Document, id: NodeId) -> bool {
-    document
-        .get(id)
-        .and_then(|node| node.element())
-        .is_some_and(|element| element.attr("multiple").is_some())
+    document.attr(id, "multiple").is_some()
 }
 
 /// The `accept` attribute, split into the hints it holds.
@@ -1236,9 +1187,7 @@ pub fn takes_many_files(document: &Document, id: NodeId) -> bool {
 #[must_use]
 pub fn accepted_files(document: &Document, id: NodeId) -> Vec<String> {
     document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("accept"))
+        .attr(id, "accept")
         .map(|value| {
             value
                 .split(',')
@@ -1500,9 +1449,7 @@ pub enum Level {
 pub fn range_bounds(document: &Document, id: NodeId) -> (f64, f64, f64) {
     let number = |key: &str| {
         document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr(key))
+            .attr(id, key)
             .and_then(|text| text.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite())
     };
@@ -1511,9 +1458,7 @@ pub fn range_bounds(document: &Document, id: NodeId) -> (f64, f64, f64) {
     // `any` turns stepping off; anything else that is not a positive number falls
     // back to one, which is the specification's default step for a slider.
     let step = document
-        .get(id)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("step"))
+        .attr(id, "step")
         .map_or(Some(1.0), |text| {
             if text.trim().eq_ignore_ascii_case("any") {
                 None
@@ -1578,9 +1523,7 @@ pub fn range_position(document: &Document, state: &FormState, id: NodeId) -> f64
 pub fn progress_position(document: &Document, id: NodeId) -> Option<f64> {
     let number = |key: &str| {
         document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr(key))
+            .attr(id, key)
             .and_then(|text| text.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite())
     };
@@ -1599,9 +1542,7 @@ pub fn progress_position(document: &Document, id: NodeId) -> Option<f64> {
 pub fn meter_reading(document: &Document, id: NodeId) -> (f64, Level) {
     let number = |key: &str| {
         document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr(key))
+            .attr(id, key)
             .and_then(|text| text.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite())
     };
@@ -1674,23 +1615,19 @@ pub fn range_state(document: &Document, state: &FormState, id: NodeId) -> Option
     ) {
         return None;
     }
-    let attribute = |key: &str| {
-        document
-            .get(id)
-            .and_then(|node| node.element())
-            .and_then(|element| element.attr(key))
-    };
-    if attribute("min").is_none() && attribute("max").is_none() {
+    if document.attr(id, "min").is_none() && document.attr(id, "max").is_none() {
         return None;
     }
     if !is_validated(document, id) {
         return None;
     }
     let value = state.value(document, id).trim().parse::<f64>().ok()?;
-    let under = attribute("min")
+    let under = document
+        .attr(id, "min")
         .and_then(|text| text.trim().parse::<f64>().ok())
         .is_some_and(|min| value < min);
-    let over = attribute("max")
+    let over = document
+        .attr(id, "max")
         .and_then(|text| text.trim().parse::<f64>().ok())
         .is_some_and(|max| value > max);
     Some(!under && !over)
@@ -1699,14 +1636,10 @@ pub fn range_state(document: &Document, state: &FormState, id: NodeId) -> Option
 /// What an `<option>` submits: its `value`, or its text when it has none.
 #[must_use]
 pub fn option_value(document: &Document, option: NodeId) -> String {
-    document
-        .get(option)
-        .and_then(|node| node.element())
-        .and_then(|element| element.attr("value"))
-        .map_or_else(
-            || text_content(document, option).trim().to_owned(),
-            str::to_owned,
-        )
+    document.attr(option, "value").map_or_else(
+        || text_content(document, option).trim().to_owned(),
+        str::to_owned,
+    )
 }
 
 /// All the text under a node, run together.

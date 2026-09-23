@@ -29,12 +29,12 @@ use super::ReplacedBox;
 /// every engine adds on top, which is the amount the web was actually built
 /// against.
 pub(super) fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f32 {
-    baseline_shift_of(style.vertical_align, style, parent)
+    baseline_shift_of(&style.vertical_align, style, parent)
 }
 
 /// The same, for a value the caller has already picked out.
 fn baseline_shift_of(
-    align: otlyra_css::VerticalAlign,
+    align: &otlyra_css::VerticalAlign,
     style: &ComputedStyle,
     parent: &ComputedStyle,
 ) -> f32 {
@@ -52,15 +52,13 @@ fn baseline_shift_of(
         | otlyra_css::VerticalAlign::TextBottom => 0.0,
         otlyra_css::VerticalAlign::Super => parent.font_size / 3.0 + 1.0,
         otlyra_css::VerticalAlign::Sub => -(parent.font_size / 5.0 + 1.0),
-        otlyra_css::VerticalAlign::Length(px) => px,
         // A percentage is of the box's own line height, which is the one place a
         // percentage in CSS is not of the containing block.
-        otlyra_css::VerticalAlign::Percent(fraction) => {
-            fraction
-                * style
-                    .line_height
-                    .resolve(style.font_size, style.font_size * 1.2)
-        }
+        otlyra_css::VerticalAlign::Shift(length) => length.resolve(
+            style
+                .line_height
+                .resolve(style.font_size, style.font_size * 1.2),
+        ),
     }
 }
 
@@ -177,11 +175,11 @@ impl<'a> Flow<'a> {
                 floor_above = floor_above.max(own.ascent);
                 floor_below = floor_below.max(own.descent);
                 self.span_reach[index] = (own.ascent, own.descent);
-                line_relative.push((*source, span_style.vertical_align, own));
+                line_relative.push((*source, span_style.vertical_align.clone(), own));
                 continue;
             }
 
-            let shift = match span_style.vertical_align {
+            let shift = match &span_style.vertical_align {
                 // The parent's own text rather than the whole line: what
                 // `text-top` and `text-bottom` mean is the edge of the text the
                 // box is set beside, not the edge of the tallest thing on the row.
