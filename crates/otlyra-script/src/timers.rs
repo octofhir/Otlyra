@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use otter_runtime::TimerScheduler;
+use otter_runtime::{TimerAdmission, TimerScheduler};
 
 /// One scheduled timer.
 #[derive(Debug, Clone, Copy)]
@@ -148,8 +148,10 @@ impl TimerWheel {
     }
 }
 
-impl TimerScheduler for TimerWheel {
-    fn schedule(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64 {
+impl TimerWheel {
+    /// Record a deadline `delay_ms` from now, repeating every `repeat_ms` when
+    /// there is one, and hand back the token that fires it.
+    fn arm(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64 {
         let mut state = self
             .state
             .lock()
@@ -173,6 +175,35 @@ impl TimerScheduler for TimerWheel {
         token
     }
 
+    /// Whether `token` is still waiting to fire.
+    fn is_pending(&self, token: u64) -> bool {
+        self.state
+            .lock()
+            .expect("the timer wheel is never poisoned")
+            .pending
+            .values()
+            .any(|timer| timer.token == token)
+    }
+}
+
+impl TimerScheduler for TimerWheel {
+    /// Every timer is admitted. A browser sets no ceiling on how many timers a
+    /// page may hold, and the admission carries nothing for us to give back,
+    /// so it is dropped as soon as the deadline is written down.
+    fn admit(&self, _repeat: bool) -> Result<TimerAdmission, String> {
+        Ok(TimerAdmission::new(Box::new(())))
+    }
+
+    fn schedule(
+        &self,
+        admission: TimerAdmission,
+        delay_ms: u64,
+        repeat_ms: Option<u64>,
+    ) -> Result<u64, String> {
+        drop(admission);
+        Ok(self.arm(delay_ms, repeat_ms))
+    }
+
     fn cancel(&self, token: u64) -> bool {
         let mut state = self
             .state
@@ -192,6 +223,14 @@ impl TimerScheduler for TimerWheel {
             // either way, so a late fire is a no-op there too.
             None => false,
         }
+    }
+
+    /// A page's event loop has no referenced and unreferenced timers: that is
+    /// how a process decides whether it may exit, and a page lives until it is
+    /// closed whatever it is waiting on. What is answered is the part that
+    /// still means something — whether the token is one we are holding.
+    fn set_ref(&self, token: u64, _refed: bool) -> bool {
+        self.is_pending(token)
     }
 }
 
@@ -233,7 +272,7 @@ mod tests {
     #[test]
     fn nothing_is_due_before_its_time() {
         let wheel = TimerWheel::new();
-        let token = wheel.schedule(50, None);
+        let token = wheel.arm(50, None);
         let now = Instant::now();
         assert!(wheel.due(now).is_empty());
         assert_eq!(wheel.due(now + Duration::from_millis(60)), vec![token]);
@@ -248,9 +287,9 @@ mod tests {
     #[test]
     fn timers_due_together_keep_the_order_they_were_asked_in() {
         let wheel = TimerWheel::new();
-        let first = wheel.schedule(0, None);
-        let second = wheel.schedule(0, None);
-        let third = wheel.schedule(0, None);
+        let first = wheel.arm(0, None);
+        let second = wheel.arm(0, None);
+        let third = wheel.arm(0, None);
         assert_eq!(
             wheel.due(Instant::now() + Duration::from_millis(1)),
             vec![first, second, third]
@@ -261,8 +300,8 @@ mod tests {
     #[test]
     fn the_earliest_deadline_runs_first() {
         let wheel = TimerWheel::new();
-        let late = wheel.schedule(100, None);
-        let soon = wheel.schedule(10, None);
+        let late = wheel.arm(100, None);
+        let soon = wheel.arm(10, None);
         let due = wheel.due(Instant::now() + Duration::from_millis(200));
         assert_eq!(due, vec![soon, late]);
     }
@@ -270,7 +309,7 @@ mod tests {
     #[test]
     fn an_interval_comes_back_and_a_cancel_takes_it_off() {
         let wheel = TimerWheel::new();
-        let token = wheel.schedule(10, Some(10));
+        let token = wheel.arm(10, Some(10));
         let at = Instant::now() + Duration::from_millis(20);
         assert_eq!(wheel.due(at), vec![token]);
         assert_eq!(wheel.len(), 1, "a repeat is re-armed as it fires");
@@ -285,7 +324,7 @@ mod tests {
     #[test]
     fn a_late_interval_is_not_run_once_per_missed_period() {
         let wheel = TimerWheel::new();
-        let token = wheel.schedule(1, Some(1));
+        let token = wheel.arm(1, Some(1));
         let much_later = Instant::now() + Duration::from_secs(5);
         assert_eq!(wheel.due(much_later), vec![token]);
         assert_eq!(wheel.due(much_later), Vec::<u64>::new());
@@ -295,9 +334,9 @@ mod tests {
     fn the_next_deadline_is_the_earliest_one() {
         let wheel = TimerWheel::new();
         assert!(wheel.next_deadline().is_none());
-        wheel.schedule(500, None);
+        wheel.arm(500, None);
         let soon = wheel.next_deadline().expect("one is pending");
-        wheel.schedule(10, None);
+        wheel.arm(10, None);
         assert!(wheel.next_deadline().expect("two are pending") < soon);
     }
 }
