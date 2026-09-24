@@ -76,13 +76,13 @@ pub fn element_depends_on(
 mod tests {
     use otlyra_dom::{Document, FormState, NodeId};
 
-    use crate::cascade::{ExternalSheets, Styler, Viewport};
+    use crate::cascade::{StyleSources, Styler, Viewport};
     use crate::state::Interaction;
 
     /// Parse `html`, and prepare a styler over its own stylesheets.
     fn styler(html: &str) -> (Document, Styler) {
         let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
-        let styler = Styler::new(&document, Viewport::default(), &ExternalSheets::default());
+        let styler = Styler::new(&document, Viewport::default(), &StyleSources::default());
         (document, styler)
     }
 

@@ -101,6 +101,19 @@ impl ElementData {
             .map(|attr| attr.value.as_ref())
     }
 
+    /// The address an attribute names — a `poster`, an `src`, an object's
+    /// `data` — without the ASCII whitespace a URL may be written inside
+    /// (HTML §2.5.2, "valid URL potentially surrounded by spaces"), or `None`
+    /// when nothing is left to fetch.
+    ///
+    /// Not yet resolved: that takes the document's base URL, which the caller
+    /// has and the element does not.
+    pub fn address(&self, name: &str) -> Option<&str> {
+        self.attr(name)
+            .map(str::trim_ascii)
+            .filter(|address| !address.is_empty())
+    }
+
     /// Where the element links to, if it is a link.
     ///
     /// An HTML `<a>` or `<area>` with an `href` (HTML §4.6.1), and an SVG `<a>`

@@ -46,17 +46,23 @@ pub struct Replaced {
     ///
     /// The picture's own pixels, and nothing else. It is what the aspect ratio
     /// is taken from, so anything written into it that is not the content's own
-    /// size changes the shape the picture is drawn at.
-    pub intrinsic: Option<(f32, f32)>,
-    /// What a `width` or `height` attribute asked for, if either did.
+    /// size changes the shape the picture is drawn at — which is why the
+    /// `width` and `height` attributes are not here: they are presentational
+    /// hints setting the two properties, and reach layout through the style.
     ///
-    /// A *presentational hint*, which is what HTML says these are: they act as
-    /// if a rule of the lowest priority had set `width` and `height`, so a
-    /// stylesheet overrides them and a missing one leaves the other to the
-    /// aspect ratio. Kept beside the intrinsic size rather than folded into it —
-    /// folded in, `width="40"` on a 4×2 picture makes the intrinsic size 40×2
-    /// and the ratio twenty, and the picture is drawn two pixels tall.
-    pub hint: (Option<f32>, Option<f32>),
+    /// `None` for content that has no size of its own: a frame, a plug-in, a
+    /// video with no poster. Such a box is drawn at the default object size
+    /// unless its style says otherwise.
+    pub intrinsic: Option<(f32, f32)>,
+}
+
+impl Replaced {
+    /// Content with nothing to draw and no size of its own: a frame whose
+    /// document is not shown, a video before its poster, an `embed`.
+    pub const EMPTY: Self = Self {
+        image: None,
+        intrinsic: None,
+    };
 }
 
 /// How a `<meter>` reads, carried through to whatever draws it: the painter is
@@ -250,13 +256,19 @@ impl BoxNode {
     /// Whether this box is block-level.
     ///
     /// An `inline-block` is not: it is a block container, which is what is *inside*
-    /// it, and it takes its place in a line like a word.
+    /// it, and it takes its place in a line like a word. A replaced box is when
+    /// its style makes it one — a floated picture is blockified, and has to be
+    /// seen as a block beside the text after it, or that text has no line to go
+    /// in and is lost.
     pub fn is_block_level(&self) -> bool {
-        matches!(self.kind, BoxKind::Block)
-            && !matches!(
+        match &self.kind {
+            BoxKind::Block => !matches!(
                 self.style.display,
                 otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
-            )
+            ),
+            BoxKind::Replaced(_) => !self.is_inline_level(),
+            BoxKind::Inline | BoxKind::Text(_) => false,
+        }
     }
 
     /// The size a widget takes when nothing says otherwise, along whichever axes

@@ -7,13 +7,14 @@
 
 use std::sync::Arc;
 
+use html5ever::ns;
 use otlyra_css::ComputedStyle;
 use otlyra_css::Display;
 use otlyra_css::cascade::{StyledDocument, Viewport};
 use otlyra_dom::{Document, ElementData, FormState, NodeData, NodeId};
 
 use crate::box_tree::{
-    BoxId, BoxKind, BoxNode, BoxTree, CellSpan, Control, ControlKind, ControlState,
+    BoxId, BoxKind, BoxNode, BoxTree, CellSpan, Control, ControlKind, ControlState, Replaced,
 };
 
 /// Build the box tree for `document` using the styles the cascade computed for
@@ -89,29 +90,58 @@ pub struct ImageSource {
 
 /// Every picture the document asks for, in tree order.
 ///
-/// One per `<img>`, and which file that is depends on the window: an element
-/// offering several is asked here, before anything is fetched, because a browser
-/// fetches the one it chose and not all of them.
+/// One per element that shows one: an `<img>`, a `<video>`'s poster, an image
+/// button, and an `<embed>` or an `<object>`, whose resource may turn out to be
+/// a picture. Which file an `<img>` wants depends on the window: an element
+/// offering several is asked here, before anything is fetched, because a
+/// browser fetches the one it chose and not all of them.
 pub fn image_sources(document: &Document, viewport: Viewport) -> Vec<ImageSource> {
     let mut sources = Vec::new();
     let mut stack = vec![document.root()];
 
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element())
-            && element.name.local.as_ref() == "img"
-            && let Some(chosen) = crate::srcset::chosen(document, id, viewport)
-            && !chosen.url.is_empty()
+            && let Some(source) = picture_source(document, id, element, viewport)
         {
-            sources.push(ImageSource {
-                node: id,
-                src: chosen.url,
-                density: chosen.density,
-            });
+            sources.push(source);
         }
         stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
     }
 
     sources
+}
+
+/// The picture one element asks for, if it is an element that shows one and
+/// names it.
+fn picture_source(
+    document: &Document,
+    id: NodeId,
+    element: &ElementData,
+    viewport: Viewport,
+) -> Option<ImageSource> {
+    // One file, at one of its pixels to a CSS pixel: nothing but an `<img>`
+    // offers a choice.
+    let named = |attribute: &str| {
+        element.address(attribute).map(|src| ImageSource {
+            node: id,
+            src: src.to_owned(),
+            density: 1.0,
+        })
+    };
+    match (&element.name.ns, element.name.local.as_ref()) {
+        (&ns!(html), "img") => crate::srcset::chosen(document, id, viewport)
+            .filter(|chosen| !chosen.url.is_empty())
+            .map(|chosen| ImageSource {
+                node: id,
+                src: chosen.url,
+                density: chosen.density,
+            }),
+        (&ns!(html), "video") => named("poster"),
+        (&ns!(html), "input") if otlyra_dom::form::is_image_button(document, id) => named("src"),
+        (&ns!(html), "embed") => named("src"),
+        (&ns!(html), "object") => named("data"),
+        _ => None,
+    }
 }
 
 fn build(
@@ -766,6 +796,12 @@ impl Builder<'_> {
         use otlyra_dom::form::{self, InputKind};
 
         let attribute = |key: &str| self.document.attr(node, key);
+        // What a picture that is not there is shown as (§15.4.2).
+        let alternative = || {
+            attribute("alt")
+                .filter(|alt| !alt.is_empty())
+                .map(str::to_owned)
+        };
 
         match name {
             "input" => {
@@ -781,8 +817,8 @@ impl Builder<'_> {
                     | InputKind::Radio
                     | InputKind::Range
                     | InputKind::Color
-                    | InputKind::Hidden
-                    | InputKind::Image => None,
+                    | InputKind::Hidden => None,
+                    InputKind::Image => alternative(),
                     // What it holds, or that it holds nothing. Never where the
                     // file came from: a page is told a name and not a path.
                     InputKind::File => Some(form::file_label(self.form, node)),
@@ -838,9 +874,7 @@ impl Builder<'_> {
             "textarea" if self.form.is_dirty(node) => {
                 Some(self.form.value(self.document, node).to_owned())
             }
-            "img" => attribute("alt")
-                .filter(|alt| !alt.is_empty())
-                .map(str::to_owned),
+            "img" => alternative(),
             _ => None,
         }
     }
@@ -863,25 +897,59 @@ impl Builder<'_> {
         out.trim().to_owned()
     }
 
-    /// The replaced content an element shows, if it has any.
+    /// The replaced content an element shows, if it is a replaced element
+    /// (HTML §15.4).
     ///
-    /// Only `<img>`, and only when its picture has arrived: an element with no
-    /// picture keeps its `alt` text, which is the whole point of having one.
-    fn replaced_content(&self, name: &str, node: NodeId) -> Option<crate::box_tree::Replaced> {
-        if name != "img" {
-            return None;
+    /// Each of HTML's embedded elements says what it shows and how big that is.
+    /// Nested documents, plug-ins and the frames of a video or a sound are not
+    /// shown here: a frame, an `embed` and a video are drawn as the boxes a
+    /// reference lays them out as, with nothing in them but a poster.
+    fn replaced_content(&self, element: &ElementData, node: NodeId) -> Option<Replaced> {
+        match (&element.name.ns, element.name.local.as_ref()) {
+            // A picture, once it has arrived. Until then the element is its
+            // alternative text, which is the whole point of having one
+            // (§15.4.2).
+            (&ns!(html), "img") => self.picture(node),
+            (&ns!(html), "input") if otlyra_dom::form::is_image_button(self.document, node) => {
+                self.picture(node)
+            }
+            // The poster, whose size is the video's while no frame of the video
+            // has been decoded, which none is; and before it, or without one,
+            // nothing, at the default object size (§15.4.1, §4.8.9).
+            (&ns!(html), "video") => Some(self.picture(node).unwrap_or(Replaced::EMPTY)),
+            // A bitmap as big as the element's attributes say (§4.12.5.1), and
+            // transparent: nothing draws into it without the scripting API.
+            (&ns!(html), "canvas") => Some(Replaced {
+                image: None,
+                intrinsic: Some(canvas_size(element)),
+            }),
+            (&ns!(html), "iframe") => Some(Replaced::EMPTY),
+            // A plug-in, or the picture it turned out to be. One with no `src`
+            // represents nothing (§4.8.6), and both references give it no box.
+            (&ns!(html), "embed") if element.address("src").is_some() => {
+                Some(self.picture(node).unwrap_or(Replaced::EMPTY))
+            }
+            // The picture its `data` is, once it has arrived. An `object`
+            // whose `data` is anything else — or that has none — shows its
+            // children, which are there for exactly that (§4.8.7): HTML has no
+            // plug-ins any more, and a nested document is not shown here.
+            (&ns!(html), "object") => self.picture(node),
+            // Its controls, which are not drawn: the room they take is the
+            // user-agent sheet's, and content that shows nothing has no size
+            // of its own. An `audio` that exposes no controls is never shown,
+            // whatever a page's rules say, so this is one that does (§15.4.1).
+            (&ns!(html), "audio") => Some(Replaced {
+                image: None,
+                intrinsic: Some((0.0, 0.0)),
+            }),
+            _ => None,
         }
+    }
+
+    /// The picture an element asked for, as replaced content, once it has
+    /// arrived.
+    fn picture(&self, node: NodeId) -> Option<Replaced> {
         let picture = self.images.get(&node)?.clone();
-
-        // A `width` or `height` attribute is a presentational hint: it acts as
-        // the lowest-priority rule setting that property, so a stylesheet
-        // overrides it and naming only one leaves the other to the aspect ratio.
-        // It is *not* the picture's own size, and writing it there would make
-        // `width="40"` on a 4×2 picture a picture forty by two.
-        let dimension =
-            |key: &str| -> Option<f32> { self.document.attr(node, key)?.trim().parse().ok() };
-
-        let hint = (dimension("width"), dimension("height"));
         // The file's own size divided by the density it was chosen for: a
         // picture picked at two device pixels per CSS pixel is drawn at half its
         // width, which is the whole point of asking for a denser one.
@@ -890,11 +958,9 @@ impl Builder<'_> {
             picture.data.width as f32 / density,
             picture.data.height as f32 / density,
         );
-
-        Some(crate::box_tree::Replaced {
+        Some(Replaced {
             image: Some(picture.data),
             intrinsic: Some(intrinsic),
-            hint,
         })
     }
 
@@ -1001,7 +1067,7 @@ impl Builder<'_> {
                     return;
                 }
 
-                let kind = match self.replaced_content(name, node) {
+                let kind = match self.replaced_content(element, node) {
                     Some(content) => BoxKind::Replaced(content),
                     None => match style.display {
                         Display::None => return,
@@ -1035,7 +1101,8 @@ impl Builder<'_> {
                 // just do it inside a widget we do not have.
                 // A replaced box shows its content, not its stand-in: the `alt`
                 // text is what is shown *instead* of a picture, not beside it.
-                let generated = (!matches!(self.tree.node(id).kind, BoxKind::Replaced(_)))
+                let replaced = matches!(self.tree.node(id).kind, BoxKind::Replaced(_));
+                let generated = (!replaced)
                     .then(|| self.generated_text(name, node))
                     .flatten();
                 if let Some(text) = generated {
@@ -1116,7 +1183,7 @@ impl Builder<'_> {
                     for child in contents {
                         self.walk(child, popup, &style);
                     }
-                } else if has_renderable_children(element) && !closed {
+                } else if !replaced && has_renderable_children(element) && !closed {
                     for child in self.document.children(node) {
                         self.walk(child, id, &style);
                     }
@@ -1158,17 +1225,38 @@ impl Builder<'_> {
 ///
 /// Separate from `display: none` because the reason differs: what is inside a
 /// `<script>` or a `<style>` is program source rather than text, and what is
-/// inside an `<iframe>` or an `<object>` stands in for a document this cannot
-/// show. A rule that makes the element itself visible does not make any of that
-/// prose. HTML's elements only — the names mean this in the HTML namespace and
-/// nothing in any other, so an SVG or MathML element that happens to share one
-/// has children like any other element.
+/// inside an `<iframe>` is a document of its own. What is inside a `<video>`,
+/// an `<audio>` or a `<canvas>` is fallback for a browser that cannot play or
+/// draw them (§4.8.9, §4.12.5), which is not this one. A rule that makes the
+/// element itself visible does not make any of that prose.
+///
+/// An `<object>` is not among them: its children are what it shows whenever
+/// it is not replaced (§4.8.7), and a replaced box has no children anyway.
+/// HTML's elements only — the names mean this in the HTML namespace and nothing
+/// in any other, so an SVG or MathML element that happens to share one has
+/// children like any other element.
 fn has_renderable_children(element: &ElementData) -> bool {
-    element.name.ns != html5ever::ns!(html)
+    element.name.ns != ns!(html)
         || !matches!(
             element.name.local.as_ref(),
-            "script" | "style" | "template" | "noscript" | "iframe" | "object"
+            "script" | "style" | "template" | "noscript" | "iframe" | "video" | "audio" | "canvas"
         )
+}
+
+/// A `<canvas>`'s bitmap size (§4.12.5.1): its `width` and `height`, read as
+/// non-negative integers, and three hundred by a hundred and fifty wherever one
+/// is missing or does not parse.
+///
+/// The bitmap's size and not the element's: CSS sizes the element, and the
+/// bitmap is what it keeps the shape of.
+fn canvas_size(canvas: &ElementData) -> (f32, f32) {
+    let side = |name: &str, default: u32| {
+        canvas
+            .attr(name)
+            .and_then(otlyra_css::non_negative_integer)
+            .unwrap_or(default) as f32
+    };
+    (side("width", 300), side("height", 150))
 }
 
 /// Wrap runs of inline children in anonymous block boxes, wherever a box has both
@@ -1326,6 +1414,26 @@ mod tests {
         runs_of(html).concat()
     }
 
+    /// What a browser without plug-ins or frames would show, and a popover
+    /// nothing has opened, leave no text behind — not even the markup inside a
+    /// `noembed`, which is parsed as text.
+    #[test]
+    fn what_the_user_agent_sheet_hides_has_no_text() {
+        for html in [
+            "<noembed><b>x</b></noembed>",
+            "<noframes>x</noframes>",
+            "<div popover>x</div>",
+        ] {
+            assert!(runs_of(html).is_empty(), "{html}: {:?}", runs_of(html));
+        }
+        // An inline SVG is laid out as boxes, and its title and its style sheet
+        // are not among them.
+        assert_eq!(
+            text_of("<p><svg><title>Logo</title><style>.a { fill: red }</style></svg>x"),
+            "x"
+        );
+    }
+
     /// Collapsing is a fact about the formatting context, not about the text
     /// node: every case here is one the node on its own cannot answer.
     #[test]
@@ -1461,12 +1569,82 @@ mod tests {
     #[test]
     fn only_html_elements_hide_their_children() {
         assert!(
-            !text_of("<p><object>fallback</object>after").contains("fallback"),
-            "an HTML <object> keeps its fallback to itself"
+            !text_of("<p><video>fallback</video>after").contains("fallback"),
+            "an HTML <video> keeps its fallback to itself"
         );
         assert!(
-            text_of("<p><svg><object>drawn</object></svg>").contains("drawn"),
+            text_of("<p><svg><video>drawn</video></svg>").contains("drawn"),
             "an SVG element that shares the name is an element like any other"
         );
+    }
+
+    /// What is inside a `video`, an `audio` or a `canvas` is for a browser that
+    /// has none; what is inside an `object` is what it shows when its resource
+    /// is not a picture (HTML §4.8.7), which without one arriving it is not.
+    #[test]
+    fn fallback_is_shown_only_by_an_object() {
+        for html in [
+            "<video>x</video>",
+            "<audio controls>x</audio>",
+            "<canvas>x</canvas>",
+            "<iframe>x</iframe>",
+        ] {
+            assert_eq!(text_of(html), "", "{html}");
+        }
+        assert_eq!(text_of("<object data=x.swf>fallback</object>"), "fallback");
+    }
+
+    /// The pictures a page asks for: an `img`'s, a video's poster, an image
+    /// button's, and whatever an `embed` or an `object` names, which may turn
+    /// out to be one. An address of nothing but spaces is no address, and a
+    /// submit button's `src` is no picture.
+    #[test]
+    fn every_element_that_shows_a_picture_asks_for_it() {
+        let document = otlyra_html::parse(
+            b"<img src=a.png><video poster=' p.png '></video><video poster=' '></video>\
+              <input type=image src=b.png><input type=submit src=c.png>\
+              <embed src=d.swf><embed><object data=e.svg></object><svg><video poster=f.png>",
+            Some("utf-8"),
+        )
+        .document;
+        let sources: Vec<String> = image_sources(&document, Viewport::default())
+            .into_iter()
+            .map(|source| source.src)
+            .collect();
+        assert_eq!(sources, ["a.png", "p.png", "b.png", "d.swf", "e.svg"]);
+    }
+
+    /// A video's poster is the picture its box shows, at the poster's size.
+    #[test]
+    fn a_poster_is_a_videos_picture() {
+        let document = otlyra_html::parse(b"<video poster=p.png></video>", Some("utf-8")).document;
+        let styles = style_document(&document, Viewport::default());
+        let data = otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(Arc::new(vec![0; 8 * 6 * 4])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: 8,
+            height: 6,
+        };
+        let images: Images = image_sources(&document, Viewport::default())
+            .into_iter()
+            .map(|source| (source.node, Picture::new(data.clone())))
+            .collect();
+        let tree = build_box_tree_with_images(&document, &styles, &images);
+        let video = tree
+            .descendants(tree.root())
+            .into_iter()
+            .find(|&id| {
+                tree.node(id)
+                    .tag
+                    .as_ref()
+                    .is_some_and(|tag| tag.as_ref() == "video")
+            })
+            .expect("a video box");
+        let BoxKind::Replaced(content) = &tree.node(video).kind else {
+            panic!("a video is replaced");
+        };
+        assert_eq!(content.image.as_ref(), Some(&data));
+        assert_eq!(content.intrinsic, Some((8.0, 6.0)));
     }
 }

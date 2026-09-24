@@ -6,11 +6,12 @@
 //! one that holds a `PendingLoad`, so it is kept whole, from the first byte to the
 //! last.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use otlyra_css::cascade::ExternalSheets;
+use otlyra_css::cascade::{FetchedSheet, StyleSources};
 use otlyra_dom::NodeId;
 use otlyra_layout::Images;
+use url::Url;
 
 use crate::downloads;
 use crate::fetcher::{Body, Fetched, ResourceKind};
@@ -38,7 +39,14 @@ pub(super) struct PendingLoad {
     record: bool,
     /// Where to put the reader once the page is built.
     restore_scroll: f32,
-    sheets: ExternalSheets,
+    /// The base the page's style resolves against, and the stylesheets fetched
+    /// for it so far.
+    sources: StyleSources,
+    /// Every sheet an `@import` has asked for, by address: a sheet imported
+    /// twice, or by a sheet it imports itself, is fetched once.
+    imports_asked: HashSet<Url>,
+    /// How many stylesheets have been asked for, linked and imported together.
+    sheets_asked: usize,
     images: Images,
     /// Which file each of those pictures came from, and at what density.
     picture_sources: HashMap<NodeId, (String, f32)>,
@@ -59,31 +67,51 @@ pub(super) struct PendingLoad {
     runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
 }
 
-/// A tree and what the parse still owes it, whether or not the parse has ended.
-///
-/// The tail of a load reads the same three things whether the document is
-/// finished or stopped at a script, so both paths hand it this.
-struct ParsedSoFar {
-    document: otlyra_dom::Document,
-    /// The `<script src>` the parse went past without running.
-    deferred_scripts: Vec<NodeId>,
-}
-
 /// What a subresource is for once it lands.
 enum PendingResource {
     /// The `<link>` whose stylesheet this is.
     Stylesheet(NodeId),
+    /// A sheet an `@import` asked for.
+    Import(Import),
     /// The `<img>` whose picture this is, the address it settled on as the
     /// markup spells it, and that candidate's density — which is what the file's
     /// own size is divided by.
     Image(NodeId, String, f32),
     /// The `<script src>` whose source this is.
     Script(NodeId),
-    /// A script asked for before the parse, named by the `src` that asked for it.
+    /// A script asked for before the parse, by the address it was fetched from.
     ///
     /// There is no node to hang it on yet — the document it is in has not been
-    /// parsed, which is the point.
+    /// parsed, which is the point. The address is the `src` resolved against the
+    /// document's own: the scan reads bytes and cannot know of a base element,
+    /// so it is the address, not the text, that the parse's scripts are matched
+    /// against.
     ScriptSource(String),
+}
+
+/// A sheet an `@import` asked for (CSS Cascade 5 §2).
+struct Import {
+    /// The address the rule named, resolved against the sheet it is in.
+    url: Url,
+    /// How many imports deep it is: one for a rule in a linked sheet or a
+    /// `<style>`.
+    depth: usize,
+    /// The `<link>` or `<style>` whose sheet the imports began in. An import
+    /// holds the first frame exactly when that element's sheet does.
+    owner: NodeId,
+}
+
+impl Import {
+    /// The imports `sheet` asks for, one level below `depth`.
+    fn all_in(sheet: &FetchedSheet, depth: usize, owner: NodeId) -> impl Iterator<Item = Self> {
+        otlyra_css::cascade::imports_in(&sheet.text, &sheet.url)
+            .into_iter()
+            .map(move |url| Self {
+                url,
+                depth: depth + 1,
+                owner,
+            })
+    }
 }
 
 /// How long a page's own deferred work may run before the first frame.
@@ -105,12 +133,17 @@ fn report_limit(asked: usize, limit: usize, what: &str) {
     }
 }
 
-/// How many stylesheets one document may pull in.
+/// How many stylesheets one document may pull in, linked and imported together.
 ///
 /// A limit rather than none: every one of these is a synchronous fetch on the way
 /// to the first frame, and a document that asks for hundreds is either generated
 /// or hostile.
 const STYLESHEET_LIMIT: usize = 32;
+
+/// How deep `@import`s may nest: a sheet imported by a sheet imported by a
+/// sheet, and one more. The specification sets no limit; this is one against
+/// a chain that is generated rather than written.
+const IMPORT_DEPTH_LIMIT: usize = 4;
 
 /// How many pictures one document may pull in, for the same reason.
 pub(super) const IMAGE_LIMIT: usize = 64;
@@ -270,7 +303,9 @@ impl Browser {
             previous_url,
             record,
             restore_scroll,
-            sheets: ExternalSheets::default(),
+            sources: StyleSources::default(),
+            imports_asked: HashSet::new(),
+            sheets_asked: 0,
             images: Images::default(),
             picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
@@ -480,14 +515,23 @@ impl Browser {
     fn prefetch_scripts(&mut self, index: usize, loaded: &crate::fetcher::Loaded) -> bool {
         let srcs = otlyra_html::prescan_scripts(&loaded.bytes);
         report_limit(srcs.len(), SCRIPT_LIMIT, "scripts");
+        // The scan reads bytes, not a tree, and sees no base element: what it
+        // finds resolves against the document's own address.
+        let here = document_url(&loaded.final_url);
+        let urls: Vec<String> = srcs
+            .iter()
+            .take(SCRIPT_LIMIT)
+            .filter_map(|src| Self::subresource_url(here.as_str(), &here, src))
+            .collect();
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
         self.request_subresources(
             &mut outstanding,
-            &loaded.final_url,
-            srcs.into_iter().take(SCRIPT_LIMIT).map(|src| {
+            here.as_str(),
+            &here,
+            urls.into_iter().map(|url| {
                 (
-                    src.clone(),
-                    PendingResource::ScriptSource(src),
+                    url.clone(),
+                    PendingResource::ScriptSource(url),
                     ResourceKind::Script,
                 )
             }),
@@ -575,27 +619,30 @@ impl Browser {
         if !blocked && let Some(parser) = parser.take() {
             page_scripts = parser.finish(&mut parsed);
         }
-        let parsed = ParsedSoFar {
-            document: parsed,
-            deferred_scripts,
-        };
+
+        // The scene the reader sees while the rest arrives. Everything below is
+        // asked for on the document's authority and resolved against its base
+        // URL, which a base element in what has been parsed so far can move.
+        let page = shown(PageScene::at(parsed, document_url(&final_url)), interface);
+        let (here, base) = (page.url().to_string(), page.base_url().clone());
+        let document = page.document();
 
         // What the page asks for, decided here and fetched on the other thread.
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
         // What the preload scan already put on the wire, taken back so this
         // load's own table does not overwrite it.
-        let preloaded: HashMap<u64, Vec<PendingResource>> = self.tabs[index]
+        let mut preloaded: HashMap<u64, Vec<PendingResource>> = self.tabs[index]
             .pending
             .as_mut()
             .map(|pending| std::mem::take(&mut pending.outstanding))
             .unwrap_or_default();
-        let mut preloaded = preloaded;
         // Pictures that were decoded for an earlier page and are still here.
         let mut ready = Images::default();
-        let links = otlyra_css::cascade::stylesheet_links(&parsed.document);
+        let links = otlyra_css::cascade::stylesheet_links(document);
         self.request_subresources(
             &mut outstanding,
-            &final_url,
+            &here,
+            &base,
             links.iter().take(STYLESHEET_LIMIT).map(|link| {
                 (
                     link.href.clone(),
@@ -608,13 +655,13 @@ impl Browser {
         // window: how wide it is and how many device pixels it has to a CSS
         // pixel. Asked here, before the fetch, because a browser fetches the
         // one it chose rather than all of them.
-        let pictures = otlyra_layout::image_sources(&parsed.document, self.picture_viewport());
+        let pictures = otlyra_layout::image_sources(document, self.picture_viewport());
         let wanted: Vec<_> = pictures
             .iter()
             .take(IMAGE_LIMIT)
             .filter(|source| {
                 // Already decoded: no request, no decode, straight into the page.
-                let Some(url) = Self::subresource_url(&final_url, &source.src) else {
+                let Some(url) = Self::subresource_url(&here, &base, &source.src) else {
                     return true;
                 };
                 match self.images.get(&url) {
@@ -639,16 +686,15 @@ impl Browser {
                 )
             })
             .collect();
-        self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
+        self.request_subresources(&mut outstanding, &here, &base, wanted.into_iter());
 
         // The scripts the parse did not run where they stood, because their
         // bytes were not in yet. They run after it, in document order, which is
         // `defer` — late, and the thing the parser learning to suspend will fix.
-        let scripts: Vec<(NodeId, String)> = parsed
-            .deferred_scripts
+        let scripts: Vec<(NodeId, String)> = deferred_scripts
             .iter()
             .filter_map(|node| {
-                let src = parsed.document.attr(*node, "src")?.trim().to_owned();
+                let src = document.attr(*node, "src")?.trim().to_owned();
                 (!src.is_empty()).then_some((*node, src))
             })
             .take(SCRIPT_LIMIT)
@@ -666,34 +712,40 @@ impl Browser {
             .as_ref()
             .and_then(otlyra_html::HtmlParser::blocked_on)
             .and_then(|node| {
-                let src = parsed.document.attr(node, "src")?.trim().to_owned();
+                let src = document.attr(node, "src")?.trim().to_owned();
                 (!src.is_empty()).then_some((node, src))
             });
         for (node, src) in stopped_at.into_iter().chain(scripts) {
-            let mut adopted = false;
-            for resource in preloaded.values_mut() {
-                if resource
-                    .iter()
-                    .any(|held| matches!(held, PendingResource::ScriptSource(held) if *held == src))
-                {
-                    resource.push(PendingResource::Script(node));
-                    adopted = true;
-                    break;
-                }
-            }
-            if !adopted {
-                wanted.push((src, PendingResource::Script(node), ResourceKind::Script));
+            let Some(url) = Self::subresource_url(&here, &base, &src) else {
+                continue;
+            };
+            let adopted = preloaded.values_mut().find(|held| {
+                held.iter()
+                    .any(|held| matches!(held, PendingResource::ScriptSource(held) if *held == url))
+            });
+            match adopted {
+                Some(held) => held.push(PendingResource::Script(node)),
+                None => wanted.push((url, PendingResource::Script(node), ResourceKind::Script)),
             }
         }
         outstanding.extend(preloaded);
-        self.request_subresources(&mut outstanding, &final_url, wanted.into_iter());
+        self.request_subresources(&mut outstanding, &here, &base, wanted.into_iter());
         report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
         report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
+        let imports: Vec<Import> = otlyra_css::cascade::style_element_imports(document, &base)
+            .into_iter()
+            .map(|(owner, url)| Import {
+                url,
+                depth: 1,
+                owner,
+            })
+            .collect();
+        let title = title_of(document);
 
         let tab = &mut self.tabs[index];
-        tab.title = title_of(&parsed.document).unwrap_or_else(|| final_url.clone());
-        tab.url = final_url.clone();
-        tab.page = Some(shown(PageScene::new(parsed.document), interface));
+        tab.title = title.unwrap_or_else(|| final_url.clone());
+        tab.url = final_url;
+        tab.page = Some(page);
         if index == self.active {
             self.sync_address();
         }
@@ -709,8 +761,11 @@ impl Browser {
         // already on screen; this is what carries on tokenizing into it when
         // the script it is waiting for arrives.
         pending.parse = parser;
+        pending.sources.base = base;
+        pending.sheets_asked = links.len().min(STYLESHEET_LIMIT);
         let record = pending.record;
         let previous = pending.previous_url.clone();
+        self.request_imports(index, imports);
 
         if record {
             self.record_history(index, &previous);
@@ -726,10 +781,14 @@ impl Browser {
     }
 
     /// Ask for a page's subresources, recording which nodes each answer feeds.
+    ///
+    /// Each address is resolved against `base` and fetched on the authority of
+    /// the document at `document`.
     fn request_subresources(
         &mut self,
         outstanding: &mut HashMap<u64, Vec<PendingResource>>,
-        base: &str,
+        document: &str,
+        base: &Url,
         wanted: impl Iterator<Item = (String, PendingResource, ResourceKind)>,
     ) {
         // One request per address: a page that names the same picture in ten places
@@ -743,7 +802,7 @@ impl Browser {
             if kind == ResourceKind::Image && !self.settings.settings.load_images {
                 continue;
             }
-            let Some(url) = Self::subresource_url(base, &href) else {
+            let Some(url) = Self::subresource_url(document, base, &href) else {
                 continue;
             };
             let id = *asked
@@ -751,6 +810,60 @@ impl Browser {
                 .or_insert_with(|| self.fetcher.request(&url, kind));
             outstanding.entry(id).or_default().push(resource);
         }
+    }
+
+    /// Ask for more on behalf of a load already under way, and add the
+    /// requests to what it is waiting for.
+    ///
+    /// Asked by the page the load has already put in the tab, on its authority
+    /// and against its base URL as it stands now.
+    fn request_for_load(
+        &mut self,
+        index: usize,
+        wanted: impl Iterator<Item = (String, PendingResource, ResourceKind)>,
+    ) {
+        let Some(page) = self.tabs[index].page.as_ref() else {
+            return;
+        };
+        let (document, base) = (page.url().to_string(), page.base_url().clone());
+        let mut outstanding = HashMap::new();
+        self.request_subresources(&mut outstanding, &document, &base, wanted);
+        if let Some(pending) = self.tabs[index].pending.as_mut() {
+            for (id, resources) in outstanding {
+                pending.outstanding.entry(id).or_default().extend(resources);
+            }
+        }
+    }
+
+    /// Ask for the sheets `@import` rules name: each once, however many rules
+    /// name it, and no deeper and no more of them than the limits allow.
+    fn request_imports(&mut self, index: usize, imports: Vec<Import>) {
+        let Some(pending) = self.tabs[index].pending.as_mut() else {
+            return;
+        };
+        let mut wanted = Vec::new();
+        for import in imports {
+            if import.depth > IMPORT_DEPTH_LIMIT {
+                tracing::warn!(url = %import.url, "an import nested past the limit is not fetched");
+                continue;
+            }
+            if pending.imports_asked.contains(&import.url) {
+                continue;
+            }
+            if pending.sheets_asked >= STYLESHEET_LIMIT {
+                tracing::warn!(url = %import.url, "an import past the stylesheet limit is not fetched");
+                continue;
+            }
+            pending.imports_asked.insert(import.url.clone());
+            pending.sheets_asked += 1;
+            wanted.push((
+                import.url.to_string(),
+                PendingResource::Import(import),
+                ResourceKind::Stylesheet,
+            ));
+        }
+        // Absolute already, each resolved against the sheet that named it.
+        self.request_for_load(index, wanted.into_iter());
     }
 
     /// A stylesheet or a picture arrived.
@@ -763,6 +876,8 @@ impl Browser {
         };
         // Whether a script the parse might be waiting for has landed.
         let mut resumed = false;
+        // What the sheets that landed import in turn.
+        let mut imports = Vec::new();
 
         match fetched.result {
             Ok(loaded) => {
@@ -786,8 +901,16 @@ impl Browser {
                 for resource in wanted {
                     match resource {
                         PendingResource::Stylesheet(node) => {
-                            let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
-                            pending.sheets.insert(node, source);
+                            if let Some(sheet) = fetched_sheet(&loaded, &fetched.url) {
+                                imports.extend(Import::all_in(&sheet, 0, node));
+                                pending.sources.links.insert(node, sheet);
+                            }
+                        }
+                        PendingResource::Import(import) => {
+                            if let Some(sheet) = fetched_sheet(&loaded, &fetched.url) {
+                                imports.extend(Import::all_in(&sheet, import.depth, import.owner));
+                                pending.sources.imports.insert(import.url, sheet);
+                            }
                         }
                         PendingResource::Script(node) => {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
@@ -826,6 +949,7 @@ impl Browser {
             }
         }
 
+        self.request_imports(index, imports);
         if resumed {
             self.resume_parse(index);
         }
@@ -901,18 +1025,10 @@ impl Browser {
                 (!src.is_empty()).then_some((node, src))
             });
             if let Some((node, src)) = src {
-                let base = self.tabs[index].url.clone();
-                let mut outstanding = HashMap::new();
-                self.request_subresources(
-                    &mut outstanding,
-                    &base,
+                self.request_for_load(
+                    index,
                     std::iter::once((src, PendingResource::Script(node), ResourceKind::Script)),
                 );
-                if let Some(pending) = self.tabs[index].pending.as_mut() {
-                    for (id, resources) in outstanding {
-                        pending.outstanding.entry(id).or_default().extend(resources);
-                    }
-                }
             }
             if let Some(pending) = self.tabs[index].pending.as_mut() {
                 pending.parse = Some(parser);
@@ -956,13 +1072,15 @@ impl Browser {
             .values()
             .flatten()
             .any(|resource| match resource {
-                PendingResource::Stylesheet(node) => {
-                    // A sheet written for another medium blocks nothing: a
-                    // print-only one holds the screen for a page it will never
-                    // style. What it says it is for is asked of the same matcher
-                    // the cascade uses, so the two cannot come to disagree.
+                // A sheet written for another medium blocks nothing: a
+                // print-only one holds the screen for a page it will never
+                // style. What it says it is for is asked of the same matcher
+                // the cascade uses, so the two cannot come to disagree. An
+                // import blocks what the sheet it began in blocks.
+                PendingResource::Stylesheet(node)
+                | PendingResource::Import(Import { owner: node, .. }) => {
                     document.is_none_or(|document| {
-                        crate::media_of_link(document, *node).is_none_or(|media| {
+                        crate::media_of_sheet_owner(document, *node).is_none_or(|media| {
                             otlyra_css::cascade::media_condition_matches(&media, viewport)
                         })
                     })
@@ -991,7 +1109,7 @@ impl Browser {
         // load events that were waiting for them. This happens before the scene
         // is rebuilt, so whatever they did to the document is in the first frame
         // the reader sees rather than in a second one after a flash.
-        let mut document = tab.page.take().map(PageScene::into_document);
+        let (mut document, url) = tab.page.take().map(PageScene::into_document).unzip();
         if let (Some(document), Some(runner)) = (document.as_mut(), pending.runner.as_mut()) {
             for node in &pending.script_order {
                 if let Some(source) = pending.scripts.get(node) {
@@ -1015,11 +1133,12 @@ impl Browser {
         // its listeners are still waiting.
         tab.scripts = pending.runner.take();
 
-        if let Some(document) = document {
+        if let (Some(document), Some(url)) = (document, url) {
             tab.page = Some(shown(
                 PageScene::with_resources(
                     document,
-                    pending.sheets,
+                    url,
+                    pending.sources,
                     pending.images,
                     pending.picture_sources,
                 ),
@@ -1072,7 +1191,14 @@ impl Browser {
                 self.start_load(&here, false, false, 0.0);
             }
             otlyra_script::dom::Navigation::Url { href, replace } => {
-                let target = otlyra_net::url::resolve(&here, &href).unwrap_or(href);
+                // Against the document's base URL: what `location` parses a
+                // URL relative to is the settings object's API base URL, which
+                // for a document is its base URL.
+                let target = self.tabs[index]
+                    .page
+                    .as_ref()
+                    .and_then(|page| page.resolve(&href))
+                    .unwrap_or(href);
                 if target == here {
                     // `location.href = location.href` is a reload, and a page
                     // that does it on every load is the loop above.
@@ -1096,23 +1222,60 @@ impl Browser {
         }
     }
 
-    /// The address a subresource is actually fetched from, or `None` if the page
-    /// may not reach it.
+    /// The address a subresource is actually fetched from, or `None` if `href`
+    /// is not a URL or the page may not reach it.
     ///
-    /// A document fetched over the network may not reach a `file:` URL, the same
-    /// rule that governs where it may navigate: a subresource is a request the page
-    /// chose to make, and a page from the internet reading the disk is the failure
-    /// that rule exists to prevent.
-    pub(super) fn subresource_url(base: &str, href: &str) -> Option<String> {
-        let url = otlyra_net::resolve(base, href)?;
-        if let Ok(target) = otlyra_net::normalize(&url)
-            && !otlyra_net::may_navigate(Some(base), &target)
-        {
-            tracing::warn!(%url, %base, "subresource refused by scheme policy");
-            return None;
-        }
-        Some(url)
+    /// `href` is resolved against `base`, and whether it may be reached is asked
+    /// of the document at `document` — the two differ once a base element points
+    /// the page's addresses somewhere else, and a base cannot lend the page an
+    /// authority it does not have. A document fetched over the network may not
+    /// reach a `file:` URL, the same rule that governs where it may navigate: a
+    /// subresource is a request the page chose to make, and a page from the
+    /// internet reading the disk is the failure that rule exists to prevent.
+    pub(super) fn subresource_url(document: &str, base: &Url, href: &str) -> Option<String> {
+        let url = base.join(href).ok()?;
+        Self::may_reach(document, &url).then(|| url.into())
     }
+
+    /// Whether the document at `document` may fetch `url`, an address already
+    /// absolute: a sheet's `url()`s, each resolved as the sheet was parsed.
+    ///
+    /// The rule is the one [`Self::subresource_url`] describes.
+    pub(super) fn may_reach(document: &str, url: &Url) -> bool {
+        let allowed = otlyra_net::may_navigate(Some(document), url);
+        if !allowed {
+            tracing::warn!(%url, %document, "subresource refused by scheme policy");
+        }
+        allowed
+    }
+}
+
+/// The address a document was read from, as a URL.
+///
+/// The fetcher hands back the address it finally read, which is one; a document
+/// whose address somehow is not is treated as one from nowhere.
+fn document_url(final_url: &str) -> Url {
+    Url::parse(final_url).unwrap_or_else(|error| {
+        tracing::warn!(%final_url, %error, "a document's address does not parse");
+        otlyra_css::cascade::about_blank()
+    })
+}
+
+/// A stylesheet response as the cascade takes it: decoded, and at the address it
+/// finally came from, which its relative addresses resolve against.
+///
+/// Where a loader names no final address, the one asked for stands in.
+fn fetched_sheet(loaded: &crate::fetcher::Loaded, requested: &str) -> Option<FetchedSheet> {
+    let url = Url::parse(&loaded.final_url)
+        .or_else(|_| Url::parse(requested))
+        .inspect_err(
+            |error| tracing::warn!(%requested, %error, "a stylesheet's address does not parse"),
+        )
+        .ok()?;
+    Some(FetchedSheet {
+        url,
+        text: decode_text(&loaded.bytes, loaded.charset.as_deref()),
+    })
 }
 
 /// A page scene the way this browser shows it.

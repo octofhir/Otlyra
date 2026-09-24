@@ -107,6 +107,15 @@
   .middle { text-align: center; }
   .right { text-align: right; }
 
+  .lang { background: #fdd; padding: 4px 8px; margin: 4px 0; }
+  .lang:lang(en) { background: #dfd; }
+  .lang-de:lang(de) { background: #dfd; }
+  .lang-unknown:not(:lang(en)) { background: #dfd; }
+  .pointer { background: #fdd; padding: 4px 8px; margin: 4px 0; }
+  @media (hover: hover) { .hover-yes { background: #dfd; } }
+  @media (any-hover: hover) { .any-hover-yes { background: #dfd; } }
+  @media (hover: none) { .hover-no { background: #fdd; } }
+  @media (pointer: fine) { .pointer-fine { background: #dfd; } }
   @media (min-width: 600px) { .wide { display: block; } }
   @supports (display: grid) { .grid { display: grid; } }
 </style>
@@ -328,6 +337,23 @@ paragraph is written long enough to run past both of the boxes above, so the
 first of its lines are narrow and the last ones are not.</p>
 <p class="cleared"><code>clear: both</code>, so this starts below whichever of
 them reaches further down.</p>
+
+<h2>Language, popovers and the pointer</h2>
+<div lang="en-GB">
+  <p class="lang"><code>:lang(en)</code> inside <code>lang="en-GB"</code>: green,
+  because a range takes in the tags under it.</p>
+  <p class="lang lang-de" lang="de"><code>:lang(de)</code> on
+  <code>lang="de"</code>: green.</p>
+  <p class="lang lang-unknown" lang=""><code>lang=""</code> is an unknown
+  language, which <code>:lang(en)</code> does not match: green.</p>
+</div>
+<div popover>A popover nothing has opened. If you can read this, the
+user-agent rule that hides it is missing.</div>
+<p class="pointer hover-yes"><code>@media (hover: hover)</code>: green, because
+the pointer is a mouse.</p>
+<p class="pointer hover-no any-hover-yes"><code>@media (any-hover: hover)</code>
+green, and <code>(hover: none)</code> would have made it red.</p>
+<p class="pointer pointer-fine"><code>@media (pointer: fine)</code>: green.</p>
 
 <h2>Elements the rules above are written against</h2>
 <section class="box" id="unique">

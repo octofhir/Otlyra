@@ -119,8 +119,9 @@ fn a_border_style_decides_what_is_drawn() {
         "a third of nine is three: {:?}",
         double[0]
     );
-    // Half the width each way: on a colour bright enough to darken, the lit
-    // half stays the colour the page named and the other half does not.
+    // Half the width each way. Red's brightest channel is already full, so
+    // lightening it changes nothing: the lit half is the red the page named and
+    // the other half is not.
     assert_eq!(fills("groove").len(), 4, "one lit half a side");
     assert_eq!(fills("inset").len(), 2, "two sides lit, two in shadow");
 
@@ -136,34 +137,46 @@ fn a_border_style_decides_what_is_drawn() {
     assert!(fills("hidden").is_empty() && strokes("hidden").is_empty());
 }
 
-/// A three-dimensional border darkens the side the shadow falls on and leaves
-/// the other alone — unless the colour is already too dark to darken, where
-/// the lit side is lightened instead so the two can still be told apart.
+/// A three-dimensional border darkens the side the shadow falls on and lightens
+/// the other — except at the two ends of the scale, where there is nowhere
+/// further to go.
 ///
-/// The curves are a reference's, read off a ramp of colours.
+/// Every pair is what Chrome paints an `outset` border in that colour, read off
+/// its pixels.
 #[test]
-fn a_carved_border_darkens_one_side_and_lightens_the_other_only_when_it_must() {
-    let pair = |colour: Color| {
-        let (dark, light) = shades(colour);
-        (
-            dark.to_rgba8().to_u8_array(),
-            light.to_rgba8().to_u8_array(),
-        )
+fn a_carved_border_darkens_one_side_and_lightens_the_other() {
+    let pair = |r, g, b| {
+        let (dark, light) = shades(Color::from_rgb8(r, g, b));
+        let bytes = |colour: Color| {
+            let [r, g, b, _] = colour.to_rgba8().to_u8_array();
+            [r, g, b]
+        };
+        (bytes(dark), bytes(light))
     };
-    let bytes = |r, g, b| [r, g, b, 255];
 
-    assert_eq!(
-        pair(Color::from_rgb8(48, 96, 192)),
-        (bytes(27, 54, 108), bytes(48, 96, 192)),
-        "bright enough to darken, so the lit side is left alone"
-    );
-    // Too dark to darken: the shadowed side is black, so the other is lifted.
-    assert_eq!(
-        pair(Color::from_rgb8(48, 48, 48)),
-        (bytes(0, 0, 0), bytes(132, 132, 132))
-    );
-    // Black has no colour to scale at all and is lifted to a fixed grey.
-    assert_eq!(pair(Color::BLACK), (bytes(0, 0, 0), bytes(84, 84, 84)));
+    // Truncated as the reference truncates: rounding would make these 64 and 128.
+    assert_eq!(pair(48, 96, 192), ([27, 54, 108], [63, 127, 255]));
+    assert_eq!(pair(128, 128, 128), ([44, 44, 44], [212, 212, 212]));
+    assert_eq!(pair(255, 0, 0), ([171, 0, 0], [255, 0, 0]));
+    assert_eq!(pair(48, 48, 48), ([0, 0, 0], [132, 132, 132]));
+
+    // Too light to lighten: the lit side is the colour itself — past the edge,
+    // and not on it.
+    assert_eq!(pair(255, 255, 255), ([171, 171, 171], [255, 255, 255]));
+    assert_eq!(pair(0xec, 0xec, 0xec), ([152, 152, 152], [236, 236, 236]));
+    assert_eq!(pair(0xeb, 0xeb, 0xeb), ([151, 151, 151], [255, 255, 255]));
+
+    // Too dark to darken: lightened once for the shadow and twice for the light,
+    // on the edge as well as past it — so black is two greys.
+    assert_eq!(pair(0x21, 0x21, 0x21), ([0, 0, 0], [117, 117, 117]));
+    assert_eq!(pair(0x20, 0x20, 0x20), ([116, 116, 116], [200, 200, 200]));
+    assert_eq!(pair(10, 20, 0), ([52, 104, 0], [94, 188, 0]));
+    assert_eq!(pair(0, 0, 0), ([84, 84, 84], [168, 168, 168]));
+
+    // Alpha is carried through, and plays no part in how dark a colour is.
+    let (dark, light) = shades(Color::from_rgba8(0, 0, 0, 128));
+    assert_eq!(dark.to_rgba8().to_u8_array(), [84, 84, 84, 128]);
+    assert_eq!(light.to_rgba8().to_u8_array(), [168, 168, 168, 128]);
 }
 
 /// A box may have several backgrounds, each placed and sized by its own
@@ -187,7 +200,8 @@ fn every_background_layer_is_drawn_in_the_order_it_was_written() {
 
     let document = otlyra_html::parse(
         b"<style>body { margin: 0 } div { width: 100px; height: 100px; \
-          background-image: url(top.png), url(bottom.png); background-repeat: no-repeat; \
+          background-image: url(https://x.test/top.png), url(https://x.test/bottom.png); \
+          background-repeat: no-repeat; \
           background-position: left top, right bottom }</style><div></div>",
         Some("utf-8"),
     )
@@ -208,8 +222,8 @@ fn every_background_layer_is_drawn_in_the_order_it_was_written() {
         &Frame {
             viewport: (800.0, 600.0),
             background: Some(&|url: &str| match url {
-                "top.png" => Some(one.clone()),
-                "bottom.png" => Some(two.clone()),
+                "https://x.test/top.png" => Some(one.clone()),
+                "https://x.test/bottom.png" => Some(two.clone()),
                 _ => None,
             }),
             ..Frame::default()

@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use otlyra_css::cascade::{ExternalSheets, Styler, Viewport};
+use otlyra_css::cascade::{StyleSources, Styler, Viewport};
 use otlyra_css::state::Interaction;
 use otlyra_dom::{Document, FormState, NodeId};
 
@@ -37,7 +37,7 @@ fn main() {
     ] {
         let source = page(style);
         let document = otlyra_html::parse(source.as_bytes(), Some("utf-8")).document;
-        let mut styler = Styler::new(&document, viewport, &ExternalSheets::default());
+        let mut styler = Styler::new(&document, viewport, &StyleSources::default());
         let form = FormState::new();
 
         // Warm the stylist, and count what a full restyle costs for comparison.

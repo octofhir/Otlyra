@@ -21,6 +21,9 @@ pub enum EncodingSource {
     /// A `<meta>` the tokenizer reached that the prescan did not, which made us
     /// decode the document again.
     TokenizerIndicator,
+    /// Nothing said anything, and the bytes themselves are UTF-8 through and
+    /// through.
+    Detected,
     /// Nothing said anything, so the legacy default applies.
     Default,
 }
@@ -42,6 +45,14 @@ pub struct EncodingDecision {
 pub const DEFAULT_ENCODING: &Encoding = encoding_rs::WINDOWS_1252;
 
 /// Decide the encoding for `bytes`, given whatever the transport said.
+///
+/// The steps of HTML §13.2.3.2, "Determining the character encoding", that
+/// apply to a document with no parent and no history: a BOM, the transport, the
+/// prescan, then a guess. The guess looks at the bytes first, as the step before
+/// the default allows a browser to: a document that is valid UTF-8 and not
+/// plain ASCII is UTF-8, which is what Chrome decides for every unlabelled
+/// document and Firefox for every file. Text in a legacy encoding is almost never
+/// valid UTF-8 by accident, so nothing that used to decode right decodes wrong.
 pub fn determine(bytes: &[u8], transport_charset: Option<&str>) -> EncodingDecision {
     if let Some((encoding, _length)) = Encoding::for_bom(bytes) {
         return EncodingDecision {
@@ -66,10 +77,23 @@ pub fn determine(bytes: &[u8], transport_charset: Option<&str>) -> EncodingDecis
         };
     }
 
+    if is_utf8_beyond_ascii(bytes) {
+        return EncodingDecision {
+            encoding: encoding_rs::UTF_8,
+            source: EncodingSource::Detected,
+        };
+    }
+
     EncodingDecision {
         encoding: DEFAULT_ENCODING,
         source: EncodingSource::Default,
     }
+}
+
+/// Whether `bytes` are UTF-8 and more than ASCII: ASCII alone reads the same in
+/// UTF-8 and in the default, so it says nothing either way.
+fn is_utf8_beyond_ascii(bytes: &[u8]) -> bool {
+    !bytes.is_ascii() && Encoding::utf8_valid_up_to(bytes) == bytes.len()
 }
 
 #[cfg(test)]
@@ -128,6 +152,30 @@ mod tests {
         let decision = decide(b"<html><body>hi", None);
         assert_eq!(decision.encoding, WINDOWS_1252);
         assert_eq!(decision.source, EncodingSource::Default);
+    }
+
+    /// An en dash in UTF-8, in a document that does not say what it is in.
+    #[test]
+    fn unlabelled_utf8_is_recognised_as_utf8() {
+        let decision = decide(b"<p>GPT\xE2\x80\x936", None);
+        assert_eq!(decision.encoding, UTF_8);
+        assert_eq!(decision.source, EncodingSource::Detected);
+    }
+
+    /// Plain ASCII is the same in both, so it says nothing, and bytes that are
+    /// not UTF-8 are the legacy default's.
+    #[test]
+    fn only_bytes_that_are_utf8_and_more_than_ascii_are_detected() {
+        assert_eq!(decide(b"<p>plain", None).source, EncodingSource::Default);
+        // "Привет" in windows-1251, which is not UTF-8.
+        let legacy = decide(b"<p>\xCF\xF0\xE8\xE2\xE5\xF2", None);
+        assert_eq!(legacy.encoding, WINDOWS_1252);
+        assert_eq!(legacy.source, EncodingSource::Default);
+        // A document that says what it is in is taken at its word.
+        assert_eq!(
+            decide(b"<meta charset=windows-1251><p>\xE2\x80\x93", None).encoding,
+            WINDOWS_1251
+        );
     }
 
     #[test]

@@ -32,6 +32,27 @@ pub(super) fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f
     baseline_shift_of(&style.vertical_align, style, parent)
 }
 
+/// The `vertical-align` that places `source`'s content on a line of `block`'s.
+///
+/// Its own, with one exception: text directly inside the block is in the block's
+/// root inline box, which nothing moves. On a block container — a table cell, an
+/// inline block — the property places the box itself, in its row or in the line
+/// outside it, and says nothing about the lines inside (CSS 2.2 §10.8.1).
+///
+/// Levelling a line and placing what is on it both ask here, so the room a line
+/// makes for a shift and where the glyphs actually go cannot disagree.
+fn alignment_on_line(
+    source: BoxId,
+    block: BoxId,
+    style: &ComputedStyle,
+) -> &otlyra_css::VerticalAlign {
+    if source == block {
+        &otlyra_css::VerticalAlign::Baseline
+    } else {
+        &style.vertical_align
+    }
+}
+
 /// The same, for a value the caller has already picked out.
 fn baseline_shift_of(
     align: &otlyra_css::VerticalAlign,
@@ -92,6 +113,25 @@ pub(super) fn baseline_of(fragment: &Fragment) -> Option<f32> {
 }
 
 impl<'a> Flow<'a> {
+    /// How far `source`'s content is raised off the baseline of a line of
+    /// `block`'s, in CSS pixels, positive up.
+    ///
+    /// Settled by [`Self::level_line_heights`] for the values that need the line
+    /// box or the parent's font, and worked out here for the rest — with the same
+    /// answer to which `vertical-align` applies, so the block's own text stays on
+    /// the baseline its line was built round.
+    pub(super) fn shift_on_line(&self, source: BoxId, block: BoxId) -> f32 {
+        if let Some(&shift) = self.line_shifts.get(&source) {
+            return shift;
+        }
+        let style = &self.tree.node(source).style;
+        baseline_shift_of(
+            alignment_on_line(source, block, style),
+            style,
+            &self.tree.node(block).style,
+        )
+    }
+
     /// Give every span of a paragraph the same line height: the tallest any of
     /// them, or the block itself, asks for — and enough room for anything a rule
     /// has raised or lowered.
@@ -157,6 +197,7 @@ impl<'a> Flow<'a> {
                 Some(own) => own,
                 None => continue,
             };
+            let align = alignment_on_line(*source, parent, &span_style);
 
             // `top` and `bottom` are the only two that need the line box, and
             // they are a position *within* it: the line does not grow to fit
@@ -165,7 +206,7 @@ impl<'a> Flow<'a> {
             // measured against the parent's own font — is a shift the box knows
             // here, and the line grows to hold it like any other.
             if matches!(
-                span_style.vertical_align,
+                align,
                 otlyra_css::VerticalAlign::Top | otlyra_css::VerticalAlign::Bottom
             ) {
                 // Its own height still asks for room; where it goes does not
@@ -175,11 +216,11 @@ impl<'a> Flow<'a> {
                 floor_above = floor_above.max(own.ascent);
                 floor_below = floor_below.max(own.descent);
                 self.span_reach[index] = (own.ascent, own.descent);
-                line_relative.push((*source, span_style.vertical_align.clone(), own));
+                line_relative.push((*source, align.clone(), own));
                 continue;
             }
 
-            let shift = match &span_style.vertical_align {
+            let shift = match align {
                 // The parent's own text rather than the whole line: what
                 // `text-top` and `text-bottom` mean is the edge of the text the
                 // box is set beside, not the edge of the tallest thing on the row.
@@ -195,7 +236,7 @@ impl<'a> Flow<'a> {
                 }
                 other => baseline_shift_of(other, &span_style, &style),
             };
-            if span_style.vertical_align.resolved_while_levelling() {
+            if align.resolved_while_levelling() {
                 self.line_shifts.insert(*source, shift);
             }
             above = above.max(shift + own.ascent);

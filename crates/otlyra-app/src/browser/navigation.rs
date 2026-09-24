@@ -201,12 +201,16 @@ impl Browser {
             return;
         }
         // The action is spelled as the markup spells it, so an empty one is the
-        // page itself and a relative one is resolved against it.
-        let here = self.tabs[self.active].url.clone();
+        // document's own address and a relative one is resolved against its base
+        // URL (HTML §4.10.21.3, "form submission algorithm").
+        let tab = &self.tabs[self.active];
         let target = if sent.url.is_empty() {
-            here.clone()
+            tab.url.clone()
         } else {
-            otlyra_net::url::resolve(&here, &sent.url).unwrap_or_else(|| sent.url.clone())
+            tab.page
+                .as_ref()
+                .and_then(|page| page.resolve(&sent.url))
+                .unwrap_or_else(|| sent.url.clone())
         };
         // A form is the page acting, not the reader, so the same scheme policy that
         // holds for a link holds here: a page from the network may not aim a form

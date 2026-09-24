@@ -14,6 +14,10 @@
      difference in one box and not in the row. */
   img { display: block; }
   .framed { border: 10px solid #c33; padding: 5px; background: #cfc; }
+  /* The embedded section: pictures that sit in a line or float in one, and
+     boxes with a background, so an empty one shows where it is. */
+  img.inline { display: inline; }
+  .tinted { background: #cde; }
 </style>
 </head>
 <body>
@@ -130,6 +134,58 @@
   <figure><div style="display: flex; flex-direction: column; flex-wrap: wrap; width: 160px;
       background: #fee"><div style="aspect-ratio: 4; background: #c93">text</div></div>
     <figcaption>aspect-ratio: 4 there — as tall as its text</figcaption></figure>
+</div>
+
+<h1>Embedded content is a box, whatever is in it</h1>
+
+<div class="row">
+  <figure><iframe></iframe>
+    <figcaption>iframe — 304&times;154</figcaption></figure>
+  <figure><iframe width="160" height="90"></iframe>
+    <figcaption>width=160 height=90</figcaption></figure>
+  <figure><iframe class="tinted" width="100" height="90" frameborder="0"></iframe>
+    <figcaption>frameborder=0</figcaption></figure>
+</div>
+
+<div class="row">
+  <figure><video width="250" height="159" poster="images/wide.png" style="background: #222">No video here.</video>
+    <figcaption>poster, contained — 250&times;159</figcaption></figure>
+  <figure><video class="tinted" width="160">No video here.</video>
+    <figcaption>no poster — 160&times;150</figcaption></figure>
+  <figure><canvas width="120" height="60" style="border: 1px solid #333">No canvas here.</canvas>
+    <figcaption>canvas 120&times;60</figcaption></figure>
+</div>
+
+<div class="row">
+  <figure><object data="images/missing.swf"><p style="margin: 0; padding: 8px; background: #fec">the object's fallback</p></object>
+    <figcaption>object, no picture</figcaption></figure>
+  <figure><object data="images/tile-100.png"><p>not shown</p></object>
+    <figcaption>object, a picture</figcaption></figure>
+  <figure><input type="image" src="images/small.png" width="32" border="2" alt="Go">
+    <input type="image" alt="Go">
+    <figcaption>image buttons</figcaption></figure>
+  <figure><audio controls></audio>
+    <figcaption>audio controls — 300&times;54</figcaption></figure>
+</div>
+
+<h1>A picture's own attributes</h1>
+
+<p style="width: 460px; background: #f4f4f4">
+  <img src="images/tile-100.png" align="left" hspace="10" vspace="5" border="2">
+  Floated left by its <code>align</code>, with ten pixels of <code>hspace</code> either
+  side of it, five of <code>vspace</code> above and below, and a two-pixel
+  <code>border</code>: the text runs down its right side and under it once past.
+</p>
+
+<div class="row">
+  <figure style="width: 200px"><img src="images/tile-400.png" width="400" height="200" style="max-width: 100%; height: auto">
+    <figcaption>width=400 height=200 in 200px, height:auto — 200&times;100</figcaption></figure>
+  <figure><img src="images/tile-100.png" width="40">
+    <figcaption>width=40 — 40&times;20</figcaption></figure>
+  <figure><p style="margin: 0">x <img class="inline" src="images/tile-100.png" width="50" align="top"> top,
+    <img class="inline" src="images/tile-100.png" width="50" align="texttop"> texttop,
+    <img class="inline" src="images/tile-100.png" width="50" align="absmiddle"> absmiddle</p>
+    <figcaption>align in a line</figcaption></figure>
 </div>
 
 </body>

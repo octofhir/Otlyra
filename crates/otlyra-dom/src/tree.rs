@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use html5ever::interface::QuirksMode;
+use html5ever::ns;
 use slotmap::SlotMap;
 
 use crate::limits::DomLimits;
@@ -106,6 +107,30 @@ impl Document {
     /// [`ElementData::link_href`](crate::node::ElementData::link_href).
     pub fn link_href(&self, id: NodeId) -> Option<&str> {
         self.get(id)?.element()?.link_href()
+    }
+
+    /// The `href` of the base element that sets the document's base URL, if one
+    /// does.
+    ///
+    /// HTML §4.2.3: the first HTML `base` element in tree order that has an
+    /// `href`, wherever it is — one without the attribute sets only a default
+    /// `target` and is passed over. The value is as written; resolving it against
+    /// the document's own address is the frozen base URL, which needs that
+    /// address and so is the caller's.
+    pub fn base_element_href(&self) -> Option<&str> {
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if let Some(element) = self.get(id).and_then(Node::element)
+                && element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "base"
+                && let Some(href) = element.attr("href")
+            {
+                return Some(href);
+            }
+            let children: Vec<NodeId> = self.children(id).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        None
     }
 
     /// How many nodes the document holds.

@@ -38,57 +38,54 @@ pub(super) fn laid_out(html: &str, width: f32) -> (FragmentTree, BoxTree) {
     (tree, boxes)
 }
 
-/// A picture's size, given what a stylesheet and the attributes asked for.
-fn drawn_at(style: &ComputedStyle, hint: (Option<f32>, Option<f32>)) -> (f32, f32) {
+/// A four-by-two picture's size, given the `width` and `height` its style
+/// asks for — which is where the `width` and `height` attributes arrive too,
+/// as the presentational hints they are.
+fn drawn_at(width: Option<f32>, height: Option<f32>) -> (f32, f32) {
+    let size = |px: Option<f32>| {
+        px.map_or(otlyra_css::Size::Auto, |px| {
+            otlyra_css::Size::Length(otlyra_css::Length::Px(px))
+        })
+    };
+    let style = ComputedStyle {
+        width: size(width),
+        height: size(height),
+        ..ComputedStyle::default()
+    };
     replaced_size(
-        style,
+        &style,
         &crate::box_tree::Replaced {
             image: None,
             // Four wide and two tall: a ratio of two, so a wrong height is
             // obvious rather than a rounding difference.
             intrinsic: Some((4.0, 2.0)),
-            hint,
         },
         InlineRoom::laid_out(800.0, 800.0),
         None,
     )
 }
 
-/// `width` and `height` on an `<img>` are presentational hints — the lowest
-/// priority rule setting those properties — and not a new intrinsic size.
-/// Written into the intrinsic size they took the aspect ratio with them, so
-/// `width="40"` drew a four-by-two picture forty wide and still two tall:
-/// squashed on one axis, which on a photograph is a wall of vertical
-/// streaks and was reported as exactly that.
+/// One dimension given takes the other from the picture's own ratio, and both
+/// given are both honoured. A size written into the intrinsic size instead
+/// took the ratio with it: forty wide drew a four-by-two picture forty by two,
+/// which on a photograph is a wall of vertical streaks and was reported as
+/// exactly that.
 #[test]
-fn a_width_attribute_is_a_hint_and_not_a_new_intrinsic_size() {
-    let plain = ComputedStyle::default();
-
-    assert_eq!(drawn_at(&plain, (None, None)), (4.0, 2.0), "nothing asked");
+fn a_given_dimension_keeps_the_pictures_ratio() {
+    assert_eq!(drawn_at(None, None), (4.0, 2.0), "nothing asked");
     assert_eq!(
-        drawn_at(&plain, (Some(40.0), None)),
+        drawn_at(Some(40.0), None),
         (40.0, 20.0),
         "one dimension takes the other from the ratio"
     );
+    assert_eq!(drawn_at(None, Some(20.0)), (40.0, 20.0), "from either side");
     assert_eq!(
-        drawn_at(&plain, (None, Some(20.0))),
-        (40.0, 20.0),
-        "from either side"
-    );
-    assert_eq!(
-        drawn_at(&plain, (Some(40.0), Some(5.0))),
+        drawn_at(Some(40.0), Some(5.0)),
         (40.0, 5.0),
         "and both given is both honoured, ratio or not"
     );
     // Downscaling is the same rule and the case the site showed.
-    assert_eq!(drawn_at(&plain, (Some(2.0), None)), (2.0, 1.0));
-
-    // A stylesheet outranks the hint, which is what makes it a hint.
-    let styled = ComputedStyle {
-        width: otlyra_css::Size::Length(otlyra_css::Length::Px(80.0)),
-        ..ComputedStyle::default()
-    };
-    assert_eq!(drawn_at(&styled, (Some(40.0), None)), (80.0, 40.0));
+    assert_eq!(drawn_at(Some(2.0), None), (2.0, 1.0));
 }
 
 /// How many lines of text a document laid out to.

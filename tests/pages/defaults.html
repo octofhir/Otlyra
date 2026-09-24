@@ -23,16 +23,21 @@ and line breaking has something to do. Two paragraphs are separated by a margin
 of one em, above and below.</p>
 <p>A second paragraph.<br>A line after a <code>&lt;br&gt;</code>, which breaks
 the line without starting a new paragraph.</p>
+<p>A paragraph whose last words are inside a <code>&lt;nobr&gt;</code>, so
+<nobr>that the whole of this run moves to the next line rather than breaking</nobr>.</p>
 
 <h2>3. Inline semantics</h2>
 <p><b>b</b>, <strong>strong</strong>, <i>i</i>, <em>em</em>, <u>u</u>,
 <s>s</s>, <del>del</del>, <ins>ins</ins>, <small>small</small>,
 <mark>mark</mark>, <code>code</code>, <kbd>kbd</kbd>, <samp>samp</samp>,
-<var>var</var>, <cite>cite</cite>, <dfn>dfn</dfn>, <abbr>abbr</abbr>,
+<var>var</var>, <cite>cite</cite>, <dfn>dfn</dfn>,
+<abbr title="abbreviation">abbr with a title</abbr>,
 <q>q</q>, <time>time</time>, <data>data</data>, H<sub>2</sub>O, x<sup>2</sup>,
 <a href="https://example.com/">a link</a>.</p>
 <p><small>Known gap here: <code>&lt;q&gt;</code> should generate quotation
-marks, which needs generated content and is not implemented.
+marks, which needs generated content and is not implemented, and an
+<code>&lt;abbr&gt;</code> with a title is underlined with a solid line where the
+line should be dotted.
 <code>&lt;sub&gt;</code> and <code>&lt;sup&gt;</code> are lowered and raised, and
 the line they sit on grows to hold them.</small></p>
 
@@ -65,9 +70,22 @@ default renderings people actually rely on.</blockquote>
     // and long lines do not wrap however far they run.
     println!("hello");
 }</pre>
+<xmp><xmp> is pre from before there was a pre: this <b>markup</b> is text.</xmp>
+<listing>&lt;listing&gt; is too, and    keeps    its    spaces.</listing>
 <p>Above the rule.</p>
 <hr>
-<p>Below it.</p>
+<p>Below it. The rule is an inset line, two pixels tall. With attributes: half
+the width and against the left, solid and four pixels tall, and coloured:</p>
+<hr width="50%" align="left">
+<hr noshade size="4" width="30%">
+<hr color="#cc3300" size="2">
+<table align="left" border="1"><tr><td>A table floated<br>left by its
+<code>align</code></td></tr></table>
+<p>Text beside the floated table, then a <code>&lt;br clear=all&gt;</code>:<br clear="all">and
+this line should start below the table.</p>
+<p><small>Known gap here: the break after <code>clear=all</code> is computed as
+<code>clear: both</code>, but inline layout does not yet move the next line
+below the float.</small></p>
 
 <h2>6. Form controls</h2>
 <form>

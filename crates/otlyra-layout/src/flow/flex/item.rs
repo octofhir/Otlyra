@@ -329,7 +329,7 @@ impl<'a> Flow<'a> {
         let transferred = self.transferred_width_limits(id, &style, room, widths);
         let own = self.own_width(id, &style, container.width, container.space.height);
         let align = style.align_self.unwrap_or(container.align_items);
-        let fills_line = align == AlignItems::Stretch && self.may_stretch(id, &style, container);
+        let fills_line = align == AlignItems::Stretch && self.may_stretch(&style, container);
         let sizing = ItemSizing {
             id,
             style: &style,
@@ -377,18 +377,14 @@ impl<'a> Flow<'a> {
     /// block and in a flex item alike.
     ///
     /// A picture's `width` and `height` attributes are sizes it named: HTML
-    /// maps them onto the properties (HTML §15.4.3), so an icon written
-    /// `<svg height=16>` keeps its sixteen pixels in a taller row rather than
-    /// being drawn the height of the row.
-    fn may_stretch(&self, id: BoxId, style: &ComputedStyle, container: Container) -> bool {
-        let hint = match &self.tree.node(id).kind {
-            BoxKind::Replaced(content) => content.hint,
-            BoxKind::Block | BoxKind::Inline | BoxKind::Text(_) => (None, None),
-        };
+    /// maps them onto the properties (HTML §15.4.3), so they arrive here as its
+    /// style, and an icon written `<svg height=16>` keeps its sixteen pixels in
+    /// a taller row rather than being drawn the height of the row.
+    fn may_stretch(&self, style: &ComputedStyle, container: Container) -> bool {
         let sized = if container.row {
-            hint.1.is_some() || self.asked_height(style, container.width).is_some()
+            self.asked_height(style, container.width).is_some()
         } else {
-            hint.0.is_some() || style.width != Size::Auto
+            style.width != Size::Auto
         };
         !sized && auto_margin_sides(style, !container.row) == (false, false)
     }

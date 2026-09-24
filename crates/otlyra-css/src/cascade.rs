@@ -10,6 +10,8 @@
 //! and it is also a way to have two documents restyle at once through one global
 //! pool; the plan defers it, and this is where that decision lives.
 
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use otlyra_dom::{Document, NodeData, NodeId};
@@ -19,15 +21,26 @@ use style::device::Device;
 use style::media_queries::{MediaList, MediaType};
 use style::properties::ComputedValues;
 use style::selector_parser::SnapshotMap;
-use style::shared_lock::{SharedRwLock, StylesheetGuards};
-use style::stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet, UrlExtraData};
+use style::shared_lock::{Locked, SharedRwLock, StylesheetGuards};
+use style::stylesheets::import_rule::{
+    ImportLayer, ImportRule, ImportSheet, ImportSupportsCondition,
+};
+use style::stylesheets::{
+    AllowImportRules, DocumentStyleSheet, Origin, Stylesheet, StylesheetLoader, UrlExtraData,
+};
 use style::stylist::Stylist;
 use style::traversal_flags::TraversalFlags;
+use style::values::CssUrl;
+use url::Url;
 
 use crate::stylo_dom::{NodeRef, StyleData, Tree, TreeScope};
 
 /// Our user-agent stylesheet, in the language it belongs to.
 pub const UA_STYLESHEET: &str = include_str!("ua.css");
+
+/// The user-agent rules HTML adds in quirks mode, and only there (HTML §15, each
+/// "In quirks mode, the following rules are also expected to apply").
+pub const QUIRKS_STYLESHEET: &str = include_str!("quirks.css");
 
 /// A computed style per element, and the sheets that produced them.
 #[allow(missing_debug_implementations)]
@@ -122,11 +135,11 @@ impl Default for Viewport {
 /// rather than a table of defaults that author rules have to be merged into by
 /// hand.
 pub fn style_document(document: &Document, viewport: Viewport) -> StyledDocument {
-    style_document_with(document, viewport, &ExternalSheets::default())
+    style_document_with(document, viewport, &StyleSources::default())
 }
 
 /// Style every element in `document`, with the stylesheets its `<link>` elements
-/// asked for already fetched.
+/// and their `@import`s asked for already fetched.
 ///
 /// The fetch is the caller's: styling is synchronous and must not wait on a
 /// network, so what arrives here is text that has already been got. A link with
@@ -135,9 +148,9 @@ pub fn style_document(document: &Document, viewport: Viewport) -> StyledDocument
 pub fn style_document_with(
     document: &Document,
     viewport: Viewport,
-    external: &ExternalSheets,
+    sources: &StyleSources,
 ) -> StyledDocument {
-    Styler::new(document, viewport, external).style(document)
+    Styler::new(document, viewport, sources).style(document)
 }
 
 /// The parsed stylesheets and the machinery that cascades them, kept between
@@ -153,6 +166,10 @@ pub struct Styler {
     stylist: Stylist,
     quirks_mode: QuirksMode,
     viewport: Viewport,
+    /// The document's base URL, which a `style` attribute and a presentational
+    /// hint resolve their addresses against: they are parsed afresh at every
+    /// restyle, and each time against the same base as the `<style>` elements.
+    base: UrlExtraData,
     /// Which rule each declaration block came from, by the block's address.
     ///
     /// The cascade hands back *what* applied — a chain of declaration blocks in
@@ -169,20 +186,17 @@ pub struct Styler {
 
 /// A `@font-face` rule: a family the page brings with it, and where from.
 ///
-/// The addresses are as the rule spells them and in the order it lists them,
-/// which is the order they are to be tried in. Resolving one needs the address of
-/// the sheet it was written in, which this crate does not know — so which sheet
-/// that was is carried instead.
+/// The addresses are in the order the rule lists them, which is the order they
+/// are to be tried in, and already absolute: each was resolved against the sheet
+/// the rule was written in as that sheet was parsed (CSS Values 4 §4.5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontFace {
     /// The family name the rule defines, as written.
     pub family: String,
-    /// Every `url()` in its `src`, in order. A `local()` source names an installed
-    /// family and is not an address, so it is not one of these.
-    pub sources: Vec<String>,
-    /// The `<link>` whose sheet this rule was in, or `None` for a `<style>` in the
-    /// document itself.
-    pub sheet: Option<NodeId>,
+    /// Every `url()` in its `src` that resolved, in order. A `local()` source
+    /// names an installed family and is not an address, so it is not one of
+    /// these.
+    pub sources: Vec<Url>,
 }
 
 /// Where a declaration block was written.
@@ -225,12 +239,11 @@ impl std::fmt::Debug for Styler {
 
 impl Styler {
     /// Parse the user-agent sheet and the document's own, once.
-    pub fn new(document: &Document, viewport: Viewport, external: &ExternalSheets) -> Self {
+    pub fn new(document: &Document, viewport: Viewport, sources: &StyleSources) -> Self {
         let _span = tracing::info_span!("parse_stylesheets").entered();
         enable_features();
 
         let lock = SharedRwLock::new();
-        let url = base_url();
         let quirks_mode = match document.quirks_mode() {
             html5ever::interface::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
             html5ever::interface::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
@@ -240,31 +253,36 @@ impl Styler {
         let mut stylist = Stylist::new(device_for(viewport, quirks_mode), quirks_mode);
         let mut selectors = HashMap::new();
 
-        let ua = Arc::new(parse_sheet(
-            UA_STYLESHEET,
-            Origin::UserAgent,
-            &lock,
-            &url,
-            quirks_mode,
-        ));
-        index_selectors(&ua, Origin::UserAgent, &lock, &mut selectors);
-        stylist.append_stylesheet(DocumentStyleSheet(ua), &lock.read());
+        // The quirks rules after the ordinary ones, so that at equal specificity
+        // they win; limited quirks mode takes none of them.
+        let user_agent_sheets = match quirks_mode {
+            QuirksMode::Quirks => &[UA_STYLESHEET, QUIRKS_STYLESHEET][..],
+            QuirksMode::LimitedQuirks | QuirksMode::NoQuirks => &[UA_STYLESHEET][..],
+        };
+        for source in user_agent_sheets {
+            let sheet = Arc::new(user_agent_sheet(source, &lock, quirks_mode));
+            index_selectors(&sheet, Origin::UserAgent, &lock, &mut selectors);
+            stylist.append_stylesheet(DocumentStyleSheet(sheet), &lock.read());
+        }
 
+        let imported = Cell::new(0);
+        let parse = AuthorParse {
+            lock: &lock,
+            quirks_mode,
+            imports: &sources.imports,
+            imported: &imported,
+        };
         let mut font_faces = Vec::new();
-        for (node, source) in author_stylesheets(document, external) {
-            // `appearance` has to survive the parser, and the parser has no such
-            // property; see the module that carries it for why the name is changed
-            // rather than the meaning.
-            let source = crate::appearance::rewrite_stylesheet(&source);
-            let sheet = Arc::new(parse_sheet(
-                &source,
-                Origin::Author,
-                &lock,
-                &url,
-                quirks_mode,
+        for author in author_stylesheets(document, sources) {
+            let media = parse.media(author.media.unwrap_or_default());
+            let sheet = Arc::new(parse.sheet(
+                &author.text,
+                author.fetched_from.unwrap_or(&sources.base),
+                media,
+                author.fetched_from.into_iter().cloned().collect(),
             ));
             index_selectors(&sheet, Origin::Author, &lock, &mut selectors);
-            collect_font_faces(&sheet, &lock, node, &mut font_faces);
+            collect_font_faces(&sheet, &lock, &mut font_faces);
             stylist.append_stylesheet(DocumentStyleSheet(sheet), &lock.read());
         }
 
@@ -273,6 +291,7 @@ impl Styler {
             stylist,
             quirks_mode,
             viewport,
+            base: UrlExtraData(Arc::new(sources.base.clone())),
             selectors,
             font_faces,
         }
@@ -393,9 +412,15 @@ impl Styler {
             }
 
             // A block with no selector is one that was not written as a rule:
-            // a `style` attribute, or a presentational hint standing in for one.
+            // the markup's presentational hints, which cascade at a level of
+            // their own, or a `style` attribute.
             let (selector, origin) = match self.selectors.get(&key) {
                 Some(source) => (source.selector.clone(), origin_name(source.origin)),
+                None if node.cascade_level().origin()
+                    == style::rule_tree::CascadeOrigin::PresHints =>
+                {
+                    ("presentational hints".to_owned(), "attribute")
+                }
                 None => ("element.style".to_owned(), "attribute"),
             };
             out.push(MatchedRule {
@@ -516,8 +541,8 @@ impl Styler {
         // own atom table, which only exists in a slot — so slots are made, for the
         // touched elements and no others.
         let mut style_data = StyleData::with_lock(self.lock.clone());
-        style_data.prepare_nodes(document, &touched, form, after);
-        let tree = Tree::styled(document, &style_data, &self.lock);
+        style_data.prepare_nodes(document, &touched, form, after, &self.base);
+        let tree = Tree::styled(document, &style_data);
         let _scope = TreeScope::enter(&tree);
         touched.into_iter().any(|id| {
             let changed = before_states.state_of(id) ^ after_states.state_of(id);
@@ -551,7 +576,7 @@ impl Styler {
         let _span = tracing::info_span!("recalc_style").entered();
 
         let mut style_data = StyleData::with_lock(self.lock.clone());
-        style_data.prepare(document, form, interaction);
+        style_data.prepare(document, form, interaction, &self.base);
 
         let guard = self.lock.read();
         self.stylist.flush(&StylesheetGuards::same(&guard));
@@ -569,7 +594,7 @@ impl Styler {
             registered_speculative_painters: &NoPainters,
         };
 
-        let tree = Tree::styled(document, &style_data, &self.lock);
+        let tree = Tree::styled(document, &style_data);
         let _scope = TreeScope::enter(&tree);
         let mut styles = HashMap::new();
         {
@@ -683,10 +708,19 @@ fn device_for(viewport: Viewport, quirks_mode: QuirksMode) -> Device {
             ColorScheme::Light => style::queries::values::PrefersColorScheme::Light,
             ColorScheme::Dark => style::queries::values::PrefersColorScheme::Dark,
         },
-        style::servo::media_features::PointerCapabilities::FINE,
-        style::servo::media_features::PointerCapabilities::FINE,
+        DESKTOP_POINTER,
+        DESKTOP_POINTER,
     )
 }
+
+/// What the pointer can do, for `pointer`, `hover` and their `any-` forms
+/// (Media Queries 4, "Interaction Media Features"): a mouse, which points
+/// precisely and hovers. It is both the primary pointer and the only one, so a
+/// page that keeps its hover styles behind `(hover: hover)`, as Tailwind's do,
+/// gets them.
+const DESKTOP_POINTER: style::servo::media_features::PointerCapabilities =
+    style::servo::media_features::PointerCapabilities::FINE
+        .union(style::servo::media_features::PointerCapabilities::HOVER);
 
 /// Declares this thread the layout thread for as long as it is held.
 struct LayoutThread;
@@ -783,49 +817,34 @@ fn resolve<'a>(
 /// which sheet came last, so a `<style>` after a `<link>` has to be appended after
 /// it — which means both kinds are collected by one walk rather than one list
 /// after another.
-fn author_stylesheets(
-    document: &Document,
-    external: &ExternalSheets,
-) -> Vec<(Option<NodeId>, String)> {
+fn author_stylesheets<'a>(
+    document: &'a Document,
+    sources: &'a StyleSources,
+) -> Vec<AuthorSheet<'a>> {
     let mut sheets = Vec::new();
     let mut stack = vec![document.root()];
 
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element()) {
+            let media = element.attr("media");
             match element.name.local.as_ref() {
                 "style" => {
-                    let mut source = String::new();
-                    for child in document.children(id) {
-                        if let Some(NodeData::Text(text)) =
-                            document.get(child).map(|node| &node.data)
-                        {
-                            source.push_str(text);
-                        }
-                    }
-                    if !source.trim().is_empty() {
-                        // A `media` attribute applies to the whole block, the way
-                        // it does on a `<link>`: a sheet written for print styles
-                        // nothing on a screen.
-                        match document.attr(id, "media").filter(|q| !q.trim().is_empty()) {
-                            Some(query) => {
-                                sheets.push((None, format!("@media {query} {{\n{source}\n}}")));
-                            }
-                            None => sheets.push((None, source)),
-                        }
+                    let text = style_text(document, id);
+                    if !text.trim().is_empty() {
+                        sheets.push(AuthorSheet {
+                            text: Cow::Owned(text),
+                            fetched_from: None,
+                            media,
+                        });
                     }
                 }
                 "link" => {
-                    if let Some(source) = external.get(&id) {
-                        // A `media` attribute applies to the whole sheet, and
-                        // wrapping it is exactly what that means — the queries
-                        // inside are then evaluated against the same device as
-                        // every other one.
-                        match document.attr(id, "media").filter(|q| !q.trim().is_empty()) {
-                            Some(query) => {
-                                sheets.push((Some(id), format!("@media {query} {{\n{source}\n}}")));
-                            }
-                            None => sheets.push((Some(id), source.clone())),
-                        }
+                    if let Some(fetched) = sources.links.get(&id) {
+                        sheets.push(AuthorSheet {
+                            text: Cow::Borrowed(&fetched.text),
+                            fetched_from: Some(&fetched.url),
+                            media,
+                        });
                     }
                 }
                 _ => {}
@@ -837,9 +856,304 @@ fn author_stylesheets(
     sheets
 }
 
-/// The stylesheets fetched for a document, by the `<link>` element that asked for
-/// each one.
-pub type ExternalSheets = HashMap<NodeId, String>;
+/// What a `<style>` element says: its child text, in order.
+fn style_text(document: &Document, style: NodeId) -> String {
+    let mut text = String::new();
+    for child in document.children(style) {
+        if let Some(NodeData::Text(chunk)) = document.get(child).map(|node| &node.data) {
+            text.push_str(chunk);
+        }
+    }
+    text
+}
+
+/// Every `@import` in the document's own `<style>` elements, resolved against
+/// its base, with the element each is in — the first of the two passes
+/// [`imports_in`] describes, for the sheets the document holds rather than
+/// fetches.
+pub fn style_element_imports(document: &Document, base: &Url) -> Vec<(NodeId, Url)> {
+    let mut found = Vec::new();
+    let mut stack = vec![document.root()];
+    while let Some(id) = stack.pop() {
+        if let Some(element) = document.get(id).and_then(|node| node.element())
+            && element.name.local.as_ref() == "style"
+        {
+            let imports = imports_in(&style_text(document, id), base);
+            found.extend(imports.into_iter().map(|url| (id, url)));
+        }
+        stack.extend(document.children(id).collect::<Vec<_>>().into_iter().rev());
+    }
+    found
+}
+
+/// One author stylesheet in the document, as the cascade takes it.
+struct AuthorSheet<'a> {
+    /// What the sheet says.
+    text: Cow<'a, str>,
+    /// Where a linked sheet was served from, which is what its relative
+    /// addresses resolve against. A `<style>` is at no address of its own, and
+    /// resolves them against the document's base.
+    fetched_from: Option<&'a Url>,
+    /// Its element's `media` attribute, which applies to the whole sheet — a
+    /// sheet written for print styles nothing on a screen (HTML §4.2.4, §4.2.6).
+    media: Option<&'a str>,
+}
+
+/// What a document's style is made of besides the document: the address its
+/// relative URLs resolve against, and the stylesheets fetched for it.
+///
+/// The fetches are the caller's, and are done before the cascade runs; this is
+/// what they came to.
+#[derive(Clone, Debug)]
+pub struct StyleSources {
+    /// The document base URL (HTML §2.4.1): what a `<style>` element, a `style`
+    /// attribute and a presentational hint resolve their addresses against.
+    pub base: Url,
+    /// The sheet each `<link rel=stylesheet>` fetched, by the element.
+    pub links: HashMap<NodeId, FetchedSheet>,
+    /// Every sheet an `@import` fetched, by the address the rule named once
+    /// resolved against the sheet it is in.
+    pub imports: HashMap<Url, FetchedSheet>,
+}
+
+impl Default for StyleSources {
+    /// A document at `about:blank` with nothing fetched for it: what a document
+    /// made from a string is.
+    fn default() -> Self {
+        Self {
+            base: about_blank(),
+            links: HashMap::new(),
+            imports: HashMap::new(),
+        }
+    }
+}
+
+/// A stylesheet as it came off the network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedSheet {
+    /// The address the response finally came from, after any redirect: the
+    /// sheet's own URL, which its relative addresses resolve against (CSS
+    /// Values 4 §4.5.1).
+    pub url: Url,
+    /// Its text, decoded.
+    pub text: String,
+}
+
+/// The address of a document that came from nowhere, and so the base of one: a
+/// relative URL resolves against it to nothing.
+pub fn about_blank() -> Url {
+    Url::parse("about:blank").expect("about:blank parses")
+}
+
+/// How many imported sheets one [`Styler::new`] parses, at most.
+///
+/// What a page may fetch is bounded where it is fetched — so many sheets, so
+/// deep — but a sheet fetched once can be imported any number of times, and
+/// every `@import` is a sheet of its own in the cascade (CSS Cascade 5 §2.1),
+/// parsed and walked afresh. Four sheets that each import the next a dozen
+/// times over are twenty thousand parses on the thread that draws. So past
+/// this many an `@import` is refused, as one whose fetch failed would be: four
+/// times the thirty-two sheets the browser fetches for a page, which no page
+/// written by hand comes near. The limit is ours; the specification sets none.
+const IMPORTED_SHEET_LIMIT: usize = 128;
+
+/// How the page's own stylesheets are parsed, shared by the sheets the document
+/// names and the sheets those import.
+#[derive(Clone, Copy)]
+struct AuthorParse<'a> {
+    /// The lock every rule in the document is kept under.
+    lock: &'a SharedRwLock,
+    quirks_mode: QuirksMode,
+    /// The sheets the document's `@import` rules fetched.
+    imports: &'a HashMap<Url, FetchedSheet>,
+    /// How many imported sheets have been parsed so far, counted against
+    /// [`IMPORTED_SHEET_LIMIT`].
+    imported: &'a Cell<usize>,
+}
+
+impl AuthorParse<'_> {
+    /// Parse one author sheet at `url`, for `media`.
+    ///
+    /// `chain` is the sheets it is being imported through, outermost first, so
+    /// that an import of one of them is a cycle and is refused rather than
+    /// parsed for ever.
+    fn sheet(
+        &self,
+        text: &str,
+        url: &Url,
+        media: Arc<Locked<MediaList>>,
+        chain: Vec<Url>,
+    ) -> Stylesheet {
+        // `appearance` has to survive the parser, and the parser has no such
+        // property; see the module that carries it for why the name is changed
+        // rather than the meaning.
+        let text = crate::appearance::rewrite_stylesheet(text);
+        let loader = ImportLoader {
+            parse: *self,
+            chain,
+        };
+        Stylesheet::from_str(
+            &text,
+            UrlExtraData(Arc::new(url.clone())),
+            Origin::Author,
+            media,
+            self.lock.clone(),
+            Some(&loader),
+            None,
+            self.quirks_mode,
+            AllowImportRules::Yes,
+        )
+    }
+
+    /// A `media` attribute as the media list its sheet applies for.
+    ///
+    /// Parsed into the list the sheet carries rather than wrapped around the
+    /// text as an `@media` block: the engine evaluates the one exactly as it
+    /// does a block, and a stray `}` in the sheet cannot close it.
+    fn media(&self, text: &str) -> Arc<Locked<MediaList>> {
+        Arc::new(self.lock.wrap(media_list(text, self.quirks_mode)))
+    }
+}
+
+/// What the cascade answers an `@import` with: the sheet fetched for it, parsed
+/// in its place, or a refusal (CSS Cascade 5 §2).
+///
+/// The engine applies what the rule says about the sheet it gets — the media
+/// it is for, the layer it goes in and where it cascades — so this decides
+/// only which sheet that is.
+struct ImportLoader<'a> {
+    parse: AuthorParse<'a>,
+    /// The sheets being parsed, outermost first, by every address each is known
+    /// by.
+    chain: Vec<Url>,
+}
+
+impl StylesheetLoader for ImportLoader<'_> {
+    fn request_stylesheet(
+        &self,
+        url: CssUrl,
+        location: cssparser::SourceLocation,
+        lock: &SharedRwLock,
+        media: Arc<Locked<MediaList>>,
+        supports: Option<ImportSupportsCondition>,
+        layer: ImportLayer,
+    ) -> Arc<Locked<ImportRule>> {
+        let stylesheet = self.imported(&url, media, supports.as_ref());
+        Arc::new(lock.wrap(ImportRule {
+            url,
+            stylesheet,
+            supports,
+            layer,
+            source_location: location,
+        }))
+    }
+}
+
+impl ImportLoader<'_> {
+    /// The sheet an `@import` of `url` brings in.
+    ///
+    /// Refused when there is none to bring: the address does not resolve, the
+    /// fetch failed or was never made, or the sheet is one of those importing
+    /// it. Refused too when its `supports()` is false, which the engine does
+    /// not ask when it cascades — so the sheet is never looked at, which is
+    /// what the specification allows and what Gecko does — and once
+    /// [`IMPORTED_SHEET_LIMIT`] sheets have been imported.
+    fn imported(
+        &self,
+        url: &CssUrl,
+        media: Arc<Locked<MediaList>>,
+        supports: Option<&ImportSupportsCondition>,
+    ) -> ImportSheet {
+        if supports.is_some_and(|condition| !condition.enabled) {
+            return ImportSheet::new_refused();
+        }
+        let Some(target) = url.url() else {
+            return ImportSheet::new_refused();
+        };
+        let Some(fetched) = self.parse.imports.get(&**target) else {
+            return ImportSheet::new_refused();
+        };
+        let cycle = self
+            .chain
+            .iter()
+            .any(|parsing| parsing == &**target || *parsing == fetched.url);
+        if cycle {
+            return ImportSheet::new_refused();
+        }
+        let imported = self.parse.imported.get();
+        if imported >= IMPORTED_SHEET_LIMIT {
+            tracing::warn!(url = %fetched.url, "an import past the limit is not parsed");
+            return ImportSheet::new_refused();
+        }
+        self.parse.imported.set(imported + 1);
+
+        let mut chain = self.chain.clone();
+        chain.extend([(**target).clone(), fetched.url.clone()]);
+        ImportSheet::new(Arc::new(self.parse.sheet(
+            &fetched.text,
+            &fetched.url,
+            media,
+            chain,
+        )))
+    }
+}
+
+/// The sheets a stylesheet's `@import` rules ask for, in the order it names
+/// them, resolved against `url` — the sheet's own address, or the document's
+/// base for a `<style>`.
+///
+/// The first of two passes (CSS Cascade 5 §2). The cascade answers an
+/// `@import` from sheets already fetched, and the fetching needs the addresses
+/// first; so the sheet is parsed once here for nothing but those, and again when
+/// the page is styled. A rule whose `supports()` is false asks for nothing — the
+/// cascade would refuse it — and one for another medium is still fetched,
+/// because a resize can make it apply.
+pub fn imports_in(text: &str, url: &Url) -> Vec<Url> {
+    /// A loader that fetches nothing and notes what it was asked for.
+    #[derive(Default)]
+    struct Recorder(RefCell<Vec<Url>>);
+
+    impl StylesheetLoader for Recorder {
+        fn request_stylesheet(
+            &self,
+            url: CssUrl,
+            location: cssparser::SourceLocation,
+            lock: &SharedRwLock,
+            _media: Arc<Locked<MediaList>>,
+            supports: Option<ImportSupportsCondition>,
+            layer: ImportLayer,
+        ) -> Arc<Locked<ImportRule>> {
+            let wanted = supports.as_ref().is_none_or(|condition| condition.enabled);
+            if wanted && let Some(target) = url.url() {
+                self.0.borrow_mut().push((**target).clone());
+            }
+            Arc::new(lock.wrap(ImportRule {
+                url,
+                stylesheet: ImportSheet::new_pending(),
+                supports,
+                layer,
+                source_location: location,
+            }))
+        }
+    }
+
+    enable_features();
+    let lock = SharedRwLock::new();
+    let recorder = Recorder::default();
+    Stylesheet::from_str(
+        text,
+        UrlExtraData(Arc::new(url.clone())),
+        Origin::Author,
+        Arc::new(lock.wrap(MediaList::empty())),
+        lock.clone(),
+        Some(&recorder),
+        None,
+        // Nothing an `@import` says reads differently in quirks mode.
+        QuirksMode::NoQuirks,
+        AllowImportRules::Yes,
+    );
+    recorder.0.into_inner()
+}
 
 /// A stylesheet a document asks for but does not contain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -900,29 +1214,9 @@ pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
 /// `@media` is or a page gets one answer in its CSS and another in its markup.
 /// The engine's own parser and device do it; nothing here re-implements matching.
 pub fn media_condition_matches(condition: &str, viewport: Viewport) -> bool {
-    let condition = condition.trim();
-    if condition.is_empty() {
-        return true;
-    }
-
     enable_features();
-    let url = base_url();
-    let context = style::parser::ParserContext::new(
-        Origin::Author,
-        &url,
-        None,
-        style_traits::ParsingMode::DEFAULT,
-        QuirksMode::NoQuirks,
-        Default::default(),
-        None,
-        None,
-        Default::default(),
-    );
-    let mut input = cssparser::ParserInput::new(condition);
-    let list = MediaList::parse(&context, &mut cssparser::Parser::new(&mut input));
-
     let device = device_for(viewport, QuirksMode::NoQuirks);
-    list.evaluate(
+    media_list(condition, QuirksMode::NoQuirks).evaluate(
         &device,
         QuirksMode::NoQuirks,
         // A `@custom-media` name is defined in a stylesheet, and this condition
@@ -931,18 +1225,34 @@ pub fn media_condition_matches(condition: &str, viewport: Viewport) -> bool {
     )
 }
 
-/// Parse one stylesheet.
-fn parse_sheet(
-    source: &str,
-    origin: Origin,
-    lock: &SharedRwLock,
-    url: &UrlExtraData,
-    quirks_mode: QuirksMode,
-) -> Stylesheet {
+/// A media query list written outside a sheet: an element's `media`, or a
+/// condition in an attribute. Empty, or nothing but whitespace, is every medium.
+fn media_list(text: &str, quirks_mode: QuirksMode) -> MediaList {
+    // A media query has no address in it, and the parser wants a base anyway.
+    let url = UrlExtraData(Arc::new(about_blank()));
+    let context = style::parser::ParserContext::new(
+        Origin::Author,
+        &url,
+        None,
+        style_traits::ParsingMode::DEFAULT,
+        quirks_mode,
+        Default::default(),
+        None,
+        None,
+        Default::default(),
+    );
+    let mut input = cssparser::ParserInput::new(text);
+    MediaList::parse(&context, &mut cssparser::Parser::new(&mut input))
+}
+
+/// Parse one of the browser's own stylesheets.
+///
+/// At no address, because there is nothing in one to resolve.
+fn user_agent_sheet(source: &str, lock: &SharedRwLock, quirks_mode: QuirksMode) -> Stylesheet {
     Stylesheet::from_str(
         source,
-        url.clone(),
-        origin,
+        UrlExtraData(Arc::new(about_blank())),
+        Origin::UserAgent,
         Arc::new(lock.wrap(MediaList::empty())),
         lock.clone(),
         None,
@@ -1014,8 +1324,9 @@ fn origin_name(origin: Origin) -> &'static str {
 ///
 /// Keyed by the address of the declaration block, because that is the only thing
 /// the cascade hands back later. Nested rules are walked too, so a declaration
-/// inside a media query or a nesting block is named by the selector it was
-/// actually written under rather than dropped for having no top-level one.
+/// inside a media query, a nesting block or an imported sheet is named by the
+/// selector it was actually written under rather than dropped for having no
+/// top-level one.
 fn index_selectors(
     sheet: &Stylesheet,
     origin: Origin,
@@ -1047,24 +1358,20 @@ fn index_selectors(
                 }
                 CssRule::Media(rule) => stack.push(rule.rules.clone()),
                 CssRule::Supports(rule) => stack.push(rule.rules.clone()),
+                CssRule::Import(rule) => stack.extend(imported_rules(rule, &guard)),
                 _ => {}
             }
         }
     }
 }
 
-/// Collect the `@font-face` rules in one sheet.
+/// Collect the `@font-face` rules in one sheet, and in the sheets it imports.
 ///
 /// Nested in the same way style rules are: a rule inside a media query counts, and
 /// counts whether or not the query matches — which sheet it came in gates that,
 /// and a rule that turns out not to apply costs a fetch nobody uses rather than a
 /// page set in the wrong font.
-fn collect_font_faces(
-    sheet: &Stylesheet,
-    lock: &SharedRwLock,
-    node: Option<NodeId>,
-    out: &mut Vec<FontFace>,
-) {
+fn collect_font_faces(sheet: &Stylesheet, lock: &SharedRwLock, out: &mut Vec<FontFace>) {
     use style::stylesheets::CssRule;
 
     let guard = lock.read();
@@ -1081,14 +1388,15 @@ fn collect_font_faces(
                     else {
                         continue;
                     };
-                    let sources: Vec<String> = sources
+                    let sources: Vec<Url> = sources
                         .0
                         .iter()
                         .filter_map(|source| match source {
-                            style::font_face::Source::Url(url) => {
-                                readable(url).then(|| specified_url(&url.url))?
+                            style::font_face::Source::Url(source) if readable(source) => {
+                                source.url.url().map(|url| (**url).clone())
                             }
-                            style::font_face::Source::Local(_) => None,
+                            style::font_face::Source::Url(_)
+                            | style::font_face::Source::Local(_) => None,
                         })
                         .collect();
                     if sources.is_empty() {
@@ -1097,11 +1405,11 @@ fn collect_font_faces(
                     out.push(FontFace {
                         family: family.name.to_string(),
                         sources,
-                        sheet: node,
                     });
                 }
                 CssRule::Media(rule) => stack.push(rule.rules.clone()),
                 CssRule::Supports(rule) => stack.push(rule.rules.clone()),
+                CssRule::Import(rule) => stack.extend(imported_rules(rule, &guard)),
                 _ => {}
             }
         }
@@ -1133,58 +1441,21 @@ fn readable(source: &style::font_face::UrlSource) -> bool {
 
     // No hint: the address is what is left to go on, and the two formats worth
     // refusing are the two nothing here can read.
-    let address = specified_url(&source.url).unwrap_or_default();
-    let path = address
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(&address)
-        .to_ascii_lowercase();
+    let path = source
+        .url
+        .url()
+        .map(|url| url.path().to_ascii_lowercase())
+        .unwrap_or_default();
     !(path.ends_with(".eot") || path.ends_with(".svg"))
 }
 
-/// The address a `url()` names, as written.
-///
-/// A sheet is parsed against a base that resolves nothing, so an absolute address
-/// comes back resolved and a relative one comes back only as the text it was
-/// written as — which is what the caller wants anyway, since it is the caller that
-/// knows what to resolve it against.
-fn specified_url(url: &style::values::specified::url::SpecifiedUrl) -> Option<String> {
-    use style_traits::values::ToCss as _;
-
-    if let Some(resolved) = url.url() {
-        return Some(resolved.as_str().to_owned());
-    }
-
-    // `url("…")`, with the address serialized as a CSS string. Reading it back is
-    // stripping the function and unescaping the string, and there is no shorter
-    // route to the text: the engine keeps it private.
-    let text = url.to_css_string();
-    let inner = text.strip_prefix("url(")?.strip_suffix(')')?;
-    let quote = inner.chars().next()?;
-    let inner = inner
-        .strip_prefix(quote)
-        .and_then(|rest| rest.strip_suffix(quote))?;
-
-    let mut out = String::with_capacity(inner.len());
-    let mut characters = inner.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\\' => out.extend(characters.next()),
-            _ => out.push(character),
-        }
-    }
-    Some(out).filter(|address| !address.is_empty())
-}
-
-/// The base every sheet is parsed against.
-///
-/// Relative `url()` in a stylesheet resolves against the document it came from,
-/// and we do not thread that through yet — so this is a base that cannot resolve
-/// to anything rather than one that resolves to the wrong thing.
-pub(crate) fn base_url() -> UrlExtraData {
-    UrlExtraData(Arc::new(
-        url::Url::parse("about:blank").expect("about:blank parses"),
-    ))
+/// The rules of the sheet an `@import` brought in, if it brought one in.
+fn imported_rules(
+    rule: &Locked<ImportRule>,
+    guard: &style::shared_lock::SharedRwLockReadGuard,
+) -> Option<Arc<Locked<style::stylesheets::CssRules>>> {
+    let sheet = rule.read_with(guard).stylesheet.as_sheet()?;
+    Some(sheet.contents.read_with(guard).rules.clone())
 }
 
 /// No paint worklets, which is a web feature nothing here implements.
@@ -1250,8 +1521,18 @@ mod tests {
     /// Style a document and hand back the computed values of the first element
     /// matching `selector`.
     fn computed(html: &str, selector: &str) -> Arc<ComputedValues> {
+        styled(html, |_| StyleSources::default(), selector)
+    }
+
+    /// Style `html` with the sources `sources` makes for its parsed document,
+    /// and read the first element matching `selector` back.
+    fn styled(
+        html: &str,
+        sources: impl FnOnce(&Document) -> StyleSources,
+        selector: &str,
+    ) -> Arc<ComputedValues> {
         let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
-        let styled = style_document(&document, Viewport::default());
+        let styled = style_document_with(&document, Viewport::default(), &sources(&document));
         let node = crate::stylo_dom::select(&document, selector)
             .expect("the selector should parse")
             .into_iter()
@@ -1271,25 +1552,51 @@ mod tests {
         )
     }
 
+    /// What a document at `base` is styled with when nothing was fetched for it.
+    fn at(base: &str) -> StyleSources {
+        StyleSources {
+            base: Url::parse(base).expect("a test's base parses"),
+            ..StyleSources::default()
+        }
+    }
+
+    /// A fetched sheet: its address and its text.
+    fn fetched(url: &str, text: &str) -> FetchedSheet {
+        FetchedSheet {
+            url: Url::parse(url).expect("a test's address parses"),
+            text: text.to_owned(),
+        }
+    }
+
+    /// Where a `@font-face` rule says its font can be fetched from, as text.
+    fn addresses(face: &FontFace) -> Vec<&str> {
+        face.sources.iter().map(Url::as_str).collect()
+    }
+
+    /// One fetched sheet per `<link>`, in the order the links appear, each at the
+    /// address it is paired with, in a document at `https://x.test/`.
+    fn linked(document: &Document, sheets: &[(impl AsRef<str>, &str)]) -> StyleSources {
+        let links = stylesheet_links(document);
+        assert_eq!(links.len(), sheets.len(), "one sheet per link");
+        StyleSources {
+            links: links
+                .iter()
+                .zip(sheets)
+                .map(|(link, (url, text))| (link.node, fetched(url.as_ref(), text)))
+                .collect(),
+            ..at("https://x.test/")
+        }
+    }
+
     /// Style a document with one fetched sheet per `<link>`, in the order the
     /// links appear, and read one element's computed style back.
-    fn computed_with_links(html: &str, sources: &[&str], selector: &str) -> Arc<ComputedValues> {
-        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
-        let links = stylesheet_links(&document);
-        assert_eq!(links.len(), sources.len(), "one source per link");
-        let external: ExternalSheets = links
+    fn computed_with_links(html: &str, sheets: &[&str], selector: &str) -> Arc<ComputedValues> {
+        let numbered: Vec<(String, &str)> = sheets
             .iter()
-            .zip(sources)
-            .map(|(link, source)| (link.node, (*source).to_owned()))
+            .enumerate()
+            .map(|(at, text)| (format!("https://x.test/sheet{at}.css"), *text))
             .collect();
-
-        let styled = style_document_with(&document, Viewport::default(), &external);
-        let node = crate::stylo_dom::select(&document, selector)
-            .expect("the selector should parse")
-            .into_iter()
-            .next()
-            .expect("something should match");
-        styled.style_of(node).expect("a styled element").clone()
+        styled(html, |document| linked(document, &numbered), selector)
     }
 
     /// The rules that decide whether an element renders like itself, checked
@@ -1312,13 +1619,31 @@ mod tests {
         };
 
         // Not shown at all: the attribute that says so, a field that is not one,
-        // a list of suggestions, and the parenthesis a browser with ruby hides.
+        // a list of suggestions, the parenthesis a browser with ruby hides, what a
+        // browser without frames or plug-ins would show, and a popover nothing
+        // has opened.
         for (markup, selector) in [
             ("<p hidden>x", "p"),
             ("<input type=hidden>", "input"),
+            ("<input type=HIDDEN style=display:block>", "input"),
             ("<datalist><option>x</option></datalist>", "datalist"),
             ("<ruby>x<rp>(</rp></ruby>", "rp"),
             ("<dialog>x</dialog>", "dialog"),
+            ("<noframes>x</noframes>", "noframes"),
+            ("<noembed>x</noembed>", "noembed"),
+            ("<object><param name=a value=b></object>", "param"),
+            ("<map><area href=/x></map>", "area"),
+            ("<div popover>x</div>", "div"),
+            ("<div popover=manual>x</div>", "div"),
+            // An `audio` with no controls, whatever the page says.
+            ("<audio></audio>", "audio"),
+            ("<audio style=display:block></audio>", "audio"),
+            // And what SVG never draws where it is written.
+            ("<svg><title>Logo</title></svg>", "title"),
+            (
+                "<svg><linearGradient></linearGradient></svg>",
+                "linearGradient",
+            ),
         ] {
             assert_eq!(
                 display(markup, selector),
@@ -1327,8 +1652,26 @@ mod tests {
             );
         }
 
-        // Shown, against what a browser does: the content of `noscript` is what a
-        // page shows when scripts do not run, and here they do not.
+        // The rules are HTML's alone: an SVG element is drawn whatever its
+        // `hidden` says, as it is in both references.
+        assert_eq!(
+            display("<svg hidden width=10 height=10></svg>", "svg"),
+            Some(Display::Inline)
+        );
+
+        // An `audio` with controls is shown, and a hidden `embed` keeps a box,
+        // of no size, because it still loads what it names (§15.3.1).
+        assert_eq!(
+            display("<audio controls></audio>", "audio"),
+            Some(Display::Inline)
+        );
+        assert_eq!(
+            display("<embed hidden src=a.swf>", "embed"),
+            Some(Display::Inline)
+        );
+
+        // The element is an inline like any unknown one; what is in it is left out
+        // by the box builder, because scripts run.
         assert_eq!(
             display("<noscript>x</noscript>", "noscript"),
             Some(Display::Inline)
@@ -1373,6 +1716,178 @@ mod tests {
         };
         assert!(styled_link("<a href=/x>x</a>"), "a link is underlined");
         assert!(!styled_link("<a name=x>x</a>"), "an anchor is not");
+
+        // `pre` from before there was a `pre`, and the line that does not break.
+        let style = |markup: &str, selector: &str| {
+            let document = otlyra_html::parse(markup.as_bytes(), Some("utf-8")).document;
+            let styled = style_document(&document, Viewport::default());
+            let node = crate::stylo_dom::select(&document, selector).expect("parses")[0];
+            crate::computed::to_layout_style(styled.style_of(node).expect("styled"))
+        };
+        for (markup, selector) in [
+            ("<xmp><b>x</b></xmp>", "xmp"),
+            ("<listing>x</listing>", "listing"),
+            ("<plaintext>x", "plaintext"),
+        ] {
+            let block = style(markup, selector);
+            assert_eq!(block.display, Display::Block, "{selector}");
+            assert_eq!(block.white_space, crate::WhiteSpace::Preserve, "{selector}");
+            // An em of the thirteen pixels monospace is set in.
+            assert_eq!(
+                block.margin.top,
+                crate::LengthOrAuto::Length(crate::Length::Px(13.0)),
+                "{selector}"
+            );
+        }
+        assert_eq!(
+            style("<p><nobr>x y</nobr>", "nobr").text_wrap,
+            crate::TextWrap::NoWrap
+        );
+        assert!(
+            style("<p><abbr title=HyperText>HT</abbr>", "abbr")
+                .text_decoration
+                .underline,
+            "an abbreviation with its expansion is underlined"
+        );
+        assert!(
+            !style("<p><abbr>HT</abbr>", "abbr")
+                .text_decoration
+                .underline,
+            "and one without is not"
+        );
+        assert_eq!(style("<p>x<br clear=all>y", "br").clear, crate::Clear::Both);
+        // A frame inside MathML is MathML's, and HTML's inset edge is not drawn
+        // round it.
+        assert_eq!(
+            style("<math><iframe></iframe></math>", "iframe")
+                .border
+                .top
+                .width,
+            0.0
+        );
+        assert_eq!(style("<iframe></iframe>", "iframe").border.top.width, 2.0);
+    }
+
+    /// An open `dialog` is shown whatever its `popover` attribute says: the rule
+    /// that hides a popover nothing has opened is not among the ones that reach
+    /// it.
+    #[test]
+    fn the_popover_rule_leaves_an_open_dialog_alone() {
+        let hides_it = |markup: &str, selector: &str| {
+            let document = otlyra_html::parse(markup.as_bytes(), Some("utf-8")).document;
+            let mut styler = Styler::new(&document, Viewport::default(), &StyleSources::default());
+            let styled = styler.style(&document);
+            let node = crate::stylo_dom::select(&document, selector).expect("parses")[0];
+            styler
+                .rules_for(styled.style_of(node).expect("styled"))
+                .iter()
+                .any(|rule| rule.selector.starts_with("[popover]"))
+        };
+        assert!(hides_it("<div popover>x</div>", "div"));
+        assert!(hides_it("<dialog popover>x</dialog>", "dialog"));
+        assert!(!hides_it("<dialog open popover>x</dialog>", "dialog"));
+    }
+
+    /// The layout style of a document's first `td`.
+    fn cell(html: &str) -> crate::ComputedStyle {
+        crate::computed::to_layout_style(&computed(html, "td"))
+    }
+
+    /// A table in quirks mode takes nothing of the text around it: not the size
+    /// of the font and not where the lines go. In standards mode, and in limited
+    /// quirks mode, it inherits both like anything else.
+    #[test]
+    fn a_quirks_mode_table_resets_the_text_it_inherits() {
+        let table = "<center style='font: 13px Verdana'><table><tr><td>x</table></center>";
+
+        let quirks = cell(table);
+        assert_eq!(quirks.font_size, 16.0);
+        assert_eq!(quirks.text_align, crate::TextAlign::Start);
+
+        for doctype in [
+            "<!doctype html>",
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \
+             \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">",
+        ] {
+            let standards = cell(&format!("{doctype}{table}"));
+            assert_eq!(standards.font_size, 13.0, "{doctype}");
+            assert_eq!(standards.text_align, crate::TextAlign::Center, "{doctype}");
+        }
+    }
+
+    /// The rest of HTML's quirks rules: a form's bottom margin, and a field
+    /// measured across its border.
+    #[test]
+    fn the_quirks_rules_apply_in_quirks_mode_alone() {
+        let layout = |html: &str, selector: &str| {
+            crate::computed::to_layout_style(&computed(html, selector))
+        };
+        let form = |doctype: &str| {
+            layout(&format!("{doctype}<form>x</form>"), "form")
+                .margin
+                .bottom
+        };
+        assert_eq!(
+            form(""),
+            crate::LengthOrAuto::Length(crate::Length::Px(16.0))
+        );
+        assert_eq!(
+            form("<!doctype html>"),
+            crate::LengthOrAuto::Length(crate::Length::Px(0.0))
+        );
+        assert_eq!(
+            layout("<input>", "input").box_sizing,
+            crate::BoxSizing::Border
+        );
+        assert_eq!(
+            layout("<!doctype html><input>", "input").box_sizing,
+            crate::BoxSizing::Content
+        );
+    }
+
+    /// `:lang()` reaches the page's own rules: the language is the nearest one
+    /// declared, a range takes in the tags below it, and a page that says its
+    /// language in a `<meta>` alone has it too.
+    #[test]
+    fn lang_selectors_match_the_language_declared_above() {
+        let green = |rule: &str, html: &str| {
+            let page =
+                format!("<style>.l1 {{ color: red }} {rule} {{ color: #008000 }}</style>{html}");
+            colour(&computed(&page, ".l1")) == (0, 128, 0)
+        };
+        assert!(green(":lang(en) .l1", "<html lang=en-FI><p class=l1>x"));
+        assert!(!green(":lang(en) .l1", "<html lang=de><p class=l1>x"));
+        assert!(!green(
+            ".l1:lang(en)",
+            "<html lang=en-FI><div lang=''><p class=l1>x"
+        ));
+        assert!(green(
+            ".l1:lang(en)",
+            "<meta http-equiv=Content-Language content=en-GB><p class=l1>x"
+        ));
+    }
+
+    /// A mouse points precisely and hovers, so the queries that ask whether the
+    /// pointer can are answered yes.
+    #[test]
+    fn the_pointer_is_a_mouse() {
+        let viewport = Viewport::default();
+        for yes in [
+            "(hover: hover)",
+            "(any-hover: hover)",
+            "(pointer: fine)",
+            "(any-pointer: fine)",
+        ] {
+            assert!(media_condition_matches(yes, viewport), "{yes}");
+        }
+        for no in [
+            "(hover: none)",
+            "(any-hover: none)",
+            "(pointer: coarse)",
+            "(pointer: none)",
+        ] {
+            assert!(!media_condition_matches(no, viewport), "{no}");
+        }
     }
 
     /// A `@font-face` rule names a family and the addresses it may be fetched
@@ -1392,7 +1907,7 @@ mod tests {
         )
         .document;
 
-        let styler = Styler::new(&document, Viewport::default(), &ExternalSheets::new());
+        let styler = Styler::new(&document, Viewport::default(), &at("https://x.test/p/"));
         let faces = styler.font_faces();
 
         assert_eq!(
@@ -1405,43 +1920,37 @@ mod tests {
             .find(|face| face.family == "Brought")
             .expect("the first rule");
         assert_eq!(
-            brought.sources,
-            ["a.woff2", "a.ttf"],
-            "in the order written"
+            addresses(brought),
+            ["https://x.test/p/a.woff2", "https://x.test/p/a.ttf"],
+            "in the order written, against the document's base"
         );
-        assert_eq!(brought.sheet, None, "written in the document itself");
 
         let queried = faces
             .iter()
             .find(|face| face.family == "Queried")
             .expect("the rule inside the query");
-        assert_eq!(queried.sources, ["q.otf"]);
+        assert_eq!(addresses(queried), ["https://x.test/p/q.otf"]);
     }
 
-    /// A rule in a fetched sheet is carried with the link it came through, which
-    /// is what lets its addresses be resolved against that sheet rather than
-    /// against the page.
+    /// A rule in a fetched sheet names its fonts against that sheet's own
+    /// address, not the page's.
     #[test]
-    fn a_font_face_remembers_which_sheet_it_was_in() {
+    fn a_font_face_resolves_against_its_own_sheet() {
         let document =
             otlyra_html::parse(b"<link rel=stylesheet href=of/its/own.css>", Some("utf-8"))
                 .document;
-        let links = stylesheet_links(&document);
-        let external: ExternalSheets = links
-            .iter()
-            .map(|link| {
-                (
-                    link.node,
-                    "@font-face { font-family: Far; src: url(../fonts/far.woff2) }".to_owned(),
-                )
-            })
-            .collect();
+        let sources = linked(
+            &document,
+            &[(
+                "https://x.test/of/its/own.css",
+                "@font-face { font-family: Far; src: url(../fonts/far.woff2) }",
+            )],
+        );
 
-        let styler = Styler::new(&document, Viewport::default(), &external);
+        let styler = Styler::new(&document, Viewport::default(), &sources);
         let face = styler.font_faces().first().expect("the rule");
         assert_eq!(face.family, "Far");
-        assert_eq!(face.sources, ["../fonts/far.woff2"]);
-        assert_eq!(face.sheet, Some(links[0].node));
+        assert_eq!(addresses(face), ["https://x.test/of/fonts/far.woff2"]);
     }
 
     /// A resize that no rule reads changes nothing, and the caller is told so:
@@ -1451,7 +1960,7 @@ mod tests {
     fn a_resize_only_restyles_when_a_rule_reads_the_viewport() {
         let plain =
             otlyra_html::parse(b"<style>p { color: red }</style><p>x", Some("utf-8")).document;
-        let mut styler = Styler::new(&plain, Viewport::default(), &ExternalSheets::new());
+        let mut styler = Styler::new(&plain, Viewport::default(), &StyleSources::default());
         styler.style(&plain);
         assert!(
             !styler.resize(Viewport {
@@ -1467,7 +1976,7 @@ mod tests {
             Some("utf-8"),
         )
         .document;
-        let mut styler = Styler::new(&queried, Viewport::default(), &ExternalSheets::new());
+        let mut styler = Styler::new(&queried, Viewport::default(), &StyleSources::default());
         styler.style(&queried);
         assert!(
             styler.resize(Viewport {
@@ -1515,7 +2024,7 @@ mod tests {
     fn a_new_scheme_restyles_only_a_page_that_asked() {
         let plain =
             otlyra_html::parse(b"<style>p { color: red }</style><p>x", Some("utf-8")).document;
-        let mut styler = Styler::new(&plain, Viewport::default(), &ExternalSheets::new());
+        let mut styler = Styler::new(&plain, Viewport::default(), &StyleSources::default());
         styler.style(&plain);
         assert!(
             !styler.resize(Viewport {
@@ -1530,7 +2039,7 @@ mod tests {
             Some("utf-8"),
         )
         .document;
-        let mut styler = Styler::new(&queried, Viewport::default(), &ExternalSheets::new());
+        let mut styler = Styler::new(&queried, Viewport::default(), &StyleSources::default());
         styler.style(&queried);
         assert!(
             styler.resize(Viewport {
@@ -1547,7 +2056,7 @@ mod tests {
     fn a_viewport_unit_makes_every_resize_a_restyle() {
         let document =
             otlyra_html::parse(b"<style>p { width: 50vw }</style><p>x", Some("utf-8")).document;
-        let mut styler = Styler::new(&document, Viewport::default(), &ExternalSheets::new());
+        let mut styler = Styler::new(&document, Viewport::default(), &StyleSources::default());
         styler.style(&document);
 
         assert!(styler.resize(Viewport {
@@ -1639,7 +2148,7 @@ mod tests {
             Some("utf-8"),
         )
         .document;
-        let styled = style_document_with(&document, Viewport::default(), &ExternalSheets::new());
+        let styled = style_document_with(&document, Viewport::default(), &StyleSources::default());
         let node = crate::stylo_dom::select(&document, "p")
             .expect("the selector should parse")
             .into_iter()
@@ -1874,6 +2383,292 @@ mod tests {
             16.0,
             "the rule does not apply below its breakpoint"
         );
+    }
+    /// The first background picture's address in a computed style.
+    fn background(style: &ComputedValues) -> Option<String> {
+        crate::computed::to_layout_style(style)
+            .backgrounds
+            .first()
+            .and_then(|layer| layer.image.as_deref().map(str::to_owned))
+    }
+
+    /// A linked sheet's relative addresses resolve against the sheet (CSS Values
+    /// 4 §4.5.1), wherever the page that links it is.
+    #[test]
+    fn a_sheet_resolves_its_urls_against_its_own_address() {
+        let style = styled(
+            "<link rel=stylesheet href=css/a.css><div>x</div>",
+            |document| {
+                linked(
+                    document,
+                    &[(
+                        "https://x.test/css/a.css",
+                        "div { background: url(../i/b.png) }",
+                    )],
+                )
+            },
+            "div",
+        );
+        assert_eq!(
+            background(&style).as_deref(),
+            Some("https://x.test/i/b.png")
+        );
+    }
+
+    /// A `<style>` and a `style` attribute have no address of their own, and
+    /// resolve theirs against the document's base.
+    #[test]
+    fn inline_style_resolves_against_the_documents_base() {
+        let html = "<style>p { background-image: url(sheet.png) }</style><p>x</p>\
+                    <div style=\"background-image: url(attribute.png)\">y</div>";
+        let cdn = |_: &Document| at("https://cdn.test/assets/");
+        assert_eq!(
+            background(&styled(html, cdn, "p")).as_deref(),
+            Some("https://cdn.test/assets/sheet.png")
+        );
+        assert_eq!(
+            background(&styled(html, cdn, "div")).as_deref(),
+            Some("https://cdn.test/assets/attribute.png")
+        );
+    }
+
+    /// A link's `media` holds for the whole sheet however the sheet is written.
+    /// Wrapping the text in an `@media` block let a stray `}` close the block
+    /// early and the rules after it apply everywhere.
+    #[test]
+    fn a_stray_brace_cannot_escape_a_links_media() {
+        let print = computed_with_links(
+            "<link rel=stylesheet href=a.css media=print><body><p>x",
+            &["a { color: blue } } p { color: rgb(0, 128, 0) }"],
+            "p",
+        );
+        assert_ne!(colour(&print), (0, 128, 0));
+    }
+
+    /// The sources for a page whose one link is `https://x.test/css/main.css`,
+    /// with the sheets its imports fetched, each at the address it was asked
+    /// for.
+    fn with_imports(document: &Document, main: &str, imports: &[(&str, &str)]) -> StyleSources {
+        StyleSources {
+            imports: imports
+                .iter()
+                .map(|(url, text)| (Url::parse(url).expect("parses"), fetched(url, text)))
+                .collect(),
+            ..linked(document, &[("https://x.test/css/main.css", main)])
+        }
+    }
+
+    const IMPORTING: &str = "<link rel=stylesheet href=css/main.css><body><p>x</p><div>y</div>";
+
+    /// An imported sheet cascades where the `@import` stands: before the rest of
+    /// the sheet that imports it, which therefore wins a tie.
+    #[test]
+    fn an_imported_sheet_cascades_where_it_is_imported() {
+        let sources = |document: &Document| {
+            with_imports(
+                document,
+                "@import url(base.css); div { color: rgb(0, 0, 255) }",
+                &[(
+                    "https://x.test/css/base.css",
+                    "p { color: rgb(0, 128, 0) } div { color: rgb(255, 0, 0) }",
+                )],
+            )
+        };
+        assert_eq!(colour(&styled(IMPORTING, sources, "p")), (0, 128, 0));
+        assert_eq!(colour(&styled(IMPORTING, sources, "div")), (0, 0, 255));
+    }
+
+    /// An import's media list is the imported sheet's, and the engine applies it.
+    #[test]
+    fn an_import_for_print_does_not_style_the_screen() {
+        let importing = |condition: &'static str| {
+            move |document: &Document| {
+                with_imports(
+                    document,
+                    condition,
+                    &[("https://x.test/css/p.css", "p { color: rgb(0, 128, 0) }")],
+                )
+            }
+        };
+        let print = styled(IMPORTING, importing("@import url(p.css) print;"), "p");
+        assert_ne!(colour(&print), (0, 128, 0));
+        let screen = styled(IMPORTING, importing("@import url(p.css) screen;"), "p");
+        assert_eq!(colour(&screen), (0, 128, 0));
+    }
+
+    /// An import inside an imported sheet is resolved against that sheet, and so
+    /// is every address in it — its fonts included.
+    #[test]
+    fn a_nested_import_resolves_against_the_sheet_it_is_in() {
+        let html = IMPORTING;
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let sources = with_imports(
+            &document,
+            "@import 'sub/a.css';",
+            &[
+                ("https://x.test/css/sub/a.css", "@import '../../b.css';"),
+                (
+                    "https://x.test/b.css",
+                    "@font-face { font-family: Deep; src: url(f/deep.woff2) } \
+                     p { background-image: url(i.png) }",
+                ),
+            ],
+        );
+        let mut styler = Styler::new(&document, Viewport::default(), &sources);
+        let styled = styler.style(&document);
+        let p = crate::stylo_dom::select(&document, "p").expect("a selector")[0];
+        assert_eq!(
+            background(styled.style_of(p).expect("a styled paragraph")).as_deref(),
+            Some("https://x.test/i.png")
+        );
+        let faces = styler.font_faces();
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        assert_eq!(addresses(&faces[0]), ["https://x.test/f/deep.woff2"]);
+    }
+
+    /// Two sheets that import each other are each parsed once, and the page is
+    /// styled; a sheet that imports itself imports nothing.
+    #[test]
+    fn an_import_cycle_ends() {
+        let sources = |document: &Document| {
+            with_imports(
+                document,
+                "@import 'main.css'; @import 'a.css';",
+                &[
+                    ("https://x.test/css/main.css", "p { color: rgb(255, 0, 0) }"),
+                    (
+                        "https://x.test/css/a.css",
+                        "@import 'b.css'; p { color: rgb(0, 128, 0) }",
+                    ),
+                    (
+                        "https://x.test/css/b.css",
+                        "@import 'a.css'; div { color: rgb(0, 0, 255) }",
+                    ),
+                ],
+            )
+        };
+        assert_eq!(colour(&styled(IMPORTING, sources, "p")), (0, 128, 0));
+        assert_eq!(colour(&styled(IMPORTING, sources, "div")), (0, 0, 255));
+    }
+
+    /// The addresses a sheet imports are resolved against it, in order; one whose
+    /// `supports()` is false is not asked for, and an `@import` after a rule is
+    /// not an import at all (CSS Cascade 5 §2).
+    #[test]
+    fn imports_are_discovered_against_their_sheet() {
+        let sheet = Url::parse("https://x.test/css/main.css").expect("parses");
+        let found = imports_in(
+            "@charset 'utf-8'; @import 'a.css'; @import url(../b.css) print; \
+             @import 'c.css' supports(nonsense: 1); @import 'd.css' supports(display: grid); \
+             p { color: red } @import 'late.css';",
+            &sheet,
+        );
+        let found: Vec<&str> = found.iter().map(Url::as_str).collect();
+        assert_eq!(
+            found,
+            [
+                "https://x.test/css/a.css",
+                "https://x.test/b.css",
+                "https://x.test/css/d.css",
+            ]
+        );
+    }
+
+    /// An import whose `supports()` is false is refused where the sheet is
+    /// parsed, not only left unfetched: the engine does not ask the condition
+    /// itself, and a sheet fetched for another import of the same address must
+    /// not apply through this one.
+    #[test]
+    fn an_import_whose_supports_is_false_is_refused() {
+        let sources = |document: &Document| {
+            with_imports(
+                document,
+                "@import url(c.css) supports(not (display: block)); \
+                 @import url(c.css) layer(low) supports(display: block); \
+                 @layer high { p { color: rgb(0, 0, 255) } }",
+                &[(
+                    "https://x.test/css/c.css",
+                    "p, div { color: rgb(0, 128, 0) }",
+                )],
+            )
+        };
+        // Unlayered, the false import would beat every layer and turn `p` green.
+        assert_eq!(colour(&styled(IMPORTING, sources, "p")), (0, 0, 255));
+        assert_eq!(colour(&styled(IMPORTING, sources, "div")), (0, 128, 0));
+    }
+
+    /// A redirected sheet is known by where it ended up as well as by what was
+    /// asked for, so importing itself at its new address is the cycle it is and
+    /// the sheet is parsed once.
+    #[test]
+    fn an_import_cycle_through_a_redirect_ends() {
+        const MOVED: &str = "@import 'a.css'; \
+             @font-face { font-family: Moved; src: url(m.woff2) } \
+             p { color: rgb(0, 128, 0) }";
+        let document = otlyra_html::parse(IMPORTING.as_bytes(), Some("utf-8")).document;
+        let mut sources = with_imports(
+            &document,
+            "@import 'a.css';",
+            &[("https://x.test/moved/a.css", MOVED)],
+        );
+        sources.imports.insert(
+            Url::parse("https://x.test/css/a.css").expect("parses"),
+            fetched("https://x.test/moved/a.css", MOVED),
+        );
+
+        let mut styler = Styler::new(&document, Viewport::default(), &sources);
+        let styled = styler.style(&document);
+        let p = crate::stylo_dom::select(&document, "p").expect("a selector")[0];
+        assert_eq!(
+            colour(styled.style_of(p).expect("a styled paragraph")),
+            (0, 128, 0)
+        );
+        let faces = styler.font_faces();
+        assert_eq!(faces.len(), 1, "parsed once: {faces:?}");
+        assert_eq!(addresses(&faces[0]), ["https://x.test/moved/m.woff2"]);
+    }
+
+    /// The inspector names a rule from an imported sheet by the selector it was
+    /// written with, as it names one in the sheet that imports it.
+    #[test]
+    fn an_imported_rule_is_named_by_its_selector() {
+        let document = otlyra_html::parse(IMPORTING.as_bytes(), Some("utf-8")).document;
+        let sources = with_imports(
+            &document,
+            "@import 'base.css';",
+            &[(
+                "https://x.test/css/base.css",
+                "body > p { color: rgb(0, 128, 0) }",
+            )],
+        );
+        let mut styler = Styler::new(&document, Viewport::default(), &sources);
+        let styled = styler.style(&document);
+        let p = crate::stylo_dom::select(&document, "p").expect("a selector")[0];
+        let rules = styler.rules_for(styled.style_of(p).expect("a styled paragraph"));
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.selector == "body > p" && rule.origin == "page"),
+            "{rules:?}"
+        );
+    }
+
+    /// However often a page imports what it fetched, no more than
+    /// [`IMPORTED_SHEET_LIMIT`] imports are parsed.
+    #[test]
+    fn imports_past_the_limit_are_refused() {
+        let document = otlyra_html::parse(IMPORTING.as_bytes(), Some("utf-8")).document;
+        let main = "@import 'leaf.css';".repeat(IMPORTED_SHEET_LIMIT * 2);
+        let sources = with_imports(
+            &document,
+            &main,
+            &[(
+                "https://x.test/css/leaf.css",
+                "@font-face { font-family: Leaf; src: url(leaf.woff2) }",
+            )],
+        );
+        let styler = Styler::new(&document, Viewport::default(), &sources);
+        assert_eq!(styler.font_faces().len(), IMPORTED_SHEET_LIMIT);
     }
 }
 

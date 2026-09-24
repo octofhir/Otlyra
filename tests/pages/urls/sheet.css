@@ -1,0 +1,5 @@
+/* Linked from ../urls.html through a base of urls/nested/, so every address
+   here resolves against this sheet or not at all. */
+@import "import.css";
+
+.from-sheet { background: url(mark.svg) center / 32px 32px no-repeat; }

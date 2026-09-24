@@ -1338,6 +1338,249 @@ fn a_page_brings_its_own_font() {
     );
 }
 
+/// A loader that serves a fixed set of addresses, logs every request, and
+/// answers anything else with a 404.
+struct TableLoader {
+    requested: Requests,
+    /// Address, content type and body.
+    table: &'static [(&'static str, &'static str, &'static [u8])],
+    /// The address that is slow to answer, if any, and by how much.
+    slow: Option<(&'static str, std::time::Duration)>,
+}
+
+impl Loader for TableLoader {
+    fn load(&self, url: &str) -> Result<Loaded, String> {
+        self.requested
+            .lock()
+            .expect("no panic on the fetch thread")
+            .push(url.to_owned());
+        if let Some((slow, delay)) = self.slow
+            && slow == url
+        {
+            std::thread::sleep(delay);
+        }
+        let (_, kind, bytes) = self
+            .table
+            .iter()
+            .find(|(address, _, _)| *address == url)
+            .ok_or_else(|| format!("404 {url}"))?;
+        Ok(Loaded {
+            content_type: Some((*kind).to_owned()),
+            bytes: bytes.to_vec(),
+            charset: Some("utf-8".to_owned()),
+            final_url: url.to_owned(),
+            ..Default::default()
+        })
+    }
+}
+
+/// A browser over `table`, and the log of what it asked for.
+fn table_browser(
+    table: &'static [(&'static str, &'static str, &'static [u8])],
+    slow: Option<(&'static str, std::time::Duration)>,
+) -> (Browser, Requests) {
+    let requested = Requests::default();
+    let browser = Browser::new(TableLoader {
+        requested: std::sync::Arc::clone(&requested),
+        table,
+        slow,
+    });
+    (browser, requested)
+}
+
+/// Draw a frame and let what it asks for arrive: the rules that name a
+/// background or a font are only computed on the way to one.
+fn frame_and_settle(browser: &mut Browser) {
+    let mut painter = otlyra_gfx::RecordingPainter::new();
+    browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+    settle(browser);
+    browser.prepare_frame(
+        Viewport::new(800, 600, 1.0),
+        std::time::Duration::from_secs(5),
+    );
+}
+
+/// A background a linked sheet names is fetched from beside the sheet, not
+/// from beside the page (CSS Values 4 §4.5.1).
+#[test]
+fn a_background_is_fetched_beside_its_sheet() {
+    let (mut browser, requested) = table_browser(
+        &[
+            (
+                "https://bg.example/page/index.html",
+                "text/html",
+                b"<link rel=stylesheet href=/assets/css/site.css><div class=logo></div>",
+            ),
+            (
+                "https://bg.example/assets/css/site.css",
+                "text/css",
+                b".logo { width: 10px; height: 10px; background: url(../img/logo.png) }",
+            ),
+            (
+                "https://bg.example/assets/img/logo.png",
+                "image/png",
+                ONE_PIXEL_PNG,
+            ),
+        ],
+        None,
+    );
+    go(&mut browser, "https://bg.example/page/index.html");
+    frame_and_settle(&mut browser);
+
+    let asked = asked_for(&requested);
+    assert!(
+        asked
+            .iter()
+            .any(|url| url == "https://bg.example/assets/img/logo.png"),
+        "{asked:?}"
+    );
+    assert!(
+        !asked
+            .iter()
+            .any(|url| url.contains("/page/") && url.ends_with("logo.png")),
+        "resolved against the page: {asked:?}"
+    );
+}
+
+/// A sheet's `url()`s come out absolute, and a page from the network is still
+/// asked whether it may reach them: neither a background nor a font on disk
+/// is fetched for it.
+#[test]
+fn a_sheet_may_not_name_the_disk() {
+    let (mut browser, requested) = table_browser(
+        &[(
+            "https://disk.example/",
+            "text/html",
+            b"<style>\
+                @font-face { font-family: Disk; src: url(file:///etc/disk.woff2) }\
+                div { width: 10px; height: 10px; font-family: Disk;\
+                      background: url(file:///etc/disk.png) }\
+              </style><div>x</div>",
+        )],
+        None,
+    );
+    go(&mut browser, "https://disk.example/");
+    frame_and_settle(&mut browser);
+
+    let asked = asked_for(&requested);
+    assert_eq!(asked, ["https://disk.example/"]);
+}
+
+/// A base element moves where the markup's addresses point — a picture and a
+/// link both — and moves nothing about what the page may reach: that is still
+/// the document's own address's to decide.
+#[test]
+fn a_base_element_moves_links_and_pictures() {
+    let (mut browser, requested) = table_browser(
+        &[
+            (
+                "https://doc.example/dir/page.html",
+                "text/html",
+                b"<base href=\"https://cdn.example/root/\">\
+                  <body><p><a href=next.html>go on</a></p><img src=pic.png>",
+            ),
+            (
+                "https://cdn.example/root/pic.png",
+                "image/png",
+                ONE_PIXEL_PNG,
+            ),
+            (
+                "https://doc.example/secret.html",
+                "text/html",
+                b"<base href=\"file:///tmp/\"><body><img src=secret.png>",
+            ),
+        ],
+        None,
+    );
+    go(&mut browser, "https://doc.example/dir/page.html");
+    assert!(
+        asked_for(&requested)
+            .iter()
+            .any(|url| url == "https://cdn.example/root/pic.png"),
+        "{:?}",
+        asked_for(&requested)
+    );
+
+    let mut painter = otlyra_gfx::RecordingPainter::new();
+    browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
+    let (x, y) = link_position(&browser);
+    browser.on_event(PlatformEvent::PointerMoved { x, y });
+    browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    assert_eq!(browser.tabs[0].url, "https://cdn.example/root/next.html");
+
+    // A page from the network with a base on disk: its picture resolves to a
+    // file, and the page may not read one.
+    go(&mut browser, "https://doc.example/secret.html");
+    let asked = asked_for(&requested);
+    assert!(
+        !asked.iter().any(|url| url.starts_with("file:")),
+        "{asked:?}"
+    );
+}
+
+/// An `@import` is fetched from beside the sheet that names it, and the page
+/// is not drawn until it has arrived — it is as much the page's style as the
+/// sheet that imports it.
+#[test]
+fn an_import_is_fetched_relative_to_its_sheet_and_holds_the_first_frame() {
+    let (mut browser, requested) = table_browser(
+        &[
+            (
+                "https://imp.example/",
+                "text/html",
+                b"<title>T</title><link rel=stylesheet href=/css/main.css><body><p>text",
+            ),
+            (
+                "https://imp.example/css/main.css",
+                "text/css",
+                b"@import \"parts/colour.css\";",
+            ),
+            (
+                "https://imp.example/css/parts/colour.css",
+                "text/css",
+                b"p { color: #008000 }",
+            ),
+        ],
+        // Long enough to outlast the wait below by a wide margin, short enough
+        // that the test does not hang.
+        Some((
+            "https://imp.example/css/parts/colour.css",
+            std::time::Duration::from_millis(1500),
+        )),
+    );
+    browser.navigate("https://imp.example/");
+    // Until the import is asked for, the link that names it is still
+    // outstanding and would hold the frame by itself; from then on the import
+    // is all there is left to wait for.
+    let colour = "https://imp.example/css/parts/colour.css";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !asked_for(&requested).iter().any(|url| url == colour) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the import was never asked for"
+        );
+        for fetched in browser.fetcher.wait(std::time::Duration::from_millis(20)) {
+            browser.receive(fetched);
+        }
+    }
+    let active = browser.active;
+    assert!(
+        browser.blocked_on_style(active),
+        "the import is outstanding"
+    );
+
+    settle(&mut browser);
+    assert!(!browser.blocked_on_style(active), "the import arrived");
+    let page = browser.tabs[active].page.as_mut().expect("a page");
+    page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
+    let boxes = page.boxes();
+    let coloured = boxes
+        .descendants(boxes.root())
+        .into_iter()
+        .any(|id| boxes.node(id).style.color == otlyra_gfx::peniko::Color::from_rgb8(0, 128, 0));
+    assert!(coloured, "the imported rule reached the box tree");
+}
+
 /// A loader whose pages contain one link, so the click path has something to
 /// land on.
 struct LinkLoader;

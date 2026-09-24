@@ -1,11 +1,20 @@
 /* The user-agent stylesheet.
  *
- * The only one: every box on every page is styled through the cascade, with
- * these rules in the user-agent origin beneath the page's own, so a page can see
- * and override every default it gets. One rule per selector, values in CSS
- * units, and the cascade deciding what wins. The source for the values is the
- * HTML standard's rendering chapter (HTML §15).
+ * The only one, but for the rules `quirks.css` adds in quirks mode: every box
+ * on every page is styled through the cascade, with these rules in the
+ * user-agent origin beneath the page's own, so a page can see and override
+ * every default it gets. One rule per selector, values in CSS units, and the
+ * cascade deciding what wins. The source for the values is the HTML standard's
+ * rendering chapter (HTML §15).
  */
+
+/* Every rule here is about HTML's elements and nothing else's, as HTML §15.1
+   writes the sheet: an SVG or a MathML element that shares a name with an HTML
+   one — an `iframe` inside `<math>` — is not styled by it, and neither is one
+   matched by an attribute alone, so an `<svg hidden>` is still drawn. */
+@namespace url(http://www.w3.org/1999/xhtml);
+/* The one exception, spelled with its prefix: SVG's own rule, below. */
+@namespace svg url(http://www.w3.org/2000/svg);
 
 html, body, div, center, section, article, aside, header, footer, main, nav,
 figcaption, form, dl, dt, dd,
@@ -15,21 +24,54 @@ blockquote, ul, ol, menu, fieldset, optgroup, option, legend { display: block; }
    is laid out as a block within its own edges. */
 input, button, select, textarea, progress, meter, marquee { display: inline-block; }
 
-head, title, meta, link, style, script, base, template { display: none; }
-/* `datalist` is a list of suggestions for a field rather than something to show,
-   and `audio` without controls shows nothing either. `rp` is the parenthesis a
-   browser *without* ruby support would show, so a browser that has ruby hides it —
-   and one that lays ruby out as ordinary text, as this does, hides it too rather
-   than printing brackets around every reading. */
-datalist, audio, rp { display: none; }
-/* The content of `noscript` is what a page shows when scripts do not run, and
-   here they do not. */
+/* Hidden elements (HTML §15.3.1). `datalist` is a list of suggestions for a
+   field rather than something to show. `rp` is the parenthesis a browser
+   *without* ruby support would show, so a browser that has ruby hides it — and
+   one that lays ruby out as ordinary text, as this does, hides it too rather than
+   printing brackets around every reading. `noembed` and `noframes` hold what a
+   browser without plug-ins or frames would show, parsed as raw text. */
+area, base, basefont, datalist, head, link, meta, noembed,
+noframes, param, rp, script, style, template, title {
+  display: none;
+}
+/* An `audio` that exposes no controls is never shown, whatever a page's rules
+   say (§15.4.1). One that does is a replaced box as big as the controls; they
+   are not drawn here, so the size is the references' rather than theirs. */
+audio:not([controls]) { display: none !important; }
+audio { width: 300px; height: 54px; }
+/* The content of `noscript` is what a page shows when scripts do not run. Here
+   they do, and the box builder leaves its children out whatever this says; the
+   element itself is the inline any unknown element would be. */
 noscript { display: inline; }
 /* The attribute that says "not yet, or not any more". It is a rule rather than a
    special case in the box tree, so a page that overrides it in its own stylesheet
-   still wins — which is what the attribute is defined to allow. */
+   still wins — which is what the attribute is defined to allow. `until-found` is
+   hidden too: what §15.3.1 gives it instead is `content-visibility: hidden`,
+   which the style engine has only in another browser's build of it. */
 [hidden] { display: none; }
-input[type="hidden"] { display: none; }
+/* A hidden `embed` still loads what it names, so it keeps a box, of no size
+   (§15.3.1). */
+embed[hidden] { display: inline; height: 0; width: 0; }
+input[type=hidden i] { display: none !important; }
+/* What SVG never draws where it is written (SVG 2 §6.8): a gradient, a pattern
+   or a clip path is drawn where something refers to it, a title and a
+   description are for tools and readers, and a script or a style is source. An
+   inline SVG is laid out here as boxes like any other element rather than drawn
+   by an SVG renderer, so without this a logo's `<title>` would be set as text
+   beside it. */
+svg|defs, svg|clipPath, svg|mask, svg|marker,
+svg|desc, svg|title, svg|metadata,
+svg|pattern, svg|linearGradient, svg|radialGradient,
+svg|script, svg|style,
+svg|symbol {
+  display: none !important;
+}
+/* A popover is not shown until it is opened (HTML §15.3.3), and nothing opens
+   one yet: that is script's, or a `popovertarget` button's. An open `dialog` is
+   shown whatever its `popover` says. */
+[popover]:not(:popover-open):not(dialog[open]) {
+  display: none;
+}
 /* A closed disclosure shows its summary and nothing else. What opens one is a
    click, which needs script or a control of our own; until then a page that ships
    one closed reads as it would anywhere else. */
@@ -50,14 +92,10 @@ tfoot { display: table-footer-group; }
 tr { display: table-row; }
 td, th { display: table-cell; padding: 1px; }
 caption { display: table-caption; }
-/* The other half of a `border` attribute: it draws on the table itself, from the
-   presentational hints, *and* one pixel wide on every cell however wide the
-   table's own is — which is what makes `border=5` a thick frame around a thin
-   grid. `border=0` asks for neither. */
-table[border]:not([border="0"]) > tr > td,
-table[border]:not([border="0"]) > tr > th,
-table[border]:not([border="0"]) > * > tr > td,
-table[border]:not([border="0"]) > * > tr > th { border: 1px inset gray; }
+/* A cell sits in the middle of its row unless told otherwise, and the row and the
+   cell take it from the section above them (HTML §15.3.8). */
+thead, tbody, tfoot, table > tr { vertical-align: middle; }
+tr, td, th { vertical-align: inherit; }
 col { display: table-column; }
 colgroup { display: table-column-group; }
 
@@ -95,10 +133,26 @@ ol ul ul, ol ul menu, ol ol ul, ol ol menu { list-style-type: square; }
 dd { margin-left: 40px; }
 dl { margin: 1em 0; }
 figure { margin: 1em 40px; }
-pre { font-family: monospace; white-space: pre; margin: 1em 0; }
-/* A rule is a border, not a filled strip: `border-style: inset` renders as one
-   flat grey line here, which is what an inset one-pixel border looks like. */
-hr { height: 0; border-top: 1px solid #c0c0c0; margin: 8px 0; }
+/* `listing`, `plaintext` and `xmp` are `pre` from before there was a `pre`
+   (HTML §15.3.3). */
+listing, plaintext, pre, xmp {
+  display: block;
+  font-family: monospace;
+  white-space: pre;
+  margin-block: 1em;
+}
+/* A rule is a box with no content and a one-pixel inset border all round, which
+   draws as two lines, the upper one in shadow (HTML §15.3.11). Its colour, its
+   thickness, its width and where it sits are its attributes' presentational
+   hints. */
+hr {
+  color: gray;
+  border-style: inset;
+  border-width: 1px;
+  margin-block: 0.5em;
+  margin-inline: auto;
+  overflow: hidden;
+}
 
 b, strong { font-weight: bold; }
 i, em, cite, var, dfn, address { font-style: italic; }
@@ -110,6 +164,12 @@ sup { vertical-align: super; }
 mark { background-color: yellow; }
 u, ins { text-decoration: underline; }
 s, strike, del { text-decoration: line-through; }
+/* An abbreviation with its expansion in a tooltip says so with a dotted line
+   (HTML §15.3.4). */
+abbr[title], acronym[title] { text-decoration: dotted underline; }
+/* A run of text no line breaks inside, but for a `wbr` that asks for one. */
+nobr { white-space: nowrap; }
+nobr wbr { white-space: normal; }
 /* An anchor without an address is not a link: it is a name for a place in the
    page, and it is not blue and not underlined anywhere else either. */
 a[href] { color: #0000ee; text-decoration: underline; }
@@ -197,6 +257,16 @@ input[type="range" i] {
   cursor: default;
 }
 
+/* An image button is its picture, or its alternative text while there is none:
+   neither reference gives it a button's face, edge or padding. */
+input[type="image" i] {
+  --otlyra-appearance: none;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  cursor: pointer;
+}
+
 /* A date or a time is a row of digits in fixed places, so it is set in a fixed
    pitch: both references do this, and a proportional font makes the parts of a
    half-filled date jump about as it is filled in. */
@@ -215,8 +285,6 @@ input[type="color" i] {
   background-color: #efefef;
   cursor: default;
 }
-
-input[type="hidden" i] { display: none; }
 
 select {
   display: inline-block;
@@ -270,9 +338,12 @@ option { padding: 0 2px; }
 option:checked { background-color: #cce4ff; }
 option:hover { background-color: #e8f1ff; }
 option:checked:hover { background-color: #b8d8ff; }
-/* A frame is a document of its own, which this cannot show — but the space it
-   takes and the edge around it are what a page is laid out against either way. */
+/* Embedded content (§15.4.1). A frame is a document of its own, which this
+   cannot show — but the space it takes and the edge around it are what a page is
+   laid out against either way. A video's poster keeps its shape inside the box,
+   centred and as large as fits. */
 iframe { border: 2px inset; }
+video { object-fit: contain; }
 
 center, caption { text-align: center; }
 th { font-weight: bold; text-align: center; }

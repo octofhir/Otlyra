@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Where a relative address points</title>
+<!-- Every address in the markup resolves against this base, which names a
+     directory that does not exist: only an address resolved against the right
+     thing finds a file, so every tick below is one resolution done right. -->
+<base href="urls/nested/">
+<link rel="stylesheet" href="../sheet.css">
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  .row { display: flex; align-items: center; gap: 16px; margin: 8px 0; }
+  .box { width: 48px; height: 48px; border: 1px solid #999; flex: none; }
+  .inline { background: url(../mark.svg) center / 32px 32px no-repeat; }
+  table { border-collapse: collapse; }
+  td { padding: 0; border: 1px solid #999; }
+</style>
+</head>
+<body>
+
+<h1>Against the sheet that names it</h1>
+
+<div class="row"><div class="box from-sheet"></div>
+  <span>a background in <code>urls/sheet.css</code>, next to the sheet</span></div>
+<div class="row"><div class="box imported"></div>
+  <span>a rule from <code>urls/import.css</code>, which the sheet imports</span></div>
+
+<h1>Against the document's base</h1>
+
+<div class="row"><div class="box inline"></div>
+  <span>a background in a <code>&lt;style&gt;</code></span></div>
+<div class="row"><div class="box" style="background: url(../mark.svg) center / 32px 32px no-repeat"></div>
+  <span>a background in a <code>style</code> attribute</span></div>
+<div class="row"><img class="box" src="../mark.svg" alt="">
+  <span>an <code>&lt;img&gt;</code></span></div>
+<div class="row"><table><tr><td background="../mark.svg" width="96" height="32"></td></tr></table>
+  <span>a cell's <code>background</code> attribute, tiled</span></div>
+
+<h1>Refused</h1>
+
+<div class="row"><div class="box" style="background: #eee url(../nowhere.svg)"></div>
+  <span>a picture that is not there is no picture, and the colour under it stays</span></div>
+
+</body>
+</html>

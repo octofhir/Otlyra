@@ -805,6 +805,14 @@ pub fn display_size(document: &Document, select: NodeId) -> u32 {
     declared.unwrap_or(if is_multiple(document, select) { 4 } else { 1 })
 }
 
+/// Whether `node` is an `<input>` in the Image Button state (HTML
+/// §4.10.5.1.19): a submit button that is a picture, and a replaced element
+/// with presentational hints of its own when it has one to show.
+#[must_use]
+pub fn is_image_button(document: &Document, node: NodeId) -> bool {
+    Control::of(document, node) == Some(Control::Input(InputKind::Image))
+}
+
 /// Whether a `<select>` is a list box rather than a drop-down.
 ///
 /// HTML §4.10.7: one that takes more than one answer, or shows more than one

@@ -2037,3 +2037,68 @@ fn a_search_asks_for_the_next_frame() {
     page.build_display_list(&mut text, 800.0, 600.0, 0.0);
     assert_eq!(page.builds(), builds + 1, "and a search is a change");
 }
+
+/// A scene of `html` as if fetched from `url`.
+fn scene_at(html: &str, url: &str) -> PageScene {
+    let parsed = otlyra_html::parse(html.as_bytes(), Some("utf-8"));
+    PageScene::at(
+        parsed.document,
+        url::Url::parse(url).expect("a test's address parses"),
+    )
+}
+
+/// A base element's `href` is resolved against the document's own address,
+/// and what the markup names is resolved against the result.
+#[test]
+fn a_base_element_moves_the_documents_base() {
+    let page = scene_at(
+        "<base target=_top><base href=\"../assets/\"><base href=https://elsewhere.test/>",
+        "https://x.test/a/b/page.html",
+    );
+    assert_eq!(page.base_url().as_str(), "https://x.test/a/assets/");
+    assert_eq!(page.url().as_str(), "https://x.test/a/b/page.html");
+    assert_eq!(
+        page.resolve("pic.png").as_deref(),
+        Some("https://x.test/a/assets/pic.png")
+    );
+    assert_eq!(
+        scene_at("<p>no base", "https://x.test/a/b/page.html")
+            .base_url()
+            .as_str(),
+        "https://x.test/a/b/page.html"
+    );
+}
+
+/// A base that is a `data:` or a `javascript:` URL, or no URL at all, is
+/// refused and the document's own address stands.
+#[test]
+fn a_data_or_script_base_is_ignored() {
+    for href in [
+        "data:text/html,<p>x",
+        "javascript:alert(1)",
+        "https://[not a host/",
+    ] {
+        let page = scene_at(
+            &format!("<base href=\"{href}\"><a href=next>x</a>"),
+            "https://x.test/dir/page.html",
+        );
+        assert_eq!(
+            page.base_url().as_str(),
+            "https://x.test/dir/page.html",
+            "{href}"
+        );
+    }
+}
+
+/// The page's own style is resolved against that base as well: a `<style>`'s
+/// picture is wanted at the address the base makes of it.
+#[test]
+fn a_style_picture_is_wanted_where_the_base_puts_it() {
+    let mut page = scene_at(
+        "<base href=https://cdn.test/img/>\
+         <style>div { width: 4px; height: 4px; background: url(a.png) }</style><div></div>",
+        "https://x.test/page.html",
+    );
+    page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
+    assert_eq!(page.wanted_pictures(), ["https://cdn.test/img/a.png"]);
+}

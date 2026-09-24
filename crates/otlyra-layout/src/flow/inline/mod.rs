@@ -434,11 +434,7 @@ impl<'a> Flow<'a> {
                     // background that missed the words it was behind — which is
                     // what a `vertical-align` on a span with a background looks
                     // like when only half of it moves.
-                    let shift = self
-                        .line_shifts
-                        .get(&inline.id)
-                        .copied()
-                        .unwrap_or_else(|| baseline_shift(&inline.style, &style));
+                    let shift = self.shift_on_line(inline.id, parent);
 
                     Some(Fragment::for_box(
                         inline.id,
@@ -485,13 +481,9 @@ impl<'a> Flow<'a> {
 
                     // `vertical-align`: the glyphs move off the line's baseline,
                     // and the room they need was already added to the line's
-                    // height when its spans were levelled.
-                    // Resolved once, in the levelling pass, for the five values
-                    // that need the line box; worked out here for the rest,
-                    // which need only the two fonts.
-                    let shift = box_id
-                        .and_then(|id| self.line_shifts.get(&id).copied())
-                        .unwrap_or_else(|| baseline_shift(&run_style, &style));
+                    // height when its spans were levelled. A run with no box of
+                    // its own is the block's text, which stays on the baseline.
+                    let shift = box_id.map_or(0.0, |id| self.shift_on_line(id, parent));
                     // The glyphs are placed relative to the fragment, so moving
                     // the fragment moves them with it. Moving both was moving
                     // everything twice as far as it was asked to go.
@@ -532,14 +524,15 @@ impl<'a> Flow<'a> {
                     crate::flow::offset(&mut fragment, dx, dy);
                     return Some(fragment);
                 }
-                let image = box_.image.clone()?;
                 // The spacer reserved the whole box; the picture fills what the
-                // frame leaves inside it.
+                // frame leaves inside it. A box with no picture in it — a frame, a
+                // video before its poster — is still a box, with a background and
+                // a border of its own.
                 let frame = Frame::of(&box_.style, width);
                 Some(replaced_fragment(
                     box_.id,
                     &box_.style,
-                    Some(image),
+                    box_.image.clone(),
                     at,
                     (
                         (spacer.width - frame.inline).max(0.0),

@@ -22,7 +22,7 @@ i b u mark bdi bdo span br wbr ins del picture source img iframe embed object vi
 audio track map area table caption colgroup col tbody thead tfoot tr td th form \
 label input button select datalist optgroup option textarea output progress meter \
 fieldset legend details summary dialog script noscript template slot canvas center \
-font big strike tt marquee frameset";
+font big strike tt marquee frameset basefont listing xmp nobr noembed noframes param";
 
 fn main() {
     println!(

@@ -6,6 +6,7 @@
 //! the same lines — so it is kept apart from the walk that decides where the box is.
 
 use otlyra_gfx::kurbo::Affine;
+use otlyra_gfx::peniko::color::Rgba8;
 use otlyra_gfx::peniko::{Brush, Color, Fill};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_layout::fragment::Fragment;
@@ -298,35 +299,116 @@ fn paint_dashes(list: &mut DisplayList, border: otlyra_css::Border, corners: [(f
     });
 }
 
-/// The two shades a three-dimensional border is drawn in.
+/// The two shades a three-dimensional border is drawn in: the side in shadow,
+/// then the lit side.
 ///
-/// A reference darkens the colour towards the shadow side and leaves the other
-/// side the colour it was told — unless the colour is already dark enough that
-/// darkening it makes black, where it lightens the lit side instead, so that the
-/// two halves can still be told apart. Both curves are the reference's own and
-/// were read off a ramp of colours rather than guessed.
+/// CSS leaves the shading to the user agent (css-backgrounds-3, "Line Patterns:
+/// the `border-style` properties"), so these are Chrome's, to the bit
+/// (`CalculateInsetOutsetColor` in its border painter). The shadow side is the
+/// colour darkened and the lit side the colour lightened, with an exception at
+/// each end of the scale, which is measured in relative luminance:
+///
+/// - a colour brighter than [`LIGHT_END`] has nowhere lighter to go, and its lit
+///   side is the colour itself;
+/// - a colour no brighter than [`DARK_END`] would darken to black, so it is
+///   lightened once for the shadow side and twice for the lit one — which is why
+///   a `<table border>` in black text is framed in two greys.
+///
+/// Firefox shades by a curve of its own and lands a few levels away from these.
 pub(super) fn shades(colour: Color) -> (Color, Color) {
-    let [r, g, b, a] = colour.components;
-    let peak = r.max(g).max(b);
-    // A third of the way up is where a darkened colour reaches black, and below it
-    // there is nothing left to take away.
-    const FLOOR: f32 = 0.33;
-
-    let scaled = |factor: f32| Color::new([r * factor, g * factor, b * factor, a]);
-    let dark = scaled(if peak > 0.0 {
-        ((peak - FLOOR) / peak).max(0.0)
+    let colour = colour.to_rgba8();
+    let luminance = relative_luminance(colour);
+    let (dark, light) = if luminance <= relative_luminance(DARK_END) {
+        let dark = lighten(colour);
+        (dark, lighten(dark))
+    } else if luminance > relative_luminance(LIGHT_END) {
+        (darken(colour), colour)
     } else {
-        0.0
-    });
-    if peak > FLOOR {
-        return (dark, colour);
-    }
-    // Nothing to darken: the lit side is lightened instead, and a colour with no
-    // light in it at all is lightened from black to the grey a reference uses.
-    let light = if peak > 0.0 {
-        scaled((peak + FLOOR).min(1.0) / peak)
-    } else {
-        Color::new([FLOOR, FLOOR, FLOOR, a])
+        (darken(colour), lighten(colour))
     };
-    (dark, light)
+    (Color::from(dark), Color::from(light))
+}
+
+/// The lightest colour [`shades`] treats as too dark to darken.
+const DARK_END: Rgba8 = Rgba8 {
+    r: 0x20,
+    g: 0x20,
+    b: 0x20,
+    a: 0xff,
+};
+
+/// The lightest colour [`shades`] still lightens.
+const LIGHT_END: Rgba8 = Rgba8 {
+    r: 0xeb,
+    g: 0xeb,
+    b: 0xeb,
+    a: 0xff,
+};
+
+/// How far [`lighten`] and [`darken`] move a colour's brightest channel, as a
+/// fraction of the whole scale.
+const STEP: f32 = 0.33;
+
+/// A colour's relative luminance, as WCAG 2 defines it: the sRGB channels
+/// linearised and weighted by how bright each looks. Alpha plays no part.
+fn relative_luminance(colour: Rgba8) -> f32 {
+    let linear = |channel: u8| {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(colour.r) + 0.7152 * linear(colour.g) + 0.0722 * linear(colour.b)
+}
+
+/// The colour with its brightest channel raised by [`STEP`], short of white, and
+/// the others in proportion. Black has no proportion to keep and becomes the grey
+/// that far up.
+fn lighten(colour: Rgba8) -> Rgba8 {
+    let peak = brightest(colour);
+    if peak == 0.0 {
+        let grey = (STEP * 255.0) as u8;
+        return Rgba8 {
+            r: grey,
+            g: grey,
+            b: grey,
+            a: colour.a,
+        };
+    }
+    scale(colour, (peak + STEP).min(1.0) / peak)
+}
+
+/// The colour with its brightest channel lowered by [`STEP`], no further than
+/// black, and the others in proportion.
+fn darken(colour: Rgba8) -> Rgba8 {
+    let peak = brightest(colour);
+    let factor = if peak == 0.0 {
+        0.0
+    } else {
+        ((peak - STEP) / peak).max(0.0)
+    };
+    scale(colour, factor)
+}
+
+/// A colour's brightest channel, from nought to one.
+fn brightest(colour: Rgba8) -> f32 {
+    f32::from(colour.r.max(colour.g).max(colour.b)) / 255.0
+}
+
+/// Every colour channel times `factor`, alpha untouched.
+///
+/// Truncated rather than rounded, against a scale a hair under 256 — so a whole
+/// channel stays whole and anything short of a level drops to the one below, as
+/// the reference's arithmetic does. Rounding instead is a level out on half the
+/// colours there are.
+fn scale(colour: Rgba8, factor: f32) -> Rgba8 {
+    let channel = |value: u8| (f32::from(value) / 255.0 * factor * 256.0_f32.next_down()) as u8;
+    Rgba8 {
+        r: channel(colour.r),
+        g: channel(colour.g),
+        b: channel(colour.b),
+        a: colour.a,
+    }
 }

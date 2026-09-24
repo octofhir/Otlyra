@@ -317,7 +317,10 @@ fn border(values: &ComputedValues) -> Sides<Border> {
 
     let border = values.get_border();
     let text = colour(values.clone_color());
-    let side = |width: &style::values::computed::BorderSideWidth, style: Declared, colour_value| {
+    let uncoloured_3d = uncoloured_3d_border(values, text);
+    let side = |width: &style::values::computed::BorderSideWidth,
+                style: Declared,
+                colour_value: &style::values::computed::Color| {
         let style = match style {
             Declared::None => BorderStyle::None,
             Declared::Hidden => BorderStyle::Hidden,
@@ -336,9 +339,17 @@ fn border(values: &ComputedValues) -> Sides<Border> {
                 ..Border::NONE
             };
         }
+        let color = match style {
+            BorderStyle::Groove | BorderStyle::Ridge | BorderStyle::Inset | BorderStyle::Outset
+                if colour_value.is_currentcolor() =>
+            {
+                uncoloured_3d
+            }
+            _ => resolve_colour(colour_value, text),
+        };
         Border {
             width: width.0.to_f32_px(),
-            color: resolve_colour(colour_value, text),
+            color,
             style,
         }
     };
@@ -364,6 +375,23 @@ fn border(values: &ComputedValues) -> Sides<Border> {
             border.border_left_style,
             &border.border_left_color,
         ),
+    }
+}
+
+/// What a groove, ridge, inset or outset border is shaded from when its colour
+/// is `currentcolor`, the colour every border has until a page names one.
+///
+/// css-backgrounds-3 leaves the shades of these styles to the user agent. Chrome
+/// keeps WebKit's answer, a light grey rather than the text's colour
+/// (`ComputedStyleUtils::BorderSideColor`), which is why the rule an `<hr>`
+/// draws and the edge round an `<iframe>` are pale there rather than dark. Its
+/// table painter resolves the colour on a path of its own, without the grey, so
+/// a table and its cells are shaded from their text — as Firefox shades every
+/// box.
+fn uncoloured_3d_border(values: &ComputedValues, text: Color) -> Color {
+    match table_part(values.get_box().display) {
+        Some(Display::Table | Display::TableCell) => text,
+        _ => Color::from_rgb8(238, 238, 238),
     }
 }
 
@@ -546,17 +574,13 @@ fn backgrounds(values: &ComputedValues) -> Vec<BackgroundLayer> {
         .iter()
         .enumerate()
         .map(|(index, image)| BackgroundLayer {
-            // The address as written, not as resolved: stylesheets are parsed
-            // against a placeholder base, so the engine cannot resolve a relative
-            // `url()` for us. Resolving it against the page is the caller's,
-            // exactly as it is for the address in an `<img src>`.
+            // Absolute: every sheet is parsed against its own address, so the
+            // engine resolved the `url()` where it was written (CSS Values 4
+            // §4.5.1). One that did not resolve is what CSS Images 3 calls an
+            // invalid image, which draws nothing and still holds its layer's
+            // place.
             image: match image {
-                Image::Url(style::url::ComputedUrl::Valid(resolved)) => {
-                    Some(Arc::from(resolved.as_str()))
-                }
-                Image::Url(style::url::ComputedUrl::Invalid(specified)) => {
-                    Some(Arc::from(specified.as_str()))
-                }
+                Image::Url(url) => url.url().map(|resolved| Arc::from(resolved.as_str())),
                 _ => None,
             },
             gradient: background_gradient(image),
@@ -1199,14 +1223,27 @@ fn aspect_ratio(value: &style::values::computed::position::AspectRatio) -> Aspec
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::cascade::{Viewport, style_document};
+    use crate::cascade::{StyleSources, Viewport, style_document_with};
 
     /// The layout style of the first element matching `selector`.
-    fn layout_style(html: &str, selector: &str) -> ComputedStyle {
+    pub(crate) fn layout_style(html: &str, selector: &str) -> ComputedStyle {
+        styled_with(html, &StyleSources::default(), selector)
+    }
+
+    /// The same, for a document whose base URL is `base`.
+    pub(crate) fn layout_style_at(html: &str, base: &str, selector: &str) -> ComputedStyle {
+        let sources = StyleSources {
+            base: url::Url::parse(base).expect("a test's base parses"),
+            ..StyleSources::default()
+        };
+        styled_with(html, &sources, selector)
+    }
+
+    fn styled_with(html: &str, sources: &StyleSources, selector: &str) -> ComputedStyle {
         let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
-        let styled = style_document(&document, Viewport::default());
+        let styled = style_document_with(&document, Viewport::default(), sources);
         let node = crate::stylo_dom::select(&document, selector)
             .expect("the selector should parse")
             .into_iter()
@@ -1533,22 +1570,27 @@ mod tests {
         );
     }
 
-    /// A formatting context layout does not have still generates a box, laid out as
-    /// a block. Dropping the element instead would hide its content entirely.
+    /// A background's address is resolved where it was written — a `<style>`'s
+    /// against the document's base — and one that resolves to nothing is an
+    /// invalid image: no picture, and still a layer.
     #[test]
-    fn a_background_picture_keeps_the_address_it_was_written_with() {
-        let style = layout_style(
-            "<style>div { background-image: url(pic.png) }</style><div>x</div>",
-            "div",
-        );
+    fn a_background_picture_is_resolved_where_it_was_written() {
+        let html = "<style>div { background-image: url(pic.png), url(\"\") }</style><div>x</div>";
+        let image = |style: &ComputedStyle, layer: usize| {
+            style.backgrounds[layer].image.as_deref().map(str::to_owned)
+        };
+
+        let placed = layout_style_at(html, "https://x.test/a/page.html", "div");
+        assert_eq!(placed.backgrounds.len(), 2);
         assert_eq!(
-            style
-                .backgrounds
-                .first()
-                .and_then(|layer| layer.image.clone())
-                .as_deref(),
-            Some("pic.png")
+            image(&placed, 0).as_deref(),
+            Some("https://x.test/a/pic.png")
         );
+        assert_eq!(image(&placed, 1), None, "an empty url() is invalid");
+
+        let nowhere = layout_style(html, "div");
+        assert_eq!(nowhere.backgrounds.len(), 2);
+        assert_eq!(image(&nowhere, 0), None, "about:blank resolves nothing");
     }
 
     /// A page that says nothing about its font gets the browser's standard one,
@@ -1693,6 +1735,11 @@ mod tests {
 
         assert_eq!(style("").object_fit, ObjectFit::Fill, "the initial value");
         assert_eq!(
+            layout_style("<video></video>", "video").object_fit,
+            ObjectFit::Contain,
+            "but a video's poster keeps its shape (HTML §15.4.1)"
+        );
+        assert_eq!(
             style("").object_position,
             BackgroundPosition::CENTER,
             "which starts in the middle rather than the corner"
@@ -1791,65 +1838,44 @@ mod tests {
         );
     }
 
-    /// The presentational attributes: style written in the markup, cascading below
-    /// every author rule and above the user-agent sheet.
+    /// A groove, ridge, inset or outset border that names no colour is shaded
+    /// from a light grey, as Chrome shades the rule under an `<hr>` and the edge
+    /// of an `<iframe>` — except round a table and its cells, which take their
+    /// text's colour. A named colour, or a flat style, is the colour it says.
     #[test]
-    fn presentational_attributes_are_style() {
-        let style = layout_style(
-            "<table bgcolor=\"#ff0000\" width=\"300\"><tr><td>x",
-            "table",
-        );
-        assert_eq!(style.background_color.to_rgba8().r, 255);
-        assert_eq!(style.width, Size::Length(Length::Px(300.0)));
-
-        // A percentage is a percentage, and a value that is not a dimension at all
-        // contributes nothing rather than being guessed at.
-        assert_eq!(
-            layout_style("<table width=\"50%\"><tr><td>x", "table").width,
-            Size::Length(Length::Percent(0.5))
-        );
-        assert_eq!(
-            layout_style("<table width=\"lots\"><tr><td>x", "table").width,
-            Size::Auto
-        );
-
-        // A border attribute draws on the table and on its cells.
-        let table = layout_style("<table border=\"3\"><tr><td>x", "table");
-        assert_eq!(table.border.top.width, 3.0);
-        assert_eq!(
-            layout_style("<table border=\"3\"><tr><td>x", "td")
+    fn an_uncoloured_3d_border_is_shaded_from_light_grey() {
+        let colour = |html: &str, selector: &str| {
+            layout_style(html, selector)
                 .border
                 .top
-                .width,
-            1.0,
-            "a cell's own border is one pixel however wide the table's is"
+                .color
+                .to_rgba8()
+                .to_u8_array()
+        };
+        let grey = [238, 238, 238, 255];
+        let red = [255, 0, 0, 255];
+        assert_eq!(colour("<hr>", "hr"), grey);
+        assert_eq!(colour("<iframe></iframe>", "iframe"), grey);
+        assert_eq!(
+            colour(
+                "<div style='border: 2px ridge currentcolor; color: red'>x</div>",
+                "div"
+            ),
+            grey
         );
         assert_eq!(
-            layout_style("<table border=\"0\"><tr><td>x", "td")
-                .border
-                .top
-                .width,
-            0.0,
-            "and none at all when the attribute asks for none"
+            colour("<div style='border: 2px outset blue'>x</div>", "div"),
+            [0, 0, 255, 255]
         );
-
-        // Author CSS beats them, which is the whole reason they are an origin of
-        // their own rather than part of the user-agent sheet.
         assert_eq!(
-            layout_style(
-                "<style>table { width: 100px }</style><table width=\"300\"><tr><td>x",
-                "table"
-            )
-            .width,
-            Size::Length(Length::Px(100.0))
+            colour("<div style='border: 2px solid; color: red'>x</div>", "div"),
+            red
         );
-        // And they beat the user-agent sheet.
-        assert_eq!(
-            layout_style("<table align=\"center\"><tr><td>x", "table")
-                .margin
-                .left,
-            LengthOrAuto::Auto
-        );
+        assert_eq!(colour("<hr noshade>", "hr"), [128, 128, 128, 255]);
+        let table = "<table style='border: 2px outset; color: red'>\
+                     <tr><td style='border: 1px inset'>x</table>";
+        assert_eq!(colour(table, "table"), red);
+        assert_eq!(colour(table, "td"), red);
     }
 
     /// `border-style` decides whether a declared width is used at all, which is

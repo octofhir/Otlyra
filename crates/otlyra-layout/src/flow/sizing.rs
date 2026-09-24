@@ -562,10 +562,6 @@ pub(super) struct OwnWidth {
     /// picture's own, or the width its height makes of it through its ratio; a
     /// widget's natural width.
     pub(super) natural: f32,
-    /// What a picture's `width` attribute asked for, which HTML makes a rule of
-    /// the lowest priority setting `width`: it stands in for an `auto` width, and
-    /// any width a stylesheet names outranks it.
-    pub(super) hint: Option<f32>,
 }
 
 /// What `width`, `min-width` and `max-width` ask of a replaced box, as
@@ -573,8 +569,7 @@ pub(super) struct OwnWidth {
 ///
 /// A picture has no content to measure but itself, so the content keywords are
 /// its own width, `own.natural` (CSS Sizing 3 §5.1): as a width and as a limit
-/// alike, and ahead of a `width` attribute, which a keyword outranks as any
-/// stylesheet does.
+/// alike.
 ///
 /// And while its contribution is measured, a percentage of the width being
 /// measured is cyclic, which a replaced box resolves rather than drops
@@ -601,9 +596,7 @@ pub(super) fn replaced_widths(
 ) -> Sizes {
     let sizes = |room: InlineRoom| Sizes {
         preferred: match &style.width {
-            Size::Auto => own
-                .hint
-                .map(|hint| content_box(hint, style.box_sizing, frame)),
+            Size::Auto => None,
             Size::Length(length) => content_length(length, room.basis, style.box_sizing, frame),
             Size::Intrinsic(_) => Some(own.natural),
             Size::Stretch => room.stretch(frame),
@@ -934,14 +927,11 @@ impl<'a> Flow<'a> {
         match &node.kind {
             BoxKind::Replaced(content) => Some(OwnWidth {
                 natural: natural_width(style, content, containing_width, containing_height),
-                hint: content.hint.0,
             }),
-            BoxKind::Block | BoxKind::Inline | BoxKind::Text(_) => {
-                node.natural_size().width.map(|natural| OwnWidth {
-                    natural,
-                    hint: None,
-                })
-            }
+            BoxKind::Block | BoxKind::Inline | BoxKind::Text(_) => node
+                .natural_size()
+                .width
+                .map(|natural| OwnWidth { natural }),
         }
     }
 

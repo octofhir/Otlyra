@@ -112,12 +112,14 @@ pub fn write_screenshot(
     Ok(())
 }
 
-/// What a `<link>` says it is for, where it says anything.
+/// What the element that brings a sheet into the document says the sheet is
+/// for, where it says anything: a `<link>`'s `media`, or a `<style>`'s, which
+/// holds for the sheets its `@import`s bring in as well.
 ///
-/// `None` for a link with no `media` attribute, which is every medium — the
-/// same answer as a condition that matches, and a different one from a
+/// `None` for an element with no `media` attribute, which is every medium —
+/// the same answer as a condition that matches, and a different one from a
 /// condition that does not.
-pub(crate) fn media_of_link(
+pub(crate) fn media_of_sheet_owner(
     document: &otlyra_dom::Document,
     node: otlyra_dom::NodeId,
 ) -> Option<String> {

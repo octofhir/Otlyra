@@ -57,7 +57,7 @@ fn main() {
     let mut styler = otlyra_css::cascade::Styler::new(
         &parsed.document,
         viewport,
-        &otlyra_css::cascade::ExternalSheets::default(),
+        &otlyra_css::cascade::StyleSources::default(),
     );
     let styles = styler.style(&parsed.document);
     let style_first = started.elapsed();

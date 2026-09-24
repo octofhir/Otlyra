@@ -795,6 +795,104 @@ fn a_caption_widens_the_table_under_it() {
     );
 }
 
+/// `cellpadding=0 cellspacing=0` packs a table's cells: each one is exactly as
+/// tall and as wide as the line in it, where the user-agent sheet's own padding
+/// would have put a pixel on every side.
+#[test]
+fn cellpadding_and_cellspacing_pack_the_cells() {
+    let cell_and_line = |attributes: &str| {
+        let tree = lay_out(
+            &format!("<body><table {attributes}><tr><td>x</td><td>y</td></tr></table>"),
+            800.0,
+        );
+        let cells: Vec<otlyra_layout::Rect> =
+            cells_of(&tree).iter().map(|cell| cell.rect).collect();
+        let line = lines(&tree).first().expect("a line").rect;
+        (cells, line)
+    };
+
+    let (packed, line) = cell_and_line("cellpadding=0 cellspacing=0");
+    assert_eq!(packed[0].height, line.height, "no padding above or below");
+    assert_eq!(packed[0].y, line.y);
+    assert_eq!(
+        packed[1].x,
+        packed[0].right(),
+        "and no spacing between the cells"
+    );
+
+    let (padded, line) = cell_and_line("");
+    assert_eq!(padded[0].height, line.height + 2.0);
+    assert_eq!(padded[1].x, padded[0].right() + 2.0);
+}
+
+/// `vertical-align` on a block container places the box — in its row, or in the
+/// line outside it — and not the lines inside it (CSS 2.2 §10.8.1): whatever a
+/// cell, an inline block or a plain block says, it is as tall as one that says
+/// nothing, and its text sits exactly where that one's does.
+#[test]
+fn vertical_align_on_a_block_leaves_its_own_lines_alone() {
+    /// The first baseline in `fragment`, in page coordinates.
+    fn first_baseline(fragment: &Fragment) -> Option<f32> {
+        match &fragment.kind {
+            FragmentKind::Text(run) => Some(fragment.rect.y + run.glyphs.first()?.y),
+            _ => fragment.children.iter().find_map(first_baseline),
+        }
+    }
+    /// A box's height, and how far below its top its text's baseline is.
+    fn measure(container: &Fragment) -> (f32, f32) {
+        let baseline = first_baseline(container).expect("text in the box");
+        (container.rect.height, baseline - container.rect.y)
+    }
+
+    let measured = |align: &str| {
+        let tree = lay_out(
+            &format!(
+                "<body><table style='border-spacing: 0'><tr>\
+                 <td style='padding: 0; vertical-align: {align}'>cell</td></tr></table>\
+                 <p><span style='display: inline-block; vertical-align: {align}'>block</span>\
+                 <div style='vertical-align: {align}'>div</div>"
+            ),
+            800.0,
+        );
+        let cell = cells_of(&tree)[0];
+        let inline_block = boxes_of(&tree)
+            .into_iter()
+            .find(|f| f.style.display == otlyra_layout::Display::InlineBlock)
+            .expect("the inline block");
+        // The paragraph holds the inline block's line; the last block to hold
+        // lines of its own is the `div`.
+        let block = text_blocks(&tree)
+            .into_iter()
+            .rfind(|f| f.style.display == otlyra_layout::Display::Block)
+            .expect("the div");
+        [cell, inline_block, block].map(measure)
+    };
+    let still = measured("baseline");
+    for align in [
+        "middle",
+        "top",
+        "bottom",
+        "text-top",
+        "text-bottom",
+        "super",
+        "sub",
+        "10px",
+        "-6px",
+    ] {
+        // To within float noise: an inline block that has moved in the line
+        // outside it is measured from a different page coordinate.
+        let moved = measured(align);
+        let alike = moved
+            .iter()
+            .zip(&still)
+            .all(|(a, b)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01);
+        assert!(
+            alike,
+            "vertical-align: {align}: {moved:?} against {still:?}"
+        );
+    }
+}
+
 /// A positioned box with a width and padding is that much wider than the width,
 /// exactly as a box in the flow is: `width` is the content box.
 #[test]

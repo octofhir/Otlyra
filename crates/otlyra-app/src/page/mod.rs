@@ -20,7 +20,7 @@ mod selection;
 pub use controls::{ControlFacts, FileRequest, Numeric, SliderMotion};
 pub use field::EditAction;
 
-use otlyra_css::cascade::ExternalSheets;
+use otlyra_css::cascade::StyleSources;
 use otlyra_dom::{Document, NodeData, NodeId};
 use otlyra_gfx::{DisplayItem, DisplayList};
 use otlyra_layout::{BoxId, BoxTree, Damage, FragmentTree, Images};
@@ -31,10 +31,21 @@ use scroll::Drag;
 
 /// A parsed document, laid out and painted.
 pub struct PageScene {
-    /// The stylesheets the document's `<link>` elements asked for, already
+    /// The document's address: what it was fetched from, after any redirect.
+    ///
+    /// The authority everything the page fetches is asked for on — a base
+    /// element can point its addresses elsewhere, never lend it the right to
+    /// read the disk — and where its base URL starts.
+    url: url::Url,
+    /// The document base URL (HTML §2.4.1): what the addresses in its markup
+    /// resolve against. Worked out again whenever script changes the tree, which
+    /// is when a base element can have come or gone.
+    base: url::Url,
+    /// The base URL the document's style is resolved against, and the
+    /// stylesheets its `<link>` elements and their `@import`s asked for, already
     /// fetched. Kept because a restyle needs them again and a restyle must not
     /// wait on a network.
-    sheets: ExternalSheets,
+    sources: StyleSources,
     /// The pictures its `<img>` elements asked for, already decoded. Kept for the
     /// same reason as the sheets: rebuilding the box tree must not wait on a
     /// network either.
@@ -291,26 +302,48 @@ impl std::fmt::Debug for PageScene {
 }
 
 impl PageScene {
-    /// A scene showing `document`, with nothing fetched for it.
+    /// A scene showing `document` at `about:blank`, with nothing fetched for it:
+    /// a document made from a string, which is at no address.
     pub fn new(document: Document) -> Self {
+        Self::at(document, otlyra_css::cascade::about_blank())
+    }
+
+    /// A scene showing `document`, fetched from `url`, before anything it asks
+    /// for has arrived.
+    ///
+    /// Its base URL is read off the tree as it stands, which is short of HTML's
+    /// resolving each address as its element goes in: see `document_base_url`.
+    pub fn at(document: Document, url: url::Url) -> Self {
+        let sources = StyleSources {
+            base: document_base_url(&document, &url),
+            ..StyleSources::default()
+        };
         Self::with_resources(
             document,
-            ExternalSheets::default(),
+            url,
+            sources,
             Images::default(),
             std::collections::HashMap::new(),
         )
     }
 
-    /// A scene showing `document` with the stylesheets and pictures it asked for,
-    /// and which file each of those pictures came from.
+    /// A scene showing `document`, fetched from `url`, with the stylesheets and
+    /// pictures it asked for, and which file each of those pictures came from.
+    ///
+    /// The sheets carry the base they are resolved against, which is the
+    /// document's base URL as it was when they were asked for: a sheet already
+    /// parsed keeps the addresses it was parsed with.
     pub fn with_resources(
         document: Document,
-        sheets: ExternalSheets,
+        url: url::Url,
+        sources: StyleSources,
         images: Images,
         picture_sources: std::collections::HashMap<NodeId, (String, f32)>,
     ) -> Self {
         Self {
-            sheets,
+            base: document_base_url(&document, &url),
+            url,
+            sources,
             images,
             picture_sources,
             // Nothing is styled until the first frame says how wide the page is,
@@ -365,6 +398,27 @@ impl PageScene {
         &self.document
     }
 
+    /// The document's address, and the authority what it fetches is asked for
+    /// on.
+    pub fn url(&self) -> &url::Url {
+        &self.url
+    }
+
+    /// The document base URL (HTML §2.4.1): what the addresses in its markup
+    /// resolve against.
+    pub fn base_url(&self) -> &url::Url {
+        &self.base
+    }
+
+    /// An address in the document's markup, parsed relative to the document
+    /// (HTML §2.4.2): absolute, or `None` when it is not a URL at all.
+    ///
+    /// The query is encoded as UTF-8 whatever the document's encoding, the one
+    /// place this differs from the specification's "encoding-parsing".
+    pub fn resolve(&self, href: &str) -> Option<String> {
+        self.base.join(href).ok().map(String::from)
+    }
+
     /// Let script change the document in place, and note what it did.
     ///
     /// The alternative is taking the document out and building the whole page
@@ -379,16 +433,21 @@ impl PageScene {
     }
 
     /// Everything style and layout produced for this document is out of date,
-    /// because script rewrote the tree under it.
+    /// because script rewrote the tree under it — and so may its base URL be.
+    ///
+    /// The sheets already parsed keep the addresses they were parsed with; the
+    /// markup's addresses resolve against the new base from here on.
     pub fn document_changed(&mut self) {
+        self.base = document_base_url(&self.document, &self.url);
         self.invalidate_styles();
     }
 
-    /// Take the document back out, to build the page again with more of what it
-    /// asked for — a stylesheet that has since arrived, a picture that has decoded.
-    /// Parsing it twice would be the alternative, and the bytes are gone by then.
-    pub fn into_document(self) -> Document {
-        self.document
+    /// Take the document and its address back out, to build the page again with
+    /// more of what it asked for — a stylesheet that has since arrived, a picture
+    /// that has decoded. Parsing it twice would be the alternative, and the bytes
+    /// are gone by then.
+    pub fn into_document(self) -> (Document, url::Url) {
+        (self.document, self.url)
     }
 
     /// The box tree behind the page.
@@ -449,7 +508,7 @@ impl PageScene {
                 self.styler = Some(otlyra_css::cascade::Styler::new(
                     &self.document,
                     viewport,
-                    &self.sheets,
+                    &self.sources,
                 ));
                 true
             }
@@ -973,6 +1032,30 @@ impl PageScene {
         self.background_pictures.insert(url, picture);
         self.damage.add(Damage::PAINT);
     }
+}
+
+/// The document base URL (HTML §2.4.1): the frozen base URL of its first base
+/// element with an `href` (§4.2.3), or its own address when there is none.
+///
+/// The `href` is parsed against the document's address, never against another
+/// base. One that does not parse, or that is a `data:` or `javascript:` URL, is
+/// refused and the document's own address stands, as "set the frozen base URL"
+/// says.
+///
+/// Read off the tree as it stands, and every address in the page resolved
+/// with it. This deliberately stops short of HTML, which resolves an `<img>`'s
+/// `src`, a `<link>`'s `href`, a `<style>` sheet, a `style` attribute and a
+/// presentational hint when each is inserted or set: there a base element
+/// later in the document moves none of the addresses before it, and here it
+/// moves them all. A conforming document puts its base before anything with an
+/// address in it (§4.2.3), where the two agree; and a link is resolved when it
+/// is followed in HTML too.
+fn document_base_url(document: &Document, url: &url::Url) -> url::Url {
+    document
+        .base_element_href()
+        .and_then(|href| url.join(href).ok())
+        .filter(|base| !matches!(base.scheme(), "data" | "javascript"))
+        .unwrap_or_else(|| url.clone())
 }
 
 /// The document's `<title>`, if it has one.

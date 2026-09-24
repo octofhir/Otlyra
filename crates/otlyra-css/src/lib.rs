@@ -11,9 +11,12 @@
 //! - [`style`] — [`ComputedStyle`] and the value types it is made of.
 //! - [`calc`] — a math function with a percentage in it, kept for layout.
 //! - [`appearance`] — `appearance`, carried through a cascade that lacks it.
-//! - [`cascade`] — parsing stylesheets, ours ([`cascade::UA_STYLESHEET`]) and the
-//!   page's, and computing a style per element.
+//! - [`cascade`] — parsing stylesheets, ours ([`cascade::UA_STYLESHEET`], and
+//!   [`cascade::QUIRKS_STYLESHEET`] in quirks mode) and the page's, and computing
+//!   a style per element.
 //! - [`computed`] — the engine's computed values, as a [`ComputedStyle`].
+//! - `hints` — the declarations HTML's presentational attributes stand for,
+//!   read with HTML's own microsyntaxes rather than as CSS.
 //! - [`state`] — the state bits `:hover`, `:checked` and their kin are matched on.
 //! - [`invalidation`] — whether a change of state can change anything at all.
 //!
@@ -32,11 +35,13 @@ pub mod appearance;
 pub mod calc;
 pub mod cascade;
 pub mod computed;
+mod hints;
 pub mod invalidation;
 pub mod state;
 pub mod style;
 pub mod stylo_dom;
 
+pub use hints::non_negative_integer;
 pub use style::{
     AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Calc, Clear, ComputedStyle,

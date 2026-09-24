@@ -304,4 +304,45 @@ mod tests {
         );
         assert_eq!(document.refused_insertions(), 1);
     }
+
+    /// The base element that counts is the first in tree order with an `href`:
+    /// one without the attribute is passed over, and so is one that is not
+    /// HTML's.
+    #[test]
+    fn the_base_href_is_the_first_base_that_has_one() {
+        let mut document = Document::new();
+        let (_html, body) = skeleton(&mut document);
+        assert_eq!(document.base_element_href(), None, "no base element at all");
+
+        let mut dom = DocumentMutator::new(&mut document);
+        let head = dom.create_element(element("head"), vec![], None, false);
+        let targeted =
+            dom.create_element(element("base"), vec![attr("target", "_top")], None, false);
+        let foreign = dom.create_element(
+            QualName::new(None, ns!(svg), LocalName::from("base")),
+            vec![attr("href", "https://svg.test/")],
+            None,
+            false,
+        );
+        let first = dom.create_element(
+            element("base"),
+            vec![attr("href", "https://first.test/")],
+            None,
+            false,
+        );
+        let second = dom.create_element(
+            element("base"),
+            vec![attr("href", "https://second.test/")],
+            None,
+            false,
+        );
+        dom.insert_before(body, head);
+        dom.append(head, targeted);
+        dom.append(head, foreign);
+        // Later in the markup than the one in the head, and so not the one.
+        dom.append(body, second);
+        dom.append(head, first);
+
+        assert_eq!(document.base_element_href(), Some("https://first.test/"));
+    }
 }

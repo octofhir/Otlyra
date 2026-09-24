@@ -614,13 +614,10 @@ impl Painter for Browser {
                     && !modifiers.is_accelerator()
                     && self.keyboard_surface == SURFACE_PAGE
                     && self.tabs[self.active].system.is_none()
-                    && let Some(href) = self.tabs[self.active]
-                        .page
-                        .as_ref()
-                        .and_then(PageScene::focused_link)
+                    && let Some(page) = self.tabs[self.active].page.as_ref()
+                    && let Some(href) = page.focused_link()
                 {
-                    let url =
-                        otlyra_net::resolve(&self.tabs[self.active].url, &href).unwrap_or(href);
+                    let url = page.resolve(&href).unwrap_or(href);
                     self.navigate_from(&url, false);
                     return;
                 }

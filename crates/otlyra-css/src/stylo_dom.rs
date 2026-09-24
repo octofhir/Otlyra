@@ -20,7 +20,6 @@ use selectors::{Element as SelectorsElement, OpaqueElement};
 use style::selector_parser::{
     AttrValue, NonTSPseudoClass, PseudoElement, SelectorImpl as StyleSelectorImpl,
 };
-use style::shared_lock::SharedRwLock;
 use style::values::AtomIdent;
 
 /// The names Stylo hands the matcher.
@@ -49,13 +48,6 @@ pub struct Tree<'a> {
     ///
     /// Absent for a tree used only to match selectors, which needs no state.
     pub style_data: Option<&'a StyleData>,
-    /// The lock the cascade's own declarations are behind.
-    ///
-    /// A presentational attribute becomes a block of declarations, and every block
-    /// the engine reads has to be locked by the same lock the guards were taken
-    /// from — so the one the stylesheets were parsed under is handed down here.
-    /// Absent for a tree used only to match selectors, which never synthesizes any.
-    pub lock: Option<&'a SharedRwLock>,
     /// Where the state bits come from when there is no per-element state to read
     /// them out of.
     ///
@@ -63,6 +55,10 @@ pub struct Tree<'a> {
     /// the slots were made. A tree built only to match a selector has no slots, and
     /// this is what answers instead — the same computation, done per question.
     pub states: Option<&'a crate::state::States<'a>>,
+    /// The document's pragma-set default language, worked out the first time a
+    /// `:lang()` reaches an element nothing above has a language for, and not
+    /// before: a restyle that never asks pays nothing for it.
+    default_language: std::cell::OnceCell<Option<Box<str>>>,
 }
 
 impl<'a> Tree<'a> {
@@ -71,8 +67,8 @@ impl<'a> Tree<'a> {
         Self {
             document,
             style_data: None,
-            lock: None,
             states: None,
+            default_language: std::cell::OnceCell::new(),
         }
     }
 
@@ -81,23 +77,31 @@ impl<'a> Tree<'a> {
         Self {
             document,
             style_data: None,
-            lock: None,
             states: Some(states),
+            default_language: std::cell::OnceCell::new(),
         }
     }
 
-    /// A tree that can be styled, with the lock its declarations are read under.
-    pub fn styled(
-        document: &'a Document,
-        style_data: &'a StyleData,
-        lock: &'a SharedRwLock,
-    ) -> Self {
+    /// A tree that can be styled.
+    pub fn styled(document: &'a Document, style_data: &'a StyleData) -> Self {
         Self {
             document,
             style_data: Some(style_data),
-            lock: Some(lock),
             states: None,
+            default_language: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The language of an element that neither it nor anything above it gives
+    /// one (HTML, "The `lang` and `xml:lang` attributes"): the pragma-set default
+    /// language, if a `<meta http-equiv=content-language>` set one.
+    ///
+    /// The language a response's `Content-Language` header names comes after it,
+    /// and is not here: the header does not reach the cascade.
+    fn default_language(&self) -> Option<&str> {
+        self.default_language
+            .get_or_init(|| pragma_set_default_language(self.document))
+            .as_deref()
     }
 
     /// A handle to one node in it.
@@ -110,6 +114,52 @@ impl<'a> Tree<'a> {
             tree: std::marker::PhantomData,
         }
     }
+}
+
+/// What the document's `<meta http-equiv=content-language>` elements leave the
+/// pragma-set default language at (HTML §4.2.5.3, "Content language state").
+///
+/// Each one sets it as it is inserted, so the last in tree order that says
+/// anything wins, as it does in Chrome. One whose content lists more than one
+/// language, or none, says nothing; one that says anything says its first word.
+fn pragma_set_default_language(document: &Document) -> Option<Box<str>> {
+    let mut language = None;
+    let mut stack = vec![document.root()];
+    while let Some(id) = stack.pop() {
+        let children: Vec<NodeId> = document.children(id).collect();
+        stack.extend(children.into_iter().rev());
+        let Some(element) = document.get(id).and_then(|node| node.element()) else {
+            continue;
+        };
+        let is_pragma = element.name.ns == html5ever::ns!(html)
+            && element.name.local.as_ref() == "meta"
+            && element
+                .attr("http-equiv")
+                .is_some_and(|state| state.eq_ignore_ascii_case("content-language"));
+        if !is_pragma {
+            continue;
+        }
+        let Some(content) = element
+            .attr("content")
+            .filter(|content| !content.contains(','))
+        else {
+            continue;
+        };
+        if let Some(candidate) = content.split_ascii_whitespace().next() {
+            language = Some(Box::from(candidate));
+        }
+    }
+    language
+}
+
+/// Whether a language tag falls in a language range (Selectors 4 §7.2, after
+/// RFC 4647's extended filtering, without its wildcards): the range itself, or
+/// the range and more subtags after a hyphen, compared ignoring ASCII case — so
+/// `en` takes in `en-GB` and not `eng`.
+fn language_range_matches(range: &str, tag: &str) -> bool {
+    tag.get(..range.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(range))
+        && matches!(tag.as_bytes().get(range.len()), None | Some(b'-'))
 }
 
 thread_local! {
@@ -385,11 +435,18 @@ impl SelectorsElement for NodeRef<'_> {
             return self.element_state().intersects(flag);
         }
         match pseudo_class {
-            NonTSPseudoClass::Lang(_) | NonTSPseudoClass::CustomState(_) => false,
-            NonTSPseudoClass::ServoNonZeroBorder => self
-                .element()
-                .and_then(|element| element.attr("border"))
-                .is_some_and(|border| border != "0"),
+            NonTSPseudoClass::Lang(range) => {
+                style::dom::TElement::match_element_lang(self, None, range)
+            }
+            // A custom state is set by the element's own script, through the
+            // custom element API, which there is none of.
+            NonTSPseudoClass::CustomState(_) => false,
+            // Stylo's name for a table whose `border` attribute draws one, which
+            // is a question about the attribute's parsed value rather than its
+            // text.
+            NonTSPseudoClass::ServoNonZeroBorder => {
+                self.element().is_some_and(crate::hints::draws_border)
+            }
             _ => false,
         }
     }
@@ -498,89 +555,6 @@ fn fxhash(value: &str) -> u32 {
     hash
 }
 
-/// The CSS one element's presentational attributes stand for.
-///
-/// Only the attributes that are still worth honouring: the ones the old web is
-/// full of and that change what a page looks like rather than only where it sits.
-/// An attribute whose value is not what it should be contributes nothing, which is
-/// what a browser does with it too.
-fn presentational_css(element: &ElementData) -> String {
-    let attribute = |name: &str| {
-        element
-            .attr(name)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    };
-
-    let tag = element.name.local.as_ref();
-    let mut css = String::new();
-
-    if let Some(colour) = attribute("bgcolor") {
-        css.push_str(&format!("background-color:{colour};"));
-    }
-    if let Some(colour) = attribute("color")
-        && matches!(tag, "font" | "basefont")
-    {
-        css.push_str(&format!("color:{colour};"));
-    }
-
-    // `width` and `height` on a picture are the picture's own size and are read
-    // where it is sized, not here; on everything else they are a used width.
-    if !matches!(
-        tag,
-        "img" | "input" | "embed" | "object" | "canvas" | "video"
-    ) {
-        if let Some(width) = attribute("width").and_then(html_dimension) {
-            css.push_str(&format!("width:{width};"));
-        }
-        if let Some(height) = attribute("height").and_then(html_dimension) {
-            css.push_str(&format!("height:{height};"));
-        }
-    }
-
-    // `align` on a table is not text alignment: it floats the table. On a row or a
-    // cell it is what it says.
-    if let Some(align) = attribute("align") {
-        match (tag, align.to_ascii_lowercase().as_str()) {
-            ("table", side @ ("left" | "right")) => css.push_str(&format!("float:{side};")),
-            ("table", "center") => css.push_str("margin-left:auto;margin-right:auto;"),
-            (
-                "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "div" | "p" | "caption",
-                side @ ("left" | "right" | "center"),
-            ) => css.push_str(&format!("text-align:{side};")),
-            _ => {}
-        }
-    }
-
-    if tag == "table" {
-        // A border attribute is a width, and it draws on the table *and*, one pixel
-        // wide however wide the table's is, on every cell — which is the rule that
-        // makes `border=5` a thick frame around a thin grid. The cells' half is in
-        // the user-agent sheet, selected on the attribute being there at all.
-        if let Some(width) = attribute("border").and_then(html_dimension) {
-            css.push_str(&format!("border:{width} outset gray;"));
-        }
-        if let Some(spacing) = attribute("cellspacing").and_then(html_dimension) {
-            css.push_str(&format!("border-spacing:{spacing};"));
-        }
-    }
-
-    css
-}
-
-/// An HTML *dimension*: a number of pixels, or a percentage.
-///
-/// Anything else — and old markup has a great deal of anything else in these
-/// attributes — is refused rather than guessed at.
-fn html_dimension(value: &str) -> Option<String> {
-    let (number, unit) = match value.strip_suffix('%') {
-        Some(number) => (number, "%"),
-        None => (value, "px"),
-    };
-    let number: f32 = number.trim().parse().ok()?;
-    (number.is_finite() && number >= 0.0).then(|| format!("{number}{unit}"))
-}
-
 /// Match `selector` against every element in `document`, in tree order.
 ///
 /// The matching engine over our tree — the thing the cascade will use for every
@@ -611,9 +585,7 @@ pub fn select_with(
     // Every stylesheet and every selector list is parsed against a base URL, which
     // is what `url()` inside it would resolve against. A selector has none, so this
     // is a stand-in that cannot resolve to anything.
-    let url = UrlExtraData(servo_arc::Arc::new(
-        url::Url::parse("about:blank").expect("about:blank parses"),
-    ));
+    let url = UrlExtraData(servo_arc::Arc::new(crate::cascade::about_blank()));
     let list = SelectorParser::parse_author_origin_no_namespace(selector, &url)
         .map_err(|error| format!("bad selector {selector:?}: {error:?}"))?;
 
@@ -1069,6 +1041,57 @@ mod tests {
         assert_eq!(matching(html, ":link").len(), 1);
     }
 
+    /// `:lang()` asks for the nearest language declared up the tree, and takes a
+    /// range: `en` is `en-FI` too, and not `eng`. An empty declaration is an
+    /// unknown language, which no range matches.
+    #[test]
+    fn lang_is_the_nearest_declared_language_taken_as_a_range() {
+        let html = "<html lang=en-FI><body><p id=a>x\
+                    <div lang=''><p id=b>y</div><div lang=de><p id=c>z</div>";
+        assert_eq!(matching(html, "html:lang(en)"), ["html"]);
+        assert_eq!(matching(html, "p:lang(en)"), ["p#a"]);
+        assert_eq!(matching(html, "p:lang(EN-fi)"), ["p#a"]);
+        assert!(matching(html, "p:lang(e)").is_empty());
+        assert!(matching(html, "p:lang(en-GB)").is_empty());
+        assert_eq!(matching(html, "p:lang(de)"), ["p#c"]);
+        assert!(matching(html, "p:lang('')").is_empty());
+    }
+
+    /// `xml:lang` in the XML namespace outranks `lang`; written on an HTML
+    /// element it is in no namespace at all, and means nothing.
+    #[test]
+    fn xml_lang_outranks_lang() {
+        let html = "<html lang=en><body><p id=p xml:lang=de>x\
+                    <svg lang=en xml:lang=de><circle id=c r=1 /></svg>";
+        assert_eq!(matching(html, "circle:lang(de)"), ["circle#c"]);
+        assert!(matching(html, "circle:lang(en)").is_empty());
+        assert_eq!(matching(html, "p:lang(en)"), ["p#p"]);
+    }
+
+    /// With no language declared anywhere above, the document's own default is
+    /// the one its last `<meta http-equiv=content-language>` set — its first word,
+    /// and only if it names a single language.
+    #[test]
+    fn a_content_language_pragma_is_the_default_language() {
+        let pragma = |content: &str| {
+            format!(
+                "<meta http-equiv=content-language content='de'>\
+                     <meta http-equiv=CONTENT-LANGUAGE content='{content}'><p id=a>x"
+            )
+        };
+        assert_eq!(matching(&pragma("fr ca"), "p:lang(fr)"), ["p#a"]);
+        assert_eq!(matching(&pragma("fr, ca"), "p:lang(de)"), ["p#a"]);
+        assert_eq!(matching(&pragma(""), "p:lang(de)"), ["p#a"]);
+        assert!(
+            matching(
+                "<meta http-equiv=content-language content=de><p lang=en id=a>x",
+                "p:lang(de)"
+            )
+            .is_empty()
+        );
+        assert!(matching("<p id=a>x", "p:lang(en)").is_empty());
+    }
+
     #[test]
     fn a_selector_that_does_not_parse_is_an_error_rather_than_a_panic() {
         let document = otlyra_html::parse(b"<p>x", Some("utf-8")).document;
@@ -1089,6 +1112,12 @@ struct ElementSlot {
     attr_names: Vec<style::LocalName>,
     /// Its `style=` attribute, parsed once.
     style_attribute: Option<
+        servo_arc::Arc<style::shared_lock::Locked<style::properties::PropertyDeclarationBlock>>,
+    >,
+    /// What its presentational attributes stand for, worked out once. Behind the
+    /// same lock as every other block the engine reads, and handed out as the same
+    /// block every time the engine asks.
+    hints: Option<
         servo_arc::Arc<style::shared_lock::Locked<style::properties::PropertyDeclarationBlock>>,
     >,
     /// The computed styles and restyle bookkeeping, in the wrapper the engine
@@ -1115,6 +1144,7 @@ impl Default for ElementSlot {
             classes: Vec::new(),
             attr_names: Vec::new(),
             style_attribute: None,
+            hints: None,
             data: style::data::ElementDataWrapper::default(),
             dirty_descendants: std::sync::atomic::AtomicBool::default(),
             children_to_process: std::sync::atomic::AtomicIsize::default(),
@@ -1164,11 +1194,15 @@ impl StyleData {
     /// interned them into — the two compare by identity within themselves and not
     /// with each other. Interning once here is what makes matching a pointer
     /// comparison rather than a string one, thousands of times per page.
+    ///
+    /// `base` is the document's base URL, which an address in a `style`
+    /// attribute or a presentational hint resolves against.
     pub fn prepare(
         &mut self,
         document: &Document,
         form: &otlyra_dom::FormState,
         interaction: crate::state::Interaction,
+        base: &style::stylesheets::UrlExtraData,
     ) {
         let mut every = Vec::new();
         let mut stack = vec![document.root()];
@@ -1176,7 +1210,7 @@ impl StyleData {
             every.push(id);
             stack.extend(document.children(id));
         }
-        self.prepare_nodes(document, &every, form, interaction);
+        self.prepare_nodes(document, &every, form, interaction, base);
     }
 
     /// The same, for a chosen few.
@@ -1191,9 +1225,9 @@ impl StyleData {
         nodes: &[NodeId],
         form: &otlyra_dom::FormState,
         interaction: crate::state::Interaction,
+        base: &style::stylesheets::UrlExtraData,
     ) {
         let states = crate::state::States::new(document, form, interaction);
-        let url = crate::cascade::base_url();
         let quirks_mode = match document.quirks_mode() {
             html5ever::interface::QuirksMode::Quirks => style::context::QuirksMode::Quirks,
             html5ever::interface::QuirksMode::LimitedQuirks => {
@@ -1211,7 +1245,7 @@ impl StyleData {
                     let source = crate::appearance::rewrite_declarations(source);
                     let block = style::properties::parse_style_attribute(
                         &source,
-                        &url,
+                        base,
                         None,
                         quirks_mode,
                         style::stylesheets::CssRuleType::Style,
@@ -1230,6 +1264,8 @@ impl StyleData {
                             .map(|attr| style::LocalName::from(attr.name.local.as_ref()))
                             .collect(),
                         style_attribute,
+                        hints: crate::hints::presentational_hints(document, id, base)
+                            .map(|block| servo_arc::Arc::new(self.lock.wrap(block))),
                         state: states.state_of(id),
                         ..ElementSlot::default()
                     },
@@ -1641,40 +1677,42 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
         None
     }
 
+    /// The language this element itself declares: `xml:lang`, the one in the
+    /// XML namespace, before `lang`, which it outranks where both are set (HTML,
+    /// "The `lang` and `xml:lang` attributes"). An `xml:lang` written on an HTML
+    /// element is in no namespace and means nothing.
     fn lang_attr(&self) -> Option<AttrValue> {
-        self.element()
-            .and_then(|element| element.attr("lang"))
+        let element = self.element()?;
+        element
+            .attr_in(&html5ever::ns!(xml), "lang")
+            .or_else(|| element.attr("lang"))
             .map(AttrValue::from)
     }
 
+    /// `:lang()` (Selectors 4 §7.2): whether this element's language falls in
+    /// `range`.
+    ///
+    /// The language is the nearest one declared up the tree, or the document's
+    /// default when nothing declares one. An empty declaration says the language
+    /// is unknown: it stops the walk, and an unknown language is in no range at
+    /// all, `:lang("")` included, as Chrome has it.
     fn match_element_lang(
         &self,
         override_lang: Option<Option<AttrValue>>,
-        value: &std::boxed::Box<str>,
+        range: &std::boxed::Box<str>,
     ) -> bool {
-        // `:lang()` matches the nearest `lang` attribute up the tree, compared as a
-        // language range: `en` matches `en-GB`.
-        let declared = match override_lang {
-            Some(value) => value,
-            None => {
-                let mut current = Some(*self);
-                let mut found = None;
-                while let Some(node) = current {
-                    if let Some(lang) = node.element().and_then(|element| element.attr("lang")) {
-                        found = Some(AttrValue::from(lang));
-                        break;
-                    }
-                    current = node.parent_element_id().map(|id| node.at(id));
-                }
-                found
-            }
+        let declared = override_lang.unwrap_or_else(|| {
+            std::iter::successors(Some(*self), |node| {
+                node.parent_element_id().map(|id| node.at(id))
+            })
+            .find_map(|node| node.lang_attr())
+        });
+        let language: Option<&str> = match &declared {
+            Some(declared) => Some(declared.as_ref()),
+            None => self.tree().default_language(),
         };
-
-        declared.is_some_and(|declared| {
-            let declared = declared.to_ascii_lowercase();
-            let wanted = value.to_ascii_lowercase();
-            declared == wanted || declared.starts_with(&format!("{wanted}-"))
-        })
+        language
+            .is_some_and(|language| !language.is_empty() && language_range_matches(range, language))
     }
 
     fn is_html_document_body_element(&self) -> bool {
@@ -1694,9 +1732,9 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
     /// the user-agent sheet, so `<td bgcolor>` beats the default that would have
     /// been transparent. The engine has an origin for exactly this.
     ///
-    /// Written as CSS and parsed rather than assembled property by property: the
-    /// values are CSS values with CSS's own edge cases in them, and a parser that
-    /// already knows them is better than a second one that nearly does.
+    /// Worked out when the slot was made, by `crate::hints`, and handed over as
+    /// they are. A tree with no slots — one built only to match a selector — has
+    /// none to hand over.
     fn synthesize_presentational_hints_for_legacy_attributes<V>(
         &self,
         _visited_handling: selectors::matching::VisitedHandlingMode,
@@ -1704,27 +1742,12 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
     ) where
         V: selectors::sink::Push<style::applicable_declarations::ApplicableDeclarationBlock>,
     {
-        let Some(lock) = self.tree().lock else {
+        let Some(block) = self.slot().and_then(|slot| slot.hints.as_ref()) else {
             return;
         };
-        let Some(element) = self.element() else {
-            return;
-        };
-        let source = presentational_css(element);
-        if source.is_empty() {
-            return;
-        }
-
-        let declarations = style::properties::parse_style_attribute(
-            &source,
-            &crate::cascade::base_url(),
-            None,
-            style::context::QuirksMode::NoQuirks,
-            style::stylesheets::CssRuleType::Style,
-        );
         hints.push(
             style::applicable_declarations::ApplicableDeclarationBlock::from_declarations(
-                servo_arc::Arc::new(lock.wrap(declarations)),
+                block.clone(),
                 style::rule_tree::CascadeLevel::new(style::rule_tree::CascadeOrigin::PresHints),
                 style::stylesheets::layer_rule::LayerOrder::root(),
             ),

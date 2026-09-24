@@ -7,16 +7,24 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{ComputedStyle, Ratio, Size};
+use otlyra_css::{ComputedStyle, Ratio};
 
 use crate::box_tree::{BoxId, Replaced};
 use crate::fragment::{Fragment, FragmentKind, Rect};
 
 use super::box_model::{resolve_border, resolve_padding};
 use super::sizing::{
-    Frame, InlineRoom, Limits, OwnWidth, PreferredRatio, Sizes, block_sizes_in, content_box,
-    preferred_ratio, replaced_widths,
+    Frame, InlineRoom, Limits, OwnWidth, PreferredRatio, Sizes, block_sizes_in, preferred_ratio,
+    replaced_widths,
 };
+
+/// The default object size (CSS Images 3 §5.2; CSS 2.2 §10.3.2 and §10.6.2):
+/// what a replaced element is along an axis where neither its style nor its
+/// content gives it a size — an `iframe`, a `video` with no poster.
+///
+/// CSS 2.2 shrinks it to the largest two-to-one rectangle that fits a device
+/// narrower than three hundred pixels; that is not done.
+const DEFAULT_OBJECT_SIZE: (f32, f32) = (300.0, 150.0);
 
 /// The size a replaced box is drawn at: its *content* box, which is the picture
 /// and not the frame around it.
@@ -29,9 +37,8 @@ use super::sizing::{
 /// `box-sizing: border-box` takes the frame out of the number the page wrote, and
 /// the ratio is applied to what is left: a hundred-pixel box with a ten-pixel
 /// border holds eighty pixels of picture, and a two-to-one picture is forty tall
-/// rather than fifty. The presentational `width` attribute goes through the same
-/// door, because it is a rule setting `width` and nothing more; and so do the
-/// minimum and the maximum, which hold the picture rather than its frame.
+/// rather than fifty. The minimum and the maximum go through the same door,
+/// because they hold the picture rather than its frame.
 ///
 /// The sizing properties are read as they are for any box (see
 /// [`replaced_widths`] for what is particular to a picture), and a given
@@ -48,7 +55,6 @@ pub(super) fn replaced_size(
     let heights = picture_heights(style, content, room.measure, containing_height);
     let own = OwnWidth {
         natural: width_from(style, content, frame, heights),
-        hint: content.hint.0,
     };
     let widths = replaced_widths(style, room, frame.inline, own);
     drawn_size(style, content, frame, widths, heights)
@@ -102,34 +108,26 @@ pub(super) fn replaced_height(
 }
 
 /// What `height`, `min-height` and `max-height` ask of a picture, as content-box
-/// heights, with a `height` attribute standing in for an `auto` height — and
-/// only for `auto`, since any height a stylesheet names outranks a hint.
+/// heights.
 pub(super) fn picture_heights(
     style: &ComputedStyle,
     content: &Replaced,
     containing_width: f32,
     containing_height: Option<f32>,
 ) -> Sizes {
-    let (_, natural_height) = content.intrinsic.unwrap_or_default();
-    let heights = block_sizes_in(
+    let (_, natural_height) = object_size(content);
+    block_sizes_in(
         style,
         containing_width,
         containing_height,
         Some(natural_height),
-    );
-    match style.height {
-        Size::Auto => Sizes {
-            preferred: content.hint.1.map(|hint| {
-                content_box(
-                    hint,
-                    style.box_sizing,
-                    Frame::of(style, containing_width).block,
-                )
-            }),
-            ..heights
-        },
-        Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => heights,
-    }
+    )
+}
+
+/// The size a replaced element is when nothing is said about its size: its
+/// content's own, or the default object size when the content has none.
+fn object_size(content: &Replaced) -> (f32, f32) {
+    content.intrinsic.unwrap_or(DEFAULT_OBJECT_SIZE)
 }
 
 /// A picture's preferred aspect ratio (CSS Sizing 4 §4.1): its natural ratio,
@@ -157,7 +155,7 @@ fn height_at(
     width: f32,
     heights: Sizes,
 ) -> f32 {
-    let (_, natural_height) = content.intrinsic.unwrap_or_default();
+    let (_, natural_height) = object_size(content);
     heights
         .used(ratio(style, content).map_or(natural_height, |ratio| ratio.height_for(width, frame)))
 }
@@ -190,7 +188,7 @@ fn drawn_size(
     widths: Sizes,
     heights: Sizes,
 ) -> (f32, f32) {
-    let (natural_width, _) = content.intrinsic.unwrap_or_default();
+    let (natural_width, _) = object_size(content);
     let at_width = |width| (width, height_at(style, content, frame, width, heights));
     match (widths.preferred, heights.preferred, ratio(style, content)) {
         // CSS 2.2 §10.3.2: an `auto` width is the used height through the

@@ -6,8 +6,6 @@
 //! one. The decoded pictures are kept here too, because every picture — whoever
 //! asked for it — is decoded once and looked up by its address.
 
-use std::collections::HashMap;
-
 use crate::fetcher::ResourceKind;
 use crate::page::PageScene;
 
@@ -85,7 +83,9 @@ impl Browser {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
             };
-            let base = self.tabs[index].url.clone();
+            // Absolute already: every sheet resolved its own `url()`s as it was
+            // parsed. The document is still asked whether it may reach them.
+            let document = page.url().to_string();
             let wanted: Vec<String> = page
                 .wanted_pictures()
                 .into_iter()
@@ -101,13 +101,15 @@ impl Browser {
                     self.background_requests.insert(url, index);
                     continue;
                 }
-                let Some(target) = Self::subresource_url(&base, &url) else {
+                let reachable =
+                    url::Url::parse(&url).is_ok_and(|target| Self::may_reach(&document, &target));
+                if !reachable {
                     // Recorded anyway: a picture that may not be fetched must not be
                     // asked for again on every frame.
                     self.background_requests.insert(url, index);
                     continue;
-                };
-                let id = self.fetcher.request(&target, ResourceKind::Image);
+                }
+                let id = self.fetcher.request(&url, ResourceKind::Image);
                 self.background_requests.insert(url.clone(), index);
                 self.background_fetches.insert(id, (index, url));
             }
@@ -139,7 +141,7 @@ impl Browser {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
             };
-            let base = self.tabs[index].url.clone();
+            let (document, base) = (page.url().to_string(), page.base_url().clone());
             let changed: Vec<otlyra_layout::ImageSource> =
                 otlyra_layout::image_sources(page.document(), viewport)
                     .into_iter()
@@ -153,7 +155,7 @@ impl Browser {
                     .collect();
 
             for source in changed {
-                let Some(target) = Self::subresource_url(&base, &source.src) else {
+                let Some(target) = Self::subresource_url(&document, &base, &source.src) else {
                     continue;
                 };
                 // Already decoded: no request, straight into the page.
@@ -183,43 +185,28 @@ impl Browser {
     /// which is a page's first restyle — so this is asked after a frame rather than
     /// with the pictures the markup names, exactly as a background picture is.
     ///
-    /// The address is resolved against the sheet the rule was written in, not
-    /// against the page: a sheet in a directory of its own names its fonts beside
+    /// The addresses come absolute, each resolved against the sheet its rule was
+    /// written in: a sheet in a directory of its own names its fonts beside
     /// itself.
     fn fetch_fonts(&mut self, tabs: &[usize]) {
         for &index in tabs {
             let Some(page) = self.tabs[index].page.as_ref() else {
                 continue;
             };
-            // The faces first: they come from the styler's own rules, and most
-            // pages have none. Resolving the sheets is a walk of the whole
-            // document, and there is no reason to walk it to place addresses
-            // nothing asked for.
             let faces: Vec<otlyra_css::cascade::FontFace> =
                 page.wanted_fonts().into_iter().take(FONT_LIMIT).collect();
-            if faces.is_empty() {
-                continue;
-            }
-            let base = self.tabs[index].url.clone();
-            let sheets: HashMap<otlyra_dom::NodeId, String> =
-                otlyra_css::cascade::stylesheet_links(page.document())
-                    .into_iter()
-                    .filter_map(|link| Some((link.node, Self::subresource_url(&base, &link.href)?)))
-                    .collect();
+            let document = page.url().to_string();
 
             for face in faces {
-                // The first address that resolves, which is as far as the order in
-                // the rule is honoured: what the rest of the list is for is formats
-                // this cannot read, and there is no telling which those are until
-                // the bytes are here.
-                let sheet_base = face
-                    .sheet
-                    .and_then(|node| sheets.get(&node))
-                    .unwrap_or(&base);
+                // The first address the page may reach, which is as far as the
+                // order in the rule is honoured: what the rest of the list is for
+                // is formats this cannot read, and there is no telling which those
+                // are until the bytes are here.
                 let Some(target) = face
                     .sources
                     .iter()
-                    .find_map(|source| Self::subresource_url(sheet_base, source))
+                    .find(|source| Self::may_reach(&document, source))
+                    .map(url::Url::to_string)
                 else {
                     continue;
                 };

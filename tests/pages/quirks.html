@@ -1,0 +1,68 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>Quirks mode — Otlyra</title>
+</head>
+<body text="#222222" topmargin="12" leftmargin="24" rightmargin="24">
+
+<h1>Quirks mode and the legacy attributes</h1>
+<p>This page has no doctype, so it is in quirks mode, and it is styled only by
+attributes the way pages were before stylesheets: the body's
+<code>text</code> colour and its <code>topmargin</code>,
+<code>leftmargin</code> and <code>rightmargin</code> — twelve pixels above,
+twenty-four at the sides — and the <code>font</code> and <code>hr</code>
+attributes below.</p>
+
+<h2>1. A table does not inherit the text around it</h2>
+<center style="font: 13px Verdana, sans-serif">
+  <p>This paragraph is centred and set in 13px Verdana, and so is everything
+  else inside the <code>center</code>, except the table.</p>
+  <table bgcolor="#ffeecc" width="70%" cellpadding="4">
+    <tr><td>In quirks mode a table resets the font size, the weight, the style,
+    the line height, the white space and the alignment to their initial values,
+    so this cell's text starts at its left edge and is 16px — still Verdana,
+    because the family is not among them.</td></tr>
+  </table>
+</center>
+<p><small>Known gaps here: a <code>center</code> should put the table itself in
+the middle too, which takes the legacy alignment of the blocks inside it; and
+quirks mode drops the default top margin of the first heading in the body,
+which is layout's quirk rather than the style sheet's.</small></p>
+
+<h2>2. font</h2>
+<p><font size="1">size=1</font> <font size="2">size=2</font>
+<font size="3">size=3</font> <font size="4">size=4</font>
+<font size="5">size=5</font> <font size="6">size=6</font>
+<font size="7">size=7</font></p>
+<p>Relative to three: <font size="+2">size=+2</font>,
+<font size="-1">size=-1</font>, and <font size="+10">size=+10</font>, which
+stops at seven.</p>
+<p><font face="Nope, monospace">face="Nope, monospace"</font> falls back along
+its list. <font face="x; display:none">face="x; display:none" is not a list of
+families, so it sets nothing, and this text is still here.</font>
+<font color="green">color=green</font>, and
+<font color="red;display:none">color="red;display:none"</font>, which is read
+as the colour #ed0000 and not as a stylesheet.</p>
+
+<h2>3. hr</h2>
+<p>The plain rule is an inset line, two pixels tall:</p>
+<hr>
+<p><code>size=5</code> is three pixels between the two lines, and
+<code>size=1</code> is the upper line alone:</p>
+<hr size="5">
+<hr size="1">
+<p><code>noshade</code> and <code>color</code> make it solid, with every border
+half the size; <code>width</code> and <code>align</code> place it:</p>
+<hr noshade size="6" width="50%" align="left">
+<hr color="#cc3300" size="4" width="200">
+<hr align="right" width="100">
+
+<h2>4. The rest of the quirks sheet</h2>
+<form style="background: #eeeeff">A form has a margin of 1em below it in
+quirks mode, and none in standards mode.</form>
+<p>This paragraph follows the form.</p>
+<p><input value="120px across" style="width: 120px"> A field is measured across
+its border in quirks mode, so this one is 120px wide, border and all.</p>
+
+</body>
+</html>

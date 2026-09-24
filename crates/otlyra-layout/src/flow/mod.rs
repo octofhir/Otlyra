@@ -455,3 +455,6 @@ mod tests;
 
 #[cfg(test)]
 mod sizing_tests;
+
+#[cfg(test)]
+mod embedded_tests;

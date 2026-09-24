@@ -1,0 +1,42 @@
+/* The user-agent rules that apply only in quirks mode.
+ *
+ * A document with no doctype, or an old one, is laid out the way the pages
+ * written for the browsers of their day expect, and HTML's rendering chapter
+ * says what that takes of the user-agent sheet: each of its sections that has
+ * such rules ends in "In quirks mode, the following rules are also expected to
+ * apply", and every one of those blocks is here, verbatim, under its section.
+ * They come after the ordinary sheet, in the same origin, so where the two say
+ * different things at the same specificity these win.
+ *
+ * Limited quirks mode is not quirks mode: none of this applies to it.
+ */
+
+@namespace url(http://www.w3.org/1999/xhtml);
+
+/* Flow content (HTML §15.3.3). */
+form { margin-block-end: 1em; }
+
+/* Lists (HTML §15.3.7): an item outside any list has its marker inside it. */
+li { list-style-position: inside; }
+li :is(dir, menu, ol, ul) { list-style-position: outside; }
+:is(dir, menu, ol, ul) :is(dir, menu, ol, ul, li) { list-style-position: unset; }
+
+/* Tables (HTML §15.3.8): a table does not inherit the text around it — which
+   is what keeps a `<center>` from centring every cell of the table inside it. */
+table {
+  font-weight: initial;
+  font-style: initial;
+  font-variant: initial;
+  font-size: initial;
+  line-height: initial;
+  white-space: initial;
+  text-align: initial;
+}
+
+/* Form controls (HTML §15.3.10). */
+input:not([type=image i]), textarea { box-sizing: border-box; }
+
+/* Images (HTML §15.4.3): a little room between an aligned image and the text
+   beside it. */
+img[align=left i] { margin-right: 3px; }
+img[align=right i] { margin-left: 3px; }

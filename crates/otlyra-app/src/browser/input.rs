@@ -186,9 +186,7 @@ impl Browser {
                 // A link is followed rather than activated: there is no control
                 // behind it, and what pressing one means is a navigation.
                 if let Some(href) = box_id.and_then(|box_id| page.href_of(box_id)) {
-                    let here = self.tabs[self.active].url.clone();
-                    let target =
-                        otlyra_net::url::resolve(&here, &href).unwrap_or_else(|| href.clone());
+                    let target = page.resolve(&href).unwrap_or(href);
                     self.navigate_from(&target, false);
                     return;
                 }
@@ -310,7 +308,7 @@ impl Browser {
         };
     }
 
-    /// The link under the pointer, resolved against the tab's own address.
+    /// The link under the pointer, resolved against the document's base URL.
     ///
     /// Resolution happens here rather than at the click, because the cursor has to
     /// know as well, and a link that changes the cursor but goes nowhere — or the
@@ -321,9 +319,9 @@ impl Browser {
             return None;
         }
         let (x, y) = self.in_page(x, y);
-        let tab = self.tabs.get(self.active)?;
-        let href = tab.page.as_ref()?.link_at(x, y)?;
-        Some(otlyra_net::resolve(&tab.url, &href).unwrap_or(href))
+        let page = self.tabs.get(self.active)?.page.as_ref()?;
+        let href = page.link_at(x, y)?;
+        Some(page.resolve(&href).unwrap_or(href))
     }
 }
 

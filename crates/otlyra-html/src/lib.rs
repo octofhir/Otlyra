@@ -224,11 +224,14 @@ pub fn parse_with_scripts(
     let (mut document, mut runner) = parse_with(bytes, decision, runner, &sources);
 
     // A `<meta>` the prescan never saw — past 1024 bytes, or only spelled out once
-    // character references were resolved. If we were guessing, the document knows
-    // better than we do, and the only way to act on that is to decode it again. Once:
+    // character references were resolved. If we were guessing, from the bytes or
+    // not, the document knows better than we do (both guesses are "tentative" in
+    // HTML §13.2.3.2), and the only way to act on that is to decode it again. Once:
     // the second pass starts from a decided encoding, so it cannot ask for a third.
-    if decision.source == EncodingSource::Default
-        && let Some(encoding) = document.indicated_encoding()
+    if matches!(
+        decision.source,
+        EncodingSource::Default | EncodingSource::Detected
+    ) && let Some(encoding) = document.indicated_encoding()
         && encoding != decision.encoding
     {
         decision = EncodingDecision {
@@ -428,6 +431,32 @@ mod tests {
         assert_eq!(parsed.encoding.source, EncodingSource::TokenizerIndicator);
         assert_eq!(parsed.encoding.encoding, encoding_rs::WINDOWS_1251);
         assert!(dump::serialize(&parsed.document).contains("\"Привет\""));
+    }
+
+    /// A document that says nothing about its encoding and is UTF-8 is read as
+    /// UTF-8, dash and all.
+    #[test]
+    fn an_unlabelled_utf8_document_is_read_as_utf8() {
+        let parsed = parse(b"<p>GPT\xE2\x80\x936", None);
+
+        assert_eq!(parsed.encoding.source, EncodingSource::Detected);
+        assert!(
+            dump::serialize(&parsed.document).contains("\"GPT\u{2013}6\""),
+            "{}",
+            dump::serialize(&parsed.document)
+        );
+    }
+
+    /// What the bytes suggest is a guess like the default, and a declaration the
+    /// prescan did not reach outranks it.
+    #[test]
+    fn a_late_meta_outranks_a_detected_encoding() {
+        let mut bytes = format!("<!--{}-->", " ".repeat(1100)).into_bytes();
+        bytes.extend_from_slice(b"<meta charset=windows-1251><p>\xE2\x80\x93");
+        let parsed = parse(&bytes, None);
+
+        assert_eq!(parsed.encoding.source, EncodingSource::TokenizerIndicator);
+        assert_eq!(parsed.encoding.encoding, encoding_rs::WINDOWS_1251);
     }
 
     /// The transport outranks the document, so a late `<meta>` must not undo it.

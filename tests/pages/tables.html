@@ -5,7 +5,9 @@
 <title>Tables</title>
 <style>
   body { margin: 8px; font: 16px/1.2 Times; }
-  table { border-spacing: 2px; }
+  /* Only the tables above the attributes section: an author rule beats a
+     presentational hint, so this one would hide every cellspacing below. */
+  body > table { border-spacing: 2px; }
 </style>
 </head>
 <body>
@@ -111,6 +113,48 @@
     <td style="border: 3px solid navy">solid</td>
   </tr>
 </table>
+
+<section>
+<h2>Presentational attributes</h2>
+<p>cellpadding 0, 5 and the default; cellspacing 0 and 8:</p>
+<table border="1" cellpadding="0"><tr><td>pad 0</td><td>b</td></tr></table>
+<table border="1" cellpadding="5"><tr><td>pad 5</td><td>b</td></tr></table>
+<table border="1"><tr><td>pad 1</td><td>b</td></tr></table>
+<table border="1" cellspacing="0"><tr><td>spacing 0</td><td>b</td></tr></table>
+<table border="1" cellspacing="8"><tr><td>spacing 8</td><td>b</td></tr></table>
+
+<p>valign on the cells, and on a row:</p>
+<table border="1">
+  <tr><td style="height: 60px">tall</td><td valign="top">top</td><td valign="middle">middle</td>
+      <td valign="bottom">bottom</td><td>default</td></tr>
+  <tr valign="bottom"><td style="height: 40px">tall</td><td>row says bottom</td></tr>
+</table>
+
+<p>nowrap, in a table squeezed narrower than its words:</p>
+<table border="1" style="width: 120px">
+  <tr><td nowrap>this cell does not wrap</td><td>this one wraps</td></tr>
+</table>
+
+<p>bgcolor: named, hashed, short, hashless, three bare digits, and not a colour:</p>
+<table cellspacing="4">
+  <tr>
+    <td bgcolor="teal">teal</td>
+    <td bgcolor="#ff8800">#ff8800</td>
+    <td bgcolor="#08f">#08f</td>
+    <td bgcolor="00cc00">00cc00</td>
+    <td bgcolor="00f">00f</td>
+    <td bgcolor="chucknorris">chucknorris</td>
+    <td bgcolor="red;display:none">red;display:none</td>
+  </tr>
+</table>
+
+<p>border as a word, as pixels, and as zero written two ways:</p>
+<table border><tr><td>border</td></tr></table>
+<table border="4"><tr><td>border=4</td></tr></table>
+<table border="2px"><tr><td>border=2px</td></tr></table>
+<table border="0px"><tr><td>border=0px</td></tr></table>
+<table border="00"><tr><td>border=00</td></tr></table>
+</section>
 
 </body>
 </html>

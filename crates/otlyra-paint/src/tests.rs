@@ -749,7 +749,7 @@ fn text_shadows_are_drawn_behind_the_text() {
 fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::ImageSampler) {
     let source = format!(
         "<style>body {{ margin: 0 }} div {{ height: 50px; width: 200px; \
-         background-image: url(behind.png); {declarations} }}</style><div></div>"
+         background-image: url(https://x.test/behind.png); {declarations} }}</style><div></div>"
     );
     let parsed = otlyra_html::parse(source.as_bytes(), Some("utf-8"));
     let styles = otlyra_css::cascade::style_document(
@@ -787,7 +787,10 @@ fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::Image
         &fragments,
         &Frame {
             viewport: (800.0, 600.0),
-            background: Some(&|url: &str| (url == "behind.png").then(|| picture.clone())),
+            // Absolute, as every address a sheet names comes out of the cascade.
+            background: Some(&|url: &str| {
+                (url == "https://x.test/behind.png").then(|| picture.clone())
+            }),
             ..Frame::default()
         },
     );
