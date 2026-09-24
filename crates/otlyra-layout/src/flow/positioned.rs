@@ -14,7 +14,7 @@ use crate::box_tree::{BoxId, BoxKind};
 use crate::fragment::{Fragment, Rect};
 
 use super::box_model::resolve_padding;
-use super::sizing::{Frame, InlineRoom};
+use super::sizing::{BlockSpace, Frame, InlineRoom};
 use super::{ContainingBlock, Flow, mark_fixed, mark_layer, offset};
 
 /// How far `relative` moves a box from where the flow put it.
@@ -45,9 +45,11 @@ impl<'a> Flow<'a> {
     /// Lay out a box's children, making it the containing block for the absolutely
     /// positioned ones if its `position` says so.
     ///
-    /// `content_height` is the box's own height, when it has one before its
-    /// contents are laid out: it is what a percentage height inside the box is
-    /// of (CSS 2.2 §10.5), and a flex container inside it is that tall.
+    /// `space` is the room the box's own content box has down the block axis. Its
+    /// height, when the box has one before its contents are laid out, is what a
+    /// percentage height inside the box is of (CSS 2.2 §10.5); and when the box
+    /// is a flex container, the height and the limits together are what its
+    /// items are fitted into.
     ///
     /// The height a containing block offers a positioned box is that height, or
     /// the rest of the page when it has none: what a percentage inset resolves
@@ -60,13 +62,14 @@ impl<'a> Flow<'a> {
         content_width: f32,
         content_x: f32,
         content_y: f32,
-        content_height: Option<f32>,
+        space: BlockSpace,
         out: &mut Vec<Fragment>,
     ) -> f32 {
-        let outer_height = std::mem::replace(&mut self.containing_height, content_height);
-        let used =
-            self.layout_contents(id, content_width, content_x, content_y, content_height, out);
+        let outer_height = std::mem::replace(&mut self.containing_height, space.height);
+        let outer_limits = std::mem::replace(&mut self.container_limits, space.limits);
+        let used = self.layout_contents(id, content_width, content_x, content_y, space.height, out);
         self.containing_height = outer_height;
+        self.container_limits = outer_limits;
         used
     }
 
@@ -139,7 +142,9 @@ impl<'a> Flow<'a> {
         // `auto` width, what its two insets leave between them, or when an edge
         // is free what its content wants of what there is; and the minimum and
         // maximum over either. A picture is its own width between two insets as
-        // anywhere else (§10.3.8), and its margins take up the rest.
+        // anywhere else (§10.3.8), and its margins take up the rest; and so is
+        // a box with a preferred aspect ratio and a height to take its width
+        // from (CSS Sizing 4 §4.2).
         let frame = Frame::of(&style, area.width).inline;
         let room = InlineRoom::laid_out(
             area.width,
@@ -147,9 +152,14 @@ impl<'a> Flow<'a> {
         );
         let picture = matches!(self.tree.node(id).kind, BoxKind::Replaced(_));
         let width = match (left, right) {
-            (Some(left), Some(right)) if !picture => self
-                .inline_sizes(id, &style, room, frame)
-                .used_border_box(frame, || (area.width - left - right).max(0.0)),
+            (Some(left), Some(right)) if !picture => {
+                let sizes = self.inline_sizes(id, &style, room, frame);
+                sizes.used_border_box(frame, || {
+                    self.automatic_width(id, &style, room, frame, |_| {
+                        (area.width - left - right).max(0.0)
+                    })
+                })
+            }
             _ => self.shrink_to_fit_width(id, &style, room, frame),
         };
 

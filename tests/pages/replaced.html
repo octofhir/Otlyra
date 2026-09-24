@@ -58,5 +58,79 @@
     <figcaption>the alternative text, framed</figcaption></figure>
 </div>
 
+<h1>aspect-ratio: a box that keeps its shape</h1>
+
+<style>
+  .ratio-hero { width: 320px; aspect-ratio: 16 / 9; background: #234 url(images/wide.png) center / cover; }
+  .embed { position: relative; width: 360px; aspect-ratio: 16 / 9; background: #222; }
+  .embed > div { position: absolute; top: 0; left: 0; width: 100%; height: 100%; box-sizing: border-box; border: 4px solid #c93; }
+  .embed > span { position: absolute; left: 8px; bottom: 8px; color: #fff; font-size: 13px; }
+  .thumbs { display: grid; grid-template-columns: repeat(4, 90px); gap: 8px; }
+  .thumbs img { width: 100%; aspect-ratio: 1; object-fit: cover; }
+  .card { width: 160px; aspect-ratio: 2; background: #cfc; font-size: 13px; }
+  .brand { display: flex; align-items: center; gap: 12px; height: 48px; padding: 0 12px; background: #eef; }
+  .brand img { height: 100%; }
+  .brand nav { margin-left: auto; }
+  .strip { display: flex; gap: 8px; height: 60px; background: #fee; }
+</style>
+
+<div class="row">
+  <figure><div class="ratio-hero"></div>
+    <figcaption>16 / 9 behind a background — 320&times;180</figcaption></figure>
+  <figure><div class="embed"><div></div><span>a video at 100% of it</span></div>
+    <figcaption>an embed, 360&times;202.5</figcaption></figure>
+</div>
+
+<div class="row">
+  <figure><div class="thumbs">
+      <img src="images/wide.png"><img src="images/tile-400.png">
+      <img src="images/square.jpg"><img src="images/tile-100.png">
+    </div>
+    <figcaption>square thumbnails, object-fit: cover</figcaption></figure>
+</div>
+
+<div class="row">
+  <figure><div class="card">two to one</div>
+    <figcaption>short — 160&times;80</figcaption></figure>
+  <figure><div class="card">Text longer than two to one has room for grows the box
+      rather than spilling out of it.</div>
+    <figcaption>content grows it</figcaption></figure>
+  <figure><div class="card" style="overflow: hidden">Text longer than two to one has room for
+      is cut off where the box keeps its shape.</div>
+    <figcaption>overflow: hidden keeps it</figcaption></figure>
+</div>
+
+<header class="brand"><img src="images/tile-400.png"><b>Brand</b>
+  <nav>a picture at height: 100% in a 48px header is 96 wide</nav></header>
+<p></p>
+<div class="strip"><img src="images/tile-400.png"><img src="images/square.jpg" style="max-height: 50%">
+  <img src="images/tile-200.png" style="margin: 10px 0"></div>
+<p style="font-size: 13px; color: #555">stretched down a 60px row: 120&times;60, 30&times;30 at max-height: 50%, 80&times;40 inside 10px margins</p>
+
+<div class="row">
+  <figure><div class="card" style="width: 200px; aspect-ratio: 5">
+      <div style="height: 60px; margin-bottom: 30px; background: #9c9">ends in a margin</div></div>
+    <figcaption>held, not its margin — 200&times;60</figcaption></figure>
+  <figure><div style="display: flex; width: 240px; background: #fee">
+      <div style="flex: 1; aspect-ratio: 1; max-height: 40px; background: #c93"></div>
+      <div style="flex: 1; height: 20px; background: #36c"></div></div>
+    <figcaption>flex: 1 past max-height — 120&times;40</figcaption></figure>
+  <figure><div style="display: flex; flex-direction: column; width: 160px">
+      <img src="images/tile-100.png"></div>
+    <figcaption>down a column — 160&times;80</figcaption></figure>
+  <figure><table style="border-spacing: 0; background: #eef"><tr>
+      <td style="width: 120px; aspect-ratio: 1; background: #fc9">a cell</td></tr></table>
+    <figcaption>no ratio</figcaption></figure>
+</div>
+
+<div class="row">
+  <figure><div style="display: flex; flex-direction: column; flex-wrap: wrap; width: 160px">
+      <img src="images/tile-100.png"></div>
+    <figcaption>down a column that wraps — 160&times;50</figcaption></figure>
+  <figure><div style="display: flex; flex-direction: column; flex-wrap: wrap; width: 160px;
+      background: #fee"><div style="aspect-ratio: 4; background: #c93">text</div></div>
+    <figcaption>aspect-ratio: 4 there — as tall as its text</figcaption></figure>
+</div>
+
 </body>
 </html>

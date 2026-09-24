@@ -1020,3 +1020,244 @@ fn a_picture_told_its_height_is_as_wide_as_its_ratio_makes_it() {
     assert_eq!((img.width, img.height), (100.0, 50.0));
     assert_eq!(rect_of(&tree, &boxes, "p").x, 100.0);
 }
+
+/// The size of the `<section>` in a page laid out 800 wide with no margin.
+fn section_in(html: &str) -> (f32, f32) {
+    let (tree, boxes) = laid_out(&format!("<style>body {{ margin: 0 }}</style>{html}"), 800.0);
+    let section = rect_of(&tree, &boxes, "section");
+    (section.width, section.height)
+}
+
+/// An automatic height is the width through `aspect-ratio` (CSS Sizing 4
+/// §4.2), across the box `box-sizing` names for a `<ratio>` and across the
+/// content box beside `auto`; content taller than that grows the box (§4.3),
+/// unless the box scrolls or `min-height` says otherwise. Every number is
+/// what Chrome draws.
+#[test]
+fn a_ratio_makes_a_height_of_a_width() {
+    let ratio = |rule: &str| section_in(&format!("<section style='width:320px;{rule}'></section>"));
+    assert_eq!(ratio("aspect-ratio:16/9"), (320.0, 180.0));
+    assert_eq!(
+        ratio("aspect-ratio:16/9;box-sizing:border-box;padding:20px"),
+        (320.0, 180.0),
+        "the border box"
+    );
+    assert_eq!(
+        ratio("aspect-ratio:auto 16/9;box-sizing:border-box;padding:20px"),
+        (320.0, 197.5),
+        "the content box, beside auto"
+    );
+    assert_eq!(
+        ratio("aspect-ratio:16/9;max-height:100px"),
+        (320.0, 100.0),
+        "a width the page named keeps its shape against a maximum across"
+    );
+    assert_eq!(ratio("aspect-ratio:16/9;min-height:200px"), (320.0, 200.0));
+
+    let tall = "<div style='height:300px'></div>";
+    let holding = |rule: &str| {
+        section_in(&format!(
+            "<section style='width:320px;aspect-ratio:16/9;{rule}'>{tall}</section>"
+        ))
+    };
+    assert_eq!(holding(""), (320.0, 300.0), "content grows the box");
+    assert_eq!(holding("overflow:hidden"), (320.0, 180.0), "and scrolls");
+    assert_eq!(holding("min-height:0"), (320.0, 180.0), "and overflows");
+}
+
+/// A percentage height inside a box whose height its ratio made is of that
+/// height, which is definite as the width it came from is (§4.2).
+#[test]
+fn a_percentage_inside_a_ratio_box_is_of_the_height_it_made() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 }</style><div style='width:400px'>\
+         <section style='width:50%;aspect-ratio:2'><p style='height:50%;margin:0'></p>\
+         </section></div>",
+        800.0,
+    );
+    let section = rect_of(&tree, &boxes, "section");
+    assert_eq!((section.width, section.height), (200.0, 100.0));
+    assert_eq!(rect_of(&tree, &boxes, "p").height, 50.0);
+}
+
+/// The other way about: an `auto` width is the height through the ratio,
+/// wherever the box would otherwise have filled the line or shrunk to fit it —
+/// a block, a float, an inline block, a positioned box between two insets or
+/// against one — and what the box contributes to one that shrinks round it.
+#[test]
+fn a_ratio_makes_a_width_of_a_height() {
+    let wide = |html: &str| section_in(html).0;
+    let box_ = "height:100px;aspect-ratio:2";
+    assert_eq!(wide(&format!("<section style='{box_}'></section>")), 200.0);
+    assert_eq!(
+        wide(
+            "<div style='height:200px'><section style='height:50%;aspect-ratio:2'></section></div>"
+        ),
+        200.0,
+        "a percentage of a height that is known"
+    );
+    assert_eq!(
+        wide(&format!("<section style='float:left;{box_}'></section>")),
+        200.0
+    );
+    assert_eq!(
+        wide(&format!(
+            "<div><section style='display:inline-block;{box_}'></section></div>"
+        )),
+        200.0
+    );
+    for insets in ["left:0", "left:0;right:0"] {
+        assert_eq!(
+            wide(&format!(
+                "<div style='position:relative;width:400px;height:100px'>\
+                 <section style='position:absolute;top:0;{insets};{box_}'></section></div>"
+            )),
+            200.0,
+            "{insets}"
+        );
+    }
+    assert_eq!(
+        wide(
+            "<section style='float:left'><div style='height:90px;aspect-ratio:16/9'></div></section>"
+        ),
+        160.0,
+        "its contribution to a float"
+    );
+}
+
+/// §4.3 in the inline axis: a square a hundred tall holding something a
+/// hundred and fifty wide is a hundred and fifty wide, and as tall.
+#[test]
+fn a_ratio_box_is_at_least_as_wide_as_its_content() {
+    assert_eq!(
+        section_in(
+            "<section style='height:100px;aspect-ratio:1'>\
+             <span style='display:inline-block;width:150px;height:10px'></span></section>"
+        ),
+        (150.0, 100.0)
+    );
+}
+
+/// CSS Sizing 4 §4.4: a maximum height is carried through the ratio onto a
+/// width the page left `auto`, so the box keeps its shape — whether the width
+/// would have filled the line or shrunk to fit.
+#[test]
+fn a_maximum_height_is_carried_onto_an_automatic_width() {
+    assert_eq!(
+        section_in("<section style='aspect-ratio:1;max-height:100px'></section>"),
+        (100.0, 100.0)
+    );
+    let (width, height) = section_in(
+        "<section style='float:left;aspect-ratio:1;max-height:50px'>hello world again</section>",
+    );
+    assert_eq!((width, height), (50.0, 50.0));
+}
+
+/// A height a ratio gives a box is a height of its own as far as its margins
+/// are concerned (§4.2.1): the last child's bottom margin does not pass
+/// through its bottom edge.
+#[test]
+fn a_margin_stays_inside_a_ratio_box() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 }</style><main>\
+         <section style='aspect-ratio:8'><div style='margin-bottom:30px'></div></section>\
+         <aside style='height:10px'></aside></main>",
+        800.0,
+    );
+    assert_eq!(rect_of(&tree, &boxes, "section").height, 100.0);
+    assert_eq!(rect_of(&tree, &boxes, "aside").y, 100.0);
+    assert_eq!(rect_of(&tree, &boxes, "main").height, 110.0);
+}
+
+/// Nor is that margin part of the content a ratio box grows to (§4.3): its
+/// min-content height is its height were it `auto`, with the margin gone
+/// through the edge. A box two hundred by twenty holding forty pixels with a
+/// thirty-pixel margin under them is forty tall, and what follows it is at
+/// forty — the margin neither in the box nor out of it, as Chrome and Firefox
+/// both lay it out. Behind padding it is the box's again.
+#[test]
+fn a_trailing_margin_does_not_grow_a_ratio_box() {
+    let laid = |padding: &str| {
+        let (tree, boxes) = laid_out(
+            &format!(
+                "<style>body {{ margin: 0 }}</style><main>\
+                 <section style='width:200px;aspect-ratio:10;{padding}'>\
+                 <div style='height:40px;margin-bottom:30px'></div></section>\
+                 <aside style='height:10px;margin-top:20px'></aside></main>"
+            ),
+            800.0,
+        );
+        (
+            rect_of(&tree, &boxes, "section").height,
+            rect_of(&tree, &boxes, "aside").y,
+        )
+    };
+    assert_eq!(laid(""), (40.0, 60.0));
+    assert_eq!(laid("padding-bottom:1px"), (71.0, 91.0), "behind padding");
+}
+
+/// `aspect-ratio` does not apply to the internal boxes of a table (§4.1): a
+/// cell is as tall as its row makes it, ratio or none. A table keeps its
+/// ratio.
+#[test]
+fn a_table_cell_takes_no_ratio() {
+    let cell = |rule: &str| {
+        section_in(&format!(
+            "<div style='display:table'><div style='display:table-row'>\
+             <section style='display:table-cell;width:200px;{rule}'>\
+             <div style='height:20px'></div></section></div></div>"
+        ))
+    };
+    assert_eq!(cell("aspect-ratio:2"), cell(""));
+    assert_eq!(cell("aspect-ratio:2").1, 20.0);
+
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 } td { padding: 0 }</style>\
+         <table style='border-spacing:0'><tr><td style='width:200px;aspect-ratio:1'>\
+         <div style='height:20px'></div></td></tr></table>",
+        800.0,
+    );
+    assert_eq!(rect_of(&tree, &boxes, "td").height, 20.0, "a td");
+}
+
+/// A ratio as steep as a number holds makes a box as big as layout goes, and
+/// no bigger: finite, so it is painted and what follows it has a place.
+#[test]
+fn a_steep_ratio_keeps_a_box_finite() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 }</style>\
+         <section style='width:100px;aspect-ratio:1/1e38'></section><p>after</p>",
+        800.0,
+    );
+    let section = rect_of(&tree, &boxes, "section");
+    assert!(section.height.is_finite() && section.height > 1e6);
+    assert!(rect_of(&tree, &boxes, "p").y.is_finite());
+
+    let (width, _) =
+        section_in("<section style='float:left;height:100px;aspect-ratio:3e38'></section>");
+    assert!(width.is_finite() && width > 1e6);
+}
+
+/// A picture's own ratio gives way to a `<ratio>` of the stylesheet's, and a
+/// ratio beside `auto` gives way to the picture's (§4.1). With both sides
+/// `auto` the picture keeps its natural width and takes its height from the
+/// ratio. A four-by-two picture, as Chrome draws each.
+#[test]
+fn a_stylesheet_ratio_overrides_a_pictures_own() {
+    let drawn = |rule: &str| {
+        let (tree, _) = laid_out_with_image(
+            &format!(
+                "<style>body {{ margin: 0 }} img {{ display: block; {rule} }}</style><img src=a.png>"
+            ),
+            800.0,
+            picture(4, 2),
+        );
+        let rect = image_rect(&tree);
+        (rect.width, rect.height)
+    };
+    assert_eq!(drawn("width:100px;aspect-ratio:1"), (100.0, 100.0));
+    assert_eq!(drawn("width:100px;aspect-ratio:auto 1"), (100.0, 50.0));
+    assert_eq!(drawn("aspect-ratio:1"), (4.0, 4.0));
+    assert_eq!(drawn("height:10px;aspect-ratio:3"), (30.0, 10.0));
+    assert_eq!(drawn("width:100%;aspect-ratio:2"), (800.0, 400.0));
+}

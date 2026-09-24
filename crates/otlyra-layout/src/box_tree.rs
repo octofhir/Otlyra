@@ -269,6 +269,16 @@ impl BoxNode {
             .unwrap_or_default()
     }
 
+    /// Whether this box is absolutely positioned, and so out of the flow of the
+    /// box it is in (CSS Position 3 §3).
+    ///
+    /// A run of text carries the style of the element around it, and never takes
+    /// that element's `position` for its own: the words of a positioned box are
+    /// in that box's flow, not out of it.
+    pub fn is_absolutely_positioned(&self) -> bool {
+        !matches!(self.kind, BoxKind::Text(_)) && self.style.position.is_out_of_flow()
+    }
+
     /// Whether this box is inline-level.
     pub fn is_inline_level(&self) -> bool {
         match &self.kind {

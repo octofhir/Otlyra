@@ -19,11 +19,42 @@ use super::box_model::{
 use super::list::PendingMarker;
 use super::positioned::relative_offset;
 use super::replaced::{replaced_fragment, replaced_height, replaced_size};
-use super::sizing::{Frame, InlineRoom};
+use super::sizing::{Frame, InlineRoom, Sizes, height_ratio};
 use super::{
     Flow, is_popup, mark_layer, mark_sticky, offset, set_clip, set_container, set_scroll_port,
     set_sticky_containers, shift,
 };
+
+/// What a box's bottom edge does with the bottom margin of the last box in it
+/// (CSS 2.2 §8.3.1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BottomEdge {
+    /// Lets it through, to collapse with the box's own: nothing stands on the
+    /// edge, and the box is as tall as what it holds.
+    Open,
+    /// Keeps it inside, where it is part of what the box holds: a border,
+    /// padding, a line of text, a height of its own or a formatting context of
+    /// its own stands on the edge.
+    Closed,
+    /// Neither: the box's height is the one its preferred aspect ratio makes of
+    /// its width, which margins do not collapse through, as they do not through
+    /// a height of the page's (CSS Sizing 4 §4.2.1). What it holds is counted
+    /// only as its min-content height — its height were it `auto`, the margin
+    /// gone through the edge — which the box grows to where that is taller than
+    /// the ratio makes it (§4.3). So a card whose text ends in a paragraph is as
+    /// tall as the text and not a margin taller.
+    Ratio,
+}
+
+impl BottomEdge {
+    /// Whether the last box's bottom margin is part of what the box holds.
+    fn keeps_margin(self) -> bool {
+        match self {
+            Self::Closed => true,
+            Self::Open | Self::Ratio => false,
+        }
+    }
+}
 
 impl<'a> Flow<'a> {
     /// Lay out the children of `parent` into a content box starting at
@@ -85,7 +116,7 @@ impl<'a> Flow<'a> {
         // A margin also escapes through an edge with no border and no padding on
         // it, so the first child's top margin is the *parent's* to spend, and was
         // spent before this call. The same at the bottom.
-        let (top_open, bottom_open) = self.open_edges(parent, width);
+        let (top_open, bottom_edge) = self.open_edges(parent, width);
         let mut cursor = y;
         let mut pending = 0.0;
         let last = children.len() - 1;
@@ -144,7 +175,7 @@ impl<'a> Flow<'a> {
                 mark_layer(&mut fragment, style.z_index.unwrap_or(0));
             }
 
-            let bottom = if index == last && bottom_open {
+            let bottom = if index == last && !bottom_edge.keeps_margin() {
                 0.0
             } else {
                 self.collapsed_bottom(child, width)
@@ -224,15 +255,15 @@ impl<'a> Flow<'a> {
         let content_y = y + border.top + padding.top;
         let mut children = Vec::new();
         self.table_width = None;
-        // What the box's own contents resolve a percentage height against: its
-        // height, when it has one to give.
-        let inner = self.inner_height(&style, width);
+        // What the box's own contents resolve a percentage height against — its
+        // height, when it has one to give — and the limits it is held between.
+        let space = self.content_space(&style, width, content_width);
         let content_height = self.layout_inside(
             id,
             content_width,
             content_x,
             content_y,
-            inner,
+            space,
             &mut children,
         );
         // A box laid out at a width the caller chose keeps it, table or not — a
@@ -241,7 +272,7 @@ impl<'a> Flow<'a> {
         self.table_width = None;
         let content_height = self.content_height(id, content_height);
         let content_height = self
-            .block_sizes_of(&style, width, Some(content_height))
+            .block_sizes_of(&style, width, content_width, Some(content_height))
             .used(content_height);
 
         // A field is one line long however much has been typed into it, so what
@@ -330,15 +361,16 @@ impl<'a> Flow<'a> {
         }
     }
 
-    /// Whether margins pass through the top and bottom edges of `id`.
+    /// Whether margins pass through the top edge of `id`, and what its bottom
+    /// edge does with them.
     ///
     /// An edge is open when nothing sits on it: no border, no padding, and no line
     /// of text, since a line box is content and content is what a margin cannot
     /// pass through. The root is closed at both ends however empty it is — a
     /// document's own margins stay inside it.
-    fn open_edges(&self, id: BoxId, containing_width: f32) -> (bool, bool) {
+    fn open_edges(&self, id: BoxId, containing_width: f32) -> (bool, BottomEdge) {
         if id == self.tree.root() {
-            return (false, false);
+            return (false, BottomEdge::Closed);
         }
         let node = self.tree.node(id);
         if node
@@ -346,7 +378,7 @@ impl<'a> Flow<'a> {
             .first()
             .is_some_and(|&child| self.tree.node(child).is_inline_level())
         {
-            return (false, false);
+            return (false, BottomEdge::Closed);
         }
 
         let style = &node.style;
@@ -379,7 +411,7 @@ impl<'a> Flow<'a> {
                 )
             });
         if establishes {
-            return (false, false);
+            return (false, BottomEdge::Closed);
         }
 
         let border = resolve_border(style);
@@ -388,12 +420,16 @@ impl<'a> Flow<'a> {
         // it says it does, not where its last child does. A percentage of a
         // height nobody knows is not one, and neither is a keyword (CSS 2.2
         // §8.3.1: the margins meet through a box whose height is `auto`).
-        let sized = self.asked_height(style, containing_width).is_some();
+        let asked = self.asked_height(style, containing_width);
+        let bottom = if border.bottom != 0.0 || padding.bottom != 0.0 || asked.is_some() {
+            BottomEdge::Closed
+        } else if height_ratio(style, asked).is_some() {
+            BottomEdge::Ratio
+        } else {
+            BottomEdge::Open
+        };
 
-        (
-            border.top == 0.0 && padding.top == 0.0,
-            border.bottom == 0.0 && padding.bottom == 0.0 && !sized,
-        )
+        (border.top == 0.0 && padding.top == 0.0, bottom)
     }
 
     /// The margin `id` presents to whatever is above it, including any that
@@ -413,7 +449,7 @@ impl<'a> Flow<'a> {
     fn collapsed_bottom(&self, id: BoxId, containing_width: f32) -> f32 {
         let node = self.tree.node(id);
         let mut margin = vertical_margin(&node.style.margin.bottom, containing_width);
-        if self.open_edges(id, containing_width).1
+        if self.open_edges(id, containing_width).1 == BottomEdge::Open
             && let Some(&last) = node.children.last()
         {
             margin = collapse(margin, self.collapsed_bottom(last, containing_width));
@@ -466,12 +502,18 @@ impl<'a> Flow<'a> {
         let padding = resolve_padding(&style, containing_width);
         let border = resolve_border(&style);
         let frame = Frame::new(padding, border);
-        let sizes = self.inline_sizes(
-            id,
-            &style,
-            InlineRoom::within(&style, containing_width),
-            frame.inline,
-        );
+        let room = InlineRoom::within(&style, containing_width);
+        let sizes = self.inline_sizes(id, &style, room, frame.inline);
+        // An `auto` width fills the line, unless the box has a preferred aspect
+        // ratio and a height to take its width from (CSS Sizing 4 §4.2): then
+        // it is that width, and its margins are what is left, as a picture's
+        // are.
+        let sizes = Sizes {
+            preferred: sizes
+                .preferred
+                .or_else(|| self.ratio_width(id, &style, room)),
+            ..sizes
+        };
         let (margin, content_width) = resolve_horizontal(
             &style,
             containing_width,
@@ -491,15 +533,16 @@ impl<'a> Flow<'a> {
         // its minimum; the table is told what that is (see `table_floor`).
         let shrinks = style.display == otlyra_css::Display::Table && sizes.preferred.is_none();
         self.table_floor = if shrinks { sizes.limits.min } else { 0.0 };
-        // What this box's contents resolve a percentage height against: its own
-        // height, when it has one to give them.
-        let inner = self.inner_height(&style, containing_width);
+        // What this box's contents resolve a percentage height against — its own
+        // height, when it has one to give them — and the limits it is held
+        // between.
+        let space = self.content_space(&style, containing_width, content_width);
         let mut content_height = self.layout_inside(
             id,
             content_width,
             content_x,
             content_y,
-            inner,
+            space,
             &mut children,
         );
         self.table_floor = 0.0;
@@ -526,7 +569,12 @@ impl<'a> Flow<'a> {
         };
         let content_height = self.content_height(id, content_height);
         let content_height = self
-            .block_sizes_of(&style, containing_width, Some(content_height))
+            .block_sizes_of(
+                &style,
+                containing_width,
+                content_width,
+                Some(content_height),
+            )
             .used(content_height);
 
         if let Some(floats) = outer_floats {

@@ -328,6 +328,47 @@ impl fmt::Display for MaxSize {
     }
 }
 
+/// A `<ratio>` (CSS Values 4 §7.2) that is not degenerate: a box's width over
+/// its height, finite and above zero.
+///
+/// Made only through [`Ratio::new`], which refuses a degenerate ratio, so a
+/// value of this type is one a box can be sized through.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Ratio(f32);
+
+impl Ratio {
+    /// The ratio of `width` to `height`, or `None` where it is degenerate —
+    /// either side zero (CSS Values 4 §7.2) — or its quotient is not a finite
+    /// number above zero.
+    pub fn new(width: f32, height: f32) -> Option<Self> {
+        let quotient = width / height;
+        (width > 0.0 && height > 0.0 && quotient.is_finite() && quotient > 0.0)
+            .then_some(Self(quotient))
+    }
+
+    /// Width over height.
+    pub fn width_over_height(self) -> f32 {
+        self.0
+    }
+}
+
+/// `aspect-ratio`: the ratio of a box's width to its height that its automatic
+/// sizes keep (CSS Sizing 4 §4.1).
+///
+/// A degenerate `<ratio>` makes the property behave as `auto`, and so is
+/// `Auto` here.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum AspectRatio {
+    /// `auto`: a replaced element's natural ratio, and none for any other box.
+    Auto,
+    /// `<ratio>`: this ratio for every box, a picture's own overridden, and
+    /// measured across the box `box-sizing` names.
+    Ratio(Ratio),
+    /// `auto && <ratio>`: a replaced element's natural ratio where it has one,
+    /// and this ratio otherwise — measured across the content box either way.
+    AutoOr(Ratio),
+}
+
 /// `flex-basis`: the size a flex item starts from before the line is shared out.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FlexBasis {
@@ -1089,6 +1130,8 @@ pub struct ComputedStyle {
     pub min_height: Size,
     /// `max-height`.
     pub max_height: MaxSize,
+    /// `aspect-ratio`, which the automatic sizes above keep. Not inherited.
+    pub aspect_ratio: AspectRatio,
     /// `float`.
     pub float: Float,
     /// `clear`.
@@ -1190,6 +1233,7 @@ impl Default for ComputedStyle {
             max_width: MaxSize::None,
             min_height: Size::Auto,
             max_height: MaxSize::None,
+            aspect_ratio: AspectRatio::Auto,
             float: Float::None,
             clear: Clear::None,
             position: Position::Static,

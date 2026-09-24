@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flex containers inside flex containers</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 24px 0 8px; }
+  h2 { font-size: 14px; font-weight: normal; color: #555; margin: 12px 0 4px; }
+  .side { display: flex; gap: 24px; align-items: flex-start; }
+  .nest div { display: flex; padding: 3px; border: 1px solid #369; background: rgba(51, 102, 153, 0.08); }
+  .nest.column div { flex-direction: column; }
+  .chain { display: flex; gap: 6px; background: #f0f0f0; width: 320px; }
+  .chain .flex { display: flex; padding: 4px; background: rgba(0, 128, 0, 0.15); }
+  .chain .word { background: #9cf; }
+  .wrapped { display: flex; flex-wrap: wrap; width: 300px; height: 220px; background: #f0f0f0;
+             align-content: space-between; align-items: flex-start; }
+  .wrapped > span { flex: 0 0 100px; background: #9cf; }
+  .wrapped > span:nth-child(even) { background: #6ad; }
+  .scroll { overflow: auto; width: 180px; height: 90px; background: #cfc; }
+  .scroll > div { height: 400px; background: linear-gradient(#9c9, #363); }
+</style>
+</head>
+<body>
+
+<h1>Nesting: each item laid out once per level, not three times</h1>
+
+<div class="side">
+  <div><h2>24 rows, each the only item of the one around it</h2>
+    <div class="nest"><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div>word</div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div>
+  <div style="width: 320px"><h2>24 columns</h2>
+    <div class="nest column"><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div>word</div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div>
+</div>
+
+<h1>stretch: every level of a chain reaches its tallest sibling</h1>
+
+<div class="chain">
+  <div class="flex"><div class="flex"><div class="flex"><div class="word">stretched</div></div></div></div>
+  <div style="height: 90px; width: 90px; background: #fc9">90px tall</div>
+</div>
+
+<h1>align-content: shared out after the items know how tall they are</h1>
+
+<h2>A hundred pixels wide, the text wraps to two lines, and the last line still ends at the bottom edge</h2>
+<div class="wrapped">
+  <span>wrapping text here</span><span>a</span><span>b</span><span>more wrapping text</span>
+</div>
+
+<h1>What measuring leaves behind: nothing</h1>
+
+<div class="side">
+  <div><h2>A scrolling item two flex levels down</h2>
+    <div style="display: flex"><div style="display: flex">
+      <div style="width: 120px; background: #fcc">left</div>
+      <div class="scroll"><div>tall content</div></div>
+    </div></div></div>
+  <div><h2>A list item holding a flex container keeps its bullet</h2>
+    <ul style="margin: 0"><li><div style="display: flex; gap: 8px"><span>one</span><span>two</span></div></li>
+      <li>and a plain item</li></ul></div>
+</div>
+
+<h1>A flex item's own frame</h1>
+
+<div class="side">
+  <div><h2>padding: 10% of the 300px container</h2>
+    <div style="display: flex; width: 300px; background: #f0f0f0">
+      <div style="padding: 10%; border: 1px solid #369"><div style="background: #9cf">30px all round</div></div>
+    </div></div>
+  <div><h2>A float stays inside the item it is in</h2>
+    <div style="display: flex; gap: 6px; width: 300px; background: #f0f0f0; align-items: flex-start">
+      <div style="background: #fcc"><div style="float: left; width: 50px; height: 60px; background: #c66"></div></div>
+      <div style="background: #9cf">beside the float's item</div>
+    </div></div>
+</div>
+
+</body>
+</html>

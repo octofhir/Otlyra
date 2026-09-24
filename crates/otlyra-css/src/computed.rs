@@ -13,12 +13,12 @@ use style::properties::ComputedValues;
 
 use crate::calc::Calc;
 use crate::style::{
-    AlignContent, AlignItems, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
+    AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle, Corners,
     Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
     Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, MaxSize, ObjectFit, Overflow,
-    Placement, Position, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap, Track,
-    TransformOp, TransformOrigin, WhiteSpace,
+    Placement, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
+    Track, TransformOp, TransformOrigin, WhiteSpace,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -100,6 +100,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         max_width: max_size(&values.get_position().max_width),
         min_height: size(&values.get_position().min_height),
         max_height: max_size(&values.get_position().max_height),
+        aspect_ratio: aspect_ratio(&values.get_position().aspect_ratio),
         float: float_of(values),
         clear: clear_of(values),
         position: position_of(values),
@@ -1178,6 +1179,25 @@ fn max_size(value: &style::values::computed::MaxSize) -> MaxSize {
     }
 }
 
+/// `aspect-ratio` (CSS Sizing 4 §4.1).
+///
+/// A degenerate ratio — either side zero, which `0/1` and `16/0` both are — makes
+/// the property behave as `auto`, with or without the `auto` keyword beside it
+/// (see [`Ratio::new`]).
+fn aspect_ratio(value: &style::values::computed::position::AspectRatio) -> AspectRatio {
+    use style::values::generics::position::PreferredRatio;
+
+    let ratio = match value.ratio {
+        PreferredRatio::None => None,
+        PreferredRatio::Ratio(ratio) => Ratio::new(ratio.0.0, ratio.1.0),
+    };
+    match (value.auto, ratio) {
+        (_, None) => AspectRatio::Auto,
+        (false, Some(ratio)) => AspectRatio::Ratio(ratio),
+        (true, Some(ratio)) => AspectRatio::AutoOr(ratio),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1407,6 +1427,62 @@ mod tests {
             div_with("width: fit-content(50%)").width.to_string(),
             "fit-content(50%)"
         );
+    }
+
+    /// `aspect-ratio` arrives as width over height, with `auto` beside a ratio
+    /// kept apart from a ratio alone, and a degenerate ratio as `auto`.
+    #[test]
+    fn an_aspect_ratio_is_width_over_height() {
+        let aspect_ratio = |declaration: &str| Some(div_with(declaration).aspect_ratio);
+        assert_eq!(aspect_ratio(""), Some(AspectRatio::Auto));
+        assert_eq!(
+            aspect_ratio("aspect-ratio: 16/9"),
+            Ratio::new(16.0, 9.0).map(AspectRatio::Ratio)
+        );
+        assert_eq!(
+            aspect_ratio("aspect-ratio: 2"),
+            Ratio::new(2.0, 1.0).map(AspectRatio::Ratio)
+        );
+        assert_eq!(
+            aspect_ratio("aspect-ratio: auto 1/1"),
+            Ratio::new(1.0, 1.0).map(AspectRatio::AutoOr)
+        );
+        assert_eq!(
+            aspect_ratio("aspect-ratio: 3/2 auto"),
+            Ratio::new(3.0, 2.0).map(AspectRatio::AutoOr),
+            "in either order"
+        );
+        assert_eq!(
+            aspect_ratio("aspect-ratio: 0/1"),
+            Some(AspectRatio::Auto),
+            "degenerate"
+        );
+        assert_eq!(
+            aspect_ratio("aspect-ratio: auto 1/0"),
+            Some(AspectRatio::Auto),
+            "degenerate beside auto"
+        );
+    }
+
+    /// A ratio is width over height, and one that could not size a box —
+    /// degenerate, or a quotient no number holds — is not a ratio at all.
+    #[test]
+    fn a_ratio_is_finite_and_above_zero() {
+        let ratio = |width, height| Ratio::new(width, height).map(Ratio::width_over_height);
+        assert_eq!(ratio(16.0, 9.0), Some(16.0 / 9.0));
+        assert_eq!(ratio(0.0, 1.0), None);
+        assert_eq!(ratio(1.0, 0.0), None);
+        assert_eq!(
+            ratio(1e38, 1e-38),
+            None,
+            "a quotient past the largest number"
+        );
+        assert_eq!(
+            ratio(1e-38, 1e38),
+            None,
+            "a quotient that rounds to nothing"
+        );
+        assert!(ratio(1.0, 1e38).is_some(), "steep, and still a ratio");
     }
 
     /// `min-width: auto` is the automatic minimum and `min-width: 0` turns it off:

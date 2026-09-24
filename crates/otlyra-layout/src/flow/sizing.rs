@@ -10,7 +10,10 @@
 //! a number the page wrote, because by the time it has the number that has been
 //! done.
 
-use otlyra_css::{BoxSizing, ComputedStyle, Intrinsic, Length, MaxSize, Sides, Size};
+use otlyra_css::{
+    AspectRatio, BoxSizing, ComputedStyle, Display, Intrinsic, Length, MaxSize, Overflow, Ratio,
+    Sides, Size,
+};
 
 use crate::box_tree::{BoxId, BoxKind};
 
@@ -87,6 +90,177 @@ pub(super) fn content_length(
         .map(|size| content_box(size, sizing, frame))
 }
 
+/// A box's preferred aspect ratio (CSS Sizing 4 §4.1): what its width is to its
+/// height when one of them is worked out from the other, and where that ratio
+/// comes from.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct PreferredRatio {
+    /// Width over height.
+    ratio: Ratio,
+    /// Where it comes from.
+    source: RatioSource,
+}
+
+/// Where a preferred aspect ratio comes from, which decides the box its two
+/// sides are measured across and whether a picture's natural size gives way to
+/// it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RatioSource {
+    /// A picture's own sides: measured across its content box, and its natural
+    /// size keeps its natural height.
+    Natural,
+    /// `aspect-ratio`: a `<ratio>` measured across the box `box-sizing` names,
+    /// or the one beside `auto` for a box without a natural ratio, across the
+    /// content box.
+    Style(BoxSizing),
+}
+
+/// The largest size, in CSS pixels, a ratio makes of a box.
+///
+/// A page may write a ratio as steep as a number holds, and a width divided by
+/// one of those runs past the largest `f32` to infinity, which is no place to
+/// put a box, nor the paragraph after it. CSS leaves an implementation's range
+/// to it (CSS Values 4 §5.1); this is the top of Blink's, whose sizes are
+/// fixed-point numbers with twenty-five bits of whole pixels, so a box a ratio
+/// stretches out of all proportion is held where Chrome holds it: finite,
+/// placed and painted.
+const LARGEST_SIZE: f32 = 33_554_432.0;
+
+impl PreferredRatio {
+    /// The box the ratio's two sides are measured across.
+    fn across(self) -> BoxSizing {
+        match self.source {
+            RatioSource::Natural => BoxSizing::Content,
+            RatioSource::Style(sizing) => sizing,
+        }
+    }
+
+    /// Whether a picture with a natural width and nothing said about its size
+    /// is as tall as this ratio makes that width, rather than its natural
+    /// height: for every ratio but its own (CSS Sizing 4 §4.1), which is how a
+    /// four-by-two photograph with `aspect-ratio: 1` is drawn four by four.
+    pub(super) fn overrides_natural_height(self) -> bool {
+        match self.source {
+            RatioSource::Natural => false,
+            RatioSource::Style(_) => true,
+        }
+    }
+
+    /// The content-box height of a box whose content box is `width` wide.
+    pub(super) fn height_for(self, width: f32, frame: Frame) -> f32 {
+        let ratio = self.ratio.width_over_height();
+        let height = match self.across() {
+            BoxSizing::Content => width / ratio,
+            BoxSizing::Border => ((width + frame.inline) / ratio - frame.block).max(0.0),
+        };
+        height.min(LARGEST_SIZE)
+    }
+
+    /// The content-box width of a box whose content box is `height` tall.
+    pub(super) fn width_for(self, height: f32, frame: Frame) -> f32 {
+        let ratio = self.ratio.width_over_height();
+        let width = match self.across() {
+            BoxSizing::Content => height * ratio,
+            BoxSizing::Border => ((height + frame.block) * ratio - frame.inline).max(0.0),
+        };
+        width.min(LARGEST_SIZE)
+    }
+}
+
+/// A box's preferred aspect ratio, when it has one (CSS Sizing 4 §4.1).
+///
+/// `natural` is the ratio of a picture's own sides, when it has both. `auto` is
+/// that ratio and no other, so a box that is not a picture has none; a
+/// `<ratio>` overrides it; and `auto && <ratio>` gives way to it, which is how
+/// a stylesheet gives a picture that has not arrived yet the shape it will
+/// have.
+pub(super) fn preferred_ratio(
+    style: &ComputedStyle,
+    natural: Option<Ratio>,
+) -> Option<PreferredRatio> {
+    let natural = natural.map(|ratio| PreferredRatio {
+        ratio,
+        source: RatioSource::Natural,
+    });
+    let of_style = |ratio, across| PreferredRatio {
+        ratio,
+        source: RatioSource::Style(across),
+    };
+    match applied_aspect_ratio(style) {
+        AspectRatio::Auto => natural,
+        AspectRatio::Ratio(ratio) => Some(of_style(ratio, style.box_sizing)),
+        AspectRatio::AutoOr(ratio) => natural.or(Some(of_style(ratio, BoxSizing::Content))),
+    }
+}
+
+/// `aspect-ratio` where it applies, which is to every box but an inline box
+/// and an internal ruby or table box (CSS Sizing 4 §4.1). A row group, a row
+/// and a cell are sized by their table, so for them it is `auto`, its initial
+/// value: a picture laid out as a cell keeps its natural ratio and nothing
+/// more. A table and its caption are not internal boxes, and keep theirs.
+/// There are no ruby boxes here.
+///
+/// An inline box is told apart by what it is rather than by its `display`,
+/// which is also a picture's: a line lays an inline box out and never asks it
+/// for a size, and the box kind keeps one out where a size is asked (see
+/// [`Flow::width_ratio`]).
+fn applied_aspect_ratio(style: &ComputedStyle) -> AspectRatio {
+    match style.display {
+        Display::TableRowGroup | Display::TableRow | Display::TableCell => AspectRatio::Auto,
+        Display::None
+        | Display::Block
+        | Display::Inline
+        | Display::InlineBlock
+        | Display::Flex
+        | Display::InlineFlex
+        | Display::Grid
+        | Display::Table
+        | Display::TableCaption => style.aspect_ratio,
+    }
+}
+
+/// The preferred aspect ratio a box's height is taken through (CSS Sizing 4
+/// §4.2): its ratio, where it has one and its height is automatic — `auto`, or
+/// a percentage of a height nobody knows, which is as automatic as `auto`.
+/// `asked` is the height the page asked for, which neither is.
+///
+/// A content keyword — as `height`, `min-height` or `max-height` — is the
+/// content's height here, ratio or none, and this stops short of what Chrome
+/// and Firefox do with one on a box with a ratio: they take its min-content
+/// height as the height the ratio makes of its width, whatever it holds, and
+/// its max-content height as the larger of that and its content. So
+/// `width: 200px; aspect-ratio: 2; min-height: min-content` holding six lines
+/// is 100 tall there and 120 here.
+///
+/// A picture's ratio is its own business and is not asked here (see
+/// `replaced`).
+pub(super) fn height_ratio(style: &ComputedStyle, asked: Option<f32>) -> Option<PreferredRatio> {
+    let automatic = asked.is_none()
+        && match style.height {
+            Size::Auto | Size::Length(_) | Size::Stretch => true,
+            Size::Intrinsic(_) => false,
+        };
+    preferred_ratio(style, None).filter(|_| automatic)
+}
+
+/// Whether a box is a scroll container (CSS Overflow 3 §3), which is what takes
+/// its automatic minimum sizes away — a flex item's (CSS Flexbox §4.5) and a box
+/// with an aspect ratio's (CSS Sizing 4 §4.3) alike: what does not fit it
+/// scrolls.
+///
+/// `overflow` here is one value for both axes, `visible` or `clip`, and `clip`
+/// stands for every value but `visible`: `hidden`, `scroll` and `auto`, which
+/// make a scroll container, and `clip`, which does not (§3.1). So a box with
+/// `overflow: clip` is taken for a scroll container and loses the automatic
+/// minimum a browser would keep. This follows the model of `overflow` split
+/// by axis, with `clip` apart from `hidden`, once that is in.
+pub(super) fn is_scroll_container(style: &ComputedStyle) -> bool {
+    match style.overflow {
+        Overflow::Visible => false,
+        Overflow::Clip => true,
+    }
+}
+
 /// The fit-content formula (CSS Sizing 3 §3.2), in border-box widths: as wide as
 /// the content wants where that fits, as narrow as it can be where even that does
 /// not, and the room there is in between.
@@ -107,6 +281,12 @@ pub(super) struct Limits {
 }
 
 impl Limits {
+    /// No minimum and no maximum: what `auto` and `none` ask for.
+    pub(super) const NONE: Self = Self {
+        min: 0.0,
+        max: f32::INFINITY,
+    };
+
     /// A size held between them.
     ///
     /// The maximum first and the minimum second, which is the order CSS 2.2 §10.4
@@ -121,6 +301,15 @@ impl Limits {
         Self {
             min: self.min + frame,
             max: self.max + frame,
+        }
+    }
+
+    /// These limits and `other`'s at once: the larger minimum and the smaller
+    /// maximum.
+    pub(super) fn intersection(self, other: Self) -> Self {
+        Self {
+            min: self.min.max(other.min),
+            max: self.max.min(other.max),
         }
     }
 
@@ -184,11 +373,16 @@ impl Sizes {
     /// with no minimum and no maximum.
     pub(super) const AUTO: Self = Self {
         preferred: None,
-        limits: Limits {
-            min: 0.0,
-            max: f32::INFINITY,
-        },
+        limits: Limits::NONE,
     };
+
+    /// The same sizes, held between `limits` as well as their own.
+    pub(super) fn within(self, limits: Limits) -> Self {
+        Self {
+            limits: self.limits.intersection(limits),
+            ..self
+        }
+    }
 
     /// The size the box is: what it asked for, or what `auto` came to when it
     /// asked for nothing, held between its minimum and its maximum.
@@ -216,6 +410,66 @@ impl Sizes {
             None => self.limits.outer(frame).clamp(auto()),
         }
     }
+}
+
+/// The room down the block axis that a box's contents are laid out in, as
+/// content-box heights: the box's own height, when it has one before they are
+/// laid out, and the minimum and maximum it is held between.
+///
+/// The height is what a percentage height inside the box is of (CSS 2.2
+/// §10.5). The limits are what a box as tall as its contents is held between
+/// once they are laid out (§10.7), which is late for a flex container: its items
+/// are fitted into its size, so it needs the limits before it has laid them out
+/// (CSS Flexbox §9.3 step 4, §9.4 step 15).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct BlockSpace {
+    /// The box's height, when it has one that does not wait for its contents:
+    /// `None` is a box as tall as they are.
+    pub(super) height: Option<f32>,
+    /// Its `min-height` and `max-height`, with `box-sizing` already taken out.
+    pub(super) limits: Limits,
+}
+
+impl BlockSpace {
+    /// The room of a box that is exactly `height` tall because whoever laid it
+    /// out said so, as a flex line or a flex container does with its items.
+    /// `definite` is whether a percentage inside it has that height to be of
+    /// (CSS Flexbox §9.8). Either way the box is held to that height, so a flex
+    /// container shares out all of it, even where a percentage cannot be of it.
+    pub(super) fn exactly(height: f32, definite: bool) -> Self {
+        Self {
+            height: definite.then_some(height),
+            limits: Limits {
+                min: height,
+                max: height,
+            },
+        }
+    }
+
+    /// How tall the box's content box is when what it holds comes to `content`:
+    /// its own height where it has one, and otherwise that content held between
+    /// its limits.
+    pub(super) fn used(self, content: f32) -> f32 {
+        self.height.unwrap_or_else(|| self.limits.clamp(content))
+    }
+
+    /// The room to the bit, which is what a measure taken in it is kept by.
+    pub(super) fn bits(self) -> SpaceBits {
+        SpaceBits {
+            height: self.height.map(f32::to_bits),
+            min: self.limits.min.to_bits(),
+            max: self.limits.max.to_bits(),
+        }
+    }
+}
+
+/// A [`BlockSpace`] to the bit, which is what a box's measured height is kept
+/// by: two spaces that differ anywhere are two questions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct SpaceBits {
+    height: Option<u32>,
+    min: u32,
+    max: u32,
 }
 
 /// The room a box's width is worked out in: what CSS Sizing 3 calls the
@@ -470,14 +724,92 @@ pub(super) fn block_sizes_in(
     )
 }
 
+/// What `height`, `min-height` and `max-height` ask of a box whose height its
+/// preferred aspect ratio makes of its width (see [`height_ratio`]), when its
+/// content box is `inline_size` wide: the width through the ratio (CSS Sizing 4
+/// §4.2). The height is definite, as the width it comes from is, so a
+/// percentage inside the box has it to be of.
+///
+/// And it is no less than the box's content, which is the automatic minimum
+/// of §4.3: `min-height: auto` is the min-content height, which is `content`
+/// once the box has been laid out, so text longer than the ratio has room for
+/// grows the box rather than spilling out of it. Not for a scroll container,
+/// which keeps its shape and scrolls, nor where the page named a minimum of
+/// its own. The limits are left as they are, and hold the height as they hold
+/// any other.
+fn ratio_height(
+    style: &ComputedStyle,
+    sizes: Sizes,
+    ratio: PreferredRatio,
+    frame: Frame,
+    inline_size: f32,
+    content: Option<f32>,
+) -> Sizes {
+    let through_ratio = ratio.height_for(inline_size, frame);
+    let content_floor = match (&style.min_height, content) {
+        (Size::Auto, Some(content)) if !is_scroll_container(style) => content,
+        (Size::Auto | Size::Length(_) | Size::Intrinsic(_) | Size::Stretch, _) => 0.0,
+    };
+    Sizes {
+        preferred: Some(through_ratio.max(content_floor)),
+        ..sizes
+    }
+}
+
+/// CSS Sizing 4 §4.4: a box's definite minimum and maximum heights, carried
+/// through its preferred aspect ratio onto its width, where its own
+/// `min-width` and `max-width` say nothing — which is how `aspect-ratio: 16/9;
+/// max-height: 80vh` keeps a video's shape on a tall, narrow screen rather than
+/// letting it run the width of the page. These are the limits carried, with
+/// no minimum and no maximum where nothing is.
+///
+/// A carried minimum is no more than a width or a maximum the page named, and
+/// a carried maximum no less than a width or a minimum it named, or than the
+/// carried minimum where there is one: a ratio never overrules a width that
+/// was asked for.
+///
+/// Only this way round. The other, a box's width limits carried onto an
+/// automatic height, changes nothing: that height is taken through the ratio
+/// from a width its limits have already held.
+fn transfer_height_limits(
+    style: &ComputedStyle,
+    widths: Sizes,
+    heights: Limits,
+    ratio: PreferredRatio,
+    frame: Frame,
+) -> Limits {
+    let Sizes { preferred, limits } = widths;
+    let min = match style.min_width {
+        Size::Auto if heights.min > 0.0 => Some(
+            ratio
+                .width_for(heights.min, frame)
+                .min(preferred.unwrap_or(f32::INFINITY))
+                .min(limits.max),
+        ),
+        Size::Auto | Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => None,
+    };
+    let max = match style.max_width {
+        MaxSize::None if heights.max.is_finite() => Some(
+            ratio
+                .width_for(heights.max, frame)
+                .max(preferred.unwrap_or(0.0))
+                .max(limits.min)
+                .max(min.unwrap_or(0.0)),
+        ),
+        MaxSize::None | MaxSize::Length(_) | MaxSize::Intrinsic(_) | MaxSize::Stretch => None,
+    };
+    Limits {
+        min: min.unwrap_or(Limits::NONE.min),
+        max: max.unwrap_or(Limits::NONE.max),
+    }
+}
+
 impl<'a> Flow<'a> {
     /// What `width`, `min-width` and `max-width` ask of a box, as content-box
-    /// widths.
-    ///
-    /// For a box being laid out and for one whose contribution to its container
-    /// is being measured alike: `room` says which. A content keyword is the box's
-    /// own content measured, which a picture and a widget answer from their own
-    /// width instead (see [`replaced_widths`]).
+    /// widths, held between the limits its heights carry onto its width
+    /// through its preferred aspect ratio as well (see
+    /// [`Self::transferred_width_limits`]) — what a block, a float, an inline
+    /// block and a positioned box are sized by.
     pub(super) fn inline_sizes(
         &mut self,
         id: BoxId,
@@ -485,7 +817,31 @@ impl<'a> Flow<'a> {
         room: InlineRoom,
         frame: f32,
     ) -> Sizes {
-        if let Some(own) = self.own_width(id, style, room.measure) {
+        let named = self.named_inline_sizes(id, style, room, frame);
+        named.within(self.transferred_width_limits(id, style, room, named))
+    }
+
+    /// What `width`, `min-width` and `max-width` ask of a box, as content-box
+    /// widths: what the page named and nothing a ratio carried over, which is
+    /// what a flex item's main size and its size across are held between.
+    ///
+    /// For a box being laid out and for one whose contribution to its container
+    /// is being measured alike: `room` says which. A content keyword is the box's
+    /// own content measured, which a picture and a widget answer from their own
+    /// width instead (see [`replaced_widths`]).
+    ///
+    /// What a box's `auto` width comes to through its preferred aspect ratio is
+    /// the formatting context's to ask (see [`Self::ratio_width`]): it is what
+    /// `auto` means there, not a width the page asked for.
+    pub(super) fn named_inline_sizes(
+        &mut self,
+        id: BoxId,
+        style: &ComputedStyle,
+        room: InlineRoom,
+        frame: f32,
+    ) -> Sizes {
+        let heights_against = self.heights_against(room);
+        if let Some(own) = self.own_width(id, style, room.measure, heights_against) {
             return replaced_widths(style, room, frame, own);
         }
         let preferred = self.preferred_width(id, style, &style.width, room, frame);
@@ -493,6 +849,66 @@ impl<'a> Flow<'a> {
             self.intrinsic_width(id, style, keyword, room, frame)
         });
         Sizes { preferred, limits }
+    }
+
+    /// The limits a box's definite heights carry onto its width through its
+    /// preferred aspect ratio (see [`transfer_height_limits`]), against the
+    /// widths the page `named`: no minimum and no maximum for a box that has
+    /// no ratio, or whose width is its own (see [`Self::width_ratio`]).
+    ///
+    /// Kept apart from the named ones because a flex item holds only what its
+    /// content asks for by them — its content size suggestion (CSS Flexbox
+    /// §4.5) among it — and not the minimum and maximum its main size and its
+    /// stretched size across are held between.
+    pub(super) fn transferred_width_limits(
+        &self,
+        id: BoxId,
+        style: &ComputedStyle,
+        room: InlineRoom,
+        named: Sizes,
+    ) -> Limits {
+        match self.width_ratio(id, style) {
+            Some(ratio) => transfer_height_limits(
+                style,
+                named,
+                block_sizes_in(style, room.measure, self.heights_against(room), None).limits,
+                ratio,
+                Frame::of(style, room.measure),
+            ),
+            None => Limits::NONE,
+        }
+    }
+
+    /// The preferred aspect ratio a box's width is worked out through here
+    /// (CSS Sizing 4 §4.1).
+    ///
+    /// `None` for a box with no ratio; for a box whose width is its own — a
+    /// picture, whose ratio is already in the width it has (see `replaced`),
+    /// and a widget with a natural width; and for an inline box and a run of
+    /// text, which `aspect-ratio` does not apply to, since a line sizes them.
+    pub(super) fn width_ratio(&self, id: BoxId, style: &ComputedStyle) -> Option<PreferredRatio> {
+        let node = self.tree.node(id);
+        match &node.kind {
+            BoxKind::Block if node.natural_size().width.is_none() => preferred_ratio(style, None),
+            BoxKind::Block | BoxKind::Replaced(_) | BoxKind::Inline | BoxKind::Text(_) => None,
+        }
+    }
+
+    /// The height of the containing block a box's own heights are resolved
+    /// against while its width is worked out: this context's, for a box being
+    /// laid out, and none while its contribution to its container is measured.
+    ///
+    /// There a percentage height is taken for `auto`. That is right where the
+    /// containing block's height waits for its contents, and short of what
+    /// browsers do where it does not: they resolve it, so a picture at `height:
+    /// 100%` in a float of a set height makes the float as wide as the picture
+    /// is at that height (CSS Sizing 4 §4.4, example). Measuring here does not
+    /// yet carry each measured box's height down to what it holds.
+    fn heights_against(&self, room: InlineRoom) -> Option<f32> {
+        match room.available {
+            Available::Definite(_) => self.containing_height,
+            Available::Measuring(_) => None,
+        }
     }
 
     /// The width of a box that is its own content — a picture, or a widget that
@@ -503,18 +919,21 @@ impl<'a> Flow<'a> {
     /// `max-width`, which are what it asks of its container rather than what it
     /// is, but with its heights, which it takes its width from when it has a
     /// ratio: a picture told to be fifty pixels tall is a hundred wide at two to
-    /// one, whatever holds it. A percentage height is of a containing block
-    /// nobody is asking about while the box is measured, so it is `auto` here.
+    /// one, whatever holds it. A percentage height is of `containing_height`,
+    /// the containing block's height where it has one — a picture at `height:
+    /// 100%` in a header of a set height is as wide as that height makes it —
+    /// and `auto` where it has none.
     pub(super) fn own_width(
         &self,
         id: BoxId,
         style: &ComputedStyle,
         containing_width: f32,
+        containing_height: Option<f32>,
     ) -> Option<OwnWidth> {
         let node = self.tree.node(id);
         match &node.kind {
             BoxKind::Replaced(content) => Some(OwnWidth {
-                natural: natural_width(style, content, containing_width),
+                natural: natural_width(style, content, containing_width, containing_height),
                 hint: content.hint.0,
             }),
             BoxKind::Block | BoxKind::Inline | BoxKind::Text(_) => {
@@ -586,7 +1005,7 @@ impl<'a> Flow<'a> {
 
     /// The border-box width the fit-content formula gives a box's content in
     /// `room`.
-    fn fit_content_size(&mut self, id: BoxId, room: InlineRoom) -> f32 {
+    pub(super) fn fit_content_size(&mut self, id: BoxId, room: InlineRoom) -> f32 {
         match room.available {
             Available::Definite(available) => fit_content(
                 self.min_content_size(id, room.measure),
@@ -597,11 +1016,63 @@ impl<'a> Flow<'a> {
         }
     }
 
+    /// The content-box width a box's automatic width comes to through its
+    /// preferred aspect ratio, when it has one and a definite height to take
+    /// the width from (CSS Sizing 4 §4.2) — or `None`, and the formatting
+    /// context answers `auto` its own way.
+    ///
+    /// The height is held between its own limits before it is carried over, as
+    /// a picture's is. And the width is no less than the box's min-content
+    /// width where `min-width` is `auto` and the box does not scroll: §4.3's
+    /// automatic minimum works in both axes, so a square a hundred pixels tall
+    /// holding a word a hundred and fifty wide is a hundred and fifty wide.
+    ///
+    /// A picture and a widget have widths of their own and are not asked (see
+    /// [`Self::width_ratio`]).
+    pub(super) fn ratio_width(
+        &mut self,
+        id: BoxId,
+        style: &ComputedStyle,
+        room: InlineRoom,
+    ) -> Option<f32> {
+        let ratio = self.width_ratio(id, style)?;
+        let height =
+            block_sizes_in(style, room.measure, self.heights_against(room), None).definite()?;
+        let frame = Frame::of(style, room.measure);
+        let width = ratio.width_for(height, frame);
+        Some(match style.min_width {
+            Size::Auto if !is_scroll_container(style) => {
+                width.max(self.min_content_size(id, room.measure) - frame.inline)
+            }
+            Size::Auto | Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => width,
+        })
+    }
+
+    /// The border-box width `auto` comes to for a box: through its preferred
+    /// aspect ratio where that has one to give it (see [`Self::ratio_width`]),
+    /// and otherwise what `otherwise` — the formatting context's own answer —
+    /// makes of it.
+    pub(super) fn automatic_width(
+        &mut self,
+        id: BoxId,
+        style: &ComputedStyle,
+        room: InlineRoom,
+        frame: f32,
+        otherwise: impl FnOnce(&mut Self) -> f32,
+    ) -> f32 {
+        match self.ratio_width(id, style, room) {
+            Some(width) => width + frame,
+            None => otherwise(self),
+        }
+    }
+
     /// The border-box width of a box whose `auto` width shrinks to fit: a float,
     /// an inline block, and an absolutely positioned box with an edge left free.
     ///
-    /// Whatever its own `width` says wins; `auto` is the fit-content formula
-    /// against the room there is; and the minimum and maximum hold either.
+    /// Whatever its own `width` says wins; `auto` is the width its preferred
+    /// aspect ratio gives it where it has one and a definite height, and the
+    /// fit-content formula against the room there is otherwise; and the
+    /// minimum and maximum hold either.
     ///
     /// A picture does not shrink to fit anything. Floated or positioned, its
     /// width is worked out as it is on a line (CSS 2.2 §10.3.6, §10.3.8), by
@@ -617,36 +1088,66 @@ impl<'a> Flow<'a> {
         if let BoxKind::Replaced(content) = &self.tree.node(id).kind {
             return replaced_size(style, content, room, self.containing_height).0 + frame;
         }
-        self.inline_sizes(id, style, room, frame)
-            .used_border_box(frame, || self.fit_content_size(id, room))
+        let sizes = self.inline_sizes(id, style, room, frame);
+        sizes.used_border_box(frame, || {
+            self.automatic_width(id, style, room, frame, |flow| {
+                flow.fit_content_size(id, room)
+            })
+        })
     }
 
     /// What `height`, `min-height` and `max-height` ask of a box laid out in a
     /// containing block `containing_width` wide, against the containing block
     /// height this context has — the one question every block-axis caller asks.
+    ///
+    /// `inline_size` is the width of the box's own content box, which an
+    /// automatic height is taken from when the box has a preferred aspect
+    /// ratio (see [`ratio_height`]).
     pub(super) fn block_sizes_of(
         &self,
         style: &ComputedStyle,
         containing_width: f32,
+        inline_size: f32,
         content: Option<f32>,
     ) -> Sizes {
-        block_sizes_in(style, containing_width, self.containing_height, content)
+        let sizes = block_sizes_in(style, containing_width, self.containing_height, content);
+        match height_ratio(style, sizes.preferred) {
+            Some(ratio) => ratio_height(
+                style,
+                sizes,
+                ratio,
+                Frame::of(style, containing_width),
+                inline_size,
+                content,
+            ),
+            None => sizes,
+        }
     }
 
     /// The content-box height a box asks for, when it asks for one that means
     /// anything here: a length, or a percentage of a containing block that has a
     /// height of its own. A keyword and a percentage of a height nobody knows are
-    /// both `auto`.
+    /// both `auto`, and so is a height a preferred aspect ratio would make of
+    /// the box's width, which is not one the page asked for.
     pub(super) fn asked_height(&self, style: &ComputedStyle, containing_width: f32) -> Option<f32> {
-        self.block_sizes_of(style, containing_width, None).preferred
+        block_sizes_in(style, containing_width, self.containing_height, None).preferred
     }
 
-    /// The height to resolve the percentages *inside* a box against: its own
-    /// content height, when it has one before its contents are laid out, held
-    /// between its minimum and its maximum. A box as tall as its contents has
-    /// none, because it cannot answer a question its contents are asking.
-    pub(super) fn inner_height(&self, style: &ComputedStyle, containing_width: f32) -> Option<f32> {
-        self.block_sizes_of(style, containing_width, None)
-            .definite()
+    /// The block space a box's own contents are laid out in, when its content
+    /// box is `inline_size` wide: its content height, when it has one before
+    /// they are laid out, held between its minimum and its maximum — which a
+    /// box as tall as its contents has not, because it cannot answer a
+    /// question its contents are asking — and those limits themselves.
+    pub(super) fn content_space(
+        &self,
+        style: &ComputedStyle,
+        containing_width: f32,
+        inline_size: f32,
+    ) -> BlockSpace {
+        let sizes = self.block_sizes_of(style, containing_width, inline_size, None);
+        BlockSpace {
+            height: sizes.definite(),
+            limits: sizes.limits,
+        }
     }
 }

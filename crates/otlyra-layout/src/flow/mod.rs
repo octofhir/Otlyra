@@ -52,6 +52,7 @@ use crate::fragment::{Fragment, FragmentKind, FragmentTree, Layer, Rect, ScrollP
 use float::FloatBox;
 use intrinsic::Wanted;
 use list::PendingMarker;
+use sizing::{Limits, SpaceBits};
 use table::TableLines;
 use widgets::size_widgets;
 
@@ -92,10 +93,12 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         collapsed: slotmap::SecondaryMap::new(),
         collapsed_lines: slotmap::SecondaryMap::new(),
         measured: std::collections::HashMap::new(),
+        measured_heights: std::collections::HashMap::new(),
         // The initial containing block is the viewport, and the viewport has a
         // height. So `html { min-height: 100% }` — which a great many pages open
         // with — is a hundred percent of something rather than of nothing.
         containing_height: Some(viewport.height),
+        container_limits: Limits::NONE,
         line_reach: (0.0, 0.0),
         span_reach: Vec::new(),
     };
@@ -166,7 +169,9 @@ pub fn relayout_contained(
         collapsed: slotmap::SecondaryMap::new(),
         collapsed_lines: slotmap::SecondaryMap::new(),
         measured: std::collections::HashMap::new(),
+        measured_heights: std::collections::HashMap::new(),
         containing_height: None,
+        container_limits: Limits::NONE,
         line_reach: (0.0, 0.0),
         span_reach: Vec::new(),
     };
@@ -282,6 +287,15 @@ struct Flow<'a> {
     /// box resolves against it. Cleared with the layout it belongs to, since a box
     /// tree lives no longer than that.
     measured: std::collections::HashMap<(BoxId, u32, Wanted), f32>,
+    /// How tall a box's contents came to, by the box, the width they were laid
+    /// out in and the block space they were laid out in (see
+    /// [`sizing::BlockSpace`]), to the bit: what flex layout
+    /// measures its items by, and what keeps nested flex containers from laying
+    /// the same box out over and over (see [`Flow::content_block_size`]).
+    ///
+    /// Heights only, never fragments: a height does not depend on where the box
+    /// is, and what is inside it can.
+    measured_heights: std::collections::HashMap<(BoxId, u32, SpaceBits), f32>,
     /// The height of the containing block, when it has one of its own.
     ///
     /// A percentage height is a percentage of the *height* of what holds the box,
@@ -290,6 +304,13 @@ struct Flow<'a> {
     /// tall as what is in it — CSS says the percentage computes to `auto`, and the
     /// box is as tall as its own contents.
     containing_height: Option<f32>,
+    /// The minimum and maximum content heights of the box whose contents are
+    /// being laid out, the other half of the [`sizing::BlockSpace`] that
+    /// `containing_height` is the height of. Only a flex container reads it,
+    /// as its own limits, since it fits its items into its height before it
+    /// knows what they come to (CSS Flexbox §9.3 step 4, §9.4 step 15); a
+    /// grid container could do the same.
+    container_limits: Limits,
     /// How far the paragraph being laid out reaches above and below its baseline,
     /// as its own struts and inline blocks settled it.
     ///

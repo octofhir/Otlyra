@@ -38,10 +38,10 @@ pub mod style;
 pub mod stylo_dom;
 
 pub use style::{
-    AlignContent, AlignItems, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
+    AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Calc, Clear, ComputedStyle,
     Corners, Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
     Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, ListStyle, MaxSize, ObjectFit,
-    Overflow, Position, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap, Track,
-    TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
+    Overflow, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
+    Track, TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
 };

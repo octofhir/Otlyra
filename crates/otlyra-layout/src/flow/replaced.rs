@@ -7,22 +7,24 @@
 
 use std::sync::Arc;
 
-use otlyra_css::{ComputedStyle, Size};
+use otlyra_css::{ComputedStyle, Ratio, Size};
 
 use crate::box_tree::{BoxId, Replaced};
 use crate::fragment::{Fragment, FragmentKind, Rect};
 
 use super::box_model::{resolve_border, resolve_padding};
 use super::sizing::{
-    Frame, InlineRoom, Limits, OwnWidth, Sizes, block_sizes_in, content_box, replaced_widths,
+    Frame, InlineRoom, Limits, OwnWidth, PreferredRatio, Sizes, block_sizes_in, content_box,
+    preferred_ratio, replaced_widths,
 };
 
 /// The size a replaced box is drawn at: its *content* box, which is the picture
 /// and not the frame around it.
 ///
 /// CSS first, then whatever the content itself says, and a single given dimension
-/// takes the other from the intrinsic ratio — which is what makes `width: 100%` on
-/// a photograph keep its shape instead of squashing it.
+/// takes the other from the picture's preferred aspect ratio — its natural one,
+/// unless `aspect-ratio` says otherwise (CSS Sizing 4 §4.1) — which is what
+/// makes `width: 100%` on a photograph keep its shape instead of squashing it.
 ///
 /// `box-sizing: border-box` takes the frame out of the number the page wrote, and
 /// the ratio is applied to what is left: a hundred-pixel box with a ten-pixel
@@ -45,27 +47,30 @@ pub(super) fn replaced_size(
     let frame = Frame::of(style, room.measure);
     let heights = picture_heights(style, content, room.measure, containing_height);
     let own = OwnWidth {
-        natural: width_from(content, heights),
+        natural: width_from(style, content, frame, heights),
         hint: content.hint.0,
     };
     let widths = replaced_widths(style, room, frame.inline, own);
-    drawn_size(content, widths, heights)
+    drawn_size(style, content, frame, widths, heights)
 }
 
 /// The content-box width a picture comes to with nothing said about its width:
 /// its own, or what its heights make of it through its ratio — which is its
 /// min-content and its max-content size alike (CSS Sizing 3 §5.1).
 ///
-/// Measured without a containing block's height, since nobody measuring a
-/// width is asking about one: a percentage height is `auto` here.
+/// A percentage height is of `containing_height`, the containing block's
+/// height when it has one, and `auto` when it has none.
 pub(super) fn natural_width(
     style: &ComputedStyle,
     content: &Replaced,
     containing_width: f32,
+    containing_height: Option<f32>,
 ) -> f32 {
     width_from(
+        style,
         content,
-        picture_heights(style, content, containing_width, None),
+        Frame::of(style, containing_width),
+        picture_heights(style, content, containing_width, containing_height),
     )
 }
 
@@ -87,13 +92,19 @@ pub(super) fn replaced_height(
     containing_height: Option<f32>,
 ) -> f32 {
     let heights = picture_heights(style, content, containing_width, containing_height);
-    height_at(content, width, heights)
+    height_at(
+        style,
+        content,
+        Frame::of(style, containing_width),
+        width,
+        heights,
+    )
 }
 
 /// What `height`, `min-height` and `max-height` ask of a picture, as content-box
 /// heights, with a `height` attribute standing in for an `auto` height — and
 /// only for `auto`, since any height a stylesheet names outranks a hint.
-fn picture_heights(
+pub(super) fn picture_heights(
     style: &ComputedStyle,
     content: &Replaced,
     containing_width: f32,
@@ -121,46 +132,81 @@ fn picture_heights(
     }
 }
 
-/// A picture's width over its height, when it has both sides to take one from.
-fn ratio(content: &Replaced) -> Option<f32> {
-    content
+/// A picture's preferred aspect ratio (CSS Sizing 4 §4.1): its natural ratio,
+/// when it has both sides to take one from, as `aspect-ratio` lets it have it.
+pub(super) fn ratio(style: &ComputedStyle, content: &Replaced) -> Option<PreferredRatio> {
+    let natural = content
         .intrinsic
-        .and_then(|(width, height)| (width > 0.0 && height > 0.0).then_some(width / height))
+        .and_then(|(width, height)| Ratio::new(width, height));
+    preferred_ratio(style, natural)
 }
 
 /// The width a picture comes to when nothing is said about its width, from
 /// what is said about its height.
-fn width_from(content: &Replaced, heights: Sizes) -> f32 {
-    drawn_size(content, Sizes::AUTO, heights).0
+fn width_from(style: &ComputedStyle, content: &Replaced, frame: Frame, heights: Sizes) -> f32 {
+    drawn_size(style, content, frame, Sizes::AUTO, heights).0
 }
 
 /// The content-box height a picture drawn `width` wide comes to: what it asked
-/// for, or the width over its ratio, or its own height when it has no ratio —
-/// held between its limits.
-fn height_at(content: &Replaced, width: f32, heights: Sizes) -> f32 {
+/// for, or the width through its ratio, or its own height when it has no ratio
+/// — held between its limits.
+fn height_at(
+    style: &ComputedStyle,
+    content: &Replaced,
+    frame: Frame,
+    width: f32,
+    heights: Sizes,
+) -> f32 {
     let (_, natural_height) = content.intrinsic.unwrap_or_default();
-    heights.used(ratio(content).map_or(natural_height, |ratio| width / ratio))
+    heights
+        .used(ratio(style, content).map_or(natural_height, |ratio| ratio.height_for(width, frame)))
+}
+
+/// The size a picture is with nothing said about either side of it, when it
+/// has a ratio: its natural size, or where the ratio is not the picture's own,
+/// its natural width and the height the ratio makes of it (see
+/// [`PreferredRatio::overrides_natural_height`]). A picture with a natural
+/// width and no natural height has no ratio of its own, and so takes its
+/// height from the stylesheet's.
+///
+/// `None` for a picture with no natural width to start from, whose ratio is
+/// the stylesheet's alone.
+fn natural_size(content: &Replaced, ratio: PreferredRatio, frame: Frame) -> Option<(f32, f32)> {
+    let (width, height) = content.intrinsic?;
+    let height = if ratio.overrides_natural_height() {
+        ratio.height_for(width, frame)
+    } else {
+        height
+    };
+    (width > 0.0 && height > 0.0).then_some((width, height))
 }
 
 /// The content-box size a picture is drawn at, once its width and its height
 /// have been asked what they want.
-fn drawn_size(content: &Replaced, widths: Sizes, heights: Sizes) -> (f32, f32) {
-    let natural = content.intrinsic.unwrap_or_default();
-    match (widths.preferred, heights.preferred, ratio(content)) {
-        // CSS 2.2 §10.3.2: an `auto` width is the used height times the ratio —
-        // the height once its own limits have had their say.
+fn drawn_size(
+    style: &ComputedStyle,
+    content: &Replaced,
+    frame: Frame,
+    widths: Sizes,
+    heights: Sizes,
+) -> (f32, f32) {
+    let (natural_width, _) = content.intrinsic.unwrap_or_default();
+    let at_width = |width| (width, height_at(style, content, frame, width, heights));
+    match (widths.preferred, heights.preferred, ratio(style, content)) {
+        // CSS 2.2 §10.3.2: an `auto` width is the used height through the
+        // ratio — the height once its own limits have had their say.
         (None, Some(height), Some(ratio)) => {
             let height = heights.limits.clamp(height);
-            (widths.limits.clamp(height * ratio), height)
+            (widths.limits.clamp(ratio.width_for(height, frame)), height)
         }
-        (None, None, Some(_)) => within_keeping_ratio(natural, widths.limits, heights.limits),
+        (None, None, Some(ratio)) => match natural_size(content, ratio, frame) {
+            Some(natural) => within_keeping_ratio(natural, widths.limits, heights.limits),
+            None => at_width(widths.used(natural_width)),
+        },
         // And §10.6.2 the other way about: a width that is given, or one that
         // is the picture's own because it has no ratio to take one from, is
         // held between its limits before the height is taken from it.
-        (Some(_), _, _) | (None, _, None) => {
-            let width = widths.used(natural.0);
-            (width, height_at(content, width, heights))
-        }
+        (Some(_), _, _) | (None, _, None) => at_width(widths.used(natural_width)),
     }
 }
 
@@ -200,7 +246,11 @@ impl Against {
 /// is everywhere else.
 ///
 /// `natural` is the picture's own size, both sides of it above zero: that is
-/// what having a ratio means.
+/// what having a ratio means. The shape kept is that size's, across the
+/// content box, which is the ratio's shape unless a `<ratio>` of the
+/// stylesheet's measures it across the border box of a picture with padding
+/// or a border: there the limits are met by a content box of the ratio's
+/// shape rather than by a border box of it.
 fn within_keeping_ratio(natural: (f32, f32), widths: Limits, heights: Limits) -> (f32, f32) {
     let (width, height) = natural;
     let widths = Limits {
