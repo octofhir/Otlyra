@@ -206,7 +206,7 @@ impl Frames {
             self.surface.clip_to(clip);
             self.surface.clear_rect(clip);
             for layer in &scene.layers {
-                otlyra_gfx::render(&layer.list, &mut self.surface);
+                otlyra_gfx::render_scrolled(&layer.list, &mut self.surface, &layer.offsets);
             }
             self.surface.reset_clip();
             raster = started.elapsed();

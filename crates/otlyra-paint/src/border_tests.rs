@@ -228,7 +228,8 @@ fn every_background_layer_is_drawn_in_the_order_it_was_written() {
             }),
             ..Frame::default()
         },
-    );
+    )
+    .at(0.0);
 
     // The layer written second is drawn first, so the one written first ends
     // up over it.

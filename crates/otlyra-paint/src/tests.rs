@@ -208,7 +208,8 @@ fn a_selection_is_drawn_under_the_text() {
             highlights: &highlight,
             ..Frame::default()
         },
-    );
+    )
+    .at(0.0);
 
     let mut painted = None;
     for item in list.items() {
@@ -539,8 +540,11 @@ fn a_scrollbar_shows_where_the_reader_is_and_only_when_there_is_somewhere_to_go(
                 DisplayItem::Fill {
                     brush: Brush::Solid(colour),
                     shape,
+                    transform,
                     ..
-                } if *colour == SCROLLBAR_THUMB => Some(shape.bounding_box()),
+                } if *colour == SCROLLBAR_THUMB => {
+                    Some(transform.transform_rect_bbox(shape.bounding_box()))
+                }
                 _ => None,
             })
             .next_back()
@@ -926,7 +930,8 @@ fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::Image
             }),
             ..Frame::default()
         },
-    );
+    )
+    .at(0.0);
 
     list.items()
         .iter()
@@ -1064,8 +1069,13 @@ fn a_sticky_box_stops_at_its_inset_and_leaves_with_its_container() {
             .items()
             .iter()
             .filter_map(|item| match item {
-                DisplayItem::Fill { brush, shape, .. } if *brush == Brush::Solid(green) => {
-                    Some(shape.bounding_box().y0)
+                DisplayItem::Fill {
+                    brush,
+                    shape,
+                    transform,
+                    ..
+                } if *brush == Brush::Solid(green) => {
+                    Some(transform.transform_rect_bbox(shape.bounding_box()).y0)
                 }
                 _ => None,
             })

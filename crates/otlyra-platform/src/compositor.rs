@@ -114,7 +114,7 @@ impl SceneCompositor {
             Damage::Full => {
                 surface.reset();
                 for layer in &scene.layers {
-                    otlyra_gfx::render(&layer.list, surface);
+                    otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
                 }
                 Upload::Full(surface.read_rgba8().map_err(Box::new)?)
             }
@@ -129,7 +129,7 @@ impl SceneCompositor {
                 surface.clear_rect(clip);
                 for layer in &scene.layers {
                     if layer.rect.intersects(&rect) {
-                        otlyra_gfx::render(&layer.list, surface);
+                        otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
                     }
                 }
                 surface.reset_clip();
@@ -429,6 +429,7 @@ mod tests {
             rect,
             epoch,
             list: std::sync::Arc::new(otlyra_gfx::DisplayList::new()),
+            offsets: Vec::new(),
             dirty: None,
         }
     }
@@ -624,6 +625,7 @@ mod tests {
                         rect: bottom,
                         epoch: 1,
                         list: Self::list(bottom, self.bottom),
+                        offsets: Vec::new(),
                         dirty: None,
                     },
                     crate::SceneLayer {
@@ -631,6 +633,7 @@ mod tests {
                         rect: top,
                         epoch: self.epoch,
                         list: Self::list(top, self.top),
+                        offsets: Vec::new(),
                         dirty: None,
                     },
                 ],

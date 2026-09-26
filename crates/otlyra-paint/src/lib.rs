@@ -36,14 +36,16 @@ mod gradient;
 mod scrollbar;
 mod shadow;
 mod shape;
+mod spatial;
 mod text;
 mod widget;
 
 pub use scrollbar::{scrollbar_thumb, scrollbar_travel};
+pub use spatial::{PAGE, PAGE_THUMB, PageList, Spatials};
 
 use otlyra_gfx::kurbo::{Affine, Rect as KurboRect, Shape};
 use otlyra_gfx::peniko::{BlendMode, Brush, Color, Fill};
-use otlyra_gfx::{DisplayItem, DisplayList, HitTestId};
+use otlyra_gfx::{DisplayItem, DisplayList, HitTestId, SpatialId};
 use otlyra_layout::fragment::{Fragment, FragmentKind, FragmentTree, Rect};
 
 use background::paint_background_layer;
@@ -111,7 +113,7 @@ impl Highlight {
 }
 
 /// Build the display list for `tree`, showing the part of the page under
-/// `scroll_y`, at `viewport` logical size.
+/// `scroll_y`, at `viewport` logical size, as plain geometry.
 pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f32) -> DisplayList {
     build_display_list_with(
         tree,
@@ -121,6 +123,7 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
             ..Frame::default()
         },
     )
+    .at(scroll_y)
 }
 
 /// Where a background picture is found, by the address a style names.
@@ -138,6 +141,12 @@ pub struct Frame<'a> {
     pub viewport: (f32, f32),
     /// How far down the page the reader is.
     pub scroll_y: f32,
+    /// How much of the page past each edge of the viewport to draw as well.
+    ///
+    /// The list is in page coordinates and the scroll is applied when it is
+    /// drawn, so a list built with a margin serves every scroll that keeps the
+    /// viewport inside it — which is most of them.
+    pub margin: f32,
     /// How far each scroll port has been scrolled.
     pub port_offset: Option<PortOffset<'a>>,
     /// The decoded picture behind a box, by the address its style names.
@@ -166,6 +175,7 @@ impl Default for Frame<'_> {
         Self {
             viewport: (0.0, 0.0),
             scroll_y: 0.0,
+            margin: 0.0,
             port_offset: None,
             background: None,
             scrollbars: true,
@@ -196,15 +206,24 @@ pub fn build_display_list_scrolled(
             ..Frame::default()
         },
     )
+    .at(scroll_y)
 }
 
-/// Build the display list for one frame.
-pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> DisplayList {
+/// Build the display list for one frame, in page coordinates, with what moves
+/// each part of it.
+///
+/// Everything that scrolls with the page is drawn where layout put it and tagged
+/// [`PAGE`]; a fixed box is drawn where it is on the screen and tagged
+/// [`SpatialId::VIEWPORT`]; a sticky box gets an id of its own. The page is
+/// drawn for the viewport and [`Frame::margin`] past each edge of it, so the list
+/// serves every scroll that keeps the viewport inside that.
+pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageList {
     let (viewport, scroll_y) = (frame.viewport, frame.scroll_y);
     let port_offset = |id| frame.port_offset.map_or(0.0, |lookup| lookup(id));
     let _span = tracing::info_span!("build_display_list").entered();
     let (width, height) = viewport;
     let mut list = DisplayList::new();
+    let mut spatials = Spatials::new(height);
 
     // The canvas. CSS gives the root element's background to the canvas rather than
     // to the element: it covers the whole viewport however short the document is,
@@ -239,7 +258,14 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
             .to_path(PATH_TOLERANCE),
     });
 
-    let scrolled = Rect::new(0.0, scroll_y, width, height);
+    // The part of the page drawn, in page coordinates, and the screen for what is
+    // fixed to it.
+    let scrolled = Rect::new(
+        0.0,
+        scroll_y - frame.margin,
+        width,
+        height + frame.margin * 2.0,
+    );
     let screen = Rect::new(0.0, 0.0, width, height);
 
     // Painting order is the tree's, and then the layers': everything in the flow,
@@ -265,11 +291,26 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         {
             close(groups.pop().expect("just looked"), &mut list);
         }
+        // What this fragment moves with. A fixed box is on the screen already; a
+        // sticky one answers to its own rule; everything else is the page.
+        let inside = fragment.scroll_port.map_or(0.0, &port_offset);
+        let spatial = if fragment.fixed {
+            SpatialId::VIEWPORT
+        } else if let Some(sticky) = fragment.sticky {
+            spatials.sticky(sticky, inside)
+        } else {
+            PAGE
+        };
         if matches!(fragment.kind, FragmentKind::Box) {
             let faded = fragment.style.opacity < 1.0;
-            let moved = transform_of(fragment, scroll_y);
+            // About the box's own origin, where the box is drawn — in the
+            // coordinates of what it moves with, which is where its items are.
+            let moved = transform_of(fragment, 0.0);
             if faded || moved.is_some() {
                 if faded {
+                    // The group's bound is the screen, and the screen does not
+                    // scroll.
+                    list.set_spatial(SpatialId::VIEWPORT);
                     list.push(DisplayItem::PushLayer {
                         blend: BlendMode::default(),
                         alpha: fragment.style.opacity,
@@ -299,7 +340,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         // it came from.
         let is_root_element = canvas_from.is_some_and(|from| std::ptr::eq(fragment, from))
             || root_element.is_some_and(|root| std::ptr::eq(fragment, root));
-        let inside = fragment.scroll_port.map_or(0.0, &port_offset);
+        list.set_spatial(spatial);
         // The highlight goes under the run it covers, so the letters are drawn over
         // it rather than through it.
         if matches!(fragment.kind, FragmentKind::Text(_)) {
@@ -311,12 +352,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
                 let moved = if fragment.fixed {
                     covered
                 } else {
-                    Rect::new(
-                        covered.x,
-                        covered.y - scroll_y - inside,
-                        covered.width,
-                        covered.height,
-                    )
+                    Rect::new(covered.x, covered.y - inside, covered.width, covered.height)
                 };
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
@@ -335,9 +371,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
         }
         paint(
             fragment,
-            scroll_y + inside,
-            scroll_y,
-            height,
+            inside,
             is_root_element,
             frame.background,
             &mut list,
@@ -350,31 +384,34 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
 
     // Scrollbars last, over everything: the page's, and one for each port that has
     // more to show than it can.
-    if !frame.scrollbars {
-        tracing::debug!(items = list.len(), "display list built");
-        return list;
-    }
-    paint_scrollbar(
-        &mut list,
-        Rect::new(0.0, 0.0, width, height),
-        tree.content_height(),
-        scroll_y,
-    );
-    for port in &tree.scroll_ports {
-        let offset = port_offset(port.id);
-        let mut area = port.port;
-        area.y -= scroll_y;
-        if area.bottom() < 0.0 || area.y > height {
-            continue;
+    if frame.scrollbars {
+        // The page's own thumb, drawn where it sits with the page at the top and
+        // carried down by its own rule as the page scrolls.
+        let area = Rect::new(0.0, 0.0, width, height);
+        list.set_spatial(PAGE_THUMB);
+        paint_scrollbar(&mut list, area, tree.content_height(), 0.0);
+        spatials.thumb(area, tree.content_height());
+        // A port's bar is on the port, which scrolls with the page.
+        list.set_spatial(PAGE);
+        for port in &tree.scroll_ports {
+            if !port.port.intersects(&scrolled) {
+                continue;
+            }
+            paint_scrollbar(
+                &mut list,
+                port.port,
+                port.content_height,
+                port_offset(port.id),
+            );
         }
-        paint_scrollbar(&mut list, area, port.content_height, offset);
     }
 
     // The caret last, so it is over everything the page drew: a caret behind a
     // background is a caret nobody can see.
+    list.set_spatial(PAGE);
     if let Some(caret) = frame.caret {
-        let y = caret.y - scroll_y;
-        if y + caret.height >= 0.0 && y <= height {
+        let y = caret.y;
+        if caret.bottom() >= scrolled.y && caret.y <= scrolled.bottom() {
             list.push(DisplayItem::Fill {
                 style: Fill::NonZero,
                 transform: Affine::IDENTITY,
@@ -392,7 +429,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> Displa
     }
 
     tracing::debug!(items = list.len(), "display list built");
-    list
+    PageList { list, spatials }
 }
 
 /// The content box inside a border box, by the style's own edges.
@@ -410,34 +447,23 @@ fn content_box_of(rect: Rect, style: &otlyra_css::ComputedStyle) -> Rect {
     )
 }
 
-/// One fragment's own drawing. Children are visited by the caller's walk, so this
-/// never recurses — a fragment whose parent was culled may still be visible.
-/// `scroll_y` moves this fragment; `page_scroll` moves the page. They differ by
-/// however far the scroll port this fragment is inside has been scrolled — and the
-/// edge that port cuts its contents off at moves with the page, not with them.
-#[allow(clippy::too_many_arguments)]
+/// One fragment's own drawing, in the coordinates of what it moves with. Children
+/// are visited by the caller's walk, so this never recurses — a fragment whose
+/// parent was culled may still be visible.
+///
+/// `inside` is how far the scroll port this fragment is in has been scrolled,
+/// which moves the fragment and not the edge the port cuts it off at: that edge
+/// belongs to the port's box, which moves with the page.
 fn paint(
     fragment: &Fragment,
-    scroll_y: f32,
-    page_scroll: f32,
-    viewport_height: f32,
+    inside: f32,
     background_on_canvas: bool,
     background_picture: Option<BackgroundLookup<'_>>,
     list: &mut DisplayList,
 ) {
-    // A sticky box moves with the page until the scroll would take it past its
-    // inset, and then holds there until its container runs out from under it.
-    let rect = match fragment.sticky {
-        Some(sticky) => {
-            let mut rect = fragment.rect;
-            rect.y += sticky_shift(sticky, scroll_y, viewport_height);
-            rect
-        }
-        None => fragment.rect,
-    };
-    // A fixed fragment is already in screen coordinates: it stays where it is
-    // however far the page has been scrolled.
-    let scroll_y = if fragment.fixed { 0.0 } else { scroll_y };
+    let rect = fragment.rect;
+    // A fixed fragment is already in screen coordinates, and nothing scrolls it.
+    let scroll_y = if fragment.fixed { 0.0 } else { inside };
 
     // Whatever an ancestor cuts this fragment off at, as a layer around its own
     // drawing. One layer per fragment rather than one around a subtree, because the
@@ -446,7 +472,7 @@ fn paint(
     // The clip belongs to the box rather than to what is inside it, so it does not
     // move when the port is scrolled: only the contents do.
     let clip_scroll = if fragment.scroll_port.is_some() {
-        page_scroll
+        0.0
     } else {
         scroll_y
     };
@@ -619,32 +645,6 @@ fn paint(
     if clip.is_some() {
         list.push(DisplayItem::PopLayer);
     }
-}
-
-/// How far a sticky box has been pushed from where the flow put it.
-///
-/// Zero until the page has scrolled far enough to take it past its inset, then
-/// however much keeps it there — and never so far that it leaves its container,
-/// which is what makes a sticky heading hand over to the next one.
-fn sticky_shift(
-    sticky: otlyra_layout::fragment::Sticky,
-    scroll_y: f32,
-    viewport_height: f32,
-) -> f32 {
-    let own = sticky.own;
-    let container = sticky.container;
-
-    if let Some(top) = sticky.top {
-        let wanted = scroll_y + top - own.y;
-        let room = (container.bottom() - own.bottom()).max(0.0);
-        return wanted.clamp(0.0, room);
-    }
-    if let Some(bottom) = sticky.bottom {
-        let wanted = (scroll_y + viewport_height - bottom) - own.bottom();
-        let room = (container.y - own.y).min(0.0);
-        return wanted.clamp(room, 0.0);
-    }
-    0.0
 }
 
 /// Where inside its box a replaced element's picture is drawn.

@@ -1,7 +1,10 @@
 //! Scrolling: the page's own offset, the panels inside it, and their scrollbars.
 //!
 //! A scroll changes which part of the page is on screen and not where anything is,
-//! so nothing here relays out or reshapes: it moves offsets and records paint. Its
+//! so nothing here relays out or reshapes. The page's own scroll does not even
+//! repaint: the list is drawn in page coordinates and the scroll is applied when
+//! it is drawn (see [`PageScene::offsets`]). A panel's scroll still repaints, as
+//! its offset is part of the list. Its
 //! own module because the wheel, a dragged scrollbar, *scroll into view* and
 //! keeping the reader's place across a relayout are all answers to one question —
 //! which part of the page is in the window.
@@ -18,7 +21,6 @@ impl PageScene {
     /// clamp against.
     pub fn set_scroll(&mut self, scroll: f32) {
         self.scroll = scroll.max(0.0);
-        self.damage.add(Damage::PAINT);
     }
 
     /// Draw no scrollbars, for a picture that is going to be compared with one
@@ -236,16 +238,14 @@ impl PageScene {
             return false;
         }
         self.scroll = scroll;
-        self.damage.add(Damage::PAINT);
         true
     }
 
     /// Scroll the page by `delta` logical pixels, clamped to the content.
     ///
-    /// Damages paint and no more: where the content is has not changed, only which
-    /// part of it is on screen.
+    /// Damages nothing: where the content is has not changed, only which part of
+    /// it is on screen, and that is an offset the next frame draws with.
     pub fn scroll_by(&mut self, delta: f32) {
-        self.damage.add(Damage::PAINT);
         let content = self
             .layout
             .as_ref()

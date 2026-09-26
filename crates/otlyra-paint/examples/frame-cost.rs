@@ -98,7 +98,7 @@ fn main() {
         ..otlyra_paint::Frame::default()
     };
     let started = Instant::now();
-    let list = otlyra_paint::build_display_list_with(&fragments, &frame);
+    let list = otlyra_paint::build_display_list_with(&fragments, &frame).list;
     let list_first = started.elapsed();
     let started = Instant::now();
     for _ in 0..FRAMES {
@@ -132,19 +132,22 @@ fn main() {
         started.elapsed() / FRAMES as u32
     );
 
-    // Scrolling is the frame a reader makes most of: no restyle, no layout, a new
-    // display list for the part now on screen, and a repaint.
-    let scrolled = otlyra_paint::Frame {
-        viewport: SIZE,
-        scroll_y: 400.0,
-        ..otlyra_paint::Frame::default()
-    };
+    // Scrolling is the frame a reader makes most of: no restyle, no layout, and
+    // no new display list either — the list is in page coordinates, drawn with a
+    // screen to spare either side, and a scroll is new offsets for it.
+    let page = otlyra_paint::build_display_list_with(
+        &fragments,
+        &otlyra_paint::Frame {
+            viewport: SIZE,
+            margin: SIZE.1,
+            ..otlyra_paint::Frame::default()
+        },
+    );
     let started = Instant::now();
     for _ in 0..FRAMES {
         use otlyra_gfx::PaintTarget as _;
-        let list = otlyra_paint::build_display_list_with(&fragments, &scrolled);
         painter.reset();
-        otlyra_gfx::render(&list, &mut painter);
+        otlyra_gfx::render_scrolled(&page.list, &mut painter, &page.spatials.offsets(400.0));
     }
     println!(
         "scroll frame               steady {:>9.2?}",

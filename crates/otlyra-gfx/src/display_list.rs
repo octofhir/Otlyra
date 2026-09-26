@@ -27,6 +27,27 @@ pub struct FontId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HitTestId(pub u64);
 
+/// What an item moves with when something scrolls.
+///
+/// An item carries its geometry in the coordinates of the thing it belongs to —
+/// the page, a box that sticks, the viewport — and the offset that puts that
+/// thing on the screen is supplied when the list is drawn, not when it is built.
+/// That is what lets a scroll be drawn from the list it already has: the page
+/// moved, the list did not.
+///
+/// The number is an index into the offsets handed to
+/// [`crate::render_scrolled`]. What each one means is the business of whoever
+/// built the list; [`SpatialId::VIEWPORT`] is the one every list has, and never
+/// moves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SpatialId(pub u32);
+
+impl SpatialId {
+    /// The viewport itself: what an item drawn in window coordinates moves with,
+    /// which is nothing.
+    pub const VIEWPORT: Self = Self(0);
+}
+
 /// One drawing command.
 ///
 /// Seven variants, matching the seven methods of [`crate::PaintTarget`] plus hit
@@ -287,10 +308,38 @@ impl FontTable {
 }
 
 /// A frame's worth of drawing commands.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayList {
     items: Vec<DisplayItem>,
     fonts: FontTable,
+    /// Which [`SpatialId`] the items move with, as runs: an item belongs to the
+    /// last run that starts at or before it, and to the viewport before the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spatial: Vec<(u32, SpatialId)>,
+    /// What [`Self::transform`] has applied to the whole list since it was
+    /// built — the device scale, an inset — so that an offset given in the
+    /// coordinates the list was built in lands in the ones it is drawn in.
+    #[serde(default = "identity", skip_serializing_if = "is_identity")]
+    frame: Affine,
+}
+
+fn identity() -> Affine {
+    Affine::IDENTITY
+}
+
+fn is_identity(affine: &Affine) -> bool {
+    *affine == Affine::IDENTITY
+}
+
+impl Default for DisplayList {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            fonts: FontTable::default(),
+            spatial: Vec::new(),
+            frame: Affine::IDENTITY,
+        }
+    }
 }
 
 impl DisplayList {
@@ -324,6 +373,88 @@ impl DisplayList {
         self.items.push(item);
     }
 
+    /// Say what the items pushed from now on move with.
+    pub fn set_spatial(&mut self, spatial: SpatialId) {
+        let current = self.spatial.last().map_or(SpatialId::VIEWPORT, |run| run.1);
+        if current == spatial {
+            return;
+        }
+        let start = self.items.len() as u32;
+        // A run nothing was pushed into is replaced rather than kept empty.
+        if self.spatial.last().is_some_and(|run| run.0 == start) {
+            self.spatial.pop();
+        }
+        let before = self.spatial.last().map_or(SpatialId::VIEWPORT, |run| run.1);
+        if before != spatial {
+            self.spatial.push((start, spatial));
+        }
+    }
+
+    /// Each item with what it moves with, in paint order.
+    pub fn items_with_spatial(&self) -> impl Iterator<Item = (SpatialId, &DisplayItem)> {
+        let mut runs = self.spatial.iter().peekable();
+        let mut current = SpatialId::VIEWPORT;
+        self.items.iter().enumerate().map(move |(index, item)| {
+            while let Some(run) = runs.next_if(|run| run.0 as usize <= index) {
+                current = run.1;
+            }
+            (current, item)
+        })
+    }
+
+    /// Whether anything in the list moves with something other than the viewport.
+    pub fn is_spatial(&self) -> bool {
+        !self.spatial.is_empty()
+    }
+
+    /// The transform that puts an item of `spatial` where `offsets` say, ahead of
+    /// the item's own: the offset, taken in the coordinates the list was built in
+    /// and carried through whatever [`Self::transform`] has done since.
+    ///
+    /// An offset is how far the thing has moved *away*: the page scrolled down by
+    /// a hundred has an offset of a hundred, and draws a hundred higher.
+    pub fn shift(&self, spatial: SpatialId, offsets: &[kurbo::Vec2]) -> Affine {
+        let Some(offset) = offsets.get(spatial.0 as usize).copied() else {
+            return Affine::IDENTITY;
+        };
+        if offset == kurbo::Vec2::ZERO {
+            return Affine::IDENTITY;
+        }
+        let [a, b, c, d, _, _] = self.frame.as_coeffs();
+        Affine::translate(kurbo::Vec2::new(
+            -(a * offset.x + c * offset.y),
+            -(b * offset.x + d * offset.y),
+        ))
+    }
+
+    /// A copy with `offsets` applied to every item, and nothing left to move.
+    ///
+    /// For whatever wants the picture at one scroll position as plain geometry — a
+    /// test looking for where something landed, a snapshot.
+    pub fn with_offsets(&self, offsets: &[kurbo::Vec2]) -> Self {
+        let mut shifts: Vec<(SpatialId, Affine)> = Vec::new();
+        let mut items = self.items.clone();
+        for (index, (spatial, _)) in self.items_with_spatial().enumerate() {
+            let shift = match shifts.iter().find(|(id, _)| *id == spatial) {
+                Some((_, shift)) => *shift,
+                None => {
+                    let shift = self.shift(spatial, offsets);
+                    shifts.push((spatial, shift));
+                    shift
+                }
+            };
+            if shift != Affine::IDENTITY {
+                prepend(&mut items[index], shift);
+            }
+        }
+        Self {
+            items,
+            fonts: self.fonts.clone(),
+            spatial: Vec::new(),
+            frame: self.frame,
+        }
+    }
+
     /// Apply `transform` to every item, ahead of the transform it already carries.
     ///
     /// This is how the device scale reaches the rasterizer: geometry is authored in
@@ -331,6 +462,7 @@ impl DisplayList {
     /// device pixels. Baking the scale into coordinates instead would make every
     /// number in the list depend on which display it was built for.
     pub fn transform(&mut self, transform: Affine) {
+        self.frame = transform * self.frame;
         self.transform_from(0, transform);
     }
 
@@ -343,16 +475,7 @@ impl DisplayList {
     pub fn transform_from(&mut self, from: usize, transform: Affine) {
         let from = from.min(self.items.len());
         for item in &mut self.items[from..] {
-            match item {
-                DisplayItem::PushLayer { transform: t, .. }
-                | DisplayItem::Blurred { transform: t, .. }
-                | DisplayItem::Fill { transform: t, .. }
-                | DisplayItem::Stroke { transform: t, .. }
-                | DisplayItem::Glyphs { transform: t, .. }
-                | DisplayItem::Image { transform: t, .. }
-                | DisplayItem::HitTest { transform: t, .. } => *t = transform * *t,
-                DisplayItem::PopLayer => {}
-            }
+            prepend(item, transform);
         }
     }
 
@@ -417,9 +540,24 @@ impl DisplayList {
     /// lets a surface keep the list it built last frame and hand it to a frame
     /// it did not build — the whole point of not rebuilding an interface that
     /// has not changed.
+    ///
+    /// What the other list's items move with comes across too. Its offsets are
+    /// taken in its own coordinates, so a list that has been transformed
+    /// differently from this one cannot bring anything that moves: its items are
+    /// kept where they stand.
     pub fn append(&mut self, other: &Self) {
         self.items.reserve(other.items.len());
-        for item in &other.items {
+        let resume = self.spatial.last().map_or(SpatialId::VIEWPORT, |run| run.1);
+        let carried = other.frame == self.frame;
+        if other.is_spatial() && !carried {
+            tracing::warn!("appending a scrolled list transformed differently; it will not scroll");
+        }
+        for (spatial, item) in other.items_with_spatial() {
+            self.set_spatial(if carried {
+                spatial
+            } else {
+                SpatialId::VIEWPORT
+            });
             match item {
                 DisplayItem::Glyphs {
                     font,
@@ -453,6 +591,7 @@ impl DisplayList {
                 other => self.items.push(other.clone()),
             }
         }
+        self.set_spatial(resume);
     }
 
     /// Hit-test regions, innermost last, in the order they were emitted.
@@ -468,6 +607,20 @@ impl DisplayList {
             }
             _ => None,
         })
+    }
+}
+
+/// Put `transform` ahead of the one `item` already carries.
+fn prepend(item: &mut DisplayItem, transform: Affine) {
+    match item {
+        DisplayItem::PushLayer { transform: t, .. }
+        | DisplayItem::Blurred { transform: t, .. }
+        | DisplayItem::Fill { transform: t, .. }
+        | DisplayItem::Stroke { transform: t, .. }
+        | DisplayItem::Glyphs { transform: t, .. }
+        | DisplayItem::Image { transform: t, .. }
+        | DisplayItem::HitTest { transform: t, .. } => *t = transform * *t,
+        DisplayItem::PopLayer => {}
     }
 }
 
@@ -701,5 +854,72 @@ mod tests {
 
         assert_eq!(list.hit_test((15.0, 15.0).into()), Some(HitTestId(1)));
         assert_eq!(list.hit_test((25.0, 25.0).into()), None);
+    }
+
+    fn square(list: &mut DisplayList, y: f64) {
+        list.push(DisplayItem::Fill {
+            style: Fill::NonZero,
+            transform: Affine::IDENTITY,
+            brush: Brush::Solid(Color::BLACK),
+            brush_transform: None,
+            shape: kurbo::Rect::new(0.0, y, 10.0, y + 10.0).to_path(0.1),
+        });
+    }
+
+    fn tops(list: &DisplayList) -> Vec<f64> {
+        list.items()
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Fill {
+                    shape, transform, ..
+                } => Some(transform.transform_rect_bbox(shape.bounding_box()).y0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn what_scrolls_moves_by_its_offset_and_what_does_not_stays() {
+        let mut list = DisplayList::new();
+        square(&mut list, 0.0);
+        list.set_spatial(SpatialId(1));
+        square(&mut list, 100.0);
+        list.set_spatial(SpatialId::VIEWPORT);
+        square(&mut list, 20.0);
+
+        let offsets = [kurbo::Vec2::ZERO, kurbo::Vec2::new(0.0, 40.0)];
+        assert_eq!(tops(&list.with_offsets(&offsets)), vec![0.0, 60.0, 20.0]);
+    }
+
+    #[test]
+    fn an_offset_is_taken_in_the_coordinates_the_list_was_built_in() {
+        // Built in logical pixels, scaled to a 2x screen afterwards: a scroll of
+        // forty logical pixels is eighty on that screen.
+        let mut list = DisplayList::new();
+        list.set_spatial(SpatialId(1));
+        square(&mut list, 100.0);
+        list.transform(Affine::scale(2.0));
+
+        let offsets = [kurbo::Vec2::ZERO, kurbo::Vec2::new(0.0, 40.0)];
+        assert_eq!(tops(&list.with_offsets(&offsets)), vec![120.0]);
+    }
+
+    #[test]
+    fn an_empty_run_is_not_kept_and_appending_carries_what_moves() {
+        let mut list = DisplayList::new();
+        list.set_spatial(SpatialId(3));
+        list.set_spatial(SpatialId(1));
+        square(&mut list, 0.0);
+        let mut into = DisplayList::new();
+        square(&mut into, 0.0);
+        into.append(&list);
+        square(&mut into, 0.0);
+
+        let spatials: Vec<SpatialId> = into.items_with_spatial().map(|(id, _)| id).collect();
+        assert_eq!(
+            spatials,
+            vec![SpatialId::VIEWPORT, SpatialId(1), SpatialId::VIEWPORT],
+            "what was appended moves, and what came after it does not"
+        );
     }
 }

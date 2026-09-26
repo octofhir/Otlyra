@@ -490,6 +490,12 @@ pub struct SceneLayer {
     /// Behind an `Arc` so an unchanged layer is carried frame to frame without
     /// copying the list — the same handle the painter's own cache holds.
     pub list: std::sync::Arc<otlyra_gfx::DisplayList>,
+    /// How far each part of `list` has moved, by [`otlyra_gfx::SpatialId`]:
+    /// what the list is drawn with. Empty for a list where nothing moves.
+    ///
+    /// Beside the list rather than in it, because it is what changes when the
+    /// list does not: a scroll is new offsets for the same list, and a new epoch.
+    pub offsets: Vec<otlyra_gfx::kurbo::Vec2>,
     /// The part of the layer this epoch changed, when the painter can say.
     ///
     /// `None` means *all of it*, which is what a layer says when it does not

@@ -21,11 +21,10 @@ impl PageScene {
     /// now.
     pub fn box_at(&self, x: f64, y: f64) -> Option<BoxId> {
         let point = otlyra_gfx::kurbo::Point::new(x, y);
-        self.targets
-            .iter()
+        self.targets_on_screen()
             .rev()
             .find(|(rect, _)| rect.contains(point))
-            .map(|(_, id)| *id)
+            .map(|(_, id)| id)
     }
 
     /// The element the pointer is over, walking out of the box tree to the nearest
@@ -296,8 +295,7 @@ impl PageScene {
 
     /// Where a box was drawn on the last frame, if it was.
     pub fn rect_of(&self, id: BoxId) -> Option<otlyra_layout::Rect> {
-        self.targets
-            .iter()
+        self.targets_on_screen()
             .find(|(_, target)| *target == id)
             .map(|(rect, _)| {
                 otlyra_layout::Rect::new(

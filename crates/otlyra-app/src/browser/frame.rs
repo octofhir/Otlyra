@@ -273,6 +273,19 @@ impl Browser {
         scaled(&mut self.chrome_device, logical, g.scale_factor)
     }
 
+    /// How far each part of the page's list has moved: what it is drawn with.
+    ///
+    /// Empty for a browser page or the blank fallback, which are drawn where they
+    /// stand. A zoom is not applied here — the list's own transform carries it to
+    /// whatever the offsets move.
+    pub(super) fn page_offsets(&self) -> Vec<otlyra_gfx::kurbo::Vec2> {
+        let tab = &self.tabs[self.active];
+        match tab.page.as_ref() {
+            Some(page) if tab.system.is_none() => page.offsets(),
+            _ => Vec::new(),
+        }
+    }
+
     /// A content version for the page layer that changes exactly when the page's
     /// list would draw something different.
     ///
@@ -307,6 +320,8 @@ impl Browser {
         } else if let Some(page) = tab.page.as_ref() {
             1u8.hash(&mut hasher);
             page.builds().hash(&mut hasher);
+            // The same list scrolled is a different picture.
+            page.scroll().to_bits().hash(&mut hasher);
         } else {
             2u8.hash(&mut hasher);
             tab.error.hash(&mut hasher);

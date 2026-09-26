@@ -63,12 +63,15 @@ pub struct PageScene {
     /// node, and a node's attributes are what say where a link goes.
     document: Document,
     boxes: BoxTree,
-    /// The last frame's hit-test targets, in paint order, in window coordinates.
+    /// The last frame's hit-test targets, in paint order, in the coordinates of
+    /// what each moves with; [`Self::offsets`] puts them in the window's.
     ///
     /// Extracted from the display list rather than kept as a second structure: the
     /// list is what was drawn, so a target taken from it cannot describe a place
     /// nothing was painted.
-    targets: Vec<(otlyra_gfx::kurbo::Rect, BoxId)>,
+    targets: Vec<(otlyra_gfx::kurbo::Rect, otlyra_gfx::SpatialId, BoxId)>,
+    /// What moves each part of the last list built, and how far at a given scroll.
+    spatials: Option<otlyra_paint::Spatials>,
     /// The last layout, and the width it was made at.
     layout: Option<(f32, FragmentTree)>,
     /// Whether that layout has to be done again before the next frame.
@@ -172,6 +175,9 @@ pub struct PageScene {
     /// `None` means *all of it*, which is the honest answer for anything but a
     /// contained relayout: a restyle can move any box on the page.
     dirty: Option<otlyra_layout::Rect>,
+    /// The scroll `dirty` was worked out at. Scrolled since, the whole page has
+    /// moved on the screen and no rectangle of it is the only one that changed.
+    dirty_scroll: f32,
     /// A field whose text changed and which can be re-shaped on its own.
     ///
     /// Set where the value changes and answered at the next frame, because
@@ -240,7 +246,10 @@ struct Painted {
     width: f32,
     height: f32,
     top: f32,
-    scroll: f32,
+    /// The part of the page the list was drawn for, top and bottom in page
+    /// coordinates: the viewport and a screen either side of it. A scroll that
+    /// keeps the viewport inside it is drawn from the same list.
+    band: (f32, f32),
     scrollbars: bool,
     pictures: usize,
     ports: Vec<(BoxId, f32)>,
@@ -274,7 +283,7 @@ impl Painted {
         self.width == other.width
             && self.height == other.height
             && self.top == other.top
-            && self.scroll == other.scroll
+            && self.band == other.band
             && self.scrollbars == other.scrollbars
             && self.pictures == other.pictures
             && self.ports == other.ports
@@ -352,6 +361,7 @@ impl PageScene {
             boxes: BoxTree::default(),
             document,
             targets: Vec::new(),
+            spatials: None,
             layout: None,
             layout_stale: true,
             styler: None,
@@ -377,6 +387,7 @@ impl PageScene {
             field_anchor: None,
             field_dragging: false,
             dirty: None,
+            dirty_scroll: 0.0,
             retype: None,
             sliding: None,
             segment: 0,
@@ -555,6 +566,18 @@ impl PageScene {
         });
         let damage = self.damage.take();
 
+        // The band the last list was drawn for serves this frame if the viewport
+        // is still inside it; otherwise a new one is drawn around where it is now.
+        let band = match &self.painted {
+            Some((built, _))
+                if built.height == height
+                    && self.scroll >= built.band.0
+                    && self.scroll + height <= built.band.1 =>
+            {
+                built.band
+            }
+            _ => (self.scroll - height, self.scroll + height * 2.0),
+        };
         let mut ports: Vec<(BoxId, f32)> =
             self.port_scroll.iter().map(|(id, at)| (*id, *at)).collect();
         ports.sort_by_key(|(id, _)| otlyra_layout::box_id_to_u64(*id));
@@ -562,7 +585,7 @@ impl PageScene {
             width,
             height,
             top,
-            scroll: self.scroll,
+            band,
             scrollbars: self.scrollbars,
             pictures: self.background_pictures.len(),
             ports,
@@ -596,7 +619,10 @@ impl PageScene {
         // changed nothing at all and the answer still belongs to the list it
         // hands back.
         self.dirty = self.changed_rect(retyped, damage, &key);
-        let scroll = self.scroll;
+        self.dirty_scroll = self.scroll;
+        // Built around the middle of the band, reaching a screen past either edge
+        // of the viewport, which is where the band's ends are.
+        let scroll = band.0 + height;
         // Taken before the layout is borrowed: the offsets are a handful of floats,
         // and the alternative is holding a borrow of the page across the walk.
         let ports = self.port_scroll.clone();
@@ -657,11 +683,12 @@ impl PageScene {
                 highlight.extend(rects.into_iter().map(|rect| (rect, wash)));
             }
         }
-        let mut list = otlyra_paint::build_display_list_with(
+        let otlyra_paint::PageList { mut list, spatials } = otlyra_paint::build_display_list_with(
             fragments,
             &otlyra_paint::Frame {
                 viewport: (width, height),
                 scroll_y: scroll,
+                margin: height,
                 port_offset: Some(&|id| ports.get(&id).copied().unwrap_or(0.0)),
                 background: Some(&|url: &str| pictures.get(url).cloned()),
                 scrollbars,
@@ -674,20 +701,21 @@ impl PageScene {
         }
 
         self.targets = list
-            .items()
-            .iter()
-            .filter_map(|item| match item {
+            .items_with_spatial()
+            .filter_map(|(spatial, item)| match item {
                 DisplayItem::HitTest {
                     rect,
                     transform,
                     id,
                 } => Some((
                     transform.transform_rect_bbox(*rect),
+                    spatial,
                     otlyra_layout::box_id_from_u64(id.0),
                 )),
                 _ => None,
             })
             .collect();
+        self.spatials = Some(spatials);
 
         // Laying out and cascading are part of building *this* list, and both
         // report damage as they go. Clearing after rather than before is what
@@ -696,6 +724,32 @@ impl PageScene {
         let list = std::sync::Arc::new(list);
         self.painted = Some((key, std::sync::Arc::clone(&list)));
         list
+    }
+
+    /// How far each part of the last list built has moved, at the page's scroll
+    /// now: what the list is drawn with.
+    ///
+    /// Asked for on every frame and not stored, because it is what changes when
+    /// the list does not: a scroll is a new set of offsets for the same list.
+    pub fn offsets(&self) -> Vec<otlyra_gfx::kurbo::Vec2> {
+        self.spatials
+            .as_ref()
+            .map(|spatials| spatials.offsets(self.scroll))
+            .unwrap_or_default()
+    }
+
+    /// The last frame's hit-test targets where they are on the screen now.
+    fn targets_on_screen(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (otlyra_gfx::kurbo::Rect, BoxId)> {
+        let offsets = self.offsets();
+        self.targets.iter().map(move |(rect, spatial, id)| {
+            let offset = offsets
+                .get(spatial.0 as usize)
+                .copied()
+                .unwrap_or(otlyra_gfx::kurbo::Vec2::ZERO);
+            (*rect - offset, *id)
+        })
     }
 
     /// How many display lists this page has built rather than reused.
@@ -857,6 +911,9 @@ impl PageScene {
     /// Read by the compositor above: a keystroke that re-shapes one field has no
     /// business re-rasterizing the paragraphs under it.
     pub fn dirty(&self) -> Option<otlyra_layout::Rect> {
+        if self.scroll != self.dirty_scroll {
+            return None;
+        }
         self.dirty
     }
 

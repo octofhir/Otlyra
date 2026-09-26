@@ -90,7 +90,7 @@ impl DirectFrame {
             Damage::Full => {
                 self.painter.reset();
                 for layer in &scene.layers {
-                    otlyra_gfx::render(&layer.list, &mut self.painter);
+                    otlyra_gfx::render_scrolled(&layer.list, &mut self.painter, &layer.offsets);
                 }
                 self.painter.flush_and_submit();
             }
@@ -105,7 +105,7 @@ impl DirectFrame {
                 self.painter.clear_rect(clip);
                 for layer in &scene.layers {
                     if layer.rect.intersects(&rect) {
-                        otlyra_gfx::render(&layer.list, &mut self.painter);
+                        otlyra_gfx::render_scrolled(&layer.list, &mut self.painter, &layer.offsets);
                     }
                 }
                 self.painter.reset_clip();

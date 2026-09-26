@@ -2,6 +2,7 @@
 
 use crate::display_list::{DisplayItem, DisplayList};
 use crate::paint_target::PaintTarget;
+use kurbo::Affine;
 use peniko::ImageBrushRef;
 
 /// Replay `list` into `target`.
@@ -11,16 +12,35 @@ use peniko::ImageBrushRef;
 /// does not know how to draw itself, and a paint target does not know what a
 /// display list is.
 pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
+    render_scrolled(list, target, &[]);
+}
+
+/// Replay `list` with each [`crate::SpatialId`] moved by its entry in
+/// `offsets`, in the coordinates the list was built in.
+///
+/// This is how a scroll is drawn without building the list again: what moved is
+/// the page, and the page is one number here. An id with no entry does not move.
+pub fn render_scrolled(list: &DisplayList, target: &mut dyn PaintTarget, offsets: &[kurbo::Vec2]) {
     let _span = tracing::info_span!("paint", items = list.len()).entered();
 
-    for item in list.items() {
+    // One shift per id, worked out the first time the id is met.
+    let mut shifts: Vec<(crate::SpatialId, Affine)> = Vec::new();
+    for (spatial, item) in list.items_with_spatial() {
+        let shift = match shifts.iter().find(|(id, _)| *id == spatial) {
+            Some((_, shift)) => *shift,
+            None => {
+                let shift = list.shift(spatial, offsets);
+                shifts.push((spatial, shift));
+                shift
+            }
+        };
         match item {
             DisplayItem::PushLayer {
                 blend,
                 alpha,
                 transform,
                 clip,
-            } => target.push_layer(*blend, *alpha, *transform, clip),
+            } => target.push_layer(*blend, *alpha, shift * *transform, clip),
 
             DisplayItem::PopLayer => target.pop_layer(),
 
@@ -29,7 +49,7 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                 brush,
                 blur,
                 shape,
-            } => target.fill_blurred(*transform, brush.into(), *blur, shape),
+            } => target.fill_blurred(shift * *transform, brush.into(), *blur, shape),
 
             DisplayItem::Fill {
                 style,
@@ -37,7 +57,13 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                 brush,
                 brush_transform,
                 shape,
-            } => target.fill(*style, *transform, brush.into(), *brush_transform, shape),
+            } => target.fill(
+                *style,
+                shift * *transform,
+                brush.into(),
+                *brush_transform,
+                shape,
+            ),
 
             DisplayItem::Stroke {
                 style,
@@ -45,7 +71,13 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                 brush,
                 brush_transform,
                 shape,
-            } => target.stroke(style, *transform, brush.into(), *brush_transform, shape),
+            } => target.stroke(
+                style,
+                shift * *transform,
+                brush.into(),
+                *brush_transform,
+                shape,
+            ),
 
             DisplayItem::Glyphs {
                 font,
@@ -69,7 +101,7 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                     normalized_coords,
                     brush.into(),
                     *blur,
-                    *transform,
+                    shift * *transform,
                     *hint,
                     &mut glyphs.iter().copied(),
                 );
@@ -85,7 +117,7 @@ pub fn render(list: &DisplayList, target: &mut dyn PaintTarget) {
                     image: image.data(),
                     sampler: *sampler,
                 },
-                *transform,
+                shift * *transform,
                 *clip_rect,
             ),
 

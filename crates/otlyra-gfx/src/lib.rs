@@ -39,12 +39,14 @@ mod recording;
 mod render;
 mod skia;
 
-pub use display_list::{DisplayItem, DisplayList, FontId, FontTable, HitTestId, ImageResource};
+pub use display_list::{
+    DisplayItem, DisplayList, FontId, FontTable, HitTestId, ImageResource, SpatialId,
+};
 pub use hit_test::{Hit, hit_test, hit_test_all};
 pub use paint_target::{Glyph, PaintShape, PaintTarget};
 pub use peniko::ImageBrushRef;
 pub use recording::{PaintOp, RecordingPainter};
-pub use render::render;
+pub use render::{render, render_scrolled};
 pub use skia::{SkiaError, SkiaPainter, decode_image, face_from_collection};
 
 /// Re-exported so downstream crates speak exactly the geometry types the seam does.

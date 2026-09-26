@@ -81,19 +81,65 @@ fn an_unchanged_page_is_not_painted_a_second_time() {
     assert_eq!(page.builds(), 1, "nothing about it moved");
     assert_eq!(first, again, "and the frame is the same frame");
 
-    // Scrolling is a repaint, and a repaint is what it asks for.
+    // A scroll is not a new list: the list is in page coordinates, and the
+    // scroll is an offset it is drawn with.
+    let still = page.offsets();
     page.set_scroll(40.0);
-    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
-    assert_eq!(page.builds(), 2);
-    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
-    assert_eq!(page.builds(), 2, "and then it is still again");
+    let scrolled = page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.builds(), 1, "the same list serves the scroll");
+    assert_eq!(first, scrolled);
+    assert_ne!(page.offsets(), still, "and it is drawn somewhere else");
 
     // A resize is a relayout, and a different band of the window to draw in
     // is a different frame even when nothing else moved.
     page.build_display_list(&mut text, 700.0, 600.0, 0.0);
-    assert_eq!(page.builds(), 3);
+    assert_eq!(page.builds(), 2);
     page.build_display_list(&mut text, 700.0, 600.0, 12.0);
-    assert_eq!(page.builds(), 4, "the page moved down the window");
+    assert_eq!(page.builds(), 3, "the page moved down the window");
+}
+
+/// A scroll inside the band a list was drawn for is served by that list; one
+/// that takes the viewport out of it draws a new one around where it is.
+#[test]
+fn a_list_serves_scrolls_inside_the_band_it_was_drawn_for() {
+    let html = "<body>".to_owned() + &"<p>a paragraph</p>".repeat(400);
+    let (mut page, mut text) = scene(&html);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.builds(), 1);
+
+    page.scroll_by(500.0);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(
+        page.builds(),
+        1,
+        "still inside the screen drawn past the edge"
+    );
+
+    page.scroll_by(700.0);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(
+        page.builds(),
+        2,
+        "out of it, and drawn again around the reader"
+    );
+}
+
+/// A press after a scroll lands on what the scroll put under the pointer, though
+/// the list the targets came from was not built again.
+#[test]
+fn a_press_after_a_scroll_lands_on_what_moved_under_it() {
+    let html = "<style>body { margin: 0 } p { margin: 0; height: 100px }</style><body>".to_owned()
+        + &(0..20)
+            .map(|index| format!("<p><a href=\"/{index}\">link {index}</a></p>"))
+            .collect::<String>();
+    let (mut page, mut text) = scene(&html);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.link_at(10.0, 5.0).as_deref(), Some("/0"));
+
+    page.scroll_by(300.0);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.builds(), 1);
+    assert_eq!(page.link_at(10.0, 5.0).as_deref(), Some("/3"));
 }
 
 /// A press still lands on what is on screen when the frame was reused: the
@@ -1639,7 +1685,8 @@ fn scrolling_moves_the_page_up_and_is_clamped_to_the_content() {
     let before = glyph_ys(&scene.build_display_list(&mut text, 800.0, 600.0, 0.0));
 
     scene.scroll_by(12.0);
-    let after = glyph_ys(&scene.build_display_list(&mut text, 800.0, 600.0, 0.0));
+    let list = scene.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    let after = glyph_ys(&list.with_offsets(&scene.offsets()));
     assert!((before[0] - after[0] - 12.0).abs() < 0.01);
 
     scene.scroll_by(-1000.0);
@@ -1766,9 +1813,8 @@ fn a_link_around_other_elements_is_still_a_link() {
     // The narrowest target is the text run itself; the wide ones are the
     // blocks it sits inside.
     let hit = scene
-        .targets
-        .iter()
-        .map(|(rect, _)| *rect)
+        .targets_on_screen()
+        .map(|(rect, _)| rect)
         .min_by(|a, b| a.width().total_cmp(&b.width()))
         .expect("something was drawn");
     assert_eq!(
