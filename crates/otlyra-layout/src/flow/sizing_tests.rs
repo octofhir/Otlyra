@@ -438,7 +438,7 @@ fn a_min_content_box_breaks_at_every_opportunity() {
     );
     let lines = tree
         .iter()
-        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .count();
     assert_eq!(lines, 3, "one word to a line");
 }

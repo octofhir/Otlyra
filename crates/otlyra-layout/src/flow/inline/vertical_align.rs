@@ -14,23 +14,8 @@ use otlyra_css::ComputedStyle;
 
 use crate::box_tree::{BoxId, BoxTree};
 use crate::flow::Flow;
-use crate::fragment::{Fragment, FragmentKind};
 
 use super::collect::InlineContent;
-
-/// How far a rule has raised the box it is written on, in CSS pixels.
-///
-/// Positive is up. The two keywords are measured against the *parent's* font size
-/// rather than the box's own, which is what makes a superscript sit at the same
-/// height whether it is set small or not.
-///
-/// A third of the font size, and a fifth of it, are what the specification names as
-/// the amounts to use when a UA does not take them from the font — plus the pixel
-/// every engine adds on top, which is the amount the web was actually built
-/// against.
-pub(super) fn baseline_shift(style: &ComputedStyle, parent: &ComputedStyle) -> f32 {
-    baseline_shift_of(&style.vertical_align, style, parent)
-}
 
 /// The `vertical-align` that places `source`'s content on a line of `block`'s.
 ///
@@ -53,7 +38,15 @@ fn alignment_on_line(
     }
 }
 
-/// The same, for a value the caller has already picked out.
+/// How far a rule raises the box it is written on off its parent's baseline,
+/// in CSS pixels, positive up.
+///
+/// The two keywords are measured against the *parent's* font size rather than
+/// the box's own, which is what makes a superscript sit at the same height
+/// whether it is set small or not. A third of the font size, and a fifth of it,
+/// are what the specification names as the amounts to use when a UA does not
+/// take them from the font — plus the pixel every engine adds on top, which is
+/// the amount the web was actually built against.
 fn baseline_shift_of(
     align: &otlyra_css::VerticalAlign,
     style: &ComputedStyle,
@@ -81,35 +74,6 @@ fn baseline_shift_of(
                 .resolve(style.font_size, style.font_size * 1.2),
         ),
     }
-}
-
-/// How far below a box's top its last baseline sits, if it has one.
-///
-/// The last line of text in it, wherever that is: a box whose last child is a
-/// paragraph sits on that paragraph's last line, which is what `inline-block`
-/// alignment is defined as. `None` when there is no text in it at all.
-pub(super) fn baseline_of(fragment: &Fragment) -> Option<f32> {
-    let mut last = None;
-    let mut stack = vec![(fragment, 0.0f32)];
-    while let Some((current, _)) = stack.pop() {
-        if let FragmentKind::Text(run) = &current.kind
-            && let Some(glyph) = run.glyphs.first()
-        {
-            let at = current.rect.y + glyph.y - fragment.rect.y;
-            last = Some(last.map_or(at, |previous: f32| previous.max(at)));
-        }
-        for child in &current.children {
-            // A box that has left the flow has left the line as well: its text is
-            // not on the line and its baseline is not the line's. Descending into
-            // one makes a drop-down's open list part of the line the drop-down sits
-            // on, and the line as tall as the list.
-            if child.style.position.is_out_of_flow() {
-                continue;
-            }
-            stack.push((child, 0.0));
-        }
-    }
-    last
 }
 
 /// How far `source`'s content is raised off the baseline of a line of `block`'s,
@@ -167,6 +131,27 @@ pub(super) struct Levels {
     /// settled here and read back when the glyphs are placed. Working them out
     /// twice would be two answers to where a box sits.
     pub(super) shifts: HashMap<BoxId, f32>,
+    /// How far each span is raised off the line's baseline, in step with the
+    /// spans: the sum of its own shift and every enclosing inline box's.
+    pub(super) span_shift: Vec<f32>,
+    /// The spans set `top` or `bottom`, with their struts: a place in the line
+    /// they land on, settled line by line once the rest of it is levelled.
+    pub(super) line_relative: Vec<LineRelative>,
+}
+
+/// A span whose `vertical-align` is `top` or `bottom`.
+pub(super) struct LineRelative {
+    pub(super) span: usize,
+    pub(super) top: bool,
+    pub(super) strut: otlyra_text::Strut,
+}
+
+/// What levelling a paragraph has worked out so far about the boxes its text
+/// is in: each one's strut, and how far it sits off the block's baseline.
+struct Frames {
+    block: BoxId,
+    struts: HashMap<BoxId, otlyra_text::Strut>,
+    totals: HashMap<BoxId, f32>,
 }
 
 impl<'a> Flow<'a> {
@@ -203,9 +188,15 @@ impl<'a> Flow<'a> {
         // Kept from the first pass so the second does not shape anything twice:
         // a strut is a font lookup, and the line-relative boxes need theirs
         // again once the line is known.
-        let mut line_relative: Vec<(BoxId, otlyra_css::VerticalAlign, otlyra_text::Strut)> =
+        let mut line_relative: Vec<(usize, BoxId, otlyra_css::VerticalAlign, otlyra_text::Strut)> =
             Vec::new();
         let mut shifts = HashMap::new();
+        let mut span_shift = vec![0.0; content.spans.len()];
+        let mut frames = Frames {
+            block: parent,
+            struts: HashMap::from([(parent, strut)]),
+            totals: HashMap::from([(parent, 0.0)]),
+        };
 
         for (index, (span, source)) in content.spans.iter().zip(&content.sources).enumerate() {
             let span_style = Arc::clone(&self.tree.node(*source).style);
@@ -226,33 +217,16 @@ impl<'a> Flow<'a> {
                 otlyra_css::VerticalAlign::Top | otlyra_css::VerticalAlign::Bottom
             ) {
                 // Its own height still asks for room; where it goes does not
-                // depend on that, but how tall the line is does.
+                // depend on that, but how tall the line is does — the line it
+                // lands on, which is settled once the rest of it is.
                 above = above.max(own.ascent);
                 below = below.max(own.descent);
-                span_reach[index] = (own.ascent, own.descent);
-                line_relative.push((*source, align.clone(), own));
+                line_relative.push((index, *source, align.clone(), own));
                 continue;
             }
 
-            let shift = match align {
-                // The parent's own text rather than the whole line: what
-                // `text-top` and `text-bottom` mean is the edge of the text the
-                // box is set beside, not the edge of the tallest thing on the row.
-                otlyra_css::VerticalAlign::TextTop => strut.ascent - own.ascent,
-                otlyra_css::VerticalAlign::TextBottom => own.descent - strut.descent,
-                // The box's middle against the parent's baseline plus half its
-                // x-height. No font here reports an x-height, so half of it is
-                // taken as a quarter of the font size — the same shape of
-                // fallback the specification names for `sub` and `super`, and the
-                // number the web was built against.
-                otlyra_css::VerticalAlign::Middle => {
-                    style.font_size * 0.25 - (own.ascent - own.descent) / 2.0
-                }
-                other => baseline_shift_of(other, &span_style, &style),
-            };
-            if align.resolved_while_levelling() {
-                shifts.insert(*source, shift);
-            }
+            let shift = self.total_shift(*source, &mut frames);
+            span_shift[index] = shift;
             above = above.max(shift + own.ascent);
             below = below.max(own.descent - shift);
             // A span that has been moved is one the shaper cannot place: it knows
@@ -277,13 +251,41 @@ impl<'a> Flow<'a> {
 
         // The second pass, for the two that had to wait: the line box is settled
         // now, so there is something for them to be a position in.
-        for (source, align, own) in line_relative {
-            let shift = match align {
-                otlyra_css::VerticalAlign::Top => above - own.ascent,
-                otlyra_css::VerticalAlign::Bottom => own.descent - below,
-                _ => 0.0,
+        //
+        // Every other box's place is its shift added up through the boxes it is
+        // in, which placing the glyphs and the boxes reads back.
+        shifts.extend(frames.totals.iter().map(|(&id, &total)| (id, total)));
+        //
+        // The boxes those inline boxes draw — a background, a border — are
+        // placed by the paragraph's line; their text by its own line.
+        let mut spans_at_edges = Vec::new();
+        for (index, source, align, own) in line_relative {
+            let top = matches!(align, otlyra_css::VerticalAlign::Top);
+            let shift = if top {
+                above - own.ascent
+            } else {
+                own.descent - below
             };
             shifts.insert(source, shift);
+            span_shift[index] = shift;
+            spans_at_edges.push(LineRelative {
+                span: index,
+                top,
+                strut: own,
+            });
+        }
+
+        // A picture or an inline block moves with the boxes it is inside, as
+        // text does (CSS 2.2 §10.8.1: a box is aligned against its parent).
+        let replaced: Vec<(usize, BoxId)> = content
+            .replaced
+            .iter()
+            .enumerate()
+            .map(|(number, box_)| (number, box_.id))
+            .collect();
+        for (number, id) in replaced {
+            let align = self.atomic_align(id, &content.replaced[number], &mut frames);
+            content.replaced[number].align = align;
         }
 
         // The shaper is still told a height per span, because that is what it
@@ -304,6 +306,120 @@ impl<'a> Flow<'a> {
             strut: (strut.ascent, strut.descent + strut.leading),
             span_reach,
             shifts,
+            span_shift,
+            line_relative: spans_at_edges,
         }
+    }
+
+    /// Where an atomic inline goes in its line: `top` and `bottom` are a place
+    /// in the line, settled once it is known; everything else is a shift off
+    /// the baseline, added to the shift of the boxes it is inside.
+    ///
+    /// `middle` puts the box's middle half an x-height above its parent's
+    /// baseline, and `text-top` and `text-bottom` its edges on the parent's
+    /// text — the font's own ascent and descent, without the leading the line
+    /// height adds (CSS 2.2 §10.8.1).
+    fn atomic_align(
+        &mut self,
+        id: BoxId,
+        box_: &super::collect::ReplacedBox,
+        frames: &mut Frames,
+    ) -> super::collect::LineAlign {
+        use super::collect::LineAlign;
+        use otlyra_css::VerticalAlign as Align;
+
+        let Some(up) = self.tree.node(id).parent else {
+            return LineAlign::Shift(0.0);
+        };
+        let style = Arc::clone(&box_.style);
+        let parent = Arc::clone(&self.tree.node(up).style);
+        let outer = box_.outer_height();
+        let own = match &style.vertical_align {
+            Align::Top => return LineAlign::Top,
+            Align::Bottom => return LineAlign::Bottom,
+            Align::Middle => parent.font_size * 0.25 + outer / 2.0 - box_.baseline,
+            edge @ (Align::TextTop | Align::TextBottom) => {
+                let stack = self.font_stack(&parent);
+                let Some(text) =
+                    self.text
+                        .strut(&stack, parent.font_size, crate::fonts::face_query(&parent))
+                else {
+                    return LineAlign::Shift(0.0);
+                };
+                if matches!(edge, Align::TextTop) {
+                    text.ascent - box_.baseline
+                } else {
+                    outer - box_.baseline - text.descent
+                }
+            }
+            other => baseline_shift_of(other, &style, &parent),
+        };
+        LineAlign::Shift(self.total_shift(up, frames) + own)
+    }
+
+    /// How far `id`'s content sits off the block's baseline: its own shift
+    /// against its parent's baseline, plus its parent's (CSS 2.2 §10.8.1 — a
+    /// box is aligned relative to its parent inline box). A `sup` holding a
+    /// link holding a `span` raises all three.
+    ///
+    /// `top` and `bottom` on an enclosing box add nothing here: they are a
+    /// place in the line, settled only for the box a run of text comes from.
+    fn total_shift(&mut self, id: BoxId, frames: &mut Frames) -> f32 {
+        if let Some(&total) = frames.totals.get(&id) {
+            return total;
+        }
+        let Some(up) = self.tree.node(id).parent else {
+            return 0.0;
+        };
+        let above = self.total_shift(up, frames);
+        let own = self.own_shift(id, up, frames);
+        frames.totals.insert(id, above + own);
+        above + own
+    }
+
+    /// How far `id`'s `vertical-align` moves it off its parent `up`'s
+    /// baseline.
+    fn own_shift(&mut self, id: BoxId, up: BoxId, frames: &mut Frames) -> f32 {
+        let style = Arc::clone(&self.tree.node(id).style);
+        let parent = Arc::clone(&self.tree.node(up).style);
+        let align = alignment_on_line(id, frames.block, &style);
+        let needs_struts = matches!(
+            align,
+            otlyra_css::VerticalAlign::TextTop
+                | otlyra_css::VerticalAlign::TextBottom
+                | otlyra_css::VerticalAlign::Middle
+        );
+        if !needs_struts {
+            return baseline_shift_of(align, &style, &parent);
+        }
+        let (Some(own), Some(outer)) = (self.frame_strut(id, frames), self.frame_strut(up, frames))
+        else {
+            return 0.0;
+        };
+        match align {
+            // The parent's own text rather than the whole line: what
+            // `text-top` and `text-bottom` mean is the edge of the text the
+            // box is set beside, not the edge of the tallest thing on the row.
+            otlyra_css::VerticalAlign::TextTop => outer.ascent - own.ascent,
+            otlyra_css::VerticalAlign::TextBottom => own.descent - outer.descent,
+            // The box's middle against the parent's baseline plus half its
+            // x-height. No font here reports an x-height, so half of it is
+            // taken as a quarter of the font size — the same shape of fallback
+            // the specification names for `sub` and `super`, and the number the
+            // web was built against.
+            _ => parent.font_size * 0.25 - (own.ascent - own.descent) / 2.0,
+        }
+    }
+
+    /// A box's strut, worked out once per paragraph.
+    fn frame_strut(&mut self, id: BoxId, frames: &mut Frames) -> Option<otlyra_text::Strut> {
+        if let Some(&strut) = frames.struts.get(&id) {
+            return Some(strut);
+        }
+        let style = Arc::clone(&self.tree.node(id).style);
+        let stack = self.font_stack(&style);
+        let strut = self.strut_of(&style, &stack)?;
+        frames.struts.insert(id, strut);
+        Some(strut)
     }
 }

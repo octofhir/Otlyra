@@ -16,8 +16,6 @@ use crate::flow::sizing::{Frame, InlineRoom};
 use crate::fonts::{face_query, is_italic};
 use crate::fragment::Fragment;
 
-use super::vertical_align::{baseline_of, baseline_shift};
-
 /// An inline element that has a box of its own to draw — a background, a border,
 /// padding — or edges that take room in its line.
 ///
@@ -109,12 +107,25 @@ pub(super) struct ReplacedBox {
     /// own and sits with its bottom margin edge on the line's, which is what this
     /// is when it is the whole margin box (CSS 2.2 §10.8.1).
     pub(super) baseline: f32,
-    /// How far a rule has raised it off that baseline, positive upwards.
+    /// Where `vertical-align` puts it in its line.
     ///
     /// A box in a line answers `vertical-align` the way a span of text does, and a
     /// bar is the reason it has to: both references set a `<progress>` a fifth of
-    /// an em below the baseline, and without this it sits on it.
-    pub(super) shift: f32,
+    /// an em below the baseline, and without this it sits on it. Settled when
+    /// the paragraph is levelled, which knows the boxes it is inside; it sits
+    /// on the baseline until then.
+    pub(super) align: LineAlign,
+}
+
+/// Where `vertical-align` puts an atomic inline in its line.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) enum LineAlign {
+    /// Raised this far off the line's baseline, positive up.
+    Shift(f32),
+    /// With its margin box's top on the line box's top.
+    Top,
+    /// With its margin box's bottom on the line box's bottom.
+    Bottom,
 }
 
 impl ReplacedBox {
@@ -359,7 +370,7 @@ impl<'a> Flow<'a> {
                         margin,
                         content: None,
                         baseline: margin.top + height + margin.bottom,
-                        shift: baseline_shift(&node.style, &self.tree.node(id).style),
+                        align: LineAlign::Shift(0.0),
                     });
                 }
                 BoxKind::Text(text) => {
@@ -429,7 +440,6 @@ impl<'a> Flow<'a> {
                     // Where it *goes* is the shaper's answer, so it is laid out at
                     // the origin and moved once the line is broken.
                     let style = Arc::clone(&node.style);
-                    let shift_of_box = baseline_shift(&style, &self.tree.node(id).style);
                     // Shrink-to-fit, like a float: its own width when it names one,
                     // what its content wants of the line otherwise, and its minimum
                     // and maximum over both — as the border box the line holds.
@@ -458,7 +468,7 @@ impl<'a> Flow<'a> {
                     // types into exists empty, and that is what this does.
                     let margin = resolve_margin(&style, containing_width);
                     let own = (!style.overflow.is_scroll_container())
-                        .then(|| baseline_of(&fragment))
+                        .then(|| fragment.last_baseline())
                         .flatten();
                     let baseline = own
                         .or_else(|| {
@@ -475,7 +485,7 @@ impl<'a> Flow<'a> {
                         margin,
                         content: Some(Box::new(fragment)),
                         baseline,
-                        shift: shift_of_box,
+                        align: LineAlign::Shift(0.0),
                     });
                 }
                 BoxKind::Block => {

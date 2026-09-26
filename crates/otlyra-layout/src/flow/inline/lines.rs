@@ -61,6 +61,20 @@ impl<'a> Flow<'a> {
     }
 }
 
+/// How tall each line of a paragraph is, and where the things placed by the
+/// line rather than by a baseline ended up on it.
+pub(super) struct LineLevels {
+    /// How far each line reaches above and below its baseline.
+    pub(super) reach: Vec<(f32, f32)>,
+    /// How far each run's glyphs are raised off their line's baseline, for
+    /// the runs of `top` and `bottom` spans; `None` for the rest, which are
+    /// raised as far as their span is.
+    pub(super) run_shift: Vec<Option<f32>>,
+    /// How far each atomic inline is raised off its line's baseline, in step
+    /// with the paragraph's.
+    pub(super) replaced_shift: Vec<f32>,
+}
+
 /// How far each line of a shaped paragraph reaches above and below its
 /// baseline: as tall as what is *on* it, with the baseline as far down as the
 /// tallest thing on it reaches (CSS 2.2 §10.8).
@@ -70,46 +84,40 @@ impl<'a> Flow<'a> {
 /// line without changing font cannot be told to it at all; and where it can, it
 /// centres the font inside the height rather than putting the baseline where the
 /// tallest thing on the line needs it. So each line is measured here, from what
-/// actually landed on it.
+/// actually landed on it: first the block's strut, then everything aligned to a
+/// baseline, then what is aligned to the line's top or bottom, which is
+/// placed in the line the rest made (§10.8: those are aligned last) and makes
+/// it taller only where it is taller than that line.
+///
+/// `run_reach` is how far each run's own font reaches, where its line height is
+/// `normal`, already moved by its span's shift: a line is as tall as the fonts
+/// actually on it ask, fallback fonts included (CSS Inline 3 §4.2).
 pub(super) fn line_reaches(
     content: &InlineContent<'_>,
     levels: &Levels,
     shaped: &ShapedText,
-) -> Vec<(f32, f32)> {
-    // A line holding a picture is the shaper's to measure: a picture stands on
-    // the baseline with all of its height above, the text beside it hangs
-    // below, and the shaper has already put the box around both — which is the
-    // answer for a picture whose ink reaches past the box the font would have
-    // given it. Every other line starts at the block's own strut.
-    let mut holds_picture = vec![false; shaped.lines.len()];
-    for spacer in &shaped.spacers {
-        let picture = content
-            .replaced_by_spacer(spacer.id)
-            .is_some_and(|box_| box_.content.is_none());
-        if picture && let Some(slot) = holds_picture.get_mut(spacer.line) {
-            *slot = true;
-        }
-    }
-    let mut reach: Vec<(f32, f32)> = shaped
-        .lines
-        .iter()
-        .zip(holds_picture)
-        .map(|(line, picture)| {
-            if picture {
-                (line.baseline - line.top, line.bottom - line.baseline)
-            } else {
-                levels.strut
-            }
-        })
-        .collect();
+    run_reach: &[Option<(f32, f32)>],
+) -> LineLevels {
+    use super::collect::LineAlign;
+
+    let mut reach = vec![levels.strut; shaped.lines.len()];
+    let edge_of = |span: usize| levels.line_relative.iter().find(|edge| edge.span == span);
 
     // The spans on each line. A span is on a line if any of its bytes were drawn
     // there.
-    for run in &shaped.runs {
+    for (run, own) in shaped.runs.iter().zip(run_reach) {
         let Some(line) = reach.get_mut(run.line) else {
             continue;
         };
-        for index in content.spans_in(run.text_range.clone()) {
+        let spans: Vec<usize> = content.spans_in(run.text_range.clone()).collect();
+        if spans.iter().any(|&span| edge_of(span).is_some()) {
+            continue;
+        }
+        if let Some((above, below)) = *own {
+            line.0 = line.0.max(above);
+            line.1 = line.1.max(below);
+        }
+        for index in spans {
             let Some(&(above, below)) = levels.span_reach.get(index) else {
                 continue;
             };
@@ -132,11 +140,83 @@ pub(super) fn line_reaches(
         ) else {
             continue;
         };
-        let above = box_.baseline + box_.shift;
-        line.0 = line.0.max(above);
-        line.1 = line.1.max(box_.outer_height() - above);
+        if let LineAlign::Shift(shift) = box_.align {
+            let above = box_.baseline + shift;
+            line.0 = line.0.max(above);
+            line.1 = line.1.max(box_.outer_height() - above);
+        }
     }
-    reach
+
+    // What hangs from the line's top or stands on its bottom needs the line to
+    // be at least as tall as it is, and grows it the other way.
+    let grow = |line: &mut (f32, f32), height: f32, top: bool| {
+        if top {
+            line.1 = line.1.max(height - line.0);
+        } else {
+            line.0 = line.0.max(height - line.1);
+        }
+    };
+    for run in &shaped.runs {
+        let edge = content.spans_in(run.text_range.clone()).find_map(edge_of);
+        if let (Some(edge), Some(line)) = (edge, reach.get_mut(run.line)) {
+            grow(line, edge.strut.height(), edge.top);
+        }
+    }
+    for spacer in &shaped.spacers {
+        let (Some(line), Some(box_)) = (
+            reach.get_mut(spacer.line),
+            content.replaced_by_spacer(spacer.id),
+        ) else {
+            continue;
+        };
+        match box_.align {
+            LineAlign::Top => grow(line, box_.outer_height(), true),
+            LineAlign::Bottom => grow(line, box_.outer_height(), false),
+            LineAlign::Shift(_) => {}
+        }
+    }
+
+    // Now each line is as tall as it will be, the edge-aligned things go to
+    // its edges.
+    let run_shift = shaped
+        .runs
+        .iter()
+        .map(|run| {
+            let edge = content.spans_in(run.text_range.clone()).find_map(edge_of)?;
+            let &(above, below) = reach.get(run.line)?;
+            Some(if edge.top {
+                above - edge.strut.ascent
+            } else {
+                edge.strut.descent - below
+            })
+        })
+        .collect();
+    let replaced_shift = content
+        .replaced
+        .iter()
+        .enumerate()
+        .map(|(number, box_)| {
+            let line = shaped
+                .spacers
+                .iter()
+                .find(|spacer| spacer.id == super::collect::replaced_spacer(number))
+                .and_then(|spacer| reach.get(spacer.line));
+            match (box_.align, line) {
+                (LineAlign::Shift(shift), _) => shift,
+                (LineAlign::Top, Some(&(above, _))) => above - box_.baseline,
+                (LineAlign::Bottom, Some(&(_, below))) => {
+                    box_.outer_height() - below - box_.baseline
+                }
+                (LineAlign::Top | LineAlign::Bottom, None) => 0.0,
+            }
+        })
+        .collect();
+
+    LineLevels {
+        reach,
+        run_shift,
+        replaced_shift,
+    }
 }
 
 /// Stack the lines of a paragraph by how far each reaches — one reach per line,

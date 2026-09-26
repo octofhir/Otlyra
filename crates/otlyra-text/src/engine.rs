@@ -78,6 +78,20 @@ impl Strut {
     pub fn height(self) -> f32 {
         self.ascent + self.descent + self.leading
     }
+
+    /// The strut of a line `line_height` tall: the font's ascent and descent
+    /// with the rest shared out above and below as half-leading (CSS 2.2
+    /// §10.8.1), the half above rounded down as Blink rounds it, so an odd
+    /// pixel of leading goes below the baseline.
+    #[must_use]
+    pub fn leaded(self, line_height: f32) -> Self {
+        let above = self.ascent + ((line_height - self.ascent - self.descent) / 2.0).floor();
+        Self {
+            ascent: above,
+            descent: line_height - above,
+            leading: 0.0,
+        }
+    }
 }
 
 /// The families whose ascent is lengthened before a line is measured from it.
@@ -101,6 +115,27 @@ fn browser_ascent(family: &str, ascent: f32, descent: f32) -> f32 {
         ascent + ((ascent + descent) * 0.15 + 0.5).floor()
     } else {
         ascent
+    }
+}
+
+/// The strut a font of `family` makes at `font_size`: its ascent, lengthened
+/// where a browser lengthens it, its descent and its line gap.
+///
+/// Rounded one at a time and then added, rather than added and rounded. The
+/// difference is a pixel on many fonts and it is the difference between lines
+/// landing where a reference browser puts them and landing a pixel out per
+/// line, which accumulates down a page.
+fn strut_from(font: &skrifa::FontRef<'_>, font_size: f32, family: &str) -> Strut {
+    let metrics = skrifa::metrics::Metrics::new(
+        font,
+        skrifa::prelude::Size::new(font_size),
+        skrifa::instance::LocationRef::default(),
+    );
+    let descent = -metrics.descent;
+    Strut {
+        ascent: browser_ascent(family, metrics.ascent, descent).round(),
+        descent: descent.round(),
+        leading: metrics.leading.round(),
     }
 }
 
@@ -401,6 +436,9 @@ pub struct TextEngine {
     layout: LayoutContext<SpanBrush>,
     /// The families pages have brought with `@font-face`.
     web: WebFamilies,
+    /// Each font's strut by its data, face and size, as [`Self::font_strut`]
+    /// works it out: a paragraph asks it of every run.
+    font_struts: HashMap<(u64, u32, u32), Strut>,
 }
 
 impl std::fmt::Debug for TextEngine {
@@ -425,6 +463,7 @@ impl TextEngine {
             fonts,
             layout: LayoutContext::new(),
             web: WebFamilies::default(),
+            font_struts: HashMap::new(),
         }
     }
 
@@ -472,6 +511,7 @@ impl TextEngine {
             fonts,
             layout: LayoutContext::new(),
             web: WebFamilies::default(),
+            font_struts: HashMap::new(),
         }
     }
 
@@ -506,24 +546,26 @@ impl TextEngine {
     pub fn strut(&mut self, stack: &FontStack, font_size: f32, query: FaceQuery) -> Option<Strut> {
         let (blob, index, family) = self.resolve(stack, query)?;
         let font = skrifa::FontRef::from_index(blob.as_ref(), index).ok()?;
-        let metrics = skrifa::metrics::Metrics::new(
-            &font,
-            skrifa::prelude::Size::new(font_size),
-            skrifa::instance::LocationRef::default(),
-        );
+        Some(strut_from(&font, font_size, &family))
+    }
 
-        let descent = -metrics.descent;
-        let ascent = browser_ascent(&family, metrics.ascent, descent);
-
-        // Rounded one at a time and then added, rather than added and rounded. The
-        // difference is a pixel on many fonts and it is the difference between
-        // lines landing where a reference browser puts them and landing a pixel out
-        // per line, which accumulates down a page.
-        Some(Strut {
-            ascent: ascent.round(),
-            descent: descent.round(),
-            leading: metrics.leading.round(),
-        })
+    /// The strut of one font a run was actually set in, at `font_size`.
+    ///
+    /// A line with `line-height: normal` is as tall as every font on it asks,
+    /// not only its first available one (CSS Inline 3 §4.2): a word that fell
+    /// back to a font with taller ascenders makes its line taller, as Blink's
+    /// lines grow for the fonts they use. The font's default instance is
+    /// measured; where a run sits along a variable font's axes is not.
+    pub fn font_strut(&mut self, font: &FontData, font_size: f32) -> Option<Strut> {
+        let key = (font.data.id(), font.index, font_size.to_bits());
+        if let Some(strut) = self.font_struts.get(&key) {
+            return Some(*strut);
+        }
+        let family = family_name(font).unwrap_or_default();
+        let face = skrifa::FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+        let strut = strut_from(&face, font_size, &family);
+        self.font_struts.insert(key, strut);
+        Some(strut)
     }
 
     /// The first available font of `stack` (CSS Fonts 4 §5.2), as bytes, face
@@ -1587,6 +1629,20 @@ mod tests {
             (jumped - expected).abs() < 0.5,
             "{jumped} rather than {expected}"
         );
+    }
+
+    /// Half-leading is shared out with the half above rounded down: Fira Sans
+    /// Medium at 18px on a 27px line has its baseline 19px down, as in Blink.
+    #[test]
+    fn half_leading_rounds_the_half_above_down() {
+        let strut = Strut {
+            ascent: 17.0,
+            descent: 5.0,
+            leading: 0.0,
+        };
+        let leaded = strut.leaded(27.0);
+        assert_eq!((leaded.ascent, leaded.descent), (19.0, 8.0));
+        assert_eq!(leaded.height(), 27.0);
     }
 
     /// A span asks for its weight and width along the axes of whatever

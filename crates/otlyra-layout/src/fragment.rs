@@ -75,7 +75,12 @@ pub enum FragmentKind {
     /// A block box: a background, and eventually borders.
     Box,
     /// One line of an inline formatting context.
-    Line,
+    Line {
+        /// Where its baseline is, down from the fragment's top: what an
+        /// inline block whose last line this is sits on in the line outside
+        /// it (CSS 2.2 §10.8.1).
+        baseline: f32,
+    },
     /// A replaced box's content: a picture, drawn to fill the fragment.
     Image(otlyra_gfx::peniko::ImageData),
     /// One shaped run of glyphs, positioned relative to the fragment's origin.
@@ -157,6 +162,37 @@ pub struct Fragment {
 }
 
 impl Fragment {
+    /// How far below its top its last line's baseline sits: the baseline of
+    /// its last line box in the flow (CSS 2.2 §10.8.1), wherever in its
+    /// descendants that is. `None` when it has no line box at all.
+    ///
+    /// A box that has left the flow has left the line as well, and so has a
+    /// float: neither is looked into. Nor is what is on a line — an inline
+    /// block on it is a box on the line, not a line of this box — so a box
+    /// whose last line holds only pictures sits on that line's baseline, not
+    /// on the pictures.
+    #[must_use]
+    pub fn last_baseline(&self) -> Option<f32> {
+        self.last_line_baseline().map(|at| at - self.rect.y)
+    }
+
+    /// The same, on the page.
+    fn last_line_baseline(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .rev()
+            .find_map(|child| match child.kind {
+                FragmentKind::Line { baseline } => Some(child.rect.y + baseline),
+                FragmentKind::Box
+                    if !child.style.position.is_out_of_flow()
+                        && child.style.float == otlyra_css::Float::None =>
+                {
+                    child.last_line_baseline()
+                }
+                FragmentKind::Box | FragmentKind::Image(_) | FragmentKind::Text(_) => None,
+            })
+    }
+
     /// A fragment with nothing inside it, where layout first puts one.
     ///
     /// Everything that is not the fragment itself starts as the flow's: no

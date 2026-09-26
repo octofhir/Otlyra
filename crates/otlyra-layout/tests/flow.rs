@@ -50,7 +50,7 @@ fn fragments(tree: &FragmentTree) -> Vec<&Fragment> {
 
 fn lines(tree: &FragmentTree) -> Vec<&Fragment> {
     tree.iter()
-        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .collect()
 }
 
@@ -69,7 +69,7 @@ fn text_blocks(tree: &FragmentTree) -> Vec<&Fragment> {
                 && fragment
                     .children
                     .iter()
-                    .any(|child| matches!(child.kind, FragmentKind::Line))
+                    .any(|child| matches!(child.kind, FragmentKind::Line { .. }))
         })
         .collect()
 }
@@ -415,7 +415,7 @@ fn a_raised_or_lowered_box_moves_and_makes_room() {
     }
     fn line_height(tree: &FragmentTree) -> f32 {
         tree.iter()
-            .find_map(|f| matches!(f.kind, FragmentKind::Line).then_some(f.rect.height))
+            .find_map(|f| matches!(f.kind, FragmentKind::Line { .. }).then_some(f.rect.height))
             .expect("a line")
     }
 
@@ -1128,7 +1128,7 @@ fn a_selection_reads_the_words_it_covers() {
     assert_eq!(rects.len(), 1, "one line, one rectangle: {rects:?}");
     let lines: Vec<&Fragment> = tree
         .iter()
-        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .collect();
     assert!(
         rects[0].width > 0.0 && rects[0].width < lines[0].rect.width,

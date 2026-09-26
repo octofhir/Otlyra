@@ -14,6 +14,16 @@ use crate::{BoxTree, FragmentKind, FragmentTree, build_box_tree};
 /// Lay a document out at `width`, with its own stylesheets applied, and keep
 /// the boxes: a fragment says where something is, and only the box says what.
 pub(super) fn laid_out(html: &str, width: f32) -> (FragmentTree, BoxTree) {
+    laid_out_with(html, width, &mut otlyra_text::TextEngine::isolated())
+}
+
+/// The same, with the fonts `text` has — the system's, for a test about
+/// fallback, which the vendored font alone cannot show.
+pub(super) fn laid_out_with(
+    html: &str,
+    width: f32,
+    text: &mut otlyra_text::TextEngine,
+) -> (FragmentTree, BoxTree) {
     let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
     let styles = style_document(
         &document,
@@ -26,10 +36,9 @@ pub(super) fn laid_out(html: &str, width: f32) -> (FragmentTree, BoxTree) {
         },
     );
     let mut boxes = build_box_tree(&document, &styles);
-    let mut text = otlyra_text::TextEngine::isolated();
     let tree = crate::layout(
         &mut boxes,
-        &mut text,
+        text,
         Viewport {
             width,
             height: 600.0,
@@ -281,7 +290,7 @@ pub(super) fn rect_of(tree: &FragmentTree, boxes: &BoxTree, tag: &str) -> Rect {
 /// The first line box, which is where alignment shows.
 fn first_line(tree: &FragmentTree) -> Rect {
     fn walk(fragment: &Fragment) -> Option<Rect> {
-        if matches!(fragment.kind, FragmentKind::Line) {
+        if matches!(fragment.kind, FragmentKind::Line { .. }) {
             return Some(fragment.rect);
         }
         fragment.children.iter().find_map(walk)
@@ -714,7 +723,7 @@ fn lines_beside_a_float_are_shorter_than_the_ones_below_it() {
     let lines: Vec<Rect> = paragraph[0]
         .children
         .iter()
-        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .map(|fragment| fragment.rect)
         .collect();
     assert!(lines.len() > 2, "the paragraph wrapped");
@@ -766,7 +775,7 @@ fn a_float_is_not_flowed_around_by_its_own_contents() {
     let inner = floats[1]
         .children
         .iter()
-        .find(|child| matches!(child.kind, FragmentKind::Line))
+        .find(|child| matches!(child.kind, FragmentKind::Line { .. }))
         .expect("the right float's own line");
     assert_eq!(
         inner.rect.x, floats[1].rect.x,
@@ -1146,7 +1155,7 @@ fn a_clipping_box_keeps_its_floats_to_itself() {
     let line = paragraph[0]
         .children
         .iter()
-        .find(|child| matches!(child.kind, FragmentKind::Line))
+        .find(|child| matches!(child.kind, FragmentKind::Line { .. }))
         .expect("a line");
     assert_eq!(line.rect.x, 0.0, "the float reached out of the box");
 }

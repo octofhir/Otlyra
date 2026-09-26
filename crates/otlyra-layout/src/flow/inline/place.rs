@@ -60,8 +60,13 @@ pub(super) struct Placement<'p, 'a> {
     pub(super) parent: BoxId,
     pub(super) content: &'p InlineContent<'a>,
     pub(super) shaped: &'p ShapedText,
-    /// What each line-relative `vertical-align` resolved to.
+    /// How far each box's content sits off the paragraph's baseline.
     pub(super) shifts: &'p HashMap<BoxId, f32>,
+    /// How far each run of a `top` or `bottom` span sits off its own line's
+    /// baseline, in step with the shaped runs.
+    pub(super) run_shift: &'p [Option<f32>],
+    /// How far each atomic inline sits off its line's baseline.
+    pub(super) replaced_shift: &'p [f32],
     /// Where the shaper put each spacer, by its identifier.
     pub(super) spacers: HashMap<u64, PlacedSpacer>,
     /// The width of the block's content box.
@@ -103,7 +108,9 @@ impl Placement<'_, '_> {
             ..Fragment::new(
                 Some(self.parent),
                 Rect::new(line.x, line.y, line.metrics.width, line.height),
-                FragmentKind::Line,
+                FragmentKind::Line {
+                    baseline: line.baseline() - line.y,
+                },
                 Arc::clone(self.style()),
             )
         }
@@ -216,8 +223,9 @@ impl Placement<'_, '_> {
         self.shaped
             .runs
             .iter()
-            .filter(|run| run.line == line.index)
-            .map(|run| {
+            .enumerate()
+            .filter(|(_, run)| run.line == line.index)
+            .map(|(number, run)| {
                 // Glyph positions come back relative to the paragraph; a
                 // fragment is a place on the page, so they are rebased onto it.
                 let mut run = run.clone();
@@ -236,7 +244,12 @@ impl Placement<'_, '_> {
                 // and the room they need was already added to the line's
                 // height when its spans were levelled. A run with no box of
                 // its own is the block's text, which stays on the baseline.
-                let shift = box_id.map_or(0.0, |id| self.shift_on_line(id));
+                let shift = self
+                    .run_shift
+                    .get(number)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| box_id.map_or(0.0, |id| self.shift_on_line(id)));
 
                 // The fragment moves with its glyphs, which are placed relative
                 // to it. Shifting only the glyphs left the background, the
@@ -282,7 +295,8 @@ impl Placement<'_, '_> {
                 // its margins: its baseline is measured from the margin box's
                 // top, which is where the line put that.
                 let x = line.x + spacer.x + box_.margin.left;
-                let y = line.baseline() - box_.shift - box_.baseline + box_.margin.top;
+                let shift = self.replaced_shift.get(number).copied().unwrap_or(0.0);
+                let y = line.baseline() - shift - box_.baseline + box_.margin.top;
                 let order = PaintOrder {
                     byte: self.content.start_of(box_.at),
                     kind: PaintKind::Atomic,

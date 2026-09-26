@@ -1,6 +1,8 @@
 //! Inline layout, checked against whole documents.
 
-use crate::flow::tests::{boxes_of, image_rect, laid_out, laid_out_with_image, picture};
+use crate::flow::tests::{
+    boxes_of, image_rect, laid_out, laid_out_with, laid_out_with_image, picture,
+};
 use crate::{BoxTree, Fragment, FragmentKind, FragmentTree, Rect};
 
 /// The one box fragment the element `tag` generated, and the run of its text.
@@ -47,7 +49,7 @@ fn a_raised_inline_box_moves_as_far_as_its_text() {
 /// How many line boxes a document laid out to.
 fn line_boxes(tree: &crate::FragmentTree) -> usize {
     tree.iter()
-        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .count()
 }
 
@@ -143,7 +145,7 @@ fn a_negative_margin_on_an_inline_box_pulls_its_neighbours_in() {
             400.0,
         );
         tree.iter()
-            .find(|fragment| matches!(fragment.kind, FragmentKind::Line))
+            .find(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
             .expect("a line box")
             .rect
             .width
@@ -259,7 +261,7 @@ fn a_no_break_space_is_a_line_of_text() {
     );
     let line = tree
         .iter()
-        .find(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .find(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .expect("a line box");
     assert_eq!(line.rect.height, 20.0);
 }
@@ -406,7 +408,7 @@ fn a_line_is_painted_in_tree_order() {
     );
     let line = tree
         .iter()
-        .find(|fragment| matches!(fragment.kind, FragmentKind::Line))
+        .find(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
         .expect("a line box");
     let span = boxes_of(&tree, &boxes, "span")[0].box_id;
     let position = |found: &dyn Fn(&Fragment) -> bool| {
@@ -456,4 +458,209 @@ fn an_inline_block_that_scrolls_sits_on_its_bottom_margin_edge() {
     let visible = below_baseline("visible");
     assert!(visible > 10.0, "its text on the baseline: {visible}");
     assert!((below_baseline("clip") - visible).abs() < 0.01);
+}
+
+/// The line box a run of text starting with `text` sits on: the one holding
+/// the run among its children.
+fn line_of(tree: &FragmentTree, text: &str) -> Rect {
+    tree.iter()
+        .find(|line| {
+            matches!(line.kind, FragmentKind::Line { .. })
+                && line.children.iter().any(|child| {
+                    matches!(&child.kind, FragmentKind::Text(run) if run.text.starts_with(text))
+                })
+        })
+        .map(|line| line.rect)
+        .unwrap_or_else(|| panic!("no line holding {text:?}"))
+}
+
+/// The baseline of the run starting with `text`, on the page.
+fn baseline_of_run(tree: &FragmentTree, text: &str) -> f32 {
+    tree.iter()
+        .find_map(|fragment| match &fragment.kind {
+            FragmentKind::Text(run) if run.text.starts_with(text) => {
+                run.glyphs.first().map(|glyph| fragment.rect.y + glyph.y)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no run starting {text:?}"))
+}
+
+/// A `sup` raises everything inside it, however deep: a link in it and a
+/// span in that are aligned against their parents, which are raised (CSS 2.2
+/// §10.8.1). The line grows to hold the raised text.
+#[test]
+fn a_shift_carries_down_to_what_is_inside() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px/18px sans-serif }</style>\
+         <div>sup a<sup><a href=#><span>[4]</span></a></sup> x</div>",
+        400.0,
+    );
+    let raised = baseline_of_run(&tree, "sup a") - baseline_of_run(&tree, "[4]");
+    assert!(
+        (raised - (16.0 / 3.0 + 1.0)).abs() < 0.01,
+        "raised {raised}, a third of the parent's font and a pixel"
+    );
+    assert!(line_of(&tree, "sup a").height > 18.0, "the line grows");
+}
+
+/// A superscript inside a superscript is raised twice.
+#[test]
+fn shifts_inside_shifts_add_up() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 21px/1 sans-serif } \
+         span { vertical-align: super }</style>\
+         <p>a<span>b<span>c</span></span></p>",
+        400.0,
+    );
+    let base = baseline_of_run(&tree, "a");
+    let once = base - baseline_of_run(&tree, "b");
+    let twice = base - baseline_of_run(&tree, "c");
+    assert!((once - 8.0).abs() < 0.01, "{once}");
+    assert!((twice - 16.0).abs() < 0.01, "{twice}");
+}
+
+/// Half the leading goes above the text, rounded down, and the rest below:
+/// on a line five pixels taller than the font, two go above.
+#[test]
+fn half_leading_above_is_rounded_down() {
+    let mut text = otlyra_text::TextEngine::isolated();
+    let stack = otlyra_text::FontStack::named(otlyra_text::TEST_FAMILY);
+    let strut = text
+        .strut(&stack, 18.0, otlyra_text::FaceQuery::default())
+        .expect("the vendored font");
+    let line_height = strut.ascent + strut.descent + 5.0;
+    let (tree, _) = laid_out(
+        &format!(
+            "<style>body {{ margin: 0; font: 18px/{line_height}px sans-serif }}</style><p>x</p>"
+        ),
+        400.0,
+    );
+    let line = line_of(&tree, "x");
+    assert_eq!(baseline_of_run(&tree, "x") - line.y, strut.ascent + 2.0);
+    assert_eq!(line.height, line_height);
+}
+
+/// A line with `line-height: normal` is as tall as the fonts on it: text that
+/// falls back to a font with a taller ascent than the first available one
+/// makes its line taller — Devanagari, whose fonts reach further than Latin
+/// ones. Skipped on a machine with no font for the script.
+#[test]
+fn line_height_normal_grows_for_a_fallback_font() {
+    let mut text = otlyra_text::TextEngine::new();
+    let page = |body: &str| {
+        format!(
+            "<style>body {{ margin: 0; font: 16px '{}' }}</style><p>{body}</p>",
+            otlyra_text::TEST_FAMILY
+        )
+    };
+    let (latin, _) = laid_out_with(&page("abc"), 400.0, &mut text);
+    let (mixed, _) = laid_out_with(&page("abc नमस्ते"), 400.0, &mut text);
+    let font_of = |tree: &FragmentTree, text: &str| {
+        tree.iter().find_map(|fragment| match &fragment.kind {
+            FragmentKind::Text(run) if run.text.contains(text) => Some(run.font.data.id()),
+            _ => None,
+        })
+    };
+    if font_of(&mixed, "न") == font_of(&mixed, "abc") {
+        return;
+    }
+    let (plain, grown) = (line_of(&latin, "abc").height, line_of(&mixed, "abc").height);
+    assert!(grown > plain, "{grown} against {plain}");
+}
+
+/// The inline blocks of white-space.html's pictures row: one holding only
+/// pictures set `bottom`, one holding words and a picture. Both are one line
+/// of the font's height, their pictures stand on that line's bottom, and they
+/// sit in the line outside by that line's baseline — so their tops agree.
+#[test]
+fn inline_blocks_of_bottom_pictures_line_up_with_words() {
+    let (tree, boxes) = laid_out_with_image(
+        "<style>body { margin: 0; font: 16px/1.5 monospace } \
+         .m { display: inline-block } \
+         img { width: 40px; height: 20px; vertical-align: bottom }</style>\
+         <div><span class=m><img src=a.png><img src=a.png></span> \
+         <span class=m>word <img src=a.png> word</span></div>",
+        600.0,
+        picture(40, 20),
+    );
+    let blocks = boxes_of(&tree, &boxes, "span");
+    let [pictures, words] = &blocks[..] else {
+        panic!("two inline blocks: {blocks:?}");
+    };
+    assert_eq!(pictures.rect.height, 24.0, "a line of the font's height");
+    assert_eq!(words.rect.height, 24.0);
+    assert_eq!(pictures.rect.y, words.rect.y, "tops agree");
+    let image = image_rect(&tree);
+    assert_eq!(
+        image.bottom(),
+        pictures.rect.bottom(),
+        "the picture stands on the bottom"
+    );
+}
+
+/// A picture set `middle` has its middle half an x-height above the baseline,
+/// the x-height taken as half the font size.
+#[test]
+fn a_middle_picture_centres_on_the_x_height() {
+    let (tree, _) = laid_out_with_image(
+        "<style>body { margin: 0; font: 20px/40px sans-serif } \
+         img { width: 10px; height: 10px; vertical-align: middle }</style>\
+         <p>x<img src=a.png></p>",
+        400.0,
+        picture(10, 10),
+    );
+    let image = image_rect(&tree);
+    let baseline = baseline_of_run(&tree, "x");
+    assert!(
+        (image.y + 5.0 - (baseline - 5.0)).abs() < 0.01,
+        "{image:?} on {baseline}"
+    );
+}
+
+/// A picture set `bottom` ends at its line's bottom, and one set `top` starts
+/// at its top.
+#[test]
+fn edge_aligned_pictures_meet_the_edges_of_their_line() {
+    for (align, edge) in [("bottom", true), ("top", false)] {
+        let (tree, _) = laid_out_with_image(
+            &format!(
+                "<style>body {{ margin: 0; font: 16px/30px sans-serif }} \
+                 img {{ width: 10px; height: 10px; vertical-align: {align} }}</style>\
+                 <p>x<img src=a.png></p>"
+            ),
+            400.0,
+            picture(10, 10),
+        );
+        let line = line_of(&tree, "x");
+        let image = image_rect(&tree);
+        assert_eq!(line.height, 30.0, "{align}: the line is the strut's");
+        if edge {
+            assert_eq!(image.bottom(), line.bottom(), "{align}");
+        } else {
+            assert_eq!(image.y, line.y, "{align}");
+        }
+    }
+}
+
+/// A span set `top` on the second line is placed in the second line, not in
+/// the paragraph's tallest one, and does not make its line taller than the
+/// strut.
+#[test]
+fn a_top_span_on_line_two_uses_line_two() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px/20px sans-serif } \
+         .tall { display: inline-block; width: 50px; height: 60px } \
+         .top { vertical-align: top; font-size: 10px }</style>\
+         <div style='width: 30px'><span class=tall></span> <span class=top>t</span></div>",
+        400.0,
+    );
+    let line = line_of(&tree, "t");
+    assert!(line.y >= 60.0, "on the second line: {line:?}");
+    assert_eq!(line.height, 20.0, "no taller than the strut");
+    let baseline = baseline_of_run(&tree, "t");
+    assert!(
+        baseline > line.y && baseline < line.bottom(),
+        "{baseline} in {line:?}"
+    );
 }

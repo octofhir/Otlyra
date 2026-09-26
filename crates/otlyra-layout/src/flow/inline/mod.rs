@@ -59,8 +59,9 @@ impl<'a> Flow<'a> {
         }
         let levels = self.level_line_heights(parent, &mut content);
         let (mut shaped, bands) = self.shape_lines(parent, &content, width, x, y);
-        let reach = line_reaches(&content, &levels, &shaped);
-        restack(&mut shaped, &reach);
+        let run_reach = self.run_reaches(&content, &levels, &shaped);
+        let line_levels = line_reaches(&content, &levels, &shaped, &run_reach);
+        restack(&mut shaped, &line_levels.reach);
         // Where the first line starts, in the shaper's coordinates. parley
         // measures line tops from the text origin, and the first line's top can
         // sit above it by the half-leading; the paragraph's box starts where its
@@ -84,6 +85,8 @@ impl<'a> Flow<'a> {
             content: &content,
             shaped: &shaped,
             shifts: &levels.shifts,
+            run_shift: &line_levels.run_shift,
+            replaced_shift: &line_levels.replaced_shift,
             spacers: shaped
                 .spacers
                 .iter()
@@ -117,6 +120,33 @@ impl<'a> Flow<'a> {
         shaped.metrics.height
     }
 
+    /// How far each run's own font reaches above and below the line's
+    /// baseline, for the runs whose line height is `normal`; `None` for the
+    /// rest, whose line height is what they asked for.
+    fn run_reaches(
+        &mut self,
+        content: &collect::InlineContent<'_>,
+        levels: &vertical_align::Levels,
+        shaped: &otlyra_text::ShapedText,
+    ) -> Vec<Option<(f32, f32)>> {
+        shaped
+            .runs
+            .iter()
+            .map(|run| {
+                let index = content.spans_in(run.text_range.clone()).next()?;
+                let source = content.sources.get(index).copied()?;
+                let style = &self.tree.node(source).style;
+                if style.line_height != otlyra_css::LineHeight::Normal {
+                    return None;
+                }
+                let strut = self.text.font_strut(&run.font, run.font_size)?;
+                let strut = strut.leaded(strut.height());
+                let shift = levels.span_shift.get(index).copied().unwrap_or(0.0);
+                Some((shift + strut.ascent, strut.descent - shift))
+            })
+            .collect()
+    }
+
     /// The font stack a style's text is set in.
     pub(super) fn font_stack(&mut self, style: &ComputedStyle) -> FontStack {
         self.font_stacks.of(&style.font_family)
@@ -128,20 +158,14 @@ impl<'a> Flow<'a> {
         style: &ComputedStyle,
         stack: &FontStack,
     ) -> Option<otlyra_text::Strut> {
-        let mut strut = self
+        let strut = self
             .text
             .strut(stack, style.font_size, crate::fonts::face_query(style))?;
-        // An explicit `line-height` replaces what the font asked for, split evenly
-        // above and below the baseline, which is what half-leading is.
-        if let otlyra_css::LineHeight::Normal = style.line_height {
-            return Some(strut);
-        }
-        let asked = style.line_height.resolve(style.font_size, strut.height());
-        let half = (asked - strut.ascent - strut.descent) / 2.0;
-        strut.ascent += half;
-        strut.descent += half;
-        strut.leading = 0.0;
-        Some(strut)
+        // An explicit `line-height` replaces what the font asked for; `normal`
+        // is the font's own line gap. Either way the leading is split above and
+        // below the baseline, which is what half-leading is.
+        let height = style.line_height.resolve(style.font_size, strut.height());
+        Some(strut.leaded(height))
     }
 }
 

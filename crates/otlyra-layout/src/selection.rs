@@ -286,7 +286,7 @@ pub(crate) fn blocks_of(tree: &FragmentTree) -> Vec<usize> {
         let block = if fragment
             .children
             .iter()
-            .any(|child| matches!(child.kind, FragmentKind::Line))
+            .any(|child| matches!(child.kind, FragmentKind::Line { .. }))
         {
             *next += 1;
             *next

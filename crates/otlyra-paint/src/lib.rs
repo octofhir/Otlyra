@@ -476,7 +476,7 @@ fn paint(
     // painting it belongs to. Keeping them together is what stops a link from being
     // clickable somewhere other than where it is drawn.
     if let Some(box_id) = fragment.box_id
-        && !matches!(fragment.kind, FragmentKind::Line)
+        && !matches!(fragment.kind, FragmentKind::Line { .. })
     {
         list.push(DisplayItem::HitTest {
             rect: KurboRect::new(
@@ -566,7 +566,7 @@ fn paint(
             }
         }
 
-        FragmentKind::Line => {}
+        FragmentKind::Line { .. } => {}
 
         FragmentKind::Image(image)
             if rect.width > 0.0 && rect.height > 0.0 && image.width > 0 && image.height > 0 =>

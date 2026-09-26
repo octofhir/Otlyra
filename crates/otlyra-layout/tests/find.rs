@@ -105,7 +105,7 @@ fn a_match_crosses_a_line_the_paragraph_wrapped_at() {
 
     let lines = tree
         .iter()
-        .filter(|fragment| matches!(fragment.kind, otlyra_layout::FragmentKind::Line))
+        .filter(|fragment| matches!(fragment.kind, otlyra_layout::FragmentKind::Line { .. }))
         .count();
     assert!(
         lines > 1,
