@@ -84,12 +84,146 @@ pub struct SkiaPainter {
     gpu_context: Option<sk::gpu::DirectContext>,
     width: u32,
     height: u32,
-    /// Number of `save`/`save_layer` pairs currently open, so that an unbalanced
-    /// [`PaintTarget::pop_layer`] cannot restore past our own baseline.
-    layer_depth: usize,
+    /// What each open [`PaintTarget::push_layer`] became, innermost last, so that
+    /// its pop restores exactly what it saved — and so that an unbalanced pop
+    /// cannot restore past our own baseline.
+    layers: Vec<Opened>,
     typefaces: TypefaceCache,
     /// The blur the run being drawn asks for, while it is being drawn.
     blur: Option<f64>,
+    /// Blurred shadow masks already computed, by shape and blur.
+    shadows: ShadowMasks,
+}
+
+/// How many bytes of blurred shadow masks a surface keeps.
+const SHADOW_MASK_BYTES: usize = 16 << 20;
+
+/// The largest mask worth keeping, in pixels. A shadow bigger than this is rare
+/// and would crowd out every card on the page; it is blurred where it is drawn.
+const SHADOW_MASK_MAX_PIXELS: usize = 2 << 20;
+
+/// Blurred shadows, computed once per shape and blur and then drawn as images.
+///
+/// A blur is the most expensive thing a CPU rasterizer does per pixel, and a
+/// page asks for the same one over and over: every card in a list casts the same
+/// shadow, and every frame that redraws the list casts it again. Before this each
+/// of them was blurred afresh on every frame — four fifths of the time a page of
+/// cards took to draw. The mask depends on the shape and the blur, not on where
+/// the shape is, so it is keyed on those alone and moved into place.
+#[derive(Default)]
+struct ShadowMasks {
+    entries: std::collections::HashMap<u64, ShadowMask>,
+    bytes: usize,
+    /// A clock for least-recently-used eviction.
+    uses: u64,
+}
+
+struct ShadowMask {
+    /// Coverage only: drawn with a paint, it takes the paint's colour.
+    image: sk::Image,
+    /// Where the mask's top-left pixel goes relative to the whole pixel the
+    /// shape's bounds start in.
+    offset: (i32, i32),
+    last_used: u64,
+}
+
+impl ShadowMasks {
+    /// The mask for `path` (in device pixels) blurred by `sigma` (device pixels),
+    /// and where its top-left pixel goes relative to the whole pixel the shape's
+    /// bounds start in. `None` when the shape is too large to keep or a surface
+    /// could not be made; the caller then blurs it in place.
+    ///
+    /// The key is the shape relative to its own corner, plus where that corner
+    /// falls within a pixel to a quarter of one: the same card further down the
+    /// page is the same key, and a mask is copied onto whole pixels — the fast
+    /// path — rather than resampled at a fraction. A quarter of a pixel is far
+    /// inside what a blur of even one pixel smears.
+    fn get(&mut self, path: &kurbo::BezPath, sigma: f64) -> Option<(sk::Image, (i32, i32))> {
+        use std::hash::{Hash, Hasher};
+
+        let bounds = kurbo::Shape::bounding_box(path);
+        let whole = (bounds.x0.floor(), bounds.y0.floor());
+        let quarter = |value: f64| ((value * 4.0).round() / 4.0).min(0.75);
+        let fraction = (quarter(bounds.x0 - whole.0), quarter(bounds.y0 - whole.1));
+        let origin = (bounds.x0 - fraction.0, bounds.y0 - fraction.1);
+        // Hashed at an eighth of a pixel: finer than antialiasing can show.
+        let quantize = |value: f64| (value * 8.0).round() as i64;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        quantize(sigma).hash(&mut hasher);
+        quantize(fraction.0).hash(&mut hasher);
+        quantize(fraction.1).hash(&mut hasher);
+        for element in path.elements() {
+            let (tag, points): (u8, &[kurbo::Point]) = match element {
+                PathEl::MoveTo(p) => (0, std::slice::from_ref(p)),
+                PathEl::LineTo(p) => (1, std::slice::from_ref(p)),
+                PathEl::QuadTo(a, b) => (2, &[*a, *b]),
+                PathEl::CurveTo(a, b, c) => (3, &[*a, *b, *c]),
+                PathEl::ClosePath => (4, &[]),
+            };
+            tag.hash(&mut hasher);
+            for point in points {
+                quantize(point.x - origin.0).hash(&mut hasher);
+                quantize(point.y - origin.1).hash(&mut hasher);
+            }
+        }
+        let key = hasher.finish();
+
+        self.uses += 1;
+        if let Some(mask) = self.entries.get_mut(&key) {
+            mask.last_used = self.uses;
+            return Some((mask.image.clone(), mask.offset));
+        }
+
+        // Three standard deviations is where a Gaussian has given up all but a
+        // fraction of a per cent; one more pixel covers the rounding.
+        let pad = (sigma * 3.0).ceil() + 1.0;
+        let width = (bounds.x1 - origin.0 + pad * 2.0).ceil() as i32;
+        let height = (bounds.y1 - origin.1 + pad * 2.0).ceil() as i32;
+        let pixels = usize::try_from(width).ok()? * usize::try_from(height).ok()?;
+        if width <= 0 || height <= 0 || pixels > SHADOW_MASK_MAX_PIXELS {
+            return None;
+        }
+
+        let info = sk::ImageInfo::new_a8((width, height));
+        let mut surface = sk::surfaces::raster(&info, None, None)?;
+        let mut paint = sk::Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_color(sk::Color::BLACK);
+        paint.set_mask_filter(sk::MaskFilter::blur(
+            sk::BlurStyle::Normal,
+            sigma as f32,
+            None,
+        )?);
+        let canvas = surface.canvas();
+        canvas.clear(sk::Color::TRANSPARENT);
+        // The shape's corner lands `fraction` into the mask's first whole pixel
+        // past the padding, which is where it falls on the surface too.
+        canvas.translate(((pad - origin.0) as f32, (pad - origin.1) as f32));
+        let skia_path = to_skia_path(path, sk::PathFillType::Winding);
+        canvas.draw_path(&skia_path, &paint);
+        let image = surface.image_snapshot();
+        let offset = (-(pad as i32), -(pad as i32));
+
+        self.bytes += pixels;
+        self.entries.insert(
+            key,
+            ShadowMask {
+                image: image.clone(),
+                offset,
+                last_used: self.uses,
+            },
+        );
+        while self.bytes > SHADOW_MASK_BYTES {
+            let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, mask)| mask.last_used)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.bytes -= (evicted.image.width() * evicted.image.height()) as usize;
+            }
+        }
+        Some((image, offset))
+    }
 }
 
 /// Parsing a font file is expensive and every glyph run asks for the same handful
@@ -441,7 +575,7 @@ impl std::fmt::Debug for SkiaPainter {
         f.debug_struct("SkiaPainter")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("layer_depth", &self.layer_depth)
+            .field("layer_depth", &self.layers.len())
             .finish()
     }
 }
@@ -462,9 +596,10 @@ impl SkiaPainter {
             gpu_context: None,
             width,
             height,
-            layer_depth: 0,
+            layers: Vec::new(),
             typefaces: TypefaceCache::default(),
             blur: None,
+            shadows: ShadowMasks::default(),
         })
     }
 
@@ -532,9 +667,10 @@ impl SkiaPainter {
             gpu_context: Some(context),
             width,
             height,
-            layer_depth: 0,
+            layers: Vec::new(),
             typefaces: TypefaceCache::default(),
             blur: None,
+            shadows: ShadowMasks::default(),
         })
     }
 
@@ -711,6 +847,56 @@ impl SkiaPainter {
 
     fn canvas(&mut self) -> &sk::Canvas {
         self.surface.canvas()
+    }
+
+    /// Draw a solid blurred shape from the mask cache. `false` when it cannot
+    /// be — a rotated or skewed shadow, or one too large to keep — and the
+    /// caller blurs it in place instead.
+    fn fill_blurred_cached(
+        &mut self,
+        transform: Affine,
+        color: Color,
+        blur: f64,
+        shape: &dyn PaintShape,
+    ) -> bool {
+        // The mask is made in device pixels, so everything that puts the shape
+        // on the surface is applied first: the canvas's own matrix and the item's.
+        let canvas_matrix = self.canvas().local_to_device_as_3x3();
+        let [a, b, c, d, e, f] = transform.as_coeffs();
+        let device = Affine::new([
+            f64::from(canvas_matrix.scale_x()),
+            f64::from(canvas_matrix.skew_y()),
+            f64::from(canvas_matrix.skew_x()),
+            f64::from(canvas_matrix.scale_y()),
+            f64::from(canvas_matrix.translate_x()),
+            f64::from(canvas_matrix.translate_y()),
+        ]) * Affine::new([a, b, c, d, e, f]);
+        let [sx, ky, kx, sy, _, _] = device.as_coeffs();
+        // Only a scale and a move: under a rotation the blur is still round but
+        // the shape is not the one the key describes, and a stretched blur is not
+        // a Gaussian of any one width.
+        if ky != 0.0 || kx != 0.0 || sx <= 0.0 || (sx - sy).abs() > 1e-6 {
+            return false;
+        }
+        let mut path = kurbo::BezPath::new();
+        shape.visit_path_elements(0.1, &mut |element| path.push(element));
+        path.apply_affine(device);
+        // CSS's blur radius is twice the standard deviation.
+        let sigma = blur / 2.0 * sx;
+
+        let Some((image, offset)) = self.shadows.get(&path, sigma) else {
+            return false;
+        };
+        let bounds = kurbo::Shape::bounding_box(&path);
+        let x = bounds.x0.floor() as i32 + offset.0;
+        let y = bounds.y0.floor() as i32 + offset.1;
+        let paint = sk::Paint::new(to_skia_color(color), None);
+        let canvas = self.canvas();
+        canvas.save();
+        canvas.reset_matrix();
+        canvas.draw_image(&image, (x as f32, y as f32), Some(&paint));
+        canvas.restore();
+        true
     }
 }
 
@@ -961,11 +1147,21 @@ fn apply_stroke(paint: &mut sk::Paint, style: &Stroke) {
     }
 }
 
+/// What one [`PaintTarget::push_layer`] opened on the canvas.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Opened {
+    /// A clip and nothing else: one `save`.
+    Clip,
+    /// An offscreen group composited on pop: a `save` for the clip and a
+    /// `save_layer` inside it.
+    Group,
+}
+
 impl PaintTarget for SkiaPainter {
     fn reset(&mut self) {
         // Unwind layers a malformed frame left open, or the clear lands inside a
         // stale layer instead of on the surface.
-        while self.layer_depth > 0 {
+        while !self.layers.is_empty() {
             self.pop_layer();
         }
         self.surface.canvas().clear(sk::Color::TRANSPARENT);
@@ -980,9 +1176,15 @@ impl PaintTarget for SkiaPainter {
     ) {
         let matrix = to_skia_matrix(transform);
         let path = to_skia_path(clip, sk::PathFillType::Winding);
-        let mut paint = sk::Paint::default();
-        paint.set_alpha_f(alpha);
-        paint.set_blend_mode(to_skia_blend(blend));
+        // A group at full opacity that blends normally composites exactly as its
+        // contents would have drawn straight onto the canvas under the same clip:
+        // source-over is associative. So it is not made a group at all. An
+        // offscreen layer is a whole extra surface the size of the clip, filled,
+        // then blended back pixel by pixel on the pop — and a page puts one round
+        // every fragment inside every box that cuts off its overflow. On a
+        // page like GitHub's that was six hundred of them a frame, ninety per
+        // cent of the time it took to draw one. A clip is a clip.
+        let isolated = alpha < 1.0 || blend != BlendMode::default();
 
         let canvas = self.canvas();
         canvas.save();
@@ -996,19 +1198,27 @@ impl PaintTarget for SkiaPainter {
         canvas.concat(&matrix);
         canvas.clip_path(&path, sk::ClipOp::Intersect, true);
         canvas.reset_matrix();
-        canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
-        self.layer_depth += 1;
+        if isolated {
+            let mut paint = sk::Paint::default();
+            paint.set_alpha_f(alpha);
+            paint.set_blend_mode(to_skia_blend(blend));
+            canvas.save_layer(&sk::canvas::SaveLayerRec::default().paint(&paint));
+            self.layers.push(Opened::Group);
+        } else {
+            self.layers.push(Opened::Clip);
+        }
     }
 
     fn pop_layer(&mut self) {
-        if self.layer_depth == 0 {
+        let Some(opened) = self.layers.pop() else {
             tracing::warn!("pop_layer with no layer open; ignoring");
             return;
-        }
-        self.layer_depth -= 1;
+        };
         let canvas = self.canvas();
-        canvas.restore(); // the save_layer
-        canvas.restore(); // the save carrying the clip and transform
+        if opened == Opened::Group {
+            canvas.restore(); // the save_layer
+        }
+        canvas.restore(); // the save carrying the clip
     }
 
     fn fill(
@@ -1044,6 +1254,12 @@ impl PaintTarget for SkiaPainter {
         blur: f64,
         shape: &dyn PaintShape,
     ) {
+        if blur > 0.0
+            && let BrushRef::Solid(color) = brush
+            && self.fill_blurred_cached(transform, color, blur, shape)
+        {
+            return;
+        }
         let path = to_skia_path(shape, sk::PathFillType::Winding);
         let mut paint = to_skia_paint(brush, None);
         paint.set_style(sk::paint::Style::Fill);
@@ -1417,6 +1633,97 @@ mod tests {
         [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
     }
 
+    /// A shadow drawn the way the backend draws one, and the same shadow blurred
+    /// in place by Skia, which is what the cache stands in for.
+    fn shadow_both_ways(at: (f64, f64), scale: f64) -> (Vec<u8>, Vec<u8>) {
+        let shape = kurbo::RoundedRect::new(at.0, at.1, at.0 + 30.0, at.1 + 18.0, 4.0);
+        let transform = Affine::scale(scale);
+        let brush = peniko::Brush::Solid(Color::from_rgba8(0x10, 0x20, 0x30, 0xc0));
+
+        let mut cached = SkiaPainter::new_raster(96, 96).expect("a surface");
+        cached.clear(Color::WHITE);
+        cached.fill_blurred(transform, (&brush).into(), 6.0, &shape);
+
+        let mut direct = SkiaPainter::new_raster(96, 96).expect("a surface");
+        direct.clear(Color::WHITE);
+        let path = to_skia_path(&shape, sk::PathFillType::Winding);
+        let mut paint = to_skia_paint((&brush).into(), None);
+        paint.set_mask_filter(sk::MaskFilter::blur(sk::BlurStyle::Normal, 3.0, None));
+        let canvas = direct.canvas();
+        canvas.save();
+        canvas.concat(&to_skia_matrix(transform));
+        canvas.draw_path(&path, &paint);
+        canvas.restore();
+
+        (
+            cached.read_rgba8().expect("read back"),
+            direct.read_rgba8().expect("read back"),
+        )
+    }
+
+    #[test]
+    fn a_cached_shadow_is_the_shadow_blurred_in_place() {
+        for (at, scale) in [
+            ((10.0, 12.0), 1.0),
+            ((10.25, 12.6), 2.0),
+            ((7.5, 3.125), 1.5),
+        ] {
+            let (cached, direct) = shadow_both_ways(at, scale);
+            let worst = cached
+                .iter()
+                .zip(&direct)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            // A quarter of a pixel of placement, inside a blur of several: a
+            // handful of levels at the steepest part of the edge, nowhere more.
+            assert!(
+                worst <= 12,
+                "at {at:?} x{scale}: worst channel difference {worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_shadow_further_down_the_page_is_blurred_once() {
+        let shape = |y: f64| kurbo::RoundedRect::new(10.0, y, 60.0, y + 20.0, 4.0);
+        let brush = peniko::Brush::Solid(Color::BLACK);
+        let mut painter = SkiaPainter::new_raster(80, 200).expect("a surface");
+        for y in [10.0, 50.0, 90.0, 130.0] {
+            painter.fill_blurred(Affine::IDENTITY, (&brush).into(), 8.0, &shape(y));
+        }
+        assert_eq!(painter.shadows.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_translucent_layer_is_still_one_group() {
+        // Two overlapping fills inside a half-transparent group: the overlap is
+        // as light as either of them alone, because the group is composited once.
+        let mut painter = SkiaPainter::new_raster(20, 10).expect("a surface");
+        painter.clear(Color::WHITE);
+        let brush = peniko::Brush::Solid(Color::BLACK);
+        painter.push_layer(
+            BlendMode::default(),
+            0.5,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 20.0, 10.0),
+        );
+        painter.fill_rect(
+            Affine::IDENTITY,
+            (&brush).into(),
+            Rect::new(0.0, 0.0, 12.0, 10.0),
+        );
+        painter.fill_rect(
+            Affine::IDENTITY,
+            (&brush).into(),
+            Rect::new(8.0, 0.0, 20.0, 10.0),
+        );
+        painter.pop_layer();
+        let pixels = painter.read_rgba8().expect("read back");
+        assert_eq!(pixel_at(&pixels, 20, 4, 5), pixel_at(&pixels, 20, 10, 5));
+        assert!(painter.layers.is_empty());
+    }
+
     #[test]
     fn zero_sized_surfaces_are_rejected_rather_than_clamped() {
         assert!(matches!(
@@ -1631,7 +1938,7 @@ mod tests {
             [0xff, 0xff, 0xff, 0xff],
             "and not at twice that, which is where the layer's matrix would put it"
         );
-        assert_eq!(painter.layer_depth, 0);
+        assert!(painter.layers.is_empty());
     }
 
     #[test]
@@ -1659,7 +1966,7 @@ mod tests {
             [0xff, 0xff, 0xff, 0xff],
             "outside the clip"
         );
-        assert_eq!(painter.layer_depth, 0);
+        assert!(painter.layers.is_empty());
     }
 
     #[test]
