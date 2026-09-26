@@ -12,7 +12,7 @@ use otlyra_css::{ComputedStyle, Length, Size};
 use otlyra_text::TextEngine;
 
 use crate::box_tree::{BoxTree, Control, ControlKind, NaturalSize};
-use crate::fonts::FontStacks;
+use crate::fonts::{FontStacks, face_query};
 use crate::widget_metrics::{
     ARROW_STRIP, CHECK_SIDE, COLOR_HEIGHT, COLOR_WIDTH, RANGE_HEIGHT, RANGE_WIDTH,
 };
@@ -253,7 +253,7 @@ fn character_widths(
     let average = text.measure("0", &stack, size).width;
     let widest = text.measure("W", &stack, size).width;
     let line = text
-        .strut(&stack, size, style.font_weight, false)
+        .strut(&stack, size, face_query(style))
         .map_or(size, |strut| match style.line_height {
             otlyra_css::LineHeight::Normal => strut.height(),
             ref asked => asked.resolve(size, strut.height()),

@@ -228,8 +228,7 @@ fn an_inline_box_is_as_tall_as_its_font_not_its_line() {
         .strut(
             &otlyra_text::FontStack::named(otlyra_text::TEST_FAMILY),
             16.0,
-            400,
-            false,
+            otlyra_text::FaceQuery::default(),
         )
         .expect("the vendored font");
     let (span, text) = box_and_text(&tree, &boxes, "span");

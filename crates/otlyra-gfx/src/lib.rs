@@ -45,7 +45,7 @@ pub use paint_target::{Glyph, PaintShape, PaintTarget};
 pub use peniko::ImageBrushRef;
 pub use recording::{PaintOp, RecordingPainter};
 pub use render::render;
-pub use skia::{SkiaError, SkiaPainter, decode_image};
+pub use skia::{SkiaError, SkiaPainter, decode_image, face_from_collection};
 
 /// Re-exported so downstream crates speak exactly the geometry types the seam does.
 pub use kurbo;

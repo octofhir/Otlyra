@@ -13,6 +13,7 @@ use crate::flow::Flow;
 use crate::flow::box_model::{any_side, resolve_border, resolve_margin, resolve_padding};
 use crate::flow::replaced::replaced_size;
 use crate::flow::sizing::{Frame, InlineRoom};
+use crate::fonts::{face_query, is_italic};
 use crate::fragment::Fragment;
 
 use super::vertical_align::{baseline_of, baseline_shift};
@@ -311,7 +312,7 @@ impl<'a> Flow<'a> {
         if span.line_height.is_none() {
             span.line_height = self
                 .text
-                .strut(&stack, style.font_size, style.font_weight, span.italic)
+                .strut(&stack, style.font_size, span.face_query())
                 .map(otlyra_text::Strut::height);
         }
         span
@@ -324,7 +325,7 @@ impl<'a> Flow<'a> {
     fn content_area(&mut self, style: &ComputedStyle) -> ContentArea {
         let stack = self.font_stack(style);
         self.text
-            .strut(&stack, style.font_size, style.font_weight, is_italic(style))
+            .strut(&stack, style.font_size, face_query(style))
             .map_or_else(ContentArea::default, |strut| ContentArea {
                 ascent: strut.ascent,
                 descent: strut.descent,
@@ -517,9 +518,4 @@ pub(in crate::flow) fn span_for<'a>(
         optical_sizing: style.optical_sizing,
         variations: &style.font_variations,
     }
-}
-
-/// Whether a style's text is set in an italic face.
-fn is_italic(style: &ComputedStyle) -> bool {
-    style.font_style == otlyra_css::FontStyle::Italic
 }

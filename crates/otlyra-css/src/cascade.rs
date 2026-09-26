@@ -13,6 +13,7 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
 
 use otlyra_dom::{Document, NodeData, NodeId};
 use servo_arc::Arc;
@@ -184,19 +185,52 @@ pub struct Styler {
     font_faces: Vec<FontFace>,
 }
 
-/// A `@font-face` rule: a family the page brings with it, and where from.
+/// A `@font-face` rule: a face of a family the page brings with it, what the
+/// face is, and where from (CSS Fonts 4 §4).
 ///
-/// The addresses are in the order the rule lists them, which is the order they
-/// are to be tried in, and already absolute: each was resolved against the sheet
-/// the rule was written in as that sheet was parsed (CSS Values 4 §4.5.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The descriptors are as CSS Fonts 4 gives them once computed. One left out
+/// has its initial value: `font-weight` and `font-stretch` are then `auto`,
+/// which for a face with no variation axes is `normal`, and is taken to be
+/// that; `unicode-range` is then every code point. `font-display` and the
+/// metric overrides (`ascent-override`, `descent-override`,
+/// `line-gap-override`, `size-adjust`) are not read.
+#[derive(Clone, Debug, PartialEq)]
 pub struct FontFace {
     /// The family name the rule defines, as written.
     pub family: String,
-    /// Every `url()` in its `src` that resolved, in order. A `local()` source
-    /// names an installed family and is not an address, so it is not one of
-    /// these.
-    pub sources: Vec<Url>,
+    /// Where the face may come from, in the order the rule lists them, which
+    /// is the order they are to be tried in (§4.3).
+    pub sources: Vec<FaceSource>,
+    /// `font-weight`, as the weights the face covers.
+    pub weight: RangeInclusive<f32>,
+    /// `font-style`.
+    pub style: FaceStyle,
+    /// `font-stretch`, as the widths the face covers, in percent.
+    pub stretch: RangeInclusive<f32>,
+    /// `unicode-range`: the code points the face is for; empty is all of them.
+    pub unicode_range: Vec<RangeInclusive<u32>>,
+}
+
+/// One entry of a `@font-face` rule's `src`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaceSource {
+    /// A file to fetch, already absolute: resolved against the sheet the rule
+    /// was written in as that sheet was parsed (CSS Values 4 §4.5.1). Only
+    /// those in a format worth fetching are kept.
+    Url(Url),
+    /// A face installed on the reader's system, by name.
+    Local(String),
+}
+
+/// A `@font-face` rule's `font-style`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FaceStyle {
+    /// `normal`, which is also `oblique 0deg`.
+    Normal,
+    /// `italic`.
+    Italic,
+    /// `oblique` over a range of angles in degrees, the smaller first.
+    Oblique(f32, f32),
 }
 
 /// Where a declaration block was written.
@@ -1387,55 +1421,130 @@ fn index_selectors(
     }
 }
 
-/// Collect the `@font-face` rules in one sheet, and in the sheets it imports.
+/// Collect the `@font-face` rules in one sheet, and in the sheets it imports,
+/// in the order they are declared: which of two faces with the same
+/// descriptors a page means is the later one (CSS Fonts 4 §4.5).
 ///
 /// Nested in the same way style rules are: a rule inside a media query counts, and
 /// counts whether or not the query matches — which sheet it came in gates that,
 /// and a rule that turns out not to apply costs a fetch nobody uses rather than a
-/// page set in the wrong font.
+/// page set in the wrong font. So does one inside a cascade layer or a container
+/// query, where only a style rule is layered or queried.
 fn collect_font_faces(sheet: &Stylesheet, lock: &SharedRwLock, out: &mut Vec<FontFace>) {
+    let guard = lock.read();
+    font_faces_in(&sheet.contents.read_with(&guard).rules, &guard, out);
+}
+
+/// The `@font-face` rules in a list of rules and the lists nested in it.
+fn font_faces_in(
+    rules: &Locked<style::stylesheets::CssRules>,
+    guard: &style::shared_lock::SharedRwLockReadGuard,
+    out: &mut Vec<FontFace>,
+) {
     use style::stylesheets::CssRule;
 
-    let guard = lock.read();
-    let mut stack: Vec<Arc<style::shared_lock::Locked<style::stylesheets::CssRules>>> =
-        vec![sheet.contents.read_with(&guard).rules.clone()];
-
-    while let Some(rules) = stack.pop() {
-        for rule in &rules.read_with(&guard).0 {
-            match rule {
-                CssRule::FontFace(rule) => {
-                    let descriptors = &rule.read_with(&guard).descriptors;
-                    let (Some(family), Some(sources)) =
-                        (descriptors.font_family.as_ref(), descriptors.src.as_ref())
-                    else {
-                        continue;
-                    };
-                    let sources: Vec<Url> = sources
-                        .0
-                        .iter()
-                        .filter_map(|source| match source {
-                            style::font_face::Source::Url(source) if readable(source) => {
-                                source.url.url().map(|url| (**url).clone())
-                            }
-                            style::font_face::Source::Url(_)
-                            | style::font_face::Source::Local(_) => None,
-                        })
-                        .collect();
-                    if sources.is_empty() {
-                        continue;
-                    }
-                    out.push(FontFace {
-                        family: family.name.to_string(),
-                        sources,
-                    });
+    for rule in &rules.read_with(guard).0 {
+        match rule {
+            CssRule::FontFace(rule) => out.extend(font_face(&rule.read_with(guard).descriptors)),
+            CssRule::Media(rule) => font_faces_in(&rule.rules, guard, out),
+            CssRule::Supports(rule) => font_faces_in(&rule.rules, guard, out),
+            CssRule::LayerBlock(rule) => font_faces_in(&rule.rules, guard, out),
+            CssRule::Container(rule) => font_faces_in(&rule.rules, guard, out),
+            CssRule::Import(rule) => {
+                if let Some(rules) = imported_rules(rule, guard) {
+                    font_faces_in(&rules, guard, out);
                 }
-                CssRule::Media(rule) => stack.push(rule.rules.clone()),
-                CssRule::Supports(rule) => stack.push(rule.rules.clone()),
-                CssRule::Import(rule) => stack.extend(imported_rules(rule, &guard)),
-                _ => {}
             }
+            // Rules that hold style rules, declarations or other at-rules'
+            // descriptors, where `@font-face` is not allowed.
+            CssRule::Style(_)
+            | CssRule::Namespace(_)
+            | CssRule::CustomMedia(_)
+            | CssRule::FontFeatureValues(_)
+            | CssRule::FontPaletteValues(_)
+            | CssRule::CounterStyle(_)
+            | CssRule::Keyframes(_)
+            | CssRule::Margin(_)
+            | CssRule::Page(_)
+            | CssRule::Property(_)
+            | CssRule::Document(_)
+            | CssRule::LayerStatement(_)
+            | CssRule::Scope(_)
+            | CssRule::StartingStyle(_)
+            | CssRule::AppearanceBase(_)
+            | CssRule::PositionTry(_)
+            | CssRule::NestedDeclarations(_)
+            | CssRule::ViewTransition(_) => {}
         }
     }
+}
+
+/// A `@font-face` rule's face, or `None` for a rule that defines none: one
+/// without a family, or without a source this could use (§4).
+fn font_face(descriptors: &style::font_face::Descriptors) -> Option<FontFace> {
+    use style::font_face::{FontStyleRange, Source};
+
+    let family = descriptors.font_family.as_ref()?;
+    let sources: Vec<FaceSource> = descriptors
+        .src
+        .as_ref()?
+        .0
+        .iter()
+        .filter_map(|source| match source {
+            Source::Url(source) if readable(source) => {
+                source.url.url().map(|url| FaceSource::Url((**url).clone()))
+            }
+            Source::Url(_) => None,
+            Source::Local(name) => Some(FaceSource::Local(name.name.to_string())),
+        })
+        .collect();
+    if sources.is_empty() {
+        return None;
+    }
+
+    let weight = descriptors
+        .font_weight
+        .as_ref()
+        .and_then(style::font_face::FontWeightRange::compute)
+        .map_or(400.0..=400.0, |range| range.0.value()..=range.1.value());
+    let stretch = descriptors
+        .font_stretch
+        .as_ref()
+        .and_then(style::font_face::FontStretchRange::compute)
+        .map_or(100.0..=100.0, |range| {
+            range.0.to_percentage().0 * 100.0..=range.1.to_percentage().0 * 100.0
+        });
+    let style = match descriptors.font_style.as_ref() {
+        None => FaceStyle::Normal,
+        Some(FontStyleRange::Italic) => FaceStyle::Italic,
+        Some(FontStyleRange::Oblique(first, second)) => match (first.degrees(), second.degrees()) {
+            (Some(first), Some(second)) => {
+                let (low, high) = (first.min(second), first.max(second));
+                if low == 0.0 && high == 0.0 {
+                    FaceStyle::Normal
+                } else {
+                    FaceStyle::Oblique(low, high)
+                }
+            }
+            // An angle that is a calculation not settled at parse time: the
+            // descriptor is as good as absent.
+            (None, _) | (_, None) => FaceStyle::Normal,
+        },
+    };
+    let unicode_range = descriptors
+        .unicode_range
+        .as_ref()
+        .map(|ranges| ranges.iter().map(|range| range.start..=range.end).collect())
+        .unwrap_or_default();
+
+    Some(FontFace {
+        family: family.name.to_string(),
+        sources,
+        weight,
+        style,
+        stretch,
+        unicode_range,
+    })
 }
 
 /// Whether a `src` entry names a format worth fetching.
@@ -1590,9 +1699,16 @@ mod tests {
         }
     }
 
-    /// Where a `@font-face` rule says its font can be fetched from, as text.
-    fn addresses(face: &FontFace) -> Vec<&str> {
-        face.sources.iter().map(Url::as_str).collect()
+    /// Where a `@font-face` rule says its font can come from, as text: an
+    /// address, or `local()` around an installed face's name.
+    fn addresses(face: &FontFace) -> Vec<String> {
+        face.sources
+            .iter()
+            .map(|source| match source {
+                FaceSource::Url(url) => url.to_string(),
+                FaceSource::Local(name) => format!("local({name})"),
+            })
+            .collect()
     }
 
     /// One fetched sheet per `<link>`, in the order the links appear, each at the
@@ -1912,18 +2028,23 @@ mod tests {
         }
     }
 
-    /// A `@font-face` rule names a family and the addresses it may be fetched
-    /// from, including the ones inside a media query — and a `local()` source is
-    /// an installed family rather than an address.
+    /// A `@font-face` rule names a family and where its face may come from,
+    /// in order: addresses, including those inside a media query or a cascade
+    /// layer, and installed faces by name. A format nothing here reads is not
+    /// a source, and a rule left with none defines nothing.
     #[test]
     fn font_face_rules_are_collected() {
         let document = otlyra_html::parse(
             br#"<style>
-              @font-face { font-family: "Brought"; src: url(a.woff2) format("woff2"), url(a.ttf); }
+              @font-face { font-family: "Brought"; src: url(a.woff2) format("woff2"), url(a.eot), url(a.ttf); }
               @media (min-width: 1px) {
                 @font-face { font-family: Queried; src: local("Helvetica"), url("q.otf"); }
               }
-              @font-face { font-family: Nowhere; src: local("Helvetica"); }
+              @layer base {
+                @font-face { font-family: Layered; src: url(l.woff2); }
+              }
+              @font-face { font-family: Installed; src: local(Helvetica Neue); }
+              @font-face { font-family: Unreadable; src: url(u.eot); }
             </style>"#,
             Some("utf-8"),
         )
@@ -1931,27 +2052,68 @@ mod tests {
 
         let styler = Styler::new(&document, Viewport::default(), &at("https://x.test/p/"));
         let faces = styler.font_faces();
-
+        let families: Vec<&str> = faces.iter().map(|face| face.family.as_str()).collect();
         assert_eq!(
-            faces.len(),
-            2,
-            "a rule with no address names no font: {faces:?}"
+            families,
+            ["Brought", "Queried", "Layered", "Installed"],
+            "in the order declared"
         );
-        let brought = faces
-            .iter()
-            .find(|face| face.family == "Brought")
-            .expect("the first rule");
         assert_eq!(
-            addresses(brought),
+            addresses(&faces[0]),
             ["https://x.test/p/a.woff2", "https://x.test/p/a.ttf"],
             "in the order written, against the document's base"
         );
+        assert_eq!(
+            addresses(&faces[1]),
+            ["local(Helvetica)", "https://x.test/p/q.otf"]
+        );
+        assert_eq!(addresses(&faces[2]), ["https://x.test/p/l.woff2"]);
+        assert_eq!(addresses(&faces[3]), ["local(Helvetica Neue)"]);
+    }
 
-        let queried = faces
-            .iter()
-            .find(|face| face.family == "Queried")
-            .expect("the rule inside the query");
-        assert_eq!(addresses(queried), ["https://x.test/p/q.otf"]);
+    /// A face is what its descriptors say: a weight or a range of them, a
+    /// style, a width, and the code points it is for. Left out, each is
+    /// normal, and the face is for every code point.
+    #[test]
+    fn font_face_descriptors_are_read() {
+        let document = otlyra_html::parse(
+            br#"<style>
+              @font-face { font-family: Plain; src: url(p.woff2); }
+              @font-face {
+                font-family: Described; src: url(d.woff2);
+                font-weight: 700 300; font-style: italic; font-stretch: condensed;
+                unicode-range: U+00??, U+0400-04FF;
+              }
+              @font-face { font-family: Leaning; src: url(o.woff2); font-style: oblique 5deg 20deg; font-weight: bold; }
+              @font-face { font-family: Upright; src: url(u.woff2); font-style: normal; }
+            </style>"#,
+            Some("utf-8"),
+        )
+        .document;
+
+        let styler = Styler::new(&document, Viewport::default(), &at("https://x.test/"));
+        let faces = styler.font_faces();
+        assert_eq!(faces.len(), 4, "{faces:?}");
+
+        let plain = &faces[0];
+        assert_eq!(plain.weight, 400.0..=400.0);
+        assert_eq!(plain.style, FaceStyle::Normal);
+        assert_eq!(plain.stretch, 100.0..=100.0);
+        assert!(plain.unicode_range.is_empty());
+
+        let described = &faces[1];
+        assert_eq!(
+            described.weight,
+            300.0..=700.0,
+            "a range, the lighter first"
+        );
+        assert_eq!(described.style, FaceStyle::Italic);
+        assert_eq!(described.stretch, 75.0..=75.0);
+        assert_eq!(described.unicode_range, [0..=0xFF, 0x400..=0x4FF]);
+
+        assert_eq!(faces[2].style, FaceStyle::Oblique(5.0, 20.0));
+        assert_eq!(faces[2].weight, 700.0..=700.0);
+        assert_eq!(faces[3].style, FaceStyle::Normal);
     }
 
     /// A rule in a fetched sheet names its fonts against that sheet's own

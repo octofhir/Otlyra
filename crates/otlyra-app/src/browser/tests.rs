@@ -1263,7 +1263,8 @@ fn a_second_click_takes_a_word_and_a_third_takes_the_block() {
 
 /// A loader whose page brings a font with it, from a stylesheet in a
 /// directory of its own — so the address is only right if it is resolved
-/// against the sheet rather than against the page.
+/// against the sheet rather than against the page — and lists a file that is
+/// not there ahead of the one that is.
 struct FontLoader;
 
 impl Loader for FontLoader {
@@ -1283,7 +1284,9 @@ impl Loader for FontLoader {
                 "text/html",
             ),
             "https://type.example/style/page.css" => page(
-                b"@font-face { font-family: Brought; src: url(../fonts/brought.ttf) }\n\
+                b"@font-face { font-family: Brought;\
+                        src: url(../fonts/missing.woff2) format(woff2), url(../fonts/brought.ttf) }\n\
+                      @font-face { font-family: Unused; src: url(../fonts/unused.ttf) }\n\
                       p { font-family: Brought }"
                     .to_vec(),
                 "text/css",
@@ -1297,8 +1300,9 @@ impl Loader for FontLoader {
 }
 
 /// A page that brings its own typeface gets it: the rule is found in the
-/// fetched sheet, the address is resolved against that sheet, and the family
-/// is one the shaper can answer for afterwards.
+/// fetched sheet, the address is resolved against that sheet, a source that
+/// fails gives way to the next, and the family is one the shaper can answer
+/// for afterwards. A family no text is set in is not fetched at all.
 #[test]
 fn a_page_brings_its_own_font() {
     let mut browser = Browser::new(FontLoader);
@@ -1322,19 +1326,20 @@ fn a_page_brings_its_own_font() {
         browser.text.has_family("Brought"),
         "the family the page defined is the shaper's now"
     );
-    assert!(
-        browser
-            .fetcher
-            .exchanges()
-            .iter()
-            .any(|exchange| exchange.url == "https://type.example/fonts/brought.ttf"),
-        "the address is resolved against the sheet, not the page: {:?}",
-        browser
-            .fetcher
-            .exchanges()
-            .iter()
-            .map(|exchange| exchange.url.clone())
-            .collect::<Vec<_>>()
+    let fonts: Vec<&str> = browser
+        .fetcher
+        .exchanges()
+        .iter()
+        .filter(|exchange| exchange.kind == crate::fetcher::ResourceKind::Font)
+        .map(|exchange| exchange.url.as_str())
+        .collect();
+    assert_eq!(
+        fonts,
+        [
+            "https://type.example/fonts/missing.woff2",
+            "https://type.example/fonts/brought.ttf"
+        ],
+        "resolved against the sheet, the second after the first failed, and filed as fonts"
     );
 }
 

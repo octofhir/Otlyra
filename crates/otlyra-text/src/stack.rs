@@ -142,18 +142,6 @@ impl FontStack {
     pub fn families(&self) -> &[Family] {
         &self.families
     }
-
-    pub(crate) fn to_parley(&self) -> parley::FontFamily<'static> {
-        let names = self
-            .families
-            .iter()
-            .map(|family| match family {
-                Family::Named(name) => parley::FontFamilyName::Named(name.clone().into()),
-                Family::Generic(generic) => parley::FontFamilyName::Generic(generic.to_parley()),
-            })
-            .collect::<Vec<_>>();
-        parley::FontFamily::List(names.into())
-    }
 }
 
 impl Default for FontStack {

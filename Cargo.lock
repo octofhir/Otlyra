@@ -3699,6 +3699,7 @@ dependencies = [
  "parley",
  "skrifa 0.43.2",
  "tracing",
+ "unicode-segmentation",
  "wuff",
 ]
 

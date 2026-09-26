@@ -9,6 +9,7 @@ use parley::{
 };
 
 use crate::breaking::{self, Glyphs, Plan};
+use crate::web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, Resolved, WebFamilies};
 use crate::{FontStack, TEST_FAMILY, TEST_FONT};
 
 /// The optical-size axis, set from the font size on every run.
@@ -24,16 +25,28 @@ use crate::{FontStack, TEST_FAMILY, TEST_FONT};
 /// takes the used font size, in pixels.
 const OPTICAL_SIZE: parley::setting::Tag = parley::setting::Tag::new(b"opsz");
 
-/// The variation settings one span is shaped with.
+/// The weight and width axes, set from `font-weight` and `font-width`.
+const WEIGHT: parley::setting::Tag = parley::setting::Tag::new(b"wght");
+const WIDTH: parley::setting::Tag = parley::setting::Tag::new(b"wdth");
+
+/// The variation settings one span is shaped with, in the order CSS Fonts 4 §7
+/// applies them.
 ///
-/// The optical size comes first and what the page asked for comes after, so a page
-/// that names `opsz` itself overrides the automatic one rather than fighting it —
-/// which is what `font-optical-sizing: none` alongside an explicit axis means.
-/// A font without an axis ignores the setting for it, so the optical size is
-/// applied without first asking which font the run resolved to, which is not known
-/// until after shaping has picked one.
+/// First the font matching variations: the weight and width the span asks
+/// for, so a variable face is drawn at them rather than at whatever instance
+/// its file defaults to — a face a page declares over a range of weights is
+/// one file for all of them. Then the optical size, and what the page asked
+/// for last, so a page that names `opsz` itself overrides the automatic one
+/// rather than fighting it — which is what `font-optical-sizing: none`
+/// alongside an explicit axis means. A font without an axis ignores the
+/// setting for it, so they are applied without first asking which font the run
+/// resolved to, which is not known until after shaping has picked one. For the
+/// same reason a weight outside the range a face's rule declares is not
+/// clamped to it, only to the file's own axis.
 fn variations(span: &TextSpan<'_>) -> FontVariations<'static> {
-    let mut settings = Vec::with_capacity(span.variations.len() + 1);
+    let mut settings = Vec::with_capacity(span.variations.len() + 3);
+    settings.push(FontVariation::new(WEIGHT, f32::from(span.font_weight)));
+    settings.push(FontVariation::new(WIDTH, span.font_width));
     if span.optical_sizing {
         settings.push(FontVariation::new(OPTICAL_SIZE, span.font_size));
     }
@@ -228,6 +241,16 @@ impl<'a> TextSpan<'a> {
             variations: &[],
         }
     }
+
+    /// What the span asks of a family's faces.
+    #[must_use]
+    pub fn face_query(&self) -> FaceQuery {
+        FaceQuery {
+            weight: f32::from(self.font_weight),
+            italic: self.italic,
+            stretch: self.font_width,
+        }
+    }
 }
 
 /// A gap reserved between two spans, and a marker of where their boundary landed.
@@ -338,6 +361,8 @@ impl ShapedText {
 pub struct TextEngine {
     fonts: FontContext,
     layout: LayoutContext<[u8; 4]>,
+    /// The families pages have brought with `@font-face`.
+    web: WebFamilies,
 }
 
 impl std::fmt::Debug for TextEngine {
@@ -361,6 +386,7 @@ impl TextEngine {
         Self {
             fonts,
             layout: LayoutContext::new(),
+            web: WebFamilies::default(),
         }
     }
 
@@ -407,6 +433,7 @@ impl TextEngine {
         Self {
             fonts,
             layout: LayoutContext::new(),
+            web: WebFamilies::default(),
         }
     }
 
@@ -438,14 +465,8 @@ impl TextEngine {
     ///
     /// `None` if the stack resolves to no font at all, which leaves the caller to
     /// let the shaper decide.
-    pub fn strut(
-        &mut self,
-        stack: &FontStack,
-        font_size: f32,
-        font_weight: u16,
-        italic: bool,
-    ) -> Option<Strut> {
-        let (blob, index, family) = self.resolve(stack, font_weight, italic)?;
+    pub fn strut(&mut self, stack: &FontStack, font_size: f32, query: FaceQuery) -> Option<Strut> {
+        let (blob, index, family) = self.resolve(stack, query)?;
         let font = skrifa::FontRef::from_index(blob.as_ref(), index).ok()?;
         let metrics = skrifa::metrics::Metrics::new(
             &font,
@@ -480,25 +501,30 @@ impl TextEngine {
         })
     }
 
-    /// The first font in `stack` that exists, as bytes, face index and family name.
+    /// The first available font of `stack` (CSS Fonts 4 §5.2), as bytes, face
+    /// index and family name: the first that exists and that `unicode-range`
+    /// does not exclude the space from.
     fn resolve(
         &mut self,
         stack: &FontStack,
-        font_weight: u16,
-        italic: bool,
+        query: FaceQuery,
     ) -> Option<(parley::fontique::Blob<u8>, u32, String)> {
-        let width = parley::FontWidth::NORMAL;
-        let style = if italic {
+        let width = parley::FontWidth::from_percentage(query.stretch);
+        let style = if query.italic {
             parley::FontStyle::Italic
         } else {
             parley::FontStyle::Normal
         };
-        let weight = parley::FontWeight::new(f32::from(font_weight));
+        let weight = parley::FontWeight::new(query.weight);
 
-        for family in stack.families() {
-            let info = match family {
-                crate::Family::Named(name) => self.fonts.collection.family_by_name(name),
-                crate::Family::Generic(generic) => {
+        for entry in self.web.expand(stack, query) {
+            let info = match entry {
+                Resolved::Web(face) if face.descriptors.covers(' ') => {
+                    self.fonts.collection.family_by_name(&face.name)
+                }
+                Resolved::Web(_) => continue,
+                Resolved::Installed(name) => self.fonts.collection.family_by_name(name),
+                Resolved::Generic(generic) => {
                     // A generic nothing is registered for is a family that is not
                     // there, and the next one in the stack answers instead. Giving
                     // up on the whole stack here is what left a page set in
@@ -644,7 +670,10 @@ impl TextEngine {
         // empty spans would otherwise be measured against the shaper's own default
         // font rather than the one the page asked for.
         if let Some(first) = spans.first() {
-            builder.push_default(StyleProperty::FontFamily(first.font_stack.to_parley()));
+            builder.push_default(StyleProperty::FontFamily(
+                self.web
+                    .parley_family(&first.font_stack, first.face_query()),
+            ));
             builder.push_default(StyleProperty::FontSize(first.font_size));
         }
 
@@ -664,10 +693,13 @@ impl TextEngine {
             if range.is_empty() {
                 continue;
             }
-            builder.push(
-                StyleProperty::FontFamily(span.font_stack.to_parley()),
-                range.clone(),
-            );
+            for (piece, family) in
+                self.web
+                    .parley_families(&span.font_stack, span.face_query(), span.text)
+            {
+                let piece = range.start + piece.start..range.start + piece.end;
+                builder.push(StyleProperty::FontFamily(family), piece);
+            }
             builder.push(StyleProperty::FontSize(span.font_size), range.clone());
             builder.push(
                 StyleProperty::FontVariations(variations(span)),
@@ -735,28 +767,96 @@ impl TextEngine {
         self.shape(text, stack, font_size, None).metrics
     }
 
-    /// Add a font the page brought with it, under the family name its rule gives.
+    /// Add a face a page brought with it, as its `@font-face` rule describes
+    /// it: of `family`, with `descriptors`, the `order`th rule of its page.
     ///
-    /// The name is the rule's rather than the file's, which is the whole of what
-    /// `@font-face` does: a page may call a face anything it likes and then ask for
-    /// it by that name, and what is baked into the file is not what the cascade
-    /// will be asking about. Returns whether the bytes were a font.
-    pub fn add_font(&mut self, family: &str, bytes: Vec<u8>) -> bool {
+    /// The family is the rule's rather than the file's, and so are the weight,
+    /// style and width, which is the whole of what `@font-face` does: a page
+    /// may call a face anything it likes and then ask for it by that name, and
+    /// what is baked into the file is not what the cascade will be asking
+    /// about. Returns whether the bytes were a font.
+    pub fn add_web_face(
+        &mut self,
+        family: &str,
+        descriptors: &FaceDescriptors,
+        order: usize,
+        bytes: Vec<u8>,
+    ) -> bool {
         let blob = parley::fontique::Blob::new(std::sync::Arc::new(unpack(bytes)));
+        self.register_web_face(family, descriptors, order, blob)
+    }
+
+    /// Add an installed face as one a page's rule names with `local()`.
+    ///
+    /// The installed family called `name` is looked up, and its face nearest
+    /// the rule's descriptors is taken. CSS Fonts 4 §4.3 has `local()` name a
+    /// single face by its full or PostScript name; a family name is what pages
+    /// write there as often, and it is the only name the collection is keyed
+    /// by. Returns whether there was such a face.
+    pub fn add_local_face(
+        &mut self,
+        name: &str,
+        family: &str,
+        descriptors: &FaceDescriptors,
+        order: usize,
+    ) -> bool {
+        let (width, style, weight) = registered_attributes(descriptors);
+        let Some(font) = self
+            .fonts
+            .collection
+            .family_by_name(name)
+            .and_then(|info| info.match_font(width, style, weight, false).cloned())
+        else {
+            return false;
+        };
+        let Some(blob) = font.load(Some(&mut self.fonts.source_cache)) else {
+            return false;
+        };
+        // One face of a collection is lifted out on its own, or registering it
+        // would register every face beside it under the rule's descriptors.
+        let blob = if blob.as_ref().starts_with(b"ttcf") {
+            match otlyra_gfx::face_from_collection(blob.as_ref(), font.index() as usize) {
+                Some(face) => parley::fontique::Blob::new(std::sync::Arc::new(face)),
+                None => return false,
+            }
+        } else {
+            blob
+        };
+        self.register_web_face(family, descriptors, order, blob)
+    }
+
+    /// Register a face under a family name of its own, with the attributes
+    /// its rule gives it.
+    fn register_web_face(
+        &mut self,
+        family: &str,
+        descriptors: &FaceDescriptors,
+        order: usize,
+        blob: parley::fontique::Blob<u8>,
+    ) -> bool {
+        let name = self.web.next_name(family);
+        let (width, style, weight) = registered_attributes(descriptors);
         let registered = self.fonts.collection.register_fonts(
             blob,
             Some(parley::fontique::FontInfoOverride {
-                family_name: Some(family),
-                ..Default::default()
+                family_name: Some(&name),
+                width: Some(width),
+                style: Some(style),
+                weight: Some(weight),
+                axes: None,
             }),
         );
-
-        !registered.is_empty()
+        if registered.is_empty() {
+            return false;
+        }
+        self.web.insert(family, name, descriptors.clone(), order);
+        true
     }
 
-    /// Whether a family name resolves to anything in the collection.
+    /// Whether a family name resolves to anything: a family a page brought,
+    /// or one installed.
     pub fn has_family(&mut self, name: &str) -> bool {
-        self.fonts.collection.family_by_name(name).is_some()
+        self.web.contains(name) || self.fonts.collection.family_by_name(name).is_some()
     }
 }
 
@@ -1256,6 +1356,33 @@ fn prefer_browser_families(fonts: &mut FontContext) {
     }
 }
 
+/// The width, style and weight a face is registered with, from its rule.
+///
+/// They decide nothing about which face is chosen, which is
+/// [`crate::web_fonts::matching_faces`]'s to say; they decide what is
+/// synthesized once it has been. A face is emboldened, or slanted, when what a
+/// run asks for is bolder, or more italic, than what its rule says it is — and
+/// a variable face is set along its axes instead. A range is registered at its
+/// point nearest normal, so a static face declared over a range is emboldened
+/// above that point even inside the range, where CSS would take it as it is.
+fn registered_attributes(
+    descriptors: &FaceDescriptors,
+) -> (parley::FontWidth, parley::FontStyle, parley::FontWeight) {
+    let nearest = |range: &std::ops::RangeInclusive<f32>, normal: f32| {
+        normal.clamp(*range.start(), *range.end())
+    };
+    let style = match descriptors.style {
+        FaceStyle::Normal => parley::FontStyle::Normal,
+        FaceStyle::Italic => parley::FontStyle::Italic,
+        FaceStyle::Oblique(low, high) => parley::FontStyle::Oblique(Some(0.0_f32.clamp(low, high))),
+    };
+    (
+        parley::FontWidth::from_percentage(nearest(&descriptors.stretch, 100.0)),
+        style,
+        parley::FontWeight::new(nearest(&descriptors.weight, 400.0)),
+    )
+}
+
 /// An OpenType font, out of whatever container the page shipped it in.
 ///
 /// What a `@font-face` on the web names is almost never a bare font: it is a WOFF
@@ -1437,6 +1564,36 @@ mod tests {
         );
     }
 
+    /// A span asks for its weight and width along the axes of whatever
+    /// variable face it lands in, ahead of the optical size and of what the
+    /// page set itself, which override them.
+    #[test]
+    fn a_span_asks_for_its_weight_and_width_along_the_axes() {
+        let settings = [(*b"wght", 300.0)];
+        let span = TextSpan {
+            font_weight: 700,
+            font_width: 87.5,
+            variations: &settings,
+            ..TextSpan::new("a", test_stack(), 20.0)
+        };
+        let FontVariations::List(list) = variations(&span) else {
+            panic!("a list");
+        };
+        let pairs: Vec<(parley::setting::Tag, f32)> = list
+            .iter()
+            .map(|setting| (setting.tag, setting.value))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (WEIGHT, 700.0),
+                (WIDTH, 87.5),
+                (OPTICAL_SIZE, 20.0),
+                (WEIGHT, 300.0)
+            ]
+        );
+    }
+
     /// A page's own font arrives packed — a WOFF or a WOFF2, which is what the web
     /// ships — and the container is unpacked before the shaper is handed anything.
     /// A bare font goes through untouched, and a container that will not unpack is
@@ -1444,8 +1601,9 @@ mod tests {
     #[test]
     fn a_font_is_unpacked_before_it_is_registered() {
         let mut engine = TextEngine::isolated();
+        let plain = FaceDescriptors::default();
         assert!(
-            engine.add_font("Bare Along", TEST_FONT.to_vec()),
+            engine.add_web_face("Bare Along", &plain, 0, TEST_FONT.to_vec()),
             "a font that is already a font registers"
         );
         assert!(engine.has_family("Bare Along"));
@@ -1454,8 +1612,146 @@ mod tests {
         // refused by the collection rather than taken as a face.
         let mut packed = b"wOF2".to_vec();
         packed.extend_from_slice(&[0u8; 64]);
-        assert!(!engine.add_font("Broken Along", packed));
+        assert!(!engine.add_web_face("Broken Along", &plain, 0, packed));
         assert!(!engine.has_family("Broken Along"));
+    }
+
+    /// The font a one-span paragraph of `text` is set in, by its data's
+    /// identity, for a run of `weight`.
+    fn font_of(engine: &mut TextEngine, text: &str, family: &str, weight: u16) -> u64 {
+        let span = TextSpan {
+            font_weight: weight,
+            ..TextSpan::new(text, FontStack::named(family), 16.0)
+        };
+        let shaped = engine.shape_spans(&[span], &[], None);
+        let run = shaped.runs.first().expect("a run");
+        assert!(
+            shaped
+                .runs
+                .iter()
+                .all(|other| other.font.data.id() == run.font.data.id()),
+            "one font for all of {text:?}"
+        );
+        run.font.data.id()
+    }
+
+    /// A face declared for Cyrillic is not the font of a Latin letter, though
+    /// its file has one: the letter falls through to the next family. A
+    /// Cyrillic letter is set in it.
+    #[test]
+    fn unicode_range_decides_which_characters_a_face_sets() {
+        let mut engine = engine();
+        let cyrillic = FaceDescriptors {
+            unicode_range: vec![0x400..=0x4FF],
+            ..FaceDescriptors::default()
+        };
+        assert!(engine.add_web_face("Split", &cyrillic, 0, TEST_FONT.to_vec()));
+
+        let fallback = font_of(&mut engine, "A", TEST_FAMILY, 400);
+        let latin = font_of(&mut engine, "A", "Split", 400);
+        let letter = font_of(&mut engine, "ж", "Split", 400);
+        assert_eq!(latin, fallback, "'A' is outside the range");
+        assert_ne!(letter, fallback, "'ж' is inside it");
+    }
+
+    /// One file declared as two weights is two faces, and a bold run is set
+    /// in the one declared bold.
+    #[test]
+    fn a_rule_says_what_weight_its_face_is() {
+        let mut engine = engine();
+        for (order, weight) in [(0, 400.0), (1, 700.0)] {
+            let face = FaceDescriptors {
+                weight: weight..=weight,
+                ..FaceDescriptors::default()
+            };
+            assert!(engine.add_web_face("Pair", &face, order, TEST_FONT.to_vec()));
+        }
+        let weights: Vec<f32> = engine
+            .web
+            .expand(&FontStack::named("Pair"), FaceQuery::default())
+            .iter()
+            .chain(&engine.web.expand(
+                &FontStack::named("Pair"),
+                FaceQuery {
+                    weight: 700.0,
+                    ..FaceQuery::default()
+                },
+            ))
+            .filter_map(|entry| match entry {
+                Resolved::Web(face) => Some(*face.descriptors.weight.start()),
+                Resolved::Installed(_) | Resolved::Generic(_) => None,
+            })
+            .collect();
+        assert_eq!(weights, [400.0, 700.0]);
+
+        let regular = font_of(&mut engine, "a", "pair", 400);
+        let bold = font_of(&mut engine, "a", "PAIR", 700);
+        assert_ne!(
+            regular, bold,
+            "and the family is named without regard to case"
+        );
+        assert_eq!(font_of(&mut engine, "a", "Pair", 800), bold);
+    }
+
+    /// Of two faces with the same descriptors, the one declared later is
+    /// tried first, whichever arrived first.
+    #[test]
+    fn the_last_declared_face_is_tried_first() {
+        let mut engine = engine();
+        let plain = FaceDescriptors::default();
+        assert!(engine.add_web_face("Twice", &plain, 1, TEST_FONT.to_vec()));
+        let later = font_of(&mut engine, "a", "Twice", 400);
+        assert!(engine.add_web_face("Twice", &plain, 0, TEST_FONT.to_vec()));
+        assert_eq!(font_of(&mut engine, "a", "Twice", 400), later);
+        assert!(engine.add_web_face("Twice", &plain, 2, TEST_FONT.to_vec()));
+        assert_ne!(font_of(&mut engine, "a", "Twice", 400), later);
+    }
+
+    /// A family's first available font is its first face that may set a
+    /// space, which is where its strut comes from.
+    #[test]
+    fn the_strut_comes_from_the_face_that_covers_a_space() {
+        let mut engine = engine();
+        let cyrillic = FaceDescriptors {
+            unicode_range: vec![0x400..=0x4FF],
+            ..FaceDescriptors::default()
+        };
+        assert!(engine.add_web_face("Strut", &cyrillic, 1, TEST_FONT.to_vec()));
+        assert!(engine.add_web_face("Strut", &FaceDescriptors::default(), 0, TEST_FONT.to_vec()));
+
+        let (_, _, family) = engine
+            .resolve(&FontStack::named("Strut"), FaceQuery::default())
+            .expect("a font");
+        let stack = FontStack::named("Strut");
+        let names: Vec<&str> = engine
+            .web
+            .expand(&stack, FaceQuery::default())
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Resolved::Web(face) => Some(face.name.as_str()),
+                Resolved::Installed(_) | Resolved::Generic(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            family, names[1],
+            "not the later face, which has no space: {names:?}"
+        );
+    }
+
+    /// `local()` takes an installed family's face under the rule's name.
+    #[test]
+    fn a_local_source_is_an_installed_face() {
+        let mut engine = engine();
+        let plain = FaceDescriptors::default();
+        assert!(engine.add_local_face(TEST_FAMILY, "Mine", &plain, 0));
+        assert!(engine.has_family("Mine"));
+        assert_eq!(
+            font_of(&mut engine, "a", "Mine", 400),
+            font_of(&mut engine, "a", TEST_FAMILY, 400),
+            "the installed face's own data"
+        );
+        assert!(!engine.add_local_face("Not Installed Anywhere", "Theirs", &plain, 0));
+        assert!(!engine.has_family("Theirs"));
     }
 
     #[test]

@@ -253,7 +253,7 @@ fn table<'a>(bytes: &'a [u8], index: usize, tag: &[u8; 4]) -> Option<&'a [u8]> {
 /// the tables behind it — so this copies the records, copies the tables they name,
 /// and fixes the offsets. Checksums are the originals and stay correct, because no
 /// table's bytes change.
-fn face_from_collection(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
+pub fn face_from_collection(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
     if bytes.get(..4)? != b"ttcf" {
         return None;
     }

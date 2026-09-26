@@ -2,6 +2,10 @@ set shell := ["bash", "-uc"]
 
 screenshot_dir := "target/screenshots"
 
+# Where mirrors of live pages are kept: outside `target/`, which is wiped, and
+# outside the repository, which is not where copies of other people's pages go.
+mirrors := env_var_or_default("OTLYRA_MIRRORS", home_directory() / "otlyra-mirrors")
+
 # List the available recipes.
 default:
     @just --list
@@ -56,7 +60,7 @@ echo-server:
 test-pages:
     @ls tests/pages/*.html | xargs -n1 basename | sed 's/\.html$//'
 
-# Copy a live page and its assets into `target/mirrors/<name>`, ready to compare.
+# Copy a live page and its assets into `<mirrors>/<name>`, ready to compare.
 #
 # A live page is not the same page tomorrow, and a headless reference pointed at
 # one renders whatever the network gave *it*. The mirror freezes one page for
@@ -64,8 +68,8 @@ test-pages:
 # boxes and text rather than about which engine ran what — `tools/mirror.py`
 # says the rest.
 mirror url name:
-    @python3 tools/mirror.py {{url}} target/mirrors/{{name}}
-    @echo "compare it with: just reference target/mirrors/{{name}}/index.html 1280 900"
+    @python3 tools/mirror.py {{url}} "{{mirrors}}/{{name}}"
+    @echo "compare it with: just reference \"{{mirrors}}/{{name}}/index.html\" 1280 900"
 
 # A mirrored page against both references, at the widths the plan records.
 #
@@ -78,7 +82,7 @@ mirror-sweep name *WIDTHS:
     widths="{{WIDTHS}}"
     for width in ${widths:-1440 1280 1100 1000 900 800 700}; do
       printf '%5s  ' "$width"
-      just reference "target/mirrors/{{name}}/index.html" "$width" 900 2>/dev/null \
+      just reference "{{mirrors}}/{{name}}/index.html" "$width" 900 2>/dev/null \
         | grep -E '^(chrome|firefox|between)' | tr '\n' ' '
       echo
     done

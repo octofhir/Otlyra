@@ -13,6 +13,8 @@
 //!
 //! - [`FontStack`] — a CSS font stack: named families then a generic fallback.
 //! - [`TextEngine`] — owns the font collection and the shaping caches.
+//! - [`FaceDescriptors`], [`FaceQuery`], [`matching_faces`] — the faces a page
+//!   brings with `@font-face`, and which of them a run is set in.
 //! - [`ShapedRun`] — one run of glyphs in one font at one size, positioned.
 //! - [`TEST_FAMILY`] — a repo-vendored family, registered unconditionally.
 //!
@@ -34,12 +36,14 @@
 mod breaking;
 mod engine;
 mod stack;
+mod web_fonts;
 
 pub use engine::{
     Brush, Decoration, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, SpacerKind, Strut,
     TextEngine, TextMetrics, TextSpan,
 };
 pub use stack::{Family, FontStack, GenericFamily};
+pub use web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, matching_faces};
 
 /// Re-exported so callers name the same font handle type the shaper does.
 pub use parley::FontData;

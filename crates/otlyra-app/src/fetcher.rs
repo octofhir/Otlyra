@@ -45,6 +45,8 @@ pub enum ResourceKind {
     Image,
     /// A script the page links to with `<script src>`.
     Script,
+    /// A face a page's `@font-face` rule names.
+    Font,
 }
 
 /// What one fetch returned.

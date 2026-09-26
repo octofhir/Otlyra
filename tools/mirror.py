@@ -19,8 +19,8 @@ background pictures, `@import`ed sheets), and its `<img>`. Everything lands in
 `assets/` under a name derived from its address, so the same page mirrored twice
 produces the same directory.
 
-    tools/mirror.py https://ya.ru target/mirrors/ya.ru
-    just reference target/mirrors/ya.ru/index.html 1280 900
+    tools/mirror.py https://ya.ru ~/otlyra-mirrors/ya.ru
+    just reference ~/otlyra-mirrors/ya.ru/index.html 1280 900
 """
 
 from __future__ import annotations
@@ -64,6 +64,13 @@ HREF = re.compile(ATTR % rb"href", re.IGNORECASE)
 SRC = re.compile(ATTR % rb"src", re.IGNORECASE)
 SRCSET = re.compile(ATTR % rb"srcset", re.IGNORECASE)
 IMG = re.compile(rb"<(?:img|source)\b[^>]*>", re.IGNORECASE)
+# What asks for a copy as a cross-origin request, or checks it against a hash:
+# a copy on disk has no origin to answer CORS with, so Chrome drops a sheet or
+# a picture that asks, and the reference is left without it.
+CORS = re.compile(
+    rb"""\s(?:crossorigin|integrity)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?""",
+    re.IGNORECASE,
+)
 CSS_URL = re.compile(r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)""")
 CSS_IMPORT = re.compile(r"""@import\s+(?:url\(\s*)?(?:"([^"]*)"|'([^']*)')""")
 
@@ -235,7 +242,7 @@ class Mirror:
                 # A sheet that did not come down is a sheet the reference must
                 # not go to the network for either.
                 return b"<!-- stylesheet dropped -->"
-            return replace_attribute(tag, HREF, f'href="assets/{name}"')
+            return CORS.sub(b"", replace_attribute(tag, HREF, f'href="assets/{name}"'))
 
         html = STYLESHEET.sub(on_stylesheet, html)
 
@@ -253,7 +260,7 @@ class Mirror:
                 rewritten = self.rewrite_srcset(attr_value(found).decode(), base)
                 if rewritten is not None:
                     tag = replace_attribute(tag, SRCSET, f'srcset="{rewritten}"')
-            return tag
+            return CORS.sub(b"", tag)
 
         html = IMG.sub(on_image, html)
 

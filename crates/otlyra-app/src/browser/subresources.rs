@@ -1,5 +1,5 @@
 //! What a page asks for once it has been styled: background pictures, pictures
-//! chosen again for a new window, and the fonts its sheets bring.
+//! chosen again for a new window, and the fonts its sheets bring (in `fonts`).
 //!
 //! These are named by rules or chosen against the window rather than named by the
 //! markup, so they are known only on the way to a frame and are asked for after
@@ -11,12 +11,6 @@ use crate::page::PageScene;
 
 use super::Browser;
 use super::loading::IMAGE_LIMIT;
-
-/// How many fonts one document may bring with it.
-///
-/// A page that ships a family ships a handful of faces of it; one that names
-/// dozens is asking for a megabyte of typefaces before its first line is set.
-const FONT_LIMIT: usize = 16;
 
 /// How many bytes of decoded pictures are kept between loads.
 ///
@@ -175,49 +169,6 @@ impl Browser {
                 let id = self.fetcher.request(&target, ResourceKind::Image);
                 self.picture_fetches
                     .insert(id, (index, source.node, source.src, source.density));
-            }
-        }
-    }
-
-    /// Ask for the fonts the pages' own stylesheets bring with them.
-    ///
-    /// A `@font-face` rule is only known once the sheet holding it has been parsed,
-    /// which is a page's first restyle — so this is asked after a frame rather than
-    /// with the pictures the markup names, exactly as a background picture is.
-    ///
-    /// The addresses come absolute, each resolved against the sheet its rule was
-    /// written in: a sheet in a directory of its own names its fonts beside
-    /// itself.
-    fn fetch_fonts(&mut self, tabs: &[usize]) {
-        for &index in tabs {
-            let Some(page) = self.tabs[index].page.as_ref() else {
-                continue;
-            };
-            let faces: Vec<otlyra_css::cascade::FontFace> =
-                page.wanted_fonts().into_iter().take(FONT_LIMIT).collect();
-            let document = page.url().to_string();
-
-            for face in faces {
-                // The first address the page may reach, which is as far as the
-                // order in the rule is honoured: what the rest of the list is for
-                // is formats this cannot read, and there is no telling which those
-                // are until the bytes are here.
-                let Some(target) = face
-                    .sources
-                    .iter()
-                    .find(|source| Self::may_reach(&document, source))
-                    .map(url::Url::to_string)
-                else {
-                    continue;
-                };
-                if !self
-                    .font_requests
-                    .insert((face.family.clone(), target.clone()))
-                {
-                    continue;
-                }
-                let id = self.fetcher.request(&target, ResourceKind::Stylesheet);
-                self.font_fetches.insert(id, face.family);
             }
         }
     }

@@ -122,6 +122,11 @@ skrifa = "=0.43.2"
 # in the tree, so it is one package rather than a subtree.
 wuff = "=0.2.8"
 
+# Grapheme clusters, for giving each cluster of a paragraph only the faces whose
+# `unicode-range` includes it: CSS Fonts 4 matches a cluster as a whole, by its
+# base character. Already in the tree, through the script engine.
+unicode-segmentation = "=1.13.3"
+
 # Reading a `data:` URL, which is a resource written into the page rather than
 # fetched: the payload is percent-encoded, and often base64 on top of that. Both
 # crates are already in the tree — `url` brings the first and the TLS stack the

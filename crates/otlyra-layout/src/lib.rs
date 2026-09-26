@@ -48,6 +48,7 @@ pub use builder::{
 };
 pub use damage::Damage;
 pub use find::PageText;
+pub use fonts::{FontUse, face_descriptors, font_uses};
 // Re-exported because a fragment carries a style and anything reading one needs
 // the vocabulary that style is written in.
 pub use flow::{Viewport, layout, relayout_contained};

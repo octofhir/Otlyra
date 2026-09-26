@@ -130,7 +130,7 @@ impl<'a> Flow<'a> {
     ) -> Option<otlyra_text::Strut> {
         let mut strut = self
             .text
-            .strut(stack, style.font_size, style.font_weight, false)?;
+            .strut(stack, style.font_size, crate::fonts::face_query(style))?;
         // An explicit `line-height` replaces what the font asked for, split evenly
         // above and below the baseline, which is what half-leading is.
         if let otlyra_css::LineHeight::Normal = style.line_height {

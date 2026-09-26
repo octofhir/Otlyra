@@ -14,10 +14,48 @@
     font-family: "Never Arrives";
     src: url("nothing-here.ttf");
   }
+  /* One file declared as two weights: bold text is set in the face declared
+     bold, which is the same regular letters and not an emboldened copy. */
+  @font-face {
+    font-family: Pair;
+    src: url("../../crates/otlyra-text/fonts/Roboto-Regular.ttf");
+  }
+  @font-face {
+    font-family: Pair;
+    font-weight: 700;
+    src: url("../../crates/otlyra-text/fonts/Roboto-Regular.ttf");
+  }
+  /* A family split by unicode-range: Latin from the vendored face, Cyrillic
+     from an installed one, though the vendored file has Cyrillic too. */
+  @font-face {
+    font-family: Split;
+    src: url("../../crates/otlyra-text/fonts/Roboto-Regular.ttf");
+    unicode-range: U+0000-00FF;
+  }
+  @font-face {
+    font-family: Split;
+    src: local("Georgia");
+    unicode-range: U+0400-04FF;
+  }
+  /* A source that is not there, and the one after it that is. */
+  @font-face {
+    font-family: Fallback;
+    src: url("nothing-here.woff2") format("woff2"),
+         url("../../crates/otlyra-text/fonts/Roboto-Regular.ttf");
+  }
+  /* An installed face under a name of the page's own. */
+  @font-face {
+    font-family: Installed;
+    src: local("Arial");
+  }
   body { margin: 8px; font: 24px/1.3 Times; }
   .brought { font-family: "Brought Along", Times; }
   .missing { font-family: "Never Arrives", Times; }
   .local { font-family: Times; }
+  .pair { font-family: Pair, Times; }
+  .split { font-family: Split, Times; }
+  .fallback { font-family: Fallback, Times; }
+  .installed { font-family: Installed, Times; }
 </style>
 </head>
 <body>
@@ -28,6 +66,11 @@
 
 <p class="brought" style="font-weight: bold">Bold, from a face that has no bold</p>
 <p class="brought" style="font-style: italic">Italic, from a face that has no italic</p>
+
+<p class="pair">Regular and <b>bold, declared bold</b></p>
+<p class="split">Latin, и кириллица из другого лица</p>
+<p class="fallback">Handgloves — from the second source</p>
+<p class="installed">Handgloves — an installed face by name</p>
 
 </body>
 </html>

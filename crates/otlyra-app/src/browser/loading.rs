@@ -323,24 +323,8 @@ impl Browser {
 
     /// One finished fetch. Returns whether it changed anything on screen.
     pub(super) fn receive(&mut self, fetched: Fetched) -> bool {
-        // A font belongs to the shaper rather than to a page: once it is in, every
-        // page that names the family is set in it.
-        if let Some(family) = self.font_fetches.remove(&fetched.id) {
-            let Ok(loaded) = fetched.result else {
-                tracing::warn!(%family, url = %fetched.url, "font failed to load");
-                return false;
-            };
-            if !self.text.add_font(&family, loaded.bytes) {
-                tracing::warn!(%family, url = %fetched.url, "font failed to register");
-                return false;
-            }
-            tracing::debug!(%family, url = %fetched.url, "font registered");
-            for tab in &mut self.tabs {
-                if let Some(page) = tab.page.as_mut() {
-                    page.font_arrived();
-                }
-            }
-            return true;
+        if let Some(load) = self.font_fetches.remove(&fetched.id) {
+            return self.face_arrived(fetched, load);
         }
 
         // A background picture belongs to a page rather than to a load, and may
@@ -402,7 +386,10 @@ impl Browser {
 
         match fetched.kind {
             ResourceKind::Document => self.receive_document(index, fetched),
-            ResourceKind::Stylesheet | ResourceKind::Image | ResourceKind::Script => {
+            ResourceKind::Stylesheet
+            | ResourceKind::Image
+            | ResourceKind::Script
+            | ResourceKind::Font => {
                 self.receive_subresource(index, fetched);
                 true
             }

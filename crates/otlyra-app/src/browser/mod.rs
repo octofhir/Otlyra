@@ -10,7 +10,7 @@
 //! responsibility each, so that a change to how a page loads is not a change to how
 //! a key is routed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use otlyra_dom::NodeId;
 use otlyra_platform::{Cursor, Viewport};
@@ -26,6 +26,7 @@ use crate::widget::runtime::UiSurfaceId;
 mod chrome;
 mod devtools;
 mod driver;
+mod fonts;
 mod frame;
 mod input;
 mod loading;
@@ -89,13 +90,11 @@ pub struct Browser {
     /// the window is a different one — which keeps a walk of every document off
     /// the ordinary frame.
     picture_window: Option<(f32, f32)>,
-    /// The fonts pages have asked for, by family and address, so none is asked
-    /// for twice — a page that names its family in ten rules names one file, and
-    /// two families out of one file are two fonts.
-    font_requests: HashSet<(String, String)>,
-    /// Font fetches in flight, by request number, with the family each one is to
-    /// be registered under.
-    font_fetches: HashMap<u64, String>,
+    /// The `@font-face` faces pages have started loading, so none is loaded
+    /// twice: the same rule on two pages, or seen again on the next frame.
+    requested_faces: Vec<otlyra_css::cascade::FontFace>,
+    /// Face fetches in flight, by request number.
+    font_fetches: HashMap<u64, fonts::FaceLoad>,
     /// Whether the pointer is taking a selection across the page.
     ///
     /// A press on the text starts one and the release ends it, so that a drag that
@@ -230,7 +229,7 @@ impl Browser {
             picture_fetches: HashMap::new(),
             picture_window: None,
             selecting: false,
-            font_requests: HashSet::new(),
+            requested_faces: Vec::new(),
             font_fetches: HashMap::new(),
             last_width: 1024.0,
             last_height: 768.0,
