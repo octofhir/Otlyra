@@ -117,12 +117,14 @@ pub enum ScrollSource {
 /// Which surface rasterizes a window's retained scene.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum RendererBackend {
-    /// Deterministic CPU Skia plus damaged-region upload. The portable default.
+    /// Skia Ganesh drawing directly into the presenter's wgpu-owned texture:
+    /// no read-back, no upload, the GPU doing the drawing. Metal on macOS. A
+    /// platform or a device it cannot draw on falls back to the CPU on its own.
     #[default]
+    Gpu,
+    /// CPU Skia plus damaged-region upload: what screenshots and tests draw
+    /// with, and what a window draws with when asked to.
     Cpu,
-    /// Skia Ganesh drawing directly into the presenter's wgpu-owned Metal
-    /// texture. Experimental and currently available only on macOS.
-    DirectGpu,
 }
 
 /// What assistive technology asked to be done.
@@ -702,7 +704,7 @@ impl Default for WindowConfig {
             startup_origin: Instant::now(),
             startup_report: None,
             startup_trace: None,
-            renderer: RendererBackend::Cpu,
+            renderer: RendererBackend::Gpu,
         }
     }
 }
@@ -749,11 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_raster_remains_the_window_default() {
-        assert_eq!(
-            WindowConfig::default().renderer,
-            RendererBackend::Cpu,
-            "direct GPU stays opt-in until parity and startup gates pass"
-        );
+    fn a_window_draws_on_the_gpu_unless_told_otherwise() {
+        assert_eq!(WindowConfig::default().renderer, RendererBackend::Gpu);
     }
 }

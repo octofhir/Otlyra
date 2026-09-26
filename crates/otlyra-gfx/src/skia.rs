@@ -75,6 +75,42 @@ pub enum SkiaError {
     WrappedMetalResize,
 }
 
+/// A Ganesh context on one Metal device and queue.
+///
+/// What every surface a window draws into on that device shares: the shaders
+/// Skia has compiled and the textures it has uploaded. Made once and kept, so
+/// that a new surface — a resized window — does not compile every shader again.
+#[cfg(target_os = "macos")]
+pub struct GpuContext {
+    context: sk::gpu::DirectContext,
+}
+
+#[cfg(target_os = "macos")]
+impl GpuContext {
+    /// A context drawing through `device` on `queue`.
+    ///
+    /// # Safety
+    ///
+    /// `device` and `queue` must point to a live `MTLDevice` and an
+    /// `MTLCommandQueue` of it, and both must outlive the context and every
+    /// painter made in it.
+    pub unsafe fn metal(
+        device: *mut std::ffi::c_void,
+        queue: *mut std::ffi::c_void,
+    ) -> Result<Self, SkiaError> {
+        for (object, handle) in [("device", device), ("queue", queue)] {
+            if handle.is_null() {
+                return Err(SkiaError::NullMetalHandle { object });
+            }
+        }
+        // SAFETY: upheld by the caller; Skia retains both Objective-C objects.
+        let backend = unsafe { sk::gpu::mtl::BackendContext::new(device, queue) };
+        let context =
+            sk::gpu::direct_contexts::make_metal(&backend, None).ok_or(SkiaError::MetalContext)?;
+        Ok(Self { context })
+    }
+}
+
 /// A [`PaintTarget`] backed by a Skia raster or wrapped Metal surface.
 pub struct SkiaPainter {
     // Dropped before `gpu_context`: a GPU surface borrows the direct context.
@@ -603,22 +639,17 @@ impl SkiaPainter {
         })
     }
 
-    /// Wrap a wgpu-owned Metal texture as this painter's Skia surface.
+    /// Wrap a wgpu-owned Metal texture as this painter's Skia surface, with a
+    /// Ganesh context of its own.
     ///
-    /// This is the narrow interop seam used by the direct-GPU acceptance spike.
-    /// It deliberately takes erased Objective-C object pointers rather than
-    /// exposing either wgpu or Metal types in this crate's public API.
+    /// For a surface drawn into once — the acceptance corpus. A window that
+    /// keeps drawing makes one [`GpuContext`] and wraps each texture it gets in
+    /// it with [`SkiaPainter::wrap_metal_texture_in`], so that the shaders and
+    /// the textures the context has built survive a resize.
     ///
     /// # Safety
     ///
-    /// - `device`, `queue`, and `texture` must point to live `MTLDevice`,
-    ///   `MTLCommandQueue`, and `MTLTexture` objects respectively.
-    /// - All three objects must belong to the same Metal device.
-    /// - `texture` must be a two-dimensional sRGB RGBA8 render target of exactly
-    ///   `width` by `height` pixels.
-    /// - The texture must outlive the returned painter and must not be used
-    ///   concurrently. Submit subsequent wgpu work only after
-    ///   [`SkiaPainter::flush_and_submit`] or [`SkiaPainter::sync_gpu`].
+    /// As [`GpuContext::metal`] and [`SkiaPainter::wrap_metal_texture_in`].
     #[cfg(target_os = "macos")]
     pub unsafe fn wrap_metal_texture(
         width: u32,
@@ -627,19 +658,41 @@ impl SkiaPainter {
         queue: *mut std::ffi::c_void,
         texture: *mut std::ffi::c_void,
     ) -> Result<Self, SkiaError> {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            let context = GpuContext::metal(device, queue)?;
+            Self::wrap_metal_texture_in(&context, width, height, texture)
+        }
+    }
+
+    /// Wrap a wgpu-owned Metal texture as this painter's Skia surface, drawn
+    /// through `context`.
+    ///
+    /// It deliberately takes an erased Objective-C object pointer rather than
+    /// exposing either wgpu or Metal types in this crate's public API.
+    ///
+    /// # Safety
+    ///
+    /// - `texture` must point to a live `MTLTexture` of the device `context`
+    ///   was made for: two-dimensional, sRGB RGBA8, a render target, exactly
+    ///   `width` by `height` pixels.
+    /// - The texture must outlive the returned painter and must not be used
+    ///   concurrently. Submit subsequent wgpu work only after
+    ///   [`SkiaPainter::flush_and_submit`] or [`SkiaPainter::sync_gpu`].
+    #[cfg(target_os = "macos")]
+    pub unsafe fn wrap_metal_texture_in(
+        context: &GpuContext,
+        width: u32,
+        height: u32,
+        texture: *mut std::ffi::c_void,
+    ) -> Result<Self, SkiaError> {
         if width == 0 || height == 0 {
             return Err(SkiaError::ZeroSize { width, height });
         }
-        for (object, handle) in [("device", device), ("queue", queue), ("texture", texture)] {
-            if handle.is_null() {
-                return Err(SkiaError::NullMetalHandle { object });
-            }
+        if texture.is_null() {
+            return Err(SkiaError::NullMetalHandle { object: "texture" });
         }
-
-        // SAFETY: upheld by the caller; Skia retains both Objective-C objects.
-        let backend = unsafe { sk::gpu::mtl::BackendContext::new(device, queue) };
-        let mut context =
-            sk::gpu::direct_contexts::make_metal(&backend, None).ok_or(SkiaError::MetalContext)?;
+        let mut context = context.context.clone();
         // SAFETY: upheld by the caller; TextureInfo retains the Objective-C object.
         let info = unsafe { sk::gpu::mtl::TextureInfo::new(texture) };
         // SAFETY: the dimensions and texture type are part of this method's contract.
@@ -672,6 +725,14 @@ impl SkiaPainter {
             blur: None,
             shadows: ShadowMasks::default(),
         })
+    }
+
+    /// Take over what `previous` has cached — configured fonts, blurred
+    /// shadows — as a surface that replaces another does: a window that is
+    /// resized draws the same page, and should not start over.
+    pub fn adopt_caches(&mut self, previous: &mut SkiaPainter) {
+        self.typefaces = std::mem::take(&mut previous.typefaces);
+        self.shadows = std::mem::take(&mut previous.shadows);
     }
 
     /// Submit recorded GPU drawing without waiting for it on the CPU.

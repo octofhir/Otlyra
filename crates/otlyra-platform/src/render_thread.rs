@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::compositor::{SceneCompositor, Upload};
-use crate::present::{DirectFrame, Presented, Presenter, PresenterSeed};
+use crate::present::{DirectFrame, GpuContext, Presented, Presenter, PresenterSeed};
 use crate::{PlatformError, RendererBackend, Scene, StartupTrace, Viewport};
 
 /// What a frame is made of, as the window's thread built it.
@@ -118,6 +118,7 @@ impl RenderThread {
 
                 let mut renderer = Renderer {
                     direct: None,
+                    gpu: None,
                     presenter,
                     compositor: SceneCompositor::new(),
                     backend,
@@ -169,11 +170,15 @@ impl Drop for RenderThread {
 /// Everything the render thread owns.
 ///
 /// Field order is the drop order, and the drop order is a contract: the Ganesh
-/// surface wraps a texture of the presenter's device, so it goes first.
+/// surface wraps a texture of the presenter's device, and the context draws on
+/// the presenter's device and queue, so both go first.
 struct Renderer {
-    /// The direct GPU path's retained surface. Created, used and dropped only on
-    /// this thread; the Skia context inside it is bound to it.
+    /// The GPU path's retained surface. Created, used and dropped only on this
+    /// thread, as the context it draws through is.
     direct: Option<DirectFrame>,
+    /// The Ganesh context every GPU surface of this window shares, made the first
+    /// time one is needed and kept across resizes.
+    gpu: Option<GpuContext>,
     presenter: Presenter,
     /// The retained CPU surface and the layer history both backends plan from.
     compositor: SceneCompositor,
@@ -188,12 +193,45 @@ impl Renderer {
             trace,
         } = job;
         match content {
-            FrameContent::Scene(scene) if self.backend == RendererBackend::DirectGpu => {
-                self.composite_direct(scene, viewport, trace)
+            FrameContent::Scene(scene) if self.backend == RendererBackend::Gpu => {
+                match self.prepare_direct(viewport) {
+                    Ok(reallocated) => self.composite_direct(scene, viewport, trace, reallocated),
+                    // A GPU the rasterizer cannot draw on is a window drawn on
+                    // the CPU, not a window that stops drawing: from this frame
+                    // on, and for the rest of the window's life.
+                    Err(error) => {
+                        tracing::warn!(%error, "drawing on the GPU failed; drawing on the CPU instead");
+                        self.backend = RendererBackend::Cpu;
+                        self.direct = None;
+                        self.gpu = None;
+                        self.compositor.discard();
+                        self.composite(scene, viewport, trace)
+                    }
+                }
             }
             FrameContent::Scene(scene) => self.composite(scene, viewport, trace),
             FrameContent::Pixels(pixels) => self.present_whole(pixels, viewport, trace),
         }
+    }
+
+    /// Make sure there is a GPU surface of the viewport's size, and answer
+    /// whether it is a new one — which holds no pixels, so the frame is whole.
+    fn prepare_direct(&mut self, viewport: Viewport) -> Result<bool, crate::present::PresentError> {
+        self.presenter.resize(viewport);
+        let current = self
+            .direct
+            .as_ref()
+            .is_some_and(|frame| frame.size() == (viewport.width, viewport.height));
+        if current {
+            return Ok(false);
+        }
+        if self.gpu.is_none() {
+            self.gpu = Some(self.presenter.gpu_context()?);
+        }
+        let context = self.gpu.as_ref().expect("made just now");
+        let previous = self.direct.take();
+        self.direct = Some(self.presenter.create_direct(context, viewport, previous)?);
+        Ok(true)
     }
 
     /// Rasterize the layers into the retained CPU surface, read back only what
@@ -261,23 +299,15 @@ impl Renderer {
         })
     }
 
-    /// The opt-in Metal path: rasterize into the presenter's retained wgpu
-    /// texture and sample it straight into the swapchain.
+    /// The GPU path: rasterize into the presenter's retained wgpu texture and
+    /// sample it straight into the swapchain — no read-back, no upload.
     fn composite_direct(
         &mut self,
         scene: Scene,
         viewport: Viewport,
         trace: Option<StartupTrace>,
+        reallocated: bool,
     ) -> Result<FrameReport, PlatformError> {
-        self.presenter.resize(viewport);
-        let reallocated = self
-            .direct
-            .as_ref()
-            .is_none_or(|frame| frame.size() != (viewport.width, viewport.height));
-        if reallocated {
-            self.direct = None;
-            self.direct = Some(self.presenter.create_direct(viewport)?);
-        }
         let damage = self.compositor.plan(&scene, reallocated);
         let direct = self.direct.as_mut().expect("direct frame prepared");
         direct.rasterize(&scene, &damage);
@@ -288,7 +318,7 @@ impl Renderer {
             trace.mark("readback_complete");
         }
 
-        let _present = tracing::info_span!("present", mode = "direct_gpu").entered();
+        let _present = tracing::info_span!("present", mode = "gpu").entered();
         let outcome = self.presenter.present_direct(direct)?;
         if outcome == Presented::Frame {
             self.compositor.commit(&scene);

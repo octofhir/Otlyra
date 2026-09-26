@@ -5,9 +5,20 @@ Investigated 2026-07-20 on Apple M1, macOS 25.5, `skia-safe 0.99`, `wgpu 30`.
 **Question.** Can Skia render directly into a wgpu-owned texture, with no per-frame
 copy, or must Skia rasterize separately and wgpu only present the result?
 
-**Live-path decision: keep the retained CPU surface until the bounded Metal
-candidate clears parity and startup gates.** Zero-copy now has an executable
-acceptance spike; it is no longer only a paper design.
+**Live-path decision (2026-09-27): the window draws on the GPU by default.**
+`RendererBackend::Gpu` rasterizes into the presenter's wgpu texture on the render
+thread through one Ganesh context kept for the window's life (a resize wraps a
+new texture in it and carries the font and shadow caches over), and falls back to
+the CPU for good the first time the GPU cannot be drawn on. `--cpu-raster` forces
+the CPU. Screenshots, `FramePump` and every test stay on CPU Skia, so the pixel
+contract they check is unchanged; the window's antialiasing may differ from them
+by a level at edges, as a GPU rasterizer's does in every browser.
+
+Measured on the GitHub mirror at 2048×1536, release, three launches each:
+visible → first frame 1129 / 456 / 448 ms on the GPU (the first launch compiling
+shaders into a cold system cache) against 466 / 447 / 365 ms on the CPU.
+
+The sections below are the investigation that led here.
 
 ## Zero-copy is reachable
 

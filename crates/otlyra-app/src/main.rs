@@ -191,12 +191,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     startup_report: Option<PathBuf>,
 
-    /// Rasterize the retained window scene directly into a wgpu Metal texture.
+    /// Draw the window on the CPU rather than the GPU.
     ///
-    /// Experimental macOS measurement path. CPU Skia remains the default and
-    /// continues to serve screenshots and deterministic tests.
+    /// The GPU is the default: it draws the window straight into the texture
+    /// that is shown, with nothing read back or uploaded. The CPU is what
+    /// screenshots and tests draw with, and this makes the window draw the same
+    /// way — for comparing the two, or for a GPU that misbehaves.
     #[arg(long)]
-    direct_gpu: bool,
+    cpu_raster: bool,
 }
 
 impl Cli {
@@ -684,10 +686,10 @@ fn window_config(cli: &Cli) -> WindowConfig {
         startup_origin: *PROCESS_STARTED,
         startup_report: cli.startup_report.clone(),
         startup_trace: Some(STARTUP_TRACE.clone()),
-        renderer: if cli.direct_gpu {
-            RendererBackend::DirectGpu
-        } else {
+        renderer: if cli.cpu_raster {
             RendererBackend::Cpu
+        } else {
+            RendererBackend::Gpu
         },
     }
 }

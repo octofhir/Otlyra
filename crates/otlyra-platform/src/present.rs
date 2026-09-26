@@ -61,6 +61,14 @@ struct Staging {
     height: u32,
 }
 
+/// The Ganesh context a window's surfaces share, where there is one.
+#[cfg(target_os = "macos")]
+pub(crate) type GpuContext = otlyra_gfx::GpuContext;
+
+/// No GPU rasterizer on this platform yet: a window draws on the CPU.
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct GpuContext;
+
 /// A retained wgpu texture that Ganesh draws into in place.
 ///
 /// Field order is the lifetime contract: the Skia surface drops before the bind
@@ -331,9 +339,43 @@ impl Presenter {
         true
     }
 
-    /// Create the experimental retained Metal texture on the calling thread.
+    /// A Ganesh context on this presenter's Metal device and queue, for every
+    /// surface the window will draw into.
     #[cfg(target_os = "macos")]
-    pub(crate) fn create_direct(&self, viewport: Viewport) -> Result<DirectFrame, PresentError> {
+    pub(crate) fn gpu_context(&self) -> Result<GpuContext, PresentError> {
+        // SAFETY: both guards expose objects owned by this Presenter, which the
+        // render thread keeps alive longer than the context: `Renderer` drops the
+        // direct frame and the context before the presenter.
+        unsafe {
+            let hal_device = self
+                .device
+                .as_hal::<wgpu::hal::api::Metal>()
+                .ok_or(PresentError::DirectGpuUnsupported)?;
+            let hal_queue = self
+                .queue
+                .as_hal::<wgpu::hal::api::Metal>()
+                .ok_or(PresentError::DirectGpuUnsupported)?;
+            Ok(otlyra_gfx::GpuContext::metal(
+                &**hal_device.raw_device() as *const _ as *mut std::ffi::c_void,
+                hal_queue.as_raw() as *const _ as *mut std::ffi::c_void,
+            )?)
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gpu_context(&self) -> Result<GpuContext, PresentError> {
+        Err(PresentError::DirectGpuUnsupported)
+    }
+
+    /// Create the retained Metal texture the window draws into, in `context`,
+    /// taking over whatever `previous` — the texture it replaces — had cached.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_direct(
+        &self,
+        context: &GpuContext,
+        viewport: Viewport,
+        previous: Option<DirectFrame>,
+    ) -> Result<DirectFrame, PresentError> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("otlyra-direct-frame"),
             size: wgpu::Extent3d {
@@ -366,29 +408,24 @@ impl Presenter {
             ],
         });
 
-        // SAFETY: all three guards expose objects owned by this Presenter and
-        // created from one wgpu Metal device. `DirectFrame` drops the painter
-        // before its texture, and the render thread drops the frame before Presenter.
-        let painter = unsafe {
-            let hal_device = self
-                .device
-                .as_hal::<wgpu::hal::api::Metal>()
-                .ok_or(PresentError::DirectGpuUnsupported)?;
-            let hal_queue = self
-                .queue
-                .as_hal::<wgpu::hal::api::Metal>()
-                .ok_or(PresentError::DirectGpuUnsupported)?;
+        // SAFETY: the texture is this Presenter's, made from the device the
+        // context was made for, an sRGB RGBA8 render target of the viewport's
+        // size. `DirectFrame` drops the painter before its texture, and the render
+        // thread drops the frame before Presenter.
+        let mut painter = unsafe {
             let hal_texture = texture
                 .as_hal::<wgpu::hal::api::Metal>()
                 .ok_or(PresentError::DirectGpuUnsupported)?;
-            otlyra_gfx::SkiaPainter::wrap_metal_texture(
+            otlyra_gfx::SkiaPainter::wrap_metal_texture_in(
+                context,
                 viewport.width,
                 viewport.height,
-                &**hal_device.raw_device() as *const _ as *mut std::ffi::c_void,
-                hal_queue.as_raw() as *const _ as *mut std::ffi::c_void,
                 hal_texture.raw_handle() as *const _ as *mut std::ffi::c_void,
             )?
         };
+        if let Some(mut previous) = previous {
+            painter.adopt_caches(&mut previous.painter);
+        }
         Ok(DirectFrame {
             painter,
             bind_group,
@@ -399,7 +436,12 @@ impl Presenter {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn create_direct(&self, _viewport: Viewport) -> Result<DirectFrame, PresentError> {
+    pub(crate) fn create_direct(
+        &self,
+        _context: &GpuContext,
+        _viewport: Viewport,
+        _previous: Option<DirectFrame>,
+    ) -> Result<DirectFrame, PresentError> {
         Err(PresentError::DirectGpuUnsupported)
     }
 
