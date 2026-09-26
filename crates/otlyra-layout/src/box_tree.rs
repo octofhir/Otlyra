@@ -653,6 +653,64 @@ impl BoxTree {
         }
     }
 
+    /// Repaint boxes in new styles, without building a box again.
+    ///
+    /// Every box drawn in the old style of one of `swaps` is drawn in its new
+    /// one — an element's box and the text boxes that share its style. An
+    /// anonymous box inside one of them inherits the new paint. And the
+    /// decorations a box draws under its text are worked out again from its
+    /// parent's, as the builder works them out, wherever either changed: a link
+    /// that turns red draws a red underline, and so does every run inside it.
+    /// Answers every swap made, for the fragments laid out from the boxes to
+    /// follow.
+    pub fn repaint(
+        &mut self,
+        swaps: &[(Arc<ComputedStyle>, Arc<ComputedStyle>)],
+    ) -> Vec<(Arc<ComputedStyle>, Arc<ComputedStyle>)> {
+        let mut made = swaps.to_vec();
+        // Depth first, so a parent is repainted before anything inside it asks
+        // what it was repainted in.
+        for id in self.descendants(self.root()) {
+            let original = Arc::clone(&self.boxes[id].style);
+            let swapped = latest(&made, &original);
+            // Text shares its element's style and follows it; it has no
+            // decorations of its own to work out.
+            if matches!(self.boxes[id].kind, BoxKind::Text(_)) {
+                self.boxes[id].style = swapped;
+                continue;
+            }
+            let Some(parent) = self.boxes[id].parent else {
+                continue;
+            };
+            let parent_style = Arc::clone(&self.boxes[parent].style);
+            let parent_repainted = made.iter().any(|(_, new)| Arc::ptr_eq(new, &parent_style));
+            if Arc::ptr_eq(&swapped, &original) && !parent_repainted {
+                continue;
+            }
+            let mut next = if self.boxes[id].node.is_none() && parent_repainted {
+                swapped.with_inherited_paint_from(&parent_style)
+            } else {
+                (*swapped).clone()
+            };
+            let replaced = matches!(self.boxes[id].kind, BoxKind::Replaced(_));
+            next.decorations = crate::builder::decorations_for(
+                &parent_style.decorations,
+                next.text_decoration,
+                crate::builder::receives_decorations(&next, replaced),
+            );
+            let next = if next == *swapped {
+                swapped
+            } else {
+                Arc::new(next)
+            };
+            if !Arc::ptr_eq(&next, &original) {
+                self.boxes[id].style = Arc::clone(&next);
+                made.push((original, next));
+            }
+        }
+        made
+    }
+
     /// Every box under `id`, depth first, `id` included.
     pub fn descendants(&self, id: BoxId) -> Vec<BoxId> {
         let mut out = Vec::new();
@@ -664,6 +722,23 @@ impl BoxTree {
         }
         out
     }
+}
+
+/// What `style` was last replaced with in `swaps`, following one replacement to
+/// the next, or `style` itself.
+pub(crate) fn latest(
+    swaps: &[(Arc<ComputedStyle>, Arc<ComputedStyle>)],
+    style: &Arc<ComputedStyle>,
+) -> Arc<ComputedStyle> {
+    let mut current = Arc::clone(style);
+    while let Some((_, next)) = swaps
+        .iter()
+        .rev()
+        .find(|(old, new)| Arc::ptr_eq(old, &current) && !Arc::ptr_eq(new, &current))
+    {
+        current = Arc::clone(next);
+    }
+    current
 }
 
 /// A [`BoxId`] as a plain number, and back.

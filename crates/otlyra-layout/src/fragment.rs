@@ -468,6 +468,63 @@ impl FragmentTree {
         self.root.rect.height
     }
 
+    /// Repaint fragments in new styles, without laying anything out again.
+    ///
+    /// Every fragment drawn in the old style of one of `swaps` takes its new one,
+    /// and a run of text drawn in it takes the new colour — the run was coloured
+    /// when it was shaped. Answers the part of the page that now looks different,
+    /// or `None` when that cannot be bounded: a box that is fixed to the screen or
+    /// sticks, whose rectangle is not where it is drawn, or one that is
+    /// transformed.
+    pub fn repaint(&mut self, swaps: &[(Arc<ComputedStyle>, Arc<ComputedStyle>)]) -> Option<Rect> {
+        fn walk(
+            fragment: &mut Fragment,
+            swaps: &[(Arc<ComputedStyle>, Arc<ComputedStyle>)],
+            dirty: &mut Option<Rect>,
+            bounded: &mut bool,
+        ) {
+            let latest = crate::box_tree::latest(swaps, &fragment.style);
+            if !Arc::ptr_eq(&latest, &fragment.style) {
+                let (old, new) = (&fragment.style, &latest);
+                if fragment.fixed
+                    || fragment.sticky.is_some()
+                    || !old.transform.is_empty()
+                    || !new.transform.is_empty()
+                {
+                    *bounded = false;
+                }
+                let reach = old.paint_reach().max(new.paint_reach()) + 2.0;
+                let area = Rect::new(
+                    fragment.rect.x - reach,
+                    fragment.rect.y - reach,
+                    fragment.rect.width + reach * 2.0,
+                    fragment.rect.height + reach * 2.0,
+                );
+                *dirty = Some(dirty.map_or(area, |dirty| {
+                    let (x, y) = (dirty.x.min(area.x), dirty.y.min(area.y));
+                    Rect::new(
+                        x,
+                        y,
+                        dirty.right().max(area.right()) - x,
+                        dirty.bottom().max(area.bottom()) - y,
+                    )
+                }));
+                if let FragmentKind::Text(run) = &mut fragment.kind {
+                    let color = new.color.to_rgba8();
+                    run.brush = [color.r, color.g, color.b, color.a];
+                }
+                fragment.style = Arc::clone(new);
+            }
+            for child in &mut fragment.children {
+                walk(child, swaps, dirty, bounded);
+            }
+        }
+        let mut dirty = None;
+        let mut bounded = true;
+        walk(&mut self.root, swaps, &mut dirty, &mut bounded);
+        if bounded { dirty } else { None }
+    }
+
     /// Repaint one control's widget without laying anything out again.
     ///
     /// A pointer moving onto a button greys it and changes nothing else — not its

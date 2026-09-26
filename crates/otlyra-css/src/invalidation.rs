@@ -72,6 +72,46 @@ pub fn element_depends_on(
     })
 }
 
+/// Whether any selector that depends on any of `changed` reaches past the
+/// element whose state changed to its later siblings — `:hover + .tip`,
+/// `:checked ~ label`.
+///
+/// Asked so that a restyle of what an interaction changed can stop at the
+/// element and what is inside it, which is what nearly every stylesheet needs:
+/// the siblings after an element are often the rest of the page. The engine
+/// records, for each selector that depends on a state, which way the
+/// dependency reaches.
+#[must_use]
+pub fn siblings_depend_on(stylist: &Stylist, changed: ElementState) -> bool {
+    use style::invalidation::element::invalidation_map::{
+        DependencyInvalidationKind, NormalDependencyInvalidationKind, StateDependency,
+    };
+
+    if changed.is_empty() {
+        return false;
+    }
+    let reaches = |dependencies: &[StateDependency]| {
+        dependencies.iter().any(|dependency| {
+            dependency.state.intersects(changed)
+                && matches!(
+                    dependency.dep.invalidation_kind(),
+                    DependencyInvalidationKind::Normal(NormalDependencyInvalidationKind::Siblings)
+                )
+        })
+    };
+    stylist.iter_origins().any(|(data, _)| {
+        let map = &data.invalidation_map().state_affecting_selectors;
+        reaches(&map.root)
+            || map.id_hash.iter().any(|(_, bucket)| reaches(bucket))
+            || map.class_hash.iter().any(|(_, bucket)| reaches(bucket))
+            || map.local_name_hash.values().any(|bucket| reaches(bucket))
+            || map.attribute_hash.values().any(|bucket| reaches(bucket))
+            || map.namespace_hash.values().any(|bucket| reaches(bucket))
+            || reaches(&map.rare_pseudo_classes)
+            || reaches(&map.other)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use otlyra_dom::{Document, FormState, NodeId};

@@ -234,7 +234,7 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
 ///
 /// The list is shared with the parent's while the box adds nothing to it,
 /// which is almost every box on a page.
-fn decorations_for(
+pub(crate) fn decorations_for(
     parent: &Arc<[otlyra_css::TextDecoration]>,
     own: otlyra_css::TextDecoration,
     receives: bool,
@@ -252,7 +252,7 @@ fn decorations_for(
 /// Propagation reaches a box's in-flow contents and stops at an atomic inline —
 /// a picture, an inline block, flex, grid or table — at a float, and at an
 /// absolutely positioned box: those draw only what they declare themselves.
-fn receives_decorations(style: &ComputedStyle, replaced: bool) -> bool {
+pub(crate) fn receives_decorations(style: &ComputedStyle, replaced: bool) -> bool {
     let atomic_inline = match style.display {
         Display::Inline => replaced,
         Display::InlineBlock | Display::InlineFlex | Display::InlineGrid => true,

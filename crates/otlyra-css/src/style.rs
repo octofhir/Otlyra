@@ -1692,6 +1692,78 @@ impl Default for ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// This style with every property that only changes how a box is drawn —
+    /// never where it is or how big — taken from `other`.
+    ///
+    /// Colours, backgrounds, shadows, opacity, a transform, corner radii, and a
+    /// border's colour and style where its width is the same. What a hovered link
+    /// or a highlighted card changes, nearly always, and what can be repainted
+    /// without a single box being laid out again.
+    ///
+    /// A decoration only in its colour: which lines a box draws under its text
+    /// decides which decorations everything inside it draws, and that the box
+    /// tree works out as it is built. Its colour it carries down as it is, so the
+    /// box tree can recolour what it worked out (see `BoxTree::repaint`).
+    #[must_use]
+    pub fn with_paint_from(&self, other: &Self) -> Self {
+        let mut painted = self.clone();
+        painted.color = other.color;
+        painted.background_color = other.background_color;
+        painted.text_shadows.clone_from(&other.text_shadows);
+        painted.shadows.clone_from(&other.shadows);
+        painted.backgrounds.clone_from(&other.backgrounds);
+        painted.object_position = other.object_position.clone();
+        painted.opacity = other.opacity;
+        painted.transform = Arc::clone(&other.transform);
+        painted.transform_origin = other.transform_origin.clone();
+        painted.radius = other.radius.clone();
+        painted.text_decoration.color = other.text_decoration.color;
+        for (mine, theirs) in [
+            (&mut painted.border.top, &other.border.top),
+            (&mut painted.border.right, &other.border.right),
+            (&mut painted.border.bottom, &other.border.bottom),
+            (&mut painted.border.left, &other.border.left),
+        ] {
+            mine.color = theirs.color;
+            if mine.width == theirs.width {
+                mine.style = theirs.style;
+            }
+        }
+        painted
+    }
+
+    /// Whether `other` differs from this style only in what
+    /// [`Self::with_paint_from`] takes: whether going from one to the other is a
+    /// repaint rather than a relayout.
+    #[must_use]
+    pub fn differs_only_in_paint(&self, other: &Self) -> bool {
+        self.with_paint_from(other) == *other
+    }
+
+    /// This style with the inherited properties that only change how a box is
+    /// drawn taken from `parent`: what an anonymous box inherits from the box
+    /// around it when that box is repainted in a new colour.
+    #[must_use]
+    pub fn with_inherited_paint_from(&self, parent: &Self) -> Self {
+        let mut painted = self.clone();
+        painted.color = parent.color;
+        painted.text_shadows.clone_from(&parent.text_shadows);
+        painted
+    }
+
+    /// How far outside its border box this style can paint: its shadows, at
+    /// their furthest.
+    #[must_use]
+    pub fn paint_reach(&self) -> f32 {
+        self.shadows
+            .iter()
+            .chain(self.text_shadows.iter())
+            .map(|shadow| {
+                shadow.x.abs().max(shadow.y.abs()) + shadow.blur * 1.5 + shadow.spread.max(0.0)
+            })
+            .fold(0.0, f32::max)
+    }
+
     /// A style that inherits from `parent` everything CSS says is inherited, and
     /// takes the initial value for everything else.
     ///

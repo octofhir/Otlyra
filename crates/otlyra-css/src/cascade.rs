@@ -617,44 +617,12 @@ impl Styler {
         let mut style_data = StyleData::with_lock(self.lock.clone());
         style_data.prepare(document, form, interaction, &self.base);
 
-        let guard = self.lock.read();
-        self.stylist.flush(&StylesheetGuards::same(&guard));
-
-        let snapshots = SnapshotMap::new();
-        let shared = SharedStyleContext {
-            stylist: &self.stylist,
-            visited_styles_enabled: false,
-            options: Default::default(),
-            guards: StylesheetGuards::same(&guard),
-            current_time_for_animations: 0.0,
-            traversal_flags: TraversalFlags::empty(),
-            snapshot_map: &snapshots,
-            animations: Default::default(),
-            registered_speculative_painters: &NoPainters,
-        };
-
-        let tree = Tree::styled(document, &style_data);
-        let _scope = TreeScope::enter(&tree);
+        let starts: Vec<(NodeId, Option<Arc<ComputedValues>>, usize)> = document
+            .children(document.root())
+            .map(|child| (child, None, 0))
+            .collect();
         let mut styles = HashMap::new();
-        {
-            // The engine's assertions check that a restyle happens on a thread that
-            // has declared itself the layout thread — including in the destructors
-            // of the context, which is why this is a guard and not two bare calls.
-            // The assertion is not a formality: element data is behind interior
-            // mutability that only one thread at a time may touch.
-            let _layout = LayoutThread::enter();
-
-            let mut thread_local = ThreadLocalStyleContext::new();
-            let mut context = StyleContext {
-                shared: &shared,
-                thread_local: &mut thread_local,
-            };
-
-            let root = document.root();
-            for child in document.children(root).collect::<Vec<_>>() {
-                resolve(&tree, child, None, 0, &mut context, &mut styles);
-            }
-        }
+        self.resolve_from(document, &style_data, &starts, &mut styles);
 
         tracing::debug!(elements = styles.len(), "styled");
         // Only a control can devolve, and a page has a handful of them — so the
@@ -672,6 +640,174 @@ impl Styler {
             style_data,
             styles,
             devolved,
+        }
+    }
+
+    /// Restyle, in place, what moving the pointer or the focus from `before` to
+    /// `after` can have changed, and answer each element restyled with the style
+    /// it had.
+    ///
+    /// What can have changed is an element whose state did, everything inside
+    /// it — `.menu:hover .item`, and whatever inherits from it — and, where a
+    /// selector reaches that way, everything after it among its siblings —
+    /// `:hover + .tip` — and nothing else, since `:has()` is off. Those are
+    /// restyled from their parents' styles, which did not change, with the
+    /// engine's resolver the whole-document cascade uses. A pointer moving from
+    /// one word of a paragraph to the next restyles the two words rather than the
+    /// page.
+    ///
+    /// `None` when that is more than a quarter of the document: then the
+    /// bookkeeping is not worth it, and the caller restyles the whole of it.
+    pub fn restyle_interaction(
+        &mut self,
+        document: &Document,
+        form: &otlyra_dom::FormState,
+        styled: &mut StyledDocument,
+        before: crate::state::Interaction,
+        after: crate::state::Interaction,
+    ) -> Option<Vec<(NodeId, Arc<ComputedValues>)>> {
+        let _span = tracing::info_span!("recalc_style").entered();
+
+        let before_states = crate::state::States::new(document, form, before);
+        let after_states = crate::state::States::new(document, form, after);
+        let changed: Vec<NodeId> = crate::state::touched_nodes(document, before, after)
+            .into_iter()
+            .filter(|node| before_states.state_of(*node) != after_states.state_of(*node))
+            .collect();
+        styled.style_data.set_states(&changed, &after_states);
+
+        let parent_of = |node: NodeId| document.get(node).and_then(|inner| inner.parent);
+        let is_element = |node: NodeId| {
+            document
+                .get(node)
+                .is_some_and(|inner| inner.element().is_some())
+        };
+        // The outermost of them: one inside another is restyled with it.
+        let outermost = changed.iter().copied().filter(|node| {
+            let mut above = parent_of(*node);
+            while let Some(ancestor) = above {
+                if changed.contains(&ancestor) {
+                    return false;
+                }
+                above = parent_of(ancestor);
+            }
+            true
+        });
+        // The siblings after one, only where a selector reaches them.
+        let bits = changed
+            .iter()
+            .fold(stylo_dom::ElementState::empty(), |bits, node| {
+                bits | (before_states.state_of(*node) ^ after_states.state_of(*node))
+            });
+        let siblings = crate::invalidation::siblings_depend_on(&self.stylist, bits);
+        let mut roots: Vec<NodeId> = Vec::new();
+        for node in outermost {
+            let mut next = Some(node);
+            while let Some(sibling) = next {
+                if !roots.contains(&sibling) {
+                    roots.push(sibling);
+                }
+                next = if siblings {
+                    document.get(sibling).and_then(|inner| inner.next_sibling())
+                } else {
+                    None
+                };
+            }
+        }
+
+        let mut reach = 0usize;
+        for root in &roots {
+            let mut stack = vec![*root];
+            while let Some(node) = stack.pop() {
+                if is_element(node) {
+                    reach += 1;
+                }
+                stack.extend(document.children(node));
+            }
+        }
+        if reach * 4 > styled.styles.len() {
+            return None;
+        }
+
+        // Each root from its nearest element ancestor's style, at its depth among
+        // elements — which is what the resolver's ancestor filter is kept at.
+        let starts: Vec<(NodeId, Option<Arc<ComputedValues>>, usize)> = roots
+            .iter()
+            .map(|root| {
+                let mut parent = None;
+                let mut depth = 0;
+                let mut above = parent_of(*root);
+                while let Some(ancestor) = above {
+                    if is_element(ancestor) {
+                        depth += 1;
+                        if parent.is_none() {
+                            parent = styled.styles.get(&ancestor).cloned();
+                        }
+                    }
+                    above = parent_of(ancestor);
+                }
+                (*root, parent, depth)
+            })
+            .collect();
+        let mut fresh = HashMap::new();
+        self.resolve_from(document, &styled.style_data, &starts, &mut fresh);
+
+        let mut previous = Vec::with_capacity(fresh.len());
+        for (node, style) in fresh {
+            if otlyra_dom::form::Control::of(document, node).is_some() {
+                if self.devolves(&style) {
+                    styled.devolved.insert(node);
+                } else {
+                    styled.devolved.remove(&node);
+                }
+            }
+            if let Some(old) = styled.styles.insert(node, style) {
+                previous.push((node, old));
+            }
+        }
+        Some(previous)
+    }
+
+    /// Resolve every element under each of `starts` — a node, the style it
+    /// inherits from, and its depth among elements — into `styles`.
+    fn resolve_from(
+        &mut self,
+        document: &Document,
+        style_data: &StyleData,
+        starts: &[(NodeId, Option<Arc<ComputedValues>>, usize)],
+        styles: &mut HashMap<NodeId, Arc<ComputedValues>>,
+    ) {
+        let guard = self.lock.read();
+        self.stylist.flush(&StylesheetGuards::same(&guard));
+
+        let snapshots = SnapshotMap::new();
+        let shared = SharedStyleContext {
+            stylist: &self.stylist,
+            visited_styles_enabled: false,
+            options: Default::default(),
+            guards: StylesheetGuards::same(&guard),
+            current_time_for_animations: 0.0,
+            traversal_flags: TraversalFlags::empty(),
+            snapshot_map: &snapshots,
+            animations: Default::default(),
+            registered_speculative_painters: &NoPainters,
+        };
+
+        let tree = Tree::styled(document, style_data);
+        let _scope = TreeScope::enter(&tree);
+        // The engine's assertions check that a restyle happens on a thread that
+        // has declared itself the layout thread — including in the destructors
+        // of the context, which is why this is a guard declared before it. The
+        // assertion is not a formality: element data is behind interior
+        // mutability that only one thread at a time may touch.
+        let _layout = LayoutThread::enter();
+        let mut thread_local = ThreadLocalStyleContext::new();
+        let mut context = StyleContext {
+            shared: &shared,
+            thread_local: &mut thread_local,
+        };
+        for (node, parent, depth) in starts {
+            resolve(&tree, *node, parent.as_ref(), *depth, &mut context, styles);
         }
     }
 }

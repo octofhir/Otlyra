@@ -202,7 +202,86 @@ impl PageScene {
         {
             return true;
         }
-        self.invalidate_styles();
+        if !self.restyle_interaction(before, next) {
+            self.invalidate_styles();
+        }
+        true
+    }
+
+    /// Restyle what moving from `before` to `next` changed and nothing else, and
+    /// repaint it in place when all that changed is how things look.
+    ///
+    /// A hovered link or card changes its colours, nearly always, and colours are
+    /// not layout: the boxes and the lines are where they were, so they keep
+    /// their fragments and take new paint, and only the part of the page they
+    /// cover is drawn again. Before this a pointer crossing a link on a long page
+    /// restyled, rebuilt and laid out the whole of it — half a second on GitHub.
+    /// A change layout does read keeps the fresh styles and rebuilds from them.
+    ///
+    /// `false` when the whole page has to be restyled: it has not been styled
+    /// and laid out yet, or the change reaches too much of it.
+    fn restyle_interaction(
+        &mut self,
+        before: otlyra_css::state::Interaction,
+        next: otlyra_css::state::Interaction,
+    ) -> bool {
+        if !self.styled || self.boxes_stale || self.layout_stale || self.layout.is_none() {
+            return false;
+        }
+        let (Some(styler), Some(styled)) = (self.styler.as_mut(), self.styled_document.as_mut())
+        else {
+            return false;
+        };
+        let Some(previous) =
+            styler.restyle_interaction(&self.document, &self.form, styled, before, next)
+        else {
+            return false;
+        };
+
+        let mut swaps = Vec::new();
+        for (node, old) in previous {
+            let Some(new) = styled.style_of(node) else {
+                continue;
+            };
+            let old = otlyra_css::computed::to_layout_style(&old);
+            let new = otlyra_css::computed::to_layout_style(new);
+            if old == new {
+                continue;
+            }
+            // An inline box is only a fragment of its own while it draws
+            // something, so one that starts or stops drawing a background has
+            // changed what layout makes of it.
+            let inline_background = old.display == otlyra_css::Display::Inline
+                && (old.background_color.components[3] > 0.0)
+                    != (new.background_color.components[3] > 0.0);
+            if inline_background || !old.differs_only_in_paint(&new) {
+                self.boxes_stale = true;
+                self.layout_stale = true;
+                self.damage.add(Damage::of(
+                    otlyra_layout::InvalidationReason::AttributeChanged,
+                ));
+                return true;
+            }
+            // An element with no box draws nothing, whatever colour it is.
+            let Some(box_id) = self.boxes.box_for(node) else {
+                continue;
+            };
+            // The box's own style, which the builder may have added to — a
+            // widget's size — with the new paint over it.
+            let current = std::sync::Arc::clone(&self.boxes.node(box_id).style);
+            let repainted = std::sync::Arc::new(current.with_paint_from(&new));
+            swaps.push((current, repainted));
+        }
+        if swaps.is_empty() {
+            return true;
+        }
+        let made = self.boxes.repaint(&swaps);
+        let Some((_, tree)) = self.layout.as_mut() else {
+            return false;
+        };
+        let area = tree.repaint(&made);
+        self.repainted = self.repainted.and(area);
+        self.damage.add(Damage::PAINT);
         true
     }
 

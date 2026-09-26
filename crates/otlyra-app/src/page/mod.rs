@@ -178,6 +178,12 @@ pub struct PageScene {
     /// The scroll `dirty` was worked out at. Scrolled since, the whole page has
     /// moved on the screen and no rectangle of it is the only one that changed.
     dirty_scroll: f32,
+    /// What restyles that only changed how things look have repainted in place
+    /// since the last list, for the next list to report as changed.
+    repainted: Repainted,
+    /// Whether the styles are current but the box tree was built from older
+    /// ones: a restyle of part of the page changed something layout reads.
+    boxes_stale: bool,
     /// A field whose text changed and which can be re-shaped on its own.
     ///
     /// Set where the value changes and answered at the next frame, because
@@ -388,6 +394,8 @@ impl PageScene {
             field_dragging: false,
             dirty: None,
             dirty_scroll: 0.0,
+            repainted: Repainted::Nothing,
+            boxes_stale: false,
             retype: None,
             sliding: None,
             segment: 0,
@@ -525,18 +533,27 @@ impl PageScene {
             }
         };
 
-        if !stale && self.styled {
+        if !stale && self.styled && !self.boxes_stale {
             return;
         }
 
+        // Styled already, and only the boxes have to follow: a restyle of part
+        // of the page changed something layout has to know about.
+        if stale || !self.styled {
+            let styles = self
+                .styler
+                .as_mut()
+                .expect("a styler was just made if there was none")
+                .style_with(&self.document, &self.form, self.interaction);
+            self.styled_document = Some(styles);
+        }
         let styles = self
-            .styler
-            .as_mut()
-            .expect("a styler was just made if there was none")
-            .style_with(&self.document, &self.form, self.interaction);
+            .styled_document
+            .as_ref()
+            .expect("styled just now or before");
         self.boxes =
-            otlyra_layout::build_page_box_tree(&self.document, &styles, &self.images, &self.form);
-        self.styled_document = Some(styles);
+            otlyra_layout::build_page_box_tree(&self.document, styles, &self.images, &self.form);
+        self.boxes_stale = false;
         self.styled = true;
         self.layout_stale = true;
         self.damage.add(Damage::of(
@@ -618,7 +635,8 @@ impl PageScene {
         // build rather than on the frame, because a frame served from the cache
         // changed nothing at all and the answer still belongs to the list it
         // hands back.
-        self.dirty = self.changed_rect(retyped, damage, &key);
+        let repainted = std::mem::take(&mut self.repainted);
+        self.dirty = self.changed_rect(retyped, repainted, damage, &key);
         self.dirty_scroll = self.scroll;
         // Built around the middle of the band, reaching a screen past either edge
         // of the viewport, which is where the band's ends are.
@@ -878,12 +896,18 @@ impl PageScene {
     fn changed_rect(
         &self,
         retyped: Option<otlyra_layout::Rect>,
+        repainted: Repainted,
         damage: Damage,
         key: &Painted,
     ) -> Option<otlyra_layout::Rect> {
         if damage.contains(Damage::LAYOUT) {
             return None;
         }
+        let retyped = match repainted {
+            Repainted::Nothing => retyped,
+            Repainted::Area(area) => Some(retyped.map_or(area, |rect| union(rect, area))),
+            Repainted::Everything => return None,
+        };
         let (before, _) = self.painted.as_ref()?;
         if !before.same_but_the_caret(key) {
             return None;
@@ -1088,6 +1112,30 @@ impl PageScene {
     pub fn set_picture(&mut self, url: String, picture: otlyra_gfx::peniko::ImageData) {
         self.background_pictures.insert(url, picture);
         self.damage.add(Damage::PAINT);
+    }
+}
+
+/// What in-place repaints have changed since the last list was built.
+#[derive(Copy, Clone, Debug, Default)]
+enum Repainted {
+    /// Nothing was repainted.
+    #[default]
+    Nothing,
+    /// This part of the page, in page coordinates.
+    Area(otlyra_layout::Rect),
+    /// Something that could not be bounded.
+    Everything,
+}
+
+impl Repainted {
+    /// This and another repaint, which changed `area` — or something that could
+    /// not be bounded, when `None`.
+    fn and(self, area: Option<otlyra_layout::Rect>) -> Self {
+        match (self, area) {
+            (Self::Everything, _) | (_, None) => Self::Everything,
+            (Self::Nothing, Some(area)) => Self::Area(area),
+            (Self::Area(before), Some(area)) => Self::Area(union(before, area)),
+        }
     }
 }
 

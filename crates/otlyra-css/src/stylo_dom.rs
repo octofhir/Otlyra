@@ -1263,6 +1263,16 @@ impl StyleData {
         }
     }
 
+    /// Give each of `nodes` the state bits `states` says it has now, for a
+    /// restyle of the part of the document that changed.
+    pub fn set_states(&mut self, nodes: &[NodeId], states: &crate::state::States<'_>) {
+        for node in nodes {
+            if let Some(slot) = self.slots.get_mut(node) {
+                slot.state = states.state_of(*node);
+            }
+        }
+    }
+
     /// Every state bit an element held when the styles were computed.
     ///
     /// Read back rather than recomputed: it was worked out once for the matcher,
