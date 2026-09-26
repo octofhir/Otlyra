@@ -50,9 +50,10 @@ pub use hints::non_negative_integer;
 pub use style::{
     AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Calc, Clear, ComputedStyle,
-    Corners, Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
-    Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, ListStyle, MaxSize, ObjectFit,
-    Overflow, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
-    TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
+    Corners, DecorationLines, DecorationStyle, Display, FlexBasis, FlexDirection, FlexWrap, Float,
+    FontStyle, Gradient, GradientStop, Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight,
+    ListStyle, MaxSize, ObjectFit, Overflow, Position, Ratio, Repeat, Shadow, Sides, Size,
+    TextAlign, TextCase, TextDecoration, TextTransform, TextWrap, TransformOp, TransformOrigin,
+    VerticalAlign, WhiteSpace,
 };
 pub use style::{FamilyName, FontFamily, GenericFamily};

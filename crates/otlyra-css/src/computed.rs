@@ -22,7 +22,10 @@ use crate::style::{
     Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap, TransformOp,
     TransformOrigin, WhiteSpace,
 };
-use crate::style::{FamilyName, FontFamily, GenericFamily};
+use crate::style::{
+    DecorationLines, DecorationStyle, FamilyName, FontFamily, GenericFamily, TextCase,
+    TextTransform,
+};
 
 /// Convert one element's computed values into the style layout reads.
 pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
@@ -84,6 +87,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         white_space: white_space(values),
         text_wrap: text_wrap(values),
         text_decoration: text_decoration(values),
+        decorations: Arc::from([] as [TextDecoration; 0]),
+        text_transform: text_transform(values),
         margin: Sides {
             top: margin(&values.get_margin().margin_top),
             right: margin(&values.get_margin().margin_right),
@@ -1073,11 +1078,48 @@ fn clear_of(values: &ComputedValues) -> Clear {
     }
 }
 
+/// The element's own `text-decoration`, its colour resolved against the
+/// element's own `color` (css-text-decor-3 §2.3).
 fn text_decoration(values: &ComputedValues) -> TextDecoration {
+    use style::computed_values::text_decoration_style::T as Declared;
+    use style::values::computed::TextDecorationLine as Line;
+
     let line = values.clone_text_decoration_line();
+    let lines = DecorationLines {
+        underline: line.contains(Line::UNDERLINE),
+        overline: line.contains(Line::OVERLINE),
+        line_through: line.contains(Line::LINE_THROUGH),
+    };
+    let (lines, style) = match values.clone_text_decoration_style() {
+        Declared::Solid => (lines, DecorationStyle::Solid),
+        Declared::Double => (lines, DecorationStyle::Double),
+        Declared::Dotted => (lines, DecorationStyle::Dotted),
+        Declared::Dashed => (lines, DecorationStyle::Dashed),
+        Declared::Wavy => (lines, DecorationStyle::Wavy),
+        // Gecko's own style for a line that is there and not drawn.
+        Declared::MozNone => (DecorationLines::NONE, DecorationStyle::Solid),
+    };
     TextDecoration {
-        underline: line.contains(style::values::computed::TextDecorationLine::UNDERLINE),
-        line_through: line.contains(style::values::computed::TextDecorationLine::LINE_THROUGH),
+        lines,
+        style,
+        color: resolve_colour(&values.get_text().text_decoration_color, colour_of(values)),
+    }
+}
+
+/// `text-transform`.
+fn text_transform(values: &ComputedValues) -> TextTransform {
+    use style::values::computed::text::TextTransform as Flags;
+    use style::values::specified::text::TextTransformCase as Case;
+
+    let flags = values.get_inherited_text().text_transform;
+    TextTransform {
+        case: match flags.case() {
+            Case::None => TextCase::None,
+            Case::Uppercase => TextCase::Uppercase,
+            Case::Lowercase => TextCase::Lowercase,
+            Case::Capitalize => TextCase::Capitalize,
+        },
+        full_width: flags.contains(Flags::FULL_WIDTH),
     }
 }
 
@@ -1587,6 +1629,59 @@ pub(crate) mod tests {
         let nowhere = layout_style(html, "div");
         assert_eq!(nowhere.backgrounds.len(), 2);
         assert_eq!(image(&nowhere, 0), None, "about:blank resolves nothing");
+    }
+
+    /// Every `text-transform` keyword, alone and with `full-width`, and the
+    /// value is inherited.
+    #[test]
+    fn text_transform_is_read() {
+        for (value, case, full_width) in [
+            ("none", TextCase::None, false),
+            ("uppercase", TextCase::Uppercase, false),
+            ("lowercase", TextCase::Lowercase, false),
+            ("capitalize", TextCase::Capitalize, false),
+            ("full-width", TextCase::None, true),
+            ("capitalize full-width", TextCase::Capitalize, true),
+        ] {
+            let html = format!("<p style='text-transform: {value}'><b>x</b></p>");
+            let style = layout_style(&html, "b");
+            assert_eq!(
+                style.text_transform,
+                TextTransform { case, full_width },
+                "{value}"
+            );
+        }
+    }
+
+    /// A decoration's lines, style and colour are the declaring element's, and
+    /// its `currentColor` is that element's colour; it is not inherited.
+    #[test]
+    fn text_decoration_is_read_where_it_is_declared() {
+        let html = "<p style='color: blue; text-decoration: underline overline wavy'>\
+                    <b style='color: red'>x</b></p>";
+        let p = layout_style(html, "p");
+        assert_eq!(
+            p.text_decoration.lines,
+            DecorationLines {
+                underline: true,
+                overline: true,
+                line_through: false
+            }
+        );
+        assert_eq!(p.text_decoration.style, DecorationStyle::Wavy);
+        assert_eq!(p.text_decoration.color, Color::from_rgb8(0, 0, 255));
+        assert!(
+            layout_style(html, "b").text_decoration.is_none(),
+            "propagated, not inherited"
+        );
+
+        let coloured = layout_style(
+            "<p style='text-decoration: line-through dotted green'>x</p>",
+            "p",
+        );
+        assert!(coloured.text_decoration.lines.line_through);
+        assert_eq!(coloured.text_decoration.style, DecorationStyle::Dotted);
+        assert_eq!(coloured.text_decoration.color, Color::from_rgb8(0, 128, 0));
     }
 
     /// A page that says nothing about its font gets the browser's standard one,

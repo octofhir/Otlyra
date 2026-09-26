@@ -12,6 +12,7 @@ repository.workspace = true
 otlyra-gfx.workspace = true
 otlyra-css.workspace = true
 otlyra-layout.workspace = true
+otlyra-text.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -119,10 +119,13 @@ fn sides_auto(value: &otlyra_css::Sides<LengthOrAuto>) -> String {
 
 fn decoration(value: &otlyra_css::TextDecoration) -> String {
     let mut out = Vec::new();
-    if value.underline {
+    if value.lines.underline {
         out.push("underline");
     }
-    if value.line_through {
+    if value.lines.overline {
+        out.push("overline");
+    }
+    if value.lines.line_through {
         out.push("line-through");
     }
     if out.is_empty() {

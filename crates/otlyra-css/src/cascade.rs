@@ -1850,6 +1850,7 @@ mod tests {
                 .expect("an anchor");
             crate::computed::to_layout_style(styled.style_of(node).expect("styled"))
                 .text_decoration
+                .lines
                 .underline
         };
         assert!(styled_link("<a href=/x>x</a>"), "a link is underlined");
@@ -1884,12 +1885,14 @@ mod tests {
         assert!(
             style("<p><abbr title=HyperText>HT</abbr>", "abbr")
                 .text_decoration
+                .lines
                 .underline,
             "an abbreviation with its expansion is underlined"
         );
         assert!(
             !style("<p><abbr>HT</abbr>", "abbr")
                 .text_decoration
+                .lines
                 .underline,
             "and one without is not"
         );

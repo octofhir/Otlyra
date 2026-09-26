@@ -39,8 +39,8 @@ mod stack;
 mod web_fonts;
 
 pub use engine::{
-    Brush, Decoration, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, SpacerKind, Strut,
-    TextEngine, TextMetrics, TextSpan,
+    Brush, DecorationMetrics, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, SpacerKind,
+    Strut, TextEngine, TextMetrics, TextSpan,
 };
 pub use stack::{Family, FontStack, GenericFamily};
 pub use web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, matching_faces};

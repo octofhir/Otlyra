@@ -16,6 +16,7 @@ otlyra-text.workspace = true
 html5ever.workspace = true
 slotmap.workspace = true
 tracing.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 otlyra-html.workspace = true

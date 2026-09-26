@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use parley::{BreakReason, Layout, PositionedLayoutItem};
 
-use crate::engine::{Brush, LINE_FIT_SLACK, SpacerKind};
+use crate::engine::{LINE_FIT_SLACK, SpacerKind, SpanBrush};
 
 /// Whether a paragraph's lines have to be chosen here rather than left to the
 /// shaper: whether it has anything the shaper breaks at that CSS does not.
@@ -98,7 +98,7 @@ impl Piece {
 /// Read off lines the shaper already broke, since a cluster's advance is only
 /// to be had from a line; where the lines broke does not change what is on
 /// them.
-fn pieces(layout: &Layout<Brush>, text: &str, kinds: &HashMap<u64, SpacerKind>) -> Vec<Piece> {
+fn pieces(layout: &Layout<SpanBrush>, text: &str, kinds: &HashMap<u64, SpacerKind>) -> Vec<Piece> {
     let mut pieces = Vec::new();
     for line in layout.lines() {
         // A run the shaper split by style comes back as several glyph runs,
@@ -142,7 +142,7 @@ fn pieces(layout: &Layout<Brush>, text: &str, kinds: &HashMap<u64, SpacerKind>) 
 /// and at the two places the shaper breaks where the text does not: after a
 /// no-break space, and between two preserved spaces, the first of which it
 /// hung. Those two are left out.
-fn opportunities(layout: &Layout<Brush>, text: &str) -> Vec<usize> {
+fn opportunities(layout: &Layout<SpanBrush>, text: &str) -> Vec<usize> {
     let lines: Vec<_> = layout.lines().collect();
     lines
         .windows(2)
@@ -166,7 +166,7 @@ fn opportunities(layout: &Layout<Brush>, text: &str) -> Vec<usize> {
 
 /// Break `layout` to no width at all, which leaves every piece of it on some
 /// line and ends a line wherever the shaper would.
-pub(crate) fn break_everywhere(layout: &mut Layout<Brush>) {
+pub(crate) fn break_everywhere(layout: &mut Layout<SpanBrush>) {
     let mut breaker = layout.break_lines();
     breaker.state_mut().set_layout_max_advance(0.0);
     breaker.state_mut().set_line_max_advance(0.0);
@@ -187,8 +187,8 @@ impl Plan {
     /// is the text's own opportunities, broken the same way, when `layout` has
     /// edges in it that would add some of their own.
     pub(crate) fn new(
-        layout: &Layout<Brush>,
-        opportunities_in: &Layout<Brush>,
+        layout: &Layout<SpanBrush>,
+        opportunities_in: &Layout<SpanBrush>,
         text: &str,
         kinds: &HashMap<u64, SpacerKind>,
     ) -> Self {

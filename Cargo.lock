@@ -3624,6 +3624,7 @@ dependencies = [
  "otlyra-text",
  "slotmap",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]

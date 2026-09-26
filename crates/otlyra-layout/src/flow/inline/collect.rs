@@ -506,8 +506,6 @@ pub(in crate::flow) fn span_for<'a>(
         font_weight: style.font_weight,
         font_width: style.font_width,
         italic: is_italic(style),
-        underline: style.text_decoration.underline,
-        strikethrough: style.text_decoration.line_through,
         brush: [color.r, color.g, color.b, color.a],
         line_height: match style.line_height {
             otlyra_css::LineHeight::Normal => None,

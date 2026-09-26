@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Text decorations</title>
+<style>
+  body { margin: 16px; font: 20px/1.6 Times; }
+  .big { font-size: 32px; }
+</style>
+</head>
+<body>
+
+<!-- Propagation: a link's underline reaches the text inside it, in the link's
+     colour; an inline block and a float inside it draw nothing of it. -->
+<p><a href="#">a link with <span style="color: #c00">a red span</span> in it</a></p>
+<p><span style="text-decoration: underline">underlined, <span style="display: inline-block; color: #070">inline block</span>, and after</span></p>
+<p><a href="#"><del>deleted inside a link</del></a> and <del><a href="#">a link inside del</a></del></p>
+
+<!-- The five styles, each in its own colour. -->
+<p class="big">
+  <span style="text-decoration: underline solid #c00">solid</span>
+  <span style="text-decoration: underline double #070">double</span>
+  <span style="text-decoration: underline dotted #00c">dotted</span>
+  <span style="text-decoration: underline dashed #a0a">dashed</span>
+  <span style="text-decoration: underline wavy #c60">wavy</span>
+</p>
+
+<!-- Overline, line-through, and all three at once. -->
+<p class="big">
+  <span style="text-decoration: overline">over</span>
+  <span style="text-decoration: line-through">through</span>
+  <span style="text-decoration: underline overline line-through #06c">all three</span>
+</p>
+
+<!-- A descendant cannot take its ancestor's line away. -->
+<p style="text-decoration: underline">outer <span style="text-decoration: none">still underlined</span> outer</p>
+
+</body>
+</html>

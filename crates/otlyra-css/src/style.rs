@@ -1005,23 +1005,111 @@ pub enum TextWrap {
 
 /// `text-decoration-line`, as the flags it is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub struct TextDecoration {
+pub struct DecorationLines {
     /// A line below the text.
     pub underline: bool,
+    /// A line above it.
+    pub overline: bool,
     /// A line through it.
     pub line_through: bool,
+}
+
+impl DecorationLines {
+    /// No line at all — the initial value.
+    pub const NONE: Self = Self {
+        underline: false,
+        overline: false,
+        line_through: false,
+    };
+
+    /// Whether any line is drawn.
+    pub fn is_none(self) -> bool {
+        !self.underline && !self.overline && !self.line_through
+    }
+}
+
+/// `text-decoration-style`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum DecorationStyle {
+    /// One line.
+    #[default]
+    Solid,
+    /// Two lines.
+    Double,
+    /// A line of dots.
+    Dotted,
+    /// A line of dashes.
+    Dashed,
+    /// A wave.
+    Wavy,
+}
+
+/// `text-decoration`: which lines an element draws, how, and in what colour.
+///
+/// This is the element's own value. What a text run is decorated with is every
+/// decoration in effect on it, its ancestors' included (css-text-decor-3
+/// §2.1), which is [`ComputedStyle::decorations`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TextDecoration {
+    /// `text-decoration-line`.
+    pub lines: DecorationLines,
+    /// `text-decoration-style`.
+    pub style: DecorationStyle,
+    /// `text-decoration-color`, already resolved: `currentColor` is the colour
+    /// of the element that declared the decoration, not of the text under it.
+    pub color: Color,
 }
 
 impl TextDecoration {
     /// No decoration at all — the initial value.
     pub const NONE: Self = Self {
-        underline: false,
-        line_through: false,
+        lines: DecorationLines::NONE,
+        style: DecorationStyle::Solid,
+        color: Color::BLACK,
     };
 
     /// Whether anything is drawn.
     pub fn is_none(self) -> bool {
-        !self.underline && !self.line_through
+        self.lines.is_none()
+    }
+}
+
+/// The case part of `text-transform` (CSS Text 3 §2.1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TextCase {
+    /// Left as written.
+    #[default]
+    None,
+    /// Every letter in upper case.
+    Uppercase,
+    /// Every letter in lower case.
+    Lowercase,
+    /// The first letter of each word in title case.
+    Capitalize,
+}
+
+/// `text-transform`.
+///
+/// `full-size-kana` is read by the cascade and not applied here: small kana
+/// stay small. `math-auto` applies to MathML, which is not laid out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct TextTransform {
+    /// Which case the letters are put in.
+    pub case: TextCase,
+    /// `full-width`: ASCII set as its full-width forms.
+    pub full_width: bool,
+}
+
+impl TextTransform {
+    /// No transform — the initial value.
+    pub const NONE: Self = Self {
+        case: TextCase::None,
+        full_width: false,
+    };
+
+    /// Whether the text is left as it is.
+    pub fn is_none(self) -> bool {
+        self == Self::NONE
     }
 }
 
@@ -1307,13 +1395,17 @@ pub struct ComputedStyle {
     pub white_space: WhiteSpace,
     /// `text-wrap-mode`. Inherited.
     pub text_wrap: TextWrap,
-    /// `text-decoration-line`.
-    ///
-    /// Not inherited in CSS — it *propagates*, which is a different thing: a
-    /// descendant cannot turn its ancestor's underline off. Propagating it as
-    /// inheritance is the approximation here, and it differs only for a case we
-    /// cannot express yet (`text-decoration: none` on a child).
+    /// `text-decoration`, the element's own. Not inherited: it *propagates*
+    /// (css-text-decor-3 §2.1), which is [`Self::decorations`].
     pub text_decoration: TextDecoration,
+    /// Every decoration in effect on this box's text, outermost first: those
+    /// its ancestors propagated to it, then its own. A descendant cannot take
+    /// one away — `text-decoration: none` on it removes nothing but its own.
+    /// Filled in by the box tree, which knows which boxes a decoration reaches;
+    /// carried to an anonymous box, which is part of its parent's contents.
+    pub decorations: Arc<[TextDecoration]>,
+    /// `text-transform`. Inherited.
+    pub text_transform: TextTransform,
     /// `width`.
     pub width: Size,
     /// `height`.
@@ -1423,6 +1515,8 @@ impl Default for ComputedStyle {
             white_space: WhiteSpace::Collapse,
             text_wrap: TextWrap::Wrap,
             text_decoration: TextDecoration::NONE,
+            decorations: Arc::from([] as [TextDecoration; 0]),
+            text_transform: TextTransform::NONE,
             margin: Sides::all(LengthOrAuto::ZERO),
             padding: Sides::all(Length::ZERO),
             border: Sides::all(Border::NONE),
@@ -1488,7 +1582,8 @@ impl ComputedStyle {
             border_collapse: parent.border_collapse,
             white_space: parent.white_space,
             text_wrap: parent.text_wrap,
-            text_decoration: parent.text_decoration,
+            decorations: Arc::clone(&parent.decorations),
+            text_transform: parent.text_transform,
             text_align: parent.text_align,
             ..Self::default()
         }

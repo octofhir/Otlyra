@@ -36,6 +36,7 @@ mod gradient;
 mod scrollbar;
 mod shadow;
 mod shape;
+mod text;
 mod widget;
 
 pub use scrollbar::{scrollbar_thumb, scrollbar_travel};
@@ -609,58 +610,7 @@ fn paint(
         FragmentKind::Image(_) => {}
 
         FragmentKind::Text(run) if !run.glyphs.is_empty() => {
-            // Decorations first, so the glyphs sit on top of them: a line drawn
-            // over text is a strikethrough whatever it was meant to be. The offset
-            // and thickness come from the font, by way of the shaper.
-            for decoration in [run.underline.as_ref(), run.strikethrough.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                let baseline = f64::from(run.glyphs[0].y);
-                let top = f64::from(rect.y - scroll_y) + baseline - f64::from(decoration.offset);
-                list.push(DisplayItem::Fill {
-                    style: Fill::NonZero,
-                    transform: Affine::IDENTITY,
-                    brush: Brush::Solid(brush_to_color(run.brush)),
-                    brush_transform: None,
-                    shape: KurboRect::new(
-                        f64::from(rect.x),
-                        top,
-                        f64::from(rect.x) + f64::from(run.advance),
-                        top + f64::from(decoration.thickness),
-                    )
-                    .to_path(PATH_TOLERANCE),
-                });
-            }
-
-            // The text's own shadows, behind it: the same glyphs, moved and
-            // softened. A shadow has no spread — there is nothing to grow but the
-            // letters themselves.
-            for shadow in &fragment.style.text_shadows {
-                if shadow.color.components[3] <= 0.0 {
-                    continue;
-                }
-                list.push_glyph_run(
-                    &run.font,
-                    run.font_size,
-                    run.normalized_coords.clone(),
-                    Brush::Solid(shadow.color),
-                    origin * Affine::translate((f64::from(shadow.x), f64::from(shadow.y))),
-                    true,
-                    f64::from(shadow.blur),
-                    run.glyphs.clone(),
-                );
-            }
-
-            list.push_glyphs(
-                &run.font,
-                run.font_size,
-                run.normalized_coords.clone(),
-                Brush::Solid(brush_to_color(run.brush)),
-                origin,
-                true,
-                run.glyphs.clone(),
-            );
+            text::paint_text_run(list, fragment, run, rect, origin, scroll_y);
         }
 
         FragmentKind::Text(_) => {}

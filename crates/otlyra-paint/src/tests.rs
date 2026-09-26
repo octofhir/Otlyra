@@ -744,6 +744,139 @@ fn text_shadows_are_drawn_behind_the_text() {
     assert_eq!(shadow_at[5] - text_at[5], 3.0, "and down by three");
 }
 
+/// What a run of text comes out as, in order: a line drawn as a fill with its
+/// colour and top edge, a line drawn as a stroke with its colour, or glyphs with
+/// theirs. The canvas, a white fill, is left out.
+#[derive(Debug, PartialEq)]
+enum Drawn {
+    Line(Color, f64),
+    Stroke(Color, bool),
+    Glyphs(Color),
+}
+
+fn drawn(list: &DisplayList) -> Vec<Drawn> {
+    list.items()
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Fill {
+                brush: Brush::Solid(colour),
+                shape,
+                ..
+            } if *colour != Color::WHITE => Some(Drawn::Line(*colour, shape.bounding_box().y0)),
+            DisplayItem::Stroke {
+                brush: Brush::Solid(colour),
+                style,
+                ..
+            } => Some(Drawn::Stroke(*colour, !style.dash_pattern.is_empty())),
+            DisplayItem::Glyphs {
+                brush: Brush::Solid(colour),
+                ..
+            } => Some(Drawn::Glyphs(*colour)),
+            _ => None,
+        })
+        .collect()
+}
+
+const RED: Color = Color::from_rgb8(255, 0, 0);
+const GREEN: Color = Color::from_rgb8(0, 128, 0);
+const BLUE: Color = Color::from_rgb8(0, 0, 255);
+
+/// A link's underline reaches the text of a span inside it, in the link's
+/// colour, not the span's: the decoration is the link's.
+#[test]
+fn a_decoration_reaches_inside_in_its_own_colour() {
+    let list = page(
+        "<style>body { margin: 0 }</style>\
+         <a style='color: rgb(0, 0, 255); text-decoration: underline'>\
+         <span style='color: rgb(255, 0, 0)'>x</span></a>",
+        0.0,
+    );
+    let drawn = drawn(&list);
+    assert!(
+        matches!(drawn.as_slice(), [Drawn::Line(line, _), Drawn::Glyphs(glyphs)]
+            if *line == BLUE && *glyphs == RED),
+        "a blue line under red glyphs: {drawn:?}"
+    );
+}
+
+/// An inline block and a float inside an underlined span are not underlined,
+/// and `text-decoration-color` names the line's colour.
+#[test]
+fn a_decoration_stops_at_an_atomic_inline_and_a_float() {
+    let list = page(
+        "<style>body { margin: 0 }</style>\
+         <p><span style='text-decoration: underline rgb(0, 128, 0)'>a\
+         <span style='display: inline-block'>b</span>\
+         <span style='float: left'>c</span></span></p>",
+        0.0,
+    );
+    let lines = drawn(&list)
+        .into_iter()
+        .filter(|item| matches!(item, Drawn::Line(colour, _) if *colour == GREEN))
+        .count();
+    assert_eq!(lines, 1, "only the span's own text is underlined");
+}
+
+/// A `<del>` inside a link has both lines: the link's under the glyphs and its
+/// own through them, drawn after them.
+#[test]
+fn lines_through_are_drawn_over_the_glyphs_and_the_rest_under_them() {
+    let list = page(
+        "<style>body { margin: 0; color: rgb(0, 0, 255) }</style>\
+         <a href=#><del>x</del></a>",
+        0.0,
+    );
+    let drawn = drawn(&list);
+    let glyphs = drawn
+        .iter()
+        .position(|item| matches!(item, Drawn::Glyphs(_)))
+        .expect("the glyphs");
+    let lines: Vec<(usize, f64)> = drawn
+        .iter()
+        .enumerate()
+        .filter_map(|(at, item)| match item {
+            Drawn::Line(_, top) => Some((at, *top)),
+            Drawn::Stroke(..) | Drawn::Glyphs(_) => None,
+        })
+        .collect();
+    assert_eq!(lines.len(), 2, "{drawn:?}");
+    let (under, through) = (lines[0], lines[1]);
+    assert!(under.0 < glyphs && through.0 > glyphs, "{drawn:?}");
+    assert!(
+        through.1 < under.1,
+        "the line through is above the underline"
+    );
+}
+
+/// An overline sits above the letters, over the line through them, and a
+/// dotted line is a stroke of dots.
+#[test]
+fn an_overline_is_on_top_and_a_dotted_line_is_dots() {
+    let list = page(
+        "<style>body { margin: 0 }</style>\
+         <p style='text-decoration: overline line-through'>X</p>\
+         <p style='text-decoration: underline dotted rgb(255, 0, 0)'>X</p>",
+        0.0,
+    );
+    let drawn = drawn(&list);
+    let tops: Vec<f64> = drawn
+        .iter()
+        .filter_map(|item| match item {
+            Drawn::Line(_, top) => Some(*top),
+            Drawn::Stroke(..) | Drawn::Glyphs(_) => None,
+        })
+        .collect();
+    assert_eq!(tops.len(), 2, "{drawn:?}");
+    assert!(
+        tops[0] < tops[1],
+        "overline above the line through: {tops:?}"
+    );
+    assert!(
+        drawn.contains(&Drawn::Stroke(RED, true)),
+        "a dashed stroke for the dots: {drawn:?}"
+    );
+}
+
 /// The one tile a background picture is placed by: where it starts, how large
 /// it is, and how far the fill that repeats it reaches.
 fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::ImageSampler) {

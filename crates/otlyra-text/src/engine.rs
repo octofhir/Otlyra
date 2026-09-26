@@ -81,9 +81,40 @@ impl Strut {
 }
 
 /// The families whose ascent is lengthened before a line is measured from it.
-///
-/// See [`TextEngine::normal_line_height`] for what is done to them and why.
 const LENGTHENED_FAMILIES: &[&str] = &["Times", "Helvetica", "Courier"];
+
+/// How far a font of `family` reaches above its baseline, as a browser
+/// measures it: the font's own ascent, and for three families more.
+///
+/// The three families a browser lengthens. Their vertical metrics are the ones
+/// the platform shipped in the 1980s and are tighter than the Microsoft-issued
+/// faces of the same names that the web was built against; left alone, a page
+/// set in them has visibly less air between its lines than the same page
+/// anywhere else. Fifteen per cent of the em box, added to the ascent, is the
+/// correction every engine settled on — and every measure taken from the
+/// ascent, an overline's place among them, is taken from the lengthened one.
+fn browser_ascent(family: &str, ascent: f32, descent: f32) -> f32 {
+    if LENGTHENED_FAMILIES
+        .iter()
+        .any(|name| family.eq_ignore_ascii_case(name))
+    {
+        ascent + ((ascent + descent) * 0.15 + 0.5).floor()
+    } else {
+        ascent
+    }
+}
+
+/// The family name a font file gives itself, typographic first.
+fn family_name(font: &parley::FontData) -> Option<String> {
+    use skrifa::MetadataProvider as _;
+    use skrifa::string::StringId;
+
+    let font = skrifa::FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+    [StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME]
+        .into_iter()
+        .find_map(|id| font.localized_strings(id).english_or_first())
+        .map(|name| name.chars().collect())
+}
 
 /// The colour carried through shaping, as straight RGBA bytes.
 ///
@@ -91,6 +122,19 @@ const LENGTHENED_FAMILIES: &[&str] = &["Times", "Helvetica", "Courier"];
 /// lets one paragraph contain differently coloured spans without shaping each of
 /// them separately and losing the line breaks between them.
 pub type Brush = [u8; 4];
+
+/// What the shaper carries for each span: its colour, and which span it is.
+///
+/// The span's index is what keeps a run of glyphs inside one span. The shaper
+/// ends a run where the style changes, and two neighbouring spans of the same
+/// colour and font would otherwise be one run — which the box tree would then
+/// give to the first span's box, with that box's decorations, its link and
+/// its hit testing, for text that is not its own.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub(crate) struct SpanBrush {
+    colour: Brush,
+    span: usize,
+}
 
 /// One run of glyphs: one font, one size, one colour, already positioned.
 ///
@@ -106,10 +150,8 @@ pub struct ShapedRun {
     pub normalized_coords: Vec<i16>,
     /// The colour this run was requested in.
     pub brush: Brush,
-    /// An underline, if the run asked for one.
-    pub underline: Option<Decoration>,
-    /// A strikethrough, if the run asked for one.
-    pub strikethrough: Option<Decoration>,
+    /// Where the run's font puts the lines a decoration draws.
+    pub decoration_metrics: DecorationMetrics,
     /// Which line of the paragraph the run belongs to.
     pub line: usize,
     /// Where the run starts along its line, in logical pixels.
@@ -133,17 +175,19 @@ pub struct ShapedRun {
     pub glyphs: Vec<Glyph>,
 }
 
-/// A decoration line under or through a run, with the metrics the font gives it.
+/// What a run's font says about the lines a text decoration draws, at the
+/// run's size.
 ///
-/// Taken from the font rather than guessed from the size: where an underline sits
-/// and how thick it is are design decisions the typeface already made, and a
-/// constant fraction of the em looks wrong in exactly the faces people notice.
+/// Whether a line is drawn at all, and how thick, is the style's to say, not
+/// the shaper's; where an underline sits is a design decision the typeface
+/// already made, and a constant fraction of the em looks wrong in exactly the
+/// faces people notice.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Decoration {
-    /// Distance from the baseline, positive upward.
-    pub offset: f32,
-    /// Thickness in logical pixels.
-    pub thickness: f32,
+pub struct DecorationMetrics {
+    /// The underline's distance from the baseline, positive upward.
+    pub underline_offset: f32,
+    /// How far the font reaches above the baseline.
+    pub ascent: f32,
 }
 
 /// One line of a shaped paragraph.
@@ -194,10 +238,6 @@ pub struct TextSpan<'a> {
     pub font_width: f32,
     /// Whether the run is italic.
     pub italic: bool,
-    /// Whether to draw a line under the run.
-    pub underline: bool,
-    /// Whether to draw a line through it.
-    pub strikethrough: bool,
     /// Colour, straight RGBA.
     pub brush: Brush,
     /// Line height in logical pixels, or `None` for the font's own.
@@ -231,8 +271,6 @@ impl<'a> TextSpan<'a> {
             font_weight: 400,
             font_width: 100.0,
             italic: false,
-            underline: false,
-            strikethrough: false,
             brush: [0, 0, 0, 255],
             line_height: None,
             letter_spacing: 0.0,
@@ -360,7 +398,7 @@ impl ShapedText {
 /// built once and kept, not built per paragraph.
 pub struct TextEngine {
     fonts: FontContext,
-    layout: LayoutContext<[u8; 4]>,
+    layout: LayoutContext<SpanBrush>,
     /// The families pages have brought with `@font-face`.
     web: WebFamilies,
 }
@@ -474,21 +512,8 @@ impl TextEngine {
             skrifa::instance::LocationRef::default(),
         );
 
-        let mut ascent = metrics.ascent;
         let descent = -metrics.descent;
-
-        // The three families a browser lengthens. Their vertical metrics are the
-        // ones the platform shipped in the 1980s and are tighter than the
-        // Microsoft-issued faces of the same names that the web was built against;
-        // left alone, a page set in them has visibly less air between its lines
-        // than the same page anywhere else. Fifteen per cent of the em box, added
-        // to the ascent, is the correction every engine settled on.
-        if LENGTHENED_FAMILIES
-            .iter()
-            .any(|name| family.eq_ignore_ascii_case(name))
-        {
-            ascent += ((ascent + descent) * 0.15 + 0.5).floor();
-        }
+        let ascent = browser_ascent(&family, metrics.ascent, descent);
 
         // Rounded one at a time and then added, rather than added and rounded. The
         // difference is a pixel on many fonts and it is the difference between
@@ -649,7 +674,7 @@ impl TextEngine {
         spans: &[TextSpan<'_>],
         spacers: &[Spacer],
         text: &str,
-    ) -> parley::Layout<Brush> {
+    ) -> parley::Layout<SpanBrush> {
         let mut ranges = Vec::with_capacity(spans.len());
         let mut boundaries = Vec::with_capacity(spans.len() + 1);
         let mut end = 0;
@@ -689,7 +714,7 @@ impl TextEngine {
                 height: spacer.height,
             });
         }
-        for (span, range) in spans.iter().zip(ranges) {
+        for (index, (span, range)) in spans.iter().zip(ranges).enumerate() {
             if range.is_empty() {
                 continue;
             }
@@ -726,12 +751,13 @@ impl TextEngine {
                 }),
                 range.clone(),
             );
-            builder.push(StyleProperty::Underline(span.underline), range.clone());
             builder.push(
-                StyleProperty::Strikethrough(span.strikethrough),
+                StyleProperty::Brush(SpanBrush {
+                    colour: span.brush,
+                    span: index,
+                }),
                 range.clone(),
             );
-            builder.push(StyleProperty::Brush(span.brush), range.clone());
             if let Some(line_height) = span.line_height {
                 builder.push(
                     StyleProperty::LineHeight(parley::LineHeight::Absolute(line_height)),
@@ -878,7 +904,7 @@ pub(crate) const LINE_FIT_SLACK: f32 = 1.0 / 64.0;
 /// depends on where the line landed. Where there is a `plan`, it chooses where
 /// each line ends and the shaper is given the advance that ends it there.
 fn break_lines(
-    layout: &mut parley::Layout<Brush>,
+    layout: &mut parley::Layout<SpanBrush>,
     plan: Option<&Plan>,
     mut line_width: impl FnMut(usize, f32) -> Option<f32>,
 ) {
@@ -1027,7 +1053,7 @@ fn shift_after(
 /// claims to be part of. It is dropped here rather than handed on as a glyph nobody
 /// asked to draw.
 fn collect(
-    layout: &parley::Layout<Brush>,
+    layout: &parley::Layout<SpanBrush>,
     text: &str,
     kinds: &HashMap<u64, SpacerKind>,
 ) -> ShapedText {
@@ -1040,6 +1066,9 @@ fn collect(
     // shaper measured. See the spacer pass below.
     let mut reached: Vec<(f32, f32)> = Vec::new();
     let mut first_baseline = 0.0;
+    // Each font's own family name, read once per paragraph: what decides
+    // whether its ascent is lengthened.
+    let mut families: HashMap<(u64, u32), String> = HashMap::new();
 
     // How many of each run's clusters have already been handed out. One run is
     // split into several glyph runs where the style changes along it — with one
@@ -1097,21 +1126,18 @@ fn collect(
                 }
             };
             let style = glyph_run.style();
-            let brush = style.brush;
+            let brush = style.brush.colour;
             let run = glyph_run.run();
             let metrics = run.metrics();
 
-            let underline = style.underline.as_ref().map(|decoration| Decoration {
-                offset: decoration.offset.unwrap_or(metrics.underline_offset),
-                thickness: decoration.size.unwrap_or(metrics.underline_size).max(1.0),
-            });
-            let strikethrough = style.strikethrough.as_ref().map(|decoration| Decoration {
-                offset: decoration.offset.unwrap_or(metrics.strikethrough_offset),
-                thickness: decoration
-                    .size
-                    .unwrap_or(metrics.strikethrough_size)
-                    .max(1.0),
-            });
+            let key = (run.font().data.id(), run.font().index);
+            let family = families
+                .entry(key)
+                .or_insert_with(|| family_name(run.font()).unwrap_or_default());
+            let decoration_metrics = DecorationMetrics {
+                underline_offset: metrics.underline_offset,
+                ascent: browser_ascent(family, metrics.ascent, metrics.descent),
+            };
 
             let run_index = run.index();
             if consumed.len() <= run_index {
@@ -1150,8 +1176,7 @@ fn collect(
                 font_size: run.font_size(),
                 normalized_coords: run.normalized_coords().to_vec(),
                 brush,
-                underline,
-                strikethrough,
+                decoration_metrics,
                 line: index,
                 offset_x: glyph_run.offset(),
                 advance: glyph_run.advance(),
@@ -1227,7 +1252,7 @@ fn collect(
 /// happens to be blank, and `<td>&nbsp;</td>` is a cell a space wide — and nor
 /// does any other space Unicode has that CSS does not collapse.
 fn hanging_space(
-    line: &parley::Line<'_, Brush>,
+    line: &parley::Line<'_, SpanBrush>,
     text: &str,
     kinds: &HashMap<u64, SpacerKind>,
 ) -> f32 {
@@ -1270,7 +1295,7 @@ fn hanging_space(
 /// carries a half-pixel of slack; overshooting by one cluster would attribute a
 /// character to the wrong element, which for a link means the wrong destination.
 fn consume_clusters(
-    run: &parley::Run<'_, Brush>,
+    run: &parley::Run<'_, SpanBrush>,
     from: &mut usize,
     advance: f32,
 ) -> (std::ops::Range<usize>, Vec<usize>) {

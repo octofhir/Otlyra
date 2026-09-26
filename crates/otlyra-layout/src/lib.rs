@@ -36,6 +36,7 @@ mod fonts;
 pub mod fragment;
 pub mod selection;
 pub mod srcset;
+mod text_transform;
 pub mod widget_metrics;
 
 pub use box_tree::{

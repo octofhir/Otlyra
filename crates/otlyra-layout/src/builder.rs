@@ -5,6 +5,7 @@
 //! with the page's own, and a box tree built without it would be a page styled
 //! by rules no page can see or override.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use html5ever::ns;
@@ -16,6 +17,7 @@ use otlyra_dom::{Document, ElementData, FormState, NodeData, NodeId};
 use crate::box_tree::{
     BoxId, BoxKind, BoxNode, BoxTree, CellSpan, Control, ControlKind, ControlState, Replaced,
 };
+use crate::text_transform::Casing;
 
 /// Build the box tree for `document` using the styles the cascade computed for
 /// it.
@@ -227,6 +229,46 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
     }
 }
 
+/// The decorations in effect on a box: those its parent's box has, if they
+/// reach it, then its own (css-text-decor-3 §2.1).
+///
+/// The list is shared with the parent's while the box adds nothing to it,
+/// which is almost every box on a page.
+fn decorations_for(
+    parent: &Arc<[otlyra_css::TextDecoration]>,
+    own: otlyra_css::TextDecoration,
+    receives: bool,
+) -> Arc<[otlyra_css::TextDecoration]> {
+    match (receives, own.is_none()) {
+        (true, true) => Arc::clone(parent),
+        (true, false) => parent.iter().copied().chain([own]).collect(),
+        (false, true) => Arc::from([] as [otlyra_css::TextDecoration; 0]),
+        (false, false) => Arc::from([own]),
+    }
+}
+
+/// Whether a box receives the decorations its parent's box is drawing.
+///
+/// Propagation reaches a box's in-flow contents and stops at an atomic inline —
+/// a picture, an inline block, flex, grid or table — at a float, and at an
+/// absolutely positioned box: those draw only what they declare themselves.
+fn receives_decorations(style: &ComputedStyle, replaced: bool) -> bool {
+    let atomic_inline = match style.display {
+        Display::Inline => replaced,
+        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid => true,
+        Display::None
+        | Display::Block
+        | Display::Flex
+        | Display::Grid
+        | Display::Table
+        | Display::TableRowGroup
+        | Display::TableRow
+        | Display::TableCell
+        | Display::TableCaption => false,
+    };
+    !atomic_inline && style.float == otlyra_css::Float::None && !style.position.is_out_of_flow()
+}
+
 /// Rewrite the text a control's box shows, as the builder would have written it.
 ///
 /// The one mutation of a built box tree there is, and it exists for one thing: a
@@ -300,10 +342,13 @@ fn collapse_white_space(tree: &mut BoxTree, id: BoxId) {
     }
 }
 
-/// One inline formatting context, collapsed.
+/// One inline formatting context, collapsed, and each piece of its text in
+/// the case its style asks for — which comes after white space is processed
+/// and before anything is shaped (CSS Text 3 Appendix A).
 fn collapse_context(tree: &mut BoxTree, root: BoxId) {
     let items = inline_items(tree, root);
     let mut state = Run::default();
+    let mut casing = Casing::default();
     let mut written: Vec<(BoxId, String)> = Vec::new();
     // How far back a trim may reach. Anything before this is not at the end of
     // anything: something that is not text came after it, and the space in
@@ -319,13 +364,18 @@ fn collapse_context(tree: &mut BoxTree, root: BoxId) {
                     continue;
                 };
                 let collapsed = state.take(text, node.style.white_space);
-                written.push((id, collapsed));
+                let shown = match casing.apply(&collapsed, node.style.text_transform) {
+                    Cow::Owned(cased) => cased,
+                    Cow::Borrowed(_) => collapsed,
+                };
+                written.push((id, shown));
             }
             // A picture or an inline-block is content: what follows it is a word
             // gap rather than the start of the context, and what came before it
             // is not trailing white space.
             Item::Content => {
                 state.after_content();
+                casing.interrupt();
                 sealed = written.len();
             }
             Item::Break => {
@@ -334,6 +384,7 @@ fn collapse_context(tree: &mut BoxTree, root: BoxId) {
                 // in one is a line that ends where the words do.
                 trim_trailing(&mut written[sealed..]);
                 state.after_break();
+                casing.interrupt();
                 sealed = written.len();
             }
         }
@@ -1069,10 +1120,9 @@ impl Builder<'_> {
         match &dom.data {
             NodeData::Element(element) => {
                 let name = &*element.name.local;
-                let Some(style) = self.style_for(node) else {
+                let Some(mut style) = self.style_for(node) else {
                     return;
                 };
-                let style = Arc::new(style);
 
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
@@ -1081,7 +1131,15 @@ impl Builder<'_> {
                     return;
                 }
 
-                let kind = match self.replaced_content(element, node) {
+                let replaced_content = self.replaced_content(element, node);
+                style.decorations = decorations_for(
+                    &parent_style.decorations,
+                    style.text_decoration,
+                    receives_decorations(&style, replaced_content.is_some()),
+                );
+                let style = Arc::new(style);
+
+                let kind = match replaced_content {
                     Some(content) => BoxKind::Replaced(content),
                     None => match style.display {
                         Display::None => return,
@@ -1441,6 +1499,36 @@ mod tests {
     /// sees.
     fn text_of(html: &str) -> String {
         runs_of(html).concat()
+    }
+
+    /// `capitalize` follows a word from one box into the next, and an
+    /// upper-case span changes its own text and nothing around it.
+    #[test]
+    fn text_transform_follows_words_across_boxes() {
+        assert_eq!(
+            runs_of("<p style='text-transform: capitalize'><b>h</b>ello world"),
+            ["H", "ello World"]
+        );
+        assert_eq!(
+            runs_of(
+                "<p style='text-transform: lowercase'>A <span style='text-transform: uppercase'>b</span> C"
+            ),
+            ["a ", "B", " c"]
+        );
+    }
+
+    /// White space is collapsed before the case changes, so a transform does
+    /// not bring back what collapsing took away.
+    #[test]
+    fn white_space_collapses_before_text_is_transformed() {
+        assert_eq!(
+            text_of("<p style='text-transform: uppercase'>  two   words  "),
+            "TWO WORDS"
+        );
+        assert_eq!(
+            text_of("<p style='text-transform: full-width'>a  b"),
+            "ａ\u{3000}ｂ"
+        );
     }
 
     /// What a browser without plug-ins or frames would show, and a popover
