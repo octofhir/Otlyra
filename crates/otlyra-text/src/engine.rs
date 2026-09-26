@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use otlyra_gfx::Glyph;
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontData, FontVariation, FontVariations,
-    LayoutContext, PositionedLayoutItem, StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontData, FontFeature, FontFeatures, FontVariation,
+    FontVariations, LayoutContext, OverflowWrap, PositionedLayoutItem, StyleProperty, WordBreak,
 };
 
 use crate::breaking::{self, Glyphs, Plan};
@@ -56,6 +56,30 @@ fn variations(span: &TextSpan<'_>) -> FontVariations<'static> {
             .map(|&(axis, value)| FontVariation::new(parley::setting::Tag::new(&axis), value)),
     );
     FontVariations::List(settings.into())
+}
+
+/// The features one span is shaped with.
+///
+/// What the page asked for, after the optional ligatures turned off where the
+/// text is letter-spaced: CSS Text 3 §8.2 has a UA not apply them there, since
+/// a ligature cannot be spaced apart. The page's own settings come after, so
+/// one that turns a ligature back on is obeyed.
+fn features(span: &TextSpan<'_>) -> FontFeatures<'static> {
+    let spaced: &[&[u8; 4]] = if span.letter_spacing != 0.0 {
+        &[b"liga", b"clig", b"dlig", b"hlig"]
+    } else {
+        &[]
+    };
+    let settings: Vec<FontFeature> = spaced
+        .iter()
+        .map(|tag| FontFeature::new(parley::setting::Tag::new(tag), 0))
+        .chain(
+            span.features
+                .iter()
+                .map(|&(tag, value)| FontFeature::new(parley::setting::Tag::new(&tag), value)),
+        )
+        .collect();
+    FontFeatures::List(settings.into())
 }
 
 /// How far a font of one size reaches above and below its baseline.
@@ -289,6 +313,15 @@ pub struct TextSpan<'a> {
     /// `font-variation-settings`: axis tags and the values asked for. Borrowed,
     /// for the same reason the text is, and empty on almost every span there is.
     pub variations: &'a [([u8; 4], f32)],
+    /// The OpenType features asked for, a later setting of a tag winning.
+    /// Borrowed, and empty on almost every span, as the variations are.
+    pub features: &'a [([u8; 4], u16)],
+    /// Whether a line may break inside the span at all: `text-wrap-mode`.
+    pub wraps: bool,
+    /// `word-break`.
+    pub word_break: WordBreak,
+    /// `overflow-wrap`.
+    pub overflow_wrap: OverflowWrap,
 }
 
 impl<'a> TextSpan<'a> {
@@ -312,6 +345,10 @@ impl<'a> TextSpan<'a> {
             word_spacing: 0.0,
             optical_sizing: true,
             variations: &[],
+            features: &[],
+            wraps: true,
+            word_break: WordBreak::Normal,
+            overflow_wrap: OverflowWrap::Normal,
         }
     }
 
@@ -675,7 +712,8 @@ impl TextEngine {
             .collect();
 
         let mut layout = self.build_layout(spans, spacers, &text);
-        let plan = (wraps && breaking::needs_plan(&text, &kinds)).then(|| {
+        let any_unwrapping = spans.iter().any(|span| !span.wraps);
+        let plan = (wraps && breaking::needs_plan(&text, &kinds, any_unwrapping)).then(|| {
             breaking::break_everywhere(&mut layout);
             // The text's own opportunities, from the same text without the
             // edges of its inline boxes, which the shaper would break at too.
@@ -730,7 +768,17 @@ impl TextEngine {
         let mut builder = self
             .layout
             .ranged_builder(&mut self.fonts, text, 1.0, false);
-        builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+        // Chromium's tailoring of UAX #14 for ASCII is its tailoring for
+        // `word-break: normal`: it decides every pair of letters, and would
+        // take back the breaks `break-all` adds and give back those `keep-all`
+        // removes. The shaper applies it to the whole paragraph or none of it,
+        // so a paragraph with any other `word-break` in it goes without.
+        if spans
+            .iter()
+            .all(|span| span.word_break == WordBreak::Normal)
+        {
+            builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+        }
 
         // The first span's font, as the default under the ranged ones. A range is
         // only pushed for a span that has text in it, so a paragraph of nothing but
@@ -785,6 +833,20 @@ impl TextEngine {
                 range.clone(),
             );
             builder.push(StyleProperty::WordSpacing(span.word_spacing), range.clone());
+            builder.push(StyleProperty::FontFeatures(features(span)), range.clone());
+            builder.push(
+                StyleProperty::TextWrapMode(if span.wraps {
+                    parley::TextWrapMode::Wrap
+                } else {
+                    parley::TextWrapMode::NoWrap
+                }),
+                range.clone(),
+            );
+            builder.push(StyleProperty::WordBreak(span.word_break), range.clone());
+            builder.push(
+                StyleProperty::OverflowWrap(span.overflow_wrap),
+                range.clone(),
+            );
             builder.push(
                 StyleProperty::FontStyle(if span.italic {
                     parley::FontStyle::Italic
@@ -1629,6 +1691,119 @@ mod tests {
             (jumped - expected).abs() < 0.5,
             "{jumped} rather than {expected}"
         );
+    }
+
+    /// A word too long for its line overflows it unless `overflow-wrap` lets
+    /// it break, and then it breaks into lines no wider than the room.
+    #[test]
+    fn overflow_wrap_breaks_a_word_only_when_asked() {
+        let mut engine = engine();
+        let shaped = |engine: &mut TextEngine, wrap| {
+            let span = TextSpan {
+                overflow_wrap: wrap,
+                ..TextSpan::new("Supercalifragilistic", test_stack(), 16.0)
+            };
+            engine.shape_spans(&[span], &[], Some(48.0))
+        };
+        assert_eq!(shaped(&mut engine, OverflowWrap::Normal).lines.len(), 1);
+        let broken = shaped(&mut engine, OverflowWrap::Anywhere);
+        assert!(broken.lines.len() > 1);
+        assert!(
+            broken
+                .lines
+                .iter()
+                .all(|line| line.width <= 48.0 + LINE_FIT_SLACK)
+        );
+    }
+
+    /// `word-break: break-all` breaks inside words; a span that may not wrap
+    /// keeps its words on one line in a paragraph that does.
+    #[test]
+    fn breaking_is_the_span_s_own() {
+        let mut engine = engine();
+        let all = TextSpan {
+            word_break: WordBreak::BreakAll,
+            ..TextSpan::new("abcdefghij klmnop", test_stack(), 16.0)
+        };
+        let shaped = engine.shape_spans(&[all], &[], Some(40.0));
+        assert!(
+            shaped
+                .lines
+                .iter()
+                .all(|line| line.width - line.trailing_space <= 40.0 + LINE_FIT_SLACK),
+            "every line fits, its hanging space aside: {:?}",
+            shaped
+                .lines
+                .iter()
+                .map(|line| line.width)
+                .collect::<Vec<_>>()
+        );
+
+        let spans = [
+            TextSpan::new("aaa ", test_stack(), 16.0),
+            TextSpan {
+                wraps: false,
+                ..TextSpan::new("bbb ccc ddd", test_stack(), 16.0)
+            },
+            TextSpan::new(" eee", test_stack(), 16.0),
+        ];
+        let shaped = engine.shape_spans(&spans, &[], Some(60.0));
+        let lines_of = |needle: &str| -> Vec<usize> {
+            shaped
+                .runs
+                .iter()
+                .filter(|run| run.text.contains(needle))
+                .map(|run| run.line)
+                .collect()
+        };
+        assert_eq!(
+            lines_of("bbb"),
+            lines_of("ddd"),
+            "one line for the unwrapping span"
+        );
+    }
+
+    /// Features reach the shaper: ligatures turned off leave one glyph per
+    /// letter, letter-spacing turns them off by itself, and turning kerning
+    /// off changes a kerned pair's width.
+    #[test]
+    fn features_reach_the_shaper() {
+        let mut engine = engine();
+        let glyphs = |engine: &mut TextEngine, span: TextSpan<'_>| {
+            engine.shape_spans(&[span], &[], None).glyph_count()
+        };
+        let no_liga = [(*b"liga", 0)];
+        let plain = TextSpan::new("fi", test_stack(), 16.0);
+        let ligated = glyphs(&mut engine, plain.clone());
+        let unligated = glyphs(
+            &mut engine,
+            TextSpan {
+                features: &no_liga,
+                ..plain.clone()
+            },
+        );
+        let spaced = glyphs(
+            &mut engine,
+            TextSpan {
+                letter_spacing: 2.0,
+                ..plain.clone()
+            },
+        );
+        assert_eq!(unligated, 2);
+        assert_eq!(spaced, 2, "letter-spaced text is not ligated");
+        assert!(ligated <= 2);
+
+        let no_kern = [(*b"kern", 0)];
+        let width = |engine: &mut TextEngine, features| {
+            let span = TextSpan {
+                features,
+                ..TextSpan::new("AVAVAV", test_stack(), 32.0)
+            };
+            engine.shape_spans(&[span], &[], None).metrics.width
+        };
+        let kerned = width(&mut engine, &[]);
+        let unkerned = width(&mut engine, &no_kern);
+        assert!(unkerned > kerned, "{unkerned} against {kerned}");
     }
 
     /// Half-leading is shared out with the half above rounded down: Fira Sans

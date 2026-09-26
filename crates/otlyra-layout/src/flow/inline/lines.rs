@@ -3,7 +3,6 @@
 
 use otlyra_text::ShapedText;
 
-use crate::box_tree::BoxId;
 use crate::flow::Flow;
 use crate::flow::float::line_room;
 
@@ -20,7 +19,7 @@ pub(super) struct Band {
 }
 
 impl<'a> Flow<'a> {
-    /// Shape the paragraph `parent` holds into lines, in a block whose content
+    /// Shape the paragraph into lines, in a block whose content
     /// box is `width` wide at `x`, `y` on the page, and say what room each line
     /// had.
     ///
@@ -29,17 +28,14 @@ impl<'a> Flow<'a> {
     /// the start is kept for placing the line.
     pub(super) fn shape_lines(
         &mut self,
-        parent: BoxId,
         content: &InlineContent<'_>,
         width: f32,
         x: f32,
         y: f32,
     ) -> (ShapedText, Vec<Band>) {
-        // `text-wrap-mode: nowrap` — which is half of what `white-space: nowrap`
-        // means — is a line that may not be broken however narrow the box is. No
-        // width offered to the shaper is exactly that: it lays the run out on one
-        // line and lets it overflow, which is what the property asks for.
-        let wraps = self.tree.node(parent).style.text_wrap != otlyra_css::TextWrap::NoWrap;
+        // `text-wrap-mode: nowrap` — half of what `white-space: nowrap` means —
+        // is each span's own, handed to the shaper with it: a line may break
+        // around a span that may not wrap, and not inside it.
         let mut bands: Vec<Band> = Vec::new();
         let floats = &self.floats;
         let mut collect_band = |index: usize, top: f32| {
@@ -51,7 +47,7 @@ impl<'a> Flow<'a> {
                 start,
                 width: available,
             };
-            wraps.then_some(available)
+            Some(available)
         };
         let spacers = inline_spacers(&content.inlines, &content.replaced);
         let shaped = self

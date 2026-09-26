@@ -23,8 +23,8 @@ use crate::style::{
     TransformOrigin, WhiteSpace,
 };
 use crate::style::{
-    DecorationLines, DecorationStyle, FamilyName, FontFamily, GenericFamily, TextCase,
-    TextTransform,
+    DecorationLines, DecorationStyle, FamilyName, FontFamily, GenericFamily, OverflowWrap,
+    TextCase, TextTransform, WordBreak,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -52,6 +52,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         font_width: font.font_stretch.to_percentage().0 * 100.0,
         optical_sizing: optical_sizing(values),
         font_variations: font_variations(values),
+        font_features: font_features(values),
         letter_spacing: values
             .get_inherited_text()
             .letter_spacing
@@ -86,6 +87,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         transform_origin: transform_origin(values),
         white_space: white_space(values),
         text_wrap: text_wrap(values),
+        word_break: word_break(values),
+        overflow_wrap: overflow_wrap(values),
         text_decoration: text_decoration(values),
         decorations: Arc::from([] as [TextDecoration; 0]),
         text_transform: text_transform(values),
@@ -557,6 +560,129 @@ fn font_variations(values: &ComputedValues) -> Arc<[([u8; 4], f32)]> {
         .iter()
         .map(|setting| (setting.tag.0.to_be_bytes(), setting.value))
         .collect()
+}
+
+/// The OpenType features `font-kerning`, the `font-variant-*` properties and
+/// `font-feature-settings` ask for, in the order CSS Fonts 4 §7.2 applies them,
+/// so a tag set twice takes the later value: what `font-feature-settings`
+/// says overrides what a variant keyword implied.
+fn font_features(values: &ComputedValues) -> Arc<[([u8; 4], u16)]> {
+    use style::computed_values::font_kerning::T as Kerning;
+    use style::computed_values::font_variant_caps::T as Caps;
+    use style::computed_values::font_variant_position::T as Position;
+    use style::values::specified::font::{
+        FontVariantEastAsian as EastAsian, FontVariantLigatures as Ligatures,
+        FontVariantNumeric as Numeric,
+    };
+
+    let font = values.get_font();
+    let mut features: Vec<([u8; 4], u16)> = Vec::new();
+    let mut set = |tags: &[&[u8; 4]], value: u16| {
+        features.extend(tags.iter().map(|tag| (**tag, value)));
+    };
+
+    match font.font_kerning {
+        Kerning::Auto => {}
+        Kerning::None => set(&[b"kern"], 0),
+        Kerning::Normal => set(&[b"kern"], 1),
+    }
+
+    let ligatures = font.font_variant_ligatures;
+    for (flag, tags, value) in [
+        (
+            Ligatures::NONE,
+            &[b"liga", b"clig", b"dlig", b"hlig", b"calt"][..],
+            0,
+        ),
+        (Ligatures::COMMON_LIGATURES, &[b"liga", b"clig"][..], 1),
+        (Ligatures::NO_COMMON_LIGATURES, &[b"liga", b"clig"][..], 0),
+        (Ligatures::DISCRETIONARY_LIGATURES, &[b"dlig"][..], 1),
+        (Ligatures::NO_DISCRETIONARY_LIGATURES, &[b"dlig"][..], 0),
+        (Ligatures::HISTORICAL_LIGATURES, &[b"hlig"][..], 1),
+        (Ligatures::NO_HISTORICAL_LIGATURES, &[b"hlig"][..], 0),
+        (Ligatures::CONTEXTUAL, &[b"calt"][..], 1),
+        (Ligatures::NO_CONTEXTUAL, &[b"calt"][..], 0),
+    ] {
+        if ligatures.contains(flag) {
+            set(tags, value);
+        }
+    }
+
+    match font.font_variant_position {
+        Position::Normal => {}
+        Position::Sub => set(&[b"subs"], 1),
+        Position::Super => set(&[b"sups"], 1),
+    }
+
+    match font.font_variant_caps {
+        Caps::Normal => {}
+        Caps::SmallCaps => set(&[b"smcp"], 1),
+    }
+
+    let numeric = font.font_variant_numeric;
+    for (flag, tag) in [
+        (Numeric::LINING_NUMS, b"lnum"),
+        (Numeric::OLDSTYLE_NUMS, b"onum"),
+        (Numeric::PROPORTIONAL_NUMS, b"pnum"),
+        (Numeric::TABULAR_NUMS, b"tnum"),
+        (Numeric::DIAGONAL_FRACTIONS, b"frac"),
+        (Numeric::STACKED_FRACTIONS, b"afrc"),
+        (Numeric::SLASHED_ZERO, b"zero"),
+        (Numeric::ORDINAL, b"ordn"),
+    ] {
+        if numeric.contains(flag) {
+            set(&[tag], 1);
+        }
+    }
+
+    let east_asian = font.font_variant_east_asian;
+    for (flag, tag) in [
+        (EastAsian::JIS78, b"jp78"),
+        (EastAsian::JIS83, b"jp83"),
+        (EastAsian::JIS90, b"jp90"),
+        (EastAsian::JIS04, b"jp04"),
+        (EastAsian::SIMPLIFIED, b"smpl"),
+        (EastAsian::TRADITIONAL, b"trad"),
+        (EastAsian::FULL_WIDTH, b"fwid"),
+        (EastAsian::PROPORTIONAL_WIDTH, b"pwid"),
+        (EastAsian::RUBY, b"ruby"),
+    ] {
+        if east_asian.contains(flag) {
+            set(&[tag], 1);
+        }
+    }
+
+    for setting in font.font_feature_settings.0.iter() {
+        let value = u16::try_from(setting.value.max(0)).unwrap_or(u16::MAX);
+        features.push((setting.tag.0.to_be_bytes(), value));
+    }
+
+    if features.is_empty() {
+        return Arc::from([] as [([u8; 4], u16); 0]);
+    }
+    features.into()
+}
+
+/// `word-break`.
+fn word_break(values: &ComputedValues) -> WordBreak {
+    use style::computed_values::word_break::T as Declared;
+
+    match values.clone_word_break() {
+        Declared::Normal => WordBreak::Normal,
+        Declared::BreakAll => WordBreak::BreakAll,
+        Declared::KeepAll => WordBreak::KeepAll,
+    }
+}
+
+/// `overflow-wrap`.
+fn overflow_wrap(values: &ComputedValues) -> OverflowWrap {
+    use style::computed_values::overflow_wrap::T as Declared;
+
+    match values.clone_overflow_wrap() {
+        Declared::Normal => OverflowWrap::Normal,
+        Declared::BreakWord => OverflowWrap::BreakWord,
+        Declared::Anywhere => OverflowWrap::Anywhere,
+    }
 }
 
 /// Every layer of `background-image`, topmost first.
@@ -1651,6 +1777,53 @@ pub(crate) mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// `word-break` and `overflow-wrap` are read and inherited, and the old
+    /// name `word-wrap` is the same property.
+    #[test]
+    fn breaking_properties_are_read() {
+        for (value, expected) in [
+            ("normal", WordBreak::Normal),
+            ("break-all", WordBreak::BreakAll),
+            ("keep-all", WordBreak::KeepAll),
+        ] {
+            let style = layout_style(&format!("<p style='word-break: {value}'><b>x</b></p>"), "b");
+            assert_eq!(style.word_break, expected, "{value}");
+        }
+        for (declaration, expected) in [
+            ("overflow-wrap: normal", OverflowWrap::Normal),
+            ("overflow-wrap: break-word", OverflowWrap::BreakWord),
+            ("overflow-wrap: anywhere", OverflowWrap::Anywhere),
+            ("word-wrap: break-word", OverflowWrap::BreakWord),
+        ] {
+            let style = layout_style(&format!("<p style='{declaration}'><b>x</b></p>"), "b");
+            assert_eq!(style.overflow_wrap, expected, "{declaration}");
+        }
+    }
+
+    /// The font features come in the order CSS Fonts 4 applies them, so an
+    /// explicit setting overrides what a keyword implied; none at all is the
+    /// shared empty list.
+    #[test]
+    fn font_features_are_read_in_order() {
+        let features = |declarations: &str| {
+            layout_style(&format!("<p style='{declarations}'>x</p>"), "p")
+                .font_features
+                .to_vec()
+        };
+        assert_eq!(
+            features("font-variant-numeric: tabular-nums slashed-zero"),
+            [(*b"tnum", 1), (*b"zero", 1)]
+        );
+        assert_eq!(features("font-kerning: none"), [(*b"kern", 0)]);
+        assert_eq!(
+            features("font-variant-ligatures: common-ligatures; font-feature-settings: \"liga\" 0"),
+            [(*b"liga", 1), (*b"clig", 1), (*b"liga", 0)],
+            "the explicit setting comes last, and wins"
+        );
+        assert_eq!(features("font-variant-caps: small-caps"), [(*b"smcp", 1)]);
+        assert!(features("color: red").is_empty());
     }
 
     /// A decoration's lines, style and colour are the declaring element's, and

@@ -525,5 +525,17 @@ pub(in crate::flow) fn span_for<'a>(
         word_spacing: style.word_spacing,
         optical_sizing: style.optical_sizing,
         variations: &style.font_variations,
+        features: &style.font_features,
+        wraps: style.text_wrap != otlyra_css::TextWrap::NoWrap,
+        word_break: match style.word_break {
+            otlyra_css::WordBreak::Normal => otlyra_text::WordBreak::Normal,
+            otlyra_css::WordBreak::BreakAll => otlyra_text::WordBreak::BreakAll,
+            otlyra_css::WordBreak::KeepAll => otlyra_text::WordBreak::KeepAll,
+        },
+        overflow_wrap: match style.overflow_wrap {
+            otlyra_css::OverflowWrap::Normal => otlyra_text::OverflowWrap::Normal,
+            otlyra_css::OverflowWrap::BreakWord => otlyra_text::OverflowWrap::BreakWord,
+            otlyra_css::OverflowWrap::Anywhere => otlyra_text::OverflowWrap::Anywhere,
+        },
     }
 }

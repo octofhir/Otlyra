@@ -664,3 +664,79 @@ fn a_top_span_on_line_two_uses_line_two() {
         "{baseline} in {line:?}"
     );
 }
+
+/// A span that may not wrap stays on one line in a paragraph that does: the
+/// line breaks around it.
+#[test]
+fn a_nowrap_span_is_one_piece_of_its_line() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <div style='width: 120px'>aaa <span style='white-space: nowrap'>bbb ccc ddd</span> eee</div>",
+        400.0,
+    );
+    let lines_holding = |text: &str| -> Vec<Rect> {
+        tree.iter()
+            .filter(|line| {
+                matches!(line.kind, FragmentKind::Line { .. })
+                    && line.children.iter().any(|child| {
+                        matches!(&child.kind, FragmentKind::Text(run) if run.text.contains(text))
+                    })
+            })
+            .map(|line| line.rect)
+            .collect()
+    };
+    assert_eq!(lines_holding("bbb"), lines_holding("ddd"));
+    assert_eq!(lines_holding("ccc").len(), 1, "on one line");
+}
+
+/// `overflow-wrap: anywhere` lets a table cell shrink below its longest word,
+/// and `break-word` does not: only the first counts its breaks towards the
+/// min-content size (CSS Text 3 §5.5).
+#[test]
+fn only_anywhere_shrinks_min_content() {
+    let cell_width = |wrap: &str| {
+        let (tree, boxes) = laid_out(
+            &format!(
+                "<style>body {{ margin: 0; font: 16px sans-serif }} td {{ padding: 0 }}</style>\
+                 <table style='width: 1px'><tr><td style='overflow-wrap: {wrap}'>\
+                 Supercalifragilistic</td></tr></table>"
+            ),
+            400.0,
+        );
+        boxes_of(&tree, &boxes, "td")[0].rect.width
+    };
+    let (normal, break_word, anywhere) = (
+        cell_width("normal"),
+        cell_width("break-word"),
+        cell_width("anywhere"),
+    );
+    assert_eq!(break_word, normal, "break-word keeps the word's width");
+    assert!(anywhere < normal / 4.0, "{anywhere} against {normal}");
+}
+
+/// An emergency break is taken through an inline box's edges too, and only
+/// where the line has no ordinary opportunity.
+#[test]
+fn a_long_word_in_a_padded_link_breaks_anywhere() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <div style='width: 60px; overflow-wrap: anywhere'>ab \
+         <a style='padding: 0 2px'>Supercalifragilistic</a></div>",
+        400.0,
+    );
+    let lines: Vec<Rect> = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
+        .map(|line| line.rect)
+        .collect();
+    assert!(lines.len() > 2, "{lines:?}");
+    assert!(
+        lines.iter().all(|line| line.width <= 60.0 + 0.1),
+        "{lines:?}"
+    );
+    assert_eq!(
+        line_of(&tree, "ab").y,
+        0.0,
+        "the first line breaks at its space"
+    );
+}

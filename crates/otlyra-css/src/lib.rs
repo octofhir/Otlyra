@@ -52,8 +52,8 @@ pub use style::{
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Calc, Clear, ComputedStyle,
     Corners, DecorationLines, DecorationStyle, Display, FlexBasis, FlexDirection, FlexWrap, Float,
     FontStyle, Gradient, GradientStop, Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight,
-    ListStyle, MaxSize, ObjectFit, Overflow, Position, Ratio, Repeat, Shadow, Sides, Size,
-    TextAlign, TextCase, TextDecoration, TextTransform, TextWrap, TransformOp, TransformOrigin,
-    VerticalAlign, WhiteSpace,
+    ListStyle, MaxSize, ObjectFit, Overflow, OverflowWrap, Position, Ratio, Repeat, Shadow, Sides,
+    Size, TextAlign, TextCase, TextDecoration, TextTransform, TextWrap, TransformOp,
+    TransformOrigin, VerticalAlign, WhiteSpace, WordBreak,
 };
 pub use style::{FamilyName, FontFamily, GenericFamily};

@@ -80,5 +80,19 @@ second line</div>
   <div class="narrow" style="white-space: pre-wrap">one two three four five</div>
 </section>
 
+<section>
+  <h2>A span that may not wrap, in a paragraph that does</h2>
+  <div class="narrow" style="width: 150px">aaa <span style="white-space: nowrap">bbb ccc ddd</span> eee fff</div>
+</section>
+
+<section>
+  <h2>A long address in a narrow column</h2>
+  <div class="narrow">https://example.com/a/very/long/path/without/spaces?query=value</div>
+  <div class="narrow" style="overflow-wrap: break-word">https://example.com/a/very/long/path/without/spaces?query=value</div>
+  <div class="narrow" style="overflow-wrap: anywhere">https://example.com/a/very/long/path/without/spaces?query=value</div>
+  <div class="narrow" style="word-break: break-all">break all of these words here</div>
+  <div class="narrow" style="word-break: keep-all">keep all of these words here</div>
+</section>
+
 </body>
 </html>

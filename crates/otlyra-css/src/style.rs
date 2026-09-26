@@ -988,6 +988,35 @@ impl WhiteSpace {
     }
 }
 
+/// `word-break` (CSS Text 3 §5.2): where inside a word a line may break.
+/// `break-word`, its deprecated fourth value, is Gecko's alone in the cascade
+/// and never reaches here.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WordBreak {
+    /// Words break where the text's own rules say (UAX #14).
+    #[default]
+    Normal,
+    /// A line may also break between any two letters of a word.
+    BreakAll,
+    /// A line may not break inside a word, CJK text included.
+    KeepAll,
+}
+
+/// `overflow-wrap` (CSS Text 3 §5.5): whether a word too long for its line may
+/// be broken where nothing else lets it, and whether those breaks count
+/// towards the text's min-content size.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OverflowWrap {
+    /// A word too long for its line overflows it.
+    #[default]
+    Normal,
+    /// It is broken, but its min-content size is the whole word.
+    BreakWord,
+    /// It is broken, and the breaks are soft wrap opportunities for sizing
+    /// too.
+    Anywhere,
+}
+
 /// `text-wrap-mode`: whether a line may be broken at all.
 ///
 /// The other half of `white-space`. Kept apart from [`WhiteSpace`] because the
@@ -1353,6 +1382,11 @@ pub struct ComputedStyle {
     /// copied, because inheriting it is the common case and cloning a list per
     /// element would be a cost every page pays for a property almost none uses.
     pub font_variations: Arc<[([u8; 4], f32)]>,
+    /// The OpenType features the text is set with, in the order CSS Fonts 4
+    /// §7.2 applies them — `font-kerning`, the `font-variant-*` properties,
+    /// then `font-feature-settings` — a later setting of a tag winning.
+    /// Inherited, and shared like the variations, being empty almost always.
+    pub font_features: Arc<[([u8; 4], u16)]>,
     /// `letter-spacing` in CSS pixels. Inherited.
     pub letter_spacing: f32,
     /// `word-spacing` in CSS pixels. Inherited.
@@ -1395,6 +1429,10 @@ pub struct ComputedStyle {
     pub white_space: WhiteSpace,
     /// `text-wrap-mode`. Inherited.
     pub text_wrap: TextWrap,
+    /// `word-break`. Inherited.
+    pub word_break: WordBreak,
+    /// `overflow-wrap`, and its old name `word-wrap`. Inherited.
+    pub overflow_wrap: OverflowWrap,
     /// `text-decoration`, the element's own. Not inherited: it *propagates*
     /// (css-text-decor-3 §2.1), which is [`Self::decorations`].
     pub text_decoration: TextDecoration,
@@ -1501,6 +1539,7 @@ impl Default for ComputedStyle {
             font_width: 100.0,
             optical_sizing: true,
             font_variations: Arc::from([] as [([u8; 4], f32); 0]),
+            font_features: Arc::from([] as [([u8; 4], u16); 0]),
             letter_spacing: 0.0,
             word_spacing: 0.0,
             line_height: LineHeight::Normal,
@@ -1514,6 +1553,8 @@ impl Default for ComputedStyle {
             transform_origin: TransformOrigin::default(),
             white_space: WhiteSpace::Collapse,
             text_wrap: TextWrap::Wrap,
+            word_break: WordBreak::Normal,
+            overflow_wrap: OverflowWrap::Normal,
             text_decoration: TextDecoration::NONE,
             decorations: Arc::from([] as [TextDecoration; 0]),
             text_transform: TextTransform::NONE,
@@ -1574,6 +1615,7 @@ impl ComputedStyle {
             font_width: parent.font_width,
             optical_sizing: parent.optical_sizing,
             font_variations: Arc::clone(&parent.font_variations),
+            font_features: Arc::clone(&parent.font_features),
             letter_spacing: parent.letter_spacing,
             word_spacing: parent.word_spacing,
             line_height: parent.line_height,
@@ -1582,6 +1624,8 @@ impl ComputedStyle {
             border_collapse: parent.border_collapse,
             white_space: parent.white_space,
             text_wrap: parent.text_wrap,
+            word_break: parent.word_break,
+            overflow_wrap: parent.overflow_wrap,
             decorations: Arc::clone(&parent.decorations),
             text_transform: parent.text_transform,
             text_align: parent.text_align,

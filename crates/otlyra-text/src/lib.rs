@@ -45,8 +45,9 @@ pub use engine::{
 pub use stack::{Family, FontStack, GenericFamily};
 pub use web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, matching_faces};
 
-/// Re-exported so callers name the same font handle type the shaper does.
-pub use parley::FontData;
+/// Re-exported so callers name the same font handle type the shaper does, and
+/// the same line-breaking rules.
+pub use parley::{FontData, OverflowWrap, WordBreak};
 
 /// The family name of the font vendored into this crate.
 ///

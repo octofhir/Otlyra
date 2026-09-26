@@ -58,7 +58,7 @@ impl<'a> Flow<'a> {
             return 0.0;
         }
         let levels = self.level_line_heights(parent, &mut content);
-        let (mut shaped, bands) = self.shape_lines(parent, &content, width, x, y);
+        let (mut shaped, bands) = self.shape_lines(&content, width, x, y);
         let run_reach = self.run_reaches(&content, &levels, &shaped);
         let line_levels = line_reaches(&content, &levels, &shaped, &run_reach);
         restack(&mut shaped, &line_levels.reach);

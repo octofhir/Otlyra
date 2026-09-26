@@ -22,9 +22,21 @@ use parley::{BreakReason, Layout, PositionedLayoutItem};
 use crate::engine::{LINE_FIT_SLACK, SpacerKind, SpanBrush};
 
 /// Whether a paragraph's lines have to be chosen here rather than left to the
-/// shaper: whether it has anything the shaper breaks at that CSS does not.
-pub(crate) fn needs_plan(text: &str, kinds: &HashMap<u64, SpacerKind>) -> bool {
-    text.contains('\u{a0}') || kinds.values().any(|kind| *kind != SpacerKind::Atomic)
+/// shaper: whether it has anything the shaper breaks at that CSS does not, or
+/// fails to break at where CSS does.
+///
+/// The last is a span that may not wrap. The shaper decides whether a space
+/// may hang at the end of a line by the wrapping of the character before it,
+/// so the space after such a span — which belongs to text that wraps — cannot
+/// hang, and the line breaks somewhere before the span instead.
+pub(crate) fn needs_plan(
+    text: &str,
+    kinds: &HashMap<u64, SpacerKind>,
+    any_unwrapping: bool,
+) -> bool {
+    any_unwrapping
+        || text.contains('\u{a0}')
+        || kinds.values().any(|kind| *kind != SpacerKind::Atomic)
 }
 
 /// How a cluster of glyphs takes part in breaking a line.
@@ -135,25 +147,36 @@ fn pieces(layout: &Layout<SpanBrush>, text: &str, kinds: &HashMap<u64, SpacerKin
     pieces
 }
 
-/// The byte offsets where the text of `layout` may break, from a pass that
-/// broke it at every one.
+/// A place a line may break, and how readily.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Opportunity {
+    /// A soft wrap opportunity of the text's own (CSS Text 3 §5).
+    Regular,
+    /// One `overflow-wrap` allows inside a word, taken only where the line
+    /// has no other (§5.5).
+    Emergency,
+}
+
+/// The byte offsets where the text of `layout` may break, and how readily,
+/// from a pass that broke it at every one.
 ///
 /// A layout broken to no width at all ends a line at each opportunity it has,
 /// and at the two places the shaper breaks where the text does not: after a
 /// no-break space, and between two preserved spaces, the first of which it
 /// hung. Those two are left out.
-fn opportunities(layout: &Layout<SpanBrush>, text: &str) -> Vec<usize> {
+fn opportunities(layout: &Layout<SpanBrush>, text: &str) -> Vec<(usize, Opportunity)> {
     let lines: Vec<_> = layout.lines().collect();
     lines
         .windows(2)
-        .filter(|pair| {
-            matches!(
-                pair[0].break_reason(),
-                BreakReason::Regular | BreakReason::Emergency
-            )
+        .filter_map(|pair| {
+            let kind = match pair[0].break_reason() {
+                BreakReason::Regular => Opportunity::Regular,
+                BreakReason::Emergency => Opportunity::Emergency,
+                BreakReason::None | BreakReason::Explicit => return None,
+            };
+            Some((pair[1].text_range().start, kind))
         })
-        .map(|pair| pair[1].text_range().start)
-        .filter(|&at| {
+        .filter(|&(at, _)| {
             let before = text.get(..at).and_then(|text| text.chars().next_back());
             let after = text.get(at..).and_then(|text| text.chars().next());
             !matches!(
@@ -177,9 +200,9 @@ pub(crate) fn break_everywhere(layout: &mut Layout<SpanBrush>) {
 /// its lines one at a time.
 pub(crate) struct Plan {
     pieces: Vec<Piece>,
-    /// Whether a line may break before each piece; one more entry than there
-    /// are pieces, the last never.
-    breaks_before: Vec<bool>,
+    /// Whether a line may break before each piece, and how readily; one more
+    /// entry than there are pieces, the last never.
+    breaks_before: Vec<Option<Opportunity>>,
 }
 
 impl Plan {
@@ -208,16 +231,22 @@ impl Plan {
     /// ends, and the piece the next line starts at.
     ///
     /// The last opportunity whose line fits, with any spaces before it hanging
-    /// past the room (CSS Text 3 §4.1.3); the first there is, and the line
-    /// overflowing, where none does (§5.2); and the forced break or the end of
-    /// the paragraph where either comes first. A break is only taken past
-    /// something with width, which is where the shaper would take it.
+    /// past the room (CSS Text 3 §4.1.3) — an emergency one only where no
+    /// other fits (§5.5); the first there is, and the line overflowing, where
+    /// none does (§5.2); and the forced break or the end of the paragraph where
+    /// either comes first. A break is only taken past something with width,
+    /// which is where the shaper would take it.
     pub(crate) fn line(&self, start: usize, room: f32) -> (f32, usize) {
         let mut x = 0.0f32;
         let mut last_fit: Option<(usize, f32)> = None;
+        let mut last_emergency: Option<(usize, f32)> = None;
         for (slot, piece) in self.pieces.iter().enumerate().skip(start) {
-            if slot > start && x != 0.0 && self.breaks_before[slot] {
-                last_fit = Some((slot, x));
+            if slot > start && x != 0.0 {
+                match self.breaks_before[slot] {
+                    Some(Opportunity::Regular) => last_fit = Some((slot, x)),
+                    Some(Opportunity::Emergency) => last_emergency = Some((slot, x)),
+                    None => {}
+                }
             }
             match *piece {
                 Piece::Text {
@@ -232,7 +261,7 @@ impl Plan {
                 _ => {
                     let next = x + piece.advance();
                     if next > room {
-                        return match last_fit {
+                        return match last_fit.or(last_emergency) {
                             Some((slot, at)) => (at + LINE_FIT_SLACK, self.settle(slot)),
                             None => self.overflow(slot, x),
                         };
@@ -249,7 +278,7 @@ impl Plan {
     /// end.
     fn overflow(&self, from: usize, mut x: f32) -> (f32, usize) {
         for (slot, piece) in self.pieces.iter().enumerate().skip(from) {
-            if slot > from && x != 0.0 && self.breaks_before[slot] {
+            if slot > from && x != 0.0 && self.breaks_before[slot].is_some() {
                 return (x + LINE_FIT_SLACK, self.settle(slot));
             }
             if let Piece::Text {
@@ -284,10 +313,14 @@ impl Plan {
 /// a break sits beside an atomic inline, which UAX #14 breaks either side of as
 /// it does U+FFFC (LB20), or between two pieces of text that have an
 /// opportunity between them on their own.
-fn may_break_before(pieces: &[Piece], opportunities: &[usize], slot: usize) -> bool {
+fn may_break_before(
+    pieces: &[Piece],
+    opportunities: &[(usize, Opportunity)],
+    slot: usize,
+) -> Option<Opportunity> {
     let (Some(before), Some(after)) = (slot.checked_sub(1).map(|at| &pieces[at]), pieces.get(slot))
     else {
-        return false;
+        return None;
     };
     let opens = matches!(
         before,
@@ -304,15 +337,16 @@ fn may_break_before(pieces: &[Piece], opportunities: &[usize], slot: usize) -> b
         }
     );
     if opens || closes {
-        return false;
+        return None;
     }
     let content_before = pieces[..slot].iter().rev().find(|piece| !piece.is_edge());
     let content_after = pieces[slot..].iter().find(|piece| !piece.is_edge());
     match (content_before, content_after) {
-        (Some(Piece::Text { .. }), Some(Piece::Text { start, .. })) => {
-            opportunities.binary_search(start).is_ok()
-        }
-        (Some(_), Some(_)) => true,
-        _ => false,
+        (Some(Piece::Text { .. }), Some(Piece::Text { start, .. })) => opportunities
+            .binary_search_by_key(start, |&(at, _)| at)
+            .ok()
+            .map(|found| opportunities[found].1),
+        (Some(_), Some(_)) => Some(Opportunity::Regular),
+        _ => None,
     }
 }

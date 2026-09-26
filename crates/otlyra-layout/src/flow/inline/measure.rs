@@ -26,17 +26,7 @@ impl Flow<'_> {
         self.measure_atomic_inlines(&mut content.replaced, containing_width, wanted);
         match wanted {
             Wanted::Widest => self.widest_line(&content),
-            Wanted::Narrowest => {
-                // Broken as hard as it will break — unless it may not break at
-                // all. Under `text-wrap-mode: nowrap` the whole run is one
-                // unbreakable thing, so its min-content size is its full width;
-                // asking for the longest word instead would let a flex item
-                // shrink to that word while the text it draws stays full length,
-                // and the item beside it would be laid over the overflow. That is
-                // what folded and then overlapped the site's own header.
-                let wraps = self.style_of(id).text_wrap != otlyra_css::TextWrap::NoWrap;
-                self.narrowest_line(&content, wraps)
-            }
+            Wanted::Narrowest => self.narrowest_line(&content),
         }
     }
 
@@ -80,21 +70,36 @@ impl Flow<'_> {
             .width
     }
 
-    /// The paragraph broken at every opportunity it has — at none, when it may
-    /// not `wrap` — measured by its widest line without the white space a
-    /// break leaves at the end.
+    /// The paragraph broken at every opportunity it has, measured by its
+    /// widest line without the white space a break leaves at the end.
+    ///
+    /// Every soft wrap opportunity counts, and only those (CSS Text 3 §5.5):
+    /// a span that may not wrap is one unbreakable piece, and the breaks
+    /// `overflow-wrap: break-word` allows inside a word do not count, where
+    /// those of `anywhere` do.
     ///
     /// Shaped with the spacers, as the widest line is: the margins, borders
     /// and padding of an inline box are part of the piece of the line they sit
     /// on, which no break separates from its text (CSS Sizing 3 §5.1), and an
     /// atomic inline is a piece of its own, margins and all.
-    fn narrowest_line(&mut self, content: &InlineContent<'_>, wraps: bool) -> f32 {
+    fn narrowest_line(&mut self, content: &InlineContent<'_>) -> f32 {
         let spacers = inline_spacers(&content.inlines, &content.replaced);
         if content.spans.is_empty() && spacers.is_empty() {
             return 0.0;
         }
+        let spans: Vec<otlyra_text::TextSpan<'_>> = content
+            .spans
+            .iter()
+            .map(|span| otlyra_text::TextSpan {
+                overflow_wrap: match span.overflow_wrap {
+                    otlyra_text::OverflowWrap::BreakWord => otlyra_text::OverflowWrap::Normal,
+                    other => other,
+                },
+                ..span.clone()
+            })
+            .collect();
         self.text
-            .shape_spans(&content.spans, &spacers, wraps.then_some(0.0))
+            .shape_spans(&spans, &spacers, Some(0.0))
             .lines
             .iter()
             .map(|line| line.width - line.trailing_space)
