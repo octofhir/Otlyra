@@ -100,12 +100,16 @@ fn report(what: &str, strokes: &[Stroke], viewport: Viewport) {
     let whole = u64::from(viewport.width) * u64::from(viewport.height);
     let mut areas: Vec<f64> = strokes
         .iter()
-        .map(|stroke| match stroke.damage {
-            Damage::Unchanged => 0.0,
-            Damage::Region(rect) => {
+        .map(|stroke| {
+            let area = |rect: &otlyra_platform::LayerRect| {
                 (u64::from(rect.width) * u64::from(rect.height)) as f64 / whole as f64 * 100.0
+            };
+            match &stroke.damage {
+                Damage::Unchanged => 0.0,
+                Damage::Region(rect) => area(rect),
+                Damage::Scrolled(scroll) => scroll.repaint.iter().map(area).sum(),
+                Damage::Full => 100.0,
             }
-            Damage::Full => 100.0,
         })
         .collect();
     areas.sort_by(f64::total_cmp);

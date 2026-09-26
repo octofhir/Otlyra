@@ -402,6 +402,31 @@ impl DisplayList {
         })
     }
 
+    /// Where the items of each id paint, and how many of them there are, in the
+    /// list's coordinates with nothing moved: what a compositor needs to know to
+    /// move the pixels one id painted and redraw the ones the others did.
+    ///
+    /// Conservative. A run of glyphs is bounded by its pen positions and its
+    /// size rather than by its outlines, a blur by three standard deviations, a
+    /// stroke by its width on either side: each rectangle holds every pixel its
+    /// items can touch, and a little more.
+    pub fn spatial_bounds(&self) -> Vec<(SpatialId, usize, Rect)> {
+        let mut found: Vec<(SpatialId, usize, Rect)> = Vec::new();
+        for (spatial, item) in self.items_with_spatial() {
+            let Some(bounds) = painted_bounds(item) else {
+                continue;
+            };
+            match found.iter_mut().find(|(id, _, _)| *id == spatial) {
+                Some((_, count, union)) => {
+                    *count += 1;
+                    *union = union.union(bounds);
+                }
+                None => found.push((spatial, 1, bounds)),
+            }
+        }
+        found
+    }
+
     /// Whether anything in the list moves with something other than the viewport.
     pub fn is_spatial(&self) -> bool {
         !self.spatial.is_empty()
@@ -608,6 +633,75 @@ impl DisplayList {
             _ => None,
         })
     }
+}
+
+/// Every pixel `item` can paint, in the coordinates its transform puts it in, or
+/// `None` for an item that paints nothing of its own.
+fn painted_bounds(item: &DisplayItem) -> Option<Rect> {
+    use kurbo::Shape;
+    let bounds = match item {
+        DisplayItem::PushLayer { .. } | DisplayItem::PopLayer | DisplayItem::HitTest { .. } => {
+            return None;
+        }
+        DisplayItem::Blurred {
+            transform,
+            blur,
+            shape,
+            ..
+        } => transform.transform_rect_bbox(shape.bounding_box().inflate(blur * 1.5, blur * 1.5)),
+        DisplayItem::Fill {
+            transform, shape, ..
+        } => transform.transform_rect_bbox(shape.bounding_box()),
+        DisplayItem::Stroke {
+            style,
+            transform,
+            shape,
+            ..
+        } => transform.transform_rect_bbox(shape.bounding_box().inflate(style.width, style.width)),
+        DisplayItem::Glyphs {
+            font_size,
+            transform,
+            blur,
+            glyphs,
+            ..
+        } => {
+            let size = f64::from(*font_size);
+            let (mut x0, mut y0, mut x1, mut y1) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            for (index, glyph) in glyphs.iter().enumerate() {
+                let (x, y) = (f64::from(glyph.x), f64::from(glyph.y));
+                if index == 0 {
+                    (x0, y0, x1, y1) = (x, y, x, y);
+                } else {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                }
+            }
+            // A glyph reaches up by its ascent and across by its advance, both of
+            // which a face may make larger than its size; twice the size up and
+            // across and one down covers every face that is not playing games.
+            let reach = size + blur * 1.5;
+            transform.transform_rect_bbox(Rect::new(
+                x0 - reach,
+                y0 - size * 2.0 - blur * 1.5,
+                x1 + size * 2.0 + blur * 1.5,
+                y1 + reach,
+            ))
+        }
+        DisplayItem::Image {
+            image,
+            transform,
+            clip_rect,
+            ..
+        } => {
+            let whole = Rect::new(
+                0.0,
+                0.0,
+                f64::from(image.data().width),
+                f64::from(image.data().height),
+            );
+            transform.transform_rect_bbox(clip_rect.map_or(whole, |clip| clip.intersect(whole)))
+        }
+    };
+    Some(bounds)
 }
 
 /// Put `transform` ahead of the one `item` already carries.

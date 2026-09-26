@@ -249,14 +249,6 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         .map(|fragment| fragment.style.background_color)
         .filter(|colour| colour.components[3] > 0.0)
         .unwrap_or(Color::WHITE);
-    list.push(DisplayItem::Fill {
-        style: Fill::NonZero,
-        transform: Affine::IDENTITY,
-        brush: Brush::Solid(canvas),
-        brush_transform: None,
-        shape: KurboRect::new(0.0, 0.0, f64::from(width), f64::from(height))
-            .to_path(PATH_TOLERANCE),
-    });
 
     // The part of the page drawn, in page coordinates, and the screen for what is
     // fixed to it.
@@ -266,6 +258,24 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         width,
         height + frame.margin * 2.0,
     );
+    // Under all of it, and scrolling with it: the canvas is one colour however
+    // far it reaches, so drawing it across the band rather than across the
+    // screen draws the same pixels — and a canvas that moves with the page is
+    // one a scroll can move rather than paint.
+    list.set_spatial(PAGE);
+    list.push(DisplayItem::Fill {
+        style: Fill::NonZero,
+        transform: Affine::IDENTITY,
+        brush: Brush::Solid(canvas),
+        brush_transform: None,
+        shape: KurboRect::new(
+            0.0,
+            f64::from(scrolled.y),
+            f64::from(width),
+            f64::from(scrolled.bottom()),
+        )
+        .to_path(PATH_TOLERANCE),
+    });
     let screen = Rect::new(0.0, 0.0, width, height);
 
     // Painting order is the tree's, and then the layers': everything in the flow,

@@ -278,10 +278,21 @@ impl Browser {
     /// Empty for a browser page or the blank fallback, which are drawn where they
     /// stand. A zoom is not applied here — the list's own transform carries it to
     /// whatever the offsets move.
-    pub(super) fn page_offsets(&self) -> Vec<otlyra_gfx::kurbo::Vec2> {
+    ///
+    /// Each offset is put on the screen's pixel grid. A trackpad scrolls by
+    /// fractions of a pixel, and a page drawn at a fraction is a page whose every
+    /// edge is resampled — and whose pixels cannot be reused by moving them,
+    /// because a move is whole pixels. Every browser does the same.
+    pub(super) fn page_offsets(&self, g: &FrameGeom) -> Vec<otlyra_gfx::kurbo::Vec2> {
         let tab = &self.tabs[self.active];
+        let device = g.scale_factor * f64::from(self.zoom);
+        let snap = |value: f64| (value * device).round() / device;
         match tab.page.as_ref() {
-            Some(page) if tab.system.is_none() => page.offsets(),
+            Some(page) if tab.system.is_none() => page
+                .offsets()
+                .into_iter()
+                .map(|offset| otlyra_gfx::kurbo::Vec2::new(snap(offset.x), snap(offset.y)))
+                .collect(),
             _ => Vec::new(),
         }
     }

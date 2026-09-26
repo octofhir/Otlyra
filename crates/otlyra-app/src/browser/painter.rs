@@ -1031,7 +1031,7 @@ impl Painter for Browser {
         // underneath it — but painting in this order means a future translucent
         // toolbar composites correctly rather than needing a clip.
         let page = self.page_list(&geom);
-        otlyra_gfx::render_scrolled(&page, target, &self.page_offsets());
+        otlyra_gfx::render_scrolled(&page, target, &self.page_offsets(&geom));
 
         // The highlight goes over the page whether or not the panel is open. They
         // are two things: the overlay says *this element*, the panel says
@@ -1100,7 +1100,7 @@ impl Painter for Browser {
             rect: page_rect,
             epoch: self.page_epoch(&geom),
             list: page,
-            offsets: self.page_offsets(),
+            offsets: self.page_offsets(&geom),
             dirty: page_dirty,
         });
 

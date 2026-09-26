@@ -2193,7 +2193,8 @@ impl Session {
 /// What a composited frame redrew, as a client reads it.
 ///
 /// A rectangle where one region moved, `null` where the frame changed nothing,
-/// and `"full"` where the whole surface was redrawn. Worth reporting because it
+/// `"full"` where the whole surface was redrawn, and for a scroll the layer that
+/// moved, how far, and the rectangles drawn afresh after it. Worth reporting because it
 /// is the difference between *the model changed* and *the screen changed*: a
 /// driver that clicks away from a field and sees no damage has found a bug that
 /// no amount of asking the browser about its own state would show.
@@ -2201,13 +2202,22 @@ fn damage_json(damage: otlyra_platform::Damage) -> Value {
     match damage {
         otlyra_platform::Damage::Unchanged => Value::Null,
         otlyra_platform::Damage::Full => json!("full"),
-        otlyra_platform::Damage::Region(rect) => json!({
-            "x": rect.x,
-            "y": rect.y,
-            "width": rect.width,
-            "height": rect.height,
+        otlyra_platform::Damage::Region(rect) => rect_json(rect),
+        otlyra_platform::Damage::Scrolled(scroll) => json!({
+            "scrolled": rect_json(scroll.rect),
+            "by": [scroll.by.0, scroll.by.1],
+            "repaint": scroll.repaint.into_iter().map(rect_json).collect::<Vec<_>>(),
         }),
     }
+}
+
+fn rect_json(rect: otlyra_platform::LayerRect) -> Value {
+    json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    })
 }
 
 /// Track lines, as a client reads them.

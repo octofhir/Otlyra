@@ -4,7 +4,8 @@
 //! and over the toolbar, and the window being resized — each drawn through the
 //! window's own frame path (`compose` → damage → retained surface) and timed as
 //! event, compose (with the style, layout and display-list stages inside it),
-//! raster and read-back. It also counts what the page's list asks the rasterizer
+//! and the compositor — moving retained pixels, drawing what changed, reading it
+//! back. It also counts what the page's list asks the rasterizer
 //! for, because that is mostly what decides a frame's cost: how many offscreen
 //! groups, how many blurs.
 //!
@@ -24,8 +25,8 @@ use std::time::{Duration, Instant};
 use otlyra_app::browser::Browser;
 use otlyra_app::fetcher::{Loaded, Loader};
 use otlyra_app::ui::UI_HEIGHT;
+use otlyra_gfx::DisplayItem;
 use otlyra_gfx::kurbo::{Rect, Shape};
-use otlyra_gfx::{DisplayItem, SkiaPainter};
 use otlyra_platform::{
     Damage, FramePump, Modifiers, Painter as _, PlatformEvent, ScrollSource, Viewport,
 };
@@ -123,7 +124,6 @@ struct Row {
     layout: Vec<f64>,
     list: Vec<f64>,
     raster: Vec<f64>,
-    readback: Vec<f64>,
     total: Vec<f64>,
     damage: Vec<f64>,
 }
@@ -133,8 +133,8 @@ impl Row {
         let over = |budget: f64| self.total.iter().filter(|took| **took > budget).count();
         println!(
             "{name:<26} n={:<3} total p50 {:7.2} p95 {:7.2} | event {:5.2} compose {:6.2} \
-             (style {:6.2} layout {:6.2} list {:5.2}) raster {:7.2} readback {:5.2} | \
-             damage {:5.1}% | >8.3ms {} >16.7ms {}",
+             (style {:6.2} layout {:6.2} list {:5.2}) compositor {:7.2} | \
+             drawn {:5.1}% | >8.3ms {} >16.7ms {}",
             self.total.len(),
             percentile(&self.total, 0.5),
             percentile(&self.total, 0.95),
@@ -144,7 +144,6 @@ impl Row {
             percentile(&self.layout, 0.5),
             percentile(&self.list, 0.5),
             percentile(&self.raster, 0.5),
-            percentile(&self.readback, 0.5),
             percentile(&self.damage, 0.5),
             over(8.33),
             over(16.67),
@@ -152,14 +151,9 @@ impl Row {
     }
 }
 
-/// The window's frame path with raster and read-back timed on their own.
-///
-/// The pump decides the damage exactly as the window does; the frame is then
-/// replayed into a surface of this harness's own under that damage, which is
-/// where raster and read-back are timed.
+/// The window's frame path, with the compose and the compositor timed apart.
 struct Frames {
     pump: FramePump,
-    surface: SkiaPainter,
 }
 
 impl Frames {
@@ -173,7 +167,7 @@ impl Frames {
     fn draw(&mut self, browser: &mut Browser, row: &mut Row, event: Duration) {
         let viewport = self.pump.viewport();
         let started = Instant::now();
-        let scene = browser
+        browser
             .compose(viewport)
             .expect("the interface draws layers");
         let compose = started.elapsed();
@@ -181,53 +175,25 @@ impl Frames {
         row.layout.push(stage("layout"));
         row.list.push(stage("build_display_list"));
 
-        // The pump's own compose is served from the caches.
+        // The pump's own compose is served from the caches, so what it adds is
+        // the retained compositor's work: moving, drawing and reading back.
+        let started = Instant::now();
         self.pump.frame(browser).expect("a frame");
+        let raster = started.elapsed();
         let whole = f64::from(viewport.width) * f64::from(viewport.height);
-        let damage = match self.pump.damage() {
-            Damage::Unchanged => None,
-            Damage::Full => Some(Rect::new(
-                0.0,
-                0.0,
-                f64::from(viewport.width),
-                f64::from(viewport.height),
-            )),
-            Damage::Region(rect) => Some(Rect::new(
-                f64::from(rect.x),
-                f64::from(rect.y),
-                f64::from(rect.x + rect.width),
-                f64::from(rect.y + rect.height),
-            )),
+        let area =
+            |rect: &otlyra_platform::LayerRect| f64::from(rect.width) * f64::from(rect.height);
+        let drawn = match self.pump.damage() {
+            Damage::Unchanged => 0.0,
+            Damage::Full => whole,
+            Damage::Region(rect) => area(&rect),
+            Damage::Scrolled(scroll) => scroll.repaint.iter().map(area).sum(),
         };
-
-        let (mut raster, mut readback) = (Duration::ZERO, Duration::ZERO);
-        if let Some(clip) = damage {
-            let started = Instant::now();
-            self.surface.clip_to(clip);
-            self.surface.clear_rect(clip);
-            for layer in &scene.layers {
-                otlyra_gfx::render_scrolled(&layer.list, &mut self.surface, &layer.offsets);
-            }
-            self.surface.reset_clip();
-            raster = started.elapsed();
-            let started = Instant::now();
-            self.surface
-                .read_rgba8_rect(
-                    clip.x0 as u32,
-                    clip.y0 as u32,
-                    clip.width() as u32,
-                    clip.height() as u32,
-                )
-                .expect("read back");
-            readback = started.elapsed();
-        }
         row.event.push(ms(event));
         row.compose.push(ms(compose));
         row.raster.push(ms(raster));
-        row.readback.push(ms(readback));
-        row.total.push(ms(event + compose + raster + readback));
-        row.damage
-            .push(damage.map_or(0.0, |rect| rect.area() / whole * 100.0));
+        row.total.push(ms(event + compose + raster));
+        row.damage.push(drawn / whole * 100.0);
     }
 }
 
@@ -264,6 +230,22 @@ fn census(browser: &mut Browser, viewport: Viewport) {
         }
     }
     println!("items {kinds:?}; translucent groups {groups} covering {group_area:.1} viewports");
+    // What moves with what: a scroll moves the part with the most items and
+    // draws the rest again, so a large part that does not scroll with the page
+    // is what makes a scroll expensive.
+    for layer in &scene.layers {
+        for (spatial, count, bounds) in layer.list.spatial_bounds() {
+            println!(
+                "  layer {:?} spatial {} items {count} bounds {:.0}x{:.0} at ({:.0}, {:.0})",
+                layer.id,
+                spatial.0,
+                bounds.width(),
+                bounds.height(),
+                bounds.x0,
+                bounds.y0
+            );
+        }
+    }
 }
 
 fn main() {
@@ -317,10 +299,7 @@ fn main() {
 
     let mut pump = FramePump::new(viewport);
     pump.open(&mut browser).expect("a first frame");
-    let mut frames = Frames {
-        pump,
-        surface: SkiaPainter::new_raster(viewport.width, viewport.height).expect("a surface"),
-    };
+    let mut frames = Frames { pump };
     census(&mut browser, viewport);
     // Warm the surface's caches with one whole frame.
     frames.draw(&mut browser, &mut Row::default(), Duration::ZERO);
@@ -407,7 +386,6 @@ fn main() {
         let started = Instant::now();
         frames.pump.resize(&mut browser, resized);
         let event = started.elapsed();
-        frames.surface = SkiaPainter::new_raster(resized.width, resized.height).expect("a surface");
         frames.draw(&mut browser, &mut row, event);
     }
     row.report("resize, 8 px a frame");

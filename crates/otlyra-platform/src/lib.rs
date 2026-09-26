@@ -41,7 +41,7 @@ mod menu;
 mod present;
 mod render_thread;
 
-pub use compositor::{Damage, FramePump};
+pub use compositor::{Damage, FramePump, Scroll};
 pub use event_loop::{PlatformError, run};
 pub use menu::{Menu, MenuBar, MenuEntry, MenuError, MenuId, SystemItem};
 

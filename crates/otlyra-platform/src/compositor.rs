@@ -14,22 +14,44 @@ use otlyra_gfx::{PaintTarget, SkiaPainter};
 use crate::{FrameRequest, LayerId, LayerRect, Painter, PlatformEvent, Scene, Viewport};
 
 /// What one composited frame had to redraw.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Damage {
     /// Nothing changed; the retained frame stands.
     Unchanged,
     /// One region moved; it alone was re-rasterized and re-uploaded.
     Region(LayerRect),
+    /// One layer's pixels were moved rather than drawn again, and only what the
+    /// move could not account for was drawn.
+    Scrolled(Scroll),
     /// The whole surface — first frame, a resize, or a structural change.
     Full,
 }
 
+/// A layer that moved as a whole: a scroll.
+///
+/// The layer kept its list and its place and changed only the offsets it is
+/// drawn with, so most of its pixels are the ones already on the surface, a
+/// whole number of pixels further along. Those are moved; what has to be drawn
+/// is the strip the move uncovered and whatever in the layer moves differently
+/// from the rest of it — a fixed header, a sticky heading, a scrollbar thumb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scroll {
+    /// The layer whose pixels moved, in device pixels.
+    pub rect: LayerRect,
+    /// How far they moved, in device pixels.
+    pub by: (i32, i32),
+    /// What is drawn afresh afterwards.
+    pub repaint: Vec<LayerRect>,
+}
+
 impl Damage {
-    /// Device pixels this damage covers, for the rasterization counters.
+    /// Device pixels this damage re-rasterized, for the rasterization counters.
     pub(crate) fn pixels(&self, viewport: Viewport) -> u64 {
+        let area = |rect: &LayerRect| u64::from(rect.width) * u64::from(rect.height);
         match self {
             Damage::Unchanged => 0,
-            Damage::Region(rect) => u64::from(rect.width) * u64::from(rect.height),
+            Damage::Region(rect) => area(rect),
+            Damage::Scrolled(scroll) => scroll.repaint.iter().map(area).sum(),
             Damage::Full => u64::from(viewport.width) * u64::from(viewport.height),
         }
     }
@@ -59,6 +81,16 @@ pub(crate) struct Composited {
     pub upload: Upload,
 }
 
+/// One layer as it was last put on the surface: enough to tell next frame what
+/// changed about it, including when all that changed is where it is scrolled to.
+struct Retained {
+    id: LayerId,
+    epoch: u64,
+    rect: LayerRect,
+    list: std::sync::Arc<otlyra_gfx::DisplayList>,
+    offsets: Vec<otlyra_gfx::kurbo::Vec2>,
+}
+
 /// The persistent raster surface and the layers that are currently on it.
 ///
 /// A layer whose epoch and rectangle are unchanged keeps the pixels it already
@@ -67,8 +99,8 @@ pub(crate) struct Composited {
 pub(crate) struct SceneCompositor {
     /// The retained surface. `None` until the first frame sizes it.
     surface: Option<SkiaPainter>,
-    /// Last presented frame's layers — identity, epoch, and rectangle, in order.
-    prev: Vec<(LayerId, u64, LayerRect)>,
+    /// Last presented frame's layers, in order.
+    prev: Vec<Retained>,
     /// Whether a full composite has reached the caller. Until it has, and after
     /// any surface reallocation, the compositor owes a whole-surface frame.
     composited_once: bool,
@@ -119,20 +151,28 @@ impl SceneCompositor {
                 Upload::Full(surface.read_rgba8().map_err(Box::new)?)
             }
             Damage::Region(rect) => {
-                let clip = otlyra_gfx::kurbo::Rect::new(
-                    f64::from(rect.x),
-                    f64::from(rect.y),
-                    f64::from(rect.x + rect.width),
-                    f64::from(rect.y + rect.height),
-                );
-                surface.clip_to(clip);
-                surface.clear_rect(clip);
-                for layer in &scene.layers {
-                    if layer.rect.intersects(&rect) {
-                        otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
-                    }
+                redraw(surface, scene, rect);
+                let pixels = surface
+                    .read_rgba8_rect(rect.x, rect.y, rect.width, rect.height)
+                    .map_err(Box::new)?;
+                Upload::Region {
+                    pixels,
+                    rect: crate::present::DamageRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
                 }
-                surface.reset_clip();
+            }
+            Damage::Scrolled(ref scroll) => {
+                apply_scroll(surface, scene, scroll);
+                // Every pixel of the moved layer is new to the screen, and so is
+                // anything drawn outside it for another layer.
+                let rect = scroll
+                    .repaint
+                    .iter()
+                    .fold(scroll.rect, |union, rect| union.union(rect));
                 let pixels = surface
                     .read_rgba8_rect(rect.x, rect.y, rect.width, rect.height)
                     .map_err(Box::new)?;
@@ -188,7 +228,13 @@ impl SceneCompositor {
         self.prev = scene
             .layers
             .iter()
-            .map(|layer| (layer.id, layer.epoch, layer.rect))
+            .map(|layer| Retained {
+                id: layer.id,
+                epoch: layer.epoch,
+                rect: layer.rect,
+                list: std::sync::Arc::clone(&layer.list),
+                offsets: layer.offsets.clone(),
+            })
             .collect();
         self.composited_once = true;
     }
@@ -224,45 +270,231 @@ impl SceneCompositor {
 ///
 /// A structural change — a different number of layers, or a layer identity in a
 /// different slot — forces a whole frame, because the retained surface can no
-/// longer be trusted position-for-position. Otherwise the damage is the union of
-/// the old and new rectangles of every layer whose epoch or rectangle moved.
-fn plan_damage(
-    prev: &[(LayerId, u64, LayerRect)],
-    next: &[crate::SceneLayer],
-    forced_full: bool,
-) -> Damage {
+/// longer be trusted position-for-position. A layer that kept its list and its
+/// place and changed only its offsets has scrolled, and its pixels are moved
+/// rather than drawn (see [`Scroll`]). Otherwise the damage is the union of the
+/// old and new rectangles of every layer whose epoch or rectangle moved.
+fn plan_damage(prev: &[Retained], next: &[crate::SceneLayer], forced_full: bool) -> Damage {
     if forced_full || prev.len() != next.len() {
         return Damage::Full;
     }
     let mut damage: Option<LayerRect> = None;
+    let mut scroll: Option<Scroll> = None;
     for (previous, layer) in prev.iter().zip(next.iter()) {
-        if previous.0 != layer.id {
+        if previous.id != layer.id {
             return Damage::Full;
         }
-        if previous.1 != layer.epoch || previous.2 != layer.rect {
-            // A layer that stayed where it is and says which part of itself
-            // changed is taken at its word; one that moved has to answer for
-            // where it was as well, and its own account of what changed inside it
-            // says nothing about the pixels it has left behind.
-            let moved = match layer.dirty {
-                Some(dirty) if previous.2 == layer.rect => clamp(dirty, layer.rect),
-                _ => previous.2.union(&layer.rect),
-            };
-            // A layer may change content that is clipped wholly outside its
-            // visible rectangle. Its epoch still advances, but there are no
-            // retained pixels to replace.
-            if moved.width == 0 || moved.height == 0 {
-                continue;
+        if previous.epoch == layer.epoch && previous.rect == layer.rect {
+            continue;
+        }
+        if scroll.is_none()
+            && previous.rect == layer.rect
+            && std::sync::Arc::ptr_eq(&previous.list, &layer.list)
+            && let Some(planned) =
+                plan_scroll(&layer.list, &previous.offsets, &layer.offsets, layer.rect)
+        {
+            scroll = Some(planned);
+            continue;
+        }
+        // A layer that stayed where it is and says which part of itself
+        // changed is taken at its word; one that moved has to answer for
+        // where it was as well, and its own account of what changed inside it
+        // says nothing about the pixels it has left behind.
+        let moved = match layer.dirty {
+            Some(dirty) if previous.rect == layer.rect => clamp(dirty, layer.rect),
+            _ => previous.rect.union(&layer.rect),
+        };
+        // A layer may change content that is clipped wholly outside its
+        // visible rectangle. Its epoch still advances, but there are no
+        // retained pixels to replace.
+        if moved.width == 0 || moved.height == 0 {
+            continue;
+        }
+        damage = Some(match damage {
+            Some(current) => current.union(&moved),
+            None => moved,
+        });
+    }
+    match (scroll, damage) {
+        (None, None) => Damage::Unchanged,
+        (None, Some(rect)) => Damage::Region(rect),
+        (Some(mut scroll), extra) => {
+            // Another layer over the scrolled one would have its pixels moved
+            // along with it; then the layer is simply drawn again.
+            let covered = next
+                .iter()
+                .filter(|layer| layer.rect != scroll.rect)
+                .any(|layer| layer.rect.intersects(&scroll.rect));
+            if covered {
+                let rect = extra.map_or(scroll.rect, |extra| extra.union(&scroll.rect));
+                return Damage::Region(rect);
             }
-            damage = Some(match damage {
-                Some(current) => current.union(&moved),
-                None => moved,
-            });
+            scroll.repaint.extend(extra);
+            Damage::Scrolled(scroll)
         }
     }
-    match damage {
-        Some(rect) => Damage::Region(rect),
-        None => Damage::Unchanged,
+}
+
+/// The scroll that takes `list` drawn with `before` to `list` drawn with
+/// `after`, in the layer at `rect` — or `None` when moving pixels is not the
+/// cheaper way there: the move is not a whole number of pixels, or so much has
+/// to be drawn afterwards that drawing everything is as cheap.
+///
+/// The part of the list that reaches furthest is taken to be what scrolled — the
+/// page, which is the whole length of the document; its move is the move. Every other part that moved differently — or did not move
+/// at all, like a fixed header — is drawn again both where the move put its old
+/// pixels and where it is now.
+fn plan_scroll(
+    list: &otlyra_gfx::DisplayList,
+    before: &[otlyra_gfx::kurbo::Vec2],
+    after: &[otlyra_gfx::kurbo::Vec2],
+    rect: LayerRect,
+) -> Option<Scroll> {
+    let parts = list.spatial_bounds();
+    let bulk = parts
+        .iter()
+        .max_by(|(_, _, one), (_, _, other)| one.area().total_cmp(&other.area()))?
+        .0;
+    let moved = |spatial| {
+        list.shift(spatial, after).translation() - list.shift(spatial, before).translation()
+    };
+    let by = moved(bulk);
+    let whole = |value: f64| (value - value.round()).abs() < 1e-3;
+    if !whole(by.x) || !whole(by.y) {
+        return None;
+    }
+    let by_pixels = (by.x.round() as i32, by.y.round() as i32);
+    if by_pixels.0.unsigned_abs() >= rect.width || by_pixels.1.unsigned_abs() >= rect.height {
+        return None;
+    }
+
+    let mut repaint = Vec::new();
+    // The strip the move uncovered.
+    let (dx, dy) = (by_pixels.0.unsigned_abs(), by_pixels.1.unsigned_abs());
+    if by_pixels.1 < 0 {
+        repaint.push(LayerRect {
+            y: rect.y + rect.height - dy,
+            height: dy,
+            ..rect
+        });
+    } else if by_pixels.1 > 0 {
+        repaint.push(LayerRect { height: dy, ..rect });
+    }
+    if by_pixels.0 < 0 {
+        repaint.push(LayerRect {
+            x: rect.x + rect.width - dx,
+            width: dx,
+            ..rect
+        });
+    } else if by_pixels.0 > 0 {
+        repaint.push(LayerRect { width: dx, ..rect });
+    }
+    // Whatever moved otherwise: where the move took its old pixels, and where it
+    // is now.
+    for (spatial, _, bounds) in &parts {
+        let own = moved(*spatial);
+        if *spatial == bulk || (own - by).hypot() < 1e-3 {
+            continue;
+        }
+        let was = *bounds + list.shift(*spatial, before).translation() + by;
+        let is = *bounds + list.shift(*spatial, after).translation();
+        for area in [was, is] {
+            let covered = clamp(pixel_rect(area), rect);
+            if covered.width > 0 && covered.height > 0 {
+                repaint.push(covered);
+            }
+        }
+    }
+
+    let repaint = merged(repaint);
+    let area = |rect: &LayerRect| u64::from(rect.width) * u64::from(rect.height);
+    let drawn: u64 = repaint.iter().map(area).sum();
+    if drawn * 5 > area(&rect) * 3 {
+        return None;
+    }
+    Some(Scroll {
+        rect,
+        by: by_pixels,
+        repaint,
+    })
+}
+
+/// `rects` with every two that overlap enough replaced by the rectangle around
+/// both.
+///
+/// Something fixed to the screen is drawn again where it is and where the move
+/// took its old pixels, and the two are the same rectangle a scroll step apart:
+/// drawn as one, the overlap is drawn once. Two that merely touch are left
+/// apart — the rectangle around a sliver down the left edge and a band across
+/// the page is most of the page, and drawing that is what this is for avoiding.
+fn merged(mut rects: Vec<LayerRect>) -> Vec<LayerRect> {
+    let area = |rect: &LayerRect| u64::from(rect.width) * u64::from(rect.height);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'pairs: for one in 0..rects.len() {
+            for other in one + 1..rects.len() {
+                let around = rects[one].union(&rects[other]);
+                if rects[one].intersects(&rects[other])
+                    && area(&around) <= area(&rects[one]) + area(&rects[other])
+                {
+                    let absorbed = rects.swap_remove(other);
+                    rects[one] = rects[one].union(&absorbed);
+                    changed = true;
+                    break 'pairs;
+                }
+            }
+        }
+    }
+    rects
+}
+
+/// The whole pixels `area` touches, and one more on every side for antialiasing.
+fn pixel_rect(area: otlyra_gfx::kurbo::Rect) -> LayerRect {
+    let x0 = (area.x0.floor() - 1.0).max(0.0);
+    let y0 = (area.y0.floor() - 1.0).max(0.0);
+    let x1 = (area.x1.ceil() + 1.0).max(x0);
+    let y1 = (area.y1.ceil() + 1.0).max(y0);
+    LayerRect {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    }
+}
+
+/// Draw `rect` of the surface afresh from every layer that reaches it.
+fn redraw(surface: &mut SkiaPainter, scene: &Scene, rect: LayerRect) {
+    let clip = otlyra_gfx::kurbo::Rect::new(
+        f64::from(rect.x),
+        f64::from(rect.y),
+        f64::from(rect.x + rect.width),
+        f64::from(rect.y + rect.height),
+    );
+    surface.clip_to(clip);
+    surface.clear_rect(clip);
+    for layer in &scene.layers {
+        if layer.rect.intersects(&rect) {
+            otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
+        }
+    }
+    surface.reset_clip();
+}
+
+/// Move a scrolled layer's pixels and draw what the move could not account for.
+pub(crate) fn apply_scroll(surface: &mut SkiaPainter, scene: &Scene, scroll: &Scroll) {
+    let rect = scroll.rect;
+    surface.shift_rect(
+        otlyra_gfx::kurbo::Rect::new(
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.x + rect.width),
+            f64::from(rect.y + rect.height),
+        ),
+        scroll.by,
+    );
+    for area in &scroll.repaint {
+        redraw(surface, scene, *area);
     }
 }
 
@@ -366,7 +598,7 @@ impl FramePump {
 
     /// What the last frame redrew.
     pub fn damage(&self) -> Damage {
-        self.damage
+        self.damage.clone()
     }
 
     /// Draw one frame now, whether or not one was asked for.
@@ -387,7 +619,7 @@ impl FramePump {
                 Damage::Full
             }
         };
-        self.damage = damage;
+        self.damage = damage.clone();
         Ok(damage)
     }
 
@@ -434,6 +666,139 @@ mod tests {
         }
     }
 
+    /// A layer as the previous frame left it.
+    fn kept(id: u64, epoch: u64, rect: LayerRect) -> Retained {
+        Retained {
+            id: LayerId(id),
+            epoch,
+            rect,
+            list: std::sync::Arc::new(otlyra_gfx::DisplayList::new()),
+            offsets: Vec::new(),
+        }
+    }
+
+    /// A page: forty bands down it that scroll, and a header fixed to the top
+    /// of the layer.
+    fn scrolling_page() -> std::sync::Arc<otlyra_gfx::DisplayList> {
+        use otlyra_gfx::kurbo::Shape;
+        let fill = |y: f64, height: f64, shade: u8| otlyra_gfx::DisplayItem::Fill {
+            style: otlyra_gfx::peniko::Fill::NonZero,
+            transform: otlyra_gfx::kurbo::Affine::IDENTITY,
+            brush: otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
+                shade,
+                255 - shade,
+                128,
+            )),
+            brush_transform: None,
+            shape: otlyra_gfx::kurbo::Rect::new(0.0, y, 100.0, y + height).to_path(0.1),
+        };
+        let mut list = otlyra_gfx::DisplayList::new();
+        list.set_spatial(otlyra_gfx::SpatialId(1));
+        for band in 0..40_u8 {
+            list.push(fill(f64::from(band) * 10.0, 10.0, band * 6));
+        }
+        list.set_spatial(otlyra_gfx::SpatialId::VIEWPORT);
+        list.push(fill(0.0, 12.0, 250));
+        std::sync::Arc::new(list)
+    }
+
+    fn scrolled(y: f64) -> Vec<otlyra_gfx::kurbo::Vec2> {
+        vec![
+            otlyra_gfx::kurbo::Vec2::ZERO,
+            otlyra_gfx::kurbo::Vec2::new(0.0, y),
+        ]
+    }
+
+    #[test]
+    fn a_scroll_moves_the_pixels_and_draws_the_strip_and_what_did_not_move() {
+        let list = scrolling_page();
+        let area = rect(0, 0, 100, 200);
+        let prev = [Retained {
+            offsets: scrolled(0.0),
+            list: std::sync::Arc::clone(&list),
+            ..kept(0, 1, area)
+        }];
+        let next = [crate::SceneLayer {
+            offsets: scrolled(40.0),
+            list,
+            ..layer(0, 2, area)
+        }];
+        let Damage::Scrolled(scroll) = plan_damage(&prev, &next, false) else {
+            panic!("a scroll is moved, not drawn");
+        };
+        assert_eq!(scroll.by, (0, -40));
+        assert!(
+            scroll.repaint.contains(&rect(0, 160, 100, 40)),
+            "the strip uncovered"
+        );
+        assert!(
+            scroll
+                .repaint
+                .iter()
+                .any(|repaint| repaint.y == 0 && repaint.height >= 12),
+            "the header, which did not move with the page"
+        );
+    }
+
+    #[test]
+    fn rectangles_are_merged_only_where_merging_draws_no_more() {
+        // A header drawn where it is and where the scroll took its old pixels.
+        let header = merged(vec![rect(0, 0, 100, 12), rect(0, 0, 100, 16)]);
+        assert_eq!(header, vec![rect(0, 0, 100, 16)]);
+        // A sliver down the left edge and a band across the page touch, and the
+        // rectangle around them would be most of the page.
+        let apart = merged(vec![rect(0, 0, 1, 180), rect(0, 60, 100, 20)]);
+        assert_eq!(apart.len(), 2);
+    }
+
+    #[test]
+    fn a_scroll_by_a_fraction_of_a_pixel_is_drawn() {
+        let list = scrolling_page();
+        let area = rect(0, 0, 100, 200);
+        let prev = [Retained {
+            offsets: scrolled(0.0),
+            list: std::sync::Arc::clone(&list),
+            ..kept(0, 1, area)
+        }];
+        let next = [crate::SceneLayer {
+            offsets: scrolled(10.5),
+            list,
+            ..layer(0, 2, area)
+        }];
+        assert_eq!(plan_damage(&prev, &next, false), Damage::Region(area));
+    }
+
+    #[test]
+    fn a_moved_frame_is_the_frame_drawn_whole() {
+        let list = scrolling_page();
+        let area = rect(0, 0, 100, 200);
+        let scene = |y: f64, epoch: u64| crate::Scene {
+            layers: vec![crate::SceneLayer {
+                offsets: scrolled(y),
+                list: std::sync::Arc::clone(&list),
+                ..layer(0, epoch, area)
+            }],
+        };
+        let viewport = Viewport::new(100, 200, 1.0);
+
+        let mut moved = SceneCompositor::new();
+        moved.rasterize(&scene(0.0, 1), viewport).expect("a frame");
+        moved.commit(&scene(0.0, 1));
+        for (step, y) in [37.0, 80.0, 45.0].into_iter().enumerate() {
+            let frame = scene(y, step as u64 + 2);
+            let composited = moved.rasterize(&frame, viewport).expect("a frame");
+            assert!(matches!(composited.damage, Damage::Scrolled(_)));
+            moved.commit(&frame);
+
+            let mut whole = SceneCompositor::new();
+            whole.rasterize(&frame, viewport).expect("a frame");
+            assert!(
+                moved.read_rgba8().expect("pixels") == whole.read_rgba8().expect("pixels"),
+                "scrolled to {y}, the moved frame differs from the one drawn whole"
+            );
+        }
+    }
+
     /// The same, saying which part of itself changed.
     fn partial(id: u64, epoch: u64, rect: LayerRect, dirty: LayerRect) -> crate::SceneLayer {
         crate::SceneLayer {
@@ -459,7 +824,7 @@ mod tests {
 
     #[test]
     fn a_different_layer_count_or_identity_redraws_everything() {
-        let prev = [(LayerId(0), 1, rect(0, 0, 10, 10))];
+        let prev = [kept(0, 1, rect(0, 0, 10, 10))];
         let two = [
             layer(0, 1, rect(0, 0, 10, 10)),
             layer(1, 1, rect(0, 10, 10, 10)),
@@ -473,8 +838,8 @@ mod tests {
     #[test]
     fn an_unchanged_frame_damages_nothing() {
         let prev = [
-            (LayerId(0), 5, rect(0, 20, 100, 80)),
-            (LayerId(1), 2, rect(0, 0, 100, 20)),
+            kept(0, 5, rect(0, 20, 100, 80)),
+            kept(1, 2, rect(0, 0, 100, 20)),
         ];
         let next = [
             layer(0, 5, rect(0, 20, 100, 80)),
@@ -508,8 +873,8 @@ mod tests {
         // Page (id 0) below, chrome (id 1) on top. Only the chrome epoch moves:
         // the page keeps its pixels, so damage is the chrome rect alone.
         let prev = [
-            (LayerId(0), 5, rect(0, 20, 100, 80)),
-            (LayerId(1), 2, rect(0, 0, 100, 20)),
+            kept(0, 5, rect(0, 20, 100, 80)),
+            kept(1, 2, rect(0, 0, 100, 20)),
         ];
         let next = [
             layer(0, 5, rect(0, 20, 100, 80)),
@@ -526,8 +891,8 @@ mod tests {
         // The page (id 0) is where it was and reports one changed rectangle — a
         // field being typed into. The paragraphs around it keep their pixels.
         let prev = [
-            (LayerId(0), 5, rect(0, 20, 100, 80)),
-            (LayerId(1), 2, rect(0, 0, 100, 20)),
+            kept(0, 5, rect(0, 20, 100, 80)),
+            kept(1, 2, rect(0, 0, 100, 20)),
         ];
         let next = [
             partial(0, 6, rect(0, 20, 100, 80), rect(10, 30, 40, 10)),
@@ -543,7 +908,7 @@ mod tests {
     fn a_layer_that_moved_damages_where_it_was_whatever_it_says_changed() {
         // Its own account is about its contents; the pixels it left behind are
         // not its contents, and nothing else in the scene has drawn them yet.
-        let prev = [(LayerId(0), 1, rect(0, 0, 10, 10))];
+        let prev = [kept(0, 1, rect(0, 0, 10, 10))];
         let next = [partial(0, 2, rect(20, 0, 10, 10), rect(20, 0, 2, 2))];
         assert_eq!(
             plan_damage(&prev, &next, false),
@@ -553,7 +918,7 @@ mod tests {
 
     #[test]
     fn a_reported_rectangle_is_cut_to_the_layer_it_belongs_to() {
-        let prev = [(LayerId(0), 1, rect(0, 20, 100, 80))];
+        let prev = [kept(0, 1, rect(0, 20, 100, 80))];
         let next = [partial(0, 2, rect(0, 20, 100, 80), rect(50, 0, 100, 200))];
         assert_eq!(
             plan_damage(&prev, &next, false),
@@ -563,14 +928,14 @@ mod tests {
 
     #[test]
     fn a_changed_layer_with_offscreen_damage_redraws_nothing() {
-        let prev = [(LayerId(0), 1, rect(0, 20, 100, 80))];
+        let prev = [kept(0, 1, rect(0, 20, 100, 80))];
         let next = [partial(0, 2, rect(0, 20, 100, 80), rect(10, 0, 30, 10))];
         assert_eq!(plan_damage(&prev, &next, false), Damage::Unchanged);
     }
 
     #[test]
     fn a_moved_rectangle_damages_both_where_it_was_and_where_it_is() {
-        let prev = [(LayerId(0), 1, rect(0, 0, 10, 10))];
+        let prev = [kept(0, 1, rect(0, 0, 10, 10))];
         let next = [layer(0, 1, rect(20, 0, 10, 10))];
         assert_eq!(
             plan_damage(&prev, &next, false),

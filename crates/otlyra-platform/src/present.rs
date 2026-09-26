@@ -84,7 +84,7 @@ impl DirectFrame {
     }
 
     /// Draw the retained scene directly into the wgpu-owned texture.
-    pub(crate) fn rasterize(&mut self, scene: &Scene, damage: Damage) {
+    pub(crate) fn rasterize(&mut self, scene: &Scene, damage: &Damage) {
         match damage {
             Damage::Unchanged => {}
             Damage::Full => {
@@ -104,11 +104,15 @@ impl DirectFrame {
                 self.painter.clip_to(clip);
                 self.painter.clear_rect(clip);
                 for layer in &scene.layers {
-                    if layer.rect.intersects(&rect) {
+                    if layer.rect.intersects(rect) {
                         otlyra_gfx::render_scrolled(&layer.list, &mut self.painter, &layer.offsets);
                     }
                 }
                 self.painter.reset_clip();
+                self.painter.flush_and_submit();
+            }
+            Damage::Scrolled(scroll) => {
+                crate::compositor::apply_scroll(&mut self.painter, scene, scroll);
                 self.painter.flush_and_submit();
             }
         }
@@ -121,7 +125,7 @@ impl DirectFrame {
         (0, 0)
     }
 
-    pub(crate) fn rasterize(&mut self, _scene: &Scene, _damage: Damage) {}
+    pub(crate) fn rasterize(&mut self, _scene: &Scene, _damage: &Damage) {}
 }
 
 impl Presenter {

@@ -806,6 +806,36 @@ impl SkiaPainter {
         );
     }
 
+    /// Move the pixels inside `rect` by `by` whole pixels, keeping them inside
+    /// `rect`: what was scrolled out of it is gone, and what is scrolled into it
+    /// is left as it was, for the caller to draw.
+    ///
+    /// How a scroll reuses what is already on the surface. The page moved; its
+    /// pixels did not change, only where they are.
+    pub fn shift_rect(&mut self, rect: Rect, by: (i32, i32)) {
+        let bounds = sk::IRect::new(
+            rect.x0 as i32,
+            rect.y0 as i32,
+            rect.x1 as i32,
+            rect.y1 as i32,
+        );
+        let Some(image) = self.surface.image_snapshot_with_bounds(bounds) else {
+            return;
+        };
+        let mut paint = sk::Paint::default();
+        paint.set_blend_mode(sk::BlendMode::Src);
+        let canvas = self.surface.canvas();
+        canvas.save();
+        canvas.reset_matrix();
+        canvas.clip_irect(bounds, sk::ClipOp::Intersect);
+        canvas.draw_image(
+            &image,
+            ((bounds.left + by.0) as f32, (bounds.top + by.1) as f32),
+            Some(&paint),
+        );
+        canvas.restore();
+    }
+
     /// Restrict all subsequent drawing to `rect` until [`SkiaPainter::reset_clip`].
     ///
     /// The retained compositor sets this to the damaged region so re-rendering the

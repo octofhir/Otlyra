@@ -280,7 +280,7 @@ impl Renderer {
         }
         let damage = self.compositor.plan(&scene, reallocated);
         let direct = self.direct.as_mut().expect("direct frame prepared");
-        direct.rasterize(&scene, damage);
+        direct.rasterize(&scene, &damage);
         if let Some(trace) = trace.as_ref() {
             trace.mark("chrome_raster_complete");
             // This backend has no readback; the milestone records that the stage
