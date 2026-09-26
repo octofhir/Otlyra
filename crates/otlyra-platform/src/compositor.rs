@@ -2,9 +2,9 @@
 //!
 //! One implementation, two callers. [`SceneCompositor`] owns the persistent
 //! raster surface, works out what a frame has to redraw from the layers the
-//! embedder published, and re-rasterizes only that; the event loop hands the
-//! result to a swapchain, and [`FramePump`] hands it back to the caller as
-//! pixels. That is the point of the split: a test or a driver that wants to know
+//! embedder published, and re-rasterizes only that; a window's render thread
+//! hands the result to a swapchain, and [`FramePump`] hands it back to the caller
+//! as pixels. That is the point of the split: a test or a driver that wants to know
 //! what the window shows runs the *same* `compose` → damage → retained-surface
 //! path the window runs, rather than a second whole-surface paint that can agree
 //! with the tests and disagree with the screen.

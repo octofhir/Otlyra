@@ -14,9 +14,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::a11y::Accessibility;
-use crate::compositor::{SceneCompositor, Upload};
+use crate::compositor::SceneCompositor;
 use crate::menu::{NativeMenu, command_from_muda};
-use crate::present::{DirectFrame, Presented, Presenter};
+use crate::present::{Presented, Presenter};
+use crate::render_thread::{FrameContent, FrameJob, FrameReport, RenderReport, RenderThread};
 use crate::{FrameRequest, MenuId, Painter, PlatformEvent, Viewport, WindowConfig};
 
 /// Logical pixels one wheel notch scrolls.
@@ -24,6 +25,16 @@ const LINE_SCROLL: f64 = 40.0;
 
 /// How many frames in a row the swapchain may refuse before we stop asking.
 const MAX_DROPPED_FRAMES: u32 = 8;
+
+/// How long a frame drawn at a new size is waited for before the loop goes back
+/// to its events.
+///
+/// Every other frame is handed to the render thread and forgotten until it
+/// reports. A frame at a new size is not: until it lands, the window shows the
+/// last frame stretched to the new size, which reads as the page smearing. So
+/// the loop waits for it — but not for ever, because a page that takes seconds
+/// to rasterize must not take the window's input with it.
+const RESIZE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Translate winit's theme into our own vocabulary.
 fn translate_theme(theme: winit::window::Theme) -> crate::ColorScheme {
@@ -70,8 +81,6 @@ enum UserEvent {
     Woken,
     /// Backend discovery completed; the main thread may attach the window.
     PresenterInstanceReady(Box<crate::present::PresenterInstance>),
-    /// GPU initialization completed without blocking the window event loop.
-    PresenterReady(Box<Result<Presenter, crate::present::PresentError>>),
 }
 
 /// Where other threads post [`UserEvent`]s: a channel, and the loop woken to
@@ -118,6 +127,9 @@ pub enum PlatformError {
     /// The requested machine-readable startup report could not be written.
     #[error("startup report failed: {0}")]
     StartupReport(#[source] std::io::Error),
+    /// The render thread could not be started, or stopped taking frames.
+    #[error("render thread failed: {0}")]
+    RenderThread(String),
 }
 
 impl From<Box<otlyra_gfx::SkiaError>> for PlatformError {
@@ -138,10 +150,6 @@ impl From<crate::present::PresentError> for PlatformError {
     }
 }
 
-/// How long the loop waits before an animated frame. Sixty a second, which is
-/// enough for a spinner and cheap enough that nothing else has to opt out.
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-
 /// Work performed by the platform frame path since the window opened.
 ///
 /// Cumulative counters make a no-op visible: tests and profiles can compare two
@@ -157,15 +165,31 @@ struct WorkCounters {
     uploaded_bytes: u64,
 }
 
-/// Coalesces immediate frames and owns the one future wake-up.
+/// Coalesces frame requests, keeps one frame in flight, and owns the one future
+/// wake-up.
+///
+/// A frame is *in flight* from the moment it is handed to the render thread
+/// until the render thread reports it. Nothing is built while one is: whatever
+/// asks for a frame meanwhile is remembered as owed, and the owed frame is built
+/// once the report arrives — one frame, from everything that changed, rather
+/// than a queue of frames each already stale.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct FrameScheduler {
+    /// A frame is owed and has not been started.
     redraw_pending: bool,
+    /// A frame is with the render thread.
+    in_flight: bool,
     deadline: Option<std::time::Instant>,
 }
 
 impl FrameScheduler {
     /// Record one request. `true` means winit needs a new redraw request now.
+    ///
+    /// `Vsync` is an owed frame like `Now`: what paces it is the frame in
+    /// flight, which reports no sooner than the display takes it. An animation
+    /// that asks again every time a frame lands therefore runs at the display's
+    /// rate — sixty, a hundred and twenty, whatever it is — with no timer
+    /// guessing at it.
     fn request(&mut self, request: FrameRequest, now: std::time::Instant) -> bool {
         match request {
             FrameRequest::None => false,
@@ -176,10 +200,7 @@ impl FrameScheduler {
                 self.deadline = None;
                 self.request_now()
             }
-            FrameRequest::Vsync => {
-                self.set_deadline(now + FRAME_INTERVAL);
-                false
-            }
+            FrameRequest::Vsync => self.request_now(),
             FrameRequest::At(deadline) if deadline <= now => self.request_now(),
             FrameRequest::At(deadline) => {
                 self.set_deadline(deadline);
@@ -188,12 +209,14 @@ impl FrameScheduler {
         }
     }
 
+    /// Owe a frame. `true` when winit has to be asked for it now; while a frame
+    /// is in flight the answer is no, and the report asks instead.
     fn request_now(&mut self) -> bool {
         if self.redraw_pending {
             return false;
         }
         self.redraw_pending = true;
-        true
+        !self.in_flight
     }
 
     fn set_deadline(&mut self, deadline: std::time::Instant) {
@@ -211,9 +234,18 @@ impl FrameScheduler {
         self.request_now()
     }
 
+    /// A frame was built and handed to the render thread.
     fn redraw_started(&mut self) {
         self.redraw_pending = false;
         self.deadline = None;
+        self.in_flight = true;
+    }
+
+    /// The render thread reported the frame in flight. `true` when another was
+    /// owed meanwhile and winit has to be asked for it now.
+    fn frame_done(&mut self) -> bool {
+        self.in_flight = false;
+        self.redraw_pending
     }
 }
 
@@ -260,12 +292,13 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         config,
         painter,
         a11y: None,
+        render: None,
+        render_ready: false,
+        last_submitted: None,
         window: None,
-        direct_frame: None,
-        presenter: None,
         mailbox,
         inbox,
-        compositor: SceneCompositor::new(),
+        whole_surface: SceneCompositor::new(),
         menu: None,
         frames: 0,
         startup_origin,
@@ -303,18 +336,24 @@ struct WindowedApp<'p> {
     /// degraded browser and not a broken one. Declared before the window so it
     /// is dropped first: it has subclassed the window's view, and gives it back.
     a11y: Option<Accessibility>,
+    /// Where frames are rasterized and presented. Absent until the window's GPU
+    /// surface has been attached. Declared before the window so it is dropped
+    /// first: dropping it stops the thread, and the thread holds the swapchain,
+    /// which holds a handle on the window.
+    render: Option<RenderThread>,
+    /// Whether the render thread has its device and can take frames.
+    render_ready: bool,
+    /// The size of the last frame handed over, to know when one is at a new size.
+    last_submitted: Option<Viewport>,
     window: Option<Arc<dyn Window>>,
-    /// Thread-bound Ganesh surface. It is created and used only on the event-loop
-    /// thread and drops before the presenter whose Metal device it wraps.
-    direct_frame: Option<DirectFrame>,
-    presenter: Option<Presenter>,
     /// Where background GPU initialization posts that it is done.
     mailbox: Mailbox,
     /// What other threads have posted, read when the loop is woken.
     inbox: mpsc::Receiver<UserEvent>,
-    /// The retained surface and the layers on it — the same compositor a
-    /// [`crate::FramePump`] drives with no window.
-    compositor: SceneCompositor,
+    /// The surface a painter with no layers paints its whole frame into, here on
+    /// the loop's thread because `paint` is the painter's and the painter is
+    /// this thread's. Layered frames go to the render thread's own compositor.
+    whole_surface: SceneCompositor,
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
     frames: u64,
@@ -439,9 +478,9 @@ impl WindowedApp<'_> {
 
     fn issue_redraw(&mut self) {
         // State may change while the GPU device is being requested. The first
-        // frame after PresenterReady observes all of it; rasterizing before
-        // there is somewhere to present would only burn startup time.
-        if self.presenter.is_none() {
+        // frame after the render thread is ready observes all of it; rasterizing
+        // before there is somewhere to present would only burn startup time.
+        if !self.render_ready {
             self.scheduler.redraw_pending = false;
             return;
         }
@@ -493,11 +532,28 @@ impl WindowedApp<'_> {
         }
     }
 
-    fn redraw(&mut self) -> Result<Presented, PlatformError> {
+    /// Build a frame and hand it to the render thread.
+    ///
+    /// Building is the painter's, so it happens here; everything after — raster,
+    /// readback, upload, waiting for the display — is the render thread's, and
+    /// this returns as soon as the frame is handed over. What became of it
+    /// arrives later as a [`RenderReport`].
+    fn redraw(&mut self, event_loop: &dyn ActiveEventLoop) -> Result<(), PlatformError> {
+        if !self.render_ready {
+            self.scheduler.redraw_pending = false;
+            return Ok(());
+        }
+        // The system can ask for a redraw on its own — a window uncovered, a
+        // display changed — while a frame is still with the render thread. That
+        // frame will report, and the report builds the one owed now.
+        if self.scheduler.in_flight {
+            self.scheduler.redraw_pending = true;
+            return Ok(());
+        }
         self.scheduler.redraw_started();
         // Only the first frame carries startup marks. Cloning the handle (an `Arc`)
-        // once here keeps the marks free of a `&self` borrow that would collide
-        // with the rasterizer's `&mut`, and skips the work on every later frame.
+        // once here keeps the marks free of a `&self` borrow, and skips the work
+        // on every later frame.
         let trace = if self.first_frame.is_none() {
             self.config.startup_trace.clone()
         } else {
@@ -505,186 +561,118 @@ impl WindowedApp<'_> {
         };
         let viewport = self.viewport();
 
-        // Retained-layer path: a painter that publishes a scene re-rasterizes and
-        // re-uploads only what moved. Everything else is drawn whole below.
-        if let Some(scene) = self.painter.compose(viewport) {
-            return self.composite(scene, viewport, &trace);
-        }
-
-        self.work.frames_started += 1;
-        self.work.rasterized_pixels = self
-            .work
-            .rasterized_pixels
-            .saturating_add(u64::from(viewport.width) * u64::from(viewport.height));
-
-        let pixels = {
-            let _paint = tracing::info_span!(
-                "paint",
-                width = viewport.width,
-                height = viewport.height,
-                scale_factor = viewport.scale_factor
-            )
-            .entered();
-            self.compositor
-                .rasterize_whole(&mut *self.painter, viewport)?
-        };
-        // Chrome build, text shaping, and CPU raster all happen inside `paint`,
-        // which interleaves list-building and Skia draw calls; the seam here can
-        // separate them from readback but not from one another.
-        if let Some(trace) = trace.as_ref() {
-            trace.mark("chrome_raster_complete");
-        }
-
-        let _present = tracing::info_span!("present", mode = "blit").entered();
-        if let Some(trace) = trace.as_ref() {
-            trace.mark("readback_complete");
-        }
-        let Some(presenter) = self.presenter.as_mut() else {
-            return Ok(Presented::Dropped);
-        };
-        presenter.resize(viewport);
-        let upload_bytes = pixels.len() as u64;
-        let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
-        self.after_present(outcome, viewport, upload_bytes, &trace)?;
-        Ok(outcome)
-    }
-
-    /// Publish this frame as retained layers, re-rasterizing and re-uploading only
-    /// the region the moved layers cover.
-    ///
-    /// The rasterizer's surface persists between frames; an unchanged layer keeps
-    /// the pixels it already has, and a frame that touches only the tab strip
-    /// neither re-rasterizes nor re-uploads the page beneath it.
-    fn composite(
-        &mut self,
-        scene: crate::Scene,
-        viewport: Viewport,
-        trace: &Option<crate::StartupTrace>,
-    ) -> Result<Presented, PlatformError> {
-        if self.config.renderer == crate::RendererBackend::DirectGpu {
-            return self.composite_direct(scene, viewport, trace);
-        }
-        self.work.frames_started += 1;
-
-        // Rasterize into the retained surface and read back only what changed.
-        // The surface is sized here, and a reallocation throws away every retained
-        // pixel, so the compositor answers with a whole-surface frame.
-        let composited = self.compositor.rasterize(&scene, viewport)?;
-        self.work.rasterized_pixels = self
-            .work
-            .rasterized_pixels
-            .saturating_add(composited.damage.pixels(viewport));
-        let upload = composited.upload;
-        if let Some(trace) = trace.as_ref() {
-            trace.mark("chrome_raster_complete");
-        }
-
-        let Some(presenter) = self.presenter.as_mut() else {
-            return Ok(Presented::Dropped);
-        };
-        presenter.resize(viewport);
-
-        let _present = tracing::info_span!("present", mode = "composite").entered();
-        let (outcome, upload_bytes) = match upload {
-            Upload::Unchanged => (presenter.reblit()?, 0),
-            Upload::Full(pixels) => {
-                if let Some(trace) = trace.as_ref() {
-                    trace.mark("readback_complete");
-                }
-                let bytes = pixels.len() as u64;
-                let outcome = presenter.present(&pixels, viewport.width, viewport.height)?;
-                (
-                    outcome,
-                    if outcome == Presented::Frame {
-                        bytes
-                    } else {
-                        0
-                    },
-                )
-            }
-            Upload::Region { pixels, rect } => {
-                if let Some(trace) = trace.as_ref() {
-                    trace.mark("readback_complete");
-                }
-                let bytes = pixels.len() as u64;
-                let outcome =
-                    presenter.present_rect(&pixels, viewport.width, viewport.height, rect)?;
-                // A fresh staging texture cannot take a partial upload; fall back to
-                // a whole frame and let the next damage be partial again.
-                if outcome == Presented::Dropped {
-                    (Presented::Dropped, 0)
-                } else {
-                    (
-                        outcome,
-                        if outcome == Presented::Frame {
-                            bytes
-                        } else {
-                            0
-                        },
+        // Retained-layer path: a painter that publishes a scene has only what
+        // moved re-rasterized. Everything else is painted whole, here, because
+        // `paint` draws as it goes and the painter lives on this thread.
+        let content = match self.painter.compose(viewport) {
+            Some(scene) => FrameContent::Scene(scene),
+            None => {
+                let pixels = {
+                    let _paint = tracing::info_span!(
+                        "paint",
+                        width = viewport.width,
+                        height = viewport.height,
+                        scale_factor = viewport.scale_factor
                     )
+                    .entered();
+                    self.whole_surface
+                        .rasterize_whole(&mut *self.painter, viewport)?
+                };
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("chrome_raster_complete");
                 }
+                FrameContent::Pixels(pixels)
             }
         };
+        self.work.frames_started += 1;
 
-        // Remember this frame's layers only once it actually reached the screen;
-        // a dropped frame must be recomposed, and forcing the next one full is the
-        // safe way to do that.
-        if outcome == Presented::Frame {
-            self.compositor.commit(&scene);
-        } else {
-            self.compositor.discard();
+        let render = self.render.as_ref().expect("ready implies a render thread");
+        if !render.submit(FrameJob {
+            content,
+            viewport,
+            trace,
+        }) {
+            return Err(PlatformError::RenderThread(
+                "the render thread stopped taking frames".to_owned(),
+            ));
         }
 
-        self.after_present(outcome, viewport, upload_bytes, trace)?;
-        Ok(outcome)
+        // A frame at a new size is waited for; see `RESIZE_WAIT`.
+        if self.last_submitted != Some(viewport) {
+            self.last_submitted = Some(viewport);
+            if let Some(report) = render.wait_report(RESIZE_WAIT) {
+                self.handle_render_report(event_loop, report);
+            }
+        }
+        Ok(())
     }
 
-    /// Opt-in Metal path: rasterize into the presenter's retained wgpu texture
-    /// and sample it directly into the swapchain.
-    fn composite_direct(
-        &mut self,
-        scene: crate::Scene,
-        viewport: Viewport,
-        trace: &Option<crate::StartupTrace>,
-    ) -> Result<Presented, PlatformError> {
-        self.work.frames_started += 1;
-        let Some(presenter) = self.presenter.as_mut() else {
-            return Ok(Presented::Dropped);
-        };
-
-        presenter.resize(viewport);
-        let reallocated = self
-            .direct_frame
-            .as_ref()
-            .is_none_or(|frame| frame.size() != (viewport.width, viewport.height));
-        if reallocated {
-            self.direct_frame = None;
-            self.direct_frame = Some(presenter.create_direct(viewport)?);
+    /// Act on one thing the render thread said.
+    fn handle_render_report(&mut self, event_loop: &dyn ActiveEventLoop, report: RenderReport) {
+        match report {
+            RenderReport::Ready => {
+                self.mark("gpu_ready");
+                self.render_ready = true;
+                self.request_frame(FrameRequest::Now);
+            }
+            RenderReport::Failed(error) => self.fail(event_loop, error),
+            RenderReport::Frame(frame) => self.frame_finished(event_loop, frame),
         }
-        let damage = self.compositor.plan(&scene, reallocated);
+        self.sync_control_flow(event_loop);
+    }
+
+    /// The frame in flight is done: account for it, and build the next one if
+    /// anything asked for it meanwhile.
+    fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
+        let owed = self.scheduler.frame_done();
         self.work.rasterized_pixels = self
             .work
             .rasterized_pixels
-            .saturating_add(damage.pixels(viewport));
-        let direct = self.direct_frame.as_mut().expect("direct frame prepared");
-        direct.rasterize(&scene, damage);
-        if let Some(trace) = trace.as_ref() {
-            trace.mark("chrome_raster_complete");
-            // This backend has no readback; keeping the milestone records that
-            // the stage completed in zero additional time and preserves the
-            // startup report schema.
-            trace.mark("readback_complete");
+            .saturating_add(frame.rasterized_pixels);
+
+        match frame.outcome {
+            Presented::Frame | Presented::Occluded => {
+                self.dropped_frames = 0;
+                if let Err(error) = self.after_present(
+                    frame.outcome,
+                    frame.viewport,
+                    frame.uploaded_bytes,
+                    &frame.trace,
+                ) {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                if self.startup_report_written {
+                    event_loop.exit();
+                    return;
+                }
+                let next = self.painter.next_frame();
+                // An animation in a window nobody can see has nobody to show
+                // itself to, and nothing would pace it: a hidden swapchain hands
+                // back at once. The window coming back asks for a frame itself.
+                if !(frame.outcome == Presented::Occluded && next == FrameRequest::Vsync) {
+                    self.request_frame(next);
+                }
+            }
+            // Ask for the frame again. Bounded, because a swapchain that fails
+            // forever must not turn the blocking loop into a spinning one — that
+            // would trade a black window for a hot CPU.
+            Presented::Dropped => {
+                self.dropped_frames += 1;
+                if self.dropped_frames <= MAX_DROPPED_FRAMES {
+                    self.request_frame(FrameRequest::Now);
+                } else {
+                    tracing::warn!(
+                        dropped = self.dropped_frames,
+                        "the swapchain keeps refusing frames; waiting for the next event"
+                    );
+                }
+            }
         }
 
-        let _present = tracing::info_span!("present", mode = "direct_gpu").entered();
-        let outcome = presenter.present_direct(direct)?;
-        if outcome == Presented::Frame {
-            self.compositor.commit(&scene);
-        } else {
-            self.compositor.discard();
+        if owed {
+            self.issue_redraw();
         }
-        self.after_present(outcome, viewport, 0, trace)?;
-        Ok(outcome)
     }
 
     /// Frame bookkeeping shared by the whole-surface and composited paths: upload
@@ -784,20 +772,21 @@ impl WindowedApp<'_> {
                     }
                 };
                 self.mark("surface_attached");
-                let mailbox = self.mailbox.clone();
-                std::thread::spawn(move || {
-                    let result = Presenter::new(seed, viewport);
-                    mailbox.send(UserEvent::PresenterReady(Box::new(result)));
-                });
-            }
-            UserEvent::PresenterReady(result) => match *result {
-                Ok(presenter) => {
-                    self.mark("gpu_ready");
-                    self.presenter = Some(presenter);
-                    self.request_frame(FrameRequest::Now);
+                // The render thread makes the device itself — the slow part of
+                // startup, kept off this thread — and says when it is ready.
+                let proxy = self.mailbox.proxy.clone();
+                match RenderThread::spawn(
+                    seed,
+                    viewport,
+                    self.config.renderer,
+                    Box::new(move || proxy.wake_up()),
+                ) {
+                    Ok(render) => self.render = Some(render),
+                    Err(error) => {
+                        self.fail(event_loop, PlatformError::RenderThread(error.to_string()));
+                    }
                 }
-                Err(error) => self.fail(event_loop, error.into()),
-            },
+            }
         }
     }
 
@@ -827,6 +816,9 @@ impl ApplicationHandler for WindowedApp<'_> {
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
         while let Ok(event) = self.inbox.try_recv() {
             self.receive(event_loop, event);
+        }
+        while let Some(report) = self.render.as_ref().and_then(RenderThread::try_report) {
+            self.handle_render_report(event_loop, report);
         }
     }
 
@@ -1084,32 +1076,11 @@ impl ApplicationHandler for WindowedApp<'_> {
                     self.deliver(event);
                 }
             }
-            WindowEvent::RedrawRequested => match self.redraw() {
-                Err(error) => self.fail(event_loop, error),
-                Ok(Presented::Frame | Presented::Occluded) => {
-                    self.dropped_frames = 0;
-                    if self.startup_report_written {
-                        event_loop.exit();
-                        return;
-                    }
-                    self.request_frame(self.painter.next_frame());
-                    self.sync_control_flow(event_loop);
+            WindowEvent::RedrawRequested => {
+                if let Err(error) = self.redraw(event_loop) {
+                    self.fail(event_loop, error);
                 }
-                // Ask for the frame again. Bounded, because a swapchain that fails
-                // forever must not turn the blocking loop into a spinning one — that
-                // would trade a black window for a hot CPU.
-                Ok(Presented::Dropped) => {
-                    self.dropped_frames += 1;
-                    if self.dropped_frames <= MAX_DROPPED_FRAMES {
-                        self.request_frame(FrameRequest::Now);
-                    } else {
-                        tracing::warn!(
-                            dropped = self.dropped_frames,
-                            "the swapchain keeps refusing frames; waiting for the next event"
-                        );
-                    }
-                }
-            },
+            }
             _ => {}
         }
     }
@@ -1345,8 +1316,15 @@ mod tests {
 
         scheduler.redraw_started();
         assert!(
+            !scheduler.request(FrameRequest::Now, now),
+            "a change during that frame is owed, not asked for"
+        );
+        assert!(scheduler.frame_done(), "the frame's report asks for it");
+        scheduler.redraw_started();
+        scheduler.frame_done();
+        assert!(
             scheduler.request(FrameRequest::Now, now),
-            "a change during or after that frame needs the next one"
+            "a change after that frame needs the next one at once"
         );
     }
 
@@ -1370,22 +1348,50 @@ mod tests {
     }
 
     #[test]
-    fn a_vsync_request_becomes_a_future_deadline() {
+    fn a_vsync_request_is_owed_behind_the_frame_in_flight() {
         let now = std::time::Instant::now();
         let mut scheduler = FrameScheduler::default();
 
-        assert!(!scheduler.request(FrameRequest::Vsync, now));
-        assert_eq!(scheduler.deadline, Some(now + FRAME_INTERVAL));
-        assert!(!scheduler.wake_due(now));
-        assert!(scheduler.wake_due(now + FRAME_INTERVAL));
+        assert!(
+            scheduler.request(FrameRequest::Vsync, now),
+            "with nothing in flight the animation frame starts at once"
+        );
+        scheduler.redraw_started();
+        assert!(
+            !scheduler.request(FrameRequest::Vsync, now),
+            "the frame in flight paces the next one"
+        );
+        assert!(scheduler.frame_done(), "and its report asks for it");
+        assert_eq!(scheduler.deadline, None, "no timer guesses at the display");
     }
 
     #[test]
-    fn an_immediate_frame_supersedes_an_old_animation_deadline() {
+    fn requests_while_a_frame_is_in_flight_become_one_frame() {
         let now = std::time::Instant::now();
         let mut scheduler = FrameScheduler::default();
 
-        assert!(!scheduler.request(FrameRequest::Vsync, now));
+        assert!(scheduler.request(FrameRequest::Now, now));
+        scheduler.redraw_started();
+        for _ in 0..5 {
+            assert!(!scheduler.request(FrameRequest::Now, now));
+        }
+        assert!(scheduler.frame_done(), "five requests, one owed frame");
+        scheduler.redraw_started();
+        assert!(
+            !scheduler.frame_done(),
+            "nothing asked during the second one"
+        );
+    }
+
+    #[test]
+    fn an_immediate_frame_supersedes_a_pending_deadline() {
+        let now = std::time::Instant::now();
+        let mut scheduler = FrameScheduler::default();
+
+        assert!(!scheduler.request(
+            FrameRequest::At(now + std::time::Duration::from_millis(500)),
+            now
+        ));
         assert!(scheduler.deadline.is_some());
         assert!(scheduler.request(FrameRequest::Now, now));
         assert_eq!(

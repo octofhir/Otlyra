@@ -44,7 +44,8 @@ pub(crate) struct Presenter {
 }
 
 /// The platform-bound part of presentation, created while the window handle is
-/// available on the event-loop thread and then moved to the GPU startup worker.
+/// available on the event-loop thread and then moved to the render thread, which
+/// makes the device from it.
 pub(crate) struct PresenterSeed {
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
@@ -363,7 +364,7 @@ impl Presenter {
 
         // SAFETY: all three guards expose objects owned by this Presenter and
         // created from one wgpu Metal device. `DirectFrame` drops the painter
-        // before its texture, and the event loop drops the frame before Presenter.
+        // before its texture, and the render thread drops the frame before Presenter.
         let painter = unsafe {
             let hal_device = self
                 .device

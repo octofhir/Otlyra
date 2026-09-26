@@ -39,6 +39,7 @@ mod event_loop;
 mod icon;
 mod menu;
 mod present;
+mod render_thread;
 
 pub use compositor::{Damage, FramePump};
 pub use event_loop::{PlatformError, run};
