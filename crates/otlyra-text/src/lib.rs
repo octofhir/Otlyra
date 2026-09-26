@@ -31,12 +31,13 @@
 //! 4. **This crate never sees a DOM, style or layout type.** Its input is a string
 //!    and a font specification.
 
+mod breaking;
 mod engine;
 mod stack;
 
 pub use engine::{
-    Brush, Decoration, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, Strut, TextEngine,
-    TextMetrics, TextSpan,
+    Brush, Decoration, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, SpacerKind, Strut,
+    TextEngine, TextMetrics, TextSpan,
 };
 pub use stack::{Family, FontStack, GenericFamily};
 

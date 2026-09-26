@@ -20,6 +20,7 @@ use crate::style::{
     Placement, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
     Track, TransformOp, TransformOrigin, WhiteSpace,
 };
+use crate::style::{FamilyName, FontFamily, GenericFamily};
 
 /// Convert one element's computed values into the style layout reads.
 pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
@@ -231,40 +232,40 @@ fn resolve_colour(value: &style::values::computed::Color, current: Color) -> Col
     value.as_absolute().map_or(current, |value| colour(*value))
 }
 
-/// The font stack, as the CSS source list the text layer parses.
-fn font_family(values: &ComputedValues) -> Arc<str> {
-    use style::values::computed::font::{GenericFontFamily, SingleFontFamily};
+/// `font-family`, entry by entry (CSS Fonts 4 §2.1).
+///
+/// Taken from the cascade as the list it is rather than written out as text and
+/// read back: a quoted `"serif"` stays a family called serif, and a quoted name
+/// with a comma in it stays one name.
+fn font_family(values: &ComputedValues) -> FontFamily {
+    use style::values::computed::font::SingleFontFamily;
 
-    let families: Vec<String> = values
-        .get_font()
-        .font_family
-        .families
-        .iter()
-        .filter_map(|family| match family {
-            SingleFontFamily::FamilyName(name) => Some(name.name.to_string()),
-            SingleFontFamily::Generic(generic) => match generic {
-                GenericFontFamily::Serif => Some("serif".to_owned()),
-                GenericFontFamily::SansSerif => Some("sans-serif".to_owned()),
-                GenericFontFamily::Monospace => Some("monospace".to_owned()),
-                GenericFontFamily::Cursive => Some("cursive".to_owned()),
-                GenericFontFamily::Fantasy => Some("fantasy".to_owned()),
-                GenericFontFamily::SystemUi => Some("system-ui".to_owned()),
-                // Not a family: the engine's placeholder for "whatever the browser
-                // calls its standard font", which is the initial value and so is
-                // what every element that says nothing has.
-                GenericFontFamily::None => None,
-            },
-        })
-        .collect();
+    FontFamily::new(values.get_font().font_family.families.iter().filter_map(
+        |family| match family {
+            SingleFontFamily::FamilyName(name) => Some(FamilyName::Named(Arc::from(&*name.name))),
+            SingleFontFamily::Generic(generic) => generic_family(*generic).map(FamilyName::Generic),
+        },
+    ))
+}
 
-    if families.is_empty() {
-        // The standard font, which every browser sets to a serif — and which
-        // `medium` is sixteen pixels of, the pair being two halves of one
-        // preference. A page that says nothing about its font should look like the
-        // same page does everywhere else.
-        Arc::from("serif")
-    } else {
-        Arc::from(families.join(", "))
+/// A generic family, or `None` for the engine's placeholder that is not one.
+fn generic_family(
+    generic: style::values::computed::font::GenericFontFamily,
+) -> Option<GenericFamily> {
+    use style::values::computed::font::GenericFontFamily as Generic;
+
+    match generic {
+        Generic::Serif => Some(GenericFamily::Serif),
+        Generic::SansSerif => Some(GenericFamily::SansSerif),
+        Generic::Monospace => Some(GenericFamily::Monospace),
+        Generic::Cursive => Some(GenericFamily::Cursive),
+        Generic::Fantasy => Some(GenericFamily::Fantasy),
+        Generic::SystemUi => Some(GenericFamily::SystemUi),
+        // Not a family: the engine's placeholder for "whatever the browser
+        // calls its standard font", which is the initial value and so is what
+        // every element that says nothing has. A list left with nothing in it
+        // is the standard font, which is what `FontFamily::new` makes of it.
+        Generic::None => None,
     }
 }
 
@@ -969,20 +970,25 @@ fn corners(values: &ComputedValues) -> Corners {
     }
 }
 
-/// `overflow`, narrowed to whether the box cuts off what does not fit.
+/// `overflow`, narrowed to whether the box cuts off what does not fit and
+/// whether it is a scroll container.
 ///
-/// `scroll` and `auto` cut off too — the part of them that layout can honour today
-/// is the clip; scrolling the box itself is a scroll port, which is more than a
-/// clip and arrives with one.
+/// `scroll` and `auto` cut off as `hidden` does — the part of them that layout
+/// can honour today is the clip; scrolling the box itself is a scroll port, which
+/// is more than a clip and arrives with one.
 fn overflow_of(values: &ComputedValues) -> Overflow {
     use style::computed_values::overflow_x::T as Computed;
 
     let box_ = values.get_box();
-    let clipped = |value: Computed| value != Computed::Visible;
-    if clipped(box_.overflow_x) || clipped(box_.overflow_y) {
-        Overflow::Clip
-    } else {
-        Overflow::Visible
+    let of = |value: Computed| match value {
+        Computed::Visible => Overflow::Visible,
+        Computed::Clip => Overflow::Clip,
+        Computed::Hidden | Computed::Scroll | Computed::Auto => Overflow::Scroll,
+    };
+    match (of(box_.overflow_x), of(box_.overflow_y)) {
+        (Overflow::Scroll, _) | (_, Overflow::Scroll) => Overflow::Scroll,
+        (Overflow::Clip, _) | (_, Overflow::Clip) => Overflow::Clip,
+        (Overflow::Visible, Overflow::Visible) => Overflow::Visible,
     }
 }
 
@@ -1540,12 +1546,68 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_font_stack_comes_back_as_css_text() {
+    fn the_font_stack_comes_back_family_by_family() {
         let style = layout_style(
             "<style>p { font-family: \"Some Face\", monospace }</style><p>x",
             "p",
         );
-        assert_eq!(&*style.font_family, "Some Face, monospace");
+        assert_eq!(
+            &*style.font_family,
+            [
+                FamilyName::Named("Some Face".into()),
+                FamilyName::Generic(GenericFamily::Monospace),
+            ]
+        );
+    }
+
+    /// A quoted keyword is a family name and not the generic it spells (CSS
+    /// Fonts 4 §2.1.1). Written out as text and read back, it was the generic.
+    #[test]
+    fn a_quoted_generic_is_a_family_name() {
+        let style = layout_style(
+            "<style>p { font-family: \"serif\", monospace }</style><p>x",
+            "p",
+        );
+        assert_eq!(
+            &*style.font_family,
+            [
+                FamilyName::Named("serif".into()),
+                FamilyName::Generic(GenericFamily::Monospace),
+            ]
+        );
+    }
+
+    /// A quoted name may hold a comma, and is still one name. Split on its
+    /// commas, it was two families neither of which exists.
+    #[test]
+    fn a_family_name_may_hold_a_comma() {
+        let style = layout_style("<style>p { font-family: 'A, B' }</style><p>x", "p");
+        assert_eq!(&*style.font_family, [FamilyName::Named("A, B".into())]);
+    }
+
+    /// What a `font-family` is written back as reads back as the same list: the
+    /// names that need quotes get them, and the rest are written as they are.
+    #[test]
+    fn a_font_family_reads_back_as_it_is_written() {
+        let declared = layout_style(
+            "<style>p { font-family: \"serif\", 'A, B', Times New Roman, Inter, \
+             'Say \\\"hi\\\"', -apple-system, system-ui }</style><p>x",
+            "p",
+        )
+        .font_family;
+        let written = declared.to_string();
+        assert_eq!(
+            written,
+            "\"serif\", \"A, B\", \"Times New Roman\", Inter, \"Say \\\"hi\\\"\", \
+             -apple-system, system-ui"
+        );
+
+        let read_back = layout_style(
+            &format!("<style>p {{ font-family: {written} }}</style><p>x"),
+            "p",
+        )
+        .font_family;
+        assert_eq!(read_back, declared);
     }
 
     /// `display: none` has to survive the narrowing: it is the one display value
@@ -1598,7 +1660,10 @@ pub(crate) mod tests {
     #[test]
     fn an_unstyled_element_takes_the_standard_font() {
         let style = layout_style("<p>text</p>", "p");
-        assert_eq!(style.font_family.as_ref(), "serif");
+        assert_eq!(
+            &*style.font_family,
+            [FamilyName::Generic(GenericFamily::Serif)]
+        );
         assert_eq!(style.font_size, 16.0);
     }
 

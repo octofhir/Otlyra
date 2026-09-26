@@ -12,6 +12,10 @@
   .m { background: #f2f2f2; display: inline-block; }
   .narrow { width: 90px; background: #f2f2f2; }
   img { width: 40px; height: 20px; vertical-align: bottom; }
+  .bar { border-left: 4px solid #c00; }
+  /* A block whose only content is empty elements has no line at all; one
+     holding a no-break space has one. */
+  .blank { width: 90px; background: #fcc; }
 </style>
 </head>
 <body>
@@ -21,6 +25,17 @@
   <div class="m"><span>a </span><span>b</span></div>
   <div class="m"><span>a </span> <span>b</span></div>
   <div class="m"><b>bold</b> <i>ital</i></div>
+</section>
+
+<section>
+  <h2>An empty element is no boundary to the spaces either side of it</h2>
+  <div class="m">a <span></span> | b</div>
+  <div class="m">a <span class="bar"></span> | b</div>
+  <div class="m"><a href="#"><span></span>
+    <span>Search</span></a></div>
+  <div class="blank"><span></span>
+    <span></span></div>
+  <div class="blank">&nbsp;</div>
 </section>
 
 <section>

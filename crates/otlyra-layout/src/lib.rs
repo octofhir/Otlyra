@@ -32,6 +32,7 @@ pub mod damage;
 pub mod dump;
 pub mod find;
 pub mod flow;
+mod fonts;
 pub mod fragment;
 pub mod selection;
 pub mod srcset;

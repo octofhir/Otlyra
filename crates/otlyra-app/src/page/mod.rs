@@ -755,7 +755,7 @@ impl PageScene {
             .boxes
             .box_for(node)
             .and_then(|id| self.boxes.get(id))
-            .is_some_and(|node| node.style.overflow == otlyra_css::style::Overflow::Clip);
+            .is_some_and(|node| node.style.overflow.clips());
         if !clips {
             return false;
         }

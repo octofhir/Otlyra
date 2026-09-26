@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>What an inline box takes and draws</title>
+<style>
+  body { margin: 0; padding: 24px; font: 16px/20px Arial, sans-serif; }
+  section { margin-bottom: 18px; }
+  h2 { font: bold 13px/1.4 system-ui, sans-serif; margin: 0 0 4px; color: #555; }
+  /* A ruler behind each case: what is judged is where the ink starts and how
+     far along the line each box is. */
+  .m { background: #eef; margin-bottom: 4px; width: 360px; }
+  .hl { background: #fc9; }
+  .framed { background: #9d9; padding: 2px 6px; border: 2px solid #363; }
+  .bar { border-left: 4px solid #c00; }
+  .chip { display: inline-block; width: 10px; height: 10px; background: #c00; }
+  img { width: 20px; height: 10px; }
+
+  .tall { line-height: 2; }
+
+  .cell { width: 200px; background: #ccc; margin-bottom: 4px; }
+
+  /* Each float is as wide as its own text; the letter spacing makes that width
+     a fraction no binary float holds, and the offset moves where the sum lands. */
+  .fit { float: left; clear: left; font: 12px Arial, sans-serif;
+         letter-spacing: 0.1px; background: #fed; margin-bottom: 2px; }
+  .floats { overflow: hidden; }
+</style>
+</head>
+<body>
+
+<section>
+  <h2>Margins, borders and padding take room at the ends of an inline box</h2>
+  <div class="m">A<span class="hl" style="margin: 0 20px">x</span>B</div>
+  <div class="m"><b style="margin-right: 40px">Big</b>after</div>
+  <div class="m">A<span class="framed">x</span>B</div>
+  <div class="m">A<span class="hl" style="margin-left: 30px; padding-right: 10px">xyz</span>B</div>
+  <div class="m">ab<span class="hl" style="margin-left: -8px">cd</span>ef</div>
+</section>
+
+<section>
+  <h2>An atomic inline sits in the line by its margin box</h2>
+  <div class="m">A<input type="checkbox">B<input type="checkbox" checked>C</div>
+  <div class="m">A<span class="chip" style="margin: 0 20px"></span>B</div>
+  <div class="m">A<img src="images/tile-100.png" style="margin: 0 20px">B</div>
+  <div class="m">A<span class="chip" style="margin: 6px 2px 9px"></span>B</div>
+</section>
+
+<section>
+  <h2>An empty box is no boundary to the spaces around it</h2>
+  <div class="m">a <span class="bar"></span> | b</div>
+  <div class="m">a <span></span> | b</div>
+  <div class="m"><span class="bar"></span> starts the line</div>
+  <div class="m"><span style="padding-left: 12px; background: #c00"></span></div>
+  <div class="m"><span style="padding-top: 12px; background: #c00"></span></div>
+</section>
+
+<section>
+  <h2>An inline box is as tall as its font, not its line</h2>
+  <div class="m tall">plain <span class="hl">lit</span> and <span class="framed">framed</span> text</div>
+  <div class="m tall" style="width: 160px">a <span class="hl">highlight that runs over two lines</span></div>
+  <div class="m" style="line-height: 8px">cramped <span class="hl">lit</span> text</div>
+</section>
+
+<section>
+  <h2>A no-break space is text</h2>
+  <div class="cell">&nbsp;</div>
+  <div class="cell">&#x2003;</div>
+  <div class="cell"><span>&nbsp;</span></div>
+</section>
+
+<section class="floats">
+  <h2>A float at its max-content width is one line</h2>
+  <div class="fit">The Organization</div>
+  <div class="fit" style="margin-left: 30px">The Organization</div>
+  <div class="fit" style="margin-left: 218px">The Organization</div>
+  <div class="fit">Root Zone Registry</div>
+  <div class="fit" style="margin-left: 30px">Root Zone Registry</div>
+  <div class="fit" style="margin-left: 218px">Root Zone Registry</div>
+  <div class="fit" style="margin-left: 218px">Number Registries</div>
+  <div class="fit" style="margin-left: 218px">IDN Repository</div>
+</section>
+
+</body>
+</html>

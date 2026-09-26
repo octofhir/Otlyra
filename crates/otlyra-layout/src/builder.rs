@@ -200,7 +200,10 @@ fn drop_whitespace_between_blocks(tree: &mut BoxTree, id: BoxId) {
         let node = tree.node(child);
         node.node.is_some()
             && node.style.white_space.collapses_spaces()
-            && matches!(&node.kind, BoxKind::Text(text) if text.trim().is_empty())
+            && matches!(
+                &node.kind,
+                BoxKind::Text(text) if text.chars().all(is_collapsible_white_space)
+            )
     };
     let inline_neighbour = |tree: &BoxTree, child: Option<&BoxId>| {
         child.is_some_and(|&child| tree.node(child).is_inline_level() && !is_space(tree, child))
@@ -318,9 +321,9 @@ fn collapse_context(tree: &mut BoxTree, root: BoxId) {
                 let collapsed = state.take(text, node.style.white_space);
                 written.push((id, collapsed));
             }
-            // A picture, an inline-block or a bordered inline is content: what
-            // follows it is a word gap rather than the start of the context, and
-            // what came before it is not trailing white space.
+            // A picture or an inline-block is content: what follows it is a word
+            // gap rather than the start of the context, and what came before it
+            // is not trailing white space.
             Item::Content => {
                 state.after_content();
                 sealed = written.len();
@@ -377,6 +380,13 @@ enum Item {
 /// Inline boxes are walked through — a `<span>` is the style on the text inside
 /// it and not a thing of its own — and anything that establishes a context of its
 /// own is one item, whatever is inside it.
+///
+/// An empty inline box is walked through like any other and so comes to nothing,
+/// even when it has a border or padding that will take room in its line. White
+/// space collapses across inline box boundaries (CSS Text 3 §4.1.1, phase I), so
+/// the space either side of `a <span></span> b` is one space, and one straight
+/// after an empty `<span>` at the start of a line is leading white space that
+/// goes (§4.1.2). The box itself stays in the tree, to be spaced and painted.
 fn inline_items(tree: &BoxTree, root: BoxId) -> Vec<Item> {
     let mut out = Vec::new();
     for &child in &tree.node(root).children {
@@ -386,19 +396,21 @@ fn inline_items(tree: &BoxTree, root: BoxId) -> Vec<Item> {
             BoxKind::Replaced(_) => out.push(Item::Content),
             BoxKind::Block => out.push(Item::Content),
             BoxKind::Inline if node.tag.as_deref() == Some("br") => out.push(Item::Break),
-            BoxKind::Inline => {
-                let inside = inline_items(tree, child);
-                if inside.is_empty() {
-                    // An empty inline still has borders and padding, which take
-                    // room and separate what is either side of them.
-                    out.push(Item::Content);
-                } else {
-                    out.extend(inside);
-                }
-            }
+            BoxKind::Inline => out.extend(inline_items(tree, child)),
         }
     }
     out
+}
+
+/// Whether a character is document white space that `white-space` may collapse:
+/// a space, a tab, or a segment break (CSS Text 3 §4.1). A carriage return is
+/// treated as a space.
+///
+/// Nothing else is. A no-break space, an em space and the rest of Unicode's
+/// white space are characters like any other, which is what `&nbsp;` exists for:
+/// a block holding nothing but one is a line tall.
+fn is_collapsible_white_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r')
 }
 
 /// How far through a context the collapsing has got.
@@ -435,7 +447,9 @@ impl Run {
                     self.at_line_start = true;
                     self.after_space = false;
                 }
-                ' ' | '\t' | '\n' | '\r' if white_space.collapses_spaces() => {
+                character
+                    if is_collapsible_white_space(character) && white_space.collapses_spaces() =>
+                {
                     if self.at_line_start || self.after_space {
                         continue;
                     }
@@ -609,7 +623,7 @@ impl Builder<'_> {
         // scrolls what is left. The number is a plain one for the same reason
         // theirs are.
         list.max_height = MaxSize::Length(Length::Px(300.0));
-        list.overflow = Overflow::Clip;
+        list.overflow = Overflow::Scroll;
 
         self.tree.push(
             select,
@@ -1357,6 +1371,18 @@ mod tests {
         build_box_tree(&document, &styles)
     }
 
+    /// The same, with a picture arrived for every `<img>`: one that has not is
+    /// an empty inline element rather than a replaced one.
+    fn styled_with_pictures(html: &str) -> BoxTree {
+        let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
+        let styles = style_document(&document, Viewport::default());
+        let images: Images = crate::image_sources(&document, Viewport::default())
+            .into_iter()
+            .map(|source| (source.node, Picture::new(crate::flow::tests::picture(4, 4))))
+            .collect();
+        build_box_tree_with_images(&document, &styles, &images)
+    }
+
     fn style_of(tree: &BoxTree, tag: &str) -> Arc<ComputedStyle> {
         tree.descendants(tree.root())
             .into_iter()
@@ -1398,7 +1424,10 @@ mod tests {
     /// The text of a tree, run by run, which is what white-space processing is
     /// judged on: what the shaper is handed and nothing else.
     fn runs_of(html: &str) -> Vec<String> {
-        let tree = styled(html);
+        runs_in(&styled(html))
+    }
+
+    fn runs_in(tree: &BoxTree) -> Vec<String> {
         tree.descendants(tree.root())
             .into_iter()
             .filter_map(|id| match &tree.node(id).kind {
@@ -1475,6 +1504,46 @@ mod tests {
         );
     }
 
+    /// An empty inline box is no boundary to collapsing, whatever it draws: it
+    /// neither keeps a second space alive nor makes the one after it a word gap
+    /// at the start of a line.
+    #[test]
+    fn white_space_collapses_across_an_empty_inline_box() {
+        assert_eq!(
+            text_of("<p>a <span></span> | b"),
+            "a | b",
+            "the spaces either side of it are one space"
+        );
+        assert_eq!(
+            text_of("<p>a <span style=\"border-left: 4px solid\"></span> | b"),
+            "a | b",
+            "and a border on it changes nothing"
+        );
+        assert_eq!(
+            text_of("<p><a href=#><span></span>\n<span>Search</span></a>"),
+            "Search",
+            "the space after one that starts a line is leading white space"
+        );
+        assert_eq!(
+            runs_of("<p><span></span>\n<span></span>"),
+            Vec::<String>::new(),
+            "and a context of nothing else keeps no text at all"
+        );
+    }
+
+    /// Only a space, a tab and a line ending collapse. A no-break space is text,
+    /// and so is every other Unicode space.
+    #[test]
+    fn a_block_of_nothing_but_a_no_break_space_keeps_it() {
+        assert_eq!(runs_of("<div>&nbsp;</div>"), ["\u{a0}"]);
+        assert_eq!(runs_of("<div>&#x2003;</div>"), ["\u{2003}"]);
+        assert_eq!(
+            runs_of("<div><div>a</div>&nbsp;<div>b</div></div>"),
+            ["a", "\u{a0}", "b"],
+            "even between two blocks"
+        );
+    }
+
     /// The other three modes, which differ in what survives.
     #[test]
     fn preserved_white_space_is_kept_exactly() {
@@ -1504,6 +1573,7 @@ mod tests {
     /// there is something after it.
     #[test]
     fn a_space_beside_a_picture_is_a_word_gap() {
+        let text_of = |html: &str| runs_in(&styled_with_pictures(html)).concat();
         assert_eq!(
             text_of("<p>word <img src=x.png>"),
             "word ",

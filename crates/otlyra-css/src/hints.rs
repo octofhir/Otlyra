@@ -952,8 +952,8 @@ impl<'a> Hints<'a> {
 mod tests {
     use crate::computed::tests::{layout_style, layout_style_at};
     use crate::style::{
-        BorderStyle, Clear, Display, Length, LengthOrAuto, Size, TextAlign, TextWrap,
-        VerticalAlign, WhiteSpace,
+        BorderStyle, Clear, Display, FamilyName, GenericFamily, Length, LengthOrAuto, Size,
+        TextAlign, TextWrap, VerticalAlign, WhiteSpace,
     };
     use peniko::Color;
 
@@ -1349,9 +1349,18 @@ mod tests {
     #[test]
     fn font_face_is_a_family_list_and_nothing_else() {
         let font = |face: &str| layout_style(&format!("<p><font face=\"{face}\">x</font>"), "font");
-        assert_eq!(&*font("Nope, monospace").font_family, "Nope, monospace");
+        assert_eq!(
+            &*font("Nope, monospace").font_family,
+            [
+                FamilyName::Named("Nope".into()),
+                FamilyName::Generic(GenericFamily::Monospace)
+            ]
+        );
         let injected = font("x; display:none");
-        assert_eq!(&*injected.font_family, "serif");
+        assert_eq!(
+            &*injected.font_family,
+            [FamilyName::Generic(GenericFamily::Serif)]
+        );
         assert_eq!(injected.display, Display::Inline);
         assert_eq!(
             rgba(layout_style("<p><font color=red>x</font>", "font").color),

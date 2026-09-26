@@ -339,10 +339,8 @@ fn vertical_align_puts_a_span_where_the_value_names() {
     let (text_bottom, _) = span_and_line("text-bottom");
     let (middle, _) = span_and_line("middle");
 
-    // Ordering rather than absolute edges: an inline box's fragment is
-    // still drawn as tall as the *line* rather than as tall as its own
-    // text — a separate defect, visible as a background taller than the
-    // words it is behind — so its top edge is what can be trusted here.
+    // Ordering rather than absolute edges: each value names a place, and
+    // the exact pixel it lands on depends on font metrics these do not pin.
     assert!(
         top.y < bottom.y,
         "top {top:?} sits above bottom {bottom:?} on {top_line:?} / {bottom_line:?}"
@@ -469,7 +467,7 @@ fn a_border_makes_the_box_bigger_and_moves_the_content_in() {
 
 /// A picture of `width` by `height`, with no file behind it: layout reads its
 /// dimensions and never its pixels.
-pub(super) fn picture(width: u32, height: u32) -> otlyra_gfx::peniko::ImageData {
+pub(crate) fn picture(width: u32, height: u32) -> otlyra_gfx::peniko::ImageData {
     otlyra_gfx::peniko::ImageData {
         data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![
             0u8;

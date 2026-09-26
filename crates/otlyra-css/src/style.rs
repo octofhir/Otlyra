@@ -857,14 +857,43 @@ impl Corners {
     }
 }
 
-/// `overflow`, in the distinction layout can act on: whether content that does not
-/// fit is shown or cut off.
+/// `overflow`, in the distinctions layout can act on: whether content that does
+/// not fit is shown or cut off, and whether the box that cuts it off is a scroll
+/// container (CSS Overflow 3 §3).
+///
+/// One value for both axes: the box cuts off in both if it does in either, and
+/// is a scroll container if either axis makes it one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Overflow {
     /// Content spills out of the box and is drawn.
     Visible,
-    /// Content is cut off at the box's padding edge.
+    /// `clip`: content is cut off at the box's padding edge, and that is all —
+    /// the box is not a scroll container and establishes nothing (§3.1).
     Clip,
+    /// `hidden`, `scroll` or `auto`: content is cut off the same way, and the
+    /// box is a scroll container, whether or not anything scrolls it yet.
+    Scroll,
+}
+
+impl Overflow {
+    /// Whether content that does not fit is cut off at the padding edge.
+    pub fn clips(self) -> bool {
+        match self {
+            Self::Visible => false,
+            Self::Clip | Self::Scroll => true,
+        }
+    }
+
+    /// Whether the box is a scroll container: what establishes an independent
+    /// formatting context (CSS Display 3 §2.2), takes a flex item's automatic
+    /// minimum size away (CSS Flexbox 1 §4.5), and sits an inline block on its
+    /// bottom margin edge (CSS 2.2 §10.8.1).
+    pub fn is_scroll_container(self) -> bool {
+        match self {
+            Self::Visible | Self::Clip => false,
+            Self::Scroll => true,
+        }
+    }
 }
 
 /// `position`, which decides what a box's coordinates mean.
@@ -999,6 +1028,167 @@ pub enum FontStyle {
     Italic,
 }
 
+/// A generic font family: a keyword standing for whichever face the browser
+/// sets that kind of type in (CSS Fonts 4 §2.1.5).
+///
+/// The keywords the cascade reads as generics. `ui-serif`, `ui-sans-serif`,
+/// `ui-monospace`, `ui-rounded`, `emoji`, `math` and `fangsong` are not among
+/// them: Stylo takes each for a family name, and so it arrives as one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GenericFamily {
+    /// `serif`.
+    Serif,
+    /// `sans-serif`.
+    SansSerif,
+    /// `monospace`.
+    Monospace,
+    /// `cursive`.
+    Cursive,
+    /// `fantasy`.
+    Fantasy,
+    /// `system-ui`: the face the platform sets its own interface in.
+    SystemUi,
+}
+
+impl GenericFamily {
+    /// The keyword, as CSS spells it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Serif => "serif",
+            Self::SansSerif => "sans-serif",
+            Self::Monospace => "monospace",
+            Self::Cursive => "cursive",
+            Self::Fantasy => "fantasy",
+            Self::SystemUi => "system-ui",
+        }
+    }
+}
+
+impl fmt::Display for GenericFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword())
+    }
+}
+
+/// One entry of a `font-family` list (CSS Fonts 4 §2.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FamilyName {
+    /// A family asked for by name. A quoted keyword is one of these — `"serif"`
+    /// names a family called serif, not the generic — and so is a quoted name
+    /// with a comma in it, which is one name and not two.
+    Named(Arc<str>),
+    /// A generic family.
+    Generic(GenericFamily),
+}
+
+impl fmt::Display for FamilyName {
+    /// A name that is a single CSS identifier, and no keyword `font-family` could
+    /// read it as, is written as it is; any other is written as a string. CSS
+    /// Fonts 4 §2.1.1 requires a name that spells a keyword to be quoted, and
+    /// recommends quoting one with white space or punctuation in it; quoting
+    /// both is what makes the list read back as the same list.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Generic(generic) => write!(f, "{generic}"),
+            Self::Named(name) if is_plain_identifier(name) && !is_family_keyword(name) => {
+                f.write_str(name)
+            }
+            Self::Named(name) => cssparser::serialize_string(name, f),
+        }
+    }
+}
+
+/// Whether `name`, tokenised as CSS, is one identifier spelling exactly itself —
+/// no escapes, no white space around it (an `<ident-token>`, CSS Syntax 3 §4).
+fn is_plain_identifier(name: &str) -> bool {
+    let mut input = cssparser::ParserInput::new(name);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let spelt = parser.expect_ident().is_ok_and(|ident| **ident == *name);
+    spelt && parser.is_exhausted()
+}
+
+/// Whether an unquoted `name` would be read as a keyword rather than as a
+/// family: a generic, including the ones CSS Fonts 4 adds that the cascade does
+/// not know yet, or one of the keywords every property takes.
+fn is_family_keyword(name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "serif",
+        "sans-serif",
+        "monospace",
+        "cursive",
+        "fantasy",
+        "system-ui",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+        "emoji",
+        "math",
+        "fangsong",
+        "inherit",
+        "initial",
+        "unset",
+        "revert",
+        "revert-layer",
+        "default",
+    ];
+    KEYWORDS
+        .iter()
+        .any(|keyword| keyword.eq_ignore_ascii_case(name))
+}
+
+/// `font-family`: the families to try, in order (CSS Fonts 4 §2.1).
+///
+/// Shared rather than copied, like [`ComputedStyle::font_variations`]: an
+/// element that inherits its family holds the very list its parent does, which
+/// is also what lets layout make one font stack per list rather than one per
+/// element. Never empty — see [`FontFamily::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFamily(Arc<[FamilyName]>);
+
+impl FontFamily {
+    /// The families, in order; the standard font when there are none.
+    pub fn new(families: impl IntoIterator<Item = FamilyName>) -> Self {
+        let families: Arc<[FamilyName]> = families.into_iter().collect();
+        if families.is_empty() {
+            Self::default()
+        } else {
+            Self(families)
+        }
+    }
+}
+
+impl std::ops::Deref for FontFamily {
+    type Target = [FamilyName];
+
+    fn deref(&self) -> &[FamilyName] {
+        &self.0
+    }
+}
+
+impl Default for FontFamily {
+    /// The standard font, which every browser sets to a serif — and which
+    /// `medium` is sixteen pixels of, the pair being two halves of one
+    /// preference. A page that says nothing about its font should look like the
+    /// same page does everywhere else.
+    fn default() -> Self {
+        Self(Arc::new([FamilyName::Generic(GenericFamily::Serif)]))
+    }
+}
+
+impl fmt::Display for FontFamily {
+    /// The list as CSS writes it, comma-separated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, family) in self.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{family}")?;
+        }
+        Ok(())
+    }
+}
+
 /// `line-height`.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum LineHeight {
@@ -1049,8 +1239,8 @@ pub struct ComputedStyle {
     /// And where inside the box what is left of it sits. Its initial value is
     /// the middle, which is not `background-position`'s corner.
     pub object_position: BackgroundPosition,
-    /// `font-family`, as the CSS source list. Inherited.
-    pub font_family: Arc<str>,
+    /// `font-family`, family by family. Inherited.
+    pub font_family: FontFamily,
     /// `font-size` in CSS pixels. Inherited.
     pub font_size: f32,
     /// `font-weight`, 100–900. Inherited.
@@ -1202,7 +1392,7 @@ impl Default for ComputedStyle {
             object_position: BackgroundPosition::CENTER,
             shadows: Vec::new(),
             text_shadows: Vec::new(),
-            font_family: Arc::from("serif"),
+            font_family: FontFamily::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
@@ -1273,7 +1463,7 @@ impl ComputedStyle {
         Self {
             text_shadows: parent.text_shadows.clone(),
             color: parent.color,
-            font_family: Arc::clone(&parent.font_family),
+            font_family: parent.font_family.clone(),
             font_size: parent.font_size,
             font_weight: parent.font_weight,
             font_style: parent.font_style,

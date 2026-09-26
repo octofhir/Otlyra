@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>What a font-family list names</title>
+<style>
+  body { margin: 8px; font: 24px/1.4 Times; }
+  p { margin: 0 0 10px; }
+  code { font: 13px/1 Menlo, monospace; color: #555; }
+
+  /* Each pair: a list, then the family it has to come out in. */
+  .generic { font-family: monospace, serif; }
+  .quoted-generic { font-family: "monospace", serif; }
+  .courier { font-family: "Courier New", serif; }
+  .comma { font-family: "Courier New, Helvetica", serif; }
+  .spaced { font-family: Courier New, serif; }
+
+  /* A raised or lowered box with a background moves as far as its text. */
+  sup, sub { font-size: 12px; }
+  sup { background: #fd0; }
+  sub { background: #9df; }
+</style>
+</head>
+<body>
+
+<p class="generic">Handgloves 0123 <code>monospace, serif</code></p>
+<p class="quoted-generic">Handgloves 0123 <code>"monospace", serif</code></p>
+
+<p class="courier">Handgloves 0123 <code>"Courier New", serif</code></p>
+<p class="comma">Handgloves 0123 <code>"Courier New, Helvetica", serif</code></p>
+<p class="spaced">Handgloves 0123 <code>Courier New, serif</code></p>
+
+<p>E = mc<sup>2</sup> and H<sub>2</sub>O, each on a background</p>
+
+</body>
+</html>

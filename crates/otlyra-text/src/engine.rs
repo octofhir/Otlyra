@@ -1,11 +1,14 @@
 //! Shaping and measurement over parley.
 
+use std::collections::HashMap;
+
 use otlyra_gfx::Glyph;
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontData, FontVariation, FontVariations,
     LayoutContext, PositionedLayoutItem, StyleProperty,
 };
 
+use crate::breaking::{self, Glyphs, Plan};
 use crate::{FontStack, TEST_FAMILY, TEST_FONT};
 
 /// The optical-size axis, set from the font size on every run.
@@ -148,11 +151,14 @@ pub struct LineMetrics {
     pub bottom: f32,
     /// The line's advance width, trailing whitespace and all.
     pub width: f32,
-    /// How much of that width is the whitespace at the end of the line.
+    /// How much of that width is the white space that hangs at the end of the
+    /// line: spaces, tabs and the line break itself.
     ///
     /// A space at a line break is not part of the line as far as anything measuring
     /// it is concerned: what a paragraph needs at its narrowest is its longest word,
-    /// not that word and the space that follows it.
+    /// not that word and the space that follows it (CSS Text 3 §4.1.3). A no-break
+    /// space is not one of them: it is not collapsible and does not hang, so a line
+    /// ending in one is as wide as its advance says.
     pub trailing_space: f32,
 }
 
@@ -238,6 +244,8 @@ impl<'a> TextSpan<'a> {
 pub struct Spacer {
     /// The caller's own identifier, handed back untouched.
     pub id: u64,
+    /// What it stands for, which decides whether a line may break beside it.
+    pub kind: SpacerKind,
     /// Where the spacer goes: before `spans[at]`, or after the last span when `at`
     /// is the number of spans.
     pub at: usize,
@@ -247,6 +255,22 @@ pub struct Spacer {
     /// tall, which is what an image sitting in a paragraph does; zero leaves the
     /// line the height of its text, which is what a border and a padding do.
     pub height: f32,
+}
+
+/// What a [`Spacer`] stands for in the line, which is what says whether a line
+/// may break beside it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpacerKind {
+    /// The start edge of an inline box — its margin, border and padding on that
+    /// side. It holds on to what follows it: an element's edges are no soft wrap
+    /// opportunity (CSS Text 3 §5.1), so a line breaks before it or not at all.
+    Opening,
+    /// The end edge of an inline box, which holds on to what goes before it.
+    Closing,
+    /// An atomic inline — a picture, an inline block, a widget. A line may break
+    /// on either side of one, as UAX #14 breaks either side of the object
+    /// replacement character it stands for in the text (LB20).
+    Atomic,
 }
 
 /// A spacer once the paragraph has been broken into lines.
@@ -270,7 +294,8 @@ pub struct PlacedSpacer {
 /// Metrics of a whole shaped paragraph.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TextMetrics {
-    /// Width of the widest line, in logical pixels.
+    /// Width of the widest line, in logical pixels, without the white space
+    /// that hangs at its end.
     pub width: f32,
     /// Total height of all lines, in logical pixels.
     pub height: f32,
@@ -516,7 +541,7 @@ impl TextEngine {
         spacers: &[Spacer],
         max_advance: Option<f32>,
     ) -> ShapedText {
-        self.shape_spans_wrapping(spans, spacers, |_, _| max_advance)
+        self.shape_paragraph(spans, spacers, max_advance.is_some(), |_, _| max_advance)
     }
 
     /// Shape several spans as one paragraph, with the width decided line by line.
@@ -537,20 +562,81 @@ impl TextEngine {
         spacers: &[Spacer],
         line_width: impl FnMut(usize, f32) -> Option<f32>,
     ) -> ShapedText {
-        let mut text = String::new();
+        self.shape_paragraph(spans, spacers, true, line_width)
+    }
+
+    /// Shape a paragraph and break it into lines as wide as `line_width` says,
+    /// choosing where they break when `wraps` and the shaper would get that
+    /// wrong (see [`crate::breaking`]).
+    fn shape_paragraph(
+        &mut self,
+        spans: &[TextSpan<'_>],
+        spacers: &[Spacer],
+        wraps: bool,
+        line_width: impl FnMut(usize, f32) -> Option<f32>,
+    ) -> ShapedText {
+        let text: String = spans.iter().map(|span| span.text).collect();
+        let kinds: HashMap<u64, SpacerKind> = spacers
+            .iter()
+            .map(|spacer| (spacer.id, spacer.kind))
+            .collect();
+
+        let mut layout = self.build_layout(spans, spacers, &text);
+        let plan = (wraps && breaking::needs_plan(&text, &kinds)).then(|| {
+            breaking::break_everywhere(&mut layout);
+            // The text's own opportunities, from the same text without the
+            // edges of its inline boxes, which the shaper would break at too.
+            let unedged = kinds
+                .values()
+                .any(|kind| *kind != SpacerKind::Atomic)
+                .then(|| {
+                    let atomic: Vec<Spacer> = spacers
+                        .iter()
+                        .filter(|spacer| spacer.kind == SpacerKind::Atomic)
+                        .copied()
+                        .collect();
+                    let mut unedged = self.build_layout(spans, &atomic, &text);
+                    breaking::break_everywhere(&mut unedged);
+                    unedged
+                });
+            Plan::new(&layout, unedged.as_ref().unwrap_or(&layout), &text, &kinds)
+        });
+        break_lines(&mut layout, plan.as_ref(), line_width);
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let mut shaped = collect(&layout, &text, &kinds);
+
+        // A tab is not a character of a width: it is a jump to the next tab stop,
+        // and where that is depends on how far along the line the tab sits. The
+        // shaper has no idea of one, so the glyphs after a tab are moved here,
+        // once the line they landed on is known.
+        if text.contains('\t') {
+            let stop = self.tab_stop(spans.first());
+            expand_tabs(&mut shaped, stop);
+        }
+        shaped
+    }
+
+    /// The spans laid end to end as one paragraph, styled by range, with the
+    /// spacers at their span boundaries: shaped, and not yet broken into lines.
+    fn build_layout(
+        &mut self,
+        spans: &[TextSpan<'_>],
+        spacers: &[Spacer],
+        text: &str,
+    ) -> parley::Layout<Brush> {
         let mut ranges = Vec::with_capacity(spans.len());
         let mut boundaries = Vec::with_capacity(spans.len() + 1);
+        let mut end = 0;
         for span in spans {
-            let start = text.len();
-            boundaries.push(start);
-            text.push_str(span.text);
-            ranges.push(start..text.len());
+            boundaries.push(end);
+            ranges.push(end..end + span.text.len());
+            end += span.text.len();
         }
-        boundaries.push(text.len());
+        boundaries.push(end);
 
         let mut builder = self
             .layout
-            .ranged_builder(&mut self.fonts, &text, 1.0, false);
+            .ranged_builder(&mut self.fonts, text, 1.0, false);
         builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
 
         // The first span's font, as the default under the ranged ones. A range is
@@ -574,7 +660,6 @@ impl TextEngine {
                 height: spacer.height,
             });
         }
-
         for (span, range) in spans.iter().zip(ranges) {
             if range.is_empty() {
                 continue;
@@ -623,20 +708,7 @@ impl TextEngine {
             }
         }
 
-        let mut layout = builder.build(&text);
-        break_lines(&mut layout, line_width);
-        layout.align(Alignment::Start, AlignmentOptions::default());
-        let mut shaped = collect(&layout, &text);
-
-        // A tab is not a character of a width: it is a jump to the next tab stop,
-        // and where that is depends on how far along the line the tab sits. The
-        // shaper has no idea of one, so the glyphs after a tab are moved here,
-        // once the line they landed on is known.
-        if text.contains('\t') {
-            let stop = self.tab_stop(spans.first());
-            expand_tabs(&mut shaped, stop);
-        }
-        shaped
+        builder.build(text)
     }
 
     /// How far apart the tab stops are: eight spaces of the paragraph's own font,
@@ -688,22 +760,45 @@ impl TextEngine {
     }
 }
 
+/// How far past its width a line may reach and still fit: a sixty-fourth of a
+/// pixel, which is Blink's `LayoutUnit`.
+///
+/// A box sized to its own max-content is given that width back through f32
+/// border-box arithmetic — the content plus its padding and border, and the
+/// padding and border taken off again — and it can come back an ulp narrower
+/// than the text it was measured from. Its last word would then wrap, which a
+/// box at its max-content size never does (CSS Sizing 3 §5.1). A line that
+/// overflows by less than a layout unit overflows by nothing any engine can
+/// draw, so it fits.
+pub(crate) const LINE_FIT_SLACK: f32 = 1.0 / 64.0;
+
 /// Break `layout` into lines, asking `line_width` how wide each one may be.
 ///
 /// One line at a time rather than all at once, because the answer for a line
-/// depends on where the line landed.
+/// depends on where the line landed. Where there is a `plan`, it chooses where
+/// each line ends and the shaper is given the advance that ends it there.
 fn break_lines(
     layout: &mut parley::Layout<Brush>,
+    plan: Option<&Plan>,
     mut line_width: impl FnMut(usize, f32) -> Option<f32>,
 ) {
     let mut breaker = layout.break_lines();
     let mut index = 0usize;
     let mut top = 0.0f32;
+    let mut start = 0usize;
 
     loop {
+        let room = line_width(index, top).map_or(f32::INFINITY, |width| width + LINE_FIT_SLACK);
+        let width = match plan {
+            Some(plan) => {
+                let (advance, next) = plan.line(start, room);
+                start = next;
+                advance
+            }
+            None => room,
+        };
         // parley asserts the two are the same, and they are two names for one
         // thing until a line can be narrower than the paragraph it is in.
-        let width = line_width(index, top).unwrap_or(f32::INFINITY);
         breaker.state_mut().set_layout_max_advance(width);
         breaker.state_mut().set_line_max_advance(width);
 
@@ -720,13 +815,6 @@ fn break_lines(
     }
 }
 
-/// Pull runs, lines and metrics out of a broken parley layout.
-///
-/// `text_len` is what was shaped. A layout with nothing in it still comes back with
-/// a line, and that line still carries a cluster — the one an empty paragraph needs
-/// so a caret in it has a height — and that cluster is past the end of the text it
-/// claims to be part of. It is dropped here rather than handed on as a glyph nobody
-/// asked to draw.
 /// Move what follows each tab to the next tab stop.
 ///
 /// A tab in CSS is a jump and not a character: what it advances by is however far
@@ -831,7 +919,18 @@ fn shift_after(
     }
 }
 
-fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
+/// Pull runs, lines and metrics out of a broken parley layout.
+///
+/// `text` is what was shaped. A layout with nothing in it still comes back with
+/// a line, and that line still carries a cluster — the one an empty paragraph needs
+/// so a caret in it has a height — and that cluster is past the end of the text it
+/// claims to be part of. It is dropped here rather than handed on as a glyph nobody
+/// asked to draw.
+fn collect(
+    layout: &parley::Layout<Brush>,
+    text: &str,
+    kinds: &HashMap<u64, SpacerKind>,
+) -> ShapedText {
     let text_len = text.len();
     let mut runs = Vec::new();
     let mut lines = Vec::new();
@@ -877,7 +976,7 @@ fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
             top,
             baseline: metrics.baseline,
             height: metrics.line_height,
-            trailing_space: metrics.trailing_whitespace,
+            trailing_space: hanging_space(&line, text, kinds),
             bottom: top + metrics.line_height,
             width: metrics.advance,
         });
@@ -997,9 +1096,17 @@ fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
         _ => layout.height(),
     };
 
+    // The widest line without what hangs off its end. The shaper's own answer
+    // leaves out every kind of white space a line ends in, no-break spaces too,
+    // and a box sized to that is one no-break space too narrow for its text.
+    let width = lines
+        .iter()
+        .map(|line| line.width - line.trailing_space)
+        .fold(0.0, f32::max);
+
     ShapedText {
         metrics: TextMetrics {
-            width: layout.width(),
+            width,
             height,
             first_baseline,
             line_count: layout.len(),
@@ -1008,6 +1115,48 @@ fn collect(layout: &parley::Layout<Brush>, text: &str) -> ShapedText {
         lines,
         spacers,
     }
+}
+
+/// How much of `line`'s advance is white space hanging off its end: the spaces
+/// and tabs it ends in, and the line break if it ends in one (CSS Text 3
+/// §4.1.3). The end edges of inline boxes after them are no reason to keep
+/// them: a link that ends in a space ends its line on its last letter.
+///
+/// Worked out here rather than taken from the shaper, which counts every kind of
+/// white space a line ends in. A no-break space does not hang — it is text that
+/// happens to be blank, and `<td>&nbsp;</td>` is a cell a space wide — and nor
+/// does any other space Unicode has that CSS does not collapse.
+fn hanging_space(
+    line: &parley::Line<'_, Brush>,
+    text: &str,
+    kinds: &HashMap<u64, SpacerKind>,
+) -> f32 {
+    let items: Vec<_> = line.items().collect();
+    let mut hanging = 0.0;
+    for item in items.iter().rev() {
+        match item {
+            PositionedLayoutItem::InlineBox(placed) => {
+                if kinds.get(&placed.id) == Some(&SpacerKind::Atomic) {
+                    return hanging;
+                }
+            }
+            PositionedLayoutItem::GlyphRun(glyph_run) => {
+                let run = glyph_run.run();
+                for index in (0..run.len()).rev() {
+                    let Some(cluster) = run.get(index) else {
+                        continue;
+                    };
+                    if Glyphs::of(text.get(cluster.text_range())) == Glyphs::Ink {
+                        return hanging;
+                    }
+                    hanging += cluster.advance();
+                }
+                // The glyph runs of one run each hold all of its clusters.
+                return hanging;
+            }
+        }
+    }
+    hanging
 }
 
 /// Take clusters from `run`, starting at `from`, until they add up to `advance`.
@@ -1384,6 +1533,22 @@ mod tests {
         assert!(broken.metrics.height > unbroken.metrics.height);
     }
 
+    /// A line given its own width back an ulp short still fits, which is what a
+    /// box sized to its max-content through f32 arithmetic can be given. A pixel
+    /// short does not.
+    #[test]
+    fn a_line_an_ulp_too_wide_still_fits() {
+        let mut engine = engine();
+        let text = "the quick brown fox";
+        let width = engine.shape(text, &test_stack(), 16.0, None).metrics.width;
+        let short = f32::from_bits(width.to_bits() - 1);
+
+        let fitted = engine.shape(text, &test_stack(), 16.0, Some(short));
+        assert_eq!(fitted.metrics.line_count, 1);
+        let narrower = engine.shape(text, &test_stack(), 16.0, Some(width - 1.0));
+        assert!(narrower.metrics.line_count > 1);
+    }
+
     /// Break opportunities over a fixed corpus. The override table is what makes
     /// these match web behaviour rather than plain UAX#14.
     #[test]
@@ -1521,12 +1686,14 @@ mod tests {
             &[
                 Spacer {
                     id: 1,
+                    kind: SpacerKind::Opening,
                     at: 1,
                     width: 0.0,
                     height: 0.0,
                 },
                 Spacer {
                     id: 2,
+                    kind: SpacerKind::Closing,
                     at: 2,
                     width: 0.0,
                     height: 0.0,
@@ -1562,6 +1729,7 @@ mod tests {
             &spans,
             &[Spacer {
                 id: 1,
+                kind: SpacerKind::Atomic,
                 at: 1,
                 width: 32.0,
                 height: 32.0,
@@ -1596,6 +1764,7 @@ mod tests {
             &spans,
             &[Spacer {
                 id: 1,
+                kind: SpacerKind::Opening,
                 at: 1,
                 width: 20.0,
                 height: 0.0,
@@ -1686,6 +1855,113 @@ mod tests {
             assert!(pair[1].baseline > pair[0].baseline);
         }
         assert!(shaped.runs.iter().all(|run| run.line < 3));
+    }
+
+    fn edge(id: u64, kind: SpacerKind, at: usize, width: f32) -> Spacer {
+        Spacer {
+            id,
+            kind,
+            at,
+            width,
+            height: 0.0,
+        }
+    }
+
+    /// The text of each line, as the runs on it spell it.
+    fn line_texts(shaped: &ShapedText) -> Vec<String> {
+        (0..shaped.lines.len())
+            .map(|line| {
+                shaped
+                    .runs
+                    .iter()
+                    .filter(|run| run.line == line)
+                    .map(|run| run.text.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A no-break space is text: it counts in the width of the line it ends,
+    /// and a line as wide as it holds it.
+    #[test]
+    fn a_no_break_space_takes_room_and_does_not_hang() {
+        let mut engine = engine();
+        let one = engine.shape("\u{a0}", &test_stack(), 16.0, None);
+        assert!(one.metrics.width > 0.0, "{:?}", one.metrics);
+        assert_eq!(one.lines[0].trailing_space, 0.0);
+
+        let two = engine.shape("\u{a0}\u{a0}", &test_stack(), 16.0, None);
+        let fitted = engine.shape("\u{a0}\u{a0}", &test_stack(), 16.0, Some(two.metrics.width));
+        assert_eq!(fitted.lines.len(), 1, "{:?}", fitted.lines);
+        assert!((two.metrics.width - 2.0 * one.metrics.width).abs() < 0.01);
+    }
+
+    /// A no-break space is no place to break a line (UAX #14 class GL), however
+    /// narrow the line: the words either side of it are one.
+    #[test]
+    fn a_line_never_breaks_at_a_no_break_space() {
+        let mut engine = engine();
+        let joined = engine.shape("10\u{a0}km away", &test_stack(), 16.0, Some(0.0));
+        assert_eq!(line_texts(&joined), ["10\u{a0}km ", "away"]);
+        let whole = engine.shape("10\u{a0}km", &test_stack(), 16.0, None);
+        assert!(
+            (joined.lines[0].width - joined.lines[0].trailing_space - whole.metrics.width).abs()
+                < 0.01
+        );
+    }
+
+    /// The edges of an inline box are not a place to break: `<a>About</a>Us` is
+    /// one word, and the edge goes with the text it is the edge of.
+    #[test]
+    fn a_line_never_breaks_at_an_inline_box_edge() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("About", 16.0, brush), span("Us", 16.0, brush)];
+        let edges = [
+            edge(0, SpacerKind::Opening, 0, 5.0),
+            edge(1, SpacerKind::Closing, 1, 0.0),
+        ];
+        let narrowest = engine.shape_spans(&spans, &edges, Some(0.0));
+        assert_eq!(line_texts(&narrowest), ["AboutUs"]);
+        let widest = engine.shape_spans(&spans, &edges, None);
+        assert!((narrowest.lines[0].width - widest.metrics.width).abs() < 0.01);
+    }
+
+    /// A word too long for its line that starts inside a box with a margin
+    /// overflows with the margin in front of it, rather than leaving the margin
+    /// on a line of its own; and the next line starts at the next word, not at
+    /// the space before it.
+    #[test]
+    fn an_edge_at_the_start_of_a_line_stays_with_its_word() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [
+            span("Averyveryverylongword", 16.0, brush),
+            span(" tail", 16.0, brush),
+        ];
+        let edges = [
+            edge(0, SpacerKind::Opening, 0, 6.0),
+            edge(1, SpacerKind::Closing, 1, 0.0),
+        ];
+        let shaped = engine.shape_spans(&spans, &edges, Some(60.0));
+        assert_eq!(line_texts(&shaped), ["Averyveryverylongword ", "tail"]);
+        let start = shaped.spacers.iter().find(|spacer| spacer.id == 0);
+        assert_eq!(start.map(|spacer| (spacer.line, spacer.x)), Some((0, 0.0)));
+    }
+
+    /// A line still breaks either side of an atomic inline, as it does either
+    /// side of the object replacement character it stands for.
+    #[test]
+    fn a_line_breaks_either_side_of_an_atomic_inline() {
+        let mut engine = engine();
+        let brush = [0, 0, 0, 255];
+        let spans = [span("ab", 16.0, brush), span("cd", 16.0, brush)];
+        let picture = Spacer {
+            height: 10.0,
+            ..edge(0, SpacerKind::Atomic, 1, 10.0)
+        };
+        let shaped = engine.shape_spans(&spans, &[picture], Some(0.0));
+        assert_eq!(line_texts(&shaped), ["ab", "", "cd"]);
     }
 
     #[test]

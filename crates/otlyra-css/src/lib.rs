@@ -50,3 +50,4 @@ pub use style::{
     Overflow, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
     Track, TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
 };
+pub use style::{FamilyName, FontFamily, GenericFamily};

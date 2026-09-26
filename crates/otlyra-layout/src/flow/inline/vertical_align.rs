@@ -7,16 +7,16 @@
 //! is, and — before the paragraph is shaped — how far each of its spans reaches,
 //! which is what the line boxes are rebuilt from once it has been.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use otlyra_css::ComputedStyle;
-use otlyra_text::TextSpan;
 
-use crate::box_tree::BoxId;
+use crate::box_tree::{BoxId, BoxTree};
 use crate::flow::Flow;
 use crate::fragment::{Fragment, FragmentKind};
 
-use super::ReplacedBox;
+use super::collect::InlineContent;
 
 /// How far a rule has raised the box it is written on, in CSS pixels.
 ///
@@ -112,57 +112,86 @@ pub(super) fn baseline_of(fragment: &Fragment) -> Option<f32> {
     last
 }
 
-impl<'a> Flow<'a> {
-    /// How far `source`'s content is raised off the baseline of a line of
-    /// `block`'s, in CSS pixels, positive up.
-    ///
-    /// Settled by [`Self::level_line_heights`] for the values that need the line
-    /// box or the parent's font, and worked out here for the rest — with the same
-    /// answer to which `vertical-align` applies, so the block's own text stays on
-    /// the baseline its line was built round.
-    pub(super) fn shift_on_line(&self, source: BoxId, block: BoxId) -> f32 {
-        if let Some(&shift) = self.line_shifts.get(&source) {
-            return shift;
-        }
-        let style = &self.tree.node(source).style;
-        baseline_shift_of(
-            alignment_on_line(source, block, style),
-            style,
-            &self.tree.node(block).style,
-        )
+/// How far `source`'s content is raised off the baseline of a line of `block`'s,
+/// in CSS pixels, positive up.
+///
+/// Settled by [`Flow::level_line_heights`] for the values that need the line box
+/// or the parent's font, and worked out here for the rest — with the same answer
+/// to which `vertical-align` applies, so the block's own text stays on the
+/// baseline its line was built round.
+pub(super) fn shift_on_line(
+    shifts: &HashMap<BoxId, f32>,
+    tree: &BoxTree,
+    source: BoxId,
+    block: BoxId,
+) -> f32 {
+    if let Some(&shift) = shifts.get(&source) {
+        return shift;
     }
+    let style = &tree.node(source).style;
+    baseline_shift_of(
+        alignment_on_line(source, block, style),
+        style,
+        &tree.node(block).style,
+    )
+}
 
-    /// Give every span of a paragraph the same line height: the tallest any of
-    /// them, or the block itself, asks for — and enough room for anything a rule
-    /// has raised or lowered.
+/// How far a paragraph and the things in it reach above and below the
+/// baseline, as far as that can be known before the paragraph is broken into
+/// lines.
+///
+/// The shaper is told how tall a line is but decides for itself where inside it
+/// the baseline sits, by centring the font. CSS does not: a line reaches as far
+/// above its baseline as its tallest thing does, and as far below as its
+/// deepest. So the line boxes are rebuilt from these once the shaper has said
+/// what landed on each line.
+#[derive(Default)]
+pub(super) struct Levels {
+    /// The block's own strut, above and below the baseline: the line it would
+    /// have with nothing in it, and what every line of the paragraph is at least.
+    pub(super) strut: (f32, f32),
+    /// How far each span reaches above and below the baseline, in step with the
+    /// spans.
     ///
-    /// CSS is finer than this. A line box is as tall as the tallest thing *on that
-    /// line*, and the block's own font sets a floor — the strut — that a line has
-    /// even when nothing on it is that tall. So a paragraph whose middle line holds
-    /// one large word should have one tall line and the rest short.
+    /// The shaper carries a line height per *run* of glyphs and opens a run when
+    /// the font changes, so it cannot be told that one span of the same font
+    /// wants a taller line; and even where it can, what it is told is a height
+    /// rather than where inside it the baseline goes. Both are settled per line,
+    /// from these, once it is known which span landed on which.
+    pub(super) span_reach: Vec<(f32, f32)>,
+    /// What each line-relative `vertical-align` resolved to, by the box it is
+    /// written on.
     ///
-    /// Levelling them is a workaround, and it is worth stating what for. The shaper
-    /// closes a run of glyphs *after* it has already moved on to the next span's
-    /// style, so a run is measured with its neighbour's line height rather than its
-    /// own — which makes a paragraph of ordinary text with one `<code>` in it two
-    /// pixels short on every line, including the lines the `<code>` is nowhere
-    /// near. One height throughout cannot be got wrong that way, and for the shape
-    /// this actually happens in — a smaller inline inside ordinary prose — the
-    /// floor is the answer CSS gives anyway. What it gets wrong is the opposite
-    /// case: a paragraph with one larger inline in it is tall on every line rather
-    /// than on the line that holds it.
+    /// `top`, `bottom`, `middle`, `text-top` and `text-bottom` are a position
+    /// within a line rather than a shift a box knows on its own, so they are
+    /// settled here and read back when the glyphs are placed. Working them out
+    /// twice would be two answers to where a box sits.
+    pub(super) shifts: HashMap<BoxId, f32>,
+}
+
+impl<'a> Flow<'a> {
+    /// How far the paragraph and each span in it reach, and where the spans a
+    /// line-relative `vertical-align` moves end up.
+    ///
+    /// It also floors every span's line height at the block's strut, for the
+    /// shaper's sake. The shaper closes a run of glyphs *after* it has already
+    /// moved on to the next span's style, so a run is measured with its
+    /// neighbour's line height rather than its own — which made a paragraph of
+    /// ordinary text with one `<code>` in it two pixels short on every line,
+    /// including the lines the `<code>` is nowhere near. The strut is what every
+    /// line is at least anyway (CSS 2.2 §10.8.1), so the floor cannot be got
+    /// wrong that way; how much taller than it each line is, is settled from what
+    /// this returns once the shaper has said what landed on the line.
     pub(super) fn level_line_heights(
         &mut self,
         parent: BoxId,
-        spans: &mut [TextSpan<'_>],
-        sources: &[BoxId],
-        replaced: &[ReplacedBox],
-    ) {
+        content: &mut InlineContent<'_>,
+    ) -> Levels {
         let style = Arc::clone(&self.tree.node(parent).style);
         let stack = self.font_stack(&style);
         // The strut: the line the block would have with no text in it at all.
         let Some(strut) = self.strut_of(&style, &stack) else {
-            return;
+            return Levels::default();
         };
 
         // The two ends grow apart: a raised box reaches further above the baseline
@@ -170,30 +199,17 @@ impl<'a> Flow<'a> {
         // below. A box on the baseline is already inside the strut wherever the
         // block's font is the larger, which is the ordinary case.
         let (mut above, mut below) = (strut.ascent, strut.descent);
-        // The same reach with the *unshifted* spans left out.
-        //
-        // Every line of the paragraph is at least this tall, and no line is made
-        // tall by a span that is not on it. A span sitting on the baseline needs
-        // nothing from the paragraph — the shaper knows its own height and which
-        // line it landed on — but one that has been raised, lowered or hung off
-        // the line box does: how far it moved is worked out here, and the shaper
-        // never hears about it.
-        let (mut floor_above, mut floor_below) = (strut.ascent, strut.descent);
-        self.span_reach.clear();
-        self.span_reach.resize(spans.len(), (0.0, 0.0));
+        let mut span_reach = vec![(0.0, 0.0); content.spans.len()];
         // Kept from the first pass so the second does not shape anything twice:
         // a strut is a font lookup, and the line-relative boxes need theirs
         // again once the line is known.
         let mut line_relative: Vec<(BoxId, otlyra_css::VerticalAlign, otlyra_text::Strut)> =
             Vec::new();
-        self.line_shifts.clear();
+        let mut shifts = HashMap::new();
 
-        for (index, span) in spans.iter().enumerate() {
-            let Some(source) = sources.get(index) else {
-                continue;
-            };
+        for (index, (span, source)) in content.spans.iter().zip(&content.sources).enumerate() {
             let span_style = Arc::clone(&self.tree.node(*source).style);
-            let own = match self.strut_of(&span_style, &span.font_stack.clone()) {
+            let own = match self.strut_of(&span_style, &span.font_stack) {
                 Some(own) => own,
                 None => continue,
             };
@@ -213,9 +229,7 @@ impl<'a> Flow<'a> {
                 // depend on that, but how tall the line is does.
                 above = above.max(own.ascent);
                 below = below.max(own.descent);
-                floor_above = floor_above.max(own.ascent);
-                floor_below = floor_below.max(own.descent);
-                self.span_reach[index] = (own.ascent, own.descent);
+                span_reach[index] = (own.ascent, own.descent);
                 line_relative.push((*source, align.clone(), own));
                 continue;
             }
@@ -237,19 +251,14 @@ impl<'a> Flow<'a> {
                 other => baseline_shift_of(other, &span_style, &style),
             };
             if align.resolved_while_levelling() {
-                self.line_shifts.insert(*source, shift);
+                shifts.insert(*source, shift);
             }
             above = above.max(shift + own.ascent);
             below = below.max(own.descent - shift);
-            self.span_reach[index] = (shift + own.ascent, own.descent - shift);
             // A span that has been moved is one the shaper cannot place: it knows
             // the span's own height and nothing of the shift, so the room a shift
-            // needs comes from the paragraph. A span sitting where the shaper put
-            // it asks nothing of the floor and is left to its own line.
-            if shift != 0.0 {
-                floor_above = floor_above.max(shift + own.ascent);
-                floor_below = floor_below.max(own.descent - shift);
-            }
+            // needs is carried here, to the line the span lands on.
+            span_reach[index] = (shift + own.ascent, own.descent - shift);
             // An explicit `line-height` on a span still asks for its own room.
             if let Some(asked) = span.line_height {
                 above = above.max(asked - strut.descent);
@@ -260,7 +269,7 @@ impl<'a> Flow<'a> {
                 // on the way through. Those, and only those, are folded into the
                 // floor: folding in the rest would make a paragraph with one larger
                 // word in it that tall on every line.
-                let (reach_above, reach_below) = &mut self.span_reach[index];
+                let (reach_above, reach_below) = &mut span_reach[index];
                 *reach_above = reach_above.max(asked - own.descent);
                 *reach_below = reach_below.max(own.descent);
             }
@@ -274,40 +283,27 @@ impl<'a> Flow<'a> {
                 otlyra_css::VerticalAlign::Bottom => own.descent - below,
                 _ => 0.0,
             };
-            self.line_shifts.insert(source, shift);
+            shifts.insert(source, shift);
         }
-
-        // A picture is deliberately *not* folded in. It sits with its bottom edge on
-        // the baseline, so all of it is above — and one large picture would make
-        // every line of the paragraph as tall as itself, which for a picture beside
-        // a sentence is far more wrong than the pixel it saves. The shaper reserves
-        // the room for it within the line it is actually on.
-        //
-        // An inline block *is* folded in, both ends of it: it is a box in the line
-        // like a tall word, sitting on its own last baseline, and CSS grows the
-        // line to hold it above and below rather than letting it hang out.
-        for box_ in replaced.iter().filter(|box_| box_.content.is_some()) {
-            above = above.max(box_.baseline);
-            below = below.max(box_.height - box_.baseline);
-            floor_above = floor_above.max(box_.baseline);
-            floor_below = floor_below.max(box_.height - box_.baseline);
-        }
-
-        // What *every* line of the paragraph is at least, and no more than that:
-        // the block's own strut, which is the line it would have with nothing in
-        // it. Everything else — a taller span, a raised one, a box — belongs to the
-        // line it is actually on and is folded in there.
-        let _ = (above, below, floor_above, floor_below);
-        self.line_reach = (strut.ascent, strut.descent + strut.leading);
 
         // The shaper is still told a height per span, because that is what it
         // measures a line by while it is breaking one. Where each line's box ends
         // up is settled afterwards, from what landed on it.
         let floor = strut.height();
         if floor.is_finite() && floor > 0.0 {
-            for span in spans {
+            for span in &mut content.spans {
                 span.line_height = Some(span.line_height.map_or(floor, |own| own.max(floor)));
             }
+        }
+
+        Levels {
+            // What *every* line of the paragraph is at least, and no more than
+            // that: the block's own strut. Everything else — a taller span, a
+            // raised one, a box — belongs to the line it is actually on and is
+            // folded in there.
+            strut: (strut.ascent, strut.descent + strut.leading),
+            span_reach,
+            shifts,
         }
     }
 }

@@ -20,7 +20,6 @@ use crate::fragment::Fragment;
 
 use super::Flow;
 use super::box_model::resolve_margin;
-use super::inline::{ReplacedBox, inline_spacers};
 use super::sizing::{BlockSpace, Frame, InlineRoom};
 
 /// Which of the two intrinsic sizes is wanted, so that two of them cannot be
@@ -75,26 +74,6 @@ impl<'a> Flow<'a> {
         })
     }
 
-    /// Size the boxes that sit on a line being measured as words do — pictures,
-    /// inline blocks, widgets — by what each contributes to it, rather than by
-    /// how it would be laid out on a line `containing_width` wide.
-    ///
-    /// A percentage of the width being measured is as cyclic on a line as on a
-    /// line of its own (CSS Sizing 3 §5.2.1), and a box that is a block and one
-    /// that is a word have to ask the same of the box they are in: at its
-    /// narrowest an inline block is as narrow as its own content can be, not as
-    /// wide as it would be laid out.
-    fn measure_atomic_inlines(
-        &mut self,
-        atomic: &mut [ReplacedBox],
-        containing_width: f32,
-        wanted: Wanted,
-    ) {
-        for box_ in atomic {
-            box_.width = self.contribution(box_.id(), containing_width, None, wanted);
-        }
-    }
-
     /// The widest a box would be if nothing made it wrap.
     ///
     /// CSS calls this the max-content size, and a flex item with no width of its
@@ -131,35 +110,7 @@ impl<'a> Flow<'a> {
         let inner = if is_flex_container(&style) {
             self.flex_content_size(&style, children, containing_width, Wanted::Widest)
         } else if self.tree.node(first).is_inline_level() {
-            // One line, however long: the shaper is asked for the paragraph
-            // with nothing to break it.
-            let mut spans = Vec::new();
-            let mut sources = Vec::new();
-            let mut inlines = Vec::new();
-            let mut replaced = Vec::new();
-            self.collect_spans(
-                id,
-                containing_width,
-                &mut spans,
-                &mut sources,
-                &mut inlines,
-                &mut replaced,
-            );
-            self.measure_atomic_inlines(&mut replaced, containing_width, Wanted::Widest);
-            // Shaped with the spacers rather than measured without them and
-            // added on afterwards: the width of a run of text is not the sum
-            // of its pieces once something that is not text sits in it. A
-            // space between two pictures is trailing white space at the end
-            // of the *text* and no space at all at the end of the run, and a
-            // paragraph measured the other way came back narrower than the
-            // one line it holds — which put the second picture on a line of
-            // its own.
-            let spacers = inline_spacers(&inlines, &replaced);
-            if spans.is_empty() && spacers.is_empty() {
-                0.0
-            } else {
-                self.text.shape_spans(&spans, &spacers, None).metrics.width
-            }
+            self.inline_content_size(id, containing_width, Wanted::Widest)
         } else {
             // Boxes that stack need the widest of them. Floated siblings do
             // not stack — they sit side by side until one clears or
@@ -229,41 +180,7 @@ impl<'a> Flow<'a> {
         let inner = if is_flex_container(&style) {
             self.flex_content_size(&style, children, containing_width, Wanted::Narrowest)
         } else if self.tree.node(first).is_inline_level() {
-            // Broken as hard as it will break: the widest line that comes back
-            // is the widest word.
-            let mut spans = Vec::new();
-            let mut sources = Vec::new();
-            let mut inlines = Vec::new();
-            let mut replaced = Vec::new();
-            self.collect_spans(
-                id,
-                containing_width,
-                &mut spans,
-                &mut sources,
-                &mut inlines,
-                &mut replaced,
-            );
-            self.measure_atomic_inlines(&mut replaced, containing_width, Wanted::Narrowest);
-            // Broken as hard as it will break — unless it may not break at
-            // all. Under `text-wrap-mode: nowrap` the whole run is one
-            // unbreakable thing, so its min-content size is its full width;
-            // asking for the longest word instead would let a flex item
-            // shrink to that word while the text it draws stays full length,
-            // and the item beside it would be laid over the overflow. That is
-            // what folded and then overlapped the site's own header.
-            let wrap_at = (style.text_wrap != otlyra_css::TextWrap::NoWrap).then_some(0.0);
-            let text = if spans.is_empty() {
-                0.0
-            } else {
-                self.text
-                    .shape_spans(&spans, &[], wrap_at)
-                    .lines
-                    .iter()
-                    .map(|line| line.width - line.trailing_space)
-                    .fold(0.0, f32::max)
-            };
-            let atomic = replaced.iter().map(|box_| box_.width).fold(0.0, f32::max);
-            text.max(atomic)
+            self.inline_content_size(id, containing_width, Wanted::Narrowest)
         } else {
             children
                 .into_iter()

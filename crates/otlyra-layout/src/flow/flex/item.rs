@@ -16,7 +16,6 @@ use crate::flow::replaced::{
 };
 use crate::flow::sizing::{
     BlockSpace, Frame, InlineRoom, Limits, OwnWidth, Sizes, block_sizes_in, content_length,
-    is_scroll_container,
 };
 use crate::fragment::{Fragment, Rect};
 
@@ -228,7 +227,7 @@ fn automatic_minimum(
     frame: f32,
     content: impl FnOnce() -> f32,
 ) -> f32 {
-    if is_scroll_container(style) {
+    if style.overflow.is_scroll_container() {
         return frame;
     }
     let content = content();
@@ -770,7 +769,7 @@ impl<'a> Flow<'a> {
             }
         };
 
-        if style.overflow == otlyra_css::Overflow::Clip {
+        if style.overflow.clips() {
             let padding_box = Rect::new(
                 x + border.left,
                 y + border.top,

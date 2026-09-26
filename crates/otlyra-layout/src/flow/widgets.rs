@@ -9,9 +9,10 @@
 use std::sync::Arc;
 
 use otlyra_css::{ComputedStyle, Length, Size};
-use otlyra_text::{FontStack, TextEngine};
+use otlyra_text::TextEngine;
 
 use crate::box_tree::{BoxTree, Control, ControlKind, NaturalSize};
+use crate::fonts::FontStacks;
 use crate::widget_metrics::{
     ARROW_STRIP, CHECK_SIDE, COLOR_HEIGHT, COLOR_WIDTH, RANGE_HEIGHT, RANGE_WIDTH,
 };
@@ -41,20 +42,31 @@ impl<'a> Flow<'a> {
     /// type on, and that line has a baseline. Measured from the box's own top edge,
     /// so it is the same number `baseline_of` would have answered the moment a
     /// letter arrived.
+    ///
+    /// A checkbox, a radio button and a slider have no line and no business
+    /// pretending to, but both references sit them on the baseline by their bottom
+    /// *border* edge, `height` below their top, with their margins hanging below
+    /// it. The rest — a button with no label, a colour well, a file picker, a bar,
+    /// a meter — keep CSS's rule.
     pub(super) fn empty_control_baseline(
         &mut self,
         id: crate::box_tree::BoxId,
         style: &Arc<ComputedStyle>,
         containing_width: f32,
+        height: f32,
     ) -> Option<f32> {
         let control = self.tree.node(id).control.as_ref()?;
-        // Only the ones that hold text of their own. A checkbox has no line and no
-        // business pretending to; a bar and a slider are drawn shapes.
-        if !matches!(
-            control.kind,
-            ControlKind::Field | ControlKind::Area | ControlKind::DropDown | ControlKind::ListBox
-        ) {
-            return None;
+        match control.kind {
+            ControlKind::Field
+            | ControlKind::Area
+            | ControlKind::DropDown
+            | ControlKind::ListBox => {}
+            ControlKind::Checkbox | ControlKind::Radio | ControlKind::Range => return Some(height),
+            ControlKind::Button
+            | ControlKind::Color
+            | ControlKind::File
+            | ControlKind::Progress
+            | ControlKind::Meter => return None,
         }
         let border = resolve_border(style);
         let padding = resolve_padding(style, containing_width);
@@ -83,7 +95,7 @@ impl<'a> Flow<'a> {
 /// written into the style as the `width` and `height` of a control whose own
 /// are `auto`, which is where everything else does.
 pub(super) fn size_widgets(tree: &mut BoxTree, text: &mut TextEngine) {
-    let mut stacks: std::collections::HashMap<usize, FontStack> = std::collections::HashMap::new();
+    let mut stacks = FontStacks::default();
     for id in tree.descendants(tree.root()) {
         let Some(control) = tree.node(id).control.clone() else {
             continue;
@@ -131,7 +143,7 @@ fn widget_size(
     control: &Control,
     style: &Arc<ComputedStyle>,
     text: &mut TextEngine,
-    stacks: &mut std::collections::HashMap<usize, FontStack>,
+    stacks: &mut FontStacks,
 ) -> NaturalSize {
     // What a scroll bar takes from the width a `<textarea>` asks for.
     const SCROLLBAR: f32 = 15.0;
@@ -185,13 +197,9 @@ fn widget_size(
 fn character_widths(
     style: &Arc<ComputedStyle>,
     text: &mut TextEngine,
-    stacks: &mut std::collections::HashMap<usize, FontStack>,
+    stacks: &mut FontStacks,
 ) -> (f32, f32, f32) {
-    let key = Arc::as_ptr(&style.font_family) as *const u8 as usize;
-    let stack = stacks
-        .entry(key)
-        .or_insert_with(|| FontStack::parse_css(&style.font_family))
-        .clone();
+    let stack = stacks.of(&style.font_family);
     let size = style.font_size;
     let average = text.measure("0", &stack, size).width;
     let widest = text.measure("W", &stack, size).width;

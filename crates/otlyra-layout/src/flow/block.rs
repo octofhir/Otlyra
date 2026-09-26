@@ -294,7 +294,7 @@ impl<'a> Flow<'a> {
         // A box that is inline outside cuts its contents off at its padding edge
         // like any other, and until a field slid its text under itself there was
         // nothing inside one that ever reached the edge to notice.
-        if style.overflow == otlyra_css::Overflow::Clip {
+        if style.overflow.clips() {
             let padding_box = Rect::new(
                 x + border.left,
                 y + border.top,
@@ -384,10 +384,11 @@ impl<'a> Flow<'a> {
         let style = &node.style;
         // A box that establishes a formatting context of its own keeps what is
         // inside it inside it: a margin does not collapse out through the edge of a
-        // flex item, a float, a cell, or anything that clips. Without this a
+        // flex item, a float, a cell, or a scroll container. Without this a
         // heading at the top of a flex item pushes the *container* down and leaves
-        // a gap above the item rather than inside it.
-        let establishes = style.overflow != otlyra_css::Overflow::Visible
+        // a gap above the item rather than inside it. A box that only clips is
+        // not one: `overflow: clip` establishes nothing (CSS Overflow 3 §3.1).
+        let establishes = style.overflow.is_scroll_container()
             || style.float != otlyra_css::Float::None
             || matches!(
                 style.position,
@@ -476,7 +477,7 @@ impl<'a> Flow<'a> {
         // and without saying so. Leaving them out is what let a footer laid out as
         // a table of floated links collapse: the floats escaped the cell, the cell
         // came out empty, and every row landed on the one above it.
-        let root = style.overflow == otlyra_css::Overflow::Clip
+        let root = style.overflow.is_scroll_container()
             || matches!(
                 style.display,
                 otlyra_css::Display::TableCell | otlyra_css::Display::InlineBlock
@@ -603,7 +604,7 @@ impl<'a> Flow<'a> {
             }
         }
 
-        if style.overflow == otlyra_css::Overflow::Clip {
+        if style.overflow.clips() {
             let padding_box = Rect::new(
                 border_x + border.left,
                 border_y + border.top,

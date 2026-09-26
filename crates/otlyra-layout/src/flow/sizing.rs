@@ -11,8 +11,7 @@
 //! done.
 
 use otlyra_css::{
-    AspectRatio, BoxSizing, ComputedStyle, Display, Intrinsic, Length, MaxSize, Overflow, Ratio,
-    Sides, Size,
+    AspectRatio, BoxSizing, ComputedStyle, Display, Intrinsic, Length, MaxSize, Ratio, Sides, Size,
 };
 
 use crate::box_tree::{BoxId, BoxKind};
@@ -241,24 +240,6 @@ pub(super) fn height_ratio(style: &ComputedStyle, asked: Option<f32>) -> Option<
             Size::Intrinsic(_) => false,
         };
     preferred_ratio(style, None).filter(|_| automatic)
-}
-
-/// Whether a box is a scroll container (CSS Overflow 3 §3), which is what takes
-/// its automatic minimum sizes away — a flex item's (CSS Flexbox §4.5) and a box
-/// with an aspect ratio's (CSS Sizing 4 §4.3) alike: what does not fit it
-/// scrolls.
-///
-/// `overflow` here is one value for both axes, `visible` or `clip`, and `clip`
-/// stands for every value but `visible`: `hidden`, `scroll` and `auto`, which
-/// make a scroll container, and `clip`, which does not (§3.1). So a box with
-/// `overflow: clip` is taken for a scroll container and loses the automatic
-/// minimum a browser would keep. This follows the model of `overflow` split
-/// by axis, with `clip` apart from `hidden`, once that is in.
-pub(super) fn is_scroll_container(style: &ComputedStyle) -> bool {
-    match style.overflow {
-        Overflow::Visible => false,
-        Overflow::Clip => true,
-    }
 }
 
 /// The fit-content formula (CSS Sizing 3 §3.2), in border-box widths: as wide as
@@ -740,7 +721,7 @@ fn ratio_height(
 ) -> Sizes {
     let through_ratio = ratio.height_for(inline_size, frame);
     let content_floor = match (&style.min_height, content) {
-        (Size::Auto, Some(content)) if !is_scroll_container(style) => content,
+        (Size::Auto, Some(content)) if !style.overflow.is_scroll_container() => content,
         (Size::Auto | Size::Length(_) | Size::Intrinsic(_) | Size::Stretch, _) => 0.0,
     };
     Sizes {
@@ -1031,7 +1012,7 @@ impl<'a> Flow<'a> {
         let frame = Frame::of(style, room.measure);
         let width = ratio.width_for(height, frame);
         Some(match style.min_width {
-            Size::Auto if !is_scroll_container(style) => {
+            Size::Auto if !style.overflow.is_scroll_container() => {
                 width.max(self.min_content_size(id, room.measure) - frame.inline)
             }
             Size::Auto | Size::Length(_) | Size::Intrinsic(_) | Size::Stretch => width,

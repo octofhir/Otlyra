@@ -44,9 +44,10 @@ mod widgets;
 use std::sync::Arc;
 
 use otlyra_css::ComputedStyle;
-use otlyra_text::{FontStack, TextEngine};
+use otlyra_text::TextEngine;
 
 use crate::box_tree::{BoxId, BoxTree};
+use crate::fonts::FontStacks;
 use crate::fragment::{Fragment, FragmentKind, FragmentTree, Layer, Rect, ScrollPort, Sticky};
 
 use float::FloatBox;
@@ -78,8 +79,7 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
     let mut engine = Flow {
         tree,
         text,
-        font_stacks: std::collections::HashMap::new(),
-        line_shifts: std::collections::HashMap::new(),
+        font_stacks: FontStacks::default(),
         floats: Vec::new(),
         containing_blocks: vec![ContainingBlock {
             rect: initial,
@@ -99,8 +99,6 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         // with — is a hundred percent of something rather than of nothing.
         containing_height: Some(viewport.height),
         container_limits: Limits::NONE,
-        line_reach: (0.0, 0.0),
-        span_reach: Vec::new(),
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -154,8 +152,7 @@ pub fn relayout_contained(
     let mut engine = Flow {
         tree,
         text,
-        font_stacks: std::collections::HashMap::new(),
-        line_shifts: std::collections::HashMap::new(),
+        font_stacks: FontStacks::default(),
         floats: Vec::new(),
         containing_blocks: vec![ContainingBlock {
             rect: content,
@@ -172,8 +169,6 @@ pub fn relayout_contained(
         measured_heights: std::collections::HashMap::new(),
         containing_height: None,
         container_limits: Limits::NONE,
-        line_reach: (0.0, 0.0),
-        span_reach: Vec::new(),
     };
     let mut children = Vec::new();
     engine.layout_children(id, content.width, content.x, content.y, &mut children);
@@ -223,21 +218,8 @@ struct ContainingBlock {
 struct Flow<'a> {
     tree: &'a BoxTree,
     text: &'a mut TextEngine,
-    /// Font stacks, keyed by the identity of the `font-family` string they were
-    /// parsed from.
-    ///
-    /// Inheritance clones the `Arc<str>`, so every element that did not name its
-    /// own family shares one pointer — which makes this a handful of entries for a
-    /// whole document instead of one parse per run per layout.
-    font_stacks: std::collections::HashMap<usize, FontStack>,
-    /// What each line-relative `vertical-align` resolved to, for the paragraph
-    /// being laid out.
-    ///
-    /// `top`, `bottom`, `middle`, `text-top` and `text-bottom` are a position
-    /// within a line rather than a shift a box knows on its own, so they are
-    /// settled once the line has been levelled and read back when the glyphs are
-    /// placed. Working them out twice would be two answers to where a box sits.
-    line_shifts: std::collections::HashMap<BoxId, f32>,
+    /// The font stack for each `font-family` list met so far.
+    font_stacks: FontStacks,
     /// The floats placed so far, in page coordinates.
     ///
     /// One list for the document rather than one per formatting context: a float
@@ -311,24 +293,6 @@ struct Flow<'a> {
     /// knows what they come to (CSS Flexbox §9.3 step 4, §9.4 step 15); a
     /// grid container could do the same.
     container_limits: Limits,
-    /// How far the paragraph being laid out reaches above and below its baseline,
-    /// as its own struts and inline blocks settled it.
-    ///
-    /// The shaper is told how tall a line is but decides for itself where inside it
-    /// the baseline sits, by centring the font. CSS does not: a line reaches as far
-    /// above its baseline as its tallest thing does, and as far below as its
-    /// deepest. So the line boxes are rebuilt around the baselines the shaper
-    /// placed the glyphs on, which moves the boxes and leaves the text where it is.
-    line_reach: (f32, f32),
-    /// How far each span of the paragraph being laid out reaches above and below
-    /// the baseline, in step with the spans themselves.
-    ///
-    /// The shaper carries a line height per *run* of glyphs and opens a run when
-    /// the font changes, so it cannot be told that one span of the same font wants
-    /// a taller line; and even where it can, what it is told is a height rather
-    /// than where inside it the baseline goes. Both are settled here, per line,
-    /// once the shaper has said which span landed on which.
-    span_reach: Vec<(f32, f32)>,
     /// The lines of each collapsed table's grid, for the table to draw.
     ///
     /// A collapsed border belongs to the edge rather than to a cell, so it is
@@ -451,7 +415,7 @@ fn offset(fragment: &mut Fragment, x: f32, y: f32) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod sizing_tests;
