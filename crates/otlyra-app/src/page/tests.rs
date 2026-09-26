@@ -1591,25 +1591,32 @@ fn scrolling_a_panel_moves_its_contents_and_not_its_edge() {
     let tops = |page: &mut PageScene, text: &mut TextEngine| {
         let list = page.build_display_list(text, 800.0, 600.0, 0.0);
         let mut painter = RecordingPainter::new();
-        render(&list, &mut painter);
+        otlyra_gfx::render_scrolled(&list, &mut painter, &page.offsets());
         let mut panel = None;
         let mut inside = None;
         use otlyra_gfx::kurbo::Shape as _;
         for op in painter.take() {
-            if let PaintOp::Fill { brush, shape, .. } = op {
+            if let PaintOp::Fill {
+                brush,
+                shape,
+                transform,
+                ..
+            } = op
+            {
+                let top = transform.transform_rect_bbox(shape.bounding_box()).y0;
                 if brush
                     == otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
                         0, 0, 255,
                     ))
                 {
-                    panel = Some(shape.bounding_box().y0);
+                    panel = Some(top);
                 }
                 if brush
                     == otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
                         255, 0, 0,
                     ))
                 {
-                    inside = Some(shape.bounding_box().y0);
+                    inside = Some(top);
                 }
             }
         }
@@ -1626,6 +1633,29 @@ fn scrolling_a_panel_moves_its_contents_and_not_its_edge() {
         60.0,
         "its contents did not move by what the wheel said"
     );
+}
+
+/// A panel scrolled is new offsets for the list the page already has, and a
+/// press in it lands on what the scroll brought under the pointer.
+#[test]
+fn scrolling_a_panel_builds_no_list_and_a_press_follows_it() {
+    let rows: String = (0..12)
+        .map(|index| {
+            format!("<p style=\"margin:0;height:20px\"><a href=\"/{index}\">row {index}</a></p>")
+        })
+        .collect();
+    let (mut page, mut text) = scene(&format!(
+        "<style>body {{ margin: 0 }} .panel {{ overflow: hidden; height: 100px }}</style>\
+         <div class=panel>{rows}</div>"
+    ));
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.link_at(10.0, 5.0).as_deref(), Some("/0"));
+    let builds = page.builds();
+
+    page.scroll_at(50.0, 50.0, 60.0);
+    page.build_display_list(&mut text, 800.0, 600.0, 0.0);
+    assert_eq!(page.builds(), builds, "the panel's scroll built a list");
+    assert_eq!(page.link_at(10.0, 5.0).as_deref(), Some("/3"));
 }
 
 /// A box that cuts its contents off and has more than it can show takes the

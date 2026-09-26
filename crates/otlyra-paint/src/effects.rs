@@ -44,7 +44,7 @@ pub(super) fn close(group: Group<'_>, list: &mut DisplayList) {
 /// unless `transform-origin` says otherwise — so the steps are applied there and
 /// the box put back afterwards, which is what makes `rotate()` turn a card about
 /// its middle rather than swing it about the corner of the page.
-pub(super) fn transform_of(fragment: &Fragment, scroll_y: f32) -> Option<Affine> {
+pub(super) fn transform_of(fragment: &Fragment) -> Option<Affine> {
     let steps = &fragment.style.transform;
     if steps.is_empty() {
         return None;
@@ -71,7 +71,7 @@ pub(super) fn transform_of(fragment: &Fragment, scroll_y: f32) -> Option<Affine>
 
     let origin = (
         f64::from(rect.x + fragment.style.transform_origin.x.resolve(rect.width)),
-        f64::from(rect.y - scroll_y + fragment.style.transform_origin.y.resolve(rect.height)),
+        f64::from(rect.y + fragment.style.transform_origin.y.resolve(rect.height)),
     );
     Some(Affine::translate(origin) * matrix * Affine::translate((-origin.0, -origin.1)))
 }

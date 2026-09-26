@@ -80,7 +80,8 @@ const RING_OFFSET: f64 = 0.0;
 /// How thick a focus ring is.
 const RING_WIDTH: f64 = 2.0;
 
-/// Draw `control` over `rect`, in page coordinates already shifted for the scroll.
+/// Draw `control` over `rect`, where layout put it: the scroll is applied when
+/// the list is drawn.
 ///
 /// Returns whether the widget drew its own face — in which case the box's CSS
 /// background and border are not drawn, because the widget *is* them. That is what

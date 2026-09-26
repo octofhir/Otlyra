@@ -1,15 +1,14 @@
 //! Scrolling: the page's own offset, the panels inside it, and their scrollbars.
 //!
 //! A scroll changes which part of the page is on screen and not where anything is,
-//! so nothing here relays out or reshapes. The page's own scroll does not even
-//! repaint: the list is drawn in page coordinates and the scroll is applied when
-//! it is drawn (see [`PageScene::offsets`]). A panel's scroll still repaints, as
-//! its offset is part of the list. Its
+//! so nothing here relays out or reshapes, or even builds a new list: the list is
+//! drawn where layout put things and the scrolls — the page's and each panel's —
+//! are applied when it is drawn (see [`PageScene::offsets`]). Its
 //! own module because the wheel, a dragged scrollbar, *scroll into view* and
 //! keeping the reader's place across a relayout are all answers to one question —
 //! which part of the page is in the window.
 
-use otlyra_layout::{BoxId, Damage};
+use otlyra_layout::BoxId;
 
 use super::PageScene;
 
@@ -20,7 +19,15 @@ impl PageScene {
     /// happens on the next scroll or the next frame, once there is a layout to
     /// clamp against.
     pub fn set_scroll(&mut self, scroll: f32) {
-        self.scroll = scroll.max(0.0);
+        self.move_to(scroll.max(0.0));
+    }
+
+    /// Put the page's scroll at `scroll`, counting it only if it moved.
+    fn move_to(&mut self, scroll: f32) {
+        if scroll != self.scroll {
+            self.scroll = scroll;
+            self.scrolls += 1;
+        }
     }
 
     /// Draw no scrollbars, for a picture that is going to be compared with one
@@ -55,7 +62,7 @@ impl PageScene {
         };
         let content = tree.content_height();
         let max = (content - self.viewport_height).max(0.0);
-        self.scroll = rect.y.clamp(0.0, max);
+        self.move_to(rect.y.clamp(0.0, max));
     }
 
     /// Take hold of a scrollbar under (`x`, `y`), if one is there.
@@ -148,7 +155,7 @@ impl PageScene {
             None => self.set_scroll(wanted),
             Some(id) => {
                 self.port_scroll.insert(id, wanted);
-                self.damage.add(Damage::PAINT);
+                self.scrolls += 1;
             }
         }
     }
@@ -184,7 +191,7 @@ impl PageScene {
             let clamped = wanted.clamp(0.0, port.range());
             if (clamped - *at).abs() > f32::EPSILON {
                 *at = clamped;
-                self.damage.add(Damage::PAINT);
+                self.scrolls += 1;
                 return;
             }
             // At its end: the page takes the rest, rather than the wheel doing
@@ -237,7 +244,7 @@ impl PageScene {
         if (scroll - self.scroll).abs() < f32::EPSILON {
             return false;
         }
-        self.scroll = scroll;
+        self.move_to(scroll);
         true
     }
 
@@ -251,7 +258,7 @@ impl PageScene {
             .as_ref()
             .map_or(0.0, |(_, tree)| tree.content_height());
         let max = (content - self.viewport_height).max(0.0);
-        self.scroll = (self.scroll + delta).clamp(0.0, max);
+        self.move_to((self.scroll + delta).clamp(0.0, max));
     }
 }
 

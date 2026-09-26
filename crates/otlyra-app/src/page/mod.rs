@@ -175,9 +175,13 @@ pub struct PageScene {
     /// `None` means *all of it*, which is the honest answer for anything but a
     /// contained relayout: a restyle can move any box on the page.
     dirty: Option<otlyra_layout::Rect>,
-    /// The scroll `dirty` was worked out at. Scrolled since, the whole page has
-    /// moved on the screen and no rectangle of it is the only one that changed.
-    dirty_scroll: f32,
+    /// How many scrolls — of the page or of a panel in it — there have been:
+    /// what a scrolled frame is told apart by, since a scroll does not build a
+    /// new list.
+    scrolls: u64,
+    /// How many there had been when `dirty` was worked out. Scrolled since, what
+    /// moved on the screen is more than the rectangle that changed.
+    dirty_scrolls: u64,
     /// What restyles that only changed how things look have repainted in place
     /// since the last list, for the next list to report as changed.
     repainted: Repainted,
@@ -258,7 +262,6 @@ struct Painted {
     band: (f32, f32),
     scrollbars: bool,
     pictures: usize,
-    ports: Vec<(BoxId, f32)>,
     selection: Option<otlyra_layout::Selection>,
     /// How many places the search found and which of them is the current one.
     ///
@@ -292,7 +295,6 @@ impl Painted {
             && self.band == other.band
             && self.scrollbars == other.scrollbars
             && self.pictures == other.pictures
-            && self.ports == other.ports
             && self.selection == other.selection
             && self.find == other.find
     }
@@ -393,7 +395,8 @@ impl PageScene {
             field_anchor: None,
             field_dragging: false,
             dirty: None,
-            dirty_scroll: 0.0,
+            scrolls: 0,
+            dirty_scrolls: 0,
             repainted: Repainted::Nothing,
             boxes_stale: false,
             retype: None,
@@ -595,9 +598,6 @@ impl PageScene {
             }
             _ => (self.scroll - height, self.scroll + height * 2.0),
         };
-        let mut ports: Vec<(BoxId, f32)> =
-            self.port_scroll.iter().map(|(id, at)| (*id, *at)).collect();
-        ports.sort_by_key(|(id, _)| otlyra_layout::box_id_to_u64(*id));
         let key = Painted {
             width,
             height,
@@ -605,7 +605,6 @@ impl PageScene {
             band,
             scrollbars: self.scrollbars,
             pictures: self.background_pictures.len(),
-            ports,
             selection: self.selection,
             find: self
                 .find
@@ -637,13 +636,12 @@ impl PageScene {
         // hands back.
         let repainted = std::mem::take(&mut self.repainted);
         self.dirty = self.changed_rect(retyped, repainted, damage, &key);
-        self.dirty_scroll = self.scroll;
+        self.dirty_scrolls = self.scrolls;
         // Built around the middle of the band, reaching a screen past either edge
         // of the viewport, which is where the band's ends are.
         let scroll = band.0 + height;
         // Taken before the layout is borrowed: the offsets are a handful of floats,
         // and the alternative is holding a borrow of the page across the walk.
-        let ports = self.port_scroll.clone();
         let pictures = self.background_pictures.clone();
         let scrollbars = self.scrollbars;
         // What the caret is *of*, taken before the layout is borrowed: where it
@@ -707,7 +705,6 @@ impl PageScene {
                 viewport: (width, height),
                 scroll_y: scroll,
                 margin: height,
-                port_offset: Some(&|id| ports.get(&id).copied().unwrap_or(0.0)),
                 background: Some(&|url: &str| pictures.get(url).cloned()),
                 scrollbars,
                 highlights: &highlight,
@@ -752,7 +749,11 @@ impl PageScene {
     pub fn offsets(&self) -> Vec<otlyra_gfx::kurbo::Vec2> {
         self.spatials
             .as_ref()
-            .map(|spatials| spatials.offsets(self.scroll))
+            .map(|spatials| {
+                spatials.offsets(self.scroll, &|port| {
+                    self.port_scroll.get(&port).copied().unwrap_or(0.0)
+                })
+            })
             .unwrap_or_default()
     }
 
@@ -768,6 +769,11 @@ impl PageScene {
                 .unwrap_or(otlyra_gfx::kurbo::Vec2::ZERO);
             (*rect - offset, *id)
         })
+    }
+
+    /// How many times the page, or a panel in it, has scrolled.
+    pub fn scrolls(&self) -> u64 {
+        self.scrolls
     }
 
     /// How many display lists this page has built rather than reused.
@@ -935,7 +941,7 @@ impl PageScene {
     /// Read by the compositor above: a keystroke that re-shapes one field has no
     /// business re-rasterizing the paragraphs under it.
     pub fn dirty(&self) -> Option<otlyra_layout::Rect> {
-        if self.scroll != self.dirty_scroll {
+        if self.scrolls != self.dirty_scrolls {
             return None;
         }
         self.dirty

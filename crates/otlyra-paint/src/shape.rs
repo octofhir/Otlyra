@@ -15,8 +15,8 @@ use crate::PATH_TOLERANCE;
 /// One radius per corner rather than an ellipse's two, and the radii are scaled
 /// down together if they overlap — which is the rule CSS gives for a box asked for
 /// rounder corners than it has room for.
-pub(super) fn box_shape(rect: Rect, scroll_y: f32, style: &otlyra_css::ComputedStyle) -> BezPath {
-    shape_with_radii(rect, scroll_y, style, 0.0)
+pub(super) fn box_shape(rect: Rect, style: &otlyra_css::ComputedStyle) -> BezPath {
+    shape_with_radii(rect, style, 0.0)
 }
 
 /// The same outline, grown by `spread` at every corner as well as every edge.
@@ -26,15 +26,14 @@ pub(super) fn box_shape(rect: Rect, scroll_y: f32, style: &otlyra_css::ComputedS
 /// the same shape rather than turning into a rounded rectangle with tighter corners.
 pub(super) fn shape_with_radii(
     rect: Rect,
-    scroll_y: f32,
     style: &otlyra_css::ComputedStyle,
     spread: f32,
 ) -> BezPath {
     let bounds = KurboRect::new(
         f64::from(rect.x),
-        f64::from(rect.y - scroll_y),
+        f64::from(rect.y),
         f64::from(rect.right()),
-        f64::from(rect.bottom() - scroll_y),
+        f64::from(rect.bottom()),
     );
 
     if !style.radius.any() {

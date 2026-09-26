@@ -129,9 +129,6 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
 /// Where a background picture is found, by the address a style names.
 pub type BackgroundLookup<'a> = &'a dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>;
 
-/// How far a scroll port has been scrolled.
-pub type PortOffset<'a> = &'a dyn Fn(otlyra_layout::BoxId) -> f32;
-
 /// Everything a frame needs beyond the fragments themselves.
 ///
 /// A struct rather than four more arguments: what a frame is made of grows, and a
@@ -147,8 +144,6 @@ pub struct Frame<'a> {
     /// drawn, so a list built with a margin serves every scroll that keeps the
     /// viewport inside it — which is most of them.
     pub margin: f32,
-    /// How far each scroll port has been scrolled.
-    pub port_offset: Option<PortOffset<'a>>,
     /// The decoded picture behind a box, by the address its style names.
     pub background: Option<BackgroundLookup<'a>>,
     /// Whether scrollbars are drawn. Off for a picture that is going to be compared
@@ -176,7 +171,6 @@ impl Default for Frame<'_> {
             viewport: (0.0, 0.0),
             scroll_y: 0.0,
             margin: 0.0,
-            port_offset: None,
             background: None,
             scrollbars: true,
             highlights: &[],
@@ -197,16 +191,16 @@ pub fn build_display_list_scrolled(
     scroll_y: f32,
     port_offset: &dyn Fn(otlyra_layout::BoxId) -> f32,
 ) -> DisplayList {
-    build_display_list_with(
+    let page = build_display_list_with(
         tree,
         &Frame {
             viewport,
             scroll_y,
-            port_offset: Some(port_offset),
             ..Frame::default()
         },
-    )
-    .at(scroll_y)
+    );
+    page.list
+        .with_offsets(&page.spatials.offsets(scroll_y, port_offset))
 }
 
 /// Build the display list for one frame, in page coordinates, with what moves
@@ -219,7 +213,6 @@ pub fn build_display_list_scrolled(
 /// serves every scroll that keeps the viewport inside that.
 pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageList {
     let (viewport, scroll_y) = (frame.viewport, frame.scroll_y);
-    let port_offset = |id| frame.port_offset.map_or(0.0, |lookup| lookup(id));
     let _span = tracing::info_span!("build_display_list").entered();
     let (width, height) = viewport;
     let mut list = DisplayList::new();
@@ -302,20 +295,29 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
             close(groups.pop().expect("just looked"), &mut list);
         }
         // What this fragment moves with. A fixed box is on the screen already; a
-        // sticky one answers to its own rule; everything else is the page.
-        let inside = fragment.scroll_port.map_or(0.0, &port_offset);
+        // sticky one answers to its own rule; what is inside a scroll port moves
+        // with the port; everything else is the page.
         let spatial = if fragment.fixed {
             SpatialId::VIEWPORT
         } else if let Some(sticky) = fragment.sticky {
-            spatials.sticky(sticky, inside)
+            spatials.sticky(sticky, fragment.scroll_port)
+        } else if let Some(port) = fragment.scroll_port {
+            spatials.port(port)
         } else {
             PAGE
+        };
+        // The edge a port cuts its contents off at is the port's box, which moves
+        // with the page and not with what scrolls inside it.
+        let clip_spatial = if fragment.scroll_port.is_some() && !fragment.fixed {
+            PAGE
+        } else {
+            spatial
         };
         if matches!(fragment.kind, FragmentKind::Box) {
             let faded = fragment.style.opacity < 1.0;
             // About the box's own origin, where the box is drawn — in the
             // coordinates of what it moves with, which is where its items are.
-            let moved = transform_of(fragment, 0.0);
+            let moved = transform_of(fragment);
             if faded || moved.is_some() {
                 if faded {
                     // The group's bound is the screen, and the screen does not
@@ -359,11 +361,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                 if covered.width <= 0.0 || covered.height <= 0.0 {
                     continue;
                 }
-                let moved = if fragment.fixed {
-                    covered
-                } else {
-                    Rect::new(covered.x, covered.y - inside, covered.width, covered.height)
-                };
+                let moved = covered;
                 list.push(DisplayItem::Fill {
                     style: Fill::NonZero,
                     transform: Affine::IDENTITY,
@@ -381,7 +379,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         }
         paint(
             fragment,
-            inside,
+            (clip_spatial, spatial),
             is_root_element,
             frame.background,
             &mut list,
@@ -401,18 +399,15 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         list.set_spatial(PAGE_THUMB);
         paint_scrollbar(&mut list, area, tree.content_height(), 0.0);
         spatials.thumb(area, tree.content_height());
-        // A port's bar is on the port, which scrolls with the page.
-        list.set_spatial(PAGE);
+        // A port's bar is on the port, which scrolls with the page, and its
+        // thumb is drawn where it sits with the port at its start and carried
+        // along the bar as the port scrolls.
         for port in &tree.scroll_ports {
             if !port.port.intersects(&scrolled) {
                 continue;
             }
-            paint_scrollbar(
-                &mut list,
-                port.port,
-                port.content_height,
-                port_offset(port.id),
-            );
+            list.set_spatial(spatials.port_thumb(port.id, port.port, port.content_height));
+            paint_scrollbar(&mut list, port.port, port.content_height, 0.0);
         }
     }
 
@@ -457,35 +452,26 @@ fn content_box_of(rect: Rect, style: &otlyra_css::ComputedStyle) -> Rect {
     )
 }
 
-/// One fragment's own drawing, in the coordinates of what it moves with. Children
-/// are visited by the caller's walk, so this never recurses — a fragment whose
-/// parent was culled may still be visible.
+/// One fragment's own drawing, where layout put it, tagged with what it moves
+/// with. Children are visited by the caller's walk, so this never recurses — a
+/// fragment whose parent was culled may still be visible.
 ///
-/// `inside` is how far the scroll port this fragment is in has been scrolled,
-/// which moves the fragment and not the edge the port cuts it off at: that edge
-/// belongs to the port's box, which moves with the page.
+/// `spatials` is what the edge an ancestor cuts it off at moves with, and what
+/// the fragment itself moves with: different for a fragment inside a scroll
+/// port, whose edge is the port's box and moves with the page.
 fn paint(
     fragment: &Fragment,
-    inside: f32,
+    (clip_spatial, spatial): (SpatialId, SpatialId),
     background_on_canvas: bool,
     background_picture: Option<BackgroundLookup<'_>>,
     list: &mut DisplayList,
 ) {
     let rect = fragment.rect;
-    // A fixed fragment is already in screen coordinates, and nothing scrolls it.
-    let scroll_y = if fragment.fixed { 0.0 } else { inside };
 
     // Whatever an ancestor cuts this fragment off at, as a layer around its own
     // drawing. One layer per fragment rather than one around a subtree, because the
     // walk is flat: a fragment carries the rectangle it is cut off at, so the two
     // cannot disagree about where the edge is.
-    // The clip belongs to the box rather than to what is inside it, so it does not
-    // move when the port is scrolled: only the contents do.
-    let clip_scroll = if fragment.scroll_port.is_some() {
-        0.0
-    } else {
-        scroll_y
-    };
     // Every fragment inside a clipping box is clipped, without asking whether it
     // needs to be. It was asked once — whether the fragment fits inside the
     // rectangle — and that was wrong the moment the box scrolled: a fragment that
@@ -493,20 +479,22 @@ fn paint(
     // answer was computed before the move.
     let clip = fragment.clip;
     if let Some(clip) = clip {
+        list.set_spatial(clip_spatial);
         list.push(DisplayItem::PushLayer {
             blend: otlyra_gfx::peniko::BlendMode::default(),
             alpha: 1.0,
             transform: Affine::IDENTITY,
             clip: KurboRect::new(
                 f64::from(clip.x),
-                f64::from(clip.y - clip_scroll),
+                f64::from(clip.y),
                 f64::from(clip.right()),
-                f64::from(clip.bottom() - clip_scroll),
+                f64::from(clip.bottom()),
             )
             .to_path(PATH_TOLERANCE),
         });
     }
-    let origin = Affine::translate((f64::from(rect.x), f64::from(rect.y - scroll_y)));
+    list.set_spatial(spatial);
+    let origin = Affine::translate((f64::from(rect.x), f64::from(rect.y)));
 
     // Hit testing is a display list too, emitted into the same sequence as the
     // painting it belongs to. Keeping them together is what stops a link from being
@@ -517,9 +505,9 @@ fn paint(
         list.push(DisplayItem::HitTest {
             rect: KurboRect::new(
                 f64::from(rect.x),
-                f64::from(rect.y - scroll_y),
+                f64::from(rect.y),
                 f64::from(rect.right()),
-                f64::from(rect.bottom() - scroll_y),
+                f64::from(rect.bottom()),
             ),
             transform: Affine::IDENTITY,
             id: HitTestId(otlyra_layout::box_id_to_u64(box_id)),
@@ -544,7 +532,7 @@ fn paint(
                     transform: Affine::IDENTITY,
                     brush: Brush::Solid(shadow.color),
                     blur: f64::from(shadow.blur),
-                    shape: shape_with_radii(cast, scroll_y, &fragment.style, shadow.spread),
+                    shape: shape_with_radii(cast, &fragment.style, shadow.spread),
                 });
             }
 
@@ -554,8 +542,7 @@ fn paint(
             // a themed control ignores the user-agent border it also computes.
             let themed = match &fragment.widget {
                 Some(control) => {
-                    let mut painted = rect;
-                    painted.y -= scroll_y;
+                    let painted = rect;
                     // A colour well fills its content box and nothing else, so
                     // the widget is given both edges: the frame it draws is the
                     // border box, and what it shows is inside the padding.
@@ -573,7 +560,7 @@ fn paint(
                     transform: Affine::IDENTITY,
                     brush: Brush::Solid(background),
                     brush_transform: None,
-                    shape: box_shape(rect, scroll_y, &fragment.style),
+                    shape: box_shape(rect, &fragment.style),
                 });
             }
 
@@ -581,24 +568,17 @@ fn paint(
             // paints them in the reverse of that, over the colour.
             if !themed && !background_on_canvas {
                 for layer in fragment.style.backgrounds.iter().rev() {
-                    paint_background_layer(
-                        list,
-                        layer,
-                        fragment,
-                        rect,
-                        scroll_y,
-                        background_picture,
-                    );
+                    paint_background_layer(list, layer, fragment, rect, background_picture);
                 }
             }
 
             // Over everything the box painted and under its border, which is where
             // CSS puts an inset shadow: it belongs to the hole rather than to the
             // box, so a background shows *through* it rather than over it.
-            paint_inset_shadows(list, fragment, rect, scroll_y);
+            paint_inset_shadows(list, fragment, rect);
 
             if !themed {
-                paint_borders(list, fragment, rect, scroll_y);
+                paint_borders(list, fragment, rect);
             }
         }
 
@@ -646,7 +626,7 @@ fn paint(
         FragmentKind::Image(_) => {}
 
         FragmentKind::Text(run) if !run.glyphs.is_empty() => {
-            text::paint_text_run(list, fragment, run, rect, origin, scroll_y);
+            text::paint_text_run(list, fragment, run, rect, origin);
         }
 
         FragmentKind::Text(_) => {}

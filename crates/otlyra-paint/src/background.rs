@@ -38,8 +38,8 @@ struct Tiling {
 
 impl Tiling {
     /// The brush's own transform: the tile's corner and the scale it is drawn at.
-    fn brush_transform(&self, scroll_y: f32) -> Affine {
-        Affine::translate((f64::from(self.tile.x), f64::from(self.tile.y - scroll_y)))
+    fn brush_transform(&self) -> Affine {
+        Affine::translate((f64::from(self.tile.x), f64::from(self.tile.y)))
             * Affine::scale_non_uniform(
                 f64::from(self.tile.width) / f64::from(self.own.0),
                 f64::from(self.tile.height) / f64::from(self.own.1),
@@ -163,16 +163,15 @@ pub(super) fn paint_background_layer(
     layer: &otlyra_css::BackgroundLayer,
     fragment: &Fragment,
     rect: otlyra_layout::Rect,
-    scroll_y: f32,
     background_picture: Option<BackgroundLookup<'_>>,
 ) {
     if let Some(gradient) = layer.gradient.as_ref() {
         list.push(DisplayItem::Fill {
             style: Fill::NonZero,
             transform: Affine::IDENTITY,
-            brush: Brush::Gradient(gradient_brush(gradient, rect, scroll_y)),
+            brush: Brush::Gradient(gradient_brush(gradient, rect)),
             brush_transform: None,
-            shape: box_shape(rect, scroll_y, &fragment.style),
+            shape: box_shape(rect, &fragment.style),
         });
         return;
     }
@@ -199,7 +198,7 @@ pub(super) fn paint_background_layer(
         blend: otlyra_gfx::peniko::BlendMode::default(),
         alpha: 1.0,
         transform: Affine::IDENTITY,
-        clip: box_shape(rect, scroll_y, &fragment.style),
+        clip: box_shape(rect, &fragment.style),
     });
     list.push(DisplayItem::Fill {
         style: Fill::NonZero,
@@ -208,12 +207,12 @@ pub(super) fn paint_background_layer(
             image: picture,
             sampler: tiling.sampler,
         }),
-        brush_transform: Some(tiling.brush_transform(scroll_y)),
+        brush_transform: Some(tiling.brush_transform()),
         shape: KurboRect::new(
             f64::from(tiling.covered.x),
-            f64::from(tiling.covered.y - scroll_y),
+            f64::from(tiling.covered.y),
             f64::from(tiling.covered.right()),
-            f64::from(tiling.covered.bottom() - scroll_y),
+            f64::from(tiling.covered.bottom()),
         )
         .to_path(PATH_TOLERANCE),
     });

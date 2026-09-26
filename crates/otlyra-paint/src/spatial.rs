@@ -9,6 +9,7 @@
 
 use otlyra_gfx::kurbo::Vec2;
 use otlyra_gfx::{DisplayList, SpatialId};
+use otlyra_layout::BoxId;
 use otlyra_layout::fragment::{Rect, Sticky};
 
 use crate::scrollbar::scrollbar_thumb;
@@ -29,12 +30,16 @@ pub struct PageList {
 }
 
 impl PageList {
-    /// The list as plain geometry at `scroll_y`: every offset applied, nothing
-    /// left to move.
+    /// The list as plain geometry at `scroll_y`, with every scroll port where it
+    /// started: every offset applied, nothing left to move.
     pub fn at(&self, scroll_y: f32) -> DisplayList {
-        self.list.with_offsets(&self.spatials.offsets(scroll_y))
+        self.list
+            .with_offsets(&self.spatials.offsets(scroll_y, &|_| 0.0))
     }
 }
+
+/// How far each scroll port has been scrolled, by its box.
+pub type PortScroll<'a> = &'a dyn Fn(BoxId) -> f32;
 
 /// One id's rule for how far it has moved.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -45,11 +50,19 @@ enum Rule {
     Page,
     /// The page's scrollbar thumb, drawn where it sits at no scroll.
     Thumb { area: Rect, content_height: f32 },
+    /// What is inside a scroll port: with the page, and with the port.
+    Port { port: BoxId },
+    /// A scroll port's thumb, drawn where it sits with the port at its start: with
+    /// the page, and along the port's bar as the port scrolls.
+    PortThumb {
+        port: BoxId,
+        area: Rect,
+        content_height: f32,
+    },
     /// A sticky box and everything in it: with the page, until its inset holds it,
-    /// until its container runs out. `inside` is how far the scroll port it is in
-    /// had been scrolled when the list was built, which is part of the scroll the
-    /// box answers to.
-    Sticky { sticky: Sticky, inside: f32 },
+    /// until its container runs out. The scroll it answers to is the page's and,
+    /// for one inside a scroll port, the port's.
+    Sticky { sticky: Sticky, port: Option<BoxId> },
 }
 
 /// The rules for every id a list uses, in id order.
@@ -78,8 +91,25 @@ impl Spatials {
 
     /// The id for a sticky box, made the first time it is asked for. Everything
     /// inside a sticky box carries the same constraint, so the whole box is one id.
-    pub(crate) fn sticky(&mut self, sticky: Sticky, inside: f32) -> SpatialId {
-        let rule = Rule::Sticky { sticky, inside };
+    pub(crate) fn sticky(&mut self, sticky: Sticky, port: Option<BoxId>) -> SpatialId {
+        self.id_for(Rule::Sticky { sticky, port })
+    }
+
+    /// The id for what is inside the scroll port `port`.
+    pub(crate) fn port(&mut self, port: BoxId) -> SpatialId {
+        self.id_for(Rule::Port { port })
+    }
+
+    /// The id for the thumb of the scroll port `port`'s bar, down `area`.
+    pub(crate) fn port_thumb(&mut self, port: BoxId, area: Rect, content_height: f32) -> SpatialId {
+        self.id_for(Rule::PortThumb {
+            port,
+            area,
+            content_height,
+        })
+    }
+
+    fn id_for(&mut self, rule: Rule) -> SpatialId {
         let index = match self.rules.iter().position(|known| *known == rule) {
             Some(index) => index,
             None => {
@@ -90,9 +120,15 @@ impl Spatials {
         SpatialId(index as u32)
     }
 
-    /// How far each id has moved with the page scrolled to `scroll_y`, in id
-    /// order: what [`otlyra_gfx::render_scrolled`] takes.
-    pub fn offsets(&self, scroll_y: f32) -> Vec<Vec2> {
+    /// How far each id has moved with the page scrolled to `scroll_y` and each
+    /// scroll port where `port` says, in id order: what
+    /// [`otlyra_gfx::render_scrolled`] takes.
+    pub fn offsets(&self, scroll_y: f32, port: PortScroll<'_>) -> Vec<Vec2> {
+        let thumb_travel = |area: Rect, content_height: f32, scroll: f32| {
+            let at =
+                |scroll| scrollbar_thumb(area, content_height, scroll).map_or(0.0, |thumb| thumb.y);
+            at(scroll) - at(0.0)
+        };
         self.rules
             .iter()
             .map(|rule| match *rule {
@@ -101,15 +137,23 @@ impl Spatials {
                 Rule::Thumb {
                     area,
                     content_height,
-                } => {
-                    let at = |scroll| {
-                        scrollbar_thumb(area, content_height, scroll).map_or(0.0, |thumb| thumb.y)
-                    };
-                    Vec2::new(0.0, f64::from(at(0.0) - at(scroll_y)))
-                }
-                Rule::Sticky { sticky, inside } => {
+                } => Vec2::new(
+                    0.0,
+                    -f64::from(thumb_travel(area, content_height, scroll_y)),
+                ),
+                Rule::Port { port: id } => Vec2::new(0.0, f64::from(scroll_y + port(id))),
+                Rule::PortThumb {
+                    port: id,
+                    area,
+                    content_height,
+                } => Vec2::new(
+                    0.0,
+                    f64::from(scroll_y - thumb_travel(area, content_height, port(id))),
+                ),
+                Rule::Sticky { sticky, port: id } => {
+                    let inside = id.map_or(0.0, port);
                     let shift = sticky_shift(sticky, scroll_y + inside, self.viewport_height);
-                    Vec2::new(0.0, f64::from(scroll_y - shift))
+                    Vec2::new(0.0, f64::from(scroll_y + inside - shift))
                 }
             })
             .collect()

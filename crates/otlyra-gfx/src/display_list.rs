@@ -427,6 +427,58 @@ impl DisplayList {
         found
     }
 
+    /// Where the items of each id paint with the list drawn at `offsets`, cut
+    /// to the clips they are drawn in, in the list's coordinates: what a moved
+    /// part actually covers on the screen.
+    ///
+    /// The clips matter: the contents of a panel that scrolls reach far past the
+    /// panel, and it is only the panel's own rectangle of them that anybody sees
+    /// — or that has to be drawn again when they move.
+    pub fn spatial_bounds_at(&self, offsets: &[kurbo::Vec2]) -> Vec<(SpatialId, usize, Rect)> {
+        use kurbo::Shape;
+        let mut found: Vec<(SpatialId, usize, Rect)> = Vec::new();
+        let mut clips: Vec<Option<Rect>> = Vec::new();
+        for (spatial, item) in self.items_with_spatial() {
+            let shift = self.shift(spatial, offsets);
+            match item {
+                DisplayItem::PushLayer {
+                    transform, clip, ..
+                } => {
+                    let own = (shift * *transform).transform_rect_bbox(clip.bounding_box());
+                    let inner = match clips.last().copied().flatten() {
+                        Some(outer) => outer.intersect(own),
+                        None => own,
+                    };
+                    clips.push(Some(inner));
+                    continue;
+                }
+                DisplayItem::PopLayer => {
+                    clips.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(bounds) = painted_bounds(item) else {
+                continue;
+            };
+            let mut bounds = shift.transform_rect_bbox(bounds);
+            if let Some(clip) = clips.last().copied().flatten() {
+                bounds = bounds.intersect(clip);
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    continue;
+                }
+            }
+            match found.iter_mut().find(|(id, _, _)| *id == spatial) {
+                Some((_, count, union)) => {
+                    *count += 1;
+                    *union = union.union(bounds);
+                }
+                None => found.push((spatial, 1, bounds)),
+            }
+        }
+        found
+    }
+
     /// Whether anything in the list moves with something other than the viewport.
     pub fn is_spatial(&self) -> bool {
         !self.spatial.is_empty()

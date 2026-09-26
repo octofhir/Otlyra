@@ -14,14 +14,13 @@ use otlyra_layout::fragment::Rect;
 pub(super) fn gradient_brush(
     gradient: &otlyra_css::Gradient,
     rect: Rect,
-    scroll_y: f32,
 ) -> otlyra_gfx::peniko::Gradient {
     use otlyra_gfx::kurbo::Point;
 
     let (width, height) = (f64::from(rect.width), f64::from(rect.height));
     let centre = Point::new(
         f64::from(rect.x) + width / 2.0,
-        f64::from(rect.y - scroll_y) + height / 2.0,
+        f64::from(rect.y) + height / 2.0,
     );
 
     // Up is negative y on the screen and zero degrees in CSS, and the angle turns

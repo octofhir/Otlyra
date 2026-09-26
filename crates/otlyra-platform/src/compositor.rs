@@ -340,8 +340,8 @@ fn plan_damage(prev: &[Retained], next: &[crate::SceneLayer], forced_full: bool)
 /// cheaper way there: the move is not a whole number of pixels, or so much has
 /// to be drawn afterwards that drawing everything is as cheap.
 ///
-/// The part of the list that reaches furthest is taken to be what scrolled — the
-/// page, which is the whole length of the document; its move is the move. Every other part that moved differently — or did not move
+/// The part of the list that covers the most, through its clips, is taken to be
+/// what scrolled — the page; its move is the move. Every other part that moved differently — or did not move
 /// at all, like a fixed header — is drawn again both where the move put its old
 /// pixels and where it is now.
 fn plan_scroll(
@@ -350,8 +350,14 @@ fn plan_scroll(
     after: &[otlyra_gfx::kurbo::Vec2],
     rect: LayerRect,
 ) -> Option<Scroll> {
-    let parts = list.spatial_bounds();
-    let bulk = parts
+    // Where each part is, cut to what the clips let through: the contents of a
+    // panel reach as far as there is content, but only the panel's rectangle of
+    // them is on the screen.
+    let (was_at, is_at) = (
+        list.spatial_bounds_at(before),
+        list.spatial_bounds_at(after),
+    );
+    let bulk = is_at
         .iter()
         .max_by(|(_, _, one), (_, _, other)| one.area().total_cmp(&other.area()))?
         .0;
@@ -390,15 +396,27 @@ fn plan_scroll(
         repaint.push(LayerRect { width: dx, ..rect });
     }
     // Whatever moved otherwise: where the move took its old pixels, and where it
-    // is now.
-    for (spatial, _, bounds) in &parts {
+    // is now — each cut to the clips it is drawn in, so that a panel's contents
+    // are the panel's rectangle and not the length of what scrolls in it.
+    // Every part that is on the screen now or was — one scrolled wholly out of
+    // sight still left its pixels behind.
+    let mut spatials: Vec<otlyra_gfx::SpatialId> =
+        was_at.iter().chain(&is_at).map(|(id, _, _)| *id).collect();
+    spatials.sort_unstable();
+    spatials.dedup();
+    for spatial in &spatials {
         let own = moved(*spatial);
         if *spatial == bulk || (own - by).hypot() < 1e-3 {
             continue;
         }
-        let was = *bounds + list.shift(*spatial, before).translation() + by;
-        let is = *bounds + list.shift(*spatial, after).translation();
-        for area in [was, is] {
+        let at = |bounds: &[(otlyra_gfx::SpatialId, usize, otlyra_gfx::kurbo::Rect)]| {
+            bounds
+                .iter()
+                .find(|(id, _, _)| id == spatial)
+                .map(|(_, _, rect)| *rect)
+        };
+        let areas = [at(&was_at).map(|was| was + by), at(&is_at)];
+        for area in areas.into_iter().flatten() {
             let covered = clamp(pixel_rect(area), rect);
             if covered.width > 0 && covered.height > 0 {
                 repaint.push(covered);
@@ -749,6 +767,81 @@ mod tests {
         // rectangle around them would be most of the page.
         let apart = merged(vec![rect(0, 0, 1, 180), rect(0, 60, 100, 20)]);
         assert_eq!(apart.len(), 2);
+    }
+
+    /// A page with a panel that scrolls: the panel's box and its edge move
+    /// with the page, and forty bands inside it move with the panel.
+    fn page_with_a_panel() -> std::sync::Arc<otlyra_gfx::DisplayList> {
+        use otlyra_gfx::kurbo::Shape;
+        let fill = |x: f64, y: f64, height: f64, shade: u8| otlyra_gfx::DisplayItem::Fill {
+            style: otlyra_gfx::peniko::Fill::NonZero,
+            transform: otlyra_gfx::kurbo::Affine::IDENTITY,
+            brush: otlyra_gfx::peniko::Brush::Solid(otlyra_gfx::peniko::Color::from_rgb8(
+                shade,
+                128,
+                255 - shade,
+            )),
+            brush_transform: None,
+            shape: otlyra_gfx::kurbo::Rect::new(x, y, x + 40.0, y + height).to_path(0.1),
+        };
+        let mut list = otlyra_gfx::DisplayList::new();
+        list.set_spatial(otlyra_gfx::SpatialId(1));
+        list.push(fill(0.0, 0.0, 400.0, 10));
+        list.push(otlyra_gfx::DisplayItem::PushLayer {
+            blend: otlyra_gfx::peniko::BlendMode::default(),
+            alpha: 1.0,
+            transform: otlyra_gfx::kurbo::Affine::IDENTITY,
+            clip: otlyra_gfx::kurbo::Rect::new(50.0, 20.0, 90.0, 80.0).to_path(0.1),
+        });
+        list.set_spatial(otlyra_gfx::SpatialId(2));
+        for band in 0..40_u8 {
+            list.push(fill(50.0, 20.0 + f64::from(band) * 10.0, 10.0, band * 6));
+        }
+        list.set_spatial(otlyra_gfx::SpatialId(1));
+        list.push(otlyra_gfx::DisplayItem::PopLayer);
+        std::sync::Arc::new(list)
+    }
+
+    #[test]
+    fn a_panel_that_scrolls_draws_its_own_rectangle_and_nothing_else() {
+        let list = page_with_a_panel();
+        let area = rect(0, 0, 100, 200);
+        let at = |panel: f64| {
+            vec![
+                otlyra_gfx::kurbo::Vec2::ZERO,
+                otlyra_gfx::kurbo::Vec2::ZERO,
+                otlyra_gfx::kurbo::Vec2::new(0.0, panel),
+            ]
+        };
+        let scene = |panel: f64, epoch: u64| crate::Scene {
+            layers: vec![crate::SceneLayer {
+                offsets: at(panel),
+                list: std::sync::Arc::clone(&list),
+                ..layer(0, epoch, area)
+            }],
+        };
+        let viewport = Viewport::new(100, 200, 1.0);
+        let mut moved = SceneCompositor::new();
+        moved.rasterize(&scene(0.0, 1), viewport).expect("a frame");
+        moved.commit(&scene(0.0, 1));
+
+        let frame = scene(30.0, 2);
+        let composited = moved.rasterize(&frame, viewport).expect("a frame");
+        let Damage::Scrolled(scroll) = &composited.damage else {
+            panic!("a panel's scroll is not a redraw of the page");
+        };
+        assert_eq!(scroll.by, (0, 0), "the page did not move");
+        let drawn: u32 = scroll
+            .repaint
+            .iter()
+            .map(|rect| rect.width * rect.height)
+            .sum();
+        assert!(drawn <= 44 * 64, "drew {drawn} pixels for a 40 by 60 panel");
+        moved.commit(&frame);
+
+        let mut whole = SceneCompositor::new();
+        whole.rasterize(&frame, viewport).expect("a frame");
+        assert!(moved.read_rgba8().expect("pixels") == whole.read_rgba8().expect("pixels"));
     }
 
     #[test]

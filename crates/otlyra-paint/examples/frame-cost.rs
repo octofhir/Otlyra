@@ -147,7 +147,11 @@ fn main() {
     for _ in 0..FRAMES {
         use otlyra_gfx::PaintTarget as _;
         painter.reset();
-        otlyra_gfx::render_scrolled(&page.list, &mut painter, &page.spatials.offsets(400.0));
+        otlyra_gfx::render_scrolled(
+            &page.list,
+            &mut painter,
+            &page.spatials.offsets(400.0, &|_| 0.0),
+        );
     }
     println!(
         "scroll frame               steady {:>9.2?}",

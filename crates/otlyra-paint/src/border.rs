@@ -24,11 +24,10 @@ pub(super) fn paint_borders(
     list: &mut DisplayList,
     fragment: &Fragment,
     rect: otlyra_layout::Rect,
-    scroll_y: f32,
 ) {
     let border = fragment.style.border;
-    let (left, top) = (f64::from(rect.x), f64::from(rect.y - scroll_y));
-    let (right, bottom) = (f64::from(rect.right()), f64::from(rect.bottom() - scroll_y));
+    let (left, top) = (f64::from(rect.x), f64::from(rect.y));
+    let (right, bottom) = (f64::from(rect.right()), f64::from(rect.bottom()));
 
     // A rounded box's border follows its corners, which four rectangles cannot do.
     // One stroke can, as long as every side is the same — and a border that is
@@ -63,7 +62,7 @@ pub(super) fn paint_borders(
             // corner comes out half a border too round and the inner one half a
             // border too tight. A square corner stays square, which is what keeps
             // one rounded corner from rounding the other three.
-            shape: shape_with_radii(inset, scroll_y, &fragment.style, -side.width / 2.0),
+            shape: shape_with_radii(inset, &fragment.style, -side.width / 2.0),
         });
         return;
     }

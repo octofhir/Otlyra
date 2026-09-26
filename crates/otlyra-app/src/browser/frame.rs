@@ -332,7 +332,7 @@ impl Browser {
             1u8.hash(&mut hasher);
             page.builds().hash(&mut hasher);
             // The same list scrolled is a different picture.
-            page.scroll().to_bits().hash(&mut hasher);
+            page.scrolls().hash(&mut hasher);
         } else {
             2u8.hash(&mut hasher);
             tab.error.hash(&mut hasher);

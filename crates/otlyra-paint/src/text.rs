@@ -76,7 +76,6 @@ pub(crate) fn paint_text_run(
     run: &ShapedRun,
     rect: Rect,
     origin: Affine,
-    scroll_y: f32,
 ) {
     let glyphs = ink(run);
     // The text's own shadows, behind it: the same glyphs, moved and softened.
@@ -101,7 +100,7 @@ pub(crate) fn paint_text_run(
     let Some(first) = run.glyphs.first() else {
         return;
     };
-    let baseline = rect.y - scroll_y + first.y;
+    let baseline = rect.y + first.y;
     let thickness = (run.font_size / 10.0).max(1.0);
     let span = (rect.x, rect.x + run.advance);
     let decorate = |list: &mut DisplayList, line: Line| {

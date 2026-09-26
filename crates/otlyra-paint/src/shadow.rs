@@ -26,7 +26,6 @@ pub(super) fn paint_inset_shadows(
     list: &mut DisplayList,
     fragment: &Fragment,
     rect: otlyra_layout::Rect,
-    scroll_y: f32,
 ) {
     let inset: Vec<&otlyra_css::Shadow> = fragment
         .style
@@ -55,7 +54,7 @@ pub(super) fn paint_inset_shadows(
         blend: otlyra_gfx::peniko::BlendMode::default(),
         alpha: 1.0,
         transform: Affine::IDENTITY,
-        clip: box_shape(hole, scroll_y, &fragment.style),
+        clip: box_shape(hole, &fragment.style),
     });
 
     for shadow in inset {
@@ -72,14 +71,14 @@ pub(super) fn paint_inset_shadows(
 
         let mut shape = KurboRect::new(
             f64::from(hole.x) - reach,
-            f64::from(hole.y - scroll_y) - reach,
+            f64::from(hole.y) - reach,
             f64::from(hole.right()) + reach,
-            f64::from(hole.bottom() - scroll_y) + reach,
+            f64::from(hole.bottom()) + reach,
         )
         .to_path(PATH_TOLERANCE);
         // Wound the other way, so the fill leaves it empty rather than covering it.
         shape.extend(
-            shape_with_radii(lit, scroll_y, &fragment.style, -shadow.spread)
+            shape_with_radii(lit, &fragment.style, -shadow.spread)
                 .reverse_subpaths()
                 .iter(),
         );
