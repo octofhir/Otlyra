@@ -312,7 +312,7 @@ impl ElementRef {
             document
                 .get(id)
                 .and_then(|node| node.element())
-                .is_some_and(|element| element.name.local.as_ref() == "form")
+                .is_some_and(|element| &*element.name.local == "form")
         })?;
         if !is_form {
             return Err(JsError::Type("submit() is a form's method".to_owned()));
@@ -669,7 +669,7 @@ fn is_element(document: &Document, id: NodeId, name: &str) -> bool {
     document
         .get(id)
         .and_then(|node| node.element())
-        .is_some_and(|element| element.name.local.as_ref() == name)
+        .is_some_and(|element| &*element.name.local == name)
 }
 
 /// Whether the node is still attached to the document's root.

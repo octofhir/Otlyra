@@ -66,7 +66,7 @@ pub(crate) fn presentational_hints(
 ) -> Option<PropertyDeclarationBlock> {
     let element = document.get(node)?.element()?;
     let mut hints = Hints::new(element, base);
-    match (&element.name.ns, element.name.local.as_ref()) {
+    match (&element.name.ns, &*element.name.local) {
         (&ns!(html), "body") => body_hints(&mut hints),
         (&ns!(html), "div") => hints.align(ALIGN_DESCENDANTS),
         (&ns!(html), "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") => hints.align(TEXT_ALIGN),
@@ -400,15 +400,15 @@ fn nowrap_mode(cell: &ElementData, document: &Document) -> text_wrap_mode::Speci
 /// section's. A cell anywhere else has no table to take them from.
 fn owning_table(document: &Document, cell: NodeId) -> Option<&ElementData> {
     let (row, element) = html_parent(document, cell)?;
-    if element.name.local.as_ref() != "tr" {
+    if &*element.name.local != "tr" {
         return None;
     }
     let (above, element) = html_parent(document, row)?;
-    match element.name.local.as_ref() {
+    match &*element.name.local {
         "table" => Some(element),
         "thead" | "tbody" | "tfoot" => html_parent(document, above)
             .map(|(_, table)| table)
-            .filter(|table| table.name.local.as_ref() == "table"),
+            .filter(|table| &*table.name.local == "table"),
         _ => None,
     }
 }

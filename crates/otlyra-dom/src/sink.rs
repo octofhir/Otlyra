@@ -121,7 +121,7 @@ impl DomSink {
             let node = document.get(id)?;
             if node
                 .element()
-                .is_some_and(|element| element.name.local.as_ref() == "select")
+                .is_some_and(|element| &*element.name.local == "select")
             {
                 break;
             }
@@ -136,7 +136,7 @@ impl DomSink {
             };
             if node
                 .element()
-                .is_some_and(|element| element.name.local.as_ref() == "selectedcontent")
+                .is_some_and(|element| &*element.name.local == "selectedcontent")
             {
                 return Some(id);
             }

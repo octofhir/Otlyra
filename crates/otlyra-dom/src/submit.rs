@@ -431,7 +431,7 @@ fn in_datalist(document: &Document, id: NodeId) -> bool {
         if document
             .get(current)
             .and_then(|node| node.element())
-            .is_some_and(|element| element.name.local.as_ref() == "datalist")
+            .is_some_and(|element| &*element.name.local == "datalist")
         {
             return true;
         }

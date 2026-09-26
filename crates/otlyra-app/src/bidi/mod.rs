@@ -2367,13 +2367,13 @@ fn node_value(document: &otlyra_dom::Document, node: otlyra_dom::NodeId) -> Valu
                 .iter()
                 .map(|attr| {
                     (
-                        attr.name.local.as_ref().to_owned(),
+                        attr.name.local.to_string(),
                         Value::String(attr.value.to_string()),
                     )
                 })
                 .collect();
             value["nodeType"] = json!(1);
-            value["localName"] = json!(element.name.local.as_ref());
+            value["localName"] = json!(&*element.name.local);
             value["namespaceURI"] = json!(element.name.ns.as_ref());
             value["attributes"] = Value::Object(attributes);
         }

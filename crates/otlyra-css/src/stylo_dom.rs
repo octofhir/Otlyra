@@ -132,7 +132,7 @@ fn pragma_set_default_language(document: &Document) -> Option<Box<str>> {
             continue;
         };
         let is_pragma = element.name.ns == html5ever::ns!(html)
-            && element.name.local.as_ref() == "meta"
+            && &*element.name.local == "meta"
             && element
                 .attr("http-equiv")
                 .is_some_and(|state| state.eq_ignore_ascii_case("content-language"));
@@ -307,16 +307,6 @@ impl std::hash::Hash for NodeRef<'_> {
     }
 }
 
-impl style::dom::AttributeProvider for NodeRef<'_> {
-    fn get_attr(&self, name: &LocalNameIdent, namespace: &NamespaceIdent) -> Option<String> {
-        self.element()?
-            .attrs
-            .iter()
-            .find(|attr| attr.name.local == name.0 && attr.name.ns == namespace.0)
-            .map(|attr| attr.value.to_string())
-    }
-}
-
 impl SelectorsElement for NodeRef<'_> {
     type Impl = StyleSelectorImpl;
 
@@ -468,8 +458,7 @@ impl SelectorsElement for NodeRef<'_> {
 
     fn is_link(&self) -> bool {
         self.element().is_some_and(|element| {
-            matches!(element.name.local.as_ref(), "a" | "area" | "link")
-                && element.attr("href").is_some()
+            matches!(&*element.name.local, "a" | "area" | "link") && element.attr("href").is_some()
         })
     }
 
@@ -530,7 +519,7 @@ impl SelectorsElement for NodeRef<'_> {
         let mut hash = |value: &str| {
             filter.insert_hash(fxhash(value));
         };
-        hash(element.name.local.as_ref());
+        hash(&element.name.local);
         if let Some(id) = element.id() {
             hash(id);
         }
@@ -1261,7 +1250,7 @@ impl StyleData {
                         attr_names: element
                             .attrs
                             .iter()
-                            .map(|attr| style::LocalName::from(attr.name.local.as_ref()))
+                            .map(|attr| style::LocalName::from(&*attr.name.local))
                             .collect(),
                         style_attribute,
                         hints: crate::hints::presentational_hints(document, id, base)
@@ -1479,6 +1468,15 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
             .map(|id| self.at(id))
             .collect();
         style::dom::LayoutIterator(children.into_iter())
+    }
+
+    /// An attribute's value, for `attr()`.
+    fn get_attr(&self, name: &style::LocalName, namespace: &style::Namespace) -> Option<String> {
+        self.element()?
+            .attrs
+            .iter()
+            .find(|attr| attr.name.local == name.0 && attr.name.ns == namespace.0)
+            .map(|attr| attr.value.to_string())
     }
 
     fn is_html_element(&self) -> bool {
@@ -1717,11 +1715,11 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
 
     fn is_html_document_body_element(&self) -> bool {
         self.element()
-            .is_some_and(|element| element.name.local.as_ref() == "body")
+            .is_some_and(|element| &*element.name.local == "body")
             && self
                 .parent_element_id()
                 .and_then(|id| self.at(id).element())
-                .is_some_and(|parent| parent.name.local.as_ref() == "html")
+                .is_some_and(|parent| &*parent.name.local == "html")
     }
 
     /// `width`, `bgcolor`, `border` and the rest of the presentational attributes.

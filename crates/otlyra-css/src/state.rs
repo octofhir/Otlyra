@@ -139,18 +139,14 @@ impl<'a> States<'a> {
 
         // A link is unvisited and stays unvisited: there is no history to ask, and
         // guessing would leak one if there were.
-        if matches!(element.name.local.as_ref(), "a" | "area" | "link")
-            && element.attr("href").is_some()
-        {
+        if matches!(&*element.name.local, "a" | "area" | "link") && element.attr("href").is_some() {
             state |= ElementState::UNVISITED;
         }
 
         // `<details>` and `<dialog>` carry their openness in an attribute, which
         // makes `:open` the one element-display-state pseudo-class we can answer
         // without anything opening it.
-        if matches!(element.name.local.as_ref(), "details" | "dialog")
-            && element.attr("open").is_some()
-        {
+        if matches!(&*element.name.local, "details" | "dialog") && element.attr("open").is_some() {
             state |= ElementState::OPEN;
         }
         if self.open == Some(id) {
@@ -167,7 +163,7 @@ impl<'a> States<'a> {
         // A form and a fieldset are valid when everything they hold is: what
         // `:invalid` on a `<form>` means, and the only way a page can style the
         // whole of a form against the state of its parts.
-        if matches!(element.name.local.as_ref(), "form" | "fieldset") {
+        if matches!(&*element.name.local, "form" | "fieldset") {
             let holds_invalid = descendants_of(document, id).into_iter().any(|node| {
                 form::is_validated(document, node)
                     && form::validity(document, self.form, node).is_invalid()

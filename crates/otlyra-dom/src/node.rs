@@ -97,7 +97,7 @@ impl ElementData {
     pub fn attr_in(&self, namespace: &html5ever::Namespace, name: &str) -> Option<&str> {
         self.attrs
             .iter()
-            .find(|attr| attr.name.ns == *namespace && attr.name.local.as_ref() == name)
+            .find(|attr| attr.name.ns == *namespace && &*attr.name.local == name)
             .map(|attr| attr.value.as_ref())
     }
 
@@ -121,7 +121,7 @@ impl ElementData {
     /// spelling every drawing program still exports. An `<a>` without one is a
     /// place in the page rather than a way out of it, and is not a link.
     pub fn link_href(&self) -> Option<&str> {
-        match (&self.name.ns, self.name.local.as_ref()) {
+        match (&self.name.ns, &*self.name.local) {
             (&html5ever::ns!(html), "a" | "area") => self.attr("href"),
             (&html5ever::ns!(svg), "a") => self
                 .attr("href")

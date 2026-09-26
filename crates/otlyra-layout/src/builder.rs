@@ -128,7 +128,7 @@ fn picture_source(
             density: 1.0,
         })
     };
-    match (&element.name.ns, element.name.local.as_ref()) {
+    match (&element.name.ns, &*element.name.local) {
         (&ns!(html), "img") => crate::srcset::chosen(document, id, viewport)
             .filter(|chosen| !chosen.url.is_empty())
             .map(|chosen| ImageSource {
@@ -561,7 +561,7 @@ impl Builder<'_> {
     fn marker_for(&self, item: NodeId, style: &ComputedStyle) -> Option<crate::box_tree::Marker> {
         let parent = self.document.get(item)?.parent?;
         let list = self.document.get(parent)?.element()?;
-        if !matches!(list.name.local.as_ref(), "ol" | "ul" | "menu") {
+        if !matches!(&*list.name.local, "ol" | "ul" | "menu") {
             return None;
         }
 
@@ -575,7 +575,7 @@ impl Builder<'_> {
                     self.document
                         .get(child)
                         .and_then(|node| node.element())
-                        .is_some_and(|element| element.name.local.as_ref() == "li")
+                        .is_some_and(|element| &*element.name.local == "li")
                 })
                 .position(|child| child == item)?
         } else {
@@ -919,7 +919,7 @@ impl Builder<'_> {
     /// shown here: a frame, an `embed` and a video are drawn as the boxes a
     /// reference lays them out as, with nothing in them but a poster.
     fn replaced_content(&self, element: &ElementData, node: NodeId) -> Option<Replaced> {
-        match (&element.name.ns, element.name.local.as_ref()) {
+        match (&element.name.ns, &*element.name.local) {
             // A picture, once it has arrived. Until then the element is its
             // alternative text, which is the whole point of having one
             // (§15.4.2).
@@ -1006,7 +1006,7 @@ impl Builder<'_> {
             self.document
                 .get(node)
                 .and_then(|node| node.element())
-                .is_some_and(|element| element.name.local.as_ref() == name)
+                .is_some_and(|element| &*element.name.local == name)
         };
 
         let mut columns = Vec::new();
@@ -1068,7 +1068,7 @@ impl Builder<'_> {
 
         match &dom.data {
             NodeData::Element(element) => {
-                let name = element.name.local.as_ref();
+                let name = &*element.name.local;
                 let Some(style) = self.style_for(node) else {
                     return;
                 };
@@ -1252,7 +1252,7 @@ impl Builder<'_> {
 fn has_renderable_children(element: &ElementData) -> bool {
     element.name.ns != ns!(html)
         || !matches!(
-            element.name.local.as_ref(),
+            &*element.name.local,
             "script" | "style" | "template" | "noscript" | "iframe" | "video" | "audio" | "canvas"
         )
 }

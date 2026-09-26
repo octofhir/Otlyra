@@ -169,7 +169,7 @@ impl PageScene {
                 self.document
                     .get(candidate)
                     .and_then(|inner| inner.element())
-                    .is_some_and(|element| element.name.local.as_ref() == "label")
+                    .is_some_and(|element| &*element.name.local == "label")
             })
             .find(|&label| otlyra_dom::form::labeled_control(&self.document, label) == Some(node))
             .map(|label| self.text_under(label))

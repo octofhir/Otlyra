@@ -182,7 +182,7 @@ impl Control {
         if element.name.ns != html5ever::ns!(html) {
             return None;
         }
-        Some(match element.name.local.as_ref() {
+        Some(match &*element.name.local {
             "input" => Self::Input(
                 element
                     .attr("type")
@@ -469,7 +469,7 @@ pub fn default_value(document: &Document, id: NodeId) -> &str {
     let Some(element) = document.get(id).and_then(|node| node.element()) else {
         return "";
     };
-    if element.name.local.as_ref() == "textarea" {
+    if &*element.name.local == "textarea" {
         // The child text of a `<textarea>` is its value, and it is the only
         // control whose value is written as content rather than as an attribute.
         return document
@@ -924,7 +924,7 @@ fn is_element(document: &Document, id: NodeId, name: &str) -> bool {
         .get(id)
         .and_then(|node| node.element())
         .is_some_and(|element| {
-            element.name.ns == html5ever::ns!(html) && element.name.local.as_ref() == name
+            element.name.ns == html5ever::ns!(html) && &*element.name.local == name
         })
 }
 

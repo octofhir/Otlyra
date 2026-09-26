@@ -1069,7 +1069,7 @@ impl<'a> Engine<'a> {
                             .iter()
                             .map(|attribute| Item::Attribute {
                                 owner: node,
-                                name: attribute.name.local.as_ref().to_owned(),
+                                name: attribute.name.local.to_string(),
                                 value: attribute.value.to_string(),
                             })
                             .collect()
@@ -1224,7 +1224,7 @@ impl<'a> Engine<'a> {
                     (Test::Any, NodeData::Element(_)) => true,
                     (Test::Name(wanted), NodeData::Element(element)) => {
                         let _ = axis;
-                        element.name.local.as_ref().eq_ignore_ascii_case(wanted)
+                        element.name.local.eq_str_ignore_ascii_case(wanted)
                     }
                     _ => false,
                 }
@@ -1451,7 +1451,7 @@ impl<'a> Engine<'a> {
                         .document
                         .get(node)
                         .and_then(|data| data.element())
-                        .map(|element| element.name.local.as_ref().to_owned())
+                        .map(|element| element.name.local.to_string())
                         .unwrap_or_default(),
                     None => String::new(),
                 }))

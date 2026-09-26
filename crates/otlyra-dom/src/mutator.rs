@@ -221,7 +221,7 @@ impl<'a> DocumentMutator<'a> {
             let at = element
                 .attrs
                 .iter()
-                .position(|attr| attr.name.local.as_ref() == name);
+                .position(|attr| &*attr.name.local == name);
             match at {
                 Some(at) => {
                     element.attrs[at].value = value.into();
@@ -256,9 +256,7 @@ impl<'a> DocumentMutator<'a> {
     pub fn remove_attr(&mut self, target: NodeId, name: &str) -> bool {
         if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
             let before = element.attrs.len();
-            element
-                .attrs
-                .retain(|attr| attr.name.local.as_ref() != name);
+            element.attrs.retain(|attr| &*attr.name.local != name);
             return element.attrs.len() != before;
         }
         false

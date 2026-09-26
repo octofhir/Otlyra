@@ -103,7 +103,7 @@ resvg = { version = "=0.47.0", default-features = false, features = [
 ] }
 
 # Font enumeration, CSS family matching, shaping and line breaking.
-parley = "=0.11.0"
+parley = "=0.11.1"
 
 # Reading a font's own tables. Already in the tree as parley's own dependency and
 # pinned to the same version, so this costs no package and cannot pull a second
@@ -204,12 +204,12 @@ tendril = { version = "=0.5.1", features = ["encoding_rs"] }
 #
 # Pinned exactly and upgraded deliberately: stylo has no API stability and ships
 # semver-breaking releases roughly monthly.
-stylo = "=0.19.0"
-stylo_traits = "=0.19.0"
-stylo_atoms = "=0.19.0"
-stylo_dom = "=0.19.0"
-stylo_static_prefs = "=0.19.0"
-selectors = "=0.39.0"
+stylo = "=0.21.0"
+stylo_traits = "=0.21.0"
+stylo_atoms = "=0.21.0"
+stylo_dom = "=0.21.0"
+stylo_static_prefs = "=0.21.0"
+selectors = "=0.40.0"
 cssparser = "=0.37.0"
 servo_arc = "=0.4.3"
 # The interior mutability the style engine's element data is stored behind. Its

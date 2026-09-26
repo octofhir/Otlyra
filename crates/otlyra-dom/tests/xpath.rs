@@ -36,7 +36,7 @@ fn find(expression: &str) -> Vec<String> {
         .map(|node| {
             let data = document.node(node);
             match &data.data {
-                NodeData::Element(element) => element.name.local.as_ref().to_owned(),
+                NodeData::Element(element) => element.name.local.to_string(),
                 NodeData::Text(text) => format!("{:?}", text.trim()),
                 other => format!("{other:?}"),
             }

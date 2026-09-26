@@ -90,7 +90,7 @@ fn sources_before(document: &Document, img: NodeId) -> Vec<NodeId> {
     let is_picture = document
         .get(parent)
         .and_then(|node| node.element())
-        .is_some_and(|element| element.name.local.as_ref() == "picture");
+        .is_some_and(|element| &*element.name.local == "picture");
     if !is_picture {
         return Vec::new();
     }
@@ -102,7 +102,7 @@ fn sources_before(document: &Document, img: NodeId) -> Vec<NodeId> {
             document
                 .get(child)
                 .and_then(|node| node.element())
-                .is_some_and(|element| element.name.local.as_ref() == "source")
+                .is_some_and(|element| &*element.name.local == "source")
         })
         .collect()
 }
@@ -449,7 +449,7 @@ mod tests {
             if document
                 .get(id)
                 .and_then(|node| node.element())
-                .is_some_and(|element| element.name.local.as_ref() == "img")
+                .is_some_and(|element| &*element.name.local == "img")
             {
                 return chosen(&document, id, viewport);
             }

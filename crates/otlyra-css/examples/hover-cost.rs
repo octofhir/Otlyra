@@ -81,7 +81,7 @@ fn paragraphs(document: &Document) -> Vec<NodeId> {
         if document
             .get(id)
             .and_then(|node| node.element())
-            .is_some_and(|element| element.name.local.as_ref() == "p")
+            .is_some_and(|element| &*element.name.local == "p")
         {
             found.push(id);
         }

@@ -1817,7 +1817,7 @@ fn choose(browser: &mut Browser, tag: &str) {
         let matches = document.get(node).is_some_and(|node| {
             matches!(&node.data,
                 otlyra_dom::NodeData::Element(element)
-                    if element.name.local.as_ref() == tag)
+                    if &*element.name.local == tag)
         });
         if matches {
             browser.inspector.selected = Some(node);

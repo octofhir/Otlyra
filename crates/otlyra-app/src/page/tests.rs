@@ -31,7 +31,7 @@ fn an_edit_restyles_the_page_and_the_next_frame_shows_it() {
         while let Some(node) = stack.pop() {
             stack.extend(document.children(node));
             if matches!(document.get(node).map(|n| &n.data),
-                Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                Some(NodeData::Element(element)) if &*element.name.local == "p")
             {
                 found = Some(node);
             }

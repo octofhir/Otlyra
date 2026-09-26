@@ -122,7 +122,7 @@ impl Document {
         while let Some(id) = stack.pop() {
             if let Some(element) = self.get(id).and_then(Node::element)
                 && element.name.ns == ns!(html)
-                && element.name.local.as_ref() == "base"
+                && &*element.name.local == "base"
                 && let Some(href) = element.attr("href")
             {
                 return Some(href);

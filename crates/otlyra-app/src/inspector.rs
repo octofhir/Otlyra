@@ -1334,7 +1334,7 @@ impl Inspector {
             ),
             NodeData::Text(text) => (format!("\"{}\"", cut(text.trim(), TEXT_LIMIT)), theme.ink),
             NodeData::Element(element) => {
-                let tag = element.name.local.as_ref();
+                let tag = &*element.name.local;
                 let mut label = format!("<{tag}");
                 if let Some(id) = element.id() {
                     label.push_str(&format!(" #{id}"));
@@ -1397,7 +1397,7 @@ impl Inspector {
                     element
                         .attrs
                         .iter()
-                        .map(|attr| (attr.name.local.as_ref().to_owned(), attr.value.to_string()))
+                        .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
                         .collect(),
                 ),
                 _ => None,
@@ -1930,13 +1930,13 @@ impl Inspector {
         match &selected.data {
             NodeData::Element(element) => {
                 rows.push(Box::new(Mono::new(
-                    format!("<{}>", element.name.local.as_ref()),
+                    format!("<{}>", &*element.name.local),
                     theme.code_tag,
                 )));
                 let attributes: Vec<Vec<String>> = element
                     .attrs
                     .iter()
-                    .map(|attr| vec![attr.name.local.as_ref().to_owned(), attr.value.to_string()])
+                    .map(|attr| vec![attr.name.local.to_string(), attr.value.to_string()])
                     .collect();
                 if attributes.is_empty() {
                     rows.push(Box::new(Label::new(
@@ -3758,7 +3758,7 @@ mod tests {
             while let Some(node) = stack.pop() {
                 stack.extend(document.children(node));
                 if matches!(document.get(node).map(|n| &n.data),
-                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                    Some(NodeData::Element(element)) if &*element.name.local == "p")
                 {
                     found = Some(node);
                 }
@@ -3826,7 +3826,7 @@ mod tests {
             while let Some(node) = stack.pop() {
                 stack.extend(document.children(node));
                 if matches!(document.get(node).map(|n| &n.data),
-                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                    Some(NodeData::Element(element)) if &*element.name.local == "p")
                 {
                     found = Some(node);
                 }
@@ -4185,7 +4185,7 @@ mod tests {
             .into_iter()
             .find(|node| {
                 matches!(document.get(*node).map(|n| &n.data),
-                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                    Some(NodeData::Element(element)) if &*element.name.local == "p")
             })
             .expect("the document has a p");
         inspector.reveal(&document, paragraph);
@@ -4332,7 +4332,7 @@ mod tests {
             .into_iter()
             .find(|node| {
                 matches!(document.get(*node).map(|n| &n.data),
-                    Some(NodeData::Element(element)) if element.name.local.as_ref() == "p")
+                    Some(NodeData::Element(element)) if &*element.name.local == "p")
             })
             .expect("the document has a p");
 

@@ -1066,7 +1066,7 @@ fn document_base_url(document: &Document, url: &url::Url) -> url::Url {
 pub fn title_of(document: &Document) -> Option<String> {
     fn find(document: &Document, id: NodeId) -> Option<String> {
         if let Some(element) = document.get(id).and_then(|node| node.element())
-            && element.name.local.as_ref() == "title"
+            && &*element.name.local == "title"
         {
             let mut text = String::new();
             for child in document.children(id) {

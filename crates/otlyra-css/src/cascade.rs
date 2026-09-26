@@ -447,7 +447,8 @@ impl Styler {
     /// `false` means the same rules apply to the same elements with the same
     /// values, so the styles already computed still hold and the caller can go
     /// straight to layout. That is the common case: a window resized on a page
-    /// with no media queries and no viewport units restyles nothing.
+    /// with no media queries and no viewport units restyles nothing. A new
+    /// colour scheme always restyles.
     ///
     /// Before the first cascade the answer is always `true`, because there is
     /// nothing yet for a resize to preserve.
@@ -459,6 +460,7 @@ impl Styler {
         // Asked before the device is replaced: the flag is set while cascading,
         // on the device that did the cascading.
         let used_viewport_units = self.stylist.device().used_viewport_size();
+        let scheme_changed = self.viewport.color_scheme != viewport.color_scheme;
         self.viewport = viewport;
 
         let device = device_for(viewport, self.quirks_mode);
@@ -475,7 +477,10 @@ impl Styler {
             self.stylist.force_stylesheet_origins_dirty(changed);
             return true;
         }
-        used_viewport_units
+        // A new scheme changes what `light-dark()` and the system colours
+        // compute to, and the engine keeps no note of whether anything read
+        // them, so every element is styled again.
+        used_viewport_units || scheme_changed
     }
 
     /// Whether any rule in the document depends on what a field holds.
@@ -654,6 +659,14 @@ impl Styler {
 /// read, or not, where it is used — but a declaration that was thrown away at
 /// parse time can never be read at all. `zoom` sits behind the same switch and
 /// stays off: Stylo enables it for the browser's own sheets only.
+///
+/// The rest are values and selectors the cascade settles on its own, with
+/// nothing for layout to learn: colours made from other colours (relative colour
+/// syntax, `color-mix()` of several, `alpha()`, `contrast-color()`),
+/// `:nth-child(… of S)`, `@custom-media`, `sibling-index()` and
+/// `sibling-count()`, `@scope`, and `attr()` in any property. `:has()` and
+/// container queries stay off: one needs invalidation this engine does not do
+/// yet, the other asks layout a question in the middle of the cascade.
 fn enable_features() {
     use std::sync::Once;
 
@@ -662,6 +675,15 @@ fn enable_features() {
         stylo_static_prefs::set_pref!("layout.grid.enabled", true);
         stylo_static_prefs::set_pref!("layout.variable_fonts.enabled", true);
         stylo_static_prefs::set_pref!("layout.unimplemented", true);
+        stylo_static_prefs::set_pref!("layout.css.relative-color-syntax.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.color-mix-multi-color.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.alpha-color-function.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.contrast-color.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.nth-child-of.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.custom-media.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.tree-counting-functions.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.at-scope.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.attr.enabled", true);
     });
 }
 
@@ -827,7 +849,7 @@ fn author_stylesheets<'a>(
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element()) {
             let media = element.attr("media");
-            match element.name.local.as_ref() {
+            match &*element.name.local {
                 "style" => {
                     let text = style_text(document, id);
                     if !text.trim().is_empty() {
@@ -876,7 +898,7 @@ pub fn style_element_imports(document: &Document, base: &Url) -> Vec<(NodeId, Ur
     let mut stack = vec![document.root()];
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element())
-            && element.name.local.as_ref() == "style"
+            && &*element.name.local == "style"
         {
             let imports = imports_in(&style_text(document, id), base);
             found.extend(imports.into_iter().map(|url| (id, url)));
@@ -1181,7 +1203,7 @@ pub fn stylesheet_links(document: &Document) -> Vec<StylesheetLink> {
 
     while let Some(id) = stack.pop() {
         if let Some(element) = document.get(id).and_then(|node| node.element())
-            && element.name.local.as_ref() == "link"
+            && &*element.name.local == "link"
         {
             let rel = document.attr(id, "rel").unwrap_or_default();
             let mut keywords = rel.split_ascii_whitespace().map(str::to_ascii_lowercase);
@@ -1230,7 +1252,7 @@ pub fn media_condition_matches(condition: &str, viewport: Viewport) -> bool {
 fn media_list(text: &str, quirks_mode: QuirksMode) -> MediaList {
     // A media query has no address in it, and the parser wants a base anyway.
     let url = UrlExtraData(Arc::new(about_blank()));
-    let context = style::parser::ParserContext::new(
+    let mut context = style::parser::ParserContext::new(
         Origin::Author,
         &url,
         None,
@@ -1242,7 +1264,7 @@ fn media_list(text: &str, quirks_mode: QuirksMode) -> MediaList {
         Default::default(),
     );
     let mut input = cssparser::ParserInput::new(text);
-    MediaList::parse(&context, &mut cssparser::Parser::new(&mut input))
+    MediaList::parse(&mut context, &mut cssparser::Parser::new(&mut input))
 }
 
 /// Parse one of the browser's own stylesheets.
@@ -2018,35 +2040,135 @@ mod tests {
         );
     }
 
-    /// The scheme goes to the sheets the same way a new width does, so a page
-    /// that never asks keeps every style it computed.
+    /// `light-dark()` picks its colour by the scheme the element is rendered
+    /// in (CSS Color 5 §2.1): the reader's, where `color-scheme` allows both.
     #[test]
-    fn a_new_scheme_restyles_only_a_page_that_asked() {
-        let plain =
-            otlyra_html::parse(b"<style>p { color: red }</style><p>x", Some("utf-8")).document;
+    fn light_dark_follows_the_scheme() {
+        const PAGE: &str = "<style>\
+             :root { color-scheme: light dark }\
+             p { color: light-dark(rgb(1, 2, 3), rgb(4, 5, 6)) }\
+             i { color-scheme: light; color: light-dark(rgb(1, 2, 3), rgb(4, 5, 6)) }\
+             </style><p>x</p><i>y</i>";
+
+        let document = otlyra_html::parse(PAGE.as_bytes(), Some("utf-8")).document;
+        let first = |selector: &str| {
+            crate::stylo_dom::select(&document, selector)
+                .expect("the selector should parse")
+                .into_iter()
+                .next()
+                .expect("an element")
+        };
+        let (p, i) = (first("p"), first("i"));
+
+        let light = style_document(&document, Viewport::default());
+        assert_eq!(colour(light.style_of(p).expect("a style")), (1, 2, 3));
+
+        let dark = style_document(
+            &document,
+            Viewport {
+                color_scheme: ColorScheme::Dark,
+                ..Viewport::default()
+            },
+        );
+        assert_eq!(colour(dark.style_of(p).expect("a style")), (4, 5, 6));
+        assert_eq!(
+            colour(dark.style_of(i).expect("a style")),
+            (1, 2, 3),
+            "an element that only supports light stays light"
+        );
+    }
+
+    /// The values and selectors switched on in `enable_features`, each settled
+    /// by the cascade: a colour from a colour, one of several mixed, the
+    /// contrasting one, `:nth-child(of)`, a custom media query, the element's
+    /// place among its siblings, `@scope`, and an attribute read into a colour.
+    #[test]
+    fn the_cascade_settles_what_it_was_switched_on_for() {
+        let colour_of = |css: &str, html: &str| {
+            let page = format!("<style>{css}</style>{html}");
+            let document = otlyra_html::parse(page.as_bytes(), Some("utf-8")).document;
+            let styled = style_document(&document, Viewport::default());
+            let node = crate::stylo_dom::select(&document, "#t")
+                .expect("the selector should parse")
+                .into_iter()
+                .next()
+                .expect("the element under test");
+            colour(styled.style_of(node).expect("a style"))
+        };
+        let p = "<p id=t>x</p>";
+        assert_eq!(
+            colour_of("p { color: rgb(from rgb(10 20 30) b g r) }", p),
+            (30, 20, 10)
+        );
+        assert_eq!(
+            colour_of(
+                "p { color: color-mix(in srgb, rgb(0 0 0), rgb(90 90 90), rgb(180 180 180)) }",
+                p
+            ),
+            (90, 90, 90)
+        );
+        assert_eq!(
+            colour_of("p { color: contrast-color(rgb(10 10 10)) }", p),
+            (255, 255, 255)
+        );
+        assert_eq!(
+            colour_of(
+                "p { color: red } p:nth-child(2 of .x) { color: rgb(1 2 3) }",
+                "<p class=x>a</p><p>b</p><p class=x id=t>c</p>"
+            ),
+            (1, 2, 3)
+        );
+        assert_eq!(
+            colour_of(
+                "@custom-media --wide (min-width: 100px); @media (--wide) { p { color: rgb(4 5 6) } }",
+                p
+            ),
+            (4, 5, 6)
+        );
+        assert_eq!(
+            colour_of(
+                "p { color: rgb(calc(sibling-index() * 10) 0 0) }",
+                "<p>a</p><p>b</p><p id=t>c</p>"
+            ),
+            (30, 0, 0)
+        );
+        assert_eq!(
+            colour_of(
+                "@scope (.card) to (.inner) { p { color: rgb(7 8 9) } }",
+                "<div class=card><p id=t>x</p></div>"
+            ),
+            (7, 8, 9)
+        );
+        assert_eq!(
+            colour_of(
+                "p { color: attr(data-c type(<color>)) }",
+                "<p id=t data-c=\"rgb(11 12 13)\">x</p>"
+            ),
+            (11, 12, 13)
+        );
+    }
+
+    /// A new scheme restyles the page: a media query may start matching, and
+    /// `light-dark()` and the system colours compute to something else.
+    #[test]
+    fn a_new_scheme_restyles_the_page() {
+        let plain = otlyra_html::parse(
+            b"<style>p { color: light-dark(red, blue) }</style><p>x",
+            Some("utf-8"),
+        )
+        .document;
         let mut styler = Styler::new(&plain, Viewport::default(), &StyleSources::default());
         styler.style(&plain);
+        assert!(styler.resize(Viewport {
+            color_scheme: ColorScheme::Dark,
+            ..Viewport::default()
+        }));
         assert!(
             !styler.resize(Viewport {
                 color_scheme: ColorScheme::Dark,
                 ..Viewport::default()
             }),
-            "nothing in this document reads the scheme"
-        );
-
-        let queried = otlyra_html::parse(
-            b"<style>@media (prefers-color-scheme: dark) { p { color: red } }</style><p>x",
-            Some("utf-8"),
-        )
-        .document;
-        let mut styler = Styler::new(&queried, Viewport::default(), &StyleSources::default());
-        styler.style(&queried);
-        assert!(
-            styler.resize(Viewport {
-                color_scheme: ColorScheme::Dark,
-                ..Viewport::default()
-            }),
-            "the query started matching"
+            "the same scheme again changes nothing"
         );
     }
 
