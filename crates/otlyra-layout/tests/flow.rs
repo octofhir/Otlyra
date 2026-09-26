@@ -1629,3 +1629,121 @@ fn a_column_of_zero_basis_items_is_as_tall_as_what_is_in_it() {
         column.rect
     );
 }
+
+/// The innermost box `height` tall, and how far down from its top the first
+/// run of text inside it starts.
+fn text_offset_in(tree: &FragmentTree, height: f32) -> (Fragment, f32) {
+    fn first_text(fragment: &Fragment) -> Option<f32> {
+        match fragment.kind {
+            FragmentKind::Text(_) => Some(fragment.rect.y),
+            _ => fragment.children.iter().find_map(first_text),
+        }
+    }
+    let control = boxes_of(tree)
+        .into_iter()
+        .rfind(|fragment| (fragment.rect.height - height).abs() < 0.01)
+        .unwrap_or_else(|| panic!("a box {height} tall"))
+        .clone();
+    let text = first_text(&control).expect("text in the control");
+    let offset = text - control.rect.y;
+    (control, offset)
+}
+
+/// A button taller than its label centres it (HTML's button layout: the
+/// anonymous button content box is centred), and so the line the button sits
+/// on is no taller than the button.
+#[test]
+fn a_tall_button_centres_its_label() {
+    let tree = lay_out(
+        "<body style='margin: 0; font: 16px/20px sans-serif'>\
+         <p style='margin: 0'>text <button style='height: 40px; padding: 0; border: 0; \
+         font: inherit'>Hi</button></p>",
+        800.0,
+    );
+    let (_, offset) = text_offset_in(&tree, 40.0);
+    assert!((offset - 10.0).abs() < 0.5, "centred: {offset}");
+    let line = lines(&tree)[0].rect;
+    assert!(line.height <= 41.0, "the line holds the button: {line:?}");
+}
+
+/// A button whose label is set at no size is centred on that nothing: its
+/// baseline is its middle, and the line it sits on grows by half of it.
+#[test]
+fn a_font_size_zero_button_sits_on_its_middle() {
+    let tree = lay_out(
+        "<body style='margin: 0; font: 24px/30px sans-serif'>\
+         <h1 style='margin: 0; font: inherit'>Crate <button style='height: 34px; padding: 0; \
+         border: 0; font-size: 0'>Copy</button></h1>",
+        800.0,
+    );
+    let line = lines(&tree)[0].rect;
+    assert!(line.height < 45.0, "not hung below the text: {line:?}");
+}
+
+/// A button laid out as a flex container places its label as flex does.
+#[test]
+fn a_flex_button_is_not_centred() {
+    let tree = lay_out(
+        "<body style='margin: 0; font: 16px/20px sans-serif'>\
+         <button style='display: flex; height: 40px; padding: 0; border: 0; \
+         font: inherit'>Hi</button>",
+        800.0,
+    );
+    let (_, offset) = text_offset_in(&tree, 40.0);
+    assert!(offset.abs() < 0.5, "at the top: {offset}");
+}
+
+/// A field taller than its line centres the line.
+#[test]
+fn a_tall_field_centres_its_line() {
+    let tree = lay_out(
+        "<body style='margin: 0; font: 16px/20px sans-serif'>\
+         <input value=Hi style='height: 40px; padding: 0; border: 0; font: inherit'>",
+        800.0,
+    );
+    let (_, offset) = text_offset_in(&tree, 40.0);
+    assert!((offset - 10.0).abs() < 0.5, "centred: {offset}");
+}
+
+/// A field drawn as a plain box keeps its twenty characters (CSS UI 4 §7.2),
+/// rather than shrinking to what is typed in it.
+#[test]
+fn a_devolved_field_keeps_its_twenty_characters() {
+    let tree = lay_out(
+        "<body style='margin: 0'><input style='border: 0; padding: 0; \
+         background: rgb(204, 255, 204)'>",
+        800.0,
+    );
+    let field = boxes_of(&tree)
+        .into_iter()
+        .map(|fragment| fragment.rect)
+        .rfind(|rect| rect.width < 800.0)
+        .expect("the field");
+    assert!(field.width > 100.0, "twenty characters: {field:?}");
+}
+
+/// A drop-down drawn as a plain box loses the arrow's strip and nothing else.
+#[test]
+fn a_devolved_select_loses_its_arrow_strip_only() {
+    let width = |style: &str| {
+        let tree = lay_out(
+            &format!(
+                "<body style='margin: 0'><select style='{style}'>\
+                 <option>Longish option</option></select>"
+            ),
+            800.0,
+        );
+        boxes_of(&tree)
+            .into_iter()
+            .map(|fragment| fragment.rect)
+            .rfind(|rect| rect.height > 0.0 && rect.width < 800.0)
+            .expect("the select")
+            .width
+    };
+    let drawn = width("");
+    let devolved = width("appearance: none");
+    assert!(
+        (drawn - devolved - otlyra_layout::widget_metrics::ARROW_STRIP).abs() < 0.5,
+        "{drawn} against {devolved}"
+    );
+}

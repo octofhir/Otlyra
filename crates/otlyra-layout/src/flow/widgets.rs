@@ -31,6 +31,49 @@ impl<'a> Flow<'a> {
         self.tree.node(id).natural_size().height.unwrap_or(laid_out)
     }
 
+    /// Place a control's contents in its content box, once they are laid out:
+    /// centred down it when they came to less than it is tall (`laid_out`
+    /// against `used`), and slid along by however far the reader has scrolled
+    /// a field. A drop-down's open list is neither: it hangs off the control
+    /// and is placed against it.
+    ///
+    /// HTML's button layout centres the anonymous button content box — which
+    /// is what puts a label, and the baseline the line sits on, in the middle
+    /// of a button taller than its text. A button laid out as a flex or grid
+    /// container is not one: its items are placed as that layout says.
+    pub(super) fn place_control_contents(
+        &self,
+        id: crate::box_tree::BoxId,
+        style: &ComputedStyle,
+        (laid_out, used): (f32, f32),
+        children: &mut [crate::fragment::Fragment],
+    ) {
+        let Some(control) = self.tree.node(id).control.as_ref() else {
+            return;
+        };
+        let lays_out_its_own = matches!(
+            style.display,
+            otlyra_css::Display::Flex
+                | otlyra_css::Display::InlineFlex
+                | otlyra_css::Display::Grid
+                | otlyra_css::Display::InlineGrid
+        );
+        let centred = if control.kind.centres_contents() && !lays_out_its_own {
+            ((used - laid_out) / 2.0).max(0.0)
+        } else {
+            0.0
+        };
+        let (dx, dy) = (-control.scroll.0, centred - control.scroll.1);
+        if (dx, dy) == (0.0, 0.0) {
+            return;
+        }
+        for child in children {
+            if !super::is_popup(self.tree, child) {
+                super::shift(child, dx, dy);
+            }
+        }
+    }
+
     /// Where the baseline of a control with nothing written in it sits.
     ///
     /// `None` for a box that is not a control, which keeps CSS's own rule for
@@ -100,7 +143,12 @@ pub(super) fn size_widgets(tree: &mut BoxTree, text: &mut TextEngine) {
         let Some(control) = tree.node(id).control.clone() else {
             continue;
         };
-        if !control.widget || control.natural.is_some() {
+        // A control whose widget is not drawn — `appearance: none`, or a
+        // field styled out of its native look — is drawn as a box, and keeps
+        // the size it would have had: devolving changes how a control looks,
+        // not how big it is (CSS UI 4 §7.2). One with nothing but its drawing
+        // to be measured by has no size left once that is gone.
+        if control.natural.is_some() || !(control.widget || control.kind.keeps_its_size()) {
             continue;
         }
         let style = Arc::clone(&tree.node(id).style);
@@ -115,7 +163,8 @@ pub(super) fn size_widgets(tree: &mut BoxTree, text: &mut TextEngine) {
         };
         let mut sized = (*style).clone();
         let mut changed = false;
-        if control.kind == ControlKind::DropDown {
+        // The arrow strip is part of the drawing, and goes with it.
+        if control.kind == ControlKind::DropDown && control.widget {
             sized.padding.right = Length::Px(resolve_padding(&style, 0.0).right + ARROW_STRIP);
             changed = true;
         }

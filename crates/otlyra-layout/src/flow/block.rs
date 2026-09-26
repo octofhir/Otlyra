@@ -22,7 +22,7 @@ use super::replaced::{replaced_fragment, replaced_height, replaced_size};
 use super::sizing::{Frame, InlineRoom, Sizes, height_ratio};
 use super::{
     Flow, is_popup, mark_layer, mark_sticky, offset, set_clip, set_container, set_scroll_port,
-    set_sticky_containers, shift,
+    set_sticky_containers,
 };
 
 /// What a box's bottom edge does with the bottom margin of the last box in it
@@ -272,27 +272,15 @@ impl<'a> Flow<'a> {
         // flex item is as wide as its line gave it. Taken rather than left, so a
         // table inside one does not report its width to the block outside.
         self.table_width = None;
+        let laid_out = content_height;
         let content_height = self.content_height(id, content_height);
         let content_height = self
             .block_sizes_of(&style, width, content_width, Some(content_height))
             .used(content_height);
 
-        // A field is one line long however much has been typed into it, so what
-        // moves is the line and not the box. Before the clip, because what is slid
-        // out of the box is exactly what the clip is for.
-        let slid = self
-            .tree
-            .node(id)
-            .control
-            .as_ref()
-            .map_or((0.0, 0.0), |control| control.scroll);
-        if slid != (0.0, 0.0) {
-            for child in &mut children {
-                if !is_popup(self.tree, child) {
-                    shift(child, -slid.0, -slid.1);
-                }
-            }
-        }
+        // Before the clip, because what a field slides out of the box is
+        // exactly what the clip is for.
+        self.place_control_contents(id, &style, (laid_out, content_height), &mut children);
         // A box that is inline outside cuts its contents off at its padding edge
         // like any other, and until a field slid its text under itself there was
         // nothing inside one that ever reached the edge to notice.
@@ -572,6 +560,7 @@ impl<'a> Flow<'a> {
             Some(_) => content_width,
             None => shrunk.unwrap_or(content_width),
         };
+        let laid_out = content_height;
         let content_height = self.content_height(id, content_height);
         let content_height = self
             .block_sizes_of(
@@ -591,22 +580,9 @@ impl<'a> Flow<'a> {
             Rect::new(content_x, content_y, content_width, content_height),
         );
 
-        // A field is one line long however much has been typed into it, so what
-        // moves is the line and not the box. Before the clip, because what is slid
-        // out of the box is what the clip is for.
-        let slid = self
-            .tree
-            .node(id)
-            .control
-            .as_ref()
-            .map_or((0.0, 0.0), |control| control.scroll);
-        if slid != (0.0, 0.0) {
-            for child in &mut children {
-                if !is_popup(self.tree, child) {
-                    shift(child, -slid.0, -slid.1);
-                }
-            }
-        }
+        // Before the clip, because what a field slides out of the box is what
+        // the clip is for.
+        self.place_control_contents(id, &style, (laid_out, content_height), &mut children);
 
         if style.overflow.clips() {
             let padding_box = Rect::new(

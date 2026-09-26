@@ -110,8 +110,9 @@ pub struct Control {
     /// The colour a colour well holds, which is the whole of what it shows.
     pub swatch: Option<[u8; 3]>,
     /// The size the widget takes when nothing says otherwise, once layout has
-    /// worked it out: `None` until then, and for a control that is not drawn as a
-    /// widget.
+    /// worked it out: `None` until then, and for a control that is not drawn as
+    /// a widget and has nothing but its drawing to be sized by (see
+    /// [`ControlKind::keeps_its_size`]).
     ///
     /// Kept as well as written into the style, because a `width` of `auto` is not
     /// the only thing that asks for it: `min-content`, `max-content` and
@@ -173,6 +174,47 @@ impl ControlKind {
     #[must_use]
     pub fn opens(self) -> bool {
         matches!(self, Self::DropDown)
+    }
+
+    /// Whether it keeps its natural size when its widget is not drawn: the
+    /// controls sized in characters and rows of text, which are sized by what
+    /// they hold rather than by how they are drawn.
+    #[must_use]
+    pub fn keeps_its_size(self) -> bool {
+        match self {
+            Self::Field | Self::Area | Self::ListBox | Self::DropDown => true,
+            Self::Button
+            | Self::Checkbox
+            | Self::Radio
+            | Self::Range
+            | Self::Color
+            | Self::File
+            | Self::Progress
+            | Self::Meter => false,
+        }
+    }
+
+    /// Whether its contents are centred down its content box when they do not
+    /// fill it.
+    ///
+    /// A button's are: HTML's rendering section says so of the anonymous
+    /// button content box. A field's line and a drop-down's option are too —
+    /// the specification leaves those open, and both references centre them.
+    /// A text area's rows and a list box's options start at the top.
+    #[must_use]
+    pub fn centres_contents(self) -> bool {
+        match self {
+            Self::Button | Self::Field | Self::DropDown => true,
+            Self::Area
+            | Self::Checkbox
+            | Self::Radio
+            | Self::ListBox
+            | Self::Range
+            | Self::Color
+            | Self::File
+            | Self::Progress
+            | Self::Meter => false,
+        }
     }
 }
 
