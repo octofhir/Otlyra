@@ -1638,6 +1638,8 @@ impl Session {
             // Written rather than fetched, and rather than cached. Saying
             // `network` would have the request list claim a socket was opened.
             served: otlyra_net::Served::Network,
+            // A driver's bytes are decoded where they are received.
+            picture: None,
         };
         self.browser.fulfil_request(id, response);
         self.blocked.remove(&id);

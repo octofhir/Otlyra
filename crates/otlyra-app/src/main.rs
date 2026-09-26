@@ -961,6 +961,8 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
                 response_headers: resource.response_headers,
                 final_url: resource.final_url,
                 served: resource.served,
+                // Decoded by the fetcher, which knows what the bytes were for.
+                picture: None,
             })
         })
     }

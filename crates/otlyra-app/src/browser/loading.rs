@@ -330,11 +330,11 @@ impl Browser {
         // A background picture belongs to a page rather than to a load, and may
         // arrive long after the page it is for.
         if let Some((index, url)) = self.background_fetches.remove(&fetched.id) {
-            let Ok(loaded) = fetched.result else {
+            let Ok(mut loaded) = fetched.result else {
                 tracing::warn!(%url, "background picture failed to load");
                 return false;
             };
-            match otlyra_gfx::decode_image(&loaded.bytes) {
+            match loaded.picture() {
                 Ok(picture) => {
                     self.images.insert(fetched.url.clone(), picture.clone());
                     match self.tabs.get_mut(index).and_then(|tab| tab.page.as_mut()) {
@@ -353,11 +353,11 @@ impl Browser {
         // A picture an element chose again after the page was built: the same
         // element, a different file.
         if let Some((index, node, src, density)) = self.picture_fetches.remove(&fetched.id) {
-            let Ok(loaded) = fetched.result else {
+            let Ok(mut loaded) = fetched.result else {
                 tracing::warn!(%src, "re-chosen picture failed to load");
                 return false;
             };
-            match otlyra_gfx::decode_image(&loaded.bytes) {
+            match loaded.picture() {
                 Ok(data) => {
                     self.images.insert(fetched.url.clone(), data.clone());
                     match self.tabs.get_mut(index).and_then(|tab| tab.page.as_mut()) {
@@ -867,13 +867,14 @@ impl Browser {
         let mut imports = Vec::new();
 
         match fetched.result {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
                 // Decoded once, however many elements asked for it.
                 let decoded = wanted
                     .iter()
                     .any(|resource| matches!(resource, PendingResource::Image(..)))
                     .then(|| {
-                        otlyra_gfx::decode_image(&loaded.bytes)
+                        loaded
+                            .picture()
                             .inspect_err(
                                 |error| tracing::warn!(url = %fetched.url, %error, "image failed to decode"),
                             )

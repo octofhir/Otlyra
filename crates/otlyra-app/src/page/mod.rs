@@ -1096,12 +1096,13 @@ impl PageScene {
     /// Hand an element the picture it now asks for, in place of the one it has.
     ///
     /// The box tree goes with it: a picture is a box's content, and a different
-    /// file is a different intrinsic size — so the page is styled and laid out
-    /// again rather than repainted.
+    /// file is a different intrinsic size — so the boxes are built again and laid
+    /// out. Not styled again: no style depends on which file a picture is, and
+    /// a page whose pictures arrive one by one was being cascaded once for each.
     pub fn set_image(&mut self, node: NodeId, src: String, picture: otlyra_layout::Picture) {
         self.picture_sources.insert(node, (src, picture.density));
         self.images.insert(node, picture);
-        self.styled = false;
+        self.boxes_stale = true;
         self.layout_stale = true;
         self.damage.add(Damage::of(
             otlyra_layout::InvalidationReason::DocumentLoaded,

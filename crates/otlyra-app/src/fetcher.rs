@@ -76,6 +76,27 @@ pub struct Loaded {
     pub final_url: String,
     /// Whether the network was touched at all, and how much of it.
     pub served: otlyra_net::Served,
+    /// The picture the bytes decode to, for a fetch that was for a picture —
+    /// decoded where it was fetched, off the window's thread.
+    ///
+    /// A large JPEG takes tens of milliseconds to decode, and decoding it where
+    /// it is received was decoding it in the middle of a frame: every picture on
+    /// a page arriving was a frame that did not come. `None` where nothing
+    /// decoded it yet; [`Loaded::picture`] decodes it then.
+    pub picture: Option<Result<otlyra_gfx::peniko::ImageData, String>>,
+}
+
+impl Loaded {
+    /// The picture these bytes are: the one decoded where they were fetched, or
+    /// decoded now for bytes that came by another way.
+    pub fn picture(&mut self) -> Result<otlyra_gfx::peniko::ImageData, String> {
+        self.picture.take().unwrap_or_else(|| decode(&self.bytes))
+    }
+}
+
+/// Decode a picture's bytes, with the failure as the words a log line wants.
+fn decode(bytes: &[u8]) -> Result<otlyra_gfx::peniko::ImageData, String> {
+    otlyra_gfx::decode_image(bytes).map_err(|error| error.to_string())
 }
 
 /// The question *should this request be held*, asked of an address.
@@ -623,12 +644,31 @@ impl Fetcher {
                 return;
             };
             let started = std::time::Instant::now();
-            let result = loader.fetch(url.clone(), body, cache, headers).await;
+            let mut result = loader.fetch(url.clone(), body, cache, headers).await;
+            let took = started.elapsed();
+            // A picture is decoded here, on the pool the blocking work goes to,
+            // so that what reaches the window's thread is ready to draw.
+            if kind == ResourceKind::Image
+                && let Ok(loaded) = result
+            {
+                result = match tokio::task::spawn_blocking(move || {
+                    let picture = decode(&loaded.bytes);
+                    Loaded {
+                        picture: Some(picture),
+                        ..loaded
+                    }
+                })
+                .await
+                {
+                    Ok(decoded) => Ok(decoded),
+                    Err(error) => Err(format!("decoding the picture failed: {error}")),
+                };
+            }
             let fetched = Fetched {
                 id,
                 kind,
                 url,
-                took: started.elapsed(),
+                took,
                 result,
             };
             // A closed channel is a browser that has gone. Nothing to report to and
