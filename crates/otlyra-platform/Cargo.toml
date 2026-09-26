@@ -10,7 +10,6 @@ repository.workspace = true
 
 [dependencies]
 accesskit.workspace = true
-accesskit_winit.workspace = true
 otlyra-gfx.workspace = true
 pollster.workspace = true
 raw-window-handle.workspace = true
@@ -21,9 +20,13 @@ wgpu.workspace = true
 winit.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+accesskit_macos.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+accesskit_windows.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

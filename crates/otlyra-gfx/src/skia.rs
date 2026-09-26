@@ -180,7 +180,7 @@ impl TypefaceCache {
 
         let font_mgr = self.font_mgr.get_or_insert_with(sk::FontMgr::new);
         let bytes = font.data.as_ref();
-        let base = match font_mgr.new_from_data(bytes, index as usize) {
+        let base = match font_mgr.new_from_bytes(bytes, index) {
             Some(typeface) => typeface,
             // A face inside a font collection: the platform's font manager here
             // takes a collection only at index zero, so the face is lifted out into
@@ -189,7 +189,7 @@ impl TypefaceCache {
             // italic monospace — draws nothing at all.
             None => {
                 let extracted = face_from_collection(bytes, index as usize)?;
-                font_mgr.new_from_data(&extracted, 0)?
+                font_mgr.new_from_bytes(&extracted, 0)?
             }
         };
         let typeface = instantiate(

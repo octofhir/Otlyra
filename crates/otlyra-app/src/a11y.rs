@@ -12,7 +12,7 @@
 //! expensive order to do it in.
 
 use otlyra_layout::{BoxId, BoxKind, BoxTree};
-use otlyra_platform::accesskit::{Node, NodeId, Rect, Role, Toggled, Tree, TreeId, TreeUpdate};
+use otlyra_platform::accesskit::{Node, NodeId, Rect, Role, Toggled, TreeId, TreeInfo, TreeUpdate};
 
 use crate::page::PageScene;
 use crate::widget::{Described, FocusId, Role as WidgetRole};
@@ -58,7 +58,7 @@ pub fn tree_for(page: &PageScene, title: &str) -> TreeUpdate {
 
     TreeUpdate {
         nodes,
-        tree: Some(Tree::new(ROOT)),
+        tree: Some(TreeInfo::new(ROOT)),
         tree_id: TreeId::ROOT,
         focus,
     }
@@ -247,7 +247,7 @@ pub fn window_tree(
 
     TreeUpdate {
         nodes,
-        tree: Some(Tree::new(ROOT)),
+        tree: Some(TreeInfo::new(ROOT)),
         tree_id: TreeId::ROOT,
         // What the interface is holding, or the document. A reader is told where
         // the keyboard *is*; claiming the window when a field has the caret would
@@ -325,7 +325,7 @@ pub fn empty_tree(label: &str) -> TreeUpdate {
     root.set_label(label.to_owned());
     TreeUpdate {
         nodes: vec![(ROOT, root)],
-        tree: Some(Tree::new(ROOT)),
+        tree: Some(TreeInfo::new(ROOT)),
         tree_id: TreeId::ROOT,
         focus: ROOT,
     }

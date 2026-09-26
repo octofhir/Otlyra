@@ -1,7 +1,5 @@
 //! GPU presentation: upload the rasterized frame and blit it to the swapchain.
 
-use std::sync::Arc;
-
 use crate::{Scene, Viewport, compositor::Damage};
 use otlyra_gfx::PaintTarget as _;
 
@@ -126,7 +124,7 @@ impl DirectFrame {
 }
 
 impl Presenter {
-    pub(crate) fn instance<W>(window: Arc<W>) -> PresenterInstance
+    pub(crate) fn instance<W>(window: W) -> PresenterInstance
     where
         W: raw_window_handle::HasDisplayHandle + std::fmt::Debug + Send + Sync + 'static,
     {
@@ -137,7 +135,7 @@ impl Presenter {
 
     pub(crate) fn prepare<W>(
         instance: PresenterInstance,
-        window: Arc<W>,
+        window: W,
     ) -> Result<PresenterSeed, PresentError>
     where
         W: wgpu::WindowHandle + raw_window_handle::HasDisplayHandle + std::fmt::Debug + 'static,

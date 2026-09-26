@@ -1,14 +1,17 @@
 //! The winit event loop, and the wall that keeps winit inside this file.
 //!
-//! Every `winit::` reference in this crate is in this module. When 0.31 lands, the
-//! diff is bounded by it.
+//! Every `winit::` reference in this crate is in this module, so a winit release
+//! is a diff bounded by it.
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
+use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::cursor::CursorIcon;
+use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event_loop::run_on_demand::EventLoopExtRunOnDemand;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::a11y::Accessibility;
 use crate::compositor::{SceneCompositor, Upload};
@@ -57,9 +60,9 @@ fn translate_key(key: &winit::keyboard::Key) -> Option<crate::Key> {
     })
 }
 
-/// Menu activations arrive on muda's own callback, off winit's event path, so they
-/// are forwarded through the event loop proxy. Without this the loop would sit in
-/// `Wait` and the menu would appear to do nothing until the next mouse move.
+/// What other threads tell the loop: a menu chosen on muda's own callback, a
+/// wake from the browser, the GPU coming up. Without these the loop would sit
+/// in `Wait` and the menu would appear to do nothing until the next mouse move.
 enum UserEvent {
     /// A menu item was chosen.
     Menu(MenuId),
@@ -69,6 +72,25 @@ enum UserEvent {
     PresenterInstanceReady(Box<crate::present::PresenterInstance>),
     /// GPU initialization completed without blocking the window event loop.
     PresenterReady(Box<Result<Presenter, crate::present::PresentError>>),
+}
+
+/// Where other threads post [`UserEvent`]s: a channel, and the loop woken to
+/// read it. winit wakes a loop and carries nothing with the wake.
+#[derive(Clone)]
+struct Mailbox {
+    sender: mpsc::Sender<UserEvent>,
+    proxy: EventLoopProxy,
+}
+
+impl Mailbox {
+    /// Post `event`, and say whether the loop is still there to read it.
+    fn send(&self, event: UserEvent) -> bool {
+        let posted = self.sender.send(event).is_ok();
+        if posted {
+            self.proxy.wake_up();
+        }
+        posted
+    }
 }
 
 /// Anything that can go wrong opening or driving a window.
@@ -201,45 +223,50 @@ impl FrameScheduler {
 /// unconditionally.
 pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), PlatformError> {
     let startup_origin = config.startup_origin;
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
+    let mut event_loop =
+        EventLoop::new().map_err(|error| PlatformError::EventLoop(error.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
+    let (sender, inbox) = mpsc::channel();
+    let mailbox = Mailbox {
+        sender,
+        proxy: event_loop.create_proxy(),
+    };
 
-    // muda dispatches on its own callback; hand activations to winit so the loop
+    // muda dispatches on its own callback; hand activations to the loop so it
     // wakes and the app sees one ordered stream of events.
-    let proxy = event_loop.create_proxy();
+    let menu_mailbox = mailbox.clone();
     muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
         if let Some(id) = command_from_muda(&event) {
-            let _ = proxy.send_event(UserEvent::Menu(id));
+            menu_mailbox.send(UserEvent::Menu(id));
         }
     }));
 
-    // A wake is a message on a channel rather than a proxy handed out directly:
-    // the proxy is winit's type and no crate above this one may name it.
-    let (wake_sender, wake_receiver) = std::sync::mpsc::channel();
-    let wake_proxy = event_loop.create_proxy();
+    // A wake is a message on a channel of its own rather than the mailbox
+    // handed out directly: the mailbox holds winit's proxy, and no crate above
+    // this one may name it.
+    let (wake_sender, wake_receiver) = mpsc::channel();
+    let wake_mailbox = mailbox.clone();
     std::thread::spawn(move || {
         // Ends when the last waker is dropped, which is when the browser goes.
         while wake_receiver.recv().is_ok() {
-            if wake_proxy.send_event(UserEvent::Woken).is_err() {
+            if !wake_mailbox.send(UserEvent::Woken) {
                 break;
             }
         }
     });
     painter.set_waker(crate::Waker::new(wake_sender));
-    let presenter_proxy = event_loop.create_proxy();
 
     let mut app = WindowedApp {
         config,
         painter,
+        a11y: None,
         window: None,
         direct_frame: None,
         presenter: None,
-        presenter_proxy,
+        mailbox,
+        inbox,
         compositor: SceneCompositor::new(),
         menu: None,
-        a11y: None,
         frames: 0,
         startup_origin,
         window_visible: None,
@@ -256,8 +283,11 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         failure: None,
     };
 
+    // On demand rather than for good: the loop runs until the window closes and
+    // then hands back, which is what lets the app borrow the painter rather
+    // than own it, and `run` return the failure it recorded.
     event_loop
-        .run_app(&mut app)
+        .run_app_on_demand(&mut app)
         .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
 
     match app.failure {
@@ -269,21 +299,24 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
 struct WindowedApp<'p> {
     config: WindowConfig,
     painter: &'p mut dyn Painter,
-    window: Option<Arc<Window>>,
+    /// The accessibility adapter. Absent if it could not be created, which is a
+    /// degraded browser and not a broken one. Declared before the window so it
+    /// is dropped first: it has subclassed the window's view, and gives it back.
+    a11y: Option<Accessibility>,
+    window: Option<Arc<dyn Window>>,
     /// Thread-bound Ganesh surface. It is created and used only on the event-loop
     /// thread and drops before the presenter whose Metal device it wraps.
     direct_frame: Option<DirectFrame>,
     presenter: Option<Presenter>,
-    /// Wakes the UI thread when background GPU initialization completes.
-    presenter_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    /// Where background GPU initialization posts that it is done.
+    mailbox: Mailbox,
+    /// What other threads have posted, read when the loop is woken.
+    inbox: mpsc::Receiver<UserEvent>,
     /// The retained surface and the layers on it — the same compositor a
     /// [`crate::FramePump`] drives with no window.
     compositor: SceneCompositor,
     /// Held for the application's lifetime: dropping it removes the menu bar.
     menu: Option<NativeMenu>,
-    /// The accessibility adapter. Absent if it could not be created, which is a
-    /// degraded browser and not a broken one.
-    a11y: Option<Accessibility>,
     frames: u64,
     /// The executable's startup origin and the milestones reached from it.
     startup_origin: std::time::Instant,
@@ -358,11 +391,11 @@ impl WindowedApp<'_> {
         let Some(window) = self.window.as_ref() else {
             return Viewport::new(1, 1, 1.0);
         };
-        let size = window.inner_size();
+        let size = window.surface_size();
         Viewport::new(size.width, size.height, window.scale_factor())
     }
 
-    fn fail(&mut self, event_loop: &ActiveEventLoop, error: PlatformError) {
+    fn fail(&mut self, event_loop: &dyn ActiveEventLoop, error: PlatformError) {
         tracing::error!(%error, "fatal platform error; closing the window");
         if self.failure.is_none() {
             self.failure = Some(error);
@@ -380,11 +413,14 @@ impl WindowedApp<'_> {
         if cursor != self.cursor
             && let Some(window) = self.window.as_ref()
         {
-            window.set_cursor(match cursor {
-                crate::Cursor::Default => winit::window::CursorIcon::Default,
-                crate::Cursor::Pointer => winit::window::CursorIcon::Pointer,
-                crate::Cursor::Text => winit::window::CursorIcon::Text,
-            });
+            window.set_cursor(
+                match cursor {
+                    crate::Cursor::Default => CursorIcon::Default,
+                    crate::Cursor::Pointer => CursorIcon::Pointer,
+                    crate::Cursor::Text => CursorIcon::Text,
+                }
+                .into(),
+            );
             self.cursor = cursor;
         }
 
@@ -417,7 +453,7 @@ impl WindowedApp<'_> {
         self.work.redraw_requests += 1;
     }
 
-    fn sync_control_flow(&self, event_loop: &ActiveEventLoop) {
+    fn sync_control_flow(&self, event_loop: &dyn ActiveEventLoop) {
         match self.scheduler.deadline {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -726,6 +762,45 @@ impl WindowedApp<'_> {
     }
 
     /// Log the cumulative work counters for one presented frame.
+    /// One event another thread posted.
+    fn receive(&mut self, event_loop: &dyn ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Menu(id) => {
+                tracing::debug!(id = ?id, "menu command");
+                self.deliver(PlatformEvent::MenuCommand(id));
+            }
+            UserEvent::Woken => self.deliver(PlatformEvent::Woken),
+            UserEvent::PresenterInstanceReady(instance) => {
+                self.mark("wgpu_instance_ready");
+                let Some(window) = self.window.as_ref().map(Arc::clone) else {
+                    return;
+                };
+                let viewport = self.viewport();
+                let seed = match Presenter::prepare(*instance, window) {
+                    Ok(seed) => seed,
+                    Err(error) => {
+                        self.fail(event_loop, error.into());
+                        return;
+                    }
+                };
+                self.mark("surface_attached");
+                let mailbox = self.mailbox.clone();
+                std::thread::spawn(move || {
+                    let result = Presenter::new(seed, viewport);
+                    mailbox.send(UserEvent::PresenterReady(Box::new(result)));
+                });
+            }
+            UserEvent::PresenterReady(result) => match *result {
+                Ok(presenter) => {
+                    self.mark("gpu_ready");
+                    self.presenter = Some(presenter);
+                    self.request_frame(FrameRequest::Now);
+                }
+                Err(error) => self.fail(event_loop, error.into()),
+            },
+        }
+    }
+
     fn log_frame(&self) {
         let painter_work = self.painter.work_counters();
         tracing::debug!(
@@ -747,9 +822,16 @@ impl WindowedApp<'_> {
     }
 }
 
-impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
+impl ApplicationHandler for WindowedApp<'_> {
+    /// Read everything other threads have posted since the last wake.
+    fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        while let Ok(event) = self.inbox.try_recv() {
+            self.receive(event_loop, event);
+        }
+    }
+
     /// Drain cross-thread work and turn a reached deadline into one redraw.
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         // Anything a screen reader asked for arrived on its own thread and was
         // queued. Drained here, between batches of window events, so it reaches
         // the painter as an ordinary event on the loop's thread like every other.
@@ -765,45 +847,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
         self.sync_control_flow(event_loop);
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::Menu(id) => {
-                tracing::debug!(id = ?id, "menu command");
-                self.deliver(PlatformEvent::MenuCommand(id));
-            }
-            UserEvent::Woken => self.deliver(PlatformEvent::Woken),
-            UserEvent::PresenterInstanceReady(instance) => {
-                self.mark("wgpu_instance_ready");
-                let Some(window) = self.window.as_ref().map(Arc::clone) else {
-                    return;
-                };
-                let viewport = self.viewport();
-                let seed = match Presenter::prepare(*instance, window) {
-                    Ok(seed) => seed,
-                    Err(error) => {
-                        self.fail(event_loop, error.into());
-                        return;
-                    }
-                };
-                self.mark("surface_attached");
-                let proxy = self.presenter_proxy.clone();
-                std::thread::spawn(move || {
-                    let result = Presenter::new(seed, viewport);
-                    let _ = proxy.send_event(UserEvent::PresenterReady(Box::new(result)));
-                });
-            }
-            UserEvent::PresenterReady(result) => match *result {
-                Ok(presenter) => {
-                    self.mark("gpu_ready");
-                    self.presenter = Some(presenter);
-                    self.request_frame(FrameRequest::Now);
-                }
-                Err(error) => self.fail(event_loop, error.into()),
-            },
-        }
-    }
-
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.window.is_some() {
             // macOS can resume an already-running application; recreating the
             // window here would orphan the surface.
@@ -832,16 +876,16 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
         // Created hidden: the accessibility adapter must exist before the window is
         // shown for the first time, and it says so by panicking otherwise.
-        let attributes = Window::default_attributes()
+        let attributes = WindowAttributes::default()
             .with_title(self.config.title.clone())
             .with_visible(false)
-            .with_inner_size(winit::dpi::LogicalSize::new(
+            .with_surface_size(winit::dpi::LogicalSize::new(
                 self.config.logical_size.0,
                 self.config.logical_size.1,
             ));
 
         let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
+            Ok(window) => Arc::<dyn Window>::from(window),
             Err(error) => {
                 self.fail(event_loop, PlatformError::WindowCreation(error.to_string()));
                 return;
@@ -852,7 +896,10 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
         // AccessKit requires the window to remain hidden until its adapter is
         // attached. GPU initialization has no such requirement and is much
         // slower, so it starts only after the hidden-window work is complete.
-        self.a11y = Some(Accessibility::new(event_loop, &window));
+        match window.window_handle() {
+            Ok(handle) => self.a11y = Some(Accessibility::new(handle.as_raw())),
+            Err(error) => tracing::warn!(%error, "no window handle for accessibility"),
+        }
         self.mark("accesskit_attached");
         // The painter may already want the window pinned — a saved preference
         // says Dark — and that has to land before the titlebar is ever seen.
@@ -873,7 +920,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
         }
 
         let viewport = {
-            let size = window.inner_size();
+            let size = window.surface_size();
             Viewport::new(size.width, size.height, window.scale_factor())
         };
         self.window = Some(Arc::clone(&window));
@@ -883,6 +930,11 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             .handle_event(PlatformEvent::SurfaceReady(viewport));
 
         window.set_visible(true);
+        // A window that is key the moment it shows says nothing about it, and
+        // the adapter publishes nothing until it hears the window has focus.
+        if let Some(a11y) = self.a11y.as_mut() {
+            a11y.focus_changed(window.has_focus());
+        }
         let visible = std::time::Instant::now();
         self.window_visible = Some(visible);
         self.mark("visibility_requested");
@@ -897,22 +949,22 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             "window visible; gpu initialization continues in background"
         );
 
-        let proxy = self.presenter_proxy.clone();
+        let mailbox = self.mailbox.clone();
         let gpu_window = Arc::clone(&window);
         std::thread::spawn(move || {
             let instance = Presenter::instance(gpu_window);
-            let _ = proxy.send_event(UserEvent::PresenterInstanceReady(Box::new(instance)));
+            mailbox.send(UserEvent::PresenterInstanceReady(Box::new(instance)));
         });
     }
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        if let (Some(a11y), Some(window)) = (self.a11y.as_mut(), self.window.as_ref()) {
-            a11y.process_event(window, &event);
+        if let (WindowEvent::Focused(focused), Some(a11y)) = (&event, self.a11y.as_mut()) {
+            a11y.focus_changed(*focused);
         }
 
         match event {
@@ -922,7 +974,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             }
             // Both mean the same thing above us: the drawable changed. winit
             // separates them because scale and pixel size can change alone.
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::SurfaceResized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 let viewport = self.viewport();
                 self.work.events_delivered += 1;
                 let request = self.painter.handle_event(PlatformEvent::Resized(viewport));
@@ -954,11 +1006,14 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                     shift: state.shift_key(),
                     control: state.control_key(),
                     alt: state.alt_key(),
-                    command: state.super_key(),
+                    command: state.meta_key(),
                 };
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            // Where the pointer came in is where it is: winit says so once, on
+            // entering, and sends no move to go with it.
+            WindowEvent::PointerEntered { position, .. }
+            | WindowEvent::PointerMoved { position, .. } => {
                 let scale = self.viewport().scale_factor;
                 self.pointer = (position.x / scale, position.y / scale);
                 self.deliver(PlatformEvent::PointerMoved {
@@ -967,14 +1022,19 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                 });
             }
 
-            WindowEvent::MouseInput { state, button, .. } => {
-                let pressed = state == winit::event::ElementState::Pressed;
+            WindowEvent::PointerButton { state, button, .. } => {
+                // A touch presses as the primary button does; a pointer with no
+                // button this knows presses nothing.
+                let Some(button) = button.mouse_button() else {
+                    return;
+                };
+                let pressed = state == ElementState::Pressed;
                 // The right button asks for a context menu everywhere, and on
                 // macOS so does the primary button with control held — which is
                 // the gesture that predates a second button and the one this
                 // platform's readers still use with a trackpad.
-                let secondary = button == winit::event::MouseButton::Right
-                    || (button == winit::event::MouseButton::Left
+                let secondary = button == MouseButton::Right
+                    || (button == MouseButton::Left
                         && cfg!(target_os = "macos")
                         && self.modifiers.control);
                 if secondary {
@@ -985,7 +1045,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
                     }
                     return;
                 }
-                if button == winit::event::MouseButton::Left {
+                if button == MouseButton::Left {
                     let event = if pressed {
                         let clicks = self.count_click();
                         PlatformEvent::PointerPressed { clicks }
@@ -997,7 +1057,7 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != winit::event::ElementState::Pressed {
+                if event.state != ElementState::Pressed {
                     return;
                 }
                 if let Some(key) = translate_key(&event.logical_key) {
@@ -1020,7 +1080,9 @@ impl ApplicationHandler<UserEvent> for WindowedApp<'_> {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.viewport().scale_factor;
-                self.deliver(scroll_event(delta, scale, self.modifiers));
+                if let Some(event) = scroll_event(delta, scale, self.modifiers) {
+                    self.deliver(event);
+                }
             }
             WindowEvent::RedrawRequested => match self.redraw() {
                 Err(error) => self.fail(event_loop, error),
@@ -1124,7 +1186,7 @@ fn scroll_event(
     delta: winit::event::MouseScrollDelta,
     scale: f64,
     modifiers: crate::Modifiers,
-) -> PlatformEvent {
+) -> Option<PlatformEvent> {
     let (x, y, source) = match delta {
         // A notch, not a distance. What it is worth in pixels is a platform
         // convention; 40 is the figure browsers settled on.
@@ -1141,13 +1203,16 @@ fn scroll_event(
             position.y / scale,
             crate::ScrollSource::Trackpad,
         ),
+        // winit keeps the list open for kinds of delta it may add; one this
+        // does not know scrolls nothing rather than by a guess.
+        _ => return None,
     };
-    PlatformEvent::Scroll {
+    Some(PlatformEvent::Scroll {
         x: -x,
         y: -y,
         source,
         modifiers,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1216,12 +1281,12 @@ mod tests {
         );
         assert_eq!(
             event,
-            PlatformEvent::Scroll {
+            Some(PlatformEvent::Scroll {
                 x: 0.0,
                 y: -LINE_SCROLL,
                 source: crate::ScrollSource::Wheel,
                 modifiers: Default::default(),
-            }
+            })
         );
     }
 
@@ -1236,12 +1301,12 @@ mod tests {
         );
         assert_eq!(
             event,
-            PlatformEvent::Scroll {
+            Some(PlatformEvent::Scroll {
                 x: 0.0,
                 y: -12.0,
                 source: crate::ScrollSource::Trackpad,
                 modifiers: Default::default(),
-            }
+            })
         );
     }
 
@@ -1260,7 +1325,7 @@ mod tests {
             crate::Modifiers::default(),
         );
         let down = |event| match event {
-            PlatformEvent::Scroll { y, .. } => y > 0.0,
+            Some(PlatformEvent::Scroll { y, .. }) => y > 0.0,
             _ => unreachable!("scroll_event only makes scrolls"),
         };
         assert!(down(wheel), "a wheel rolled away from the reader goes down");

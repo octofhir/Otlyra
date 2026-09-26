@@ -41,15 +41,17 @@ otlyra-text = { path = "crates/otlyra-text", version = "0.0.0" }
 # `default-features = false` drops winit's X11 and Wayland backends. They are inert
 # on macOS but drag in the whole wayland-scanner/quick-xml and sctk-adwaita/ttf-parser
 # tree, which carries live advisories. Linux support re-enables them per target.
-winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
-wgpu = "=30.0.0"
+# The 0.31 line: windows and the active loop are traits, pointers of every kind
+# are one set of events, and a loop is woken rather than sent a value.
+winit = { version = "=0.31.0-beta.3", default-features = false }
+wgpu = "=30.0.1"
 
 # Native menus. winit has none, and drawing them ourselves would lose the system
 # menu bar, accessibility and system-wide shortcut handling.
 #
 # `default-features = false` drops muda's GTK3 and libxdo backends, which are Linux
 # only and pull in the unmaintained gtk-rs GTK3 bindings. Linux re-enables them.
-muda = { version = "=0.19.3", default-features = false }
+muda = { version = "=0.20.0", default-features = false }
 
 # Cocoa bindings, for the Dock icon an unbundled binary cannot get from a plist.
 # Versions match muda's so the two share one objc2 in the graph.
@@ -71,7 +73,7 @@ raw-window-handle = "=0.6.2"
 # and this is the set that exists — which is no loss: the web serves WebP
 # everywhere, and a rasterizer that cannot decode it draws those pictures as
 # nothing too.
-skia-safe = { version = "=0.99.0", features = ["svg", "webp"] }
+skia-safe = { version = "=0.153.3", features = ["svg", "webp"] }
 
 # Static SVG: parsing, the cascade inside the file, `use`, gradients, masks,
 # text as paths — and the rasterizing of all of it.
@@ -95,7 +97,7 @@ skia-safe = { version = "=0.99.0", features = ["svg", "webp"] }
 # `text` and `system-fonts` because a logo is often lettering; `raster-images`
 # because an SVG may embed a photograph and one that drew nothing there would be
 # the black-shapes bug again in a different place.
-resvg = { version = "=0.47.0", default-features = false, features = [
+resvg = { version = "=0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
@@ -135,15 +137,15 @@ peniko = "=0.6.1"
 # has to build this tree out of the DOM whatever toolkit it uses — which is why the
 # plan puts it here rather than later: retrofitting it is the expensive path.
 #
-# `accesskit_winit` 0.33 rather than the 0.32 the plan named: both target the winit
-# 0.30 line and the same accesskit, and the newer one is where the fixes are.
-accesskit = "=0.24.1"
-#
-# `default-features = false` for the same reason winit and muda take it: the
-# defaults turn on the X11 and Wayland backends, which are inert on macOS and drag
-# in `wayland-scanner` and its `quick-xml`, currently carrying two high-severity
-# advisories. Linux re-enables `accesskit_unix` per target.
-accesskit_winit = { version = "=0.33.2", default-features = false, features = ["rwh_06"] }
+# The platform adapters themselves, one per system, rather than
+# `accesskit_winit`: every release of that crate is built on winit 0.30, and on
+# the two systems it serves it is a thin wrapper over these — a view or a window
+# handed over by its native handle, and told when the window takes focus. Linux
+# has no adapter yet, as it had none through `accesskit_winit` with its
+# `accesskit_unix` feature off.
+accesskit = "=0.25.1"
+accesskit_macos = "=0.27.1"
+accesskit_windows = "=0.35.1"
 
 # The system file dialogue, for `<input type=file>`. The page never opens it: it
 # asks, the shell answers, and what answers is a swappable detail — which is what

@@ -1,15 +1,15 @@
 //! The accessibility tree, handed to the platform's assistive technology.
 //!
 //! winit has no accessibility of its own — issue #1878 has been open since 2021 —
-//! so this is `accesskit_winit`, which speaks NSAccessibility on macOS, UI
-//! Automation on Windows and AT-SPI on Linux. What goes *into* the tree is the
-//! browser's business: a page's structure lives in its DOM and no toolkit can
-//! guess it.
+//! so this is AccessKit's adapter for the system: NSAccessibility on macOS, UI
+//! Automation on Windows, attached to the window by its native handle. Linux has
+//! none yet. What goes *into* the tree is the browser's business: a page's
+//! structure lives in its DOM and no toolkit can guess it.
 
 use std::sync::{Arc, Mutex};
 
-use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate};
-use winit::window::Window;
+use accesskit::{ActionHandler, ActionRequest, ActivationHandler, TreeUpdate};
+use raw_window_handle::RawWindowHandle;
 
 /// The most recent tree, shared with the adapter.
 ///
@@ -76,30 +76,55 @@ impl ActionHandler for Actions {
     }
 }
 
-impl DeactivationHandler for Actions {
-    fn deactivate_accessibility(&mut self) {}
+/// The system's adapter, attached to one window.
+#[cfg(target_os = "macos")]
+type Adapter = accesskit_macos::SubclassingAdapter;
+#[cfg(target_os = "windows")]
+type Adapter = accesskit_windows::SubclassingAdapter;
+
+/// Attach an adapter to the window `handle` names.
+#[cfg(target_os = "macos")]
+fn attach(handle: RawWindowHandle, tree: SharedTree, actions: Actions) -> Option<Adapter> {
+    let RawWindowHandle::AppKit(handle) = handle else {
+        return None;
+    };
+    // SAFETY: the view is winit's, alive for as long as its window is, and the
+    // adapter is dropped before the window (see `WindowedApp`). The adapter
+    // subclasses the view in place, which is what AccessKit asks of a view it
+    // does not own.
+    Some(unsafe { Adapter::new(handle.ns_view.as_ptr(), tree, actions) })
 }
 
-/// Wraps the platform adapter.
+#[cfg(target_os = "windows")]
+fn attach(handle: RawWindowHandle, tree: SharedTree, actions: Actions) -> Option<Adapter> {
+    let RawWindowHandle::Win32(handle) = handle else {
+        return None;
+    };
+    let hwnd = accesskit_windows::HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+    Some(Adapter::new(hwnd, tree, actions))
+}
+
+/// The adapter, where the system has one, and what it hands the browser.
 pub(crate) struct Accessibility {
-    adapter: accesskit_winit::Adapter,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    adapter: Option<Adapter>,
     tree: SharedTree,
     actions: Actions,
 }
 
 impl Accessibility {
-    /// Start the adapter for `window`, which must not yet be visible.
-    pub(crate) fn new(event_loop: &winit::event_loop::ActiveEventLoop, window: &Window) -> Self {
+    /// Start the adapter for the window `handle` names, which must not yet be
+    /// visible.
+    pub(crate) fn new(handle: RawWindowHandle) -> Self {
         let tree = SharedTree::default();
         let actions = Actions::default();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let adapter = attach(handle, tree.clone(), actions.clone());
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = handle;
         Self {
-            adapter: accesskit_winit::Adapter::with_direct_handlers(
-                event_loop,
-                window,
-                tree.clone(),
-                actions.clone(),
-                actions.clone(),
-            ),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            adapter,
             tree,
             actions,
         }
@@ -110,15 +135,32 @@ impl Accessibility {
         self.actions.take()
     }
 
-    /// Let the adapter see a window event. Focus changes in particular are how it
-    /// learns to publish anything at all.
-    pub(crate) fn process_event(&mut self, window: &Window, event: &winit::event::WindowEvent) {
-        self.adapter.process_event(window, event);
+    /// Tell the adapter whether the window has the keyboard focus, which is
+    /// how it learns to publish anything at all.
+    pub(crate) fn focus_changed(&mut self, focused: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(events) = self
+            .adapter
+            .as_mut()
+            .and_then(|adapter| adapter.update_view_focus_state(focused))
+        {
+            events.raise();
+        }
+        // Windows follows the window's focus itself.
+        #[cfg(not(target_os = "macos"))]
+        let _ = focused;
     }
 
     /// Publish a new tree.
     pub(crate) fn update(&mut self, update: TreeUpdate) {
         self.tree.set(update.clone());
-        self.adapter.update_if_active(|| update);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(events) = self
+            .adapter
+            .as_mut()
+            .and_then(|adapter| adapter.update_if_active(|| update))
+        {
+            events.raise();
+        }
     }
 }

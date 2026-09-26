@@ -18,8 +18,10 @@ smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Metal through Ganesh, the GPU backend the surface is drawn with. rust-skia
+# names the engine as a feature of its own since Graphite joined it.
 [target.'cfg(target_os = "macos")'.dependencies]
-skia-safe = { workspace = true, features = ["metal"] }
+skia-safe = { workspace = true, features = ["ganesh", "metal"] }
 
 [dev-dependencies]
 # For the comparison example, which writes the picture of what differed.
