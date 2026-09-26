@@ -8,6 +8,7 @@ use parley::{
     FontVariations, LayoutContext, OverflowWrap, PositionedLayoutItem, StyleProperty, WordBreak,
 };
 
+use crate::adjust;
 use crate::breaking::{self, Glyphs, Plan};
 use crate::web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, Resolved, WebFamilies};
 use crate::{FontStack, TEST_FAMILY, TEST_FONT};
@@ -276,6 +277,57 @@ pub struct LineMetrics {
     /// space is not one of them: it is not collapsible and does not hang, so a line
     /// ending in one is as wide as its advance says.
     pub trailing_space: f32,
+    /// How far in from the start of its room the line begins: `text-indent`,
+    /// where it applies to this line. The glyphs are already that far along.
+    pub indent: f32,
+    /// What ended the line.
+    pub end: LineEnd,
+}
+
+/// What ended a line.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LineEnd {
+    /// It wrapped at a soft wrap opportunity: the lines `text-align: justify`
+    /// spreads.
+    Wrapped,
+    /// A forced break ended it.
+    Forced,
+    /// It is the paragraph's last.
+    Last,
+}
+
+/// `text-indent`, resolved to a length (CSS Text 3 §8.1).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct Indent {
+    /// How far in the indented lines start; negative pulls them out.
+    pub amount: f32,
+    /// `hanging`: every line but those `each_line` names is indented instead.
+    pub hanging: bool,
+    /// `each-line`: the first line after each forced break is indented too.
+    pub each_line: bool,
+}
+
+/// `tab-size` (CSS Text 3 §4.2).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TabSize {
+    /// So many spaces of the paragraph's font, with its letter and word
+    /// spacing.
+    Spaces(f32),
+    /// A length.
+    Px(f32),
+}
+
+/// What a paragraph as a whole asks of its lines, rather than any one span.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct Paragraph {
+    /// `text-indent`.
+    pub indent: Indent,
+    /// How far apart the tab stops are, or `None` for eight spaces of the
+    /// first span's font — `tab-size`'s initial value, for a paragraph no
+    /// block container sets.
+    pub tab_stop: Option<f32>,
+    /// Whether the lines that wrap are spread to fill their room.
+    pub justify: bool,
 }
 
 /// A span of text with one style, for shaping a paragraph made of several.
@@ -566,6 +618,7 @@ impl TextEngine {
         self.shape_spans(
             &[TextSpan::new(text, stack.clone(), font_size)],
             &[],
+            &Paragraph::default(),
             max_advance,
         )
     }
@@ -669,9 +722,12 @@ impl TextEngine {
         &mut self,
         spans: &[TextSpan<'_>],
         spacers: &[Spacer],
+        paragraph: &Paragraph,
         max_advance: Option<f32>,
     ) -> ShapedText {
-        self.shape_paragraph(spans, spacers, max_advance.is_some(), |_, _| max_advance)
+        self.shape_paragraph(spans, spacers, paragraph, max_advance.is_some(), |_, _| {
+            max_advance
+        })
     }
 
     /// Shape several spans as one paragraph, with the width decided line by line.
@@ -690,9 +746,10 @@ impl TextEngine {
         &mut self,
         spans: &[TextSpan<'_>],
         spacers: &[Spacer],
+        paragraph: &Paragraph,
         line_width: impl FnMut(usize, f32) -> Option<f32>,
     ) -> ShapedText {
-        self.shape_paragraph(spans, spacers, true, line_width)
+        self.shape_paragraph(spans, spacers, paragraph, true, line_width)
     }
 
     /// Shape a paragraph and break it into lines as wide as `line_width` says,
@@ -702,6 +759,7 @@ impl TextEngine {
         &mut self,
         spans: &[TextSpan<'_>],
         spacers: &[Spacer],
+        paragraph: &Paragraph,
         wraps: bool,
         line_width: impl FnMut(usize, f32) -> Option<f32>,
     ) -> ShapedText {
@@ -732,17 +790,33 @@ impl TextEngine {
                 });
             Plan::new(&layout, unedged.as_ref().unwrap_or(&layout), &text, &kinds)
         });
-        break_lines(&mut layout, plan.as_ref(), line_width);
+        let indent = paragraph.indent;
+        layout.set_text_indent(
+            indent.amount,
+            parley::IndentOptions {
+                each_line: indent.each_line,
+                hanging: indent.hanging,
+            },
+        );
+        let rooms = break_lines(&mut layout, plan.as_ref(), indent, line_width);
         layout.align(Alignment::Start, AlignmentOptions::default());
-        let mut shaped = collect(&layout, &text, &kinds);
+        let mut shaped = collect(&layout, &text, &kinds, &rooms);
 
         // A tab is not a character of a width: it is a jump to the next tab stop,
         // and where that is depends on how far along the line the tab sits. The
         // shaper has no idea of one, so the glyphs after a tab are moved here,
         // once the line they landed on is known.
         if text.contains('\t') {
-            let stop = self.tab_stop(spans.first());
-            expand_tabs(&mut shaped, stop);
+            let stop = match (paragraph.tab_stop, spans.first()) {
+                (Some(stop), _) => stop,
+                (None, Some(first)) => self.tab_stop(first, TabSize::Spaces(8.0)),
+                (None, None) => 0.0,
+            };
+            adjust::expand_tabs(&mut shaped, stop);
+        }
+        if paragraph.justify {
+            let widths: Vec<f32> = rooms.iter().map(|room| room.width).collect();
+            adjust::justify(&mut shaped, &widths);
         }
         shaped
     }
@@ -873,23 +947,26 @@ impl TextEngine {
         builder.build(text)
     }
 
-    /// How far apart the tab stops are: eight spaces of the paragraph's own font,
-    /// which is `tab-size`'s initial value and the only one read.
-    fn tab_stop(&mut self, span: Option<&TextSpan<'_>>) -> f32 {
-        const TAB_SIZE: f32 = 8.0;
-
-        let Some(span) = span else {
-            return 0.0;
-        };
-        // The *advance* of a space rather than the width of the line it makes:
-        // a line of nothing but white space is a line of no width, because
-        // trailing white space is not part of what a paragraph measures.
-        let space = self
-            .shape(" ", &span.font_stack, span.font_size, None)
-            .lines
-            .first()
-            .map_or(0.0, |line| line.width);
-        space * TAB_SIZE
+    /// How far apart the tab stops of text set like `span` are, for a
+    /// `tab-size` of `size` (CSS Text 3 §4.2): a length as it is, or so many
+    /// spaces, each as wide as the font's space with the letter and word
+    /// spacing added to it. Zero is a tab that advances nothing.
+    pub fn tab_stop(&mut self, span: &TextSpan<'_>, size: TabSize) -> f32 {
+        match size {
+            TabSize::Px(px) => px,
+            TabSize::Spaces(count) => {
+                // The *advance* of a space rather than the width of the line
+                // it makes: a line of nothing but white space is a line of no
+                // width, because trailing white space is not part of what a
+                // paragraph measures.
+                let space = self
+                    .shape(" ", &span.font_stack, span.font_size, None)
+                    .lines
+                    .first()
+                    .map_or(0.0, |line| line.width);
+                count * (space + span.letter_spacing + span.word_spacing)
+            }
+        }
     }
 
     /// Measure without keeping the glyphs.
@@ -1002,30 +1079,45 @@ impl TextEngine {
 /// draw, so it fits.
 pub(crate) const LINE_FIT_SLACK: f32 = 1.0 / 64.0;
 
-/// Break `layout` into lines, asking `line_width` how wide each one may be.
+/// The room a line was broken in, and how far in it started.
+#[derive(Copy, Clone, Debug)]
+struct Room {
+    width: f32,
+    indent: f32,
+}
+
+/// Break `layout` into lines, asking `line_width` how wide each one may be,
+/// and say what room each one had.
 ///
 /// One line at a time rather than all at once, because the answer for a line
 /// depends on where the line landed. Where there is a `plan`, it chooses where
-/// each line ends and the shaper is given the advance that ends it there.
+/// each line ends and the shaper is given the advance that ends it there. An
+/// indented line has the indent taken off its room first, as the shaper takes
+/// it off the advance it is given.
 fn break_lines(
     layout: &mut parley::Layout<SpanBrush>,
     plan: Option<&Plan>,
+    indent: Indent,
     mut line_width: impl FnMut(usize, f32) -> Option<f32>,
-) {
+) -> Vec<Room> {
     let mut breaker = layout.break_lines();
     let mut index = 0usize;
     let mut top = 0.0f32;
     let mut start = 0usize;
+    let mut after_forced = true;
+    let mut rooms = Vec::new();
 
     loop {
-        let room = line_width(index, top).map_or(f32::INFINITY, |width| width + LINE_FIT_SLACK);
+        let room = line_width(index, top).unwrap_or(f32::INFINITY);
+        let indented = (after_forced && (index == 0 || indent.each_line)) != indent.hanging;
+        let offset = if indented { indent.amount } else { 0.0 };
         let width = match plan {
             Some(plan) => {
-                let (advance, next) = plan.line(start, room);
+                let (advance, next) = plan.line(start, room - offset + LINE_FIT_SLACK);
                 start = next;
-                advance
+                advance + offset
             }
-            None => room,
+            None => room + LINE_FIT_SLACK,
         };
         // parley asserts the two are the same, and they are two names for one
         // thing until a line can be narrower than the paragraph it is in.
@@ -1035,6 +1127,11 @@ fn break_lines(
         match breaker.break_next() {
             Some(parley::YieldData::LineBreak(line)) => {
                 top = line.line_y_end as f32;
+                after_forced = line.reason == parley::BreakReason::Explicit;
+                rooms.push(Room {
+                    width: room,
+                    indent: offset,
+                });
                 index += 1;
             }
             // The other yields are for callers that place their own boxes or cap
@@ -1043,110 +1140,7 @@ fn break_lines(
             None => break,
         }
     }
-}
-
-/// Move what follows each tab to the next tab stop.
-///
-/// A tab in CSS is a jump and not a character: what it advances by is however far
-/// it is to the next stop, so it can only be settled once the glyphs before it on
-/// the line have been placed. The shaper knows nothing of stops — it gives the
-/// tab whatever advance the font has for it — so the glyphs after one are moved
-/// along here, and the line grows by what they moved.
-///
-/// Left to right, because where each tab lands depends on the ones before it. A
-/// line that was *broken* with the tab at its font width was broken a little
-/// early, which shows only where a paragraph both preserves tabs and wraps.
-fn expand_tabs(shaped: &mut ShapedText, stop: f32) {
-    if stop <= 0.0 {
-        return;
-    }
-
-    for line in 0..shaped.lines.len() {
-        for (run_index, glyph_index) in tabs_on(shaped, line) {
-            let run = &shaped.runs[run_index];
-            let at = run.glyphs[glyph_index].x;
-            let after = run
-                .glyphs
-                .get(glyph_index + 1)
-                .map_or(run.offset_x + run.advance, |glyph| glyph.x);
-            // The next stop strictly past where the tab starts: a tab that lands
-            // exactly on one still goes to the following one, which is what makes
-            // a tab always take room.
-            let target = ((at / stop).floor() + 1.0) * stop;
-            let delta = target - after;
-            if delta.abs() < 0.01 {
-                continue;
-            }
-            shift_after(shaped, line, run_index, glyph_index, delta);
-        }
-    }
-}
-
-/// Where the tabs on one line are, as a run and a glyph in it, left to right.
-///
-/// Taken before anything moves and read back as things do: shifting a glyph does
-/// not change which glyph it is, and each tab's own position is read again when
-/// its turn comes.
-///
-/// Each glyph is asked which character it drew rather than counted against the
-/// text: a tab is never part of a ligature, but anything ligated in front of one
-/// on the same line would otherwise put the jump on the wrong glyph.
-fn tabs_on(shaped: &ShapedText, line: usize) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    for (run_index, run) in shaped.runs.iter().enumerate() {
-        if run.line != line {
-            continue;
-        }
-        for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
-            if run
-                .text
-                .get(glyph.text_offset as usize..)
-                .is_some_and(|rest| rest.starts_with('\t'))
-            {
-                out.push((run_index, glyph_index));
-            }
-        }
-    }
-    out
-}
-
-/// Move everything after one glyph on a line along by `delta`.
-fn shift_after(
-    shaped: &mut ShapedText,
-    line: usize,
-    run_index: usize,
-    glyph_index: usize,
-    delta: f32,
-) {
-    let from = shaped.runs[run_index].offset_x;
-
-    for (index, run) in shaped.runs.iter_mut().enumerate() {
-        if run.line != line || index < run_index {
-            continue;
-        }
-        if index == run_index {
-            for glyph in run.glyphs.iter_mut().skip(glyph_index + 1) {
-                glyph.x += delta;
-            }
-            run.advance += delta;
-        } else {
-            run.offset_x += delta;
-            for glyph in &mut run.glyphs {
-                glyph.x += delta;
-            }
-        }
-    }
-
-    for spacer in &mut shaped.spacers {
-        if spacer.line == line && spacer.x >= from {
-            spacer.x += delta;
-        }
-    }
-
-    if let Some(metrics) = shaped.lines.get_mut(line) {
-        metrics.width += delta;
-        shaped.metrics.width = shaped.metrics.width.max(metrics.width);
-    }
+    rooms
 }
 
 /// Pull runs, lines and metrics out of a broken parley layout.
@@ -1160,6 +1154,7 @@ fn collect(
     layout: &parley::Layout<SpanBrush>,
     text: &str,
     kinds: &HashMap<u64, SpacerKind>,
+    rooms: &[Room],
 ) -> ShapedText {
     let text_len = text.len();
     let mut runs = Vec::new();
@@ -1212,6 +1207,12 @@ fn collect(
             trailing_space: hanging_space(&line, text, kinds),
             bottom: top + metrics.line_height,
             width: metrics.advance,
+            indent: rooms.get(index).map_or(0.0, |room| room.indent),
+            end: match line.break_reason() {
+                parley::BreakReason::Regular | parley::BreakReason::Emergency => LineEnd::Wrapped,
+                parley::BreakReason::Explicit => LineEnd::Forced,
+                parley::BreakReason::None => LineEnd::Last,
+            },
         });
 
         for item in line.items() {
@@ -1328,9 +1329,11 @@ fn collect(
     // The widest line without what hangs off its end. The shaper's own answer
     // leaves out every kind of white space a line ends in, no-break spaces too,
     // and a box sized to that is one no-break space too narrow for its text.
+    // An indent pushes a line along its room, and so is part of what the
+    // paragraph needs; one that pulls a line out needs nothing.
     let width = lines
         .iter()
-        .map(|line| line.width - line.trailing_space)
+        .map(|line| line.indent.max(0.0) + line.width - line.trailing_space)
         .fold(0.0, f32::max);
 
     ShapedText {
@@ -1703,7 +1706,7 @@ mod tests {
                 overflow_wrap: wrap,
                 ..TextSpan::new("Supercalifragilistic", test_stack(), 16.0)
             };
-            engine.shape_spans(&[span], &[], Some(48.0))
+            engine.shape_spans(&[span], &[], &Paragraph::default(), Some(48.0))
         };
         assert_eq!(shaped(&mut engine, OverflowWrap::Normal).lines.len(), 1);
         let broken = shaped(&mut engine, OverflowWrap::Anywhere);
@@ -1725,7 +1728,7 @@ mod tests {
             word_break: WordBreak::BreakAll,
             ..TextSpan::new("abcdefghij klmnop", test_stack(), 16.0)
         };
-        let shaped = engine.shape_spans(&[all], &[], Some(40.0));
+        let shaped = engine.shape_spans(&[all], &[], &Paragraph::default(), Some(40.0));
         assert!(
             shaped
                 .lines
@@ -1747,7 +1750,7 @@ mod tests {
             },
             TextSpan::new(" eee", test_stack(), 16.0),
         ];
-        let shaped = engine.shape_spans(&spans, &[], Some(60.0));
+        let shaped = engine.shape_spans(&spans, &[], &Paragraph::default(), Some(60.0));
         let lines_of = |needle: &str| -> Vec<usize> {
             shaped
                 .runs
@@ -1770,7 +1773,9 @@ mod tests {
     fn features_reach_the_shaper() {
         let mut engine = engine();
         let glyphs = |engine: &mut TextEngine, span: TextSpan<'_>| {
-            engine.shape_spans(&[span], &[], None).glyph_count()
+            engine
+                .shape_spans(&[span], &[], &Paragraph::default(), None)
+                .glyph_count()
         };
         let no_liga = [(*b"liga", 0)];
         let plain = TextSpan::new("fi", test_stack(), 16.0);
@@ -1799,11 +1804,128 @@ mod tests {
                 features,
                 ..TextSpan::new("AVAVAV", test_stack(), 32.0)
             };
-            engine.shape_spans(&[span], &[], None).metrics.width
+            engine
+                .shape_spans(&[span], &[], &Paragraph::default(), None)
+                .metrics
+                .width
         };
         let kerned = width(&mut engine, &[]);
         let unkerned = width(&mut engine, &no_kern);
         assert!(unkerned > kerned, "{unkerned} against {kerned}");
+    }
+
+    /// The first line starts `text-indent` along, the rest at the start;
+    /// with each-line the line after a forced break is indented too, and
+    /// hanging turns it round.
+    #[test]
+    fn an_indent_moves_the_lines_it_applies_to() {
+        let mut engine = engine();
+        let starts = |engine: &mut TextEngine, indent: Indent, text: &str| -> Vec<f32> {
+            let span = TextSpan::new(text, test_stack(), 16.0);
+            let paragraph = Paragraph {
+                indent,
+                ..Paragraph::default()
+            };
+            let shaped = engine.shape_spans(&[span], &[], &paragraph, Some(120.0));
+            (0..shaped.lines.len())
+                .map(|line| {
+                    shaped
+                        .runs
+                        .iter()
+                        .filter(|run| run.line == line)
+                        .filter_map(|run| run.glyphs.first().map(|glyph| glyph.x))
+                        .fold(f32::INFINITY, f32::min)
+                })
+                .collect()
+        };
+        let forty = |hanging, each_line| Indent {
+            amount: 40.0,
+            hanging,
+            each_line,
+        };
+        let text = "alpha beta gamma delta epsilon";
+        let plain = starts(&mut engine, forty(false, false), text);
+        assert!(
+            (plain[0] - 40.0).abs() < 0.5 && plain[1].abs() < 0.5,
+            "{plain:?}"
+        );
+        let hanging = starts(&mut engine, forty(true, false), text);
+        assert!(
+            hanging[0].abs() < 0.5 && (hanging[1] - 40.0).abs() < 0.5,
+            "{hanging:?}"
+        );
+        let each = starts(&mut engine, forty(false, true), "one\ntwo");
+        assert!((each[1] - 40.0).abs() < 0.5, "{each:?}");
+        let once = starts(&mut engine, forty(false, false), "one\ntwo");
+        assert!(once[1].abs() < 0.5, "{once:?}");
+    }
+
+    /// A justified paragraph spreads each wrapped line to its room; its last
+    /// line, and one before a forced break, keep their width, and each line
+    /// says what ended it.
+    #[test]
+    fn justified_lines_fill_their_room() {
+        let mut engine = engine();
+        let span = TextSpan::new(
+            "the quick brown fox jumps over the lazy dog\nand then some more words to wrap",
+            test_stack(),
+            16.0,
+        );
+        let paragraph = Paragraph {
+            justify: true,
+            ..Paragraph::default()
+        };
+        let shaped = engine.shape_spans(&[span], &[], &paragraph, Some(200.0));
+        let ends: Vec<LineEnd> = shaped.lines.iter().map(|line| line.end).collect();
+        assert!(ends.contains(&LineEnd::Forced), "{ends:?}");
+        assert_eq!(ends.last(), Some(&LineEnd::Last));
+        for (index, line) in shaped.lines.iter().enumerate() {
+            let reach = line.width - line.trailing_space;
+            match line.end {
+                LineEnd::Wrapped => assert!((reach - 200.0).abs() < 0.5, "line {index}: {reach}"),
+                LineEnd::Forced | LineEnd::Last => assert!(reach < 199.0, "line {index}: {reach}"),
+            }
+        }
+    }
+
+    /// A tab jumps to the next stop: half as far at four spaces as at eight,
+    /// thirty pixels for a length of thirty, and nowhere for none.
+    #[test]
+    fn tab_size_sets_the_stops() {
+        let mut engine = engine();
+        let span = TextSpan::new("\tx", test_stack(), 16.0);
+        let eight = engine.tab_stop(&span, TabSize::Spaces(8.0));
+        let four = engine.tab_stop(&span, TabSize::Spaces(4.0));
+        assert!((eight - 2.0 * four).abs() < 0.01);
+        assert_eq!(engine.tab_stop(&span, TabSize::Px(30.0)), 30.0);
+        let x_after = |engine: &mut TextEngine, stop| {
+            let paragraph = Paragraph {
+                tab_stop: Some(stop),
+                ..Paragraph::default()
+            };
+            let shaped = engine.shape_spans(std::slice::from_ref(&span), &[], &paragraph, None);
+            shaped.runs[0].glyphs[1].x
+        };
+        assert!((x_after(&mut engine, 30.0) - 30.0).abs() < 0.01);
+        assert!(x_after(&mut engine, 0.0) < 10.0, "no stop, no jump");
+    }
+
+    /// A run is cut between clusters, never through a ligature, and carries
+    /// the text and range of what it kept.
+    #[test]
+    fn keep_before_cuts_between_clusters() {
+        let mut engine = engine();
+        let run = engine.shape("office hours", &test_stack(), 16.0, None).runs[0].clone();
+        let whole = run.offset_x + run.advance;
+        let cut = run.keep_before(whole / 2.0).expect("some of it");
+        assert!(cut.advance <= whole / 2.0 + 0.01);
+        assert!(run.text.starts_with(&*cut.text));
+        assert_eq!(cut.text_range.len(), cut.text.len());
+        let ends_on_cluster = cut.glyphs.len() == run.glyphs.len()
+            || run.glyphs[cut.glyphs.len()].text_offset
+                != run.glyphs[cut.glyphs.len() - 1].text_offset;
+        assert!(ends_on_cluster, "never inside a cluster");
+        assert!(run.keep_before(0.5).is_none(), "not even the first letter");
     }
 
     /// Half-leading is shared out with the half above rounded down: Fira Sans
@@ -1879,7 +2001,7 @@ mod tests {
             font_weight: weight,
             ..TextSpan::new(text, FontStack::named(family), 16.0)
         };
-        let shaped = engine.shape_spans(&[span], &[], None);
+        let shaped = engine.shape_spans(&[span], &[], &Paragraph::default(), None);
         let run = shaped.runs.first().expect("a run");
         assert!(
             shaped
@@ -2137,13 +2259,19 @@ mod tests {
     #[test]
     fn letter_spacing_is_added_after_every_character() {
         let mut engine = engine();
-        let plain = engine.shape_spans(&[TextSpan::new("abcdef", test_stack(), 16.0)], &[], None);
+        let plain = engine.shape_spans(
+            &[TextSpan::new("abcdef", test_stack(), 16.0)],
+            &[],
+            &Paragraph::default(),
+            None,
+        );
         let spaced = engine.shape_spans(
             &[TextSpan {
                 letter_spacing: 2.0,
                 ..TextSpan::new("abcdef", test_stack(), 16.0)
             }],
             &[],
+            &Paragraph::default(),
             None,
         );
 
@@ -2159,13 +2287,19 @@ mod tests {
     #[test]
     fn word_spacing_is_added_at_every_space() {
         let mut engine = engine();
-        let plain = engine.shape_spans(&[TextSpan::new("a b c", test_stack(), 16.0)], &[], None);
+        let plain = engine.shape_spans(
+            &[TextSpan::new("a b c", test_stack(), 16.0)],
+            &[],
+            &Paragraph::default(),
+            None,
+        );
         let spaced = engine.shape_spans(
             &[TextSpan {
                 word_spacing: 10.0,
                 ..TextSpan::new("a b c", test_stack(), 16.0)
             }],
             &[],
+            &Paragraph::default(),
             None,
         );
 
@@ -2184,7 +2318,12 @@ mod tests {
     fn a_static_font_is_unmoved_by_variation_settings() {
         let mut engine = engine();
         let plain = engine
-            .shape_spans(&[TextSpan::new("Otlyra", test_stack(), 32.0)], &[], None)
+            .shape_spans(
+                &[TextSpan::new("Otlyra", test_stack(), 32.0)],
+                &[],
+                &Paragraph::default(),
+                None,
+            )
             .metrics
             .width;
 
@@ -2202,7 +2341,10 @@ mod tests {
                 ..TextSpan::new("Otlyra", test_stack(), 32.0)
             },
         ] {
-            let width = engine.shape_spans(&[span], &[], None).metrics.width;
+            let width = engine
+                .shape_spans(&[span], &[], &Paragraph::default(), None)
+                .metrics
+                .width;
             assert!(
                 (width - plain).abs() < 0.01,
                 "a static font moved from {plain} to {width}"
@@ -2218,6 +2360,7 @@ mod tests {
         let shaped = engine.shape_spans(
             &[span("red ", 16.0, red), span("blue", 16.0, blue)],
             &[],
+            &Paragraph::default(),
             None,
         );
 
@@ -2232,7 +2375,7 @@ mod tests {
         let mut engine = engine();
         let brush = [0, 0, 0, 255];
         let spans = [span("one", 16.0, brush), span("two", 16.0, brush)];
-        let plain = engine.shape_spans(&spans, &[], None);
+        let plain = engine.shape_spans(&spans, &[], &Paragraph::default(), None);
         let marked = engine.shape_spans(
             &spans,
             &[
@@ -2251,6 +2394,7 @@ mod tests {
                     height: 0.0,
                 },
             ],
+            &Paragraph::default(),
             None,
         );
 
@@ -2276,7 +2420,7 @@ mod tests {
         let mut engine = engine();
         let brush = [0, 0, 0, 255];
         let spans = [span("before ", 16.0, brush), span(" after", 16.0, brush)];
-        let plain = engine.shape_spans(&spans, &[], None);
+        let plain = engine.shape_spans(&spans, &[], &Paragraph::default(), None);
         let with_box = engine.shape_spans(
             &spans,
             &[Spacer {
@@ -2286,6 +2430,7 @@ mod tests {
                 width: 32.0,
                 height: 32.0,
             }],
+            &Paragraph::default(),
             None,
         );
 
@@ -2311,7 +2456,7 @@ mod tests {
         let mut engine = engine();
         let brush = [0, 0, 0, 255];
         let spans = [span("one", 16.0, brush), span("two", 16.0, brush)];
-        let plain = engine.shape_spans(&spans, &[], None);
+        let plain = engine.shape_spans(&spans, &[], &Paragraph::default(), None);
         let spaced = engine.shape_spans(
             &spans,
             &[Spacer {
@@ -2321,6 +2466,7 @@ mod tests {
                 width: 20.0,
                 height: 0.0,
             }],
+            &Paragraph::default(),
             None,
         );
 
@@ -2335,12 +2481,13 @@ mod tests {
         let brush = [0, 0, 0, 255];
         let spans = [span("alpha beta gamma delta epsilon", 16.0, brush)];
 
-        let even = engine.shape_spans(&spans, &[], Some(200.0));
+        let even = engine.shape_spans(&spans, &[], &Paragraph::default(), Some(200.0));
         // The first two lines are half as wide, as a float beside them would make
         // them; the rest of the paragraph gets the full width back.
-        let stepped = engine.shape_spans_wrapping(&spans, &[], |index, _| {
-            Some(if index < 2 { 100.0 } else { 200.0 })
-        });
+        let stepped =
+            engine.shape_spans_wrapping(&spans, &[], &Paragraph::default(), |index, _| {
+                Some(if index < 2 { 100.0 } else { 200.0 })
+            });
 
         assert!(stepped.lines.len() > even.lines.len());
         assert!(stepped.lines[0].width <= 100.0);
@@ -2359,6 +2506,7 @@ mod tests {
         let together = engine.shape_spans(
             &[span("alpha ", 16.0, brush), span("beta", 16.0, brush)],
             &[],
+            &Paragraph::default(),
             Some(48.0),
         );
         let one_string = engine.shape("alpha beta", &test_stack(), 16.0, Some(48.0));
@@ -2381,6 +2529,7 @@ mod tests {
         let mixed = engine.shape_spans(
             &[span("small ", 12.0, brush), span("BIG", 32.0, brush)],
             &[],
+            &Paragraph::default(),
             None,
         );
 
@@ -2473,9 +2622,9 @@ mod tests {
             edge(0, SpacerKind::Opening, 0, 5.0),
             edge(1, SpacerKind::Closing, 1, 0.0),
         ];
-        let narrowest = engine.shape_spans(&spans, &edges, Some(0.0));
+        let narrowest = engine.shape_spans(&spans, &edges, &Paragraph::default(), Some(0.0));
         assert_eq!(line_texts(&narrowest), ["AboutUs"]);
-        let widest = engine.shape_spans(&spans, &edges, None);
+        let widest = engine.shape_spans(&spans, &edges, &Paragraph::default(), None);
         assert!((narrowest.lines[0].width - widest.metrics.width).abs() < 0.01);
     }
 
@@ -2495,7 +2644,7 @@ mod tests {
             edge(0, SpacerKind::Opening, 0, 6.0),
             edge(1, SpacerKind::Closing, 1, 0.0),
         ];
-        let shaped = engine.shape_spans(&spans, &edges, Some(60.0));
+        let shaped = engine.shape_spans(&spans, &edges, &Paragraph::default(), Some(60.0));
         assert_eq!(line_texts(&shaped), ["Averyveryverylongword ", "tail"]);
         let start = shaped.spacers.iter().find(|spacer| spacer.id == 0);
         assert_eq!(start.map(|spacer| (spacer.line, spacer.x)), Some((0, 0.0)));
@@ -2512,7 +2661,7 @@ mod tests {
             height: 10.0,
             ..edge(0, SpacerKind::Atomic, 1, 10.0)
         };
-        let shaped = engine.shape_spans(&spans, &[picture], Some(0.0));
+        let shaped = engine.shape_spans(&spans, &[picture], &Paragraph::default(), Some(0.0));
         assert_eq!(line_texts(&shaped), ["ab", "", "cd"]);
     }
 

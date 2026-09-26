@@ -22,12 +22,42 @@ use super::vertical_align::shift_on_line;
 /// Alignment moves the whole line, glyphs and all: the shaper laid it out from
 /// the start edge, and where that edge is is the block's decision, not the
 /// paragraph's. It is against what the line actually had to fill, which is
-/// narrower than the block wherever a float sits beside it.
+/// narrower than the block wherever a float sits beside it and than that by
+/// its indent, and against the line without the white space that hangs at its
+/// end (CSS Text 3 §4.1.3), which is no part of what is centred.
+///
+/// A line that wrapped is aligned as `text-align` says; one a forced break or
+/// the paragraph's end ended, as `text-align-last` does (§7.3). A justified
+/// line was spread by the shaper and starts at the start. `text-align-last:
+/// justify` is not done: such a line is aligned to its start.
 pub(super) fn line_offset(style: &ComputedStyle, line: &LineMetrics, band: Band) -> f32 {
-    match style.text_align {
-        otlyra_css::TextAlign::Start => 0.0,
-        otlyra_css::TextAlign::Center => ((band.width - line.width) / 2.0).max(0.0),
-        otlyra_css::TextAlign::End => (band.width - line.width).max(0.0),
+    use otlyra_css::{TextAlign, TextAlignLast};
+
+    #[derive(Copy, Clone)]
+    enum Edge {
+        Start,
+        Center,
+        End,
+    }
+    let of_align = |align: TextAlign| match align {
+        TextAlign::Start | TextAlign::Justify => Edge::Start,
+        TextAlign::Center => Edge::Center,
+        TextAlign::End => Edge::End,
+    };
+    let edge = match line.end {
+        otlyra_text::LineEnd::Wrapped => of_align(style.text_align),
+        otlyra_text::LineEnd::Forced | otlyra_text::LineEnd::Last => match style.text_align_last {
+            TextAlignLast::Auto => of_align(style.text_align),
+            TextAlignLast::Start | TextAlignLast::Justify => Edge::Start,
+            TextAlignLast::Center => Edge::Center,
+            TextAlignLast::End => Edge::End,
+        },
+    };
+    let free = band.width - line.indent - (line.width - line.trailing_space);
+    match edge {
+        Edge::Start => 0.0,
+        Edge::Center => (free / 2.0).max(0.0),
+        Edge::End => free.max(0.0),
     }
 }
 

@@ -53,7 +53,8 @@ pub use style::{
     Corners, DecorationLines, DecorationStyle, Display, FlexBasis, FlexDirection, FlexWrap, Float,
     FontStyle, Gradient, GradientStop, Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight,
     ListStyle, MaxSize, ObjectFit, Overflow, OverflowWrap, Position, Ratio, Repeat, Shadow, Sides,
-    Size, TextAlign, TextCase, TextDecoration, TextTransform, TextWrap, TransformOp,
-    TransformOrigin, VerticalAlign, WhiteSpace, WordBreak,
+    Size, TabSize, TextAlign, TextAlignLast, TextCase, TextDecoration, TextIndent, TextJustify,
+    TextOverflow, TextTransform, TextWrap, TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
+    WordBreak,
 };
 pub use style::{FamilyName, FontFamily, GenericFamily};

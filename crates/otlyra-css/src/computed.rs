@@ -23,8 +23,8 @@ use crate::style::{
     TransformOrigin, WhiteSpace,
 };
 use crate::style::{
-    DecorationLines, DecorationStyle, FamilyName, FontFamily, GenericFamily, OverflowWrap,
-    TextCase, TextTransform, WordBreak,
+    DecorationLines, DecorationStyle, FamilyName, FontFamily, GenericFamily, OverflowWrap, TabSize,
+    TextAlignLast, TextCase, TextIndent, TextJustify, TextOverflow, TextTransform, WordBreak,
 };
 
 /// Convert one element's computed values into the style layout reads.
@@ -106,6 +106,11 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         },
         border: border(values),
         text_align: text_align(values),
+        text_align_last: text_align_last(values),
+        text_justify: text_justify(values),
+        text_indent: text_indent(values),
+        tab_size: tab_size(values),
+        text_overflow: text_overflow(values),
         width: size(&values.get_position().width),
         height: size(&values.get_position().height),
         min_width: size(&values.get_position().min_width),
@@ -416,11 +421,68 @@ fn text_align(values: &ComputedValues) -> TextAlign {
     use style::values::computed::TextAlign as Computed;
 
     match values.clone_text_align() {
+        Computed::Start | Computed::Left | Computed::MozLeft => TextAlign::Start,
         Computed::Center | Computed::MozCenter => TextAlign::Center,
         Computed::Right | Computed::End | Computed::MozRight => TextAlign::End,
-        // `justify` spaces a line out, which inline layout does not do; its start
-        // edge is where a start-aligned line begins, so that is what it gets.
-        _ => TextAlign::Start,
+        Computed::Justify => TextAlign::Justify,
+    }
+}
+
+/// `text-align-last`, with left and right as start and end in the one
+/// writing direction there is.
+fn text_align_last(values: &ComputedValues) -> TextAlignLast {
+    use style::values::computed::text::TextAlignLast as Computed;
+
+    match values.clone_text_align_last() {
+        Computed::Auto => TextAlignLast::Auto,
+        Computed::Start | Computed::Left => TextAlignLast::Start,
+        Computed::End | Computed::Right => TextAlignLast::End,
+        Computed::Center => TextAlignLast::Center,
+        Computed::Justify => TextAlignLast::Justify,
+    }
+}
+
+/// `text-justify`, `distribute` arriving as `inter-character`.
+fn text_justify(values: &ComputedValues) -> TextJustify {
+    use style::values::computed::TextJustify as Computed;
+
+    match values.clone_text_justify() {
+        Computed::Auto => TextJustify::Auto,
+        Computed::None => TextJustify::None,
+        Computed::InterWord => TextJustify::InterWord,
+        Computed::InterCharacter => TextJustify::InterCharacter,
+    }
+}
+
+/// `text-indent`.
+fn text_indent(values: &ComputedValues) -> TextIndent {
+    let indent = &values.get_inherited_text().text_indent;
+    TextIndent {
+        length: length_percentage(&indent.length),
+        hanging: indent.hanging,
+        each_line: indent.each_line,
+    }
+}
+
+/// `tab-size`: a number of spaces or a length.
+fn tab_size(values: &ComputedValues) -> TabSize {
+    use style::values::generics::length::LengthOrNumber;
+
+    match &values.get_inherited_text().tab_size {
+        LengthOrNumber::Number(spaces) => TabSize::Spaces(spaces.0),
+        LengthOrNumber::Length(length) => TabSize::Px(length.0.px()),
+    }
+}
+
+/// `text-overflow` at the end of a line: the second value where two are
+/// given, and the one value otherwise, which is what the second is then.
+fn text_overflow(values: &ComputedValues) -> TextOverflow {
+    use style::values::specified::text::TextOverflowSide as Side;
+
+    match &values.get_text().text_overflow.second {
+        Side::Clip => TextOverflow::Clip,
+        Side::Ellipsis => TextOverflow::Ellipsis,
+        Side::String(string) => TextOverflow::String(Arc::from(string.to_string())),
     }
 }
 
@@ -2170,7 +2232,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn text_align_narrows_to_the_three_a_line_box_can_honour() {
+    fn text_align_arrives_in_the_one_writing_direction() {
         let align = |css: &str| {
             layout_style(
                 &format!("<style>p {{ text-align: {css} }}</style><p>x"),
@@ -2181,8 +2243,47 @@ pub(crate) mod tests {
         assert_eq!(align("center"), TextAlign::Center);
         assert_eq!(align("right"), TextAlign::End);
         assert_eq!(align("left"), TextAlign::Start);
-        // Justification spaces a line out, which inline layout does not do.
-        assert_eq!(align("justify"), TextAlign::Start);
+        assert_eq!(align("justify"), TextAlign::Justify);
+        assert_eq!(align("-webkit-center"), TextAlign::Center);
+    }
+
+    /// The properties that shape a paragraph as a whole: `text-align-last`,
+    /// `text-justify`, `text-indent`, `tab-size` and `text-overflow`, the last
+    /// taken at the end of the line and not inherited.
+    #[test]
+    fn paragraph_properties_are_read() {
+        let style = layout_style(
+            "<style>p { text-align-last: right; text-justify: none; \
+             text-indent: 10%; tab-size: 4; \
+             text-overflow: ellipsis; overflow: hidden }</style><p><b>x</b></p>",
+            "p",
+        );
+        assert_eq!(style.text_align_last, TextAlignLast::End);
+        assert_eq!(style.text_justify, TextJustify::None);
+        assert_eq!(
+            style.text_indent,
+            TextIndent {
+                length: Length::Percent(0.1),
+                hanging: false,
+                each_line: false,
+            }
+        );
+        // `hanging` and `each-line` are Gecko's alone in the cascade: the
+        // declaration that names them is dropped.
+        let keyworded = layout_style("<p style='text-indent: 1px hanging'>x</p>", "p");
+        assert_eq!(keyworded.text_indent, TextIndent::NONE);
+        assert_eq!(style.tab_size, TabSize::Spaces(4.0));
+        assert_eq!(style.text_overflow, TextOverflow::Ellipsis);
+
+        let inner = layout_style(
+            "<style>p { tab-size: 30px; text-overflow: clip '>'; text-indent: 2em }</style><p><b>x</b></p>",
+            "b",
+        );
+        assert_eq!(inner.tab_size, TabSize::Px(30.0));
+        assert_eq!(inner.text_overflow, TextOverflow::Clip, "not inherited");
+        assert_eq!(inner.text_indent.length, Length::Px(32.0), "inherited");
+        let marked = layout_style("<p style=\"text-overflow: clip '>'\">x</p>", "p");
+        assert_eq!(marked.text_overflow, TextOverflow::String(Arc::from(">")));
     }
 
     /// The four ways a box can treat the white space in it, which is more than

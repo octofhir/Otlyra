@@ -54,7 +54,8 @@ impl<'a> Flow<'a> {
             let mut span = span_for(text, &marker.style, stack.clone());
             // Whatever the item's first line does, the marker is one line of its own.
             span.line_height = None;
-            self.text.shape_spans(&[span], &[], None)
+            self.text
+                .shape_spans(&[span], &[], &otlyra_text::Paragraph::default(), None)
         };
         let shaped = measure(&marker.marker.text);
         // The gap is a space set in the item's own font, which is what CSS puts

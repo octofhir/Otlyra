@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Where lines start and end</title>
+<style>
+  body { margin: 16px; font: 16px/1.4 Arial, sans-serif; }
+  h2 { font: bold 13px/1.4 system-ui, sans-serif; margin: 16px 0 4px; color: #555; }
+  .box { width: 320px; background: #f2f2f2; }
+  .logo { display: block; width: 120px; height: 24px; background: #9cf; overflow: hidden; text-indent: -9999px; }
+  .cell { width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #eef; }
+  .float { float: left; width: 100px; height: 90px; background: #fc9; margin-right: 8px; }
+</style>
+</head>
+<body>
+
+<h2>text-indent: a length, a percentage, and the logo trick</h2>
+<p class="box" style="text-indent: 40px">An indented paragraph runs on long enough to show that only its first line moves in from the edge.</p>
+<p class="box" style="text-indent: 10%">Ten per cent of the content width, which is thirty-two pixels here, and again only the first line.</p>
+<a class="logo" href="#">Logo text nobody sees</a>
+
+<h2>Justified beside a float, with text-align-last</h2>
+<div class="box" style="text-align: justify"><div class="float"></div>Justified text beside a float spreads each wrapped line to the room the float leaves it, and leaves the last line alone.</div>
+<div class="box" style="text-align: justify; text-align-last: center">Justified text whose last line is centred rather than started at the edge like the rest.</div>
+
+<h2>A centred wrapped heading</h2>
+<div class="box" style="text-align: center; font-size: 22px">A heading centred on its letters, not its spaces</div>
+
+<h2>tab-size in pre</h2>
+<pre style="tab-size: 4">a	b	c
+aa	bb	cc</pre>
+<pre style="tab-size: 40px">a	b	c</pre>
+
+<h2>Ellipsis in cells and cards</h2>
+<div class="cell">A title far too long for its cell</div>
+<div class="cell" style="text-overflow: '»'">A title far too long for its cell</div>
+<div class="cell">Short</div>
+<table style="table-layout: fixed; width: 300px"><tr>
+  <td class="cell" style="width: 100px">cranpose-platform-desktop-winit</td>
+  <td class="cell" style="width: 180px">Desktop winit platform adapter for Cranpose</td>
+</tr></table>
+
+</body>
+</html>

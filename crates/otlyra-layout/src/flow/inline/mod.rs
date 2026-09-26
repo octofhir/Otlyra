@@ -19,6 +19,7 @@
 //!   narrowest.
 
 mod collect;
+mod ellipsis;
 mod lines;
 mod measure;
 mod place;
@@ -58,7 +59,8 @@ impl<'a> Flow<'a> {
             return 0.0;
         }
         let levels = self.level_line_heights(parent, &mut content);
-        let (mut shaped, bands) = self.shape_lines(&content, width, x, y);
+        let paragraph = self.paragraph_of(parent, &content, width);
+        let (mut shaped, bands) = self.shape_lines(&content, &paragraph, width, x, y);
         let run_reach = self.run_reaches(&content, &levels, &shaped);
         let line_levels = line_reaches(&content, &levels, &shaped, &run_reach);
         restack(&mut shaped, &line_levels.reach);
@@ -79,6 +81,7 @@ impl<'a> Flow<'a> {
         }
 
         let style = Arc::clone(&self.tree.node(parent).style);
+        let marker = self.overflow_marker(&style);
         let placement = Placement {
             tree: self.tree,
             parent,
@@ -114,7 +117,11 @@ impl<'a> Flow<'a> {
                     .get(index + 1)
                     .map_or(metrics.bottom - metrics.top, |next| next.top - metrics.top),
             };
-            out.push(placement.line_fragment(&line));
+            let mut fragment = placement.line_fragment(&line);
+            if let Some(marker) = &marker {
+                ellipsis::elide_line(&mut fragment, x + band.start + band.width, marker);
+            }
+            out.push(fragment);
         }
 
         shaped.metrics.height
@@ -145,6 +152,78 @@ impl<'a> Flow<'a> {
                 Some((shift + strut.ascent, strut.descent - shift))
             })
             .collect()
+    }
+
+    /// What the block container `id` asks of its paragraph as a whole, in a
+    /// content box `width` wide.
+    ///
+    /// `text-indent` indents the first line of the block container (CSS Text 3
+    /// §8.1): the paragraph of the container itself, or of the anonymous block
+    /// that starts it. A later anonymous block's lines follow a block, and are
+    /// not the container's first. Tab stops are measured in the container's own
+    /// font, and only where there is a tab to stop.
+    fn paragraph_of(
+        &mut self,
+        id: BoxId,
+        content: &collect::InlineContent<'_>,
+        width: f32,
+    ) -> otlyra_text::Paragraph {
+        let node = self.tree.node(id);
+        let style = Arc::clone(&node.style);
+        let starts_container = !node.anonymous
+            || node
+                .parent
+                .is_none_or(|up| self.tree.node(up).children.first() == Some(&id));
+        let indent = &style.text_indent;
+        let indent = otlyra_text::Indent {
+            amount: if starts_container {
+                indent.length.resolve(width)
+            } else {
+                0.0
+            },
+            hanging: indent.hanging,
+            each_line: indent.each_line,
+        };
+        let tab_stop = content
+            .spans
+            .iter()
+            .any(|span| span.text.contains('\t'))
+            .then(|| {
+                let stack = self.font_stack(&style);
+                let span = span_for("", &style, stack);
+                let size = match style.tab_size {
+                    otlyra_css::TabSize::Spaces(count) => otlyra_text::TabSize::Spaces(count),
+                    otlyra_css::TabSize::Px(px) => otlyra_text::TabSize::Px(px),
+                };
+                self.text.tab_stop(&span, size)
+            });
+        otlyra_text::Paragraph {
+            indent,
+            tab_stop,
+            justify: style.text_align == otlyra_css::TextAlign::Justify
+                && style.text_justify != otlyra_css::TextJustify::None,
+        }
+    }
+
+    /// The marker `text-overflow` puts at the end of a line its block cuts
+    /// off, shaped in the block's own style: for a block container that clips
+    /// what overflows it along the line and asks for one (CSS Overflow 4
+    /// §3.1). `None` where nothing is drawn.
+    fn overflow_marker(&mut self, style: &Arc<ComputedStyle>) -> Option<ellipsis::Marker> {
+        let text: Arc<str> = match &style.text_overflow {
+            otlyra_css::TextOverflow::Clip => return None,
+            otlyra_css::TextOverflow::Ellipsis => Arc::from("\u{2026}"),
+            otlyra_css::TextOverflow::String(text) => Arc::clone(text),
+        };
+        if !style.overflow.clips() {
+            return None;
+        }
+        let stack = self.font_stack(style);
+        let span = span_for(&text, style, stack);
+        let shaped = self
+            .text
+            .shape_spans(&[span], &[], &otlyra_text::Paragraph::default(), None);
+        ellipsis::Marker::new(shaped, Arc::clone(style))
     }
 
     /// The font stack a style's text is set in.

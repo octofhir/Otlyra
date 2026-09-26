@@ -23,10 +23,13 @@ impl Flow<'_> {
         wanted: Wanted,
     ) -> f32 {
         let mut content = self.collect_inline(id, containing_width);
+        // A percentage indent is of a width being worked out here, which is as
+        // cyclic as any percentage in an intrinsic size, and counts as none.
+        let paragraph = self.paragraph_of(id, &content, 0.0);
         self.measure_atomic_inlines(&mut content.replaced, containing_width, wanted);
         match wanted {
-            Wanted::Widest => self.widest_line(&content),
-            Wanted::Narrowest => self.narrowest_line(&content),
+            Wanted::Widest => self.widest_line(&content, &paragraph),
+            Wanted::Narrowest => self.narrowest_line(&content, &paragraph),
         }
     }
 
@@ -59,13 +62,17 @@ impl Flow<'_> {
     /// end of the run, and a paragraph measured the other way came back narrower
     /// than the one line it holds — which put the second picture on a line of
     /// its own.
-    fn widest_line(&mut self, content: &InlineContent<'_>) -> f32 {
+    fn widest_line(
+        &mut self,
+        content: &InlineContent<'_>,
+        paragraph: &otlyra_text::Paragraph,
+    ) -> f32 {
         let spacers = inline_spacers(&content.inlines, &content.replaced);
         if content.spans.is_empty() && spacers.is_empty() {
             return 0.0;
         }
         self.text
-            .shape_spans(&content.spans, &spacers, None)
+            .shape_spans(&content.spans, &spacers, paragraph, None)
             .metrics
             .width
     }
@@ -82,7 +89,11 @@ impl Flow<'_> {
     /// and padding of an inline box are part of the piece of the line they sit
     /// on, which no break separates from its text (CSS Sizing 3 §5.1), and an
     /// atomic inline is a piece of its own, margins and all.
-    fn narrowest_line(&mut self, content: &InlineContent<'_>) -> f32 {
+    fn narrowest_line(
+        &mut self,
+        content: &InlineContent<'_>,
+        paragraph: &otlyra_text::Paragraph,
+    ) -> f32 {
         let spacers = inline_spacers(&content.inlines, &content.replaced);
         if content.spans.is_empty() && spacers.is_empty() {
             return 0.0;
@@ -99,10 +110,10 @@ impl Flow<'_> {
             })
             .collect();
         self.text
-            .shape_spans(&spans, &spacers, Some(0.0))
+            .shape_spans(&spans, &spacers, paragraph, Some(0.0))
             .lines
             .iter()
-            .map(|line| line.width - line.trailing_space)
+            .map(|line| line.indent.max(0.0) + line.width - line.trailing_space)
             .fold(0.0, f32::max)
     }
 }

@@ -29,6 +29,7 @@ impl<'a> Flow<'a> {
     pub(super) fn shape_lines(
         &mut self,
         content: &InlineContent<'_>,
+        paragraph: &otlyra_text::Paragraph,
         width: f32,
         x: f32,
         y: f32,
@@ -50,9 +51,9 @@ impl<'a> Flow<'a> {
             Some(available)
         };
         let spacers = inline_spacers(&content.inlines, &content.replaced);
-        let shaped = self
-            .text
-            .shape_spans_wrapping(&content.spans, &spacers, &mut collect_band);
+        let shaped =
+            self.text
+                .shape_spans_wrapping(&content.spans, &spacers, paragraph, &mut collect_band);
         (shaped, bands)
     }
 }

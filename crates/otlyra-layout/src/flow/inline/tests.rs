@@ -740,3 +740,211 @@ fn a_long_word_in_a_padded_link_breaks_anywhere() {
         "the first line breaks at its space"
     );
 }
+
+/// The x of the first glyph of each line, on the page.
+fn line_starts(tree: &FragmentTree) -> Vec<f32> {
+    tree.iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
+        .filter_map(|line| {
+            line.children
+                .iter()
+                .filter_map(|child| match &child.kind {
+                    FragmentKind::Text(run) => {
+                        run.glyphs.first().map(|glyph| child.rect.x + glyph.x)
+                    }
+                    _ => None,
+                })
+                .reduce(f32::min)
+        })
+        .collect()
+}
+
+/// `text-indent` moves the first line of a block, as a length or as a
+/// percentage of the content width, and none of the others.
+#[test]
+fn text_indent_moves_the_first_line() {
+    for (indent, expected) in [("40px", 40.0), ("10%", 40.0)] {
+        let (tree, _) = laid_out(
+            &format!(
+                "<style>body {{ margin: 0; font: 16px sans-serif }}</style>\
+                 <p style='width: 400px; text-indent: {indent}'>alpha beta gamma delta epsilon \
+                 zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau</p>"
+            ),
+            800.0,
+        );
+        let starts = line_starts(&tree);
+        assert!(starts.len() > 1);
+        assert!((starts[0] - expected).abs() < 0.5, "{indent}: {starts:?}");
+        assert!(starts[1].abs() < 0.5, "{indent}: {starts:?}");
+    }
+}
+
+/// An indent far to the left takes the text out of a box that hides it: the
+/// image-replacement trick for a logo.
+#[test]
+fn a_large_negative_indent_moves_text_out_of_its_box() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <a style='display: block; width: 100px; overflow: hidden; text-indent: -9999px'>Logo</a>",
+        400.0,
+    );
+    assert!(line_starts(&tree)[0] < 0.0);
+}
+
+/// Only the block container's first line is indented: the anonymous block
+/// after a block inside it starts no first line.
+#[test]
+fn the_indent_is_the_containers_first_line_only() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <div style='text-indent: 30px'>first<div>inside</div>after</div>",
+        400.0,
+    );
+    let starts = line_starts(&tree);
+    assert!((starts[0] - 30.0).abs() < 0.5, "{starts:?}");
+    assert!(
+        (starts[1] - 30.0).abs() < 0.5,
+        "the inner block's own first line: {starts:?}"
+    );
+    assert!(
+        starts[2].abs() < 0.5,
+        "not the anonymous block after it: {starts:?}"
+    );
+}
+
+/// A right-aligned line ends at the edge with its last letter, not with the
+/// space that hangs after it; a centred one is centred on its letters and
+/// within what the indent leaves.
+#[test]
+fn aligned_lines_leave_their_hanging_space_out() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <p style='width: 100px; text-align: right'>aaa bbb ccc ddd eee fff</p>",
+        400.0,
+    );
+    for line in tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
+    {
+        let end = line
+            .children
+            .iter()
+            .filter_map(|child| match &child.kind {
+                FragmentKind::Text(run) => {
+                    let ink = run.text.trim_end().len();
+                    run.glyphs
+                        .iter()
+                        .take_while(|glyph| (glyph.text_offset as usize) < ink)
+                        .last()
+                        .map(|_| child.rect.x)
+                }
+                _ => None,
+            })
+            .count();
+        assert!(end > 0);
+        // The line box's width counts the space hanging after its last
+        // letter, and that is all that passes the edge.
+        let right = line.rect.right();
+        assert!((100.0 - 0.5..=105.0).contains(&right), "{:?}", line.rect);
+    }
+}
+
+/// Justified lines beside a float are spread to the room the float leaves,
+/// and the last line is aligned as `text-align-last` says.
+#[test]
+fn justified_lines_fill_the_room_beside_a_float() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0; font: 16px sans-serif }</style>\
+         <div style='width: 300px; text-align: justify; text-align-last: center'>\
+         <div style='float: left; width: 100px; height: 200px'></div>\
+         alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi</div>",
+        400.0,
+    );
+    let lines: Vec<&crate::Fragment> = tree
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
+        .collect();
+    assert!(lines.len() > 2);
+    let (last, wrapped) = lines.split_last().expect("lines");
+    for line in wrapped {
+        let reach = line
+            .children
+            .iter()
+            .map(|child| child.rect.x + child.rect.width)
+            .fold(0.0, f32::max);
+        // To the edge, with at most the hanging space past it.
+        assert!((299.0..=305.0).contains(&reach), "{reach}");
+        assert!(line.rect.x >= 100.0 - 0.5);
+    }
+    let middle = last.rect.x + last.rect.width / 2.0;
+    assert!(
+        (middle - 200.0).abs() < 1.0,
+        "the last line centred beside the float: {middle}"
+    );
+}
+
+/// The ellipsis marker is the last thing on a line its block cuts off, with
+/// everything on the line inside the content box; nothing is marked where
+/// the box shows its overflow or the text fits, and a string marks as given.
+#[test]
+fn text_overflow_ends_a_cut_line_in_a_marker() {
+    let marked = |style: &str, text: &str| {
+        let (tree, _) = laid_out(
+            &format!(
+                "<style>body {{ margin: 0; font: 16px sans-serif }}</style>\
+                 <div style='width: 60px; white-space: nowrap; {style}'>{text}</div>"
+            ),
+            400.0,
+        );
+        tree.iter()
+            .find(|fragment| matches!(fragment.kind, FragmentKind::Line { .. }))
+            .expect("a line")
+            .clone()
+    };
+    let line = marked(
+        "overflow: hidden; text-overflow: ellipsis",
+        "a long line of words <span style='display: inline-block; width: 10px'></span>",
+    );
+    let last = line.children.last().expect("children");
+    let FragmentKind::Text(run) = &last.kind else {
+        panic!("the marker is text");
+    };
+    assert_eq!(&*run.text, "\u{2026}");
+    assert!(
+        line.children
+            .iter()
+            .all(|child| child.rect.x + child.rect.width <= 60.0 + 0.01),
+        "{:?}",
+        line.children
+            .iter()
+            .map(|child| child.rect)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        line.children
+            .iter()
+            .all(|child| !matches!(child.kind, FragmentKind::Box)),
+        "the inline block past the cut is gone"
+    );
+
+    for (style, text) in [
+        ("text-overflow: ellipsis", "a long line of words"),
+        ("overflow: hidden; text-overflow: ellipsis", "fits"),
+    ] {
+        let line = marked(style, text);
+        assert!(
+            line.children.iter().all(|child| !matches!(&child.kind,
+                FragmentKind::Text(run) if &*run.text == "\u{2026}")),
+            "{style} {text}"
+        );
+    }
+
+    let line = marked(
+        "overflow: hidden; text-overflow: \">>\"",
+        "a long line of words",
+    );
+    let FragmentKind::Text(run) = &line.children.last().expect("children").kind else {
+        panic!("the marker is text");
+    };
+    assert_eq!(&*run.text, ">>");
+}

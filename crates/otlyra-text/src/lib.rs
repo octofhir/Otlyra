@@ -33,14 +33,15 @@
 //! 4. **This crate never sees a DOM, style or layout type.** Its input is a string
 //!    and a font specification.
 
+mod adjust;
 mod breaking;
 mod engine;
 mod stack;
 mod web_fonts;
 
 pub use engine::{
-    Brush, DecorationMetrics, LineMetrics, PlacedSpacer, ShapedRun, ShapedText, Spacer, SpacerKind,
-    Strut, TextEngine, TextMetrics, TextSpan,
+    Brush, DecorationMetrics, Indent, LineEnd, LineMetrics, Paragraph, PlacedSpacer, ShapedRun,
+    ShapedText, Spacer, SpacerKind, Strut, TabSize, TextEngine, TextMetrics, TextSpan,
 };
 pub use stack::{Family, FontStack, GenericFamily};
 pub use web_fonts::{FaceDescriptors, FaceQuery, FaceStyle, matching_faces};

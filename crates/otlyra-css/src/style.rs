@@ -573,6 +573,85 @@ pub enum TextAlign {
     Center,
     /// The end edge.
     End,
+    /// Spread from edge to edge, the last line and one before a forced break
+    /// aligned as `text-align-last` says.
+    Justify,
+}
+
+/// `text-align-last` (CSS Text 3 §7.3): how the last line of a paragraph, and
+/// one ended by a forced break, is aligned.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextAlignLast {
+    /// As `text-align` says, except that `justify` is `start`.
+    #[default]
+    Auto,
+    /// The start edge.
+    Start,
+    /// The end edge.
+    End,
+    /// Centred.
+    Center,
+    /// Spread from edge to edge.
+    Justify,
+}
+
+/// `text-justify` (CSS Text 3 §7.4): what justified text is spread by.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextJustify {
+    /// The UA's choice, which is between words.
+    #[default]
+    Auto,
+    /// Justification is off: a justified line is aligned to its start.
+    None,
+    /// Between words.
+    InterWord,
+    /// Between letters.
+    InterCharacter,
+}
+
+/// `text-indent` (CSS Text 3 §8.1). The cascade parses `hanging` and
+/// `each-line` only in its Gecko build, so from it they are always off; they
+/// are carried for when that changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextIndent {
+    /// How far the first line is indented; a percentage is of the block's
+    /// content width.
+    pub length: Length,
+    /// `hanging`: every other line is indented instead.
+    pub hanging: bool,
+    /// `each-line`: the first line after each forced break is indented too.
+    pub each_line: bool,
+}
+
+impl TextIndent {
+    /// No indent — the initial value.
+    pub const NONE: Self = Self {
+        length: Length::ZERO,
+        hanging: false,
+        each_line: false,
+    };
+}
+
+/// `tab-size` (CSS Text 3 §4.2).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TabSize {
+    /// So many spaces.
+    Spaces(f32),
+    /// A length, in CSS pixels.
+    Px(f32),
+}
+
+/// What `text-overflow` draws at the end of a line cut off by its box
+/// (CSS Overflow 4 §3.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextOverflow {
+    /// Nothing: the text is clipped.
+    #[default]
+    Clip,
+    /// A horizontal ellipsis.
+    Ellipsis,
+    /// The given string.
+    String(Arc<str>),
 }
 
 /// `background-size`, in the three shapes that mean something without a full
@@ -1425,6 +1504,17 @@ pub struct ComputedStyle {
     pub border: Sides<Border>,
     /// `text-align`. Inherited.
     pub text_align: TextAlign,
+    /// `text-align-last`. Inherited.
+    pub text_align_last: TextAlignLast,
+    /// `text-justify`. Inherited.
+    pub text_justify: TextJustify,
+    /// `text-indent`. Inherited.
+    pub text_indent: TextIndent,
+    /// `tab-size`. Inherited.
+    pub tab_size: TabSize,
+    /// `text-overflow`. Not inherited: it is a property of the block container
+    /// whose lines it cuts.
+    pub text_overflow: TextOverflow,
     /// `white-space-collapse`. Inherited.
     pub white_space: WhiteSpace,
     /// `text-wrap-mode`. Inherited.
@@ -1562,6 +1652,11 @@ impl Default for ComputedStyle {
             padding: Sides::all(Length::ZERO),
             border: Sides::all(Border::NONE),
             text_align: TextAlign::Start,
+            text_align_last: TextAlignLast::Auto,
+            text_justify: TextJustify::Auto,
+            text_indent: TextIndent::NONE,
+            tab_size: TabSize::Spaces(8.0),
+            text_overflow: TextOverflow::Clip,
             width: Size::Auto,
             height: Size::Auto,
             min_width: Size::Auto,
@@ -1629,6 +1724,10 @@ impl ComputedStyle {
             decorations: Arc::clone(&parent.decorations),
             text_transform: parent.text_transform,
             text_align: parent.text_align,
+            text_align_last: parent.text_align_last,
+            text_justify: parent.text_justify,
+            text_indent: parent.text_indent.clone(),
+            tab_size: parent.tab_size,
             ..Self::default()
         }
     }

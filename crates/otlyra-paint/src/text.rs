@@ -78,6 +78,7 @@ pub(crate) fn paint_text_run(
     origin: Affine,
     scroll_y: f32,
 ) {
+    let glyphs = ink(run);
     // The text's own shadows, behind it: the same glyphs, moved and softened.
     // A shadow has no spread — there is nothing to grow but the letters
     // themselves.
@@ -93,7 +94,7 @@ pub(crate) fn paint_text_run(
             origin * Affine::translate((f64::from(shadow.x), f64::from(shadow.y))),
             true,
             f64::from(shadow.blur),
-            run.glyphs.clone(),
+            glyphs.clone(),
         );
     }
 
@@ -121,9 +122,24 @@ pub(crate) fn paint_text_run(
         Brush::Solid(brush_to_color(run.brush)),
         origin,
         true,
-        run.glyphs.clone(),
+        glyphs,
     );
     decorate(list, Line::Through);
+}
+
+/// The glyphs of a run that have ink: all but a tab's, which is a jump along
+/// the line and not a character to draw — the font's glyph for it, where it
+/// has one, is the box it draws for a character it does not have.
+fn ink(run: &ShapedRun) -> Vec<otlyra_gfx::Glyph> {
+    run.glyphs
+        .iter()
+        .filter(|glyph| {
+            !run.text
+                .get(glyph.text_offset as usize..)
+                .is_some_and(|rest| rest.starts_with('\t'))
+        })
+        .copied()
+        .collect()
 }
 
 /// One decoration line from `x0` to `x1`, its top edge at `top` and `t` thick,
