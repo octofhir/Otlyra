@@ -3205,47 +3205,24 @@ pub fn describe(style: &otlyra_css::ComputedStyle) -> Vec<(&'static str, String)
             ),
         ]);
     }
-    if style.display == otlyra_css::Display::Grid {
+    if let Some(grid) = &style.grid {
+        // Spelled the way a stylesheet spells it: a value nobody can put back
+        // into a stylesheet is not much of a computed value.
         rows.extend([
-            (
-                "grid-template-columns",
-                tracks(&style.grid_columns, style.grid_columns_fill.as_deref()),
-            ),
-            ("grid-template-rows", tracks(&style.grid_rows, None)),
+            ("grid-template-columns", grid.columns.to_string()),
+            ("grid-template-rows", grid.rows.to_string()),
         ]);
     }
     if matches!(
         style.display,
-        otlyra_css::Display::Flex | otlyra_css::Display::Grid
+        otlyra_css::Display::Flex
+            | otlyra_css::Display::InlineFlex
+            | otlyra_css::Display::Grid
+            | otlyra_css::Display::InlineGrid
     ) {
         rows.push(("gap", format!("{} {}", style.gap.0, style.gap.1)));
     }
     rows
-}
-
-/// A track list, as CSS would write it.
-///
-/// Spelled the way a stylesheet spells it rather than the way the engine stores
-/// it. A pane — or a driver reading this over the protocol — that reported
-/// `fixed(px(200.0))` would be reporting a value nobody can put back into a
-/// stylesheet, which is most of what a computed value is for.
-fn tracks(template: &[otlyra_css::Track], fill: Option<&[otlyra_css::Track]>) -> String {
-    let one = |track: &otlyra_css::Track| match track {
-        otlyra_css::Track::Fixed(length) => length.to_string(),
-        otlyra_css::Track::Fraction(share) => format!("{share}fr"),
-        otlyra_css::Track::Auto => "auto".to_owned(),
-    };
-    let mut out: Vec<String> = template.iter().map(one).collect();
-    if let Some(fill) = fill {
-        out.push(format!(
-            "repeat(auto-fill, {})",
-            fill.iter().map(one).collect::<Vec<_>>().join(" ")
-        ));
-    }
-    if out.is_empty() {
-        return "none".to_owned();
-    }
-    out.join(" ")
 }
 
 /// A colour as CSS writes it, which is what a person is looking for.
@@ -4657,7 +4634,9 @@ mod tests {
         assert!(named(&style).contains(&"flex-direction"));
         assert!(named(&style).contains(&"gap"));
 
+        // What the cascade makes of a grid container: the display, and its grid.
         style.display = otlyra_css::Display::Grid;
+        style.grid = Some(std::sync::Arc::new(otlyra_css::GridTemplate::default()));
         assert!(named(&style).contains(&"grid-template-columns"));
         assert!(!named(&style).contains(&"flex-direction"));
     }

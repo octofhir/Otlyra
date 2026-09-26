@@ -1307,7 +1307,7 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
     // child needs the same wrapping a mixed block does.
     let flex = matches!(
         tree.node(id).style.display,
-        Display::Flex | Display::InlineFlex | Display::Grid
+        Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid
     );
     let has_block = children
         .iter()

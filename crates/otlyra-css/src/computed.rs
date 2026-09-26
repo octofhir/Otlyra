@@ -11,14 +11,16 @@ use std::sync::Arc;
 use peniko::Color;
 use style::properties::ComputedValues;
 
+mod grid;
+
 use crate::calc::Calc;
 use crate::style::{
     AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
     BackgroundSize, Border, BorderCollapse, BorderStyle, BoxSizing, Clear, ComputedStyle, Corners,
     Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
     Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, MaxSize, ObjectFit, Overflow,
-    Placement, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
-    Track, TransformOp, TransformOrigin, WhiteSpace,
+    Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap, TransformOp,
+    TransformOrigin, WhiteSpace,
 };
 use crate::style::{FamilyName, FontFamily, GenericFamily};
 
@@ -26,9 +28,10 @@ use crate::style::{FamilyName, FontFamily, GenericFamily};
 pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
     let font = values.get_font();
     let font_size = font.font_size.used_size().px();
+    let display = display_of(values);
 
     ComputedStyle {
-        display: display_of(values),
+        display,
         color: colour(values.clone_color()),
         background_color: values
             .get_background()
@@ -122,14 +125,14 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         object_position: object_position(values),
         shadows: shadows(values),
         text_shadows: text_shadows(values),
-        grid_columns: tracks(&values.get_position().grid_template_columns),
-        grid_rows: tracks(&values.get_position().grid_template_rows),
-        grid_columns_fill: auto_repeat(&values.get_position().grid_template_columns),
-        grid_column: placement(
+        grid: display
+            .is_grid()
+            .then(|| Arc::new(grid::grid_template(values))),
+        grid_column: grid::placement(
             &values.get_position().grid_column_start,
             &values.get_position().grid_column_end,
         ),
-        grid_row: placement(
+        grid_row: grid::placement(
             &values.get_position().grid_row_start,
             &values.get_position().grid_row_end,
         ),
@@ -138,6 +141,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         justify_content: justify_content(values),
         align_items: align_items(values),
         align_self: align_self(values),
+        justify_items: justify_items(values),
+        justify_self: justify_self(values),
         align_content: align_content(values),
         order: values.clone_order(),
         flex_grow: values.clone_flex_grow().0,
@@ -174,7 +179,10 @@ fn display_of(values: &ComputedValues) -> Display {
         };
     }
     if display.inside() == DisplayInside::Grid {
-        return Display::Grid;
+        return match display.outside() {
+            DisplayOutside::Inline => Display::InlineGrid,
+            _ => Display::Grid,
+        };
     }
     if let Some(part) = table_part(display) {
         return part;
@@ -816,124 +824,6 @@ fn background_gradient(image: &style::values::computed::Image) -> Option<Gradien
     Some(Gradient { angle, stops })
 }
 
-/// The tracks a `grid-template-*` names.
-///
-/// `repeat()` with a count is expanded here, where the count is known; `auto-fill`
-/// and `auto-fit` depend on the container's size and are left for layout, which
-/// does not do them yet and treats them as one track.
-fn tracks(template: &style::values::computed::GridTemplateComponent) -> Vec<Track> {
-    use style::values::generics::grid::{
-        GenericTrackListValue as ListValue, GenericTrackSize as Size, RepeatCount,
-        TrackBreadth as Breadth,
-    };
-
-    let breadth = |value: &Breadth<style::values::computed::LengthPercentage>| match value {
-        Breadth::Breadth(length) => Track::Fixed(length_percentage(length)),
-        Breadth::Flex(flex) => Track::Fraction(flex.0),
-        _ => Track::Auto,
-    };
-    let size = |value: &Size<style::values::computed::LengthPercentage>| match value {
-        Size::Breadth(value) => breadth(value),
-        // A range is laid out at its larger end, which is what a grid does when
-        // there is room; the smaller end matters when there is not, and that needs
-        // sizing this does not do.
-        Size::Minmax(_, max) => breadth(max),
-        Size::FitContent(_) => Track::Auto,
-    };
-
-    let mut out = Vec::new();
-    let style::values::generics::grid::GenericGridTemplateComponent::TrackList(list) = template
-    else {
-        return out;
-    };
-
-    for value in list.values.iter() {
-        match value {
-            ListValue::TrackSize(track) => out.push(size(track)),
-            ListValue::TrackRepeat(repeat) => {
-                // `auto-fill` and `auto-fit` need the container's size to know how
-                // many times they go in; they come back through `auto_repeat`
-                // instead, and layout decides.
-                let RepeatCount::Number(count) = repeat.count else {
-                    continue;
-                };
-                for _ in 0..count.max(0) {
-                    out.extend(repeat.track_sizes.iter().map(&size));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Where a grid item sits along one axis, from the two lines it names.
-///
-/// A named line needs the container's line names, which an item cannot see from
-/// here; a numbered one is what a page writes and is what this reads.
-fn placement(
-    start: &style::values::computed::GridLine,
-    end: &style::values::computed::GridLine,
-) -> Placement {
-    let numbered = |line: &style::values::computed::GridLine| {
-        (!line.is_span && line.line_num != 0).then_some(line.line_num)
-    };
-    let span_of = |line: &style::values::computed::GridLine| {
-        (line.is_span && line.line_num > 0).then_some(line.line_num as u32)
-    };
-
-    let line = numbered(start);
-    let span = match (span_of(start), span_of(end), line, numbered(end)) {
-        (Some(span), _, _, _) | (_, Some(span), _, _) => span,
-        // Two numbered lines: the item covers what is between them.
-        (None, None, Some(from), Some(to)) if to > from => (to - from) as u32,
-        _ => 1,
-    };
-
-    Placement {
-        line,
-        span: span.max(1),
-    }
-}
-
-/// The pattern inside a `repeat(auto-fill)` or `repeat(auto-fit)`, if the template
-/// has one: how many times it goes in is the container's business.
-fn auto_repeat(template: &style::values::computed::GridTemplateComponent) -> Option<Vec<Track>> {
-    use style::values::generics::grid::{
-        GenericTrackListValue as ListValue, GenericTrackSize as Size, RepeatCount,
-        TrackBreadth as Breadth,
-    };
-
-    let style::values::generics::grid::GenericGridTemplateComponent::TrackList(list) = template
-    else {
-        return None;
-    };
-
-    list.values.iter().find_map(|value| {
-        let ListValue::TrackRepeat(repeat) = value else {
-            return None;
-        };
-        if matches!(repeat.count, RepeatCount::Number(_)) {
-            return None;
-        }
-        Some(
-            repeat
-                .track_sizes
-                .iter()
-                .map(|size| match size {
-                    Size::Breadth(Breadth::Breadth(length)) => {
-                        Track::Fixed(length_percentage(length))
-                    }
-                    Size::Breadth(Breadth::Flex(flex)) => Track::Fraction(flex.0),
-                    Size::Minmax(_, Breadth::Breadth(length)) => {
-                        Track::Fixed(length_percentage(length))
-                    }
-                    _ => Track::Auto,
-                })
-                .collect(),
-        )
-    })
-}
-
 /// A computed `<length-percentage>`, as the length layout reads.
 ///
 /// Every property that takes one comes through here, so none of them can drop
@@ -1040,6 +930,11 @@ fn flex_wrap(values: &ComputedValues) -> FlexWrap {
     }
 }
 
+/// `justify-content`. `normal` and `stretch` are one value to layout: a grid
+/// stretches its `auto` tracks with it, a flex container starts its items.
+/// `left` and `right` are the start and end of a line written left to right,
+/// the only direction laid out here. The `safe` and `unsafe` flags are
+/// dropped: overflow alignment (CSS Align 3 §4.4) is not modelled.
 fn justify_content(values: &ComputedValues) -> JustifyContent {
     use style::values::specified::align::AlignFlags;
 
@@ -1049,7 +944,8 @@ fn justify_content(values: &ComputedValues) -> JustifyContent {
         AlignFlags::SPACE_EVENLY => JustifyContent::SpaceEvenly,
         AlignFlags::CENTER => JustifyContent::Center,
         AlignFlags::END | AlignFlags::FLEX_END | AlignFlags::RIGHT => JustifyContent::End,
-        _ => JustifyContent::Start,
+        AlignFlags::START | AlignFlags::FLEX_START | AlignFlags::LEFT => JustifyContent::Start,
+        _ => JustifyContent::Stretch,
     }
 }
 
@@ -1071,24 +967,39 @@ fn align_content(values: &ComputedValues) -> AlignContent {
     }
 }
 
-/// One `align-items`-shaped keyword, whatever property it came from.
+/// One `align-items`-shaped keyword, whatever property it came from. The
+/// `safe` and `unsafe` flags are dropped: overflow alignment (CSS Align 3 §4.4)
+/// is not modelled.
 fn align_keyword(value: style::values::specified::align::AlignFlags) -> Option<AlignItems> {
     use style::values::specified::align::AlignFlags;
 
     match value.value() {
+        AlignFlags::NORMAL => Some(AlignItems::Normal),
         AlignFlags::CENTER => Some(AlignItems::Center),
         AlignFlags::START | AlignFlags::SELF_START | AlignFlags::FLEX_START => {
             Some(AlignItems::Start)
         }
         AlignFlags::END | AlignFlags::SELF_END | AlignFlags::FLEX_END => Some(AlignItems::End),
-        AlignFlags::STRETCH | AlignFlags::NORMAL => Some(AlignItems::Stretch),
+        AlignFlags::STRETCH => Some(AlignItems::Stretch),
         AlignFlags::BASELINE | AlignFlags::LAST_BASELINE => Some(AlignItems::Baseline),
         _ => None,
     }
 }
 
+/// The same along the inline axis, where `left` and `right` are the start and
+/// end of a line written left to right — the only direction laid out here.
+fn justify_keyword(value: style::values::specified::align::AlignFlags) -> Option<AlignItems> {
+    use style::values::specified::align::AlignFlags;
+
+    match value.value() {
+        AlignFlags::LEFT => Some(AlignItems::Start),
+        AlignFlags::RIGHT => Some(AlignItems::End),
+        _ => align_keyword(value),
+    }
+}
+
 fn align_items(values: &ComputedValues) -> AlignItems {
-    align_keyword(values.clone_align_items().0).unwrap_or(AlignItems::Stretch)
+    align_keyword(values.clone_align_items().0).unwrap_or(AlignItems::Normal)
 }
 
 fn align_self(values: &ComputedValues) -> Option<AlignItems> {
@@ -1099,6 +1010,27 @@ fn align_self(values: &ComputedValues) -> Option<AlignItems> {
         return None;
     }
     align_keyword(value)
+}
+
+/// `justify-items`, with `legacy` gone: alone it is `normal`, and beside a
+/// position it is that position (CSS Align 3 §6.1.3). What `legacy` does on
+/// to a block's descendants is the `center` of `<center>`, which this does
+/// not read.
+fn justify_items(values: &ComputedValues) -> AlignItems {
+    use style::values::specified::align::AlignFlags;
+
+    let value = values.clone_justify_items().computed.0.0;
+    justify_keyword(value & !AlignFlags::LEGACY).unwrap_or(AlignItems::Normal)
+}
+
+fn justify_self(values: &ComputedValues) -> Option<AlignItems> {
+    use style::values::specified::align::AlignFlags;
+
+    let value = values.clone_justify_self().0;
+    if value.value() == AlignFlags::AUTO {
+        return None;
+    }
+    justify_keyword(value)
 }
 
 /// A `row-gap` or `column-gap`. `normal` is no gap outside a multi-column layout.
@@ -1404,8 +1336,10 @@ pub(crate) mod tests {
         assert_eq!((at(x), at(y)), (90.0, -100.0));
 
         let grid = div_with("display: grid; grid-template-columns: calc(50% - 8px) 1fr");
-        let Some(Track::Fixed(track)) = grid.grid_columns.first() else {
-            panic!("a fixed track, got {:?}", grid.grid_columns);
+        let tracks = &grid.grid.as_ref().expect("a grid container").columns.tracks;
+        let Some(crate::grid::TrackMax::Length(track)) = tracks.first().map(|track| &track.max)
+        else {
+            panic!("a fixed track, got {tracks:?}");
         };
         assert_eq!(at(track), 92.0);
 

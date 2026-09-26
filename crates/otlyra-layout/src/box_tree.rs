@@ -264,7 +264,9 @@ impl BoxNode {
         match &self.kind {
             BoxKind::Block => !matches!(
                 self.style.display,
-                otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+                otlyra_css::Display::InlineBlock
+                    | otlyra_css::Display::InlineFlex
+                    | otlyra_css::Display::InlineGrid
             ),
             BoxKind::Replaced(_) => !self.is_inline_level(),
             BoxKind::Inline | BoxKind::Text(_) => false,
@@ -303,7 +305,9 @@ impl BoxNode {
             // than a line of its own.
             BoxKind::Block => matches!(
                 self.style.display,
-                otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+                otlyra_css::Display::InlineBlock
+                    | otlyra_css::Display::InlineFlex
+                    | otlyra_css::Display::InlineGrid
             ),
         }
     }

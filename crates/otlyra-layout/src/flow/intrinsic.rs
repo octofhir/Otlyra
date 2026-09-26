@@ -107,7 +107,11 @@ impl<'a> Flow<'a> {
         let Some(&first) = children.first() else {
             return extra;
         };
-        let inner = if is_flex_container(&style) {
+        let inner = if style.display.is_grid() {
+            // The sum of its columns, sized under this constraint (CSS Grid 2
+            // §12.1), rather than the widest of its items.
+            self.grid_content_width(id, containing_width, Wanted::Widest)
+        } else if is_flex_container(&style) {
             self.flex_content_size(&style, children, containing_width, Wanted::Widest)
         } else if self.tree.node(first).is_inline_level() {
             self.inline_content_size(id, containing_width, Wanted::Widest)
@@ -177,7 +181,11 @@ impl<'a> Flow<'a> {
         let Some(&first) = children.first() else {
             return extra;
         };
-        let inner = if is_flex_container(&style) {
+        let inner = if style.display.is_grid() {
+            // The sum of its columns, sized under this constraint (CSS Grid 2
+            // §12.1), rather than the widest of its items.
+            self.grid_content_width(id, containing_width, Wanted::Narrowest)
+        } else if is_flex_container(&style) {
             self.flex_content_size(&style, children, containing_width, Wanted::Narrowest)
         } else if self.tree.node(first).is_inline_level() {
             self.inline_content_size(id, containing_width, Wanted::Narrowest)

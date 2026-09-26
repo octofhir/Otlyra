@@ -92,7 +92,9 @@ impl<'a> Flow<'a> {
             otlyra_css::Display::Flex | otlyra_css::Display::InlineFlex => {
                 return self.layout_flex(parent, width, x, y, out);
             }
-            otlyra_css::Display::Grid => return self.layout_grid(parent, width, x, y, out),
+            otlyra_css::Display::Grid | otlyra_css::Display::InlineGrid => {
+                return self.layout_grid(parent, width, x, y, out);
+            }
             // A table with no rows in it is not a table; it falls through and its
             // children are stacked, which at least shows what is in them.
             otlyra_css::Display::Table => {
@@ -399,6 +401,7 @@ impl<'a> Flow<'a> {
                 otlyra_css::Display::Flex
                     | otlyra_css::Display::InlineFlex
                     | otlyra_css::Display::Grid
+                    | otlyra_css::Display::InlineGrid
                     | otlyra_css::Display::InlineBlock
                     | otlyra_css::Display::Table
                     | otlyra_css::Display::TableCell
@@ -409,6 +412,7 @@ impl<'a> Flow<'a> {
                     otlyra_css::Display::Flex
                         | otlyra_css::Display::InlineFlex
                         | otlyra_css::Display::Grid
+                        | otlyra_css::Display::InlineGrid
                 )
             });
         if establishes {

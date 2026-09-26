@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Grid</title>
+<style>
+  body { margin: 8px; font: 14px/18px sans-serif; }
+  h2 { font-size: 15px; margin: 14px 0 6px; }
+  .g { display: grid; background: #eef; }
+  .g > * { background: #9cf; outline: 1px solid #36c; }
+  .row { margin-bottom: 8px; }
+</style>
+
+<h2>Track sizing</h2>
+<div class="g row" style="grid-template-columns: 1fr 1fr; width: 400px">
+  <div style="white-space: nowrap; width: 300px">unbreakable three hundred</div><div>b</div>
+</div>
+<div class="g row" style="grid-template-columns: auto 1fr; width: 400px">
+  <div>A paragraph that is much too long for one line of this column and so wraps.</div><div>fr</div>
+</div>
+<div class="g row" style="grid-template-columns: minmax(100px, 200px) fit-content(80px) auto; width: 600px">
+  <div>minmax</div><div>fit-content with more text than fits</div><div>auto</div>
+</div>
+<div class="g row" style="grid-template-columns: repeat(4, minmax(0, 1fr)); width: 400px">
+  <div>a</div><div>b</div><div>c</div><div>d</div>
+</div>
+<div class="g row" style="height: 80px; grid-template-rows: 1fr 2fr; width: 200px">
+  <div>1fr</div><div>2fr</div>
+</div>
+
+<h2>Placement</h2>
+<div class="g row" style="grid-template-columns: repeat(6, 1fr); width: 600px; gap: 4px">
+  <div style="grid-column: 2 / -2">2 / -2</div>
+  <div style="grid-column: 1 / span 2; grid-row: 2 / span 2">span 2 × 2</div>
+  <div>auto</div><div>auto</div><div>auto</div><div style="order: -1">order −1</div>
+</div>
+<div class="g row" style="grid-template-columns: [full-start] minmax(16px, 1fr) [content-start] minmax(0, 300px) [content-end] minmax(16px, 1fr) [full-end]; width: 500px">
+  <div style="grid-column: content">content</div>
+  <div style="grid-column: full">full</div>
+</div>
+<div class="g row" style="grid-auto-flow: column; grid-template-rows: repeat(3, 20px); width: 300px">
+  <div>1</div><div>2</div><div>3</div><div>4</div><div>5</div>
+</div>
+<div class="g row" style="grid-template-columns: repeat(3, 60px); grid-auto-flow: dense">
+  <div>a</div><div style="grid-column: span 3">wide</div><div>b</div><div>c</div>
+</div>
+
+<h2>Areas and automatic repetition</h2>
+<div class="g row" style="grid-template-columns: 100px 1fr; grid-template-areas: 'h h' 's m' 'f f'; width: 400px">
+  <div style="grid-area: f">footer</div><div style="grid-area: m">main</div>
+  <div style="grid-area: s">side</div><div style="grid-area: h">header</div>
+</div>
+<div class="g row" style="grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); width: 350px">
+  <div>fill</div><div>fill</div>
+</div>
+<div class="g row" style="grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); width: 350px">
+  <div>fit</div><div>fit</div>
+</div>
+
+<h2>Alignment</h2>
+<div class="g row" style="place-items: center; width: 200px; height: 80px">
+  <div style="width: 40px; height: 20px"></div>
+</div>
+<div class="g row" style="grid-template-columns: 100px 100px 100px; justify-content: center; width: 400px">
+  <div style="justify-self: end">end</div><div style="margin: 0 auto">auto</div><div style="justify-self: start">start</div>
+</div>
+<div class="g row" style="grid-template-columns: 100px 100px; align-items: end; height: 60px; width: 200px">
+  <div>end</div><div style="align-self: stretch">stretch</div>
+</div>
+
+<h2>Intrinsic widths and inline-grid</h2>
+<div class="row" style="overflow: hidden"><div style="float: left; background: #fc9">
+  <div class="g" style="grid-template-columns: auto auto; gap: 3px"><div>icon</div><div>LIVE</div></div>
+</div>after the float</div>
+<p class="row">before <span class="g" style="display: inline-grid; grid-template-columns: 30px 30px"><span>a</span><span>b</span></span> after</p>

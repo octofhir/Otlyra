@@ -213,6 +213,7 @@ fn applied_aspect_ratio(style: &ComputedStyle) -> AspectRatio {
         | Display::Flex
         | Display::InlineFlex
         | Display::Grid
+        | Display::InlineGrid
         | Display::Table
         | Display::TableCaption => style.aspect_ratio,
     }
@@ -564,11 +565,12 @@ pub(super) struct OwnWidth {
 ///
 /// For its max-content contribution the percentage is `auto` and `none`, and
 /// the specification counts on the container to hold the picture back — a
-/// grid's `auto` tracks stretch to fill it (CSS Grid §11.8), a table shares its
-/// own width out. Neither does that here yet, so what the percentage would come
-/// to in the width it is measured in stands in as a maximum: an 800-pixel
-/// picture in a 400-pixel float or table cell asks for 400, and a 64-pixel one
-/// with `width: 100%` for 64.
+/// grid's `auto` tracks stretch to fill it (CSS Grid 2 §12.8), a table shares
+/// its own width out. A table does not do that here yet, and a float has no
+/// container to do it, so what the percentage would come to in the width it
+/// is measured in stands in as a maximum: an 800-pixel picture in a 400-pixel
+/// float or table cell asks for 400, and a 64-pixel one with `width: 100%`
+/// for 64.
 pub(super) fn replaced_widths(
     style: &ComputedStyle,
     room: InlineRoom,

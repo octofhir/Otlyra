@@ -443,10 +443,9 @@ fn a_min_content_box_breaks_at_every_opportunity() {
     assert_eq!(lines, 3, "one word to a line");
 }
 
-/// A grid's `auto` column is stretched to fill the container in CSS, which is
-/// what gives an item at `width: 100%` the whole of it; until that step is
-/// taken here the container's width stands in for the item's area, so the one
-/// column of a search box is the width of the box rather than of its
+/// A grid's `auto` column is stretched to fill the container (CSS Grid 2
+/// §12.8), which is what gives an item at `width: 100%` the whole of it: the
+/// one column of a search box is the width of the box rather than of its
 /// placeholder.
 #[test]
 fn a_full_width_grid_item_fills_its_one_auto_column() {

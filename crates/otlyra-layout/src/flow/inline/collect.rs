@@ -417,7 +417,9 @@ impl<'a> Flow<'a> {
                 BoxKind::Block
                     if matches!(
                         node.style.display,
-                        otlyra_css::Display::InlineBlock | otlyra_css::Display::InlineFlex
+                        otlyra_css::Display::InlineBlock
+                            | otlyra_css::Display::InlineFlex
+                            | otlyra_css::Display::InlineGrid
                     ) =>
                 {
                     // Laid out here and now, as the block container it is, at the

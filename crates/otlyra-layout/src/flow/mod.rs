@@ -34,6 +34,7 @@ mod float;
 mod grid;
 mod inline;
 mod intrinsic;
+mod item;
 mod list;
 mod positioned;
 mod replaced;

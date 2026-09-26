@@ -333,7 +333,8 @@ fn spread(spread: Spread, leftover: f32, count: usize) -> Spacing {
 /// margins have taken what they are owed (CSS Flexbox §9.5, step 12).
 pub(super) fn justify(justify: JustifyContent, leftover: f32, count: usize) -> Spacing {
     let position = match justify {
-        JustifyContent::Start => Spread::Start,
+        // Nothing along a flex line stretches, so `normal` starts it.
+        JustifyContent::Start | JustifyContent::Stretch => Spread::Start,
         JustifyContent::End => Spread::End,
         JustifyContent::Center => Spread::Center,
         JustifyContent::SpaceBetween => Spread::SpaceBetween,

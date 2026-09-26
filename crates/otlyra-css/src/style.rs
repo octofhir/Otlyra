@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use peniko::Color;
 
+use crate::grid::{GridPlacement, GridTemplate};
+
 pub use crate::calc::Calc;
 
 /// The `display` values we model.
@@ -31,6 +33,9 @@ pub enum Display {
     InlineFlex,
     /// A grid container: its children are placed into rows and columns.
     Grid,
+    /// A grid container that is inline-level outside, placed in a line the way
+    /// an `inline-block` is.
+    InlineGrid,
     /// A table: its rows and cells are placed into a grid of its own, with the
     /// columns sized by what is in them.
     Table,
@@ -45,6 +50,11 @@ pub enum Display {
 }
 
 impl Display {
+    /// Whether this is a grid container, block-level or inline-level.
+    pub fn is_grid(self) -> bool {
+        matches!(self, Self::Grid | Self::InlineGrid)
+    }
+
     /// Whether this is a table or one of the parts a table is made of.
     pub fn is_table_part(self) -> bool {
         matches!(
@@ -86,6 +96,10 @@ impl FlexDirection {
 /// How the leftover main-axis space is shared out.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum JustifyContent {
+    /// `normal` or `stretch`, the initial value: a grid's `auto` tracks grow
+    /// to take it (CSS Grid 2 §12.8); a flex container, which has nothing to
+    /// stretch along its main axis, lays it out as `start` (CSS Align 3 §5.1).
+    Stretch,
     /// All of it after the items.
     Start,
     /// All of it before them.
@@ -100,9 +114,14 @@ pub enum JustifyContent {
     SpaceEvenly,
 }
 
-/// How items are placed across the cross axis.
+/// How an item is placed in the space it has along one axis: across a flex
+/// line, or in its grid area, by `align-*` or `justify-*`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AlignItems {
+    /// `normal`, the initial value: `stretch` for a flex item and for most
+    /// grid items; `start` for a grid item with a natural aspect ratio (CSS
+    /// Align 3 §6.1, §6.2).
+    Normal,
     /// At the start edge.
     Start,
     /// At the end edge.
@@ -113,6 +132,22 @@ pub enum AlignItems {
     Stretch,
     /// On their first baselines. Not implemented, and laid out as `start`.
     Baseline,
+}
+
+impl From<JustifyContent> for AlignContent {
+    /// The same distribution along the other axis: the two properties share
+    /// one set of values (CSS Align 3 §5.1), `normal` included.
+    fn from(justify: JustifyContent) -> Self {
+        match justify {
+            JustifyContent::Stretch => Self::Stretch,
+            JustifyContent::Start => Self::Start,
+            JustifyContent::End => Self::End,
+            JustifyContent::Center => Self::Center,
+            JustifyContent::SpaceBetween => Self::SpaceBetween,
+            JustifyContent::SpaceAround => Self::SpaceAround,
+            JustifyContent::SpaceEvenly => Self::SpaceEvenly,
+        }
+    }
 }
 
 /// `align-content`: how a wrapped container's lines share what is left across it.
@@ -794,34 +829,6 @@ pub struct Gradient {
     pub stops: Vec<GradientStop>,
 }
 
-/// Where a grid item sits along one axis.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Placement {
-    /// The line it starts on, counting from one, or `None` for wherever it lands.
-    pub line: Option<i32>,
-    /// How many tracks it covers.
-    pub span: u32,
-}
-
-impl Placement {
-    /// Placed wherever the auto-placement gets to, one track wide.
-    pub const AUTO: Self = Self {
-        line: None,
-        span: 1,
-    };
-}
-
-/// One track of a grid: a column's width or a row's height.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Track {
-    /// A length or a percentage of the container.
-    Fixed(Length),
-    /// A share of what is left over, in `fr`.
-    Fraction(f32),
-    /// As big as its contents need.
-    Auto,
-}
-
 /// The four corner radii of a box, in CSS order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Corners {
@@ -1337,17 +1344,14 @@ pub struct ComputedStyle {
     /// `border-radius`, per corner. Only the horizontal radius of each: an ellipse
     /// with two different radii is a corner nobody writes.
     pub radius: Corners,
-    /// `grid-template-columns`, with `repeat()` of a definite count expanded.
-    pub grid_columns: Vec<Track>,
-    /// `grid-template-rows`, the same.
-    pub grid_rows: Vec<Track>,
-    /// The pattern of `repeat(auto-fill, ...)` in the columns, if there is one: how
-    /// many times it goes in depends on the container, so layout decides.
-    pub grid_columns_fill: Option<Vec<Track>>,
-    /// `grid-column`, read by an item rather than by the container.
-    pub grid_column: Placement,
-    /// `grid-row`.
-    pub grid_row: Placement,
+    /// The grid a grid container defines: its tracks, line names, areas and
+    /// flow. `None` on anything that is not a grid container.
+    pub grid: Option<Arc<GridTemplate>>,
+    /// `grid-column-start` and `grid-column-end`, read by an item rather than
+    /// by the container.
+    pub grid_column: GridPlacement,
+    /// `grid-row-start` and `grid-row-end`.
+    pub grid_row: GridPlacement,
     /// `flex-direction`, read by a flex container.
     pub flex_direction: FlexDirection,
     /// `flex-wrap`.
@@ -1359,6 +1363,12 @@ pub struct ComputedStyle {
     /// `align-self`, which overrides the container's `align-items` for one item.
     /// `None` is `auto`: take the container's.
     pub align_self: Option<AlignItems>,
+    /// `justify-items`: where a grid container's items sit across their areas
+    /// along the inline axis, unless one says otherwise.
+    pub justify_items: AlignItems,
+    /// `justify-self`, or `None` for `auto`, which defers to the container's
+    /// `justify-items`.
+    pub justify_self: Option<AlignItems>,
     /// `align-content`: how the *lines* of a wrapped container share the room
     /// across it. It says nothing at all about a container with one line.
     pub align_content: AlignContent,
@@ -1431,16 +1441,16 @@ impl Default for ComputedStyle {
             z_index: None,
             overflow: Overflow::Visible,
             radius: Corners::SQUARE,
-            grid_columns: Vec::new(),
-            grid_rows: Vec::new(),
-            grid_columns_fill: None,
-            grid_column: Placement::AUTO,
-            grid_row: Placement::AUTO,
+            grid: None,
+            grid_column: GridPlacement::AUTO,
+            grid_row: GridPlacement::AUTO,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
-            justify_content: JustifyContent::Start,
-            align_items: AlignItems::Stretch,
+            justify_content: JustifyContent::Stretch,
+            align_items: AlignItems::Normal,
             align_self: None,
+            justify_items: AlignItems::Normal,
+            justify_self: None,
             align_content: AlignContent::Stretch,
             order: 0,
             flex_grow: 0.0,

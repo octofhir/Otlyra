@@ -35,12 +35,17 @@ pub mod appearance;
 pub mod calc;
 pub mod cascade;
 pub mod computed;
+pub mod grid;
 mod hints;
 pub mod invalidation;
 pub mod state;
 pub mod style;
 pub mod stylo_dom;
 
+pub use grid::{
+    AutoRepeat, FlowAxis, GridAutoFlow, GridLine, GridPlacement, GridTemplate, LineName, NamedArea,
+    RepeatKind, TrackList, TrackMax, TrackMin, TrackSize,
+};
 pub use hints::non_negative_integer;
 pub use style::{
     AlignContent, AlignItems, AspectRatio, BackgroundLayer, BackgroundPosition, BackgroundRepeat,
@@ -48,6 +53,6 @@ pub use style::{
     Corners, Display, FlexBasis, FlexDirection, FlexWrap, Float, FontStyle, Gradient, GradientStop,
     Intrinsic, JustifyContent, Length, LengthOrAuto, LineHeight, ListStyle, MaxSize, ObjectFit,
     Overflow, Position, Ratio, Repeat, Shadow, Sides, Size, TextAlign, TextDecoration, TextWrap,
-    Track, TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
+    TransformOp, TransformOrigin, VerticalAlign, WhiteSpace,
 };
 pub use style::{FamilyName, FontFamily, GenericFamily};

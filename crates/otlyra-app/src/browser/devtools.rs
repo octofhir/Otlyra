@@ -193,7 +193,10 @@ impl Browser {
         // drawn on the page they laid out.
         let tracks = matches!(
             style.display,
-            otlyra_css::Display::Grid | otlyra_css::Display::Flex
+            otlyra_css::Display::Grid
+                | otlyra_css::Display::InlineGrid
+                | otlyra_css::Display::Flex
+                | otlyra_css::Display::InlineFlex
         )
         .then(|| {
             let items: Vec<crate::ui::Rect> = box_node
@@ -205,7 +208,7 @@ impl Browser {
             crate::inspector::Tracks::of(
                 edges.content_of(border),
                 &items,
-                style.display == otlyra_css::Display::Grid,
+                style.display.is_grid(),
                 (
                     f64::from(style.gap.0.resolve(border.width as f32)),
                     f64::from(style.gap.1.resolve(border.width as f32)),

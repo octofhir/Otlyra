@@ -48,8 +48,9 @@ use crate::box_tree::BoxId;
 use crate::fragment::Fragment;
 
 use super::Flow;
+use super::item::ItemHeight;
 use super::sizing::BlockSpace;
-use item::{FlexItem, ItemHeight, stretched};
+use item::{FlexItem, stretched};
 use lines::{Flexible, break_lines, end_to_end, justify, resolve_flexible_lengths, size_lines};
 
 /// What a flex container's items are sized and placed against.
@@ -341,7 +342,10 @@ impl<'a> Flow<'a> {
                         // `baseline` needs a baseline to align on, which a box
                         // does not carry yet; it lays out as `start`, which is
                         // where it would be for a single line of text anyway.
-                        AlignItems::Start | AlignItems::Stretch | AlignItems::Baseline => 0.0,
+                        AlignItems::Start
+                        | AlignItems::Stretch
+                        | AlignItems::Normal
+                        | AlignItems::Baseline => 0.0,
                     }
                 };
 
@@ -387,7 +391,7 @@ impl<'a> Flow<'a> {
             };
 
             let fragment = self.layout_item(
-                item,
+                &item.boxed(),
                 (item_x, item_y),
                 item_width,
                 item_height,
