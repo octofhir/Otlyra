@@ -7,6 +7,10 @@ use otlyra_gfx::PaintTarget as _;
 /// re-encodes; the rasterizer hands us sRGB-encoded premultiplied RGBA8.
 const STAGING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// Format of the texture Skia draws the window into on the GPU: the same bytes as
+/// the staging texture, stored plain and sampled through an `*Srgb` view.
+const DIRECT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 const BLIT_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -386,13 +390,49 @@ impl Presenter {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: STAGING_FORMAT,
+            format: DIRECT_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: &[STAGING_FORMAT],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Skia writes the sRGB-encoded bytes the CPU rasterizer would have, into
+        // a plain RGBA8 texture; the sampler reads them through an sRGB view, as
+        // it reads the staging texture. An sRGB texture under Skia encoded them a
+        // second time on the way in, and the window came out washed out.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(STAGING_FORMAT),
+            ..Default::default()
+        });
+        // wgpu does not see what Skia draws, so a texture it has never written is
+        // one it zeroes before its first use — the first time the swapchain
+        // sampled it, after Skia had drawn the whole window into it. Clearing it
+        // here, through wgpu, is what makes it wgpu's idea of initialised.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("otlyra-direct-frame-init"),
+            });
+        {
+            let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("otlyra-direct-frame-init"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("otlyra-direct-frame-bind-group"),
             layout: &self.bind_group_layout,

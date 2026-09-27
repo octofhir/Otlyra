@@ -34,7 +34,7 @@ Every piece exists:
 
 ## What the acceptance spike proved
 
-`backend-corpus` can wrap a wgpu-owned `Rgba8UnormSrgb` texture in Ganesh and replay
+`backend-corpus` can wrap a wgpu-owned `Rgba8Unorm` texture in Ganesh and replay
 the exact same seven-operation `PaintTarget` corpus used by the CPU backend.
 Crucially, Skia receives wgpu's own `MTLCommandQueue`, not a second queue. A
 Skia flush committed before later wgpu work is therefore ordered by Metal's
@@ -136,3 +136,15 @@ Keep the spike outside the live default until:
 - screenshots and deterministic tests continue through CPU Skia;
 - device loss or unsupported platforms select the CPU backend without changing
   browser/UI code.
+
+## Two traps the window fell into (2026-09-27)
+
+- **The texture is plain RGBA8, not `*Srgb`.** Skia is given sRGB-encoded bytes, as
+  the raster surface is. Under an `Rgba8UnormSrgb` texture Ganesh's writes were
+  encoded a second time and the window came out washed out; a read-back decodes
+  them again, so a corpus that compares read-back pixels cannot see it. The
+  presenter samples through an `Rgba8UnormSrgb` view (`view_formats`).
+- **wgpu must think the texture initialised.** It does not see Skia's writes, so it
+  zeroes a texture it never wrote before the first time it is sampled — after Skia
+  had drawn the whole window into it. The presenter clears a new texture through a
+  wgpu render pass before Skia draws.

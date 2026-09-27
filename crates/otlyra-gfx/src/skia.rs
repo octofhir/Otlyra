@@ -674,7 +674,8 @@ impl SkiaPainter {
     /// # Safety
     ///
     /// - `texture` must point to a live `MTLTexture` of the device `context`
-    ///   was made for: two-dimensional, sRGB RGBA8, a render target, exactly
+    ///   was made for: two-dimensional, plain (not sRGB) RGBA8 — it is given
+    ///   sRGB-encoded bytes, as the raster surface is — a render target, exactly
     ///   `width` by `height` pixels.
     /// - The texture must outlive the returned painter and must not be used
     ///   concurrently. Submit subsequent wgpu work only after
@@ -709,7 +710,7 @@ impl SkiaPainter {
             &backend_texture,
             sk::gpu::SurfaceOrigin::TopLeft,
             0,
-            sk::ColorType::SRGBA8888,
+            sk::ColorType::RGBA8888,
             sk::ColorSpace::new_srgb(),
             None,
         )
