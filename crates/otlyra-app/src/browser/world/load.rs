@@ -46,6 +46,12 @@ pub(super) struct PendingLoad {
     imports_asked: HashSet<Url>,
     /// How many stylesheets have been asked for, linked and imported together.
     sheets_asked: usize,
+    /// The `<link rel=stylesheet>` elements already asked for. A parse stopped
+    /// at a script shows the document a piece at a time, and each piece may
+    /// link a sheet the last one did not have.
+    links_asked: HashSet<NodeId>,
+    /// The same for the elements that show a picture.
+    pictures_asked: HashSet<NodeId>,
     images: Images,
     /// Which file each of those pictures came from, and at what density.
     picture_sources: HashMap<NodeId, (String, f32)>,
@@ -245,6 +251,8 @@ impl PageWorld {
             sources: StyleSources::default(),
             imports_asked: HashSet::new(),
             sheets_asked: 0,
+            links_asked: HashSet::new(),
+            pictures_asked: HashSet::new(),
             images: Images::default(),
             picture_sources: HashMap::new(),
             outstanding: HashMap::new(),
@@ -579,6 +587,16 @@ impl PageWorld {
         pending.parse = parser;
         pending.sources.base = base;
         pending.sheets_asked = links.len().min(STYLESHEET_LIMIT);
+        pending.links_asked = links
+            .iter()
+            .take(STYLESHEET_LIMIT)
+            .map(|link| link.node)
+            .collect();
+        pending.pictures_asked = pictures
+            .iter()
+            .take(IMAGE_LIMIT)
+            .map(|source| source.node)
+            .collect();
         let recorded = pending.record.then(|| pending.previous_url.clone());
         // The window hears of the arrival before anything the rest of the load
         // does: it is where the tab's title and history entry come from.
@@ -842,6 +860,10 @@ impl PageWorld {
     /// Put the parser back, or finish the parse if it has nothing left to wait
     /// for.
     fn after_parse_step(&mut self, tab: TabId, parser: otlyra_html::HtmlParser) {
+        // What the parse just added may link sheets and show pictures that the
+        // part before it did not; those are asked for now, while the load is
+        // still waiting, or they would never be asked for at all.
+        self.request_found(tab);
         if parser.blocked_on().is_some() {
             // Stopped again, at the next script. Ask for that one.
             let src = self.page(tab).and_then(|page| {
@@ -873,6 +895,93 @@ impl PageWorld {
         {
             pending.runner = Some(runner);
         }
+        self.request_found(tab);
+    }
+
+    /// Ask for the sheets and pictures the tab's document names that have not
+    /// been asked for yet: the ones a parse that stopped at a script had not
+    /// reached when the document was first put on screen.
+    fn request_found(&mut self, tab: TabId) {
+        let Some(page) = self.page(tab) else {
+            return;
+        };
+        let Some(pending) = self.pending(tab) else {
+            return;
+        };
+        let (here, base) = (page.url().to_string(), page.base_url().clone());
+        let document = page.document();
+
+        let links: Vec<_> = otlyra_css::cascade::stylesheet_links(document)
+            .into_iter()
+            .filter(|link| !pending.links_asked.contains(&link.node))
+            .take(STYLESHEET_LIMIT.saturating_sub(pending.sheets_asked))
+            .collect();
+        let pictures: Vec<_> = otlyra_layout::image_sources(document, self.environment.viewport)
+            .into_iter()
+            .filter(|source| !pending.pictures_asked.contains(&source.node))
+            .take(IMAGE_LIMIT.saturating_sub(pending.pictures_asked.len()))
+            .collect();
+        let imports: Vec<Import> = otlyra_css::cascade::style_element_imports(document, &base)
+            .into_iter()
+            .filter(|(_, url)| !pending.imports_asked.contains(url))
+            .map(|(owner, url)| Import {
+                url,
+                depth: 1,
+                owner,
+            })
+            .collect();
+        if links.is_empty() && pictures.is_empty() && imports.is_empty() {
+            return;
+        }
+
+        let mut wanted = Vec::new();
+        let mut ready = Images::default();
+        for source in &pictures {
+            // Decoded for an earlier page and still here: no request at all.
+            let cached = Self::subresource_url(&here, &base, &source.src)
+                .and_then(|url| self.images.get(&url));
+            match cached {
+                Some(data) => {
+                    ready.insert(
+                        source.node,
+                        otlyra_layout::Picture {
+                            data,
+                            density: source.density,
+                        },
+                    );
+                }
+                None => wanted.push((
+                    source.src.clone(),
+                    PendingResource::Image(source.node, source.src.clone(), source.density),
+                    ResourceKind::Image,
+                )),
+            }
+        }
+        for link in &links {
+            wanted.push((
+                link.href.clone(),
+                PendingResource::Stylesheet(link.node),
+                ResourceKind::Stylesheet,
+            ));
+        }
+        tracing::debug!(
+            sheets = links.len(),
+            pictures = pictures.len(),
+            imports = imports.len(),
+            "found more to ask for as the parse went on"
+        );
+        if let Some(pending) = self.pending_mut(tab) {
+            pending.sheets_asked += links.len();
+            pending
+                .links_asked
+                .extend(links.iter().map(|link| link.node));
+            pending
+                .pictures_asked
+                .extend(pictures.iter().map(|source| source.node));
+            pending.images.extend(ready);
+        }
+        self.request_for_load(tab, wanted.into_iter());
+        self.request_imports(tab, imports);
     }
 
     /// Whether a tab is still waiting for a stylesheet it cannot be drawn without.

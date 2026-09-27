@@ -1453,6 +1453,46 @@ fn a_sheet_may_not_name_the_disk() {
     assert_eq!(asked, ["https://disk.example/"]);
 }
 
+/// What a document names after the script its parse stopped at is asked for
+/// too. The page goes on screen as far as the parse got, which is the head; the
+/// sheet and the picture in the body are only there once the script has come
+/// and the parse has carried on, and a load that asked only for what the first
+/// piece named left every page with a script in its head unstyled and bare.
+#[test]
+fn what_follows_a_blocking_script_is_asked_for() {
+    let (mut browser, requested) = table_browser(
+        &[
+            (
+                "https://late.example/",
+                "text/html",
+                b"<head><script src=a.js></script></head>\
+                  <body><link rel=stylesheet href=late.css><img src=p.png><p>x</p></body>",
+            ),
+            ("https://late.example/a.js", "text/javascript", b"1;"),
+            (
+                "https://late.example/late.css",
+                "text/css",
+                b"p { color: red }",
+            ),
+            ("https://late.example/p.png", "image/png", ONE_PIXEL_PNG),
+        ],
+        Some((
+            "https://late.example/a.js",
+            std::time::Duration::from_millis(50),
+        )),
+    );
+    go(&mut browser, "https://late.example/");
+    frame_and_settle(&mut browser);
+
+    let asked = asked_for(&requested);
+    for url in [
+        "https://late.example/late.css",
+        "https://late.example/p.png",
+    ] {
+        assert!(asked.iter().any(|asked| asked == url), "{url} in {asked:?}");
+    }
+}
+
 /// A base element moves where the markup's addresses point — a picture and a
 /// link both — and moves nothing about what the page may reach: that is still
 /// the document's own address's to decide.
