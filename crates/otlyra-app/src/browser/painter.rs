@@ -15,13 +15,11 @@ use crate::page::PageScene;
 use crate::ui::{SystemPage, UI_HEIGHT, UiAction};
 
 use super::frame::{LAYER_CHROME, LAYER_HIGHLIGHT, LAYER_INSPECTOR, LAYER_PAGE};
-use super::{
-    Browser, SURFACE_CHROME, SURFACE_INSPECTOR, SURFACE_PAGE, SURFACE_SYSTEM, Tab, ZoomStep,
-};
+use super::{Browser, SURFACE_CHROME, SURFACE_INSPECTOR, SURFACE_PAGE, SURFACE_SYSTEM, ZoomStep};
 
 impl Painter for Browser {
     fn set_waker(&mut self, waker: Waker) {
-        self.fetcher.set_waker(waker.clone());
+        self.world.fetcher.set_waker(waker.clone());
         self.downloads_writer.set_waker(waker);
         // Anything that finished before the loop had a waker to be woken by is
         // sitting in the channel: a page asked for on the command line usually
@@ -37,24 +35,20 @@ impl Painter for Browser {
         let Some(tab) = self.tabs.get(self.active) else {
             return FrameRequest::None;
         };
-        if self.tabs.iter().any(Tab::loading) {
+        if self.world.any_loading() {
             return FrameRequest::Vsync;
         }
         // A page mid-animation asks for the next frame at display pace, which
         // is what `requestAnimationFrame` is.
-        if tab
-            .scripts
-            .as_ref()
-            .is_some_and(|scripts| scripts.frames_pending())
-        {
+        if self.world.frames_pending(tab.id) {
             return FrameRequest::Vsync;
         }
         // The caret's next half-second and the pause before a control is named:
         // whichever comes first, because one wake serves both and a loop told
         // about the later one would sleep through the earlier.
-        let caret = tab
-            .page
-            .as_ref()
+        let caret = self
+            .world
+            .page(tab.id)
             .and_then(crate::page::PageScene::next_caret_frame);
         let tooltip = self.ui.next_tooltip_frame();
         // And whatever any page put on the clock: a timer is a reason to wake
@@ -104,7 +98,7 @@ impl Painter for Browser {
             page_paints: self
                 .tabs
                 .iter()
-                .filter_map(|tab| tab.page.as_ref())
+                .filter_map(|tab| self.world.page(tab.id))
                 .map(PageScene::builds)
                 .sum(),
         }
@@ -114,11 +108,7 @@ impl Painter for Browser {
         let previous_pointer = self.pointer;
         let picking_before = self.inspector.picking;
         let selected_before = self.inspector.selected;
-        let page_damage = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.page.as_ref())
-            .map(PageScene::damage);
+        let page_damage = self.page(self.active).map(PageScene::damage);
         self.on_event(event);
 
         let PlatformEvent::PointerMoved { x, y } = event else {
@@ -129,11 +119,7 @@ impl Painter for Browser {
             return FrameRequest::None;
         }
 
-        let current_damage = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.page.as_ref())
-            .map(PageScene::damage);
+        let current_damage = self.page(self.active).map(PageScene::damage);
         let dock_top = self.dock_top();
         let chrome_changed = previous_pointer.1 < UI_HEIGHT
             || y < UI_HEIGHT
@@ -215,7 +201,7 @@ impl Painter for Browser {
                 if self.selecting {
                     let top = self.page_top();
                     let (x, y) = self.in_page(x, y);
-                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    if let Some(page) = self.active_page_mut() {
                         page.select_to(x as f32, y as f32, top);
                         return;
                     }
@@ -225,7 +211,7 @@ impl Painter for Browser {
                 // wherever the pointer wanders.
                 let (width, height) = self.in_page(self.last_width, self.last_height - UI_HEIGHT);
                 let (_, page_y) = self.in_page(0.0, y - UI_HEIGHT);
-                if let Some(page) = self.tabs[self.active].page.as_mut()
+                if let Some(page) = self.active_page_mut()
                     && page.dragging_scrollbar()
                 {
                     page.drag_scrollbar(page_y as f32, width as f32, height.max(0.0) as f32);
@@ -237,7 +223,7 @@ impl Painter for Browser {
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
                     let over_page = y >= UI_HEIGHT && y < self.dock_top();
                     let (page_x, page_y) = self.in_page(x, y);
-                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    if let Some(page) = self.active_page_mut() {
                         let _ = if over_page {
                             page.pointer_moved(page_x, page_y)
                         } else {
@@ -312,7 +298,7 @@ impl Painter for Browser {
                     let (width, height) =
                         self.in_page(self.last_width, self.last_height - UI_HEIGHT);
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1 - UI_HEIGHT);
-                    if let Some(page) = self.tabs[self.active].page.as_mut()
+                    if let Some(page) = self.active_page_mut()
                         && page.grab_scrollbar(
                             x as f32,
                             y as f32,
@@ -389,12 +375,11 @@ impl Painter for Browser {
                     && self.pointer.1 >= UI_HEIGHT
                 {
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
-                    let pressed = self.tabs[self.active]
-                        .page
-                        .as_mut()
+                    let pressed = self
+                        .active_page_mut()
                         .is_some_and(|page| page.control_under(x, y));
                     if pressed {
-                        if let Some(page) = self.tabs[self.active].page.as_mut() {
+                        if let Some(page) = self.active_page_mut() {
                             page.clear_selection();
                             page.pointer_pressed_times(x, y, clicks);
                         }
@@ -405,7 +390,7 @@ impl Painter for Browser {
                     // the same statement the toolbar's blur above answers, made
                     // about the document instead. The press then goes on to start
                     // a selection where it landed.
-                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    if let Some(page) = self.active_page_mut() {
                         page.blur();
                     }
                 }
@@ -415,7 +400,7 @@ impl Painter for Browser {
                 if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
                     let top = self.page_top();
-                    if let Some(page) = self.tabs[self.active].page.as_mut() {
+                    if let Some(page) = self.active_page_mut() {
                         let (x, y) = (x as f32, y as f32);
                         // A second click takes the word and a third the block it
                         // is in; a fourth starts over, which is what the count
@@ -452,7 +437,7 @@ impl Painter for Browser {
             PlatformEvent::PointerReleased => {
                 self.selecting = false;
                 let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
-                if let Some(page) = self.tabs[self.active].page.as_mut() {
+                if let Some(page) = self.active_page_mut() {
                     page.release_scrollbar();
                     // A control is activated on the release and only where the
                     // press landed: a press that wanders off the checkbox before it
@@ -503,9 +488,8 @@ impl Painter for Browser {
                         .key_pressed(
                             key,
                             modifiers,
-                            self.tabs[self.active]
-                                .page
-                                .as_ref()
+                            self.world
+                                .page(self.tabs[self.active].id)
                                 .map(PageScene::document),
                             self.clipboard.as_mut(),
                         )
@@ -600,9 +584,8 @@ impl Painter for Browser {
                     && self.tabs[self.active].system.is_none()
                 {
                     let forward = !modifiers.shift;
-                    let walked = self.tabs[self.active]
-                        .page
-                        .as_mut()
+                    let walked = self
+                        .active_page_mut()
                         .is_some_and(|page| page.focus_step(forward));
                     if walked {
                         self.accessibility_dirty = true;
@@ -623,7 +606,7 @@ impl Painter for Browser {
                     && !modifiers.is_accelerator()
                     && self.keyboard_surface == SURFACE_PAGE
                     && self.tabs[self.active].system.is_none()
-                    && let Some(page) = self.tabs[self.active].page.as_ref()
+                    && let Some(page) = self.page(self.active)
                     && let Some(href) = page.focused_link()
                 {
                     let url = page.resolve(&href).unwrap_or(href);
@@ -651,9 +634,8 @@ impl Painter for Browser {
                 if key == Key::Enter
                     && self.keyboard_surface == SURFACE_PAGE
                     && self.tabs[self.active].system.is_none()
-                    && self.tabs[self.active]
-                        .page
-                        .as_mut()
+                    && self
+                        .active_page_mut()
                         .is_some_and(PageScene::implicit_submit)
                 {
                     self.follow_submission();
@@ -724,7 +706,7 @@ impl Painter for Browser {
                     }
                     SURFACE_PAGE => {
                         if self.tabs[self.active].system.is_none()
-                            && let Some(page) = self.tabs[self.active].page.as_mut()
+                            && let Some(page) = self.active_page_mut()
                         {
                             let _ = page.typed(&character.to_string());
                         }
@@ -805,7 +787,7 @@ impl Painter for Browser {
                     self.bookmarks_page.scroll_by(y);
                 } else if self.tabs[self.active].system == Some(SystemPage::Cookies) {
                     self.cookies_page.scroll_by(y);
-                } else if let Some(page) = self.tabs[self.active].page.as_mut() {
+                } else if let Some(page) = self.world.page_mut(self.tabs[self.active].id) {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box
                     // has reached its end.
@@ -964,7 +946,7 @@ impl Painter for Browser {
         // Rebuilt only after something that can change semantics, geometry or
         // focus. Paint-only animation leaves the last tree valid.
         let tab = self.tabs.get(self.active)?;
-        let document = match tab.page.as_ref() {
+        let document = match self.world.page(tab.id) {
             Some(page) => crate::a11y::tree_for(page, &tab.title),
             None => crate::a11y::empty_tree(&tab.title),
         };

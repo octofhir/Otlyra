@@ -46,7 +46,7 @@ impl Browser {
         }
         // Before the factor changes, because it is the layout being left that
         // knows where the reader was.
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             page.hold_the_reader_s_place();
         }
         self.zoom = zoom;
@@ -67,7 +67,7 @@ impl Browser {
         }
         // Everything below the zoom is a function of it: the page lays out in a
         // viewport of a different size, so it has to be laid out again.
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             page.invalidate_layout();
         }
     }
@@ -103,7 +103,7 @@ impl Browser {
         }
         self.zoom = wanted;
         self.ui.zoom = wanted;
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             page.invalidate_layout();
         }
     }

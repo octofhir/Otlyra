@@ -39,7 +39,7 @@ impl Browser {
     pub fn open_system_in_new_tab(&mut self, page: SystemPage) {
         let blank = {
             let tab = &self.tabs[self.active];
-            tab.url.is_empty() && tab.page.is_none() && tab.system.is_none()
+            tab.url.is_empty() && self.world.page(tab.id).is_none() && tab.system.is_none()
         };
         if !blank {
             self.new_tab();
@@ -104,7 +104,7 @@ impl Browser {
         let scroll = match tab.system {
             Some(SystemPage::Settings) => settings,
             Some(_) => 0.0,
-            None => tab.page.as_ref().map_or(0.0, |page| page.scroll()),
+            None => self.world.page(tab.id).map_or(0.0, |page| page.scroll()),
         };
         if let Some(entry) = tab.history.get_mut(tab.position) {
             entry.scroll = scroll;
@@ -125,7 +125,7 @@ impl Browser {
         }
 
         let url = tab.url.clone();
-        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        let scroll = self.world.page(tab.id).map_or(0.0, |page| page.scroll());
         // A reload is the reader saying they think it changed, so the stored copy
         // is not the answer however fresh it still is. It is still worth
         // consulting: the server may say nothing changed, and a reload that costs
@@ -165,7 +165,7 @@ impl Browser {
             return;
         }
         let url = tab.url.clone();
-        let scroll = tab.page.as_ref().map_or(0.0, |page| page.scroll());
+        let scroll = self.world.page(tab.id).map_or(0.0, |page| page.scroll());
         self.start_load(&url, false, false, scroll);
     }
 
@@ -176,10 +176,10 @@ impl Browser {
     /// `receive` accepts only request ids a live tab still owns, so a late
     /// document, stylesheet, or image cannot replace what the reader kept.
     pub fn stop(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if tab.pending.take().is_some() {
+        if self.world.stop(tab.id) {
             tracing::info!(url = %tab.url, "navigation stopped");
         }
     }
@@ -190,11 +190,7 @@ impl Browser {
     /// without a script. An action of nothing at all means the page's own address,
     /// which is what reloads a page with its answers in the query.
     pub(super) fn follow_submission(&mut self) {
-        let Some(sent) = self.tabs[self.active]
-            .page
-            .as_mut()
-            .and_then(PageScene::take_submission)
-        else {
+        let Some(sent) = self.active_page_mut().and_then(PageScene::take_submission) else {
             return;
         };
         if sent.method == otlyra_dom::Method::Dialog {
@@ -207,8 +203,8 @@ impl Browser {
         let target = if sent.url.is_empty() {
             tab.url.clone()
         } else {
-            tab.page
-                .as_ref()
+            self.world
+                .page(tab.id)
                 .and_then(|page| page.resolve(&sent.url))
                 .unwrap_or_else(|| sent.url.clone())
         };
@@ -239,7 +235,7 @@ impl Browser {
     /// all, and a page from the internet must never be able to claim it.
     pub(super) fn navigate_from(&mut self, url: &str, user_initiated: bool) {
         if user_initiated {
-            self.script_hops = 0;
+            self.world.reset_script_hops();
         }
         self.remember_scroll();
         self.start_load(url, user_initiated, true, 0.0);
@@ -265,8 +261,8 @@ impl Browser {
         tab.url = page.url().to_owned();
         tab.title = page.label().to_owned();
         tab.error = None;
-        tab.page = None;
-        tab.pending = None;
+        let id = tab.id;
+        self.world.set_page(id, None);
 
         if record {
             self.record_history(index, &previous_url);

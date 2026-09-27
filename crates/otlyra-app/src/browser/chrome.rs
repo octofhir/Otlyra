@@ -76,7 +76,7 @@ impl Browser {
             .finding()
             .then(|| self.ui.find.text().to_owned())
             .filter(|query| !query.is_empty());
-        let Some(page) = self.tabs[self.active].page.as_mut() else {
+        let Some(page) = self.active_page_mut() else {
             self.ui.find_status = crate::ui::FindStatus::default();
             return;
         };
@@ -97,7 +97,7 @@ impl Browser {
 
     /// Go to the next place the query occurs, or the one before it.
     fn step_match(&mut self, forward: bool) {
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             page.step_match(forward);
         }
         self.update_find();
@@ -110,9 +110,8 @@ impl Browser {
     /// makes the bar per tab without a second copy of the query to keep in step —
     /// and it is why navigating clears it: the page a search belongs to is gone.
     pub(super) fn sync_find(&mut self) {
-        let query = self.tabs[self.active]
-            .page
-            .as_ref()
+        let query = self
+            .page(self.active)
             .and_then(PageScene::find_query)
             .map(str::to_owned);
         match query {
@@ -194,15 +193,12 @@ impl Browser {
         if y < UI_HEIGHT || y >= self.dock_top() {
             return;
         }
-        if self.tabs[self.active].page.is_none() {
+        if self.page(self.active).is_none() {
             return;
         }
 
         let link = self.link_under_pointer();
-        let selection = self.tabs[self.active]
-            .page
-            .as_ref()
-            .is_some_and(PageScene::has_selection);
+        let selection = self.page(self.active).is_some_and(PageScene::has_selection);
         let mut rows = Vec::new();
         if link.is_some() {
             rows.push(ContextRow::Command(ContextCommand::OpenLinkInNewTab, true));
@@ -255,7 +251,7 @@ impl Browser {
                 self.copy_selection();
             }
             ContextCommand::SelectAll => {
-                if let Some(page) = self.tabs[self.active].page.as_mut() {
+                if let Some(page) = self.active_page_mut() {
                     page.select_all();
                 }
                 self.activate_surface(SURFACE_PAGE);

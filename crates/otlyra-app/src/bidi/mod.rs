@@ -1429,7 +1429,7 @@ impl Session {
         };
 
         Ok(json!({
-            "loading": self.browser.tabs().iter().any(crate::browser::Tab::loading),
+            "loading": self.browser.loading(),
             "took": started.elapsed().as_secs_f64() * 1000.0,
             "found": matched.as_ref().map_or(Value::Null, |nodes| json!(!nodes.is_empty())),
             "nodes": matched.map_or_else(Vec::new, |nodes| {

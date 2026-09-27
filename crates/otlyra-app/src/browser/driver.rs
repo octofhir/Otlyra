@@ -11,9 +11,6 @@ use crate::page::PageScene;
 
 use super::{Browser, Readiness};
 
-/// How long a caller with no event loop waits between checks for a finished fetch.
-const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-
 impl Browser {
     /// Paint one frame nobody sees, so that everything a frame *asks for* has been
     /// asked for, and wait for it.
@@ -26,28 +23,9 @@ impl Browser {
         let mut discarded = otlyra_gfx::RecordingPainter::new();
         self.paint(&mut discarded, viewport);
 
-        let deadline = std::time::Instant::now() + timeout;
-        while !self.background_fetches.is_empty()
-            || !self.font_fetches.is_empty()
-            || !self.picture_fetches.is_empty()
-        {
-            // Everything left is stopped at the gate, waiting for a driver — and
-            // the driver is answered by this thread. Waiting here would be waiting
-            // for a command nobody is left to read, which is a deadlock and not a
-            // slow page. The frame goes out with what arrived.
-            if self.only_held_remains() {
-                tracing::debug!("a driver is holding everything this frame was waiting for");
-                return;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("gave up waiting for a background picture or a font");
-                return;
-            }
-            for fetched in self.fetcher.wait(remaining.min(FETCH_POLL)) {
-                self.receive(fetched);
-            }
-        }
+        self.sync_world();
+        self.world.wait_for_frame_resources(timeout);
+        self.apply_world_events();
 
         // The font landed after the frame that asked for it: every line was
         // measured in whatever the stack fell back to, so the frame the caller is
@@ -65,26 +43,6 @@ impl Browser {
         self.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
     }
 
-    /// Whether everything still outstanding is stopped at the gate.
-    ///
-    /// `false` when nothing is outstanding at all, because *nothing to wait for*
-    /// is the loop's own condition and not this one's.
-    fn only_held_remains(&self) -> bool {
-        let mut any = false;
-        for id in self
-            .background_fetches
-            .keys()
-            .chain(self.font_fetches.keys())
-            .chain(self.picture_fetches.keys())
-        {
-            any = true;
-            if !self.fetcher.is_held(*id) {
-                return false;
-            }
-        }
-        any
-    }
-
     /// How far the tab at `index` has got.
     ///
     /// Read rather than pushed, like everything else a driver asks about: the
@@ -93,11 +51,14 @@ impl Browser {
     /// socket. A tab with nothing in flight is complete however little is in it —
     /// a blank tab has arrived everywhere it was going.
     pub fn readiness(&self, index: usize) -> Readiness {
-        match self.tabs.get(index).and_then(|tab| tab.pending.as_ref()) {
-            None => Readiness::Complete,
-            Some(pending) if pending.document_arrived => Readiness::Interactive,
-            Some(_) => Readiness::Started,
-        }
+        self.tabs
+            .get(index)
+            .map_or(Readiness::Complete, |tab| self.world.readiness(tab.id))
+    }
+
+    /// Whether any tab is waiting for something.
+    pub fn loading(&self) -> bool {
+        self.world.any_loading()
     }
 
     /// Wait for the tab to finish loading, for callers with no event loop.
@@ -106,25 +67,22 @@ impl Browser {
     /// have nowhere to be woken from, and waiting is what they mean by "load".
     pub fn wait_for_load(&mut self, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
-        while self.tabs.iter().any(|tab| tab.loading()) {
-            // The document itself is stopped at the gate. Only a driver can let it
-            // go, and a driver is answered by whichever thread called this — so
-            // the wait would be for a command that cannot be read until it ends.
-            if self.tabs.iter().all(|tab| {
-                tab.pending
-                    .as_ref()
-                    .is_none_or(|pending| self.fetcher.is_held(pending.document))
-            }) {
-                tracing::debug!("a driver is holding the document this wait was for");
+        loop {
+            self.sync_world();
+            self.world
+                .wait_for_load(deadline.saturating_duration_since(std::time::Instant::now()));
+            // What arrived may have been a page whose script sends the tab on, and
+            // the load it asks for is the window's to start: the wait is for where
+            // the tab ends up, not for the first stop on the way.
+            let events = self.world.take_events();
+            if events.is_empty() {
                 return;
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("gave up waiting for a load");
-                return;
+            for event in events {
+                self.apply_world_event(event);
             }
-            for fetched in self.fetcher.wait(remaining.min(FETCH_POLL)) {
-                self.receive(fetched);
+            if !self.world.any_loading() || std::time::Instant::now() >= deadline {
+                return;
             }
         }
     }
@@ -135,27 +93,27 @@ impl Browser {
     /// a browser nobody is driving holds nothing, and a request held with nobody
     /// to let it go is a page that never loads. See [`crate::fetcher::Fetcher`].
     pub fn hold_requests(&mut self, gate: Option<crate::fetcher::Gate>) {
-        self.fetcher.set_gate(gate);
+        self.world.fetcher.set_gate(gate);
     }
 
     /// The requests being held, oldest first.
     pub fn held(&self) -> &[crate::fetcher::Held] {
-        self.fetcher.held()
+        self.world.fetcher.held()
     }
 
     /// Let a held request go, with whatever was changed about it.
     pub fn resume_request(&mut self, id: u64, change: crate::fetcher::Change) -> bool {
-        self.fetcher.resume(id, change)
+        self.world.fetcher.resume(id, change)
     }
 
     /// Answer a held request with a response nobody sent.
     pub fn fulfil_request(&mut self, id: u64, response: crate::fetcher::Loaded) -> bool {
-        self.fetcher.fulfil(id, response)
+        self.world.fetcher.fulfil(id, response)
     }
 
     /// End a held request as a failure, which is what blocking one means.
     pub fn fail_request(&mut self, id: u64, why: &str) -> bool {
-        self.fetcher.fail(id, why)
+        self.world.fetcher.fail(id, why)
     }
 
     /// Every request this browser has made, oldest first.
@@ -163,7 +121,7 @@ impl Browser {
     /// The fetcher's own list, which is what the inspector's network pane reads:
     /// one account of what was asked for, however it is being looked at.
     pub fn exchanges(&self) -> &[crate::fetcher::Exchange] {
-        self.fetcher.exchanges()
+        self.world.fetcher.exchanges()
     }
 
     /// The page the active tab is showing, if it has one.
@@ -171,7 +129,7 @@ impl Browser {
     /// For a driver asking about the document rather than about the browser: the
     /// same page the inspector reads, so the two cannot answer differently.
     pub fn active_page(&self) -> Option<&PageScene> {
-        self.tabs[self.active].page.as_ref()
+        self.page(self.active)
     }
 
     /// Where the active tab is, which is what a driver asks after navigating.

@@ -16,7 +16,7 @@ use crate::settings;
 use crate::ui::{ContextCommand, SystemPage};
 
 use super::frame::{LAYER_CHROME, LAYER_INSPECTOR, LAYER_PAGE};
-use super::subresources::IMAGE_CACHE_BUDGET;
+use super::world::{IMAGE_CACHE_BUDGET, ImageCache};
 
 /// The smallest PNG that decodes: one opaque pixel.
 const ONE_PIXEL_PNG: &[u8] = &[
@@ -230,7 +230,7 @@ fn typing_an_address_and_pressing_enter_loads_it() {
 
     assert_eq!(asked_for(&requested), ["example.com"]);
     assert_eq!(browser.tabs[0].title, "Title of example.com");
-    assert!(browser.tabs[0].page.is_some());
+    assert!(browser.page(0).is_some());
 }
 
 /// One navigation, one visit — and the visit is where the load *ended up*.
@@ -339,7 +339,7 @@ fn a_failed_load_keeps_the_tab_and_says_what_happened() {
     type_url(&mut browser, "broken.example");
 
     assert_eq!(browser.tabs.len(), 1);
-    assert!(browser.tabs[0].page.is_none());
+    assert!(browser.page(0).is_none());
     assert!(
         browser.tabs[0]
             .error
@@ -378,7 +378,7 @@ fn closing_the_last_tab_empties_it_rather_than_leaving_no_tabs() {
     browser.close_tab(0);
 
     assert_eq!(browser.tabs.len(), 1);
-    assert!(browser.tabs[0].page.is_none());
+    assert!(browser.page(0).is_none());
     assert_eq!(browser.ui.address.text(), "");
 }
 
@@ -403,14 +403,7 @@ fn scrolling_belongs_to_the_active_tab() {
     });
 
     let active = browser.active;
-    assert_eq!(
-        browser.tabs[1 - active]
-            .page
-            .as_ref()
-            .expect("page")
-            .scroll(),
-        0.0
-    );
+    assert_eq!(browser.page(1 - active).expect("page").scroll(), 0.0);
 }
 
 #[test]
@@ -427,7 +420,7 @@ fn a_scroll_over_the_interface_does_not_scroll_the_page() {
         source: otlyra_platform::ScrollSource::Wheel,
         modifiers: Default::default(),
     });
-    assert_eq!(browser.tabs[0].page.as_ref().expect("page").scroll(), 0.0);
+    assert_eq!(browser.page(0).expect("page").scroll(), 0.0);
 }
 
 /// Clicking a link navigates, and the address it navigates to is resolved
@@ -560,9 +553,8 @@ fn tab_walks_the_page_and_leaves_it_at_the_end() {
         });
     };
     let focused_link = |browser: &Browser| {
-        browser.tabs[browser.active]
-            .page
-            .as_ref()
+        browser
+            .page(browser.active)
             .and_then(PageScene::focused_link)
     };
 
@@ -622,9 +614,8 @@ fn tab_off_the_end_of_the_chrome_goes_back_into_the_page() {
     }
     assert!(entered, "the toolbar kept the keyboard to itself");
     assert_eq!(
-        browser.tabs[browser.active]
-            .page
-            .as_ref()
+        browser
+            .page(browser.active)
             .and_then(PageScene::focused_link)
             .as_deref(),
         Some("/next"),
@@ -672,9 +663,8 @@ fn tabindex_orders_the_walk_and_takes_things_out_of_it() {
             modifiers: Modifiers::default(),
         });
         reached.push(
-            browser.tabs[browser.active]
-                .page
-                .as_ref()
+            browser
+                .page(browser.active)
                 .and_then(PageScene::focused_link),
         );
     }
@@ -714,9 +704,8 @@ fn tab_past_the_end_of_the_page_reaches_the_interface() {
         "the keyboard left the page and landed nowhere"
     );
     assert!(
-        browser.tabs[browser.active]
-            .page
-            .as_ref()
+        browser
+            .page(browser.active)
             .and_then(PageScene::focused_link)
             .is_none(),
         "the page kept the focus it handed on"
@@ -1092,14 +1081,12 @@ fn dragging_across_the_page_selects_text_and_copies_it() {
     // Across the first line of the page, which is the paragraph the loader
     // serves. The pointer is moved first, because a press lands where the
     // pointer last was.
-    let line = browser.tabs[0]
-        .page
-        .as_ref()
+    let line = browser
+        .page(0)
         .expect("a page")
         .rect_of(
-            browser.tabs[0]
-                .page
-                .as_ref()
+            browser
+                .page(0)
                 .expect("a page")
                 .box_at(30.0, UI_HEIGHT + 20.0)
                 .expect("something under the pointer"),
@@ -1112,9 +1099,8 @@ fn dragging_across_the_page_selects_text_and_copies_it() {
     browser.on_event(PlatformEvent::PointerMoved { x: 400.0, y });
     browser.on_event(PlatformEvent::PointerReleased);
 
-    let selected = browser.tabs[0]
-        .page
-        .as_ref()
+    let selected = browser
+        .page(0)
         .expect("a page")
         .selected_text()
         .expect("a drag across the words selected some of them");
@@ -1160,11 +1146,7 @@ fn a_press_on_an_open_menu_never_reaches_the_page_behind_it() {
         "the page took a press that belonged to the menu"
     );
     assert!(
-        !browser.tabs[0]
-            .page
-            .as_ref()
-            .expect("a page")
-            .has_selection(),
+        !browser.page(0).expect("a page").has_selection(),
         "and started selecting behind it"
     );
     assert!(
@@ -1199,9 +1181,8 @@ fn a_second_click_takes_a_word_and_a_third_takes_the_block() {
     browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
     let selected = |browser: &Browser| {
-        browser.tabs[0]
-            .page
-            .as_ref()
+        browser
+            .page(0)
             .expect("a page")
             .selected_text()
             .unwrap_or_default()
@@ -1307,7 +1288,7 @@ impl Loader for FontLoader {
 fn a_page_brings_its_own_font() {
     let mut browser = Browser::new(FontLoader);
     assert!(
-        !browser.text.has_family("Brought"),
+        !browser.world.text.has_family("Brought"),
         "the family cannot exist before the page that defines it"
     );
 
@@ -1323,10 +1304,11 @@ fn a_page_brings_its_own_font() {
     );
 
     assert!(
-        browser.text.has_family("Brought"),
+        browser.world.text.has_family("Brought"),
         "the family the page defined is the shaper's now"
     );
     let fonts: Vec<&str> = browser
+        .world
         .fetcher
         .exchanges()
         .iter()
@@ -1564,7 +1546,11 @@ fn an_import_is_fetched_relative_to_its_sheet_and_holds_the_first_frame() {
             std::time::Instant::now() < deadline,
             "the import was never asked for"
         );
-        for fetched in browser.fetcher.wait(std::time::Duration::from_millis(20)) {
+        for fetched in browser
+            .world
+            .fetcher
+            .wait(std::time::Duration::from_millis(20))
+        {
             browser.receive(fetched);
         }
     }
@@ -1576,7 +1562,7 @@ fn an_import_is_fetched_relative_to_its_sheet_and_holds_the_first_frame() {
 
     settle(&mut browser);
     assert!(!browser.blocked_on_style(active), "the import arrived");
-    let page = browser.tabs[active].page.as_mut().expect("a page");
+    let page = browser.page_mut(active).expect("a page");
     page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
     let boxes = page.boxes();
     let coloured = boxes
@@ -1658,7 +1644,7 @@ fn the_picker_chooses_the_element_a_click_would_have_hit() {
         "armed, the press picked rather than followed the link"
     );
     let selected = browser.inspector.selected.expect("something was chosen");
-    let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
+    let page = browser.page(0).expect("a page is loaded");
     let named = page
         .document()
         .get(selected)
@@ -1702,7 +1688,7 @@ fn moving_the_picker_between_page_elements_requests_each_highlight_frame() {
     browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
 
     let positions = {
-        let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
+        let page = browser.page(0).expect("a page is loaded");
         let boxes = page.boxes();
         boxes
             .descendants(boxes.root())
@@ -1777,7 +1763,7 @@ fn the_highlight_is_where_the_engine_drew_the_chosen_box() {
         .border;
     // Asserted against the engine's own answer rather than against numbers:
     // whatever box the hit test names, the overlay is that box's rectangle.
-    let page = browser.tabs[0].page.as_ref().expect("a page is loaded");
+    let page = browser.page(0).expect("a page is loaded");
     let id = page
         .boxes()
         .box_for(browser.inspector.selected.expect("something was chosen"))
@@ -1815,7 +1801,7 @@ impl Loader for GridLoader {
 
 /// Choose the first element the document has whose tag is `tag`.
 fn choose(browser: &mut Browser, tag: &str) {
-    let page = browser.tabs[0].page.as_ref().expect("a page");
+    let page = browser.page(0).expect("a page");
     let document = page.document();
     let mut stack = vec![document.root()];
     while let Some(node) = stack.pop() {
@@ -2042,9 +2028,8 @@ fn a_widened_window_asks_for_a_larger_picture() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         browser.paint(&mut painter, wide);
-        let held = browser.tabs[0]
-            .page
-            .as_ref()
+        let held = browser
+            .page(0)
             .and_then(|page| {
                 let node = otlyra_layout::image_sources(
                     page.document(),
@@ -2080,13 +2065,16 @@ fn a_frame_takes_in_a_load_that_nothing_woke_the_loop_for() {
     // Nothing here pumps but painting, which is the whole point.
     let mut painter = otlyra_gfx::RecordingPainter::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while browser.tabs[0].loading() && std::time::Instant::now() < deadline {
+    while browser.world.loading(browser.tabs[0].id) && std::time::Instant::now() < deadline {
         browser.paint(&mut painter, Viewport::new(800, 600, 1.0));
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    assert!(!browser.tabs[0].loading(), "the tab is still loading");
-    assert!(browser.tabs[0].page.is_some());
+    assert!(
+        !browser.world.loading(browser.tabs[0].id),
+        "the tab is still loading"
+    );
+    assert!(browser.page(0).is_some());
 }
 
 /// Back and forward walk the addresses the tab has been to, and a new tab has
@@ -2189,7 +2177,7 @@ fn a_scroll_goes_the_same_way_on_a_document_and_on_a_browser_page() {
         source: otlyra_platform::ScrollSource::Wheel,
         modifiers: Default::default(),
     });
-    let page = browser.tabs[0].page.as_ref().expect("a page").scroll();
+    let page = browser.page(0).expect("a page").scroll();
     assert!(page > 0.0, "a positive delta goes down the document");
 
     browser.open_system(SystemPage::Settings);
@@ -2225,7 +2213,7 @@ fn a_trackpad_scrolls_by_what_it_says_rather_than_by_a_notch() {
         source: otlyra_platform::ScrollSource::Trackpad,
         modifiers: Default::default(),
     });
-    assert_eq!(browser.tabs[0].page.as_ref().expect("a page").scroll(), 3.0);
+    assert_eq!(browser.page(0).expect("a page").scroll(), 3.0);
 }
 
 /// Where the reader had got to comes back with the page, which is the part of
@@ -2235,20 +2223,13 @@ fn going_back_restores_where_the_reader_was() {
     let mut browser = Browser::new(LongLoader);
     browser.navigate("long.example");
     settle(&mut browser);
-    browser.tabs[0]
-        .page
-        .as_mut()
-        .expect("a page")
-        .set_scroll(120.0);
+    browser.page_mut(0).expect("a page").set_scroll(120.0);
 
     browser.navigate("long.example/second");
     settle(&mut browser);
     browser.go_back();
     settle(&mut browser);
-    assert_eq!(
-        browser.tabs[0].page.as_ref().expect("a page").scroll(),
-        120.0
-    );
+    assert_eq!(browser.page(0).expect("a page").scroll(), 120.0);
 }
 
 #[test]
@@ -2265,6 +2246,7 @@ fn the_network_list_holds_every_request_and_what_became_of_it() {
     settle(&mut browser);
 
     let listed: Vec<(&str, ResourceKind)> = browser
+        .world
         .fetcher
         .exchanges()
         .iter()
@@ -2284,6 +2266,7 @@ fn the_network_list_holds_every_request_and_what_became_of_it() {
     // there was, and the one that did not says why.
     let by_url = |wanted: &str| {
         browser
+            .world
             .fetcher
             .exchanges()
             .iter()
@@ -2498,11 +2481,11 @@ fn two_tabs_keep_their_own_contents_across_a_switch() {
     // is in, so the other tab is still on its document.
     browser.select_tab(0);
     assert_eq!(browser.system_page(), None);
-    assert!(browser.tabs[0].page.is_some());
+    assert!(browser.page(0).is_some());
 
     browser.select_tab(1);
     assert_eq!(browser.system_page(), Some(SystemPage::Settings));
-    assert!(browser.tabs[1].page.is_none());
+    assert!(browser.page(1).is_none());
 }
 
 #[test]
@@ -2514,11 +2497,7 @@ fn the_history_walks_through_a_browser_page_like_any_other() {
 
     // Left somewhere down the page, which is the thing going back has to
     // bring back along with the document.
-    browser.tabs[0]
-        .page
-        .as_mut()
-        .expect("a page")
-        .set_scroll(120.0);
+    browser.page_mut(0).expect("a page").set_scroll(120.0);
 
     browser.open_system(SystemPage::Settings);
     assert_eq!(browser.tabs[0].url, "about:settings");
@@ -2527,7 +2506,7 @@ fn the_history_walks_through_a_browser_page_like_any_other() {
     settle(&mut browser);
     assert_eq!(browser.tabs[0].url, document);
     assert_eq!(
-        browser.tabs[0].page.as_ref().expect("a page").scroll(),
+        browser.page(0).expect("a page").scroll(),
         120.0,
         "and at the place it was left at"
     );
@@ -2750,7 +2729,7 @@ fn a_form_that_posts_sends_its_body() {
     // Pressed where it was drawn, which needs a frame: the button's rectangle
     // is the last layout's, like every other press.
     let active = browser.active;
-    let page = browser.tabs[active].page.as_mut().expect("a page");
+    let page = browser.page_mut(active).expect("a page");
     page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
     let boxes = page.boxes();
     let button = boxes
@@ -2885,7 +2864,7 @@ fn navigation_fetches_the_stylesheets_the_page_links() {
     );
 
     let active = browser.active;
-    let page = browser.tabs[active].page.as_mut().expect("a page");
+    let page = browser.page_mut(active).expect("a page");
     // The cascade runs on the way to a frame, so ask for one.
     page.build_display_list(&mut TextEngine::isolated(), 800.0, 600.0, 0.0);
 
@@ -3180,11 +3159,11 @@ fn a_zoom_keeps_the_reader_where_they_were_reading() {
     // point and a top inset and adds the scroll itself, so the top of the
     // window is `y == top`.
     let words = |browser: &mut Browser| {
-        let page = browser.tabs[browser.active].page.as_mut().expect("a page");
+        let page = browser.page_mut(browser.active).expect("a page");
         page.select_word_at(40.0, 0.0, 0.0);
         page.selected_text()
     };
-    if let Some(page) = browser.tabs[browser.active].page.as_mut() {
+    if let Some(page) = browser.page_mut(browser.active) {
         page.set_scroll(700.0);
     }
     draw(&mut browser);
@@ -3193,11 +3172,7 @@ fn a_zoom_keeps_the_reader_where_they_were_reading() {
 
     browser.step_zoom(ZoomStep::In);
     draw(&mut browser);
-    let after = browser.tabs[browser.active]
-        .page
-        .as_ref()
-        .expect("a page")
-        .scroll();
+    let after = browser.page(browser.active).expect("a page").scroll();
     assert_ne!(
         after, 700.0,
         "the page moved to keep the reader's place rather than staying at an \
@@ -3227,11 +3202,7 @@ fn a_press_on_a_zoomed_page_lands_where_it_was_aimed() {
     };
     let hit = |browser: &Browser, x: f64, y: f64| {
         let (x, y) = browser.in_page(x, y);
-        browser.tabs[browser.active]
-            .page
-            .as_ref()
-            .expect("a page")
-            .box_at(x, y)
+        browser.page(browser.active).expect("a page").box_at(x, y)
     };
 
     draw(&mut browser);
@@ -3332,13 +3303,13 @@ fn a_web_page_may_not_link_a_stylesheet_on_disk() {
     let mut browser = Browser::new(DiskLoader);
     browser.navigate("site.example");
     settle(&mut browser);
-    assert!(browser.tabs[browser.active].page.is_some());
+    assert!(browser.page(browser.active).is_some());
 }
 
 /// Where the link's text was actually painted, taken from the page's own
 /// targets rather than guessed.
 fn link_position(browser: &Browser) -> (f64, f64) {
-    let page = browser.tabs[browser.active].page.as_ref().expect("page");
+    let page = browser.page(browser.active).expect("page");
     let mut x = 0.0;
     let mut y = 0.0;
     for offset in 0..2000 {
@@ -3395,20 +3366,17 @@ fn stopping_a_load_rejects_its_late_document() {
     let mut browser = Browser::new(SlowSecondPage);
     go(&mut browser, "first.example");
     browser.navigate("second.example");
-    assert!(browser.tabs[0].loading());
+    assert!(browser.world.loading(browser.tabs[0].id));
 
     browser.stop();
     assert!(
-        !browser.tabs[0].loading(),
+        !browser.world.loading(browser.tabs[0].id),
         "the spinner should stop at once"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(75));
     browser.pump();
-    let page = browser.tabs[0]
-        .page
-        .as_ref()
-        .expect("the first page remains");
+    let page = browser.page(0).expect("the first page remains");
     assert_eq!(
         crate::page::title_of(page.document()).as_deref(),
         Some("First"),
@@ -3433,15 +3401,12 @@ fn reloading_keeps_the_scroll_position() {
         source: otlyra_platform::ScrollSource::Wheel,
         modifiers: Default::default(),
     });
-    let scrolled = browser.tabs[0].page.as_ref().expect("page").scroll();
+    let scrolled = browser.page(0).expect("page").scroll();
     assert!(scrolled > 0.0);
 
     browser.reload();
     settle(&mut browser);
-    assert_eq!(
-        browser.tabs[0].page.as_ref().expect("page").scroll(),
-        scrolled
-    );
+    assert_eq!(browser.page(0).expect("page").scroll(), scrolled);
 }
 
 #[test]
@@ -3569,9 +3534,8 @@ fn a_slow_page_waits_for_the_resize_to_stop() {
     let (drawn, _) = page_of(&browser.compose(wide).expect("a frame"));
 
     // Quick: laid out again at the new width straight away.
-    browser.tabs[browser.active]
-        .page
-        .as_mut()
+    browser
+        .page_mut(browser.active)
         .expect("a page")
         .pretend_layout_took(std::time::Duration::from_millis(1));
     let narrower = Viewport::new(1900, 1536, 2.0);
@@ -3580,9 +3544,8 @@ fn a_slow_page_waits_for_the_resize_to_stop() {
     assert!(!Arc::ptr_eq(&drawn, &quick), "a quick page waited");
 
     // Slow: the last frame's page, until the resize has settled.
-    browser.tabs[browser.active]
-        .page
-        .as_mut()
+    browser
+        .page_mut(browser.active)
         .expect("a page")
         .pretend_layout_took(std::time::Duration::from_millis(200));
     let narrowest = Viewport::new(1700, 1536, 2.0);
@@ -3706,9 +3669,8 @@ fn scrolling_the_page_moves_its_layer_epoch_and_leaves_the_chrome_alone() {
 
     // Scroll the long page. Only the page's own list is rebuilt; the tab strip
     // and toolbar are drawing nothing new.
-    browser.tabs[browser.active]
-        .page
-        .as_mut()
+    browser
+        .page_mut(browser.active)
         .expect("a loaded page")
         .scroll_by(300.0);
     let after = browser.compose(viewport).expect("the interface composes");

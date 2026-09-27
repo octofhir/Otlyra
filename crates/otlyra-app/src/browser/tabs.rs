@@ -5,10 +5,8 @@
 //! reordering and choosing tabs touch only that list and which entry is active, so
 //! they are kept apart from what happens inside any one of them.
 
-use crate::page::PageScene;
 use crate::ui::SystemPage;
 
-use super::loading::PendingLoad;
 use super::{Browser, SURFACE_CHROME};
 
 /// One place a tab has been.
@@ -34,16 +32,6 @@ pub struct Tab {
     pub url: String,
     /// Its title, or the URL until it has one.
     pub title: String,
-    /// The document, absent for a blank tab or one whose load failed.
-    pub page: Option<PageScene>,
-    /// The page's script world, kept for as long as the page is on screen.
-    ///
-    /// A page does not stop when its last byte is parsed: its timers come due,
-    /// its animation frames are owed, and its listeners are waiting. Dropping
-    /// the isolate at the end of the load would be a browser that runs a page
-    /// once. It goes when the tab navigates away or closes, which is when the
-    /// document it holds goes.
-    pub(super) scripts: Option<Box<dyn otlyra_html::ScriptRunner>>,
     /// What went wrong, if anything.
     pub error: Option<String>,
     /// The browser's own page this tab is showing, if it is showing one.
@@ -52,8 +40,6 @@ pub struct Tab {
     /// place a tab can be — one tab may sit on the preferences while another
     /// reads a document, and going back from it must reach what was there.
     pub system: Option<SystemPage>,
-    /// The load in flight, if one is.
-    pub(super) pending: Option<PendingLoad>,
     /// What the most recent navigation in this tab is called.
     ///
     /// Kept after the load ends rather than dropped with `pending`, because the
@@ -68,14 +54,6 @@ pub struct Tab {
     pub(super) history: Vec<HistoryEntry>,
     /// Which entry is showing. Meaningless while the history is empty.
     pub(super) position: usize,
-    /// The page's build count when its subresources were last swept for.
-    ///
-    /// Asking a page what pictures and fonts it wants walks its whole box tree
-    /// and its whole document, and the answer cannot change while the display
-    /// list it was built from is being reused. Without this the walk happened
-    /// for every open tab on every frame — sixty full document walks a second,
-    /// per tab, to be told nothing new each time.
-    pub(super) swept_at_build: Option<u64>,
 }
 
 /// What names a tab for as long as it is open.
@@ -124,21 +102,12 @@ impl Tab {
             id: next_tab_id(),
             url: String::new(),
             title: "New tab".to_owned(),
-            page: None,
-            scripts: None,
             error: None,
             system: None,
-            pending: None,
             navigation: None,
             history: Vec::new(),
             position: 0,
-            swept_at_build: None,
         }
-    }
-
-    /// Whether this tab is waiting for something.
-    pub fn loading(&self) -> bool {
-        self.pending.is_some()
     }
 
     /// Whether there is anywhere to go back to.
@@ -157,7 +126,6 @@ impl std::fmt::Debug for Tab {
         f.debug_struct("Tab")
             .field("url", &self.url)
             .field("title", &self.title)
-            .field("loaded", &self.page.is_some())
             .finish()
     }
 }
@@ -198,6 +166,7 @@ impl Browser {
         if index >= self.tabs.len() {
             return;
         }
+        self.world.close(self.tabs[index].id);
         if self.tabs.len() == 1 {
             self.tabs[0] = Tab::blank();
             self.ui.address.clear();

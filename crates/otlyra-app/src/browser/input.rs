@@ -25,7 +25,7 @@ impl Browser {
         }
         // A list that is showing owns the keys that walk it, and the one that puts
         // it away.
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             match key {
                 Key::Escape if page.is_open() => return page.close_open(),
                 Key::Enter if page.is_open() => return page.accept_open(),
@@ -35,7 +35,7 @@ impl Browser {
         }
         // A slider takes the keys that move it before anything else looks at
         // them: an arrow on a focused slider is a step, not a scroll.
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             use crate::page::SliderMotion;
             let motion = match key {
                 Key::Left | Key::Down => Some(SliderMotion::Down),
@@ -62,9 +62,7 @@ impl Browser {
             Key::End => EditAction::End,
             _ => return false,
         };
-        self.tabs[self.active]
-            .page
-            .as_mut()
+        self.active_page_mut()
             .is_some_and(|page| page.edit_text(action, extend))
     }
 
@@ -75,22 +73,14 @@ impl Browser {
         use otlyra_layout::Motion;
 
         if key == Key::Character('a') && modifiers.command {
-            return self.tabs[self.active]
-                .page
-                .as_mut()
-                .is_some_and(PageScene::select_all);
+            return self.active_page_mut().is_some_and(PageScene::select_all);
         }
 
         // Only with shift held. An arrow on a page nobody is editing scrolls it,
         // in every browser and here — turning that into a caret the moment
         // something is selected would take the page's scrolling away for as long
         // as a selection is on screen.
-        if !modifiers.shift
-            || !self.tabs[self.active]
-                .page
-                .as_ref()
-                .is_some_and(PageScene::has_selection)
-        {
+        if !modifiers.shift || !self.page(self.active).is_some_and(PageScene::has_selection) {
             return false;
         }
 
@@ -108,7 +98,7 @@ impl Browser {
             _ => return false,
         };
 
-        let Some(page) = self.tabs[self.active].page.as_mut() else {
+        let Some(page) = self.active_page_mut() else {
             return false;
         };
         page.move_selection(motion, true);
@@ -123,9 +113,8 @@ impl Browser {
     /// on a machine with none the request simply goes unanswered and the control
     /// goes on saying that no file was chosen.
     pub(super) fn answer_file_request(&mut self) {
-        let Some(request) = self.tabs[self.active]
-            .page
-            .as_mut()
+        let Some(request) = self
+            .active_page_mut()
             .and_then(PageScene::take_file_request)
         else {
             return;
@@ -134,7 +123,7 @@ impl Browser {
         if chosen.is_empty() {
             return;
         }
-        if let Some(page) = self.tabs[self.active].page.as_mut() {
+        if let Some(page) = self.active_page_mut() {
             page.set_files(request.node, chosen);
         }
     }
@@ -150,7 +139,7 @@ impl Browser {
         node: otlyra_platform::accesskit::NodeId,
         action: otlyra_platform::AccessibilityAction,
     ) {
-        let Some(page) = self.tabs[self.active].page.as_mut() else {
+        let Some(page) = self.active_page_mut() else {
             return;
         };
         // A box for nearly everything on the page, and an element for the few
@@ -212,13 +201,13 @@ impl Browser {
         /// How much of the window a page key keeps, so the reader has an anchor.
         const PAGE_OVERLAP: f32 = 48.0;
 
-        let Some(page) = self.tabs[self.active].page.as_mut() else {
+        let screen = (self.last_height as f32 - UI_HEIGHT as f32 - PAGE_OVERLAP).max(LINE);
+        let Some(page) = self.active_page_mut() else {
             return;
         };
         if page.editing_text() {
             return;
         }
-        let screen = (self.last_height as f32 - UI_HEIGHT as f32 - PAGE_OVERLAP).max(LINE);
 
         match key {
             Key::Down => page.scroll_by(LINE),
@@ -236,11 +225,7 @@ impl Browser {
     /// Returns whether there was anything to copy, which is what decides whether
     /// the key belonged to the page or to whatever else wanted it.
     pub(super) fn copy_selection(&mut self) -> bool {
-        let Some(text) = self.tabs[self.active]
-            .page
-            .as_ref()
-            .and_then(PageScene::selected_text)
-        else {
+        let Some(text) = self.page(self.active).and_then(PageScene::selected_text) else {
             return false;
         };
         tracing::debug!(characters = text.len(), "copied the selection");
@@ -255,7 +240,7 @@ impl Browser {
     /// which is what it did before there was anywhere else for it to go.
     pub(super) fn hand_keyboard_to_the_page(&mut self, forward: bool) {
         let entered = self.tabs[self.active].system.is_none()
-            && self.tabs[self.active].page.as_mut().is_some_and(|page| {
+            && self.active_page_mut().is_some_and(|page| {
                 // From the end the reader is coming in at, which is what
                 // makes shift-Tab out of the toolbar land on the last thing
                 // in the document rather than the first.
@@ -319,7 +304,7 @@ impl Browser {
             return None;
         }
         let (x, y) = self.in_page(x, y);
-        let page = self.tabs.get(self.active)?.page.as_ref()?;
+        let page = self.page(self.active)?;
         let href = page.link_at(x, y)?;
         Some(page.resolve(&href).unwrap_or(href))
     }

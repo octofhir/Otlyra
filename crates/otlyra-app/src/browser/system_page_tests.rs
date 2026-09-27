@@ -440,7 +440,7 @@ fn an_attachment_becomes_a_completed_download_instead_of_a_document() {
 
     assert_eq!(browser.system_page(), Some(SystemPage::Downloads));
     assert_eq!(browser.tabs()[0].url, "about:downloads");
-    assert!(browser.tabs()[0].page.is_none());
+    assert!(browser.page(0).is_none());
     let download = browser
         .downloads
         .downloads()
@@ -613,9 +613,8 @@ fn an_animation_frame_that_changes_nothing_rebuilds_nothing() {
     browser.wait_for_load(std::time::Duration::from_secs(5));
     browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
 
-    let builds = browser.tabs[browser.active]
-        .page
-        .as_ref()
+    let builds = browser
+        .page(browser.active)
         .expect("the page is loaded")
         .builds();
     assert!(
@@ -627,9 +626,8 @@ fn an_animation_frame_that_changes_nothing_rebuilds_nothing() {
         browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
     }
 
-    let page = browser.tabs[browser.active]
-        .page
-        .as_ref()
+    let page = browser
+        .page(browser.active)
         .expect("the page is still loaded");
     assert_eq!(
         page.builds(),

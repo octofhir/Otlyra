@@ -36,7 +36,7 @@ impl Browser {
         let Some(node) = self.inspector.selected else {
             return;
         };
-        let Some(page) = self.tabs[self.active].page.as_mut() else {
+        let Some(page) = self.active_page_mut() else {
             return;
         };
         // The edit, and then everything downstream of the document: a restyle, a
@@ -100,7 +100,7 @@ impl Browser {
         let panel = crate::ui::Rect::new(0.0, top + content_height, width, dock);
         // Everything the panel is shown about the page, gathered before it is
         // built: the panel reads, and the browser is what does the reaching.
-        let page = self.tabs[self.active].page.as_ref();
+        let page = self.world.page(self.tabs[self.active].id);
         let style = page.and_then(|page| {
             self.inspector
                 .selected
@@ -124,7 +124,7 @@ impl Browser {
             rules: &rules,
             rect: chosen.as_ref().map(|chosen| chosen.border),
             containing: chosen.as_ref().and_then(|chosen| chosen.containing),
-            exchanges: self.fetcher.exchanges(),
+            exchanges: self.world.fetcher.exchanges(),
         };
         self.inspector
             .build_display_list(panel, &facts, &mut self.text)
@@ -163,7 +163,7 @@ impl Browser {
     /// of it. The overlay and the panel ask through the chosen one, and all
     /// three go through here, so there is one account of what a box is.
     pub fn box_facts(&self, node: otlyra_dom::NodeId) -> Option<Chosen> {
-        let page = self.tabs[self.active].page.as_ref()?;
+        let page = self.page(self.active)?;
         let id = page.boxes().box_for(node)?;
         let border = to_rect(page.rect_of(id)?);
         let box_node = page.boxes().get(id)?;
@@ -231,7 +231,7 @@ impl Browser {
     /// Nothing new is measured and no second answer to *what is here* exists.
     pub(super) fn pick_at(&mut self, x: f64, y: f64) {
         let (x, y) = self.in_page(x, y);
-        let Some(page) = self.tabs[self.active].page.as_ref() else {
+        let Some(page) = self.world.page(self.tabs[self.active].id) else {
             return;
         };
         let Some(node) = page

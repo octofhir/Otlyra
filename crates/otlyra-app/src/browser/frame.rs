@@ -11,7 +11,7 @@ use otlyra_platform::{LayerRect, Viewport};
 
 use crate::ui::{SystemPage, TabLabel, UI_HEIGHT};
 
-use super::{Browser, Tab};
+use super::Browser;
 
 /// How long after the last step of a resize the window counts as still being
 /// resized.
@@ -71,9 +71,8 @@ impl Browser {
     /// once turn together, which reads as one browser working rather than as
     /// several unrelated things.
     pub(super) fn spinner_phase(&self) -> Option<f32> {
-        self.tabs
-            .iter()
-            .any(Tab::loading)
+        self.world
+            .any_loading()
             .then(|| self.load_started.elapsed().as_secs_f32() * 4.0)
     }
 
@@ -83,7 +82,7 @@ impl Browser {
             .map(|tab| TabLabel {
                 id: tab.id.0,
                 title: tab.title.clone(),
-                loading: tab.loading(),
+                loading: self.world.loading(tab.id),
             })
             .collect()
     }
@@ -199,7 +198,7 @@ impl Browser {
             Arc::new(list)
         } else if let Some(device) = self.deferred_page(g) {
             device
-        } else if self.tabs[self.active].page.is_some() && !self.blocked_on_style(self.active) {
+        } else if self.page(self.active).is_some() && !self.blocked_on_style(self.active) {
             // Told before the frame is built, because it decides what `medium`
             // computes to and every element that inherited a size inherited that.
             // Laid out in the page's own pixels and drawn back up to the
@@ -211,11 +210,12 @@ impl Browser {
             // zoom has moved.
             let zoom = f64::from(self.zoom);
             let logical = {
-                let page = self.tabs[self.active].page.as_mut().expect("a page");
+                let tab = self.tabs[self.active].id;
+                let (page, text) = self.world.page_and_text(tab).expect("a page");
                 page.set_text_scale(g.text_scale);
                 page.set_color_scheme(g.page_scheme);
                 page.build_display_list(
-                    &mut self.text,
+                    text,
                     (g.width / zoom) as f32,
                     (g.content_height / zoom) as f32,
                     (g.top / zoom) as f32,
@@ -258,7 +258,7 @@ impl Browser {
         if tab.system.is_some() {
             return None;
         }
-        let (width, took) = tab.page.as_ref()?.last_layout()?;
+        let (width, took) = self.world.page(tab.id)?.last_layout()?;
         if (f64::from(width) - g.width / zoom).abs() < f64::EPSILON || took <= LIVE_LAYOUT {
             return None;
         }
@@ -269,7 +269,7 @@ impl Browser {
     /// What the page is drawn on: its canvas colour, for a document.
     pub(super) fn page_background(&self) -> Option<otlyra_gfx::peniko::Color> {
         let tab = &self.tabs[self.active];
-        match tab.page.as_ref() {
+        match self.world.page(tab.id) {
             Some(page) if tab.system.is_none() => Some(page.canvas()),
             _ => None,
         }
@@ -336,7 +336,7 @@ impl Browser {
         let tab = &self.tabs[self.active];
         let device = g.scale_factor * f64::from(self.zoom);
         let snap = |value: f64| (value * device).round() / device;
-        match tab.page.as_ref() {
+        match self.world.page(tab.id) {
             Some(page) if tab.system.is_none() => page
                 .offsets()
                 .into_iter()
@@ -377,7 +377,7 @@ impl Browser {
             self.cookies_page.builds().hash(&mut hasher);
             self.cache_page.builds().hash(&mut hasher);
             self.about.builds().hash(&mut hasher);
-        } else if let Some(page) = tab.page.as_ref() {
+        } else if let Some(page) = self.world.page(tab.id) {
             1u8.hash(&mut hasher);
             page.builds().hash(&mut hasher);
             // The same list scrolled is a different picture.
@@ -408,7 +408,7 @@ impl Browser {
     /// the layer's own bounds, so a field scrolled half out of view is not this
     /// function's problem.
     pub(super) fn page_dirty(&self, g: &FrameGeom) -> Option<LayerRect> {
-        let page = self.tabs[self.active].page.as_ref()?;
+        let page = self.page(self.active)?;
         let dirty = page.dirty()?;
         let scroll = f64::from(page.scroll());
         let left = (f64::from(dirty.x) - 1.0) * g.scale_factor;

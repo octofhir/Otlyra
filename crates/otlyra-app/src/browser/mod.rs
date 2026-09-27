@@ -10,9 +10,6 @@
 //! responsibility each, so that a change to how a page loads is not a change to how
 //! a key is routed.
 
-use std::collections::HashMap;
-
-use otlyra_dom::NodeId;
 use otlyra_platform::{Cursor, Viewport};
 use otlyra_text::TextEngine;
 
@@ -26,16 +23,15 @@ use crate::widget::runtime::UiSurfaceId;
 mod chrome;
 mod devtools;
 mod driver;
-mod fonts;
 mod frame;
 mod input;
 mod loading;
 mod navigation;
 mod painter;
 mod pump;
-mod subresources;
 mod system_pages;
 mod tabs;
+mod world;
 mod zoom;
 
 pub use devtools::Chosen;
@@ -44,7 +40,7 @@ pub use zoom::ZoomStep;
 
 use chrome::ContextTarget;
 use frame::Scaled;
-use subresources::ImageCache;
+use world::PageWorld;
 
 const SURFACE_CHROME: UiSurfaceId = UiSurfaceId::new(1);
 const SURFACE_PAGE: UiSurfaceId = UiSurfaceId::new(2);
@@ -57,44 +53,16 @@ pub struct Browser {
     ui: BrowserUi,
     tabs: Vec<Tab>,
     active: usize,
-    fetcher: Fetcher,
+    /// The pages, and everything fetched and run for them.
+    world: PageWorld,
     /// When the current load started, so the spinner has something to turn by.
     load_started: std::time::Instant,
-    /// When this browser started, which is the zero of the clock every page's
-    /// animation integrates against.
-    started: std::time::Instant,
     /// Whether the browser's own interface is drawn at all.
     ///
     /// Off is for a screenshot that is going to be compared against another
     /// browser's: the page has to start at the top of the picture, or every
     /// comparison is a comparison of two toolbars.
     interface: bool,
-    /// Pictures that have already been decoded.
-    images: ImageCache,
-    /// Background pictures asked for, so none is asked for twice.
-    background_requests: HashMap<String, usize>,
-    /// How many navigations in a row page script has asked for.
-    ///
-    /// A redirector page sends the reader on, and the page it sends them to may
-    /// send them on again — that is what a sign-in bounce is. A page that does
-    /// it forever is a loop, and this is where it stops being our problem.
-    script_hops: u8,
-    /// Background fetches in flight, by request number.
-    background_fetches: HashMap<u64, (usize, String)>,
-    /// Fetches for a picture an element chose again, by request number, with the
-    /// tab, the element and the address as its markup spells it.
-    picture_fetches: HashMap<u64, (usize, NodeId, String, f32)>,
-    /// The window the pictures on screen were last chosen against.
-    ///
-    /// The choice is a question about the window, so it is put again only when
-    /// the window is a different one — which keeps a walk of every document off
-    /// the ordinary frame.
-    picture_window: Option<(f32, f32)>,
-    /// The `@font-face` faces pages have started loading, so none is loaded
-    /// twice: the same rule on two pages, or seen again on the next frame.
-    requested_faces: Vec<otlyra_css::cascade::FontFace>,
-    /// Face fetches in flight, by request number.
-    font_fetches: HashMap<u64, fonts::FaceLoad>,
     /// Whether the pointer is taking a selection across the page.
     ///
     /// A press on the text starts one and the release ends it, so that a drag that
@@ -217,24 +185,33 @@ impl Browser {
 
     /// The constructor itself, over a pool that has already been built.
     fn with_fetcher(fetcher: Fetcher, settings: crate::settings::Settings) -> Self {
+        // Built once, which is the expensive part: the pages shape with a fork of
+        // it rather than looking at the system's fonts a second time.
+        let text = TextEngine::new();
         let mut browser = Self {
-            text: TextEngine::new(),
+            world: PageWorld::new(
+                fetcher,
+                text.fork(),
+                world::Environment {
+                    load_images: settings.load_images,
+                    interface: true,
+                    viewport: otlyra_css::cascade::Viewport {
+                        width: 1024.0,
+                        height: 768.0 - UI_HEIGHT as f32,
+                        scale: 1.0,
+                        text_scale: (settings.text_scale / 100.0) as f32,
+                        color_scheme: otlyra_css::cascade::ColorScheme::Light,
+                    },
+                    active: None,
+                },
+            ),
+            text,
             ui: BrowserUi::new(),
             tabs: vec![Tab::blank()],
             active: 0,
-            fetcher,
             load_started: std::time::Instant::now(),
-            started: std::time::Instant::now(),
             interface: true,
-            images: ImageCache::default(),
-            background_requests: HashMap::new(),
-            script_hops: 0,
-            background_fetches: HashMap::new(),
-            picture_fetches: HashMap::new(),
-            picture_window: None,
             selecting: false,
-            requested_faces: Vec::new(),
-            font_fetches: HashMap::new(),
             last_width: 1024.0,
             last_height: 768.0,
             last_scale: 1.0,
@@ -355,8 +332,8 @@ impl Browser {
     /// with one from elsewhere.
     pub fn hide_interface(&mut self) {
         self.interface = false;
-        for tab in &mut self.tabs {
-            if let Some(page) = tab.page.as_mut() {
+        for tab in &self.tabs {
+            if let Some(page) = self.world.page_mut(tab.id) {
                 page.hide_scrollbars();
             }
         }
@@ -382,7 +359,10 @@ impl Browser {
         let tab = &self.tabs[self.active];
         if tab.system.is_some() {
             SURFACE_SYSTEM
-        } else if tab.page.is_some() || tab.pending.is_some() || tab.error.is_some() {
+        } else if self.world.page(tab.id).is_some()
+            || self.world.loading(tab.id)
+            || tab.error.is_some()
+        {
             SURFACE_PAGE
         } else {
             SURFACE_CHROME
@@ -407,7 +387,7 @@ impl Browser {
             self.ui.blur();
         }
         if surface != SURFACE_PAGE
-            && let Some(page) = self.tabs[self.active].page.as_mut()
+            && let Some(page) = self.active_page_mut()
         {
             page.blur();
         }

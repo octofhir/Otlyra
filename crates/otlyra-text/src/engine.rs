@@ -604,6 +604,27 @@ impl TextEngine {
         }
     }
 
+    /// A second engine over the same fonts, for another thread to shape with.
+    ///
+    /// The system's fonts were enumerated when this engine was built, and that
+    /// is the expensive part of building one: a fork shares what was found
+    /// rather than looking again. What each engine learns afterwards — the faces
+    /// a page brings with `@font-face` — stays its own, which is right, since
+    /// those belong to the pages the fork shapes and not to whatever shapes the
+    /// browser's own interface.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            fonts: FontContext {
+                collection: self.fonts.collection.clone(),
+                source_cache: self.fonts.source_cache.clone(),
+            },
+            layout: LayoutContext::new(),
+            web: WebFamilies::default(),
+            font_struts: HashMap::new(),
+        }
+    }
+
     /// Shape and position `text`, breaking lines at `max_advance` if given.
     ///
     /// `scale` is the device scale factor. parley applies it internally for

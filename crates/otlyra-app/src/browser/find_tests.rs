@@ -55,7 +55,7 @@ fn the_bar_searches_the_page_and_steps_through_what_it_found() {
         },
         "the bar counts what the page found"
     );
-    let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+    let page = browser.page(0).expect("a loaded page");
     assert_eq!(page.match_count(), 3);
     assert_eq!(
         page.match_rects().len(),
@@ -78,7 +78,7 @@ fn the_bar_searches_the_page_and_steps_through_what_it_found() {
     // Escape closes the bar and takes the wash off the page with it.
     key(&mut browser, Key::Escape, Modifiers::default());
     assert!(!browser.ui.finding());
-    let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+    let page = browser.page(0).expect("a loaded page");
     assert_eq!(page.match_count(), 0);
     assert!(page.match_rects().is_empty());
 }
@@ -241,7 +241,7 @@ fn the_current_match_is_the_selection_and_can_be_copied() {
     let mut browser = three_needles();
     look_for(&mut browser, "needle");
 
-    let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+    let page = browser.page(0).expect("a loaded page");
     assert_eq!(
         page.selected_text().as_deref(),
         Some("needle"),
@@ -257,7 +257,7 @@ fn the_current_match_is_the_selection_and_can_be_copied() {
     // And closing the bar leaves the last match selected, the way every
     // browser does: the wash goes and what was found stays copyable.
     key(&mut browser, Key::Escape, Modifiers::default());
-    let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+    let page = browser.page(0).expect("a loaded page");
     assert_eq!(page.match_count(), 0, "the wash is gone");
     assert_eq!(page.selected_text().as_deref(), Some("needle"));
 }
@@ -273,7 +273,7 @@ fn a_resize_keeps_the_selection_on_the_match_it_was_on() {
     let mut target = otlyra_gfx::RecordingPainter::default();
     browser.paint(&mut target, Viewport::new(360, 600, 1.0));
 
-    let page = browser.tabs[0].page.as_ref().expect("a loaded page");
+    let page = browser.page(0).expect("a loaded page");
     assert_eq!(page.match_count(), 3, "still three of them, laid out anew");
     assert_eq!(
         page.selected_text().as_deref(),
