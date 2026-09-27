@@ -1632,7 +1632,16 @@ fn svg_fonts() -> &'static std::sync::Arc<resvg::usvg::fontdb::Database> {
 /// Drawn rather than decoded: there are no pixels in the file, only instructions
 /// for making some, and these are made at the size the file says it is. A rule
 /// that then draws it larger magnifies these — see the gap about that.
-fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
+fn draw_svg_file(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
+    draw_svg(bytes, 1.0).map(|(image, _)| image)
+}
+
+/// Draw an SVG at `density` device pixels to each of its own, and say how big it
+/// says it is.
+///
+/// For an `svg` written into a page, whose box is laid out at the declared size
+/// and drawn on a screen that may have two device pixels to each of those.
+pub fn draw_svg(bytes: &[u8], density: f32) -> Result<(peniko::ImageData, (f32, f32)), SkiaError> {
     /// As large as one will be drawn, so that a document declaring a page-sized
     /// picture cannot ask for a surface measured in gigabytes.
     const LARGEST: f32 = 4096.0;
@@ -1648,7 +1657,7 @@ fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
     let declared = tree.size();
     let scale = (LARGEST / declared.width())
         .min(LARGEST / declared.height())
-        .min(1.0);
+        .min(density.max(f32::MIN_POSITIVE));
     let width = ((declared.width() * scale).round() as u32).max(1);
     let height = ((declared.height() * scale).round() as u32).max(1);
 
@@ -1659,13 +1668,16 @@ fn draw_svg(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
         &mut pixmap.as_mut(),
     );
 
-    Ok(peniko::ImageData {
-        data: peniko::Blob::new(std::sync::Arc::new(pixmap.take())),
-        format: peniko::ImageFormat::Rgba8,
-        alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
-        width,
-        height,
-    })
+    Ok((
+        peniko::ImageData {
+            data: peniko::Blob::new(std::sync::Arc::new(pixmap.take())),
+            format: peniko::ImageFormat::Rgba8,
+            alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+            width,
+            height,
+        },
+        (declared.width(), declared.height()),
+    ))
 }
 
 /// Decode an encoded image (PNG, JPEG, …) into pixels the display list can carry.
@@ -1679,7 +1691,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
     // that names a size of its own then scales these pixels, which is what a
     // vector picture is for and is the one place it shows.
     if looks_like_svg(bytes) {
-        return draw_svg(bytes);
+        return draw_svg_file(bytes);
     }
 
     let data = sk::Data::new_copy(bytes);

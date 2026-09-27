@@ -34,6 +34,7 @@ pub mod find;
 pub mod flow;
 mod fonts;
 pub mod fragment;
+mod inline_svg;
 pub mod selection;
 pub mod srcset;
 mod text_transform;

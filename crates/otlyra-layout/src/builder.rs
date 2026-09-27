@@ -1131,7 +1131,18 @@ impl Builder<'_> {
                     return;
                 }
 
-                let replaced_content = self.replaced_content(element, node);
+                let replaced_content = if element.name.ns == ns!(svg)
+                    && &*element.name.local == "svg"
+                    && crate::inline_svg::is_outermost(self.document, node)
+                {
+                    Some(crate::inline_svg::replaced(
+                        self.document,
+                        node,
+                        style.color,
+                    ))
+                } else {
+                    self.replaced_content(element, node)
+                };
                 style.decorations = decorations_for(
                     &parent_style.decorations,
                     style.text_decoration,
@@ -1543,8 +1554,8 @@ mod tests {
         ] {
             assert!(runs_of(html).is_empty(), "{html}: {:?}", runs_of(html));
         }
-        // An inline SVG is laid out as boxes, and its title and its style sheet
-        // are not among them.
+        // An inline SVG is a picture, and its title and its style sheet are
+        // not text on the page.
         assert_eq!(
             text_of("<p><svg><title>Logo</title><style>.a { fill: red }</style></svg>x"),
             "x"
@@ -1723,7 +1734,7 @@ mod tests {
     }
 
     /// What is inside a `<script>` or an `<object>` is not prose, but only
-    /// HTML's elements of those names mean that: an SVG one is just an element.
+    /// HTML's elements of those names mean that: a MathML one is just an element.
     #[test]
     fn only_html_elements_hide_their_children() {
         assert!(
@@ -1731,8 +1742,8 @@ mod tests {
             "an HTML <video> keeps its fallback to itself"
         );
         assert!(
-            text_of("<p><svg><video>drawn</video></svg>").contains("drawn"),
-            "an SVG element that shares the name is an element like any other"
+            text_of("<p><math><video>drawn</video></math>").contains("drawn"),
+            "a MathML element that shares the name is an element like any other"
         );
     }
 
