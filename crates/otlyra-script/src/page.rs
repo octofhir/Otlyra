@@ -293,7 +293,9 @@ impl PageScripts {
             str::to_owned,
         );
         let Self { host, state, .. } = self;
+        state.set_current_script(Some(element));
         let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
+        state.set_current_script(None);
         self.absorb_turn();
         match outcome {
             None => self.failed += 1,
@@ -334,7 +336,7 @@ impl PageScripts {
 }
 
 impl ScriptRunner for PageScripts {
-    fn run(&mut self, source: &str, _element: NodeId, document: &mut Document) {
+    fn run(&mut self, source: &str, element: NodeId, document: &mut Document) {
         self.seen += 1;
         // Inline scripts have no URL of their own, so they borrow the
         // document's and are numbered in document order. That is what makes
@@ -344,7 +346,9 @@ impl ScriptRunner for PageScripts {
         // script changed in it comes back with it, and the flag says whether
         // there was anything.
         let Self { host, state, .. } = self;
+        state.set_current_script(Some(element));
         let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
+        state.set_current_script(None);
         self.absorb_turn();
         match outcome {
             None => self.failed += 1,

@@ -85,6 +85,10 @@ pub struct PageState {
     document_url: String,
     /// Where script asked to go, if it asked.
     navigation: Option<Navigation>,
+    /// The `<script>` element whose code is running, which is what
+    /// `document.currentScript` answers. Bundlers find their own address
+    /// through it, and load the rest of themselves relative to that.
+    current_script: Option<otlyra_dom::NodeId>,
 }
 
 impl PageState {
@@ -121,6 +125,12 @@ impl PageState {
     /// Where script asked to go, if it asked.
     pub fn take_navigation(&mut self) -> Option<Navigation> {
         self.navigation.take()
+    }
+
+    /// Say which `<script>` element is running, or that none is: a timer, an
+    /// event listener and a frame callback run with none.
+    pub fn set_current_script(&mut self, element: Option<otlyra_dom::NodeId>) {
+        self.current_script = element;
     }
 }
 
@@ -159,6 +169,10 @@ pub(crate) fn note_frame_request() {
 
 pub(crate) fn is_ready() -> bool {
     with_state(|state| state.ready)
+}
+
+pub(crate) fn current_script() -> Option<otlyra_dom::NodeId> {
+    with_state(|state| state.current_script)
 }
 
 /// Lend `document` and `state` to the isolate for the duration of `run`.

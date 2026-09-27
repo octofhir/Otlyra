@@ -151,14 +151,14 @@ const STYLESHEET_LIMIT: usize = 32;
 const IMPORT_DEPTH_LIMIT: usize = 4;
 
 /// How many pictures one document may pull in, for the same reason.
-pub(super) const IMAGE_LIMIT: usize = 64;
+pub(super) const IMAGE_LIMIT: usize = 256;
 
 /// How many scripts one page may link to.
 ///
 /// A page with more than this many is not a page we refuse; it is a page whose
 /// hundredth script we decline to fetch, the way the stylesheet and picture
 /// limits work.
-const SCRIPT_LIMIT: usize = 32;
+const SCRIPT_LIMIT: usize = 256;
 
 /// How many navigations in a row page script may ask for.
 ///

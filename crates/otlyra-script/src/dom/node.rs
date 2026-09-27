@@ -564,6 +564,18 @@ impl DocumentRef {
         }
     }
 
+    /// The `<script>` element whose code is running, or `null` outside one.
+    #[getter(name = "currentScript")]
+    fn js_current_script(&self) -> Result<Option<Wrapped<ElementRef>>, JsError> {
+        let Some(element) = super::current_script() else {
+            return Ok(None);
+        };
+        with_document(self.doc(), |document| {
+            Wrapped(ElementRef::of(document.id(), element))
+        })
+        .map(Some)
+    }
+
     #[method(name = "getElementById", length = 1)]
     fn js_get_element_by_id(&self, id: String) -> Result<Option<Wrapped<ElementRef>>, JsError> {
         with_document(self.doc(), |document| {

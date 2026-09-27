@@ -606,6 +606,46 @@ fn an_external_script_runs_after_the_parse_and_the_load_events_wait_for_it() {
     );
 }
 
+/// `document.currentScript` is the element whose code is running, inline or
+/// fetched, and nothing once it has returned. A bundler reads its own `src`
+/// from it to find the chunks it loads next.
+#[test]
+fn the_current_script_is_the_running_element() {
+    let (output, _seen, _run) = parse_running_scripts(
+        "<body><script id=first>\
+           console.log(document.currentScript.id);\
+           setTimeout(() => console.log(String(document.currentScript)), 0);\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        vec!["Log: first".to_owned(), "Log: null".to_owned()]
+    );
+
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;
+    let (mut parsed, runner) = otlyra_html::parse_with_scripts(
+        b"<body><script src=\"https://cdn.example/app.js\"></script>",
+        Some("utf-8"),
+        Some(Box::new(PageScripts::with_console(
+            "https://example.com/",
+            handle,
+        ))),
+        otlyra_html::ExternalSources::new(),
+    );
+    let mut runner = runner.expect("the runner comes back out");
+    let node = parsed.deferred_scripts[0];
+    runner.run_external(
+        "console.log(document.currentScript.src)",
+        node,
+        &mut parsed.document,
+    );
+    assert_eq!(
+        lines(&sink),
+        vec!["Log: https://cdn.example/app.js".to_owned()]
+    );
+}
+
 #[test]
 fn an_element_has_a_style_a_page_can_read_and_write() {
     let (output, _seen, _run, tree) = parse_and_dump(
