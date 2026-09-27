@@ -143,7 +143,7 @@ fn report_limit(asked: usize, limit: usize, what: &str) {
 /// A limit rather than none: every one of these is a synchronous fetch on the way
 /// to the first frame, and a document that asks for hundreds is either generated
 /// or hostile.
-const STYLESHEET_LIMIT: usize = 32;
+const STYLESHEET_LIMIT: usize = 256;
 
 /// How deep `@import`s may nest: a sheet imported by a sheet imported by a
 /// sheet, and one more. The specification sets no limit; this is one against
