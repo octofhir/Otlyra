@@ -13,6 +13,16 @@ use crate::ui::{SystemPage, TabLabel, UI_HEIGHT};
 
 use super::{Browser, Tab};
 
+/// How long after the last step of a resize the window counts as still being
+/// resized.
+pub(super) const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a layout may take and still be done at every step of a resize: half
+/// a frame at sixty a second. A page that lays out faster follows the window
+/// live; one that is slower is left as it was until the resize stops, rather
+/// than taking the window with it.
+const LIVE_LAYOUT: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// A logical display list, the scale it was scaled at, and the device list that
 /// came out — one layer's answer to *has this already been scaled?*
 pub(super) type Scaled = (
@@ -187,6 +197,8 @@ impl Browser {
             }
             list.transform(g.scale);
             Arc::new(list)
+        } else if let Some(device) = self.deferred_page(g) {
+            device
         } else if self.tabs[self.active].page.is_some() && !self.blocked_on_style(self.active) {
             // Told before the frame is built, because it decides what `medium`
             // computes to and every element that inherited a size inherited that.
@@ -223,6 +235,43 @@ impl Browser {
             );
             list.transform(g.scale);
             Arc::new(list)
+        }
+    }
+
+    /// The page as it was last drawn, while the window is being resized and the
+    /// page is too slow to lay out at every step of it.
+    ///
+    /// What every browser does one way or another: the window's own interface
+    /// follows the pointer, and the page catches up. Laying out a long page takes
+    /// a tenth of a second or more, and doing it for each of the dozens of sizes a
+    /// window passes through on the way to the one it is let go at is a window
+    /// that cannot be resized at all. The page is drawn on its own colour, so the
+    /// part of a wider window it does not reach is the page's and not a hole.
+    fn deferred_page(&mut self, g: &FrameGeom) -> Option<Arc<otlyra_gfx::DisplayList>> {
+        let until = self.resizing_until?;
+        if std::time::Instant::now() >= until {
+            self.resizing_until = None;
+            return None;
+        }
+        let zoom = f64::from(self.zoom);
+        let tab = &self.tabs[self.active];
+        if tab.system.is_some() {
+            return None;
+        }
+        let (width, took) = tab.page.as_ref()?.last_layout()?;
+        if (f64::from(width) - g.width / zoom).abs() < f64::EPSILON || took <= LIVE_LAYOUT {
+            return None;
+        }
+        let (_, scale, device) = self.page_device.as_ref()?;
+        (*scale == g.scale_factor * zoom).then(|| Arc::clone(device))
+    }
+
+    /// What the page is drawn on: its canvas colour, for a document.
+    pub(super) fn page_background(&self) -> Option<otlyra_gfx::peniko::Color> {
+        let tab = &self.tabs[self.active];
+        match tab.page.as_ref() {
+            Some(page) if tab.system.is_none() => Some(page.canvas()),
+            _ => None,
         }
     }
 

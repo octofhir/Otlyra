@@ -146,7 +146,7 @@ impl SceneCompositor {
             Damage::Full => {
                 surface.reset();
                 for layer in &scene.layers {
-                    otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
+                    draw_layer(surface, layer);
                 }
                 Upload::Full(surface.read_rgba8().map_err(Box::new)?)
             }
@@ -493,10 +493,29 @@ fn redraw(surface: &mut SkiaPainter, scene: &Scene, rect: LayerRect) {
     surface.clear_rect(clip);
     for layer in &scene.layers {
         if layer.rect.intersects(&rect) {
-            otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
+            draw_layer(surface, layer);
         }
     }
     surface.reset_clip();
+}
+
+/// Draw one layer: its background across its rectangle, then its list.
+pub(crate) fn draw_layer(surface: &mut SkiaPainter, layer: &crate::SceneLayer) {
+    if let Some(colour) = layer.background {
+        use otlyra_gfx::PaintTarget as _;
+        let rect = layer.rect;
+        surface.fill_rect(
+            otlyra_gfx::kurbo::Affine::IDENTITY,
+            (&otlyra_gfx::peniko::Brush::Solid(colour)).into(),
+            otlyra_gfx::kurbo::Rect::new(
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.x + rect.width),
+                f64::from(rect.y + rect.height),
+            ),
+        );
+    }
+    otlyra_gfx::render_scrolled(&layer.list, surface, &layer.offsets);
 }
 
 /// Move a scrolled layer's pixels and draw what the move could not account for.
@@ -680,6 +699,7 @@ mod tests {
             epoch,
             list: std::sync::Arc::new(otlyra_gfx::DisplayList::new()),
             offsets: Vec::new(),
+            background: None,
             dirty: None,
         }
     }
@@ -738,6 +758,7 @@ mod tests {
         }];
         let next = [crate::SceneLayer {
             offsets: scrolled(40.0),
+            background: None,
             list,
             ..layer(0, 2, area)
         }];
@@ -816,6 +837,7 @@ mod tests {
         let scene = |panel: f64, epoch: u64| crate::Scene {
             layers: vec![crate::SceneLayer {
                 offsets: at(panel),
+                background: None,
                 list: std::sync::Arc::clone(&list),
                 ..layer(0, epoch, area)
             }],
@@ -855,6 +877,7 @@ mod tests {
         }];
         let next = [crate::SceneLayer {
             offsets: scrolled(10.5),
+            background: None,
             list,
             ..layer(0, 2, area)
         }];
@@ -868,6 +891,7 @@ mod tests {
         let scene = |y: f64, epoch: u64| crate::Scene {
             layers: vec![crate::SceneLayer {
                 offsets: scrolled(y),
+                background: None,
                 list: std::sync::Arc::clone(&list),
                 ..layer(0, epoch, area)
             }],
@@ -1084,6 +1108,7 @@ mod tests {
                         epoch: 1,
                         list: Self::list(bottom, self.bottom),
                         offsets: Vec::new(),
+                        background: None,
                         dirty: None,
                     },
                     crate::SceneLayer {
@@ -1092,6 +1117,7 @@ mod tests {
                         epoch: self.epoch,
                         list: Self::list(top, self.top),
                         offsets: Vec::new(),
+                        background: None,
                         dirty: None,
                     },
                 ],

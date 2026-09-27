@@ -61,10 +61,17 @@ impl Painter for Browser {
         // exactly as an animation is, and a browser that only woke for its own
         // interface would run a page's `setTimeout` the next time the reader
         // happened to move the pointer.
-        match [caret, tooltip, self.next_timer_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        // And the end of a resize, when a page left as it was laid out is laid
+        // out for the size the window came to.
+        match [
+            caret,
+            tooltip,
+            self.next_timer_deadline(),
+            self.resizing_until,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
         {
             Some(at) => FrameRequest::At(at),
             None => FrameRequest::None,
@@ -180,6 +187,8 @@ impl Painter for Browser {
                 {
                     self.ui.dismiss_context_menu();
                     self.context_target = None;
+                    self.resizing_until =
+                        Some(std::time::Instant::now() + super::frame::RESIZE_SETTLE);
                 }
                 self.set_viewport(viewport);
             }
@@ -1101,6 +1110,7 @@ impl Painter for Browser {
             epoch: self.page_epoch(&geom),
             list: page,
             offsets: self.page_offsets(&geom),
+            background: self.page_background(),
             dirty: page_dirty,
         });
 
@@ -1115,6 +1125,7 @@ impl Painter for Browser {
                 epoch: self.highlight_epoch(),
                 list: highlight,
                 offsets: Vec::new(),
+                background: None,
                 dirty: None,
             });
         }
@@ -1132,6 +1143,7 @@ impl Painter for Browser {
                 epoch: self.inspector_epoch(),
                 list: inspector,
                 offsets: Vec::new(),
+                background: None,
                 dirty: None,
             });
         }
@@ -1153,6 +1165,7 @@ impl Painter for Browser {
             epoch: self.chrome_epoch(),
             list: chrome,
             offsets: Vec::new(),
+            background: None,
             dirty: chrome_dirty,
         });
 

@@ -3550,6 +3550,62 @@ fn an_unchanged_frame_composes_to_the_same_layer_epochs() {
     }
 }
 
+/// A page too slow to lay out at every step of a resize is shown as it was
+/// until the window stops moving, on its own colour, and laid out once then; a
+/// page that is quick follows the window live.
+#[test]
+fn a_slow_page_waits_for_the_resize_to_stop() {
+    let mut browser = Browser::new(LongLoader);
+    go(&mut browser, "long.example");
+    let page_of = |scene: &Scene| {
+        let layer = scene
+            .layers
+            .iter()
+            .find(|layer| layer.id == LayerId(LAYER_PAGE))
+            .expect("a page layer");
+        (Arc::clone(&layer.list), layer.background)
+    };
+    let wide = Viewport::new(2048, 1536, 2.0);
+    let (drawn, _) = page_of(&browser.compose(wide).expect("a frame"));
+
+    // Quick: laid out again at the new width straight away.
+    browser.tabs[browser.active]
+        .page
+        .as_mut()
+        .expect("a page")
+        .pretend_layout_took(std::time::Duration::from_millis(1));
+    let narrower = Viewport::new(1900, 1536, 2.0);
+    browser.handle_event(PlatformEvent::Resized(narrower));
+    let (quick, _) = page_of(&browser.compose(narrower).expect("a frame"));
+    assert!(!Arc::ptr_eq(&drawn, &quick), "a quick page waited");
+
+    // Slow: the last frame's page, until the resize has settled.
+    browser.tabs[browser.active]
+        .page
+        .as_mut()
+        .expect("a page")
+        .pretend_layout_took(std::time::Duration::from_millis(200));
+    let narrowest = Viewport::new(1700, 1536, 2.0);
+    browser.handle_event(PlatformEvent::Resized(narrowest));
+    let (held, background) = page_of(&browser.compose(narrowest).expect("a frame"));
+    assert!(
+        Arc::ptr_eq(&quick, &held),
+        "a slow page was laid out mid-resize"
+    );
+    assert!(background.is_some(), "and it is drawn on nothing");
+    assert!(
+        matches!(browser.next_frame(), FrameRequest::At(_)),
+        "the end of the resize is a frame"
+    );
+
+    std::thread::sleep(super::frame::RESIZE_SETTLE);
+    let (settled, _) = page_of(&browser.compose(narrowest).expect("a frame"));
+    assert!(
+        !Arc::ptr_eq(&held, &settled),
+        "the resize stopped and the page did not follow"
+    );
+}
+
 #[test]
 fn an_open_menu_expands_the_composited_chrome_layer() {
     let mut browser = Browser::new(LongLoader);

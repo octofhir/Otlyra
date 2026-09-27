@@ -510,6 +510,13 @@ pub struct SceneLayer {
     /// It is a promise rather than a hint. A layer that reports a rectangle
     /// smaller than what it actually redrew leaves stale pixels on the screen.
     pub dirty: Option<LayerRect>,
+    /// What the layer is drawn on, under its list, across the whole of its
+    /// rectangle.
+    ///
+    /// For a list that does not reach every edge of the layer: a page drawn
+    /// for a narrower window, shown while the window is being resized, on the
+    /// page's own colour rather than on nothing.
+    pub background: Option<otlyra_gfx::peniko::Color>,
 }
 
 /// One frame as an ordered, back-to-front stack of retained layers.

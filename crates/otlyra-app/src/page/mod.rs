@@ -72,6 +72,10 @@ pub struct PageScene {
     targets: Vec<(otlyra_gfx::kurbo::Rect, otlyra_gfx::SpatialId, BoxId)>,
     /// What moves each part of the last list built, and how far at a given scroll.
     spatials: Option<otlyra_paint::Spatials>,
+    /// The canvas colour the last list was built with.
+    canvas: otlyra_gfx::peniko::Color,
+    /// How long the last layout took.
+    layout_took: std::time::Duration,
     /// The last layout, and the width it was made at.
     layout: Option<(f32, FragmentTree)>,
     /// Whether that layout has to be done again before the next frame.
@@ -370,6 +374,8 @@ impl PageScene {
             document,
             targets: Vec::new(),
             spatials: None,
+            canvas: otlyra_gfx::peniko::Color::WHITE,
+            layout_took: std::time::Duration::ZERO,
             layout: None,
             layout_stale: true,
             styler: None,
@@ -489,6 +495,7 @@ impl PageScene {
 
         let stale = self.layout_stale || !matches!(&self.layout, Some((last, _)) if *last == width);
         if stale {
+            let started = std::time::Instant::now();
             self.damage.add(Damage::of(
                 otlyra_layout::InvalidationReason::ViewportResized,
             ));
@@ -498,6 +505,7 @@ impl PageScene {
                 otlyra_layout::Viewport { width, height },
             );
             self.layout = Some((width, tree));
+            self.layout_took = started.elapsed();
             self.layout_stale = false;
             // Every path to a new layout comes through here, which is what makes
             // this the one place a search has to be asked again — and the one
@@ -699,7 +707,11 @@ impl PageScene {
                 highlight.extend(rects.into_iter().map(|rect| (rect, wash)));
             }
         }
-        let otlyra_paint::PageList { mut list, spatials } = otlyra_paint::build_display_list_with(
+        let otlyra_paint::PageList {
+            mut list,
+            spatials,
+            canvas,
+        } = otlyra_paint::build_display_list_with(
             fragments,
             &otlyra_paint::Frame {
                 viewport: (width, height),
@@ -731,6 +743,7 @@ impl PageScene {
             })
             .collect();
         self.spatials = Some(spatials);
+        self.canvas = canvas;
 
         // Laying out and cascading are part of building *this* list, and both
         // report damage as they go. Clearing after rather than before is what
@@ -769,6 +782,25 @@ impl PageScene {
                 .unwrap_or(otlyra_gfx::kurbo::Vec2::ZERO);
             (*rect - offset, *id)
         })
+    }
+
+    /// The colour the page is drawn on, past its edges as well as under it.
+    pub fn canvas(&self) -> otlyra_gfx::peniko::Color {
+        self.canvas
+    }
+
+    /// How long the last layout took, and the width it was made at: what a
+    /// window being resized weighs laying the page out again against.
+    pub fn last_layout(&self) -> Option<(f32, std::time::Duration)> {
+        self.layout
+            .as_ref()
+            .map(|(width, _)| (*width, self.layout_took))
+    }
+
+    /// Say the last layout took `took`, for a test of what a slow page does.
+    #[cfg(test)]
+    pub(crate) fn pretend_layout_took(&mut self, took: std::time::Duration) {
+        self.layout_took = took;
     }
 
     /// How many times the page, or a panel in it, has scrolled.

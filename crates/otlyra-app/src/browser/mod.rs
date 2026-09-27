@@ -176,6 +176,10 @@ pub struct Browser {
     /// that resulted. Lets an unchanged page skip re-scaling: while the page
     /// hands back the same `Arc` and the scale holds, the device list is reused.
     page_device: Option<Scaled>,
+    /// Until when the window counts as being resized: a resize and then quiet
+    /// for [`frame::RESIZE_SETTLE`]. While it is, a page whose layout is slow is
+    /// shown as it was laid out last rather than laid out again at every step.
+    resizing_until: Option<std::time::Instant>,
     /// The same for the tab strip and toolbar, which hand back their cached list
     /// unchanged for every frame nothing in the interface moved.
     chrome_device: Option<Scaled>,
@@ -264,6 +268,7 @@ impl Browser {
             theme: crate::widget::theme::Theme::light(),
             accessibility_dirty: true,
             page_device: None,
+            resizing_until: None,
             chrome_device: None,
             inspector_device: None,
         };

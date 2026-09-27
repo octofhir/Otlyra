@@ -434,7 +434,11 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
     }
 
     tracing::debug!(items = list.len(), "display list built");
-    PageList { list, spatials }
+    PageList {
+        list,
+        spatials,
+        canvas,
+    }
 }
 
 /// The content box inside a border box, by the style's own edges.

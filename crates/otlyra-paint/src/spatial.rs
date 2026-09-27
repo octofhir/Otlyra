@@ -27,6 +27,9 @@ pub struct PageList {
     pub list: DisplayList,
     /// How far each part of the list has moved at a given scroll.
     pub spatials: Spatials,
+    /// The canvas's colour: what the page is drawn on, past its edges as well
+    /// as under it.
+    pub canvas: otlyra_gfx::peniko::Color,
 }
 
 impl PageList {
