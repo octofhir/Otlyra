@@ -48,5 +48,14 @@ html5ever.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# The engine's own front end, at build time only: the page's DOM glue in
+# `src/dom/dom.js` is compiled to bytecode by `build.rs` and linked into the
+# isolate as it is built, which is how the engine takes an extension's script
+# half — it parses nothing at startup that it could have parsed at build time.
+[build-dependencies]
+otter-compiler = { git = "https://github.com/octofhir/otter", rev = "800a830ac4bb3924fb932556b77c095a834271e2" }
+otter-bytecode = { git = "https://github.com/octofhir/otter", rev = "800a830ac4bb3924fb932556b77c095a834271e2" }
+otter-syntax = { git = "https://github.com/octofhir/otter", rev = "800a830ac4bb3924fb932556b77c095a834271e2" }
+
 [lints]
 workspace = true

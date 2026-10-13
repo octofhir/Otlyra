@@ -707,25 +707,6 @@ otter_macros::romp! {
         TextRefIntrinsic,
         DocumentRefIntrinsic,
     ],
-    js = [
-        (include_str!("dom.js"), defines = [
-            "window",
-            "self",
-            "top",
-            "parent",
-            "document",
-            "matchMedia",
-            "requestAnimationFrame",
-            "cancelAnimationFrame",
-            "addEventListener",
-            "removeEventListener",
-            "dispatchEvent",
-            "setTimeout",
-            "setInterval",
-            "clearTimeout",
-            "clearInterval",
-            "__otlyraFlushDeferred",
-            "location",
-        ]),
-    ],
+    // Compiled by `build.rs`, which also owns the list of globals it defines.
+    js = Some(include!(concat!(env!("OUT_DIR"), "/dom-bootstrap.rs"))),
 }

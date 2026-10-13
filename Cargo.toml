@@ -340,3 +340,6 @@ otter-runtime = { path = "../otter/crates/otter-runtime" }
 otter-macros = { path = "../otter/crates/otter-macros" }
 otter-gc = { path = "../otter/crates/otter-gc" }
 otter-web = { path = "../otter/crates/otter-web" }
+otter-compiler = { path = "../otter/crates/otter-compiler" }
+otter-bytecode = { path = "../otter/crates/otter-bytecode" }
+otter-syntax = { path = "../otter/crates/otter-syntax" }

@@ -3684,9 +3684,12 @@ dependencies = [
  "otlyra-css",
  "otlyra-dom",
  "otlyra-html",
+ "otter-bytecode",
+ "otter-compiler",
  "otter-gc",
  "otter-macros",
  "otter-runtime",
+ "otter-syntax",
  "otter-web",
  "thiserror 2.0.19",
  "tracing",
@@ -3725,6 +3728,7 @@ dependencies = [
  "oxc_ast_visit",
  "oxc_span",
  "oxc_syntax",
+ "rustc-hash 2.1.3",
  "serde",
  "thiserror 2.0.19",
 ]
@@ -3748,7 +3752,6 @@ dependencies = [
  "dynasmrt",
  "otter-bytecode",
  "otter-vm",
- "regalloc2",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
@@ -3771,8 +3774,11 @@ dependencies = [
 name = "otter-regex"
 version = "0.0.0"
 dependencies = [
+ "dynasm",
+ "dynasmrt",
  "icu_casemap",
  "icu_properties",
+ "memchr",
  "smallvec",
  "unicode-ident",
 ]
@@ -3816,6 +3822,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "url",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3836,6 +3843,7 @@ name = "otter-vm"
 version = "0.1.0"
 dependencies = [
  "fixed_decimal",
+ "hashbrown 0.17.1",
  "icu_collator",
  "icu_datetime",
  "icu_decimal",
@@ -3847,6 +3855,7 @@ dependencies = [
  "icu_time",
  "indexmap",
  "itoa",
+ "libc",
  "num-bigint 0.4.8",
  "num-traits",
  "otter-bytecode",
@@ -3874,14 +3883,23 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "hmac",
+ "otter-bytecode",
+ "otter-compiler",
  "otter-gc",
  "otter-macros",
  "otter-runtime",
+ "otter-syntax",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
  "pbkdf2",
  "sha1 0.10.7",
  "sha2",
  "thiserror 2.0.19",
  "url",
+ "wasm-encoder 0.253.0",
  "wasmtime",
 ]
 
@@ -6635,6 +6653,16 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
+version = "0.253.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59972d6cd272259de647b7c1f1912e45e289c75ffd4be04e10695507cd7e1b59"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.253.0",
+]
+
+[[package]]
+name = "wasm-encoder"
 version = "0.254.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09480d646178e5fdd12bb06e812d0af9a3a191dbc9cd697fdc86687beade7393"
@@ -6667,6 +6695,17 @@ dependencies = [
  "indexmap",
  "semver",
  "serde",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.253.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19db11f87d2486580e1e8b6f494c54df7e0566b87d0b599db843c24019667339"
+dependencies = [
+ "bitflags 2.13.1",
+ "indexmap",
+ "semver",
 ]
 
 [[package]]
@@ -7691,6 +7730,12 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yaxpeax-arch"
