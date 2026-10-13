@@ -305,6 +305,7 @@ impl PageScripts {
                 tracing::error!(
                     target: "page.script",
                     %error,
+                    at = error.excerpt(source).unwrap_or_default(),
                     range = ?error.range(),
                     frames = ?error.frames(),
                     "external script failed",
@@ -361,6 +362,7 @@ impl ScriptRunner for PageScripts {
                     tracing::error!(
                         target: "page.script",
                         %error,
+                        at = error.excerpt(source).unwrap_or_default(),
                         range = ?error.range(),
                         frames = ?error.frames(),
                         "script failed",

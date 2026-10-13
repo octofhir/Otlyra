@@ -50,6 +50,9 @@ const MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
 /// a caught exception.
 const MAX_STACK_DEPTH: u32 = 1024;
 
+/// How much of a failing script [`ScriptError::excerpt`] quotes.
+pub const EXCERPT_BYTES: usize = 120;
+
 /// A script that did not finish the way it meant to.
 #[derive(Debug, thiserror::Error)]
 #[error("{specifier}: {source}")]
@@ -83,6 +86,21 @@ impl ScriptError {
         }
     }
 
+    /// The code the error points at, as the page wrote it: the rest of the
+    /// line from where the range starts, at most [`EXCERPT_BYTES`] of it.
+    ///
+    /// The engine's message names the kind of failure — "value is not a
+    /// function" — and not the expression that failed, so in a minified bundle
+    /// this is what says *which* call it was.
+    #[must_use]
+    pub fn excerpt<'a>(&self, source: &'a str) -> Option<&'a str> {
+        let (start, _) = self.range()?;
+        let start = source.floor_char_boundary(usize::try_from(start).ok()?);
+        let rest = source.get(start..)?;
+        let end = rest.floor_char_boundary(EXCERPT_BYTES);
+        rest[..end].lines().next()
+    }
+
     /// The call stack the engine unwound, innermost first.
     #[must_use]
     pub fn frames(&self) -> Vec<String> {
@@ -90,10 +108,21 @@ impl ScriptError {
             OtterError::Runtime { diagnostic } => diagnostic,
             _ => return Vec::new(),
         };
+        // One line per frame, the way a console prints a stack: the engine's
+        // own `Debug` carries the whole source line of every frame with it.
         diagnostic
             .frames
             .iter()
-            .map(|frame| format!("{frame:?}"))
+            .map(|frame| match &frame.source_position {
+                Some(at) => format!(
+                    "{} ({}:{}:{})",
+                    frame.function,
+                    at.script_name,
+                    at.line_number,
+                    at.start_column + 1
+                ),
+                None => format!("{} ({})", frame.function, frame.module),
+            })
             .collect()
     }
 }
