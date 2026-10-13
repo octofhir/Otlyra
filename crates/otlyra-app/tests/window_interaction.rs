@@ -175,6 +175,103 @@ fn region(pixels: &[u8], width: u32, rect: (u32, u32, u32, u32)) -> Vec<u8> {
     out
 }
 
+/// Closing and reopening must reach the retained page and chrome layers at both
+/// device scales, including after the last tab was replaced with a blank one.
+#[test]
+fn a_reopened_tab_returns_to_the_composited_window_at_both_scales() {
+    for scale in [1, 2] {
+        let viewport = Viewport::new(900 * scale, 640 * scale, f64::from(scale));
+        let mut browser = Browser::new(Pages);
+        browser.navigate("https://form.example/");
+        browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+        let original = browser.active_id();
+        let mut pump = FramePump::new(viewport);
+        pump.open(&mut browser).expect("the original page");
+        let before_png = pump.png().expect("the original window");
+        let (width, before) = decode(&before_png);
+
+        pump.event(
+            &mut browser,
+            PlatformEvent::MenuCommand(otlyra_app::menu::Command::CloseTab.id()),
+        );
+        pump.frame(&mut browser).expect("the blank tab");
+        let (_, closed) = decode(&pump.png().expect("the closed window"));
+        let page = (
+            0,
+            UI_HEIGHT as u32 * scale,
+            width,
+            (640 - UI_HEIGHT as u32) * scale,
+        );
+        assert_ne!(region(&before, width, page), region(&closed, width, page));
+
+        pump.event(
+            &mut browser,
+            PlatformEvent::MenuCommand(otlyra_app::menu::Command::ReopenClosedTab.id()),
+        );
+        browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+        pump.frame(&mut browser).expect("the restored page");
+        let restored_png = pump.png().expect("the restored window");
+        let (_, restored) = decode(&restored_png);
+        if let Some(directory) = std::env::var_os("OTLYRA_TAB_CAPTURE_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).expect("capture directory");
+            std::fs::write(directory.join(format!("before-{scale}x.png")), &before_png)
+                .expect("original capture");
+            std::fs::write(
+                directory.join(format!("restored-{scale}x.png")),
+                &restored_png,
+            )
+            .expect("restored capture");
+        }
+        assert_ne!(browser.active_id(), original);
+        assert_eq!(browser.tabs().len(), 1);
+        let differing: Vec<usize> = before
+            .chunks_exact(4)
+            .zip(restored.chunks_exact(4))
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "{} differing pixels at {scale}x, first at {:?}, last at {:?}",
+            differing.len(),
+            differing
+                .first()
+                .map(|index| (index % width as usize, index / width as usize)),
+            differing
+                .last()
+                .map(|index| (index % width as usize, index / width as usize)),
+        );
+    }
+}
+
+/// Removing a tab on the left changes strip geometry, never which page the
+/// retained compositor displays.
+#[test]
+fn closing_a_background_tab_keeps_the_foreground_page_in_the_window() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut browser = Browser::new(Pages);
+    browser.navigate("https://first.example/");
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+    browser.new_tab();
+    browser.navigate("https://active.example/");
+    browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+    let active = browser.active_id();
+    browser.new_tab();
+    browser.select_tab(1);
+    let mut pump = FramePump::new(viewport);
+    pump.open(&mut browser).expect("the active page");
+    let (width, before) = decode(&pump.png().expect("before closing"));
+    browser.close_tab(0);
+    pump.frame(&mut browser).expect("the shorter strip");
+    let (_, after) = decode(&pump.png().expect("after closing"));
+    assert_eq!(browser.active_id(), active);
+    let page = (0, UI_HEIGHT as u32, width, 640 - UI_HEIGHT as u32);
+    assert_eq!(region(&before, width, page), region(&after, width, page));
+    let strip = (0, 0, width, 36);
+    assert_ne!(region(&before, width, strip), region(&after, width, strip));
+}
+
 /// Where the field's pixels are in the window: the page sits under the chrome.
 fn field_in_window() -> (u32, u32, u32, u32) {
     let (x, y, w, h) = FIELD;

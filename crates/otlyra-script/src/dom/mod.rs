@@ -41,16 +41,28 @@
 //! of that is needed — a binding that guessed at damage levels would be a
 //! second, quieter invalidation system beside the real one.
 
+mod character_data;
+mod document;
+mod element;
 mod identity;
+#[cfg(test)]
+mod interface_tree;
+mod interfaces;
+mod markup;
 mod node;
+mod tree;
 
 use std::cell::RefCell;
 
 use otlyra_dom::{Document, DocumentId};
 use otter_runtime::marshal::JsError;
 
-pub use identity::{Wrapped, forget_all as forget_wrappers, wrapper_count};
-pub use node::{DOM_EXTENSION, DocumentRef, ElementRef, NodeRef, TextRef};
+pub use identity::{JsNode, forget_all as forget_wrappers, wrapper_count};
+pub use interfaces::{element_interface, is_valid_custom_element_name};
+pub use node::{
+    CharacterDataRef, CommentRef, DocumentFragmentRef, DocumentRef, DocumentTypeRef, ElementRef,
+    NodeRef, TextRef,
+};
 /// Where script asked to go. Declared beside the parser's script point, because
 /// that is the seam the browser reads it across.
 pub use otlyra_html::Navigation;
@@ -258,4 +270,23 @@ fn detached() -> JsError {
     JsError::Type(
         "this node belongs to a document that is not available to script right now".to_owned(),
     )
+}
+
+otter_macros::romp! {
+    name = "dom",
+    ident = DOM_EXTENSION,
+    // Parents before children: a subclass finds its parent's prototype off the
+    // global when it is installed.
+    classes = [
+        node::NodeRefIntrinsic,
+        element::ElementRefIntrinsic,
+        character_data::CharacterDataRefIntrinsic,
+        character_data::TextRefIntrinsic,
+        character_data::CommentRefIntrinsic,
+        document::DocumentRefIntrinsic,
+        document::DocumentFragmentRefIntrinsic,
+        document::DocumentTypeRefIntrinsic,
+    ],
+    // Compiled by `build.rs`, which also owns the list of globals it defines.
+    js = Some(include!(concat!(env!("OUT_DIR"), "/dom-bootstrap.rs"))),
 }

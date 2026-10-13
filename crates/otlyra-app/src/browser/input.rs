@@ -13,6 +13,47 @@ use crate::ui::{SystemPage, UI_HEIGHT};
 use super::{Browser, SURFACE_PAGE};
 
 impl Browser {
+    /// Tab commands belong to the window, including while an inspector filter,
+    /// a page field or one of the browser's own pages holds the keyboard.
+    pub(super) fn tab_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        if modifiers.control && !modifiers.command && !modifiers.alt {
+            match key {
+                Key::Tab => {
+                    self.cycle_tab(!modifiers.shift);
+                    return true;
+                }
+                Key::PageUp | Key::PageDown if !modifiers.shift => {
+                    self.cycle_tab(key == Key::PageDown);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if !modifiers.is_accelerator() {
+            return false;
+        }
+        match key {
+            Key::Character('t' | 'T') if modifiers.shift => {
+                self.reopen_closed_tab();
+            }
+            Key::Character('w') if !modifiers.shift => self.close_tab(self.active),
+            Key::Character('[' | '{') if modifiers.shift => self.cycle_tab(false),
+            Key::Character(']' | '}') if modifiers.shift => self.cycle_tab(true),
+            Key::Character(digit @ '1'..='9') if !modifiers.shift => {
+                let index = if digit == '9' {
+                    self.tabs.len() - 1
+                } else {
+                    (digit as u8 - b'1') as usize
+                };
+                if index != self.active {
+                    self.select_tab(index);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// The keys that edit a field in the page, while one has the focus.
     ///
     /// Answered before the keys that move a selection: an arrow belongs to the

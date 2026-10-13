@@ -22,6 +22,14 @@ pub enum Command {
     OpenFile,
     /// Close the current tab.
     CloseTab,
+    /// Restore the last closed tab and its navigation history.
+    ReopenClosedTab,
+    /// Open an independent copy of the active tab beside it.
+    DuplicateTab,
+    /// Select the next tab, wrapping at the end of the strip.
+    NextTab,
+    /// Select the previous tab, wrapping at the beginning of the strip.
+    PreviousTab,
     /// Reload the current page.
     Reload,
     /// Reload, bypassing the cache.
@@ -75,6 +83,10 @@ impl Command {
         Self::NewWindow,
         Self::OpenFile,
         Self::CloseTab,
+        Self::ReopenClosedTab,
+        Self::DuplicateTab,
+        Self::NextTab,
+        Self::PreviousTab,
         Self::Reload,
         Self::ReloadIgnoringCache,
         Self::Stop,
@@ -127,6 +139,10 @@ impl Command {
             self,
             Self::NewTab
                 | Self::CloseTab
+                | Self::ReopenClosedTab
+                | Self::DuplicateTab
+                | Self::NextTab
+                | Self::PreviousTab
                 | Self::Reload
                 | Self::ReloadIgnoringCache
                 | Self::Stop
@@ -227,6 +243,12 @@ pub fn menu_bar() -> MenuBar {
                 entry(Command::Back, "Back", Some("CmdOrCtrl+BracketLeft")),
                 entry(Command::Forward, "Forward", Some("CmdOrCtrl+BracketRight")),
                 MenuEntry::Separator,
+                entry(
+                    Command::ReopenClosedTab,
+                    "Reopen Closed Tab",
+                    Some("CmdOrCtrl+Shift+KeyT"),
+                ),
+                MenuEntry::Separator,
                 entry(Command::Home, "Home", Some("CmdOrCtrl+Shift+KeyH")),
                 entry(
                     Command::ShowHistory,
@@ -280,6 +302,14 @@ pub fn menu_bar() -> MenuBar {
         .with(Menu::new(
             "Window",
             vec![
+                entry(Command::NextTab, "Select Next Tab", Some("Ctrl+Tab")),
+                entry(
+                    Command::PreviousTab,
+                    "Select Previous Tab",
+                    Some("Ctrl+Shift+Tab"),
+                ),
+                entry(Command::DuplicateTab, "Duplicate Tab", None),
+                MenuEntry::Separator,
                 MenuEntry::System(SystemItem::Minimize),
                 MenuEntry::System(SystemItem::Maximize),
                 MenuEntry::Separator,

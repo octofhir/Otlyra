@@ -376,6 +376,9 @@ pub enum UiAction {
     None,
     /// Navigate the active tab to this text, as typed.
     Navigate(String),
+    /// Navigate in a new foreground tab, as requested by Alt/Option+Enter in
+    /// the address field. The current tab stays at the page it was on.
+    NavigateInNewTab(String),
     /// Open a tab.
     NewTab,
     /// The keyboard walked off the end of the chrome and belongs to the page.
@@ -1440,6 +1443,12 @@ impl BrowserUi {
     /// the field is focused, so dropping the focus is what puts them away.
     pub fn blur(&mut self) {
         self.focused = None;
+        // A field can ask for focus before the next frame has created its id.
+        // Leaving this surface cancels that request too, otherwise a rebuild
+        // would put a caret back into chrome while the page owns the keyboard.
+        self.address_wanted = false;
+        self.find_takes_keyboard.set(false);
+        self.focus_granted.set(None);
     }
 
     /// Put the keyboard on the first or last control this surface has.
@@ -2082,6 +2091,8 @@ impl BrowserUi {
                 let typed = taken.unwrap_or_else(|| self.address.text().trim().to_owned());
                 if typed.is_empty() {
                     UiAction::None
+                } else if modifiers.alt && !modifiers.control && !modifiers.command {
+                    UiAction::NavigateInNewTab(typed)
                 } else {
                     UiAction::Navigate(typed)
                 }
@@ -3932,6 +3943,26 @@ mod tests {
             UiAction::None
         );
         assert!(!ui.address_focused());
+    }
+
+    #[test]
+    fn blurring_cancels_field_focus_requested_before_the_next_frame() {
+        let mut text = TextEngine::isolated();
+        let mut ui = BrowserUi::new();
+        frame(&mut ui, &mut text, 1000.0, 1);
+        ui.focus_address();
+        ui.blur();
+        frame(&mut ui, &mut text, 1000.0, 1);
+        assert!(!ui.address_focused());
+        assert!(!ui.text_input('x'));
+
+        ui.open_find();
+        assert!(ui.find_wants_keyboard());
+        ui.blur();
+        frame(&mut ui, &mut text, 1000.0, 1);
+        assert!(ui.finding(), "the search remains visible while reading");
+        assert!(!ui.find_focused());
+        assert!(!ui.find_wants_keyboard());
     }
 
     #[test]

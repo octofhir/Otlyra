@@ -1,15 +1,13 @@
 # <img src="assets/logo/logo-circle.png" alt="" width="36" valign="middle"> Otlyra
 
 An experimental web browser, written from scratch in Rust: its own DOM, its own
-cascade, its own layout, its own painting, and its own interface. Scripting is
-not wired up yet, so a page is rendered the way a browser with scripting switched
-off renders it — and when it is, the engine running it will be ours too:
+cascade, its own layout, its own painting, and its own interface. Scripting runs on
 [octofhir/otter](https://github.com/octofhir/otter), a TypeScript and JavaScript
 runtime on a bytecode VM of its own, in Rust, built alongside this.
 
 It opens pages, follows links, keeps tabs and history, and can be driven by
-WebDriver BiDi or by the Model Context Protocol. Around seven hundred tests, a
-conformance suite, and a comparison harness that renders the same page through
+WebDriver BiDi or by the Model Context Protocol. A unit and integration test
+suite, a conformance suite, and a comparison harness that renders the same page through
 this engine and through two shipping browsers and reports the difference as a
 number.
 
@@ -57,11 +55,13 @@ all built on a widget layer that paints into the same display list the page does
 Selection by drag, word, paragraph and select-all, with ⌘C. A native menu bar and
 a Dock icon on macOS.
 
-**Scripting, when it comes.** A `<script>` is parsed, counted, and not run. The
-engine that will run it is [otter](https://github.com/octofhir/otter) — an
-embeddable TypeScript and JavaScript runtime on its own bytecode VM and garbage
-collector, ours and in Rust, so the whole browser stays one thing rather than a
-renderer wrapped around somebody else's virtual machine.
+**Scripting.** Inline and external classic scripts run in
+[Otter](https://github.com/octofhir/otter) isolates. The bindings expose the DOM,
+selectors, attribute and style reflection, events, timers, and animation frames.
+`innerHTML`, `outerHTML` and `insertAdjacentHTML` parse through the same HTML
+engine as page loading, including table, SVG, MathML and template contexts, and
+serialize back to HTML. The web platform is still incomplete; its JavaScript VM
+and garbage collector remain ours and in Rust.
 
 ## Requirements
 
@@ -81,6 +81,13 @@ just --list                                  # every other task
 `--screenshot` needs no display server and exits non-zero on failure, so it is
 what drives the image tests in CI.
 
+Command/Control+Shift+T reopens a closed tab with its back/forward history and
+scroll position; up to 25 closed tabs are kept during the current run.
+Control+Tab and Control+Shift+Tab cycle tabs, Command/Control+1–8 select one by
+position, and 9 selects the last. Option/Alt+Enter opens an address-bar entry in
+a new tab. Window → Duplicate Tab opens an independent copy beside the current
+tab. Restored and duplicated pages are fetched again.
+
 ### Looking inside
 
 Every stage of the pipeline can be printed instead of drawn, which is how most
@@ -99,9 +106,9 @@ cargo run -- --file page.html --inspector --screenshot shot.png
 Context Protocol on stdin and stdout, so an agent can drive the browser with no
 client library at all.
 
-Scripting is not wired up, so neither surface has `script.evaluate` — and neither
-needs it to be useful. A caller reads the page as Markdown, asks for everything on
-it that can be clicked or typed into, and acts on what it read by the handle it
+Neither surface has `script.evaluate` yet. A caller reads the page as Markdown,
+asks for everything on it that can be clicked or typed into, and acts on what it
+read by the handle it
 was given: no screenshot per turn and no selector guessed. Both readings come off
 the accessibility tree rather than off the DOM, so what an agent is told and what
 a screen reader is told cannot drift apart. Elements can be found by selector, by
@@ -150,6 +157,7 @@ second line reported the wrong text back to a selection.
 | `otlyra-app` | The shell: navigation, tabs, history, the interface, the inspector, the automation protocols |
 | `otlyra-platform` | Window, GPU surface, input. The only crate that knows what an OS is |
 | `otlyra-net` | Fetching bytes, and deciding what kind of thing arrived — nothing that knows what they mean |
+| `otlyra-script` | Otter isolates, DOM bindings, page scripts, timers and events |
 | `otlyra-html` | Encoding determination and the tokenizer driver: the parts a parser leaves to the browser |
 | `otlyra-dom` | The document tree: a generational arena, and the only API that mutates it |
 | `otlyra-css` | The cascade, computed values, and the user-agent stylesheet |

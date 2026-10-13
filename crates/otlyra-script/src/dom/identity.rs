@@ -1,4 +1,5 @@
-//! One wrapper object per node, for as long as script can still reach it.
+//! One wrapper object per node, of the right interface, for as long as script
+//! can still reach it.
 //!
 //! ## Why a table
 //!
@@ -13,16 +14,32 @@
 //! it is what every engine does: Chromium keeps the same table under the name
 //! `DOMWrapperMap`, Gecko under `nsWrapperCache`.
 //!
-//! ## Why the roots are weak
+//! ## Why one way in
 //!
-//! A strong root would make the table an owner: every element script ever
-//! touched would be kept alive by a browser that has no other reason to hold it,
-//! for as long as the page is open. Weak roots let the collector take a wrapper
-//! nobody is holding, which is right — a wrapper carries no state of its own,
-//! and the next access simply makes another.
+//! Every binding hands a node to script as a [`JsNode`], and [`JsNode`] alone
+//! decides what the wrapper is made as: the node's kind picks the data the
+//! wrapper carries, and an element's name picks its interface — see
+//! [`super::interfaces`]. A wrapper made through one binding is therefore the
+//! same object, of the same class, as one made through any other: a node first
+//! met as somebody's `parentNode` is not an `Element` that lacks
+//! `HTMLInputElement`'s members when it is later met by `querySelector`.
 //!
-//! That is also why a cleared entry is not a bug to report but a lookup that
-//! misses: [`Wrapped`] drops it and makes a new wrapper.
+//! ## Why the roots are strong
+//!
+//! A page keeps its own state *on* nodes: React hangs its fiber and its props
+//! off every element it renders under keys like `__reactFiber$…`, jQuery its
+//! data under its expando, and a hundred smaller libraries do the same. That
+//! state is a property of the wrapper object, so a wrapper the collector took
+//! would take it with it, and the next lookup would hand the page a fresh
+//! object that has forgotten everything — "unable to find node on an unmounted
+//! component", on a node that is plainly still there.
+//!
+//! So a wrapper lives as long as its node can be reached, and since the arena
+//! does not free nodes yet, that is as long as the page. Every engine ties the
+//! two lifetimes together by tracing from the tree; ours will when the arena
+//! learns to collect detached nodes, and the table will learn it in the same
+//! change. Until then the cost is one object per node script has touched,
+//! which is the same order as the arena's own.
 //!
 //! ## What keeps it honest
 //!
@@ -31,40 +48,32 @@
 //! The `NodeId` is generational, so a node that has been destroyed and its slot
 //! reused is a different key and gets a different wrapper.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use otlyra_dom::{DocumentId, NodeId};
 use otter_runtime::RuntimePersistentRootId as PersistentRootId;
-use otter_runtime::marshal::{
-    HostAncestry, HostClassMeta, IntoJs, JsError, JsValue, MarshalCx, class_instance,
+use otter_runtime::marshal::{IntoJs, JsError, JsValue, MarshalCx, class_instance};
+
+use super::node::{
+    CharacterDataRef, CommentRef, DocumentFragmentRef, DocumentRef, DocumentTypeRef, ElementRef,
+    NodeRef, TextRef,
 };
+use super::tree::{self, Kind};
 
 thread_local! {
-    /// The wrapper each node has been given, if it still has one.
+    /// The wrapper each node has been given.
     static WRAPPERS: RefCell<HashMap<(DocumentId, NodeId), PersistentRootId>> =
         RefCell::new(HashMap::new());
-    /// How many entries the table had when it was last swept.
-    static SWEPT_AT: Cell<usize> = const { Cell::new(0) };
 }
-
-/// How much the table may grow between sweeps.
-///
-/// A node that is removed from the tree and never asked about again leaves its
-/// entry behind: the root goes cleared, but nothing looks at it, so nothing
-/// notices. Left alone that is a table which only grows, on a page that
-/// builds and throws away rows all day. The sweep costs one walk per this many
-/// new wrappers, which is nothing beside the allocation of that many objects.
-const SWEEP_EVERY: usize = 512;
 
 /// Forget every wrapper this thread has handed out.
 ///
 /// For a page that is being torn down or parsed again: the tree those wrappers
 /// name is going, and an entry that outlived it would be a lookup that can only
-/// miss. The roots themselves are weak and go with the isolate.
+/// miss. The roots go with the isolate they were made in.
 pub fn forget_all() {
     WRAPPERS.with(|wrappers| wrappers.borrow_mut().clear());
-    SWEPT_AT.with(|at| at.set(0));
 }
 
 /// How many nodes currently have a wrapper. For tests and for the panel.
@@ -73,91 +82,91 @@ pub fn wrapper_count() -> usize {
     WRAPPERS.with(|wrappers| wrappers.borrow().len())
 }
 
-/// A host class that is a name for one node.
-///
-/// Implemented by the four wrapper classes; it is what lets one table serve all
-/// of them, since a node has exactly one wrapper whatever class that wrapper is.
-pub trait NodeWrapper: HostAncestry + HostClassMeta + Sized {
-    /// The node this names, and whose document.
-    fn key(&self) -> (DocumentId, NodeId);
+/// A node on its way to script, made as whatever kind of node it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsNode {
+    /// Whose node.
+    pub(crate) doc: DocumentId,
+    /// Which node.
+    pub(crate) id: NodeId,
 }
 
-/// A wrapper on its way to script, through the table rather than around it.
-///
-/// A binding returns `Wrapped(element)` instead of `element` and that is the
-/// whole of the difference: `IntoJs` looks the node up and hands back the object
-/// it was given last time.
-#[derive(Debug, Clone, Copy)]
-pub struct Wrapped<T>(pub T);
+impl JsNode {
+    /// The node `id` of document `doc`.
+    pub(crate) fn new(doc: DocumentId, id: NodeId) -> Self {
+        Self { doc, id }
+    }
+}
 
-impl<T: NodeWrapper> IntoJs for Wrapped<T> {
+impl IntoJs for JsNode {
     fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<JsValue<'s>, JsError> {
-        let key = self.0.key();
+        let key = (self.doc, self.id);
 
         if let Some(root) = WRAPPERS.with(|wrappers| wrappers.borrow().get(&key).copied()) {
             match cx.ctx().persistent_root_get(root) {
                 Some(value) => return Ok(cx.park(value)),
-                // The collector took it, which is what a weak root is for. The
-                // entry is dropped here rather than anywhere else, because this
-                // is the only moment we are told.
+                // A strong root does not clear; one that has is a root the
+                // engine dropped with an isolate this table outlived, and the
+                // entry is as good as absent.
                 None => {
                     WRAPPERS.with(|wrappers| wrappers.borrow_mut().remove(&key));
                 }
             }
         }
 
-        let instance = class_instance(cx, T::JS_NAME, self.0)?;
+        // What to make it as is a question about the node, asked of the lent
+        // document: its kind, and for an element its name.
+        let made = super::with_document(self.doc, |document| {
+            let kind = tree::kind(document, self.id)?;
+            let interface = match kind {
+                Kind::Element => document
+                    .get(self.id)
+                    .and_then(|node| node.element())
+                    .map_or("Element", |element| {
+                        super::interfaces::element_interface(&element.name)
+                    }),
+                Kind::Text => "Text",
+                Kind::Comment => "Comment",
+                Kind::Document => "HTMLDocument",
+                Kind::Fragment => "DocumentFragment",
+                Kind::Doctype => "DocumentType",
+            };
+            Some((kind, interface))
+        })?;
+        // A node that is gone by the time it is handed over — destroyed by the
+        // turn that is handing it — is nothing, not an error.
+        let Some((kind, interface)) = made else {
+            return Ok(cx.null());
+        };
+
+        let node = NodeRef::of(self.doc, self.id);
+        let instance = match kind {
+            Kind::Element => class_instance(cx, interface, ElementRef { node })?,
+            Kind::Text => class_instance(
+                cx,
+                interface,
+                TextRef {
+                    data: CharacterDataRef { node },
+                },
+            )?,
+            Kind::Comment => class_instance(
+                cx,
+                interface,
+                CommentRef {
+                    data: CharacterDataRef { node },
+                },
+            )?,
+            Kind::Document => class_instance(cx, interface, DocumentRef { node })?,
+            Kind::Fragment => class_instance(cx, interface, DocumentFragmentRef { node })?,
+            Kind::Doctype => class_instance(cx, interface, DocumentTypeRef { node })?,
+        };
         let value = cx.escape(instance);
-        // Weak, and inserted before the handle is returned: the insertion may
-        // allocate, and a `Local` is what survives an allocation — the raw value
-        // above is only good until one happens, which is why it is escaped for
-        // this call and not kept.
-        let root = cx
-            .ctx()
-            .persistent_root_insert_weak(value)
-            .map_err(|error| JsError::Type(error.to_string()))?;
-        let grown = WRAPPERS.with(|wrappers| {
-            let mut wrappers = wrappers.borrow_mut();
-            wrappers.insert(key, root);
-            wrappers.len()
-        });
-        if grown >= SWEPT_AT.with(Cell::get) + SWEEP_EVERY {
-            sweep(cx);
-        }
+        // Inserted before the handle is returned: the insertion may allocate,
+        // and a `Local` is what survives an allocation — the raw value above is
+        // only good until one happens, which is why it is escaped for this call
+        // and not kept.
+        let root = cx.ctx().persistent_root_insert(value);
+        WRAPPERS.with(|wrappers| wrappers.borrow_mut().insert(key, root));
         Ok(instance)
-    }
-}
-
-/// Drop the entries whose wrapper the collector has taken.
-///
-/// A lookup drops a cleared entry when it happens on one, but a node the page
-/// has forgotten is a node nothing looks up — so the entries of a removed
-/// subtree would sit there for the life of the page. The root is removed from
-/// the engine's table too, which is the slot the plan's acceptance criterion is
-/// about: the table must not grow across create-and-destroy cycles.
-fn sweep(cx: &mut MarshalCx<'_, '_, '_>) {
-    let dead: Vec<((DocumentId, NodeId), PersistentRootId)> = WRAPPERS.with(|wrappers| {
-        wrappers
-            .borrow()
-            .iter()
-            .filter(|(_, root)| cx.ctx().persistent_root_get(**root).is_none())
-            .map(|(key, root)| (*key, *root))
-            .collect()
-    });
-
-    for (key, root) in &dead {
-        cx.ctx().persistent_root_remove(*root);
-        WRAPPERS.with(|wrappers| wrappers.borrow_mut().remove(key));
-    }
-
-    let left = WRAPPERS.with(|wrappers| wrappers.borrow().len());
-    SWEPT_AT.with(|at| at.set(left));
-    if !dead.is_empty() {
-        tracing::debug!(
-            target: "page.script",
-            dropped = dead.len(),
-            kept = left,
-            "swept the wrappers the collector took"
-        );
     }
 }

@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dynamic HTML compatibility</title>
+<style>
+  body { margin: 40px; color: #182438; background: #f5f7fb; font: 18px sans-serif; }
+  #root { max-width: 720px; background: white; padding: 24px; border: 1px solid #d5dcea; }
+  h1 { font-size: 30px; color: #2457ad; margin-top: 0; }
+  td { padding: 12px; border: 1px solid #aebed8; }
+  .status { color: #246b3b; }
+</style>
+<body id="page">
+<div id="root"><p id="placeholder">Waiting for JavaScript.</p></div>
+<script>
+  const root = document.getElementById('root');
+  root.innerHTML = '<h1 id="heading">Dynamic markup works</h1><table id="table"></table><p id="replace">Replace this node</p>';
+  document.getElementById('table').innerHTML = '<tr><td id="cell">Parsed in table context</td></tr>';
+  document.getElementById('replace').outerHTML = '<p id="replacement" class="status">Outer replacement</p>';
+  root.insertAdjacentHTML('beforeend', '<p>Adjacent insertion preserves the existing nodes.</p>');
+  const template = document.createElement('template');
+  template.innerHTML = '<p id="template-copy">Template content imported into the page.</p>';
+  root.appendChild(template.content.cloneNode(true));
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', '100');
+  svg.setAttribute('height', '70');
+  svg.innerHTML = '<circle id="svg-circle" cx="35" cy="35" r="24" fill="#2457ad"></circle>';
+  root.appendChild(svg);
+</script>

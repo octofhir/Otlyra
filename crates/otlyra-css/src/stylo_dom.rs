@@ -564,10 +564,85 @@ pub fn select_with(
     form: &otlyra_dom::FormState,
     interaction: crate::state::Interaction,
 ) -> Result<Vec<NodeId>, String> {
-    use selectors::matching::{
-        MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
-        QuirksMode as SelectorsQuirksMode,
-    };
+    let list = parse_selector_list(selector)?;
+    let states = crate::state::States::new(document, form, interaction);
+    Ok(Matcher::new(document, &states, None).select_under(&list, document.root(), false))
+}
+
+/// The elements under `scope` that `selector` matches, in tree order — what
+/// `querySelectorAll` on an element, a fragment or a document answers.
+///
+/// DOM §4.2.6 "scope-match a selectors string": the selector is matched against
+/// the whole tree, so `.a .b` sees the ancestors an element really has, but only
+/// `scope`'s descendants are candidates, and `:scope` is `scope` itself. With
+/// `first`, the walk stops at the first match, which is `querySelector`.
+///
+/// # Errors
+///
+/// The parser's complaint, when `selector` is not a selector list.
+pub fn select_within(
+    document: &Document,
+    scope: NodeId,
+    selector: &str,
+    first: bool,
+) -> Result<Vec<NodeId>, String> {
+    let list = parse_selector_list(selector)?;
+    let form = otlyra_dom::FormState::new();
+    let states = crate::state::States::new(document, &form, crate::state::Interaction::none());
+    Ok(Matcher::new(document, &states, Some(scope)).select_under(&list, scope, first))
+}
+
+/// Whether `element` matches `selector` — `Element.matches()`, with `:scope` as
+/// the element itself (DOM §4.9).
+///
+/// # Errors
+///
+/// As [`select_within`].
+pub fn matches_selector(
+    document: &Document,
+    element: NodeId,
+    selector: &str,
+) -> Result<bool, String> {
+    let list = parse_selector_list(selector)?;
+    let form = otlyra_dom::FormState::new();
+    let states = crate::state::States::new(document, &form, crate::state::Interaction::none());
+    Ok(Matcher::new(document, &states, Some(element)).matches(&list, element))
+}
+
+/// The nearest inclusive ancestor of `element` that matches `selector` —
+/// `Element.closest()`, with `:scope` as `element` (DOM §4.9).
+///
+/// # Errors
+///
+/// As [`select_within`].
+pub fn closest(
+    document: &Document,
+    element: NodeId,
+    selector: &str,
+) -> Result<Option<NodeId>, String> {
+    let list = parse_selector_list(selector)?;
+    let form = otlyra_dom::FormState::new();
+    let states = crate::state::States::new(document, &form, crate::state::Interaction::none());
+    let mut matcher = Matcher::new(document, &states, Some(element));
+    let mut current = Some(element);
+    while let Some(id) = current {
+        let node = document.get(id);
+        if node.and_then(otlyra_dom::Node::element).is_none() {
+            return Ok(None);
+        }
+        if matcher.matches(&list, id) {
+            return Ok(Some(id));
+        }
+        current = node.and_then(|node| node.parent);
+    }
+    Ok(None)
+}
+
+/// Parse a selector list the way a script hands one over: author origin, no
+/// namespace prefixes declared.
+fn parse_selector_list(
+    selector: &str,
+) -> Result<selectors::SelectorList<StyleSelectorImpl>, String> {
     use style::selector_parser::SelectorParser;
     use style::stylesheets::UrlExtraData;
 
@@ -575,43 +650,92 @@ pub fn select_with(
     // is what `url()` inside it would resolve against. A selector has none, so this
     // is a stand-in that cannot resolve to anything.
     let url = UrlExtraData(servo_arc::Arc::new(crate::cascade::about_blank()));
-    let list = SelectorParser::parse_author_origin_no_namespace(selector, &url)
-        .map_err(|error| format!("bad selector {selector:?}: {error:?}"))?;
+    SelectorParser::parse_author_origin_no_namespace(selector, &url)
+        .map_err(|error| format!("{selector:?} is not a valid selector: {error:?}"))
+}
 
-    let mut caches = selectors::context::SelectorCaches::default();
-    let mut context = MatchingContext::new(
-        MatchingMode::Normal,
-        None,
-        &mut caches,
-        SelectorsQuirksMode::NoQuirks,
-        NeedsSelectorFlags::No,
-        MatchingForInvalidation::No,
-    );
+/// One matching pass over a document: the tree view, its scope, and the
+/// matcher's caches, set up once and asked about as many elements as needed.
+struct Matcher<'a> {
+    tree: Tree<'a>,
+    scope: Option<NodeId>,
+    caches: selectors::context::SelectorCaches,
+}
 
-    let states = crate::state::States::new(document, form, interaction);
-    let tree = Tree::matching(document, &states);
-    let _scope = TreeScope::enter(&tree);
-    let mut matched = Vec::new();
-    let mut stack = vec![document.root()];
-    let mut order = Vec::new();
-    while let Some(id) = stack.pop() {
-        order.push(id);
-        let children: Vec<NodeId> = document.children(id).collect();
-        stack.extend(children.into_iter().rev());
-    }
-
-    for id in order {
-        let node = tree.node(id);
-        if node.element().is_none() {
-            continue;
-        }
-        if list.slice().iter().any(|selector| {
-            selectors::matching::matches_selector(selector, 0, None, &node, &mut context)
-        }) {
-            matched.push(id);
+impl<'a> Matcher<'a> {
+    fn new(
+        document: &'a Document,
+        states: &'a crate::state::States<'a>,
+        scope: Option<NodeId>,
+    ) -> Self {
+        Self {
+            tree: Tree::matching(document, states),
+            scope,
+            caches: selectors::context::SelectorCaches::default(),
         }
     }
-    Ok(matched)
+
+    /// Whether the element `id` matches any selector in `list`.
+    fn matches(&mut self, list: &selectors::SelectorList<StyleSelectorImpl>, id: NodeId) -> bool {
+        use selectors::matching::{
+            MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
+            QuirksMode as SelectorsQuirksMode,
+        };
+
+        let _scope = TreeScope::enter(&self.tree);
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut self.caches,
+            SelectorsQuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        // `:scope` is the element the question is asked of. Only an element can
+        // be one; for a document or a fragment it falls back to the root, which
+        // is what the selectors crate does with none.
+        context.scope_element = self
+            .scope
+            .filter(|scope| {
+                self.tree
+                    .document
+                    .get(*scope)
+                    .and_then(otlyra_dom::Node::element)
+                    .is_some()
+            })
+            .map(|scope| self.tree.node(scope).opaque());
+        let node = self.tree.node(id);
+        node.element().is_some()
+            && list.slice().iter().any(|selector| {
+                selectors::matching::matches_selector(selector, 0, None, &node, &mut context)
+            })
+    }
+
+    /// The elements under `root` — not `root` itself — that match, in tree
+    /// order; with `first`, at most one.
+    fn select_under(
+        &mut self,
+        list: &selectors::SelectorList<StyleSelectorImpl>,
+        root: NodeId,
+        first: bool,
+    ) -> Vec<NodeId> {
+        let document = self.tree.document;
+        let mut matched = Vec::new();
+        let mut stack: Vec<NodeId> = document.children(root).collect();
+        stack.reverse();
+        while let Some(id) = stack.pop() {
+            if self.matches(list, id) {
+                matched.push(id);
+                if first {
+                    break;
+                }
+            }
+            let mark = stack.len();
+            stack.extend(document.children(id));
+            stack[mark..].reverse();
+        }
+        matched
+    }
 }
 
 #[cfg(test)]

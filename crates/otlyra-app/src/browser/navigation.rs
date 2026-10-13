@@ -96,11 +96,17 @@ impl Browser {
 
     /// Record where the reader is in the entry they are about to leave.
     pub(super) fn remember_scroll(&mut self) {
+        self.remember_tab_scroll(self.active);
+    }
+
+    /// Closing a background tab needs its own scroll, without activating it or
+    /// disturbing the address field the reader is editing in the foreground.
+    pub(super) fn remember_tab_scroll(&mut self, index: usize) {
         // A browser page keeps its own, on the surface that draws it, so where
         // the number lives depends on what the tab is showing — and the history
         // entry does not care which it was.
         let settings = self.settings.settings.scroll as f32;
-        let tab = &mut self.tabs[self.active];
+        let tab = &mut self.tabs[index];
         let scroll = match tab.system {
             Some(SystemPage::Settings) => settings,
             Some(_) => 0.0,

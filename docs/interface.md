@@ -155,6 +155,27 @@ logo beside a wordmark came out as wide as the wordmark alone.
   exists to type in. A state that acts on either has to have had a frame drawn
   first.
 
+## Tab commands
+
+Closing a background tab keeps the active tab's identity, keyboard surface and
+address edit. Closing the active tab selects the neighbour on its right, or the
+one on its left at the end of the strip; closing the last tab leaves a blank tab.
+
+The History menu and Command/Control+Shift+T reopen the most recently closed tab.
+The browser keeps metadata for at most 25 closed tabs during this session,
+including their back/forward entries, history position and scroll. Reopening
+loads the page again with a fresh context identity and reuses an untouched blank
+tab. Documents, form edits and script heaps are released on close; this is not
+session persistence across browser restarts. Window → Duplicate Tab creates an
+independent copy beside the active tab, with its history and reading position.
+
+Control+Tab and Control+Shift+Tab select the next and previous tabs and wrap at
+the ends. Control+PageDown/PageUp and Command/Control+Shift+]/[ do the same.
+Command/Control+1 through 8 select the corresponding tab; 9 selects the last.
+These commands work from every keyboard surface, including page fields and the
+inspector. Option/Alt+Enter in the address field opens the typed address or
+marked suggestion in a new foreground tab.
+
 ## Deliberately not built
 
 Decisions rather than omissions.

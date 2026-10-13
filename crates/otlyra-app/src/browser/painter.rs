@@ -453,6 +453,9 @@ impl Painter for Browser {
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
+                if self.tab_key(key, modifiers) {
+                    return;
+                }
                 // The one accelerator that is the inspector's. Alt as well as
                 // the platform's own modifier, which is what every browser uses
                 // and what keeps it clear of ⌘I.
@@ -838,6 +841,12 @@ impl Painter for Browser {
                 Some(crate::menu::Command::ActualSize) => self.step_zoom(ZoomStep::Reset),
                 Some(crate::menu::Command::NewTab) => self.new_tab(),
                 Some(crate::menu::Command::CloseTab) => self.close_tab(self.active),
+                Some(crate::menu::Command::ReopenClosedTab) => {
+                    self.reopen_closed_tab();
+                }
+                Some(crate::menu::Command::DuplicateTab) => self.duplicate_tab(),
+                Some(crate::menu::Command::NextTab) => self.cycle_tab(true),
+                Some(crate::menu::Command::PreviousTab) => self.cycle_tab(false),
                 // The editing four are the keystroke they carry, delivered as
                 // one. A menu item that did the copying itself would be a second
                 // answer to *what does ⌘C mean here* — and the answer depends on

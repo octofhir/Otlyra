@@ -45,6 +45,10 @@ impl Browser {
             // address, which is a decision to leave, still navigates in place.
             UiAction::OpenPage(page) => self.open_system_in_new_tab(page),
             UiAction::Navigate(url) => self.navigate(&url),
+            UiAction::NavigateInNewTab(url) => {
+                self.new_tab();
+                self.navigate(&url);
+            }
             UiAction::Back => self.go_back(),
             UiAction::Forward => self.go_forward(),
             UiAction::Stop => self.stop(),

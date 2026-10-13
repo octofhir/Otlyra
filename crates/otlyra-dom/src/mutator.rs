@@ -179,24 +179,79 @@ impl<'a> DocumentMutator<'a> {
     /// The DOM's `cloneNode(true)`, and the one place a node is duplicated rather
     /// than moved. Iterative rather than recursive: a document is untrusted input,
     /// and a clone that recurses inherits its nesting as stack depth.
+    ///
+    /// A `<template>`'s contents are copied with it, into contents of the copy's
+    /// own (DOM §4.5 "clone a node", HTML §4.12.3's cloning steps): two templates
+    /// sharing one fragment would each see the other's edits.
     pub fn deep_clone(&mut self, source: NodeId) -> Option<NodeId> {
-        let data = self.document.get(source)?.data.clone();
-        let root = self.create(data);
+        let root = self.shallow_clone(source)?;
 
         let mut pending = vec![(source, root)];
         while let Some((from, to)) = pending.pop() {
-            let children: Vec<NodeId> = self.document.children(from).collect();
-            for child in children {
-                let Some(data) = self.document.get(child).map(|node| node.data.clone()) else {
+            // The template's contents travel beside its children, not under them.
+            let contents = self.template_contents(from).zip(self.template_contents(to));
+            let mut sources: Vec<(NodeId, NodeId)> = self
+                .document
+                .children(from)
+                .map(|child| (child, to))
+                .collect();
+            if let Some((from_contents, to_contents)) = contents {
+                sources.extend(
+                    self.document
+                        .children(from_contents)
+                        .map(|child| (child, to_contents)),
+                );
+            }
+            for (child, parent) in sources {
+                let Some(copy) = self.shallow_clone(child) else {
                     continue;
                 };
-                let copy = self.create(data);
-                if self.append(to, copy) {
+                if self.append(parent, copy) {
                     pending.push((child, copy));
                 }
             }
         }
         Some(root)
+    }
+
+    /// Copy one node and none of its children. The copy is detached.
+    ///
+    /// The DOM's `cloneNode(false)`. An element keeps its name and attributes; a
+    /// `<template>` gets a new, empty contents fragment of its own rather than
+    /// the original's, which [`Self::deep_clone`] then fills.
+    pub fn shallow_clone(&mut self, source: NodeId) -> Option<NodeId> {
+        let mut data = self.document.get(source)?.data.clone();
+        if let NodeData::Element(element) = &mut data
+            && element.template_contents.is_some()
+        {
+            element.template_contents = Some(self.create(NodeData::Document));
+        }
+        Some(self.create(data))
+    }
+
+    /// A `<template>`'s contents fragment, if `id` is a template.
+    fn template_contents(&self, id: NodeId) -> Option<NodeId> {
+        self.document.get(id)?.element()?.template_contents
+    }
+
+    /// Replace the text a text or comment node holds.
+    ///
+    /// Returns whether `target` was character data. Its place in the tree is
+    /// untouched, which is what makes this the DOM's `data` setter rather than a
+    /// remove and an insert.
+    pub fn set_character_data(&mut self, target: NodeId, text: StrTendril) -> bool {
+        match self
+            .document
+            .nodes_mut()
+            .get_mut(target)
+            .map(|node| &mut node.data)
+        {
+            Some(NodeData::Text(data) | NodeData::Comment(data)) => {
+                *data = text;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Remove every child of `parent` from the tree.
@@ -212,17 +267,54 @@ impl<'a> DocumentMutator<'a> {
     /// what the tree construction algorithm says — but everything that edits a
     /// document afterwards does. Returns whether it landed on an element.
     ///
+    /// `name` is a *qualified* name, as `setAttribute` takes one (DOM §4.9): the
+    /// first attribute spelled that way — `xlink:href` included — is the one
+    /// changed, and a new one is created in no namespace.
+    ///
     /// An empty value is still a value: `hidden=""` is set, not absent, and the
     /// two mean different things to a selector.
     pub fn set_attr(&mut self, target: NodeId, name: &str, value: &str) -> bool {
+        let qualified = |attr: &Attribute| qualified_name_is(&attr.name, name);
+        self.put_attr(
+            target,
+            qualified,
+            || html5ever::QualName::new(None, html5ever::ns!(), html5ever::LocalName::from(name)),
+            value,
+        )
+    }
+
+    /// Set one attribute by namespace and local name, as `setAttributeNS` does.
+    ///
+    /// The attribute that is replaced is the one with the same namespace and
+    /// local name, whatever its prefix (DOM §4.9 "set an attribute value"); a new
+    /// one keeps the prefix it was given, which is what it serializes with.
+    pub fn set_attr_ns(&mut self, target: NodeId, name: QualName, value: &str) -> bool {
+        let (ns, local) = (name.ns.clone(), name.local.clone());
+        self.put_attr(
+            target,
+            |attr: &Attribute| attr.name.ns == ns && attr.name.local == local,
+            || name,
+            value,
+        )
+    }
+
+    /// The shared half of the two setters: find by `matches`, else append.
+    fn put_attr(
+        &mut self,
+        target: NodeId,
+        matches: impl Fn(&Attribute) -> bool,
+        name: impl FnOnce() -> QualName,
+        value: &str,
+    ) -> bool {
         let limit = self.document.limits().max_attrs_per_element;
         let mut refused = false;
-        let set = if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
-            let at = element
-                .attrs
-                .iter()
-                .position(|attr| &*attr.name.local == name);
-            match at {
+        let set = match self
+            .document
+            .nodes_mut()
+            .get_mut(target)
+            .map(|node| &mut node.data)
+        {
+            Some(NodeData::Element(element)) => match element.attrs.iter().position(&matches) {
                 Some(at) => {
                     element.attrs[at].value = value.into();
                     true
@@ -233,18 +325,13 @@ impl<'a> DocumentMutator<'a> {
                 }
                 None => {
                     element.attrs.push(Attribute {
-                        name: html5ever::QualName::new(
-                            None,
-                            html5ever::ns!(),
-                            html5ever::LocalName::from(name),
-                        ),
+                        name: name(),
                         value: value.into(),
                     });
                     true
                 }
-            }
-        } else {
-            false
+            },
+            _ => false,
         };
         if refused {
             self.document.refuse();
@@ -252,12 +339,36 @@ impl<'a> DocumentMutator<'a> {
         set
     }
 
-    /// Remove one attribute. Returns whether it was there to remove.
+    /// Remove one attribute, by qualified name. Returns whether it was there to
+    /// remove.
     pub fn remove_attr(&mut self, target: NodeId, name: &str) -> bool {
-        if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
-            let before = element.attrs.len();
-            element.attrs.retain(|attr| &*attr.name.local != name);
-            return element.attrs.len() != before;
+        self.drop_attr(target, |attr| qualified_name_is(&attr.name, name))
+    }
+
+    /// Remove one attribute by namespace and local name. Returns whether it was
+    /// there to remove.
+    pub fn remove_attr_ns(
+        &mut self,
+        target: NodeId,
+        ns: &html5ever::Namespace,
+        local: &str,
+    ) -> bool {
+        self.drop_attr(target, |attr| {
+            attr.name.ns == *ns && &*attr.name.local == local
+        })
+    }
+
+    /// Remove the first attribute `matches` picks.
+    fn drop_attr(&mut self, target: NodeId, matches: impl Fn(&Attribute) -> bool) -> bool {
+        if let Some(NodeData::Element(element)) = self
+            .document
+            .nodes_mut()
+            .get_mut(target)
+            .map(|node| &mut node.data)
+            && let Some(at) = element.attrs.iter().position(matches)
+        {
+            element.attrs.remove(at);
+            return true;
         }
         false
     }
@@ -295,5 +406,17 @@ impl<'a> DocumentMutator<'a> {
         }
         self.document.refuse();
         false
+    }
+}
+
+/// Whether an attribute's qualified name — `prefix:local`, or `local` with no
+/// prefix — is `name`.
+fn qualified_name_is(attr: &QualName, name: &str) -> bool {
+    match &attr.prefix {
+        Some(prefix) => name
+            .strip_prefix(&**prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|local| local == &*attr.local),
+        None => name == &*attr.local,
     }
 }

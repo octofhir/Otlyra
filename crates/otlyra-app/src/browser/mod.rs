@@ -53,6 +53,9 @@ pub struct Browser {
     ui: BrowserUi,
     tabs: Vec<Tab>,
     active: usize,
+    /// Recently closed tab metadata. Documents and script worlds are released
+    /// on close and fetched again when a tab is restored.
+    closed_tabs: std::collections::VecDeque<tabs::ClosedTab>,
     /// The pages, and everything fetched and run for them.
     world: PageWorld,
     /// When the current load started, so the spinner has something to turn by.
@@ -209,6 +212,7 @@ impl Browser {
             ui: BrowserUi::new(),
             tabs: vec![Tab::blank()],
             active: 0,
+            closed_tabs: std::collections::VecDeque::new(),
             load_started: std::time::Instant::now(),
             interface: true,
             selecting: false,
@@ -415,3 +419,9 @@ mod tests;
 
 #[cfg(test)]
 mod find_tests;
+
+#[cfg(test)]
+mod tab_tests;
+
+#[cfg(test)]
+mod markup_tests;

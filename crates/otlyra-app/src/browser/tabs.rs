@@ -20,6 +20,7 @@ pub struct HistoryEntry {
 }
 
 /// One tab.
+#[derive(Clone)]
 pub struct Tab {
     /// What this tab is, for as long as it is open.
     ///
@@ -59,6 +60,15 @@ pub struct Tab {
 /// What names a tab for as long as it is open.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TabId(pub u64);
+
+/// Enough to reopen a tab without retaining its document or script runtime.
+pub(super) struct ClosedTab {
+    index: usize,
+    tab: Tab,
+}
+
+/// Bound the number of histories kept after their tabs have been closed.
+const CLOSED_TAB_LIMIT: usize = 25;
 
 /// The next identity to hand out.
 ///
@@ -166,19 +176,112 @@ impl Browser {
         if index >= self.tabs.len() {
             return;
         }
+        self.remember_tab_scroll(index);
         self.world.close(self.tabs[index].id);
-        if self.tabs.len() == 1 {
-            self.tabs[0] = Tab::blank();
+        let was_active = index == self.active;
+        let tab = self.tabs.remove(index);
+        if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
+            self.closed_tabs.pop_front();
+        }
+        self.closed_tabs.push_back(ClosedTab { index, tab });
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab::blank());
+            self.active = 0;
+            self.ui.dismiss_popup();
+            self.context_target = None;
+            self.ui.close_find();
             self.ui.address.clear();
             self.ui.focus_address();
             self.activate_surface(SURFACE_CHROME);
             return;
         }
-        self.tabs.remove(index);
-        self.active = self.active.min(self.tabs.len() - 1);
-        self.sync_address();
-        let surface = self.tab_surface();
-        self.activate_surface(surface);
+        if index < self.active {
+            self.active -= 1;
+        } else if was_active {
+            self.active = index.min(self.tabs.len() - 1);
+        }
+        // Closing a background tab must not replace an address being edited or
+        // take the keyboard from the surface the reader is still using.
+        if was_active {
+            self.select_tab(self.active);
+        }
+    }
+
+    /// Reopen the most recently closed tab, including its back/forward history
+    /// and reading position. The restored context gets a fresh identity, so a
+    /// late response or automation handle cannot refer to the old document.
+    ///
+    /// Returns whether there was a tab to restore. Closed tabs last for this
+    /// browser session only; their documents are loaded again.
+    pub fn reopen_closed_tab(&mut self) -> bool {
+        let Some(closed) = self.closed_tabs.pop_back() else {
+            return false;
+        };
+        // Reuse the empty tab left after closing the last one, as well as an
+        // untouched new tab. Removing it is not another user close to undo.
+        let active = &self.tabs[self.active];
+        if active.url.is_empty()
+            && active.history.is_empty()
+            && active.system.is_none()
+            && self.world.page(active.id).is_none()
+            && !self.world.loading(active.id)
+        {
+            self.world.close(active.id);
+            self.tabs.remove(self.active);
+        }
+        self.restore_tab(closed.tab, closed.index);
+        true
+    }
+
+    /// Open a copy of the active tab beside it, with independent navigation and
+    /// the same reading position. The page is fetched again in a new context.
+    pub fn duplicate_tab(&mut self) {
+        self.remember_scroll();
+        let tab = self.tabs[self.active].clone();
+        self.restore_tab(tab, self.active + 1);
+    }
+
+    /// Install tab metadata and reload its current entry without losing forward
+    /// history or recording a second visit for an already completed navigation.
+    fn restore_tab(&mut self, mut tab: Tab, index: usize) {
+        let url = tab.url.clone();
+        let entry = tab
+            .history
+            .get(tab.position)
+            .filter(|entry| entry.url == url);
+        let scroll = entry.map_or(0.0, |entry| entry.scroll);
+        let record = entry.is_none();
+        if record {
+            // A tab closed before its navigation arrived still shows the
+            // requested URL, while its history is on the previous page. The
+            // load must depart from that entry so arrival records the new URL.
+            tab.url = tab
+                .history
+                .get(tab.position)
+                .map_or_else(String::new, |entry| entry.url.clone());
+        }
+        tab.id = next_tab_id();
+        tab.navigation = None;
+        tab.error = None;
+        tab.system = None;
+        let index = index.min(self.tabs.len());
+        self.tabs.insert(index, tab);
+        self.select_tab(index);
+        if !url.is_empty() {
+            self.start_load(&url, true, record, scroll);
+        }
+    }
+
+    /// Move one tab along the strip, wrapping at either end.
+    pub fn cycle_tab(&mut self, forward: bool) {
+        if self.tabs.len() > 1 {
+            let index = if forward {
+                (self.active + 1) % self.tabs.len()
+            } else {
+                (self.active + self.tabs.len() - 1) % self.tabs.len()
+            };
+            self.select_tab(index);
+        }
     }
 
     /// Put the tab named `id` at `to`, taking the tabs after it along.
@@ -209,10 +312,15 @@ impl Browser {
     /// Make a tab active.
     pub fn select_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
+            self.ui.dismiss_popup();
+            self.context_target = None;
             self.active = index;
             self.sync_address();
             let surface = self.tab_surface();
             self.activate_surface(surface);
+            if surface == SURFACE_CHROME {
+                self.ui.focus_address();
+            }
         }
     }
 

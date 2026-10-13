@@ -215,13 +215,49 @@ impl HtmlParser {
     /// all. The context also decides which tokenizer state to start in, which is
     /// why this cannot be the document parser with a different root.
     pub fn for_fragment(document: Document, context: QualName, attrs: Vec<Attribute>) -> Self {
+        Self::for_fragment_with_form(document, context, attrs, false)
+    }
+
+    /// A fragment parser that knows whether the context has an HTML form
+    /// ancestor. The parser's form pointer prevents markup APIs from creating
+    /// nested forms that ordinary page parsing would reject.
+    pub fn for_fragment_with_form(
+        document: Document,
+        context: QualName,
+        attrs: Vec<Attribute>,
+        form_ancestor: bool,
+    ) -> Self {
+        let context_is_form = context.ns == html5ever::ns!(html) && &*context.local == "form";
+        let quirks_mode = document.quirks_mode();
         let sink = DomSink::with_document(document);
         let context_element = create_element(&sink, context, attrs);
+        let form = if context_is_form {
+            Some(context_element)
+        } else if form_ancestor {
+            Some(create_element(
+                &sink,
+                QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from("form"),
+                ),
+                Vec::new(),
+            ))
+        } else {
+            None
+        };
 
-        let tree_builder =
-            TreeBuilder::new_for_fragment(sink, context_element, None, TreeBuilderOpts::default());
+        let tree_builder = TreeBuilder::new_for_fragment(
+            sink,
+            context_element,
+            form,
+            TreeBuilderOpts {
+                quirks_mode,
+                ..TreeBuilderOpts::default()
+            },
+        );
         let tokenizer_opts = TokenizerOpts {
-            initial_state: Some(tree_builder.tokenizer_state_for_context_elem(false)),
+            initial_state: Some(tree_builder.tokenizer_state_for_context_elem(true)),
             ..TokenizerOpts::default()
         };
 
@@ -236,9 +272,8 @@ impl HtmlParser {
             external_sources: ExternalSources::new(),
             blocked: None,
             encoding_indicator: None,
-            // A fragment parser never runs script: `innerHTML` parses its input
-            // with scripting off, and a `<script>` in it becomes an element and
-            // nothing more.
+            // Tokenization follows a scripting-enabled browser (notably for
+            // noscript), but markup APIs never execute the scripts they parse.
             script_runner: None,
         }
     }

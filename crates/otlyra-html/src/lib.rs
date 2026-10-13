@@ -127,10 +127,62 @@ pub fn parse_fragment(html: &str, context: &str) -> Document {
     };
     let name = QualName::new(None, namespace, LocalName::from(local));
 
-    let mut parser = HtmlParser::for_fragment(Document::new(), name, Vec::new());
+    parse_fragment_with_context(html, name, Vec::new())
+}
+
+/// Parse markup with an element's qualified name and attributes as context.
+///
+/// Keeping the namespace and attributes matters for SVG and MathML integration
+/// points, such as `annotation-xml` with `encoding="text/html"`. The result's
+/// root contains the fragment nodes; scripts in the markup are not executed.
+pub fn parse_fragment_with_context(
+    html: &str,
+    context: html5ever::QualName,
+    attributes: Vec<html5ever::Attribute>,
+) -> Document {
+    let mut parser = HtmlParser::for_fragment(Document::new(), context, attributes);
     // The context element was built into the parser's own arena, so that arena
     // is the one the fragment is parsed into — a fresh one would have the
     // context's id pointing at nothing.
+    let mut document = parser.take_document();
+    parser.feed(&mut document, html.into());
+    parser.finish(&mut document);
+    document
+}
+
+/// Parse markup in an existing document's context, preserving namespace,
+/// attributes, quirks mode and the nearest HTML form ancestor.
+///
+/// A non-element context, such as a document fragment, uses a fictional body
+/// element as HTML's markup replacement algorithms require.
+pub fn parse_fragment_for_element(html: &str, owner: &Document, context: NodeId) -> Document {
+    use html5ever::{LocalName, QualName, ns};
+    let (name, attributes) = owner
+        .get(context)
+        .and_then(|node| node.element())
+        .map(|element| (element.name.clone(), element.attrs.clone()))
+        .unwrap_or_else(|| {
+            (
+                QualName::new(None, ns!(html), LocalName::from("body")),
+                Vec::new(),
+            )
+        });
+    let mut ancestor = owner.get(context).and_then(|node| node.parent);
+    let mut form_ancestor = false;
+    while let Some(id) = ancestor {
+        let node = owner.node(id);
+        if node
+            .element()
+            .is_some_and(|element| element.name.ns == ns!(html) && &*element.name.local == "form")
+        {
+            form_ancestor = true;
+            break;
+        }
+        ancestor = node.parent;
+    }
+    let mut fragment = Document::with_limits(owner.limits());
+    otlyra_dom::DocumentMutator::new(&mut fragment).set_quirks_mode(owner.quirks_mode());
+    let mut parser = HtmlParser::for_fragment_with_form(fragment, name, attributes, form_ancestor);
     let mut document = parser.take_document();
     parser.feed(&mut document, html.into());
     parser.finish(&mut document);
