@@ -146,8 +146,13 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   damage and tab/viewport/layer transitions retain conservative full redraws.
   1x/2x field edits, disjoint skipped updates, late completion and dropped frames
   have pixel-parity coverage; CPU raster comparisons exclude native presentation.
-- [ ] Avoid copying the full retained document accessibility tree when only
-  native chrome changes; retain correct activation and document generations.
+- [x] Avoid copying the full retained document accessibility tree when only
+  native chrome changes. Publish changed window controls and focus; retain the
+  complete tree for late AccessKit activation. Clear old document nodes during
+  pending navigation and scope focus before joining chrome/system descriptions.
+- [ ] Make content accessibility generation incremental after DOM/layout
+  changes. The owner still builds a full snapshot for semantic invalidations;
+  equal snapshots retain their Arc, but generation/comparison still walks it.
 
 ## Priority 2 — Retained scene layers and damage
 

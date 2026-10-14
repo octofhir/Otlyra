@@ -204,6 +204,24 @@ baseline. Tab activation, layer changes, viewport changes and cached DPI scaling
 keep full damage where a partial rectangle cannot describe the transition.
 The implementation retains one rectangle per cached layer, not a frame history.
 
+Window accessibility uses incremental `TreeUpdate`s. Native chrome descriptions
+are cached by their rendered build; changed controls alone are published while
+the retained document Arc stays unchanged. Focus-only changes contain no nodes,
+and unchanged wakes/hover publish no update. Content keeps equal semantic
+snapshots on the same Arc within one tab/navigation generation. Pending
+navigation exposes an empty document until the current owner reply arrives.
+The platform merges updates with the same AccessKit consumer used by its
+adapters; a screen reader attaching later receives a complete current tree,
+including the latest focus and excluding removed descendants.
+
+Text fields now describe their actual focus IDs even when empty. Chrome and
+system-page focus is resolved within its owning surface before their flat
+descriptions are joined, avoiding collisions between local IDs. Toolbar semantic
+invalidation includes bookmark labels, loading-state transitions and changes to
+the tab-strip focus prefix. Shared datalist options have one accessible parent:
+the focused/open field, or the first rendered editable field. Taking a suggestion
+focuses and updates that same field, preserving a valid tree when lists are shared.
+
 `content_owner_ready`, `first_content_scene_ready`,
 `first_content_scene_received` and `first_content_scene_composed` separate
 construction, publication, receipt and use in a native frame. Receipt intervals
@@ -218,7 +236,7 @@ records the earlier UI accounting separately. Strict budgets remain unchanged.
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, hidden-page
 scheduling, interruptible content/raster work,
-incremental accessibility updates and durable nonblocking shutdown persistence
+incremental content accessibility generation and durable nonblocking shutdown persistence
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.
 

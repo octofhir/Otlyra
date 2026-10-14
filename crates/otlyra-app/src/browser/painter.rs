@@ -981,6 +981,7 @@ impl Painter for Browser {
         // its own surface, so its controls come from that surface rather than
         // from the document tree, which for an `about:` page has nothing in it.
         let mut described = self.ui.describe();
+        let chrome_len = described.len();
         let (page_focus, page_described) = match system {
             Some(SystemPage::Settings) => (self.settings.focused(), self.settings.describe()),
             Some(SystemPage::History) => {
@@ -1002,18 +1003,22 @@ impl Painter for Browser {
             // describe none.
             _ => (None, Vec::new()),
         };
-        described.extend(page_described);
-
         // Only the active root may publish keyboard focus. Background surfaces
         // can retain render state, but never a second accessibility focus.
         let focused = match self.keyboard_surface {
-            SURFACE_CHROME => self.ui.focused(),
-            SURFACE_SYSTEM => page_focus,
+            SURFACE_CHROME => self
+                .ui
+                .focused()
+                .and_then(|focus| crate::a11y::focused_index(&described, focus)),
+            SURFACE_SYSTEM => page_focus
+                .and_then(|focus| crate::a11y::focused_index(&page_described, focus))
+                .map(|index| chrome_len + index),
             SURFACE_PAGE | SURFACE_INSPECTOR => None,
             _ => None,
         };
+        described.extend(page_described);
 
-        Some(crate::a11y::window_tree(
+        Some(crate::a11y::window_tree_at(
             &described, focused, document, &title,
         ))
     }

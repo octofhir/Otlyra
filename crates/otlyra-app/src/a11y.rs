@@ -214,6 +214,25 @@ pub fn window_tree(
     document: TreeUpdate,
     title: &str,
 ) -> TreeUpdate {
+    window_tree_at(
+        interface,
+        focused.and_then(|focus| focused_index(interface, focus)),
+        document,
+        title,
+    )
+}
+
+/// Resolve focus within the surface that owns it, before joining descriptions.
+pub(crate) fn focused_index(interface: &[Described], focus: FocusId) -> Option<usize> {
+    interface.iter().rposition(|node| node.focus == Some(focus))
+}
+
+pub(crate) fn window_tree_at(
+    interface: &[Described],
+    focused: Option<usize>,
+    document: TreeUpdate,
+    title: &str,
+) -> TreeUpdate {
     let mut nodes = document.nodes;
 
     // The document's own root becomes a child of the window's, so the page keeps
@@ -232,7 +251,7 @@ pub fn window_tree(
     let mut interface_focus = None;
     for (index, described) in interface.iter().enumerate() {
         let id = described_node(index);
-        if described.focus.is_some() && described.focus == focused {
+        if Some(index) == focused {
             interface_focus = Some(id);
         }
         nodes.push((id, node_for(described)));
@@ -253,6 +272,127 @@ pub fn window_tree(
         // the keyboard *is*; claiming the window when a field has the caret would
         // be describing a different browser than the one on screen.
         focus: interface_focus.unwrap_or(document.focus.max(ROOT)),
+    }
+}
+
+/// Retain the document while publishing only changed window nodes and focus.
+#[derive(Default)]
+pub(crate) struct WindowTree {
+    document: Option<std::sync::Arc<TreeUpdate>>,
+    interface: Vec<Node>,
+    root: Option<Node>,
+    page_root: Option<Node>,
+    focus: Option<NodeId>,
+    wrapped: Option<bool>,
+    described: Vec<Described>,
+    chrome_len: usize,
+}
+
+impl WindowTree {
+    pub(crate) fn update(
+        &mut self,
+        chrome: &[Described],
+        content: &[Described],
+        focused: Option<usize>,
+        document: &std::sync::Arc<TreeUpdate>,
+        title: &str,
+        wrapped: bool,
+    ) -> Option<TreeUpdate> {
+        let initial = self.wrapped != Some(wrapped);
+        let document_changed = initial
+            || self
+                .document
+                .as_ref()
+                .is_none_or(|old| !std::sync::Arc::ptr_eq(old, document));
+        if !wrapped {
+            self.wrapped = Some(false);
+            self.document = Some(std::sync::Arc::clone(document));
+            self.focus = Some(document.focus);
+            self.interface.clear();
+            self.root = None;
+            self.page_root = None;
+            self.described.clear();
+            self.chrome_len = 0;
+            return document_changed.then(|| (**document).clone());
+        }
+        let count = chrome.len() + content.len();
+        let focus = focused
+            .filter(|index| *index < count)
+            .map_or(document.focus, described_node);
+        let descriptions_changed = initial
+            || self.chrome_len != chrome.len()
+            || self.described.len() != count
+            || self.described[..chrome.len()] != *chrome
+            || self.described[chrome.len()..] != *content;
+        let title_changed = self
+            .root
+            .as_ref()
+            .is_none_or(|root| root.label() != Some(title));
+        if !document_changed && !descriptions_changed && !title_changed {
+            if self.focus == Some(focus) {
+                return None;
+            }
+            self.focus = Some(focus);
+            return Some(TreeUpdate {
+                nodes: Vec::new(),
+                tree: None,
+                tree_id: TreeId::ROOT,
+                focus,
+            });
+        }
+        let mut nodes = Vec::new();
+        if document_changed {
+            for (id, node) in &document.nodes {
+                let mut node = node.clone();
+                let id = if *id == ROOT {
+                    node.set_label(title.to_owned());
+                    self.page_root = Some(node.clone());
+                    NodeId(INTERFACE_BASE - 1)
+                } else {
+                    *id
+                };
+                nodes.push((id, node));
+            }
+        } else if let Some(root) = &mut self.page_root
+            && root.label() != Some(title)
+        {
+            root.set_label(title.to_owned());
+            nodes.push((NodeId(INTERFACE_BASE - 1), root.clone()));
+        }
+        let mut next_interface = Vec::with_capacity(count);
+        let mut children = Vec::with_capacity(count + 1);
+        for (index, described) in chrome.iter().chain(content).enumerate() {
+            let node = node_for(described);
+            let id = described_node(index);
+            if initial || self.interface.get(index) != Some(&node) {
+                nodes.push((id, node.clone()));
+            }
+            next_interface.push(node);
+            children.push(id);
+        }
+        if self.page_root.is_some() {
+            children.push(NodeId(INTERFACE_BASE - 1));
+        }
+        let mut root = Node::new(Role::Window);
+        root.set_label(title.to_owned());
+        root.set_children(children);
+        if initial || self.root.as_ref() != Some(&root) {
+            nodes.push((ROOT, root.clone()));
+        }
+        let unchanged = !initial && nodes.is_empty() && self.focus == Some(focus);
+        self.document = Some(std::sync::Arc::clone(document));
+        self.interface = next_interface;
+        self.root = Some(root);
+        self.focus = Some(focus);
+        self.wrapped = Some(true);
+        self.described = chrome.iter().chain(content).cloned().collect();
+        self.chrome_len = chrome.len();
+        (!unchanged).then_some(TreeUpdate {
+            nodes,
+            tree: initial.then(|| TreeInfo::new(ROOT)),
+            tree_id: TreeId::ROOT,
+            focus,
+        })
     }
 }
 
@@ -396,7 +536,17 @@ fn collect(page: &PageScene, boxes: &BoxTree, id: BoxId) -> Vec<Accessible> {
                         // A field's suggestions are in a `<datalist>` somewhere
                         // else in the document and are never boxes until the list
                         // is showing, so a reader walks them from there.
-                        described(page, otlyra_dom::form::suggestions_of(page.document(), dom))
+                        let options = otlyra_dom::form::suggestions_of(page.document(), dom);
+                        // One datalist can serve several fields. Its option IDs
+                        // cannot appear under several parents in the same tree.
+                        if options
+                            .first()
+                            .is_some_and(|option| page.suggestion_owner(*option) == Some(dom))
+                        {
+                            described(page, options)
+                        } else {
+                            Vec::new()
+                        }
                     } else {
                         described(page, otlyra_dom::form::options_of(page.document(), dom))
                     }
@@ -1125,5 +1275,226 @@ mod tests {
         let update = empty_tree("New tab");
         assert_eq!(update.nodes.len(), 1);
         assert_eq!(update.focus, ROOT);
+    }
+
+    struct IgnoreChanges;
+    impl accesskit_consumer::TreeChangeHandler for IgnoreChanges {
+        fn node_added(&mut self, _: &accesskit_consumer::NodeRef) {}
+        fn node_updated(
+            &mut self,
+            _: &accesskit_consumer::NodeRef,
+            _: &accesskit_consumer::NodeRef,
+        ) {
+        }
+        fn focus_moved(
+            &mut self,
+            _: Option<&accesskit_consumer::NodeRef>,
+            _: Option<&accesskit_consumer::NodeRef>,
+        ) {
+        }
+        fn node_removed(&mut self, _: &accesskit_consumer::NodeRef) {}
+    }
+
+    #[test]
+    fn chrome_deltas_retain_document_nodes_and_resolve_surface_local_focus() {
+        let mut address = described(WidgetRole::TextInput, "Address", Some("before"));
+        address.focus = Some(7);
+        let mut setting = described(WidgetRole::CheckBox, "Load images", Some("ticked"));
+        setting.focus = Some(7);
+        let document = std::sync::Arc::new(tree_for(&page("<p>document retained"), "Page"));
+        let mut publisher = WindowTree::default();
+        let initial = publisher
+            .update(
+                &[address.clone()],
+                &[setting.clone()],
+                Some(0),
+                &document,
+                "Page",
+                true,
+            )
+            .unwrap();
+        let mut tree = accesskit_consumer::Tree::new(initial, true);
+        assert_eq!(tree.state().focus_in_tree().data().label(), Some("Address"));
+        address.value = Some("after".into());
+        let changed = publisher
+            .update(
+                &[address.clone()],
+                &[setting.clone()],
+                Some(0),
+                &document,
+                "Page",
+                true,
+            )
+            .unwrap();
+        assert_eq!(changed.nodes.len(), 1);
+        assert_eq!(changed.nodes[0].0, described_node(0));
+        assert!(changed.tree.is_none());
+        tree.update_and_process_changes(changed, &mut IgnoreChanges);
+        let focus = publisher
+            .update(
+                &[address.clone()],
+                &[setting.clone()],
+                Some(1),
+                &document,
+                "Page",
+                true,
+            )
+            .unwrap();
+        assert!(focus.nodes.is_empty());
+        tree.update_and_process_changes(focus, &mut IgnoreChanges);
+        assert_eq!(
+            tree.state().focus_in_tree().data().label(),
+            Some("Load images")
+        );
+        assert!(
+            publisher
+                .update(&[address], &[setting], Some(1), &document, "Page", true)
+                .is_none()
+        );
+        assert!(
+            tree.state()
+                .node_by_tree_local_id(NodeId(INTERFACE_BASE - 1), TreeId::ROOT)
+                .unwrap()
+                .children()
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn document_replacement_removes_old_nodes_and_validates_new_focus() {
+        let first = std::sync::Arc::new(tree_for(&page("<h1>old heading<p>old text"), "Old"));
+        let mut publisher = WindowTree::default();
+        let initial = publisher
+            .update(&[], &[], None, &first, "Old", true)
+            .unwrap();
+        let mut tree = accesskit_consumer::Tree::new(initial, true);
+        let blank = std::sync::Arc::new(empty_tree("New"));
+        let update = publisher
+            .update(&[], &[], None, &blank, "New", true)
+            .unwrap();
+        tree.update_and_process_changes(update, &mut IgnoreChanges);
+        let root = tree
+            .state()
+            .node_by_tree_local_id(NodeId(INTERFACE_BASE - 1), TreeId::ROOT)
+            .unwrap();
+        assert!(root.children().next().is_none());
+        assert_eq!(root.data().label(), Some("New"));
+        assert_eq!(tree.state().focus_in_tree().data().role(), Role::Window);
+    }
+
+    #[test]
+    fn shared_datalist_produces_a_valid_accessibility_tree() {
+        let mut page = page(
+            "<input id=a list=choices><input id=b list=choices><datalist id=choices><option value=red><option value=blue></datalist>",
+        );
+        let first = otlyra_css::stylo_dom::select(page.document(), "#a").unwrap()[0];
+        let second = otlyra_css::stylo_dom::select(page.document(), "#b").unwrap()[0];
+        let option = otlyra_css::stylo_dom::select(page.document(), "option").unwrap()[0];
+        let mut tree = accesskit_consumer::Tree::new(tree_for(&page, "Shared choices"), true);
+        page.focus_node(second);
+        let mut text = otlyra_text::TextEngine::new();
+        page.build_display_list(&mut text, 1024.0, 768.0, 0.0);
+        tree.update_and_process_changes(tree_for(&page, "Shared choices"), &mut IgnoreChanges);
+        assert_eq!(tree.state().focus_in_tree().children().count(), 2);
+        assert!(page.activate_node(option));
+        assert_eq!(
+            page.control_facts(second).unwrap().value.as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            page.control_facts(first).unwrap().value.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn large_document_chrome_edits_publish_one_node_and_record_cost() {
+        use std::{sync::Arc, time::Instant};
+        let mut root = Node::new(Role::Document);
+        root.set_label("Large page");
+        root.set_children((1..=10_000).map(NodeId).collect::<Vec<_>>());
+        let mut nodes = vec![(ROOT, root)];
+        for index in 1..=10_000 {
+            let mut node = Node::new(Role::Label);
+            node.set_value(format!("paragraph {index}"));
+            nodes.push((NodeId(index), node));
+        }
+        let document = Arc::new(TreeUpdate {
+            nodes,
+            tree: Some(TreeInfo::new(ROOT)),
+            tree_id: TreeId::ROOT,
+            focus: ROOT,
+        });
+        let mut address = described(WidgetRole::TextInput, "Address", Some("before"));
+        address.focus = Some(7);
+        let mut publisher = WindowTree::default();
+        let first = publisher
+            .update(
+                std::slice::from_ref(&address),
+                &[],
+                Some(0),
+                &document,
+                "Large page",
+                true,
+            )
+            .unwrap();
+        let mut tree = accesskit_consumer::Tree::new(first, true);
+        let mut samples = Vec::new();
+        for index in 0..22 {
+            address.value = Some(format!("query {index}"));
+            let chrome = std::slice::from_ref(&address);
+            let mut times = [0.0; 2];
+            let mut full = None;
+            let mut partial = None;
+            let order = if index % 2 == 0 { [0, 1] } else { [1, 0] };
+            for mode in order {
+                let began = Instant::now();
+                if mode == 0 {
+                    partial = publisher.update(chrome, &[], Some(0), &document, "Large page", true);
+                } else {
+                    full = Some(window_tree(
+                        chrome,
+                        Some(7),
+                        (*document).clone(),
+                        "Large page",
+                    ));
+                }
+                times[mode] = began.elapsed().as_secs_f64() * 1000.0;
+            }
+            let partial = partial.unwrap();
+            let full = full.unwrap();
+            assert_eq!(partial.nodes.len(), 1);
+            assert_eq!(full.nodes.len(), 10_003);
+            tree.update_and_process_changes(partial, &mut IgnoreChanges);
+            assert_eq!(
+                tree.state().focus_in_tree().data().value(),
+                address.value.as_deref()
+            );
+            assert!(
+                tree.state()
+                    .node_by_tree_local_id(NodeId(10_000), TreeId::ROOT)
+                    .is_some()
+            );
+            assert!(
+                publisher
+                    .update(chrome, &[], Some(0), &document, "Large page", true)
+                    .is_none()
+            );
+            if index >= 2 {
+                samples.push(
+                    serde_json::json!({ "sample": index - 2, "partial_ms": times[0],
+                    "full_ms": times[1], "partial_nodes": 1, "full_nodes": full.nodes.len() }),
+                );
+            }
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/accessibility-chrome-pairs.json");
+        std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": 1, "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "document_nodes": 10_001, "warmups": 2, "sampling": "alternating-order same-input publisher pairs",
+            "endpoint": "window tree publication; excludes DOM generation and native adapter work",
+            "samples": samples,
+        })).unwrap()).unwrap();
     }
 }

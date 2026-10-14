@@ -51,6 +51,7 @@ rfd.workspace = true
 security-framework.workspace = true
 
 [dev-dependencies]
+accesskit_consumer.workspace = true
 otlyra-text.workspace = true
 insta.workspace = true
 png.workspace = true

@@ -44,7 +44,8 @@ This proves separation of native input and chrome from the busy content task.
 CPU frame-pump durations are not native input-to-present latency. One content
 owner still serializes tabs and inspector work. The retained-damage follow-up
 below now accumulates partial updates through render acknowledgements;
-UI still merges owned accessibility data. Visibility, independent scrolling,
+Chrome accessibility now retains unchanged document nodes and publishes deltas
+as described below. Visibility, independent scrolling,
 content/raster interruption and shutdown persistence remain explicit follow-ups.
 An early UI-only frame can be shown before content is ready. Startup reporting
 uses the readiness captured on the submitted render job, so late content receipt
@@ -136,6 +137,43 @@ passed, the one ignored desktop smoke passed explicitly for native GPU/CPU,
 all-target clippy passed with warnings denied, and the 22 boundary tests passed
 after the final test-fixture update. Builds use the earlier read-only Otter
 snapshot (`23c5a114f769`), leaving the working Otter checkout unchanged.
+
+## Incremental window accessibility follow-up
+
+Native chrome edits previously cloned the complete retained document into a
+window update. The platform then cloned that update again to retain the latest
+tree. Window publication now keeps the immutable document Arc and emits only
+changed controls, parent child lists, titles or focus. A focus-only update has no
+nodes; unchanged wakes/hover return no update. Content preserves equal snapshots
+within the same tab/navigation generation. Navigation invalidation removes old
+document nodes before the owner can answer.
+
+The platform retains the current graph with `accesskit_consumer` (the existing
+adapter dependency, pinned at the same version). Late activation materializes a
+complete tree, rather than returning the last partial update. Consumer-backed
+tests validate document replacement, removals, focus changes and busy-owner tab
+projection. Text fields now carry focus IDs even when empty. Focus is resolved
+inside chrome/system surfaces before joining them; their local IDs can overlap.
+Bookmark/loading transitions and tab focus-prefix changes invalidate toolbar
+semantics. Shared datalist options are exposed under one current field and apply
+to that field; exposing the same option under two fields produced an invalid
+AccessKit graph and is now covered by a regression.
+
+On Apple M1 / macOS 26.5, the debug publisher comparison used a prepared document
+with 10,000 leaf nodes, two warmups and 20 alternating-order matched input pairs.
+Full publication emitted 10,003 nodes per edit; incremental publication emitted
+one changed address node and zero document nodes. Publisher time p50 / p95 was
+1.6679 / 2.9902 ms for the full path and 0.0150 / 0.0242 ms for the incremental
+path. This excludes DOM/tree generation, native adapter processing and
+presentation, and does not establish native input-to-present latency. Raw samples
+and build metadata are in `target/accessibility-chrome-pairs.json`.
+
+Validation: 1,764 workspace tests passed, the desktop GPU/CPU startup smoke
+passed explicitly, and all-target clippy passed with warnings denied. Builds use
+the read-only Otter snapshot `23c5a114f769`; the working engine checkout is
+unchanged. Content still regenerates full accessibility snapshots after semantic
+invalidations; equal-snapshot comparison and native initial-tree materialization
+still walk the document. Incremental DOM generation remains a separate follow-up.
 
 ## What the reference browsers do
 

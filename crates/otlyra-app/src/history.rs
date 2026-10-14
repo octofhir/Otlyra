@@ -589,6 +589,7 @@ impl HistorySurface {
             },
             Action::SearchHit,
         )
+        .focus(search_id)
         .into_widget(theme)
     }
 

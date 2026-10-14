@@ -18,19 +18,68 @@ use raw_window_handle::RawWindowHandle;
 /// means that question always has an answer, rather than one that depends on
 /// catching the next frame.
 #[derive(Clone, Default)]
-pub(crate) struct SharedTree(Arc<Mutex<Option<TreeUpdate>>>);
+pub(crate) struct SharedTree(Arc<Mutex<Option<RetainedTree>>>);
+
+struct RetainedTree {
+    tree: accesskit_consumer::Tree,
+    info: accesskit::TreeInfo,
+}
+
+struct IgnoreChanges;
+impl accesskit_consumer::TreeChangeHandler for IgnoreChanges {
+    fn node_added(&mut self, _: &accesskit_consumer::NodeRef) {}
+    fn node_updated(&mut self, _: &accesskit_consumer::NodeRef, _: &accesskit_consumer::NodeRef) {}
+    fn focus_moved(
+        &mut self,
+        _: Option<&accesskit_consumer::NodeRef>,
+        _: Option<&accesskit_consumer::NodeRef>,
+    ) {
+    }
+    fn node_removed(&mut self, _: &accesskit_consumer::NodeRef) {}
+}
 
 impl SharedTree {
     fn set(&self, update: TreeUpdate) {
         if let Ok(mut slot) = self.0.lock() {
-            *slot = Some(update);
+            if let Some(retained) = slot.as_mut() {
+                if let Some(info) = &update.tree {
+                    retained.info.clone_from(info);
+                }
+                retained
+                    .tree
+                    .update_and_process_changes(update, &mut IgnoreChanges);
+            } else {
+                let info = update
+                    .tree
+                    .clone()
+                    .expect("initial accessibility tree has a root");
+                *slot = Some(RetainedTree {
+                    tree: accesskit_consumer::Tree::new(update, true),
+                    info,
+                });
+            }
         }
     }
 }
 
 impl ActivationHandler for SharedTree {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
-        self.0.lock().ok()?.clone()
+        let slot = self.0.lock().ok()?;
+        let retained = slot.as_ref()?;
+        let state = retained.tree.state();
+        let mut pending = vec![retained.info.root];
+        let mut nodes = Vec::new();
+        while let Some(id) = pending.pop() {
+            let node = state.node_by_tree_local_id(id, accesskit::TreeId::ROOT)?;
+            pending.extend_from_slice(node.data().children());
+            nodes.push((id, node.data().clone()));
+        }
+        Some(TreeUpdate {
+            nodes,
+            tree: Some(retained.info.clone()),
+            tree_id: accesskit::TreeId::ROOT,
+            focus: state.locate_node(state.focus_id_in_tree())?.0,
+        })
     }
 }
 
@@ -162,5 +211,85 @@ impl Accessibility {
         {
             events.raise();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit::{Node, NodeId, Role, TreeId, TreeInfo};
+
+    fn initial() -> TreeUpdate {
+        let mut root = Node::new(Role::Window);
+        root.set_children(vec![NodeId(1), NodeId(2)]);
+        let mut field = Node::new(Role::TextInput);
+        field.set_value("before");
+        TreeUpdate {
+            nodes: vec![
+                (NodeId(0), root),
+                (NodeId(1), field),
+                (NodeId(2), Node::new(Role::Document)),
+            ],
+            tree: Some(TreeInfo::new(NodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: NodeId(1),
+        }
+    }
+
+    #[test]
+    fn late_activation_gets_the_complete_tree_after_partial_and_focus_updates() {
+        let mut shared = SharedTree::default();
+        assert!(shared.request_initial_tree().is_none());
+        shared.set(initial());
+        let mut changed = Node::new(Role::TextInput);
+        changed.set_value("after");
+        shared.set(TreeUpdate {
+            nodes: vec![(NodeId(1), changed)],
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(1),
+        });
+        shared.set(TreeUpdate {
+            nodes: Vec::new(),
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(2),
+        });
+        let complete = shared.request_initial_tree().unwrap();
+        assert_eq!(complete.nodes.len(), 3);
+        assert_eq!(complete.focus, NodeId(2));
+        assert_eq!(
+            complete
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == NodeId(1))
+                .unwrap()
+                .1
+                .value(),
+            Some("after")
+        );
+        let tree = accesskit_consumer::Tree::new(complete, true);
+        assert_eq!(tree.state().focus_in_tree().data().role(), Role::Document);
+    }
+
+    #[test]
+    fn activation_omits_removed_children_and_keeps_tree_metadata() {
+        let mut shared = SharedTree::default();
+        shared.set(initial());
+        let mut root = Node::new(Role::Window);
+        root.set_children(vec![NodeId(2)]);
+        let mut info = TreeInfo::new(NodeId(0));
+        info.toolkit_name = Some("Otlyra".into());
+        shared.set(TreeUpdate {
+            nodes: vec![(NodeId(0), root)],
+            tree: Some(info.clone()),
+            tree_id: TreeId::ROOT,
+            focus: NodeId(2),
+        });
+        let complete = shared.request_initial_tree().unwrap();
+        assert_eq!(complete.nodes.len(), 2);
+        assert!(!complete.nodes.iter().any(|(id, _)| *id == NodeId(1)));
+        assert_eq!(complete.tree, Some(info));
+        accesskit_consumer::Tree::new(complete, true);
     }
 }

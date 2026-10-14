@@ -3522,6 +3522,7 @@ dependencies = [
 name = "otlyra-app"
 version = "0.0.0"
 dependencies = [
+ "accesskit_consumer",
  "arboard",
  "aws-lc-rs",
  "clap",
@@ -3660,6 +3661,7 @@ name = "otlyra-platform"
 version = "0.0.0"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_macos",
  "accesskit_windows",
  "muda",

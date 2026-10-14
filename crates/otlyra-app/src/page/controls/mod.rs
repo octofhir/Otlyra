@@ -133,14 +133,13 @@ impl PageScene {
         }
         // A suggestion is taken rather than chosen, and it goes into the field
         // showing it — the same thing a press on one does.
-        if let Some(field) =
-            otlyra_dom::form::suggested_control(&self.document, node, self.interaction.open)
-        {
+        if let Some(field) = self.suggestion_owner(node) {
             if otlyra_dom::form::is_disabled(&self.document, node)
                 || !otlyra_dom::form::is_mutable(&self.document, field)
             {
                 return false;
             }
+            self.focus_node(field);
             self.take_suggestion(field, node);
             self.close_open();
             return true;

@@ -292,6 +292,10 @@ pub struct WindowBrowser {
     presented_content: Option<(TabId, Viewport)>,
     invalidated: HashMap<TabId, u64>,
     accessibility_dirty: bool,
+    accessibility_tree: crate::a11y::WindowTree,
+    chrome_description: Vec<Described>,
+    chrome_description_builds: Option<u64>,
+    placeholder_document: Option<(TabId, Option<u64>, String, Arc<accesskit::TreeUpdate>)>,
     visible_dirty: bool,
     first_content_received: bool,
     first_content_composed: bool,
@@ -441,6 +445,10 @@ impl WindowBrowser {
             presented_content: None,
             invalidated: HashMap::new(),
             accessibility_dirty: true,
+            accessibility_tree: Default::default(),
+            chrome_description: Vec::new(),
+            chrome_description_builds: None,
+            placeholder_document: None,
             visible_dirty: true,
             first_content_received: false,
             first_content_composed: false,
@@ -587,6 +595,7 @@ impl WindowBrowser {
             self.context_serial = None;
         }
         self.visible_dirty = true;
+        self.accessibility_dirty = true;
         if matches!(
             action,
             UiAction::Navigate(_)
@@ -1131,35 +1140,64 @@ impl Painter for WindowBrowser {
     }
 
     fn accessibility(&mut self) -> Option<accesskit::TreeUpdate> {
-        if !std::mem::take(&mut self.accessibility_dirty) {
+        let chrome_changed = self.chrome_description_builds != Some(self.ui.builds());
+        if !std::mem::take(&mut self.accessibility_dirty) && !chrome_changed {
             return None;
         }
-        let current = self.tabs[self.active].id == self.snapshot.tabs[self.snapshot.active].id;
+        if chrome_changed {
+            self.chrome_description = self.ui.describe();
+            self.chrome_description_builds = Some(self.ui.builds());
+        }
+        let tab = &self.tabs[self.active];
+        let current = tab.id == self.snapshot.tabs[self.snapshot.active].id
+            && self
+                .invalidated
+                .get(&tab.id)
+                .is_none_or(|serial| self.snapshot.serial >= *serial);
         let document = if current {
-            (*self.snapshot.document).clone()
+            Arc::clone(&self.snapshot.document)
         } else {
-            crate::a11y::empty_tree(&self.tabs[self.active].title)
+            if self
+                .placeholder_document
+                .as_ref()
+                .is_none_or(|(id, navigation, title, _)| {
+                    *id != tab.id || *navigation != tab.navigation || *title != tab.title
+                })
+            {
+                self.placeholder_document = Some((
+                    tab.id,
+                    tab.navigation,
+                    tab.title.clone(),
+                    Arc::new(crate::a11y::empty_tree(&tab.title)),
+                ));
+            }
+            Arc::clone(&self.placeholder_document.as_ref().unwrap().3)
         };
-        if !self.interface {
-            return Some(document);
-        }
-        let mut described = self.ui.describe();
-        if current {
-            described.extend(self.snapshot.described.clone());
-        }
+        let described = if current {
+            self.snapshot.described.as_slice()
+        } else {
+            &[]
+        };
         let focus = if self.chrome_focused {
-            self.ui.focused()
+            self.ui
+                .focused()
+                .and_then(|focus| crate::a11y::focused_index(&self.chrome_description, focus))
         } else if current {
-            self.snapshot.focused
+            self.snapshot
+                .focused
+                .and_then(|focus| crate::a11y::focused_index(described, focus))
+                .map(|index| self.chrome_description.len() + index)
         } else {
             None
         };
-        Some(crate::a11y::window_tree(
-            &described,
+        self.accessibility_tree.update(
+            &self.chrome_description,
+            described,
             focus,
-            document,
-            &self.tabs[self.active].title,
-        ))
+            &document,
+            &tab.title,
+            self.interface,
+        )
     }
 
     fn cursor(&self) -> Cursor {

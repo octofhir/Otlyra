@@ -149,6 +149,7 @@ peniko = "=0.6.1"
 # has no adapter yet, as it had none through `accesskit_winit` with its
 # `accesskit_unix` feature off.
 accesskit = "=0.25.1"
+accesskit_consumer = "=0.39.1"
 accesskit_macos = "=0.27.1"
 accesskit_windows = "=0.35.1"
 

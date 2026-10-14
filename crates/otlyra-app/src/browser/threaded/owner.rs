@@ -44,12 +44,16 @@ impl Snapshot {
             .layers
             .retain(|layer| layer.id != LayerId(LAYER_CHROME));
         let tab = &browser.tabs[browser.active];
-        if browser.accessibility_dirty || cache.tab != Some(tab.id) {
-            cache.document = Arc::new(browser.world.page(tab.id).map_or_else(
+        let context_changed = cache.tab != Some((tab.id, tab.navigation));
+        if browser.accessibility_dirty || context_changed {
+            let document = browser.world.page(tab.id).map_or_else(
                 || crate::a11y::empty_tree(&tab.title),
                 |page| crate::a11y::tree_for(page, &tab.title),
-            ));
-            cache.tab = Some(tab.id);
+            );
+            if context_changed || document != *cache.document {
+                cache.document = Arc::new(document);
+            }
+            cache.tab = Some((tab.id, tab.navigation));
             browser.accessibility_dirty = false;
         }
         let (focused, described) = match tab.system {
@@ -142,7 +146,7 @@ impl Snapshot {
 }
 
 struct MetadataCache {
-    tab: Option<TabId>,
+    tab: Option<(TabId, Option<u64>)>,
     document: Arc<accesskit::TreeUpdate>,
     revision: Option<(u64, u64)>,
     suggestions: Arc<Vec<Suggestion>>,

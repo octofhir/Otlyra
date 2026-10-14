@@ -3,6 +3,8 @@ use crate::fetcher::{Fetcher, Loaded, Loader};
 use otlyra_platform::FramePump;
 use std::time::Duration;
 
+mod accessibility;
+
 const PAGE: &str = r#"<!doctype html><title>Page</title><body style="margin:0;background:#fff">
 <input id=field value=hello style="position:absolute;left:40px;top:40px;width:240px;height:32px">
 <p id=result style="margin-top:150px">before callback</p>"#;

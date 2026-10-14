@@ -594,6 +594,7 @@ pub enum FieldHit {
 /// double-click or a drag at that offset means to its own caret and anchor.
 pub struct TextInput<A> {
     view: FieldView,
+    focus: Option<FocusId>,
     on_hit: Box<dyn Fn(FieldHit) -> A>,
     leading: Option<Mark>,
     face: Option<Color>,
@@ -610,12 +611,19 @@ impl<A> TextInput<A> {
     pub fn new(view: FieldView, on_hit: impl Fn(FieldHit) -> A + 'static) -> Self {
         Self {
             view,
+            focus: None,
             on_hit: Box::new(on_hit),
             leading: None,
             face: None,
             rect: Rect::ZERO,
             hit_map: Vec::new(),
         }
+    }
+
+    /// The surface's stable identity, including while the field is empty.
+    pub fn focus(mut self, id: FocusId) -> Self {
+        self.focus = Some(id);
+        self
     }
 
     /// A mark inside the field's left end, before the text.
@@ -671,9 +679,7 @@ impl<A> Widget<A> for TextInput<A> {
             // empty or not.
             label: self.view.placeholder.clone(),
             value: Some(self.view.text.clone()),
-            // A field has no focus id — the caret being present *is* the field
-            // having the keyboard, and that is already in the view it was given.
-            focus: None,
+            focus: self.focus,
             enabled: true,
         });
     }

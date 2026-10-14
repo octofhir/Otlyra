@@ -14,6 +14,40 @@ use otlyra_text::TextEngine;
 use crate::page::PageScene;
 
 impl PageScene {
+    /// A shared datalist has one accessible parent: the field that would take
+    /// its suggestion. Prefer keyboard focus, then the open list, then the
+    /// first rendered editable field when neither owns this option.
+    pub(crate) fn suggestion_owner(&self, option: NodeId) -> Option<NodeId> {
+        if !otlyra_dom::form::is_suggestion(&self.document, option) {
+            return None;
+        }
+        let accepts = |field| {
+            self.document.attr(field, "list").is_some()
+                && otlyra_dom::form::is_mutable(&self.document, field)
+                && otlyra_dom::form::suggested_control(&self.document, option, Some(field))
+                    .is_some()
+        };
+        for field in [self.interaction.focus, self.interaction.open]
+            .into_iter()
+            .flatten()
+        {
+            if accepts(field) {
+                return Some(field);
+            }
+        }
+        let mut pending = vec![self.boxes.root()];
+        while let Some(id) = pending.pop() {
+            let node = self.boxes.node(id);
+            if let Some(field) = node.node
+                && accepts(field)
+            {
+                return Some(field);
+            }
+            pending.extend(node.children.iter().rev().copied());
+        }
+        None
+    }
+
     /// Put a suggestion into the field it was offered to.
     ///
     /// It is the field's value and nothing else — a suggestion is not a choice the

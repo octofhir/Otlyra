@@ -414,6 +414,7 @@ impl Settings {
             },
             Action::HomeHit,
         )
+        .focus(home_id)
         .into_widget(theme);
 
         controls::card(

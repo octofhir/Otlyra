@@ -2466,9 +2466,11 @@ impl BrowserUi {
             .tab_runtime_work
             .iter()
             .any(|(_, dirty)| dirty.contains(UiDirty::SEMANTICS));
-        let toolbar_semantics_dirty = self.toolbar_appearance.as_ref().is_none_or(|old| {
+        let mut toolbar_semantics_dirty = self.toolbar_appearance.as_ref().is_none_or(|old| {
             old.width != toolbar_appearance.width
                 || old.history != toolbar_appearance.history
+                || old.bookmark != toolbar_appearance.bookmark
+                || old.spinner.is_some() != toolbar_appearance.spinner.is_some()
                 || old.address != toolbar_appearance.address
                 || old.caret != toolbar_appearance.caret
                 || old.selection != toolbar_appearance.selection
@@ -2478,6 +2480,7 @@ impl BrowserUi {
             tab_changed || self.toolbar_appearance.as_ref() != Some(&toolbar_appearance);
 
         if tab_changed {
+            let previous_tab_focus_end = self.tab_focus_end;
             self.focus.begin();
             let theme = self.theme.clone();
             let focus = self.focus.clone();
@@ -2507,6 +2510,7 @@ impl BrowserUi {
                 },
             );
             self.tab_focus_end = self.focus.len();
+            toolbar_semantics_dirty |= previous_tab_focus_end != self.tab_focus_end;
         } else if toolbar_changed {
             self.focus.truncate(self.tab_focus_end);
         }
@@ -3017,6 +3021,7 @@ fn find_bar(
             },
             UiAction::FindHit,
         )
+        .focus(field_id)
         .face(theme.surface)
         .into_widget(theme),
     )) as Child<UiAction>;
@@ -3345,6 +3350,7 @@ fn toolbar(
         },
         UiAction::AddressHit,
     )
+    .focus(address_id)
     .leading(move |list, rect, color| {
         if secure {
             icon::lock(list, rect, color);
@@ -3535,6 +3541,49 @@ mod tests {
                 ("Tab 2".to_owned(), Some("not selected".to_owned())),
             ]
         );
+    }
+
+    #[test]
+    fn toolbar_semantics_follow_bookmarks_loading_and_focus_prefix_changes() {
+        let mut ui = BrowserUi::new();
+        let mut text = TextEngine::isolated();
+        ui.bookmark = Bookmarked::No;
+        frame(&mut ui, &mut text, 900.0, 2);
+        let old_field = ui
+            .describe()
+            .into_iter()
+            .find(|node| node.role == Role::TextInput)
+            .unwrap();
+        ui.bookmark = Bookmarked::Yes;
+        frame(&mut ui, &mut text, 900.0, 2);
+        assert!(
+            ui.describe()
+                .iter()
+                .any(|node| node.label == "Remove bookmark")
+        );
+        ui.build_display_list(
+            900.0,
+            640.0,
+            &labels(2),
+            0,
+            (true, true),
+            Some(0.25),
+            &mut text,
+        );
+        assert!(
+            ui.describe()
+                .iter()
+                .any(|node| node.label == "Stop loading")
+        );
+        frame(&mut ui, &mut text, 900.0, 1);
+        let descriptions = ui.describe();
+        assert!(descriptions.iter().any(|node| node.label == "Reload"));
+        let field = descriptions
+            .iter()
+            .find(|node| node.role == Role::TextInput)
+            .unwrap();
+        assert_ne!(field.focus, old_field.focus);
+        assert_eq!(field.focus, ui.focus.first_text());
     }
 
     /// The address field reports what is in it, and that it is a field.

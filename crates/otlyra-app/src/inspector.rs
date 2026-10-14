@@ -1692,6 +1692,7 @@ impl Inspector {
             },
             Action::SearchHit,
         )
+        .focus(id)
         .face(theme.surface_sunken)
         .into_widget(theme)
     }
@@ -1984,6 +1985,7 @@ impl Inspector {
                                         },
                                         Action::AttributeHit,
                                     )
+                                    .focus(id)
                                     .face(theme.surface_sunken)
                                     .into_widget(theme),
                                 )),
