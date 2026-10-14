@@ -225,7 +225,8 @@ struct Snapshot {
     active: usize,
     window_visible: bool,
     labels: Vec<TabLabel>,
-    scene: Scene,
+    scene: Option<Scene>,
+    full_damage: bool,
     viewport: Viewport,
     cursor: Cursor,
     chrome_focused: bool,
@@ -396,7 +397,8 @@ impl WindowBrowser {
             active,
             window_visible,
             labels: Vec::new(),
-            scene: Scene { layers: Vec::new() },
+            scene: None,
+            full_damage: false,
             viewport,
             cursor: Cursor::Default,
             chrome_focused: tabs[active].url.is_empty(),
@@ -658,31 +660,29 @@ impl WindowBrowser {
                 || self.snapshot.zoom != snapshot.zoom
                 || self.snapshot.bookmark != snapshot.bookmark
                 || self.snapshot.find_status != snapshot.find_status;
-            if self.tabs[self.active].id == tab {
-                self.visible_dirty |= self.scenes.get(&tab).is_none_or(|(viewport, scene)| {
-                    *viewport != snapshot.viewport || !same_scene(scene, &snapshot.scene)
+            if self.tabs[self.active].id == tab
+                && let Some(scene) = &snapshot.scene
+            {
+                self.visible_dirty |= self.scenes.get(&tab).is_none_or(|(viewport, previous)| {
+                    *viewport != snapshot.viewport || !same_scene(previous, scene)
                 });
             }
-            if self
-                .invalidated
-                .get(&tab)
-                .is_none_or(|serial| snapshot.serial >= *serial)
+            if let Some(mut scene) = snapshot.scene.take()
+                && self
+                    .invalidated
+                    .get(&tab)
+                    .is_none_or(|serial| snapshot.serial >= *serial)
             {
-                if let Some((viewport, previous)) = self.scenes.get(&tab)
+                if !snapshot.full_damage
+                    && let Some((viewport, previous)) = self.scenes.get(&tab)
                     && *viewport == snapshot.viewport
                 {
-                    accumulate_damage(previous, &mut snapshot.scene);
+                    accumulate_damage(previous, &mut scene);
                 } else {
-                    full_damage(&mut snapshot.scene);
+                    full_damage(&mut scene);
                 }
                 self.scene_device.retain(|(id, _), _| *id != tab);
-                self.scenes.insert(
-                    tab,
-                    (
-                        snapshot.viewport,
-                        std::mem::replace(&mut snapshot.scene, Scene { layers: Vec::new() }),
-                    ),
-                );
+                self.scenes.insert(tab, (snapshot.viewport, scene));
             }
             self.pending.retain(|(serial, _)| *serial > snapshot.serial);
             self.tabs = snapshot.tabs.clone();

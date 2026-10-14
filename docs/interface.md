@@ -243,9 +243,18 @@ late render reports retain unpresented damage and restoration requests a fresh
 frame at the current viewport. Native visibility commands stay ordered while
 content is busy. Timer deadlines continue to run without native painting.
 
+Hidden content publications carry metadata without style/layout, a new scene
+or document accessibility generation. Page invalidations remain pending;
+restoration prepares current content at the latest viewport with full damage.
+Geometry-bound input prepares deferred content explicitly, including restoration
+and pointer input processed in the same command batch. Hidden navigation clears
+the retired document's accessibility rather than describing stale layout.
+Existing resource loads and timers continue; CSS resources discovered only by
+style/layout begin when that preparation is requested.
+
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, background timer
-budgets and deferred hidden content layout, interruptible content/raster work,
+budgets, fewer hidden metadata wakes, interruptible content/raster work,
 incremental content accessibility generation and durable nonblocking shutdown persistence
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.

@@ -38,14 +38,26 @@ impl Snapshot {
         serial: u64,
         cache: &mut MetadataCache,
     ) -> Self {
-        let mut scene = browser.compose_content_scene(viewport);
-        browser.update_find();
-        scene
-            .layers
-            .retain(|layer| layer.id != LayerId(LAYER_CHROME));
+        let scene = if browser.window_visible {
+            let mut scene = browser.compose_content_scene(viewport);
+            browser.update_find();
+            scene
+                .layers
+                .retain(|layer| layer.id != LayerId(LAYER_CHROME));
+            cache.deferred = false;
+            Some(scene)
+        } else {
+            // Loading and timers still progress, but their visual invalidations
+            // remain on the page until a visible frame or geometry-bound input.
+            if browser.pump() {
+                browser.accessibility_dirty = true;
+            }
+            cache.deferred = true;
+            None
+        };
         let tab = &browser.tabs[browser.active];
         let context_changed = cache.tab != Some((tab.id, tab.navigation));
-        if browser.accessibility_dirty || context_changed {
+        if browser.window_visible && (browser.accessibility_dirty || context_changed) {
             let document = browser.world.page(tab.id).map_or_else(
                 || crate::a11y::empty_tree(&tab.title),
                 |page| crate::a11y::tree_for(page, &tab.title),
@@ -53,30 +65,41 @@ impl Snapshot {
             if context_changed || document != *cache.document {
                 cache.document = Arc::new(document);
             }
-            cache.tab = Some((tab.id, tab.navigation));
             browser.accessibility_dirty = false;
+        } else if context_changed {
+            // Never describe a retired document using the last laid-out tree.
+            cache.document = Arc::new(crate::a11y::empty_tree(&tab.title));
+            browser.accessibility_dirty = true;
         }
-        let (focused, described) = match tab.system {
-            Some(SystemPage::Settings) => (browser.settings.focused(), browser.settings.describe()),
-            Some(SystemPage::History) => (
-                browser.history_page.focused(),
-                browser.history_page.describe(),
-            ),
-            Some(SystemPage::Downloads) => (
-                browser.downloads_page.focused(),
-                browser.downloads_page.describe(),
-            ),
-            Some(SystemPage::Bookmarks) => (
-                browser.bookmarks_page.focused(),
-                browser.bookmarks_page.describe(),
-            ),
-            Some(SystemPage::Cookies) => (
-                browser.cookies_page.focused(),
-                browser.cookies_page.describe(),
-            ),
-            Some(SystemPage::About) => (browser.about.focused(), browser.about.describe()),
-            _ => (None, Vec::new()),
-        };
+        cache.tab = Some((tab.id, tab.navigation));
+        if browser.window_visible {
+            (cache.focused, cache.described) = match tab.system {
+                Some(SystemPage::Settings) => {
+                    (browser.settings.focused(), browser.settings.describe())
+                }
+                Some(SystemPage::History) => (
+                    browser.history_page.focused(),
+                    browser.history_page.describe(),
+                ),
+                Some(SystemPage::Downloads) => (
+                    browser.downloads_page.focused(),
+                    browser.downloads_page.describe(),
+                ),
+                Some(SystemPage::Bookmarks) => (
+                    browser.bookmarks_page.focused(),
+                    browser.bookmarks_page.describe(),
+                ),
+                Some(SystemPage::Cookies) => (
+                    browser.cookies_page.focused(),
+                    browser.cookies_page.describe(),
+                ),
+                Some(SystemPage::About) => (browser.about.focused(), browser.about.describe()),
+                _ => (None, Vec::new()),
+            };
+        } else if context_changed {
+            cache.focused = None;
+            cache.described.clear();
+        }
         let revision = (browser.bookmarks.revision(), browser.history.revision());
         if cache.revision != Some(revision) {
             cache.suggestions = Arc::new(
@@ -116,6 +139,7 @@ impl Snapshot {
                 })
                 .collect(),
             scene,
+            full_damage: false,
             viewport,
             cursor: browser.cursor,
             chrome_focused: browser.keyboard_surface == SURFACE_CHROME,
@@ -136,9 +160,9 @@ impl Snapshot {
             next: browser.next_frame(),
             work: browser.work_counters(),
             document: Arc::clone(&cache.document),
-            described,
+            described: cache.described.clone(),
             focused: (browser.keyboard_surface == SURFACE_SYSTEM)
-                .then_some(focused)
+                .then_some(cache.focused)
                 .flatten(),
             suggestions: Arc::clone(&cache.suggestions),
             context: browser.ui.context_menu(),
@@ -151,6 +175,9 @@ struct MetadataCache {
     document: Arc<accesskit::TreeUpdate>,
     revision: Option<(u64, u64)>,
     suggestions: Arc<Vec<Suggestion>>,
+    described: Vec<Described>,
+    focused: Option<FocusId>,
+    deferred: bool,
 }
 
 pub(super) fn content_loop(
@@ -166,32 +193,51 @@ pub(super) fn content_loop(
         document: Arc::new(crate::a11y::empty_tree("")),
         revision: None,
         suggestions: Arc::new(Vec::new()),
+        described: Vec::new(),
+        focused: None,
+        deferred: false,
     };
     let mut first = true;
     let mut published = None;
     loop {
         let mut snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
         let context = (snapshot.tabs[snapshot.active].id, snapshot.viewport);
-        if published != Some(context) {
-            full_damage(&mut snapshot.scene);
+        if let Some(scene) = &mut snapshot.scene {
+            if published != Some(context) {
+                full_damage(scene);
+                snapshot.full_damage = true;
+            }
+            published = Some(context);
+        } else {
+            // Hidden metadata can replace an unconsumed scene. Conservatively
+            // invalidate the first resumed scene, including that lost damage.
+            published = None;
         }
-        published = Some(context);
         let next = snapshot.next;
         let (previous, waker) = {
             let mut mailbox = mailbox.lock().unwrap();
-            if first {
+            if first && snapshot.scene.is_some() {
                 if let Some(trace) = &mailbox.startup {
                     trace.mark("first_content_scene_ready");
                 }
                 first = false;
             }
-            if let Some(previous) = &mailbox.latest {
+            if let Some(previous) = &mailbox.latest
+                && let Some(scene) = &mut snapshot.scene
+                && let Some(previous_scene) = &previous.scene
+            {
                 if previous.tabs[previous.active].id == snapshot.tabs[snapshot.active].id
                     && previous.viewport == snapshot.viewport
                 {
-                    accumulate_damage(&previous.scene, &mut snapshot.scene);
+                    if previous.full_damage || snapshot.full_damage {
+                        full_damage(scene);
+                        snapshot.full_damage = true;
+                    } else {
+                        accumulate_damage(previous_scene, scene);
+                    }
                 } else {
-                    full_damage(&mut snapshot.scene);
+                    full_damage(scene);
+                    snapshot.full_damage = true;
                 }
             }
             let previous = mailbox.latest.replace(snapshot);
@@ -292,6 +338,13 @@ pub(super) fn content_loop(
                         };
                         browser.select_tab(index);
                     }
+                    if cache.deferred && navigation.is_some() {
+                        // Restore and input may share a command batch. Hit tests,
+                        // focus traversal and accessibility actions need current
+                        // layout even before the next visible publication.
+                        browser.compose_content_scene(viewport);
+                        cache.deferred = false;
+                    }
                     {
                         let mut state = clipboard_state.borrow_mut();
                         state.serial = serial;
@@ -317,7 +370,9 @@ pub(super) fn content_loop(
                             Some(query) => browser.ui.restore_find(&query),
                             None => browser.ui.close_find(),
                         }
-                        browser.update_find();
+                        if browser.window_visible {
+                            browser.update_find();
+                        }
                     }
                     match action {
                         UiAction::NewTab

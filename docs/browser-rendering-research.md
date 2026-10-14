@@ -264,9 +264,37 @@ startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
 passed against the same immutable Otter snapshot; its working checkout was not
 edited. These checks do not establish a new startup latency distribution.
 
-Timers and resource loads continue. The owner can still lay out and publish
-timer-driven document changes while hidden. Timer budgets, exemptions, deferred
-hidden scene preparation and interruptible content tasks remain separate work.
+Timers and resource loads continue. Hidden scene preparation was addressed in
+the following step; timer budgets, exemptions and interruptible content tasks
+remain separate work.
+
+## Hidden content preparation follow-up
+
+The content owner's snapshot now distinguishes metadata from a prepared scene.
+While the window is hidden it pumps timers, parsing and completed resources but
+does not compose content, refresh find geometry or generate document
+accessibility. Page style/layout invalidations remain pending. Existing loads
+continue; CSS images/fonts discovered only by visual preparation can start later.
+
+Metadata does not replace the UI's retained scene. A tab/navigation change clears
+the retired document accessibility; the first visible snapshot prepares the new
+tree. Restoration forces full scene damage at the latest viewport, also covering
+an unconsumed scene overwritten by hidden metadata. Geometry-bound input can
+prepare content explicitly before hit testing or accessibility actions, so a
+restore and pointer event in one command batch use current layout.
+
+Tests cover real hidden JavaScript timers moving and changing a field without
+additional display-list builds, retained accessibility/list identity, initial
+hidden loading, a 2x resize, hidden navigation, same-batch restore/input, and
+unconsumed visible damage. Resumed CPU output is compared with a fresh full
+surface at 1x/2x. This is functional evidence, not a native energy or latency
+distribution. Metadata publications still wake the native loop; avoiding those
+wakes is separate work.
+
+Verification: 1,783 workspace Rust tests passed with no failures; all-target
+clippy with `-D warnings`, formatting, diff checks and the opt-in native GPU/CPU
+startup smoke passed against the same immutable Otter snapshot. The working
+Otter checkout was not edited.
 
 ## What the reference browsers do
 
@@ -347,7 +375,11 @@ graphics overview is not used to infer current process counts or Fission status.
 Source links to `main` describe the branch inspected on the research date, not
 a promise about every shipping build or platform.
 
-## Otlyra audit
+## Otlyra audit baseline
+
+This table records the call paths before the follow-ups above. Windowed content
+ownership, asynchronous frame submission and visibility have since changed;
+the remaining work is tracked in `BROWSER_UI_PLAN.md`.
 
 | Finding | Evidence in this checkout | Consequence |
 |---|---|---|

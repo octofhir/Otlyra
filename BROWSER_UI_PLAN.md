@@ -136,8 +136,12 @@ This work crosses the browser/page boundary rather than replacing UI foundations
 - [x] Propagate confirmed native window occlusion/minimization to content's
   visibility. Stop hidden native raster/Vsync, preserve unpresented damage and
   restore at the latest viewport. Unfocused visible windows remain visible.
-- [ ] Define background timer budgets/exemptions and defer unnecessary hidden
-  content layout/publication. Timers currently continue normally.
+- [x] Defer hidden-window style/layout, scene preparation and document
+  accessibility generation while continuing timers and loads. Publish metadata
+  without replacing retained scenes; restore with full damage at the latest
+  viewport. Geometry-bound input explicitly prepares deferred content.
+- [ ] Define background timer budgets/exemptions. Timers currently continue
+  normally; hidden metadata publications still wake native UI.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

@@ -4,6 +4,7 @@ use otlyra_platform::FramePump;
 use std::time::Duration;
 
 mod accessibility;
+mod hidden_preparation;
 
 fn animated_window(viewport: Viewport) -> WindowBrowser {
     use crate::browser::visibility_tests::HTML;
@@ -949,7 +950,12 @@ fn wait_pending_epoch(window: &WindowBrowser, previous: u64) {
             .unwrap()
             .latest
             .as_ref()
-            .is_some_and(|snapshot| snapshot.scene.layers[0].epoch != previous)
+            .is_some_and(|snapshot| {
+                snapshot
+                    .scene
+                    .as_ref()
+                    .is_some_and(|scene| scene.layers[0].epoch != previous)
+            })
         {
             return;
         }
@@ -1256,6 +1262,8 @@ fn a_layout_change_dominates_a_coalesced_field_update() {
         .as_ref()
         .unwrap()
         .scene
+        .as_ref()
+        .unwrap()
         .layers[0]
         .epoch;
     window
