@@ -73,7 +73,7 @@ impl Snapshot {
         }
         cache.tab = Some((tab.id, tab.navigation));
         if browser.window_visible {
-            (cache.focused, cache.described) = match tab.system {
+            let (focused, described) = match tab.system {
                 Some(SystemPage::Settings) => {
                     (browser.settings.focused(), browser.settings.describe())
                 }
@@ -96,9 +96,13 @@ impl Snapshot {
                 Some(SystemPage::About) => (browser.about.focused(), browser.about.describe()),
                 _ => (None, Vec::new()),
             };
+            cache.focused = focused;
+            if *cache.described != described {
+                cache.described = Arc::new(described);
+            }
         } else if context_changed {
             cache.focused = None;
-            cache.described.clear();
+            cache.described = Arc::new(Vec::new());
         }
         let revision = (browser.bookmarks.revision(), browser.history.revision());
         if cache.revision != Some(revision) {
@@ -121,52 +125,86 @@ impl Snapshot {
             cache.revision = Some(revision);
         }
         Self {
-            serial,
-            tabs: browser
-                .tabs
-                .iter()
-                .map(|tab| WindowTab::from_tab(tab, browser.world.loading(tab.id)))
-                .collect(),
-            active: browser.active,
-            window_visible: browser.window_visible,
-            labels: browser
-                .tabs
-                .iter()
-                .map(|tab| TabLabel {
-                    id: tab.id.0,
-                    title: tab.title.clone(),
-                    loading: browser.world.loading(tab.id),
-                })
-                .collect(),
             scene,
             full_damage: false,
-            viewport,
-            cursor: browser.cursor,
-            chrome_focused: browser.keyboard_surface == SURFACE_CHROME,
-            content_chrome: browser.keyboard_surface == SURFACE_SYSTEM
-                || browser.keyboard_surface == super::super::SURFACE_INSPECTOR,
-            find_wants_keyboard: browser.ui.find_wants_keyboard(),
-            picking: browser.inspector.picking,
-            address_focused: browser.ui.address_focused() || browser.ui.address_wants_keyboard(),
-            find: browser
-                .ui
-                .finding()
-                .then(|| browser.ui.find.text().to_owned()),
-            find_status: browser.ui.find_status,
-            bookmark: browser.ui.bookmark,
-            zoom: browser.zoom,
-            theme: browser.theme.clone(),
-            appearance: browser.window_appearance(),
-            next: browser.next_frame(),
-            work: browser.work_counters(),
-            document: Arc::clone(&cache.document),
-            described: cache.described.clone(),
-            focused: (browser.keyboard_surface == SURFACE_SYSTEM)
-                .then_some(cache.focused)
-                .flatten(),
-            suggestions: Arc::clone(&cache.suggestions),
-            context: browser.ui.context_menu(),
+            metadata: Arc::new(SnapshotMetadata {
+                serial,
+                tabs: browser
+                    .tabs
+                    .iter()
+                    .map(|tab| WindowTab::from_tab(tab, browser.world.loading(tab.id)))
+                    .collect(),
+                active: browser.active,
+                window_visible: browser.window_visible,
+                labels: browser
+                    .tabs
+                    .iter()
+                    .map(|tab| TabLabel {
+                        id: tab.id.0,
+                        title: tab.title.clone(),
+                        loading: browser.world.loading(tab.id),
+                    })
+                    .collect(),
+                viewport,
+                cursor: browser.cursor,
+                chrome_focused: browser.keyboard_surface == SURFACE_CHROME,
+                content_chrome: browser.keyboard_surface == SURFACE_SYSTEM
+                    || browser.keyboard_surface == super::super::SURFACE_INSPECTOR,
+                find_wants_keyboard: browser.ui.find_wants_keyboard(),
+                picking: browser.inspector.picking,
+                address_focused: browser.ui.address_focused()
+                    || browser.ui.address_wants_keyboard(),
+                find: browser
+                    .ui
+                    .finding()
+                    .then(|| browser.ui.find.text().to_owned()),
+                find_status: browser.ui.find_status,
+                bookmark: browser.ui.bookmark,
+                zoom: browser.zoom,
+                theme: browser.theme.clone(),
+                appearance: browser.window_appearance(),
+                next: browser.next_frame(),
+                work: browser.work_counters(),
+                document: Arc::clone(&cache.document),
+                described: Arc::clone(&cache.described),
+                focused: (browser.keyboard_surface == SURFACE_SYSTEM)
+                    .then_some(cache.focused)
+                    .flatten(),
+                suggestions: Arc::clone(&cache.suggestions),
+                context: browser.ui.context_menu(),
+            }),
         }
+    }
+}
+
+impl SnapshotMetadata {
+    fn unchanged_hidden(&self, previous: &Self) -> bool {
+        // Labels are derived entirely from tabs; semantics use retained handles.
+        self.context == previous.context
+            && self.serial == previous.serial
+            && self.tabs == previous.tabs
+            && self.active == previous.active
+            && self.window_visible == previous.window_visible
+            && self.viewport == previous.viewport
+            && self.cursor == previous.cursor
+            && self.chrome_focused == previous.chrome_focused
+            && self.content_chrome == previous.content_chrome
+            && self.find_wants_keyboard == previous.find_wants_keyboard
+            && self.picking == previous.picking
+            && self.address_focused == previous.address_focused
+            && self.find == previous.find
+            && self.find_status == previous.find_status
+            && self.bookmark == previous.bookmark
+            && self.zoom == previous.zoom
+            && self.theme == previous.theme
+            && self.appearance == previous.appearance
+            && self.work == previous.work
+            && self.focused == previous.focused
+            && Arc::ptr_eq(&self.document, &previous.document)
+            && Arc::ptr_eq(&self.described, &previous.described)
+            && Arc::ptr_eq(&self.suggestions, &previous.suggestions)
+        // `next` belongs to content's scheduler. Native hidden windows request
+        // no frame, so changing a timer deadline does not need a UI publication.
     }
 }
 
@@ -175,9 +213,10 @@ struct MetadataCache {
     document: Arc<accesskit::TreeUpdate>,
     revision: Option<(u64, u64)>,
     suggestions: Arc<Vec<Suggestion>>,
-    described: Vec<Described>,
+    described: Arc<Vec<Described>>,
     focused: Option<FocusId>,
     deferred: bool,
+    last_hidden: Option<Arc<SnapshotMetadata>>,
 }
 
 pub(super) fn content_loop(
@@ -193,9 +232,10 @@ pub(super) fn content_loop(
         document: Arc::new(crate::a11y::empty_tree("")),
         revision: None,
         suggestions: Arc::new(Vec::new()),
-        described: Vec::new(),
+        described: Arc::new(Vec::new()),
         focused: None,
         deferred: false,
+        last_hidden: None,
     };
     let mut first = true;
     let mut published = None;
@@ -214,38 +254,50 @@ pub(super) fn content_loop(
             published = None;
         }
         let next = snapshot.next;
-        let (previous, waker) = {
-            let mut mailbox = mailbox.lock().unwrap();
-            if first && snapshot.scene.is_some() {
-                if let Some(trace) = &mailbox.startup {
-                    trace.mark("first_content_scene_ready");
+        let publish = snapshot.window_visible
+            || cache
+                .last_hidden
+                .as_ref()
+                .is_none_or(|previous| !snapshot.metadata.unchanged_hidden(previous));
+        if snapshot.window_visible {
+            cache.last_hidden = None;
+        } else if publish {
+            cache.last_hidden = Some(Arc::clone(&snapshot.metadata));
+        }
+        if publish {
+            let (previous, waker) = {
+                let mut mailbox = mailbox.lock().unwrap();
+                if first && snapshot.scene.is_some() {
+                    if let Some(trace) = &mailbox.startup {
+                        trace.mark("first_content_scene_ready");
+                    }
+                    first = false;
                 }
-                first = false;
-            }
-            if let Some(previous) = &mailbox.latest
-                && let Some(scene) = &mut snapshot.scene
-                && let Some(previous_scene) = &previous.scene
-            {
-                if previous.tabs[previous.active].id == snapshot.tabs[snapshot.active].id
-                    && previous.viewport == snapshot.viewport
+                if let Some(previous) = &mailbox.latest
+                    && let Some(scene) = &mut snapshot.scene
+                    && let Some(previous_scene) = &previous.scene
                 {
-                    if previous.full_damage || snapshot.full_damage {
+                    if previous.tabs[previous.active].id == context.0
+                        && previous.viewport == context.1
+                    {
+                        if previous.full_damage || snapshot.full_damage {
+                            full_damage(scene);
+                            snapshot.full_damage = true;
+                        } else {
+                            accumulate_damage(previous_scene, scene);
+                        }
+                    } else {
                         full_damage(scene);
                         snapshot.full_damage = true;
-                    } else {
-                        accumulate_damage(previous_scene, scene);
                     }
-                } else {
-                    full_damage(scene);
-                    snapshot.full_damage = true;
                 }
+                let previous = mailbox.latest.replace(snapshot);
+                (previous, mailbox.waker.clone())
+            };
+            drop(previous);
+            if let Some(waker) = waker {
+                waker.wake();
             }
-            let previous = mailbox.latest.replace(snapshot);
-            (previous, mailbox.waker.clone())
-        };
-        drop(previous);
-        if let Some(waker) = waker {
-            waker.wake();
         }
         let command = match next {
             FrameRequest::At(at) => {

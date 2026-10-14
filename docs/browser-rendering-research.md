@@ -288,8 +288,8 @@ additional display-list builds, retained accessibility/list identity, initial
 hidden loading, a 2x resize, hidden navigation, same-batch restore/input, and
 unconsumed visible damage. Resumed CPU output is compared with a fresh full
 surface at 1x/2x. This is functional evidence, not a native energy or latency
-distribution. Metadata publications still wake the native loop; avoiding those
-wakes is separate work.
+distribution. Identical metadata publications were suppressed in the follow-up
+below.
 
 Verification: 1,783 workspace Rust tests passed with no failures; all-target
 clippy with `-D warnings`, formatting, diff checks and the opt-in native GPU/CPU
@@ -364,6 +364,33 @@ Verification: 1,799 workspace Rust tests passed, plus the opt-in native GPU/CPU
 startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
 passed against the same immutable Otter snapshot. The working Otter checkout
 was not edited.
+
+## Hidden metadata publication follow-up
+
+Snapshots now separate a prepared scene from immutable shared metadata. The
+content owner retains its last hidden metadata handle and suppresses identical
+publications, avoiding native UI wakes caused by timers or commands that change
+only deferred document state. It continues pumping and uses each newly computed
+timer deadline locally, even when it publishes nothing.
+
+Equality includes ordered command serials, tabs/loading/navigation/title,
+viewport, focus/cursor, find/bookmark state, zoom/theme, work counters and context
+menus; document semantics, system descriptions and suggestions use retained
+handles. Labels are derived from tabs. System descriptions now reuse a shared
+handle while unchanged. Visibility restoration always publishes current data and
+a prepared scene; a suppressed hidden publication still invalidates the resumed
+scene's full-damage context.
+
+Tests observe no new publication or native wake across one hundred unchanged
+hidden commands, including with an open context menu. They verify changed menu
+payloads, title, viewport, ordered acknowledgements and projected tabs still
+arrive, and restoration publishes again. Existing real timer, damage and 1x/2x
+pixel-parity tests remain covered. This proves publication behavior; it is not
+a measured background CPU/energy improvement or a timer budget.
+
+Verification: 1,802 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
+passed on the immutable Otter snapshot, leaving its working checkout unchanged.
 
 ## What the reference browsers do
 

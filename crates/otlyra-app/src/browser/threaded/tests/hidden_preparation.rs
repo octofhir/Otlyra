@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const HTML: &str = r#"<!doctype html><title>Deferred</title><body style="margin:0;background:white">
 <input id=field value=before style="position:absolute;left:40px;top:40px;width:240px;height:32px">
@@ -262,4 +263,123 @@ fn hidden_metadata_cannot_lose_damage_from_an_unconsumed_visible_scene() {
         pump.frame(&mut window).unwrap();
         assert_full_pixels(&mut window, &mut pump, viewport);
     }
+}
+
+#[test]
+fn unchanged_hidden_work_does_not_publish_or_wake_native_ui() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = deferred_window(viewport, true);
+    ready(&mut window);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&wakes);
+    window.set_waker(Waker::from_callback(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    }));
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    hidden_updates(&window);
+    wait(&mut window, |window| !window.snapshot.window_visible);
+    let publication = Arc::clone(&window.snapshot.metadata);
+    let before = wakes.load(Ordering::SeqCst);
+    for _ in 0..100 {
+        inspect(&window, |_| ());
+    }
+    let resume = pause_owner(&window);
+    assert_eq!(wakes.load(Ordering::SeqCst), before);
+    assert!(window.mailbox.lock().unwrap().latest.is_none());
+    window.receive();
+    assert!(Arc::ptr_eq(&publication, &window.snapshot.metadata));
+    drop(resume);
+    window.on_event(PlatformEvent::VisibilityChanged(true));
+    wait(&mut window, |window| window.snapshot.window_visible);
+    assert!(wakes.load(Ordering::SeqCst) > before);
+}
+
+#[test]
+fn hidden_metadata_changes_and_command_acknowledgements_still_publish() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = deferred_window(viewport, true);
+    ready(&mut window);
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    hidden_updates(&window);
+    wait(&mut window, |window| !window.snapshot.window_visible);
+    window
+        .sender
+        .send(Command::Task(Box::new(|browser| {
+            browser.tabs[browser.active].title = "background title".into();
+        })))
+        .unwrap();
+    wait(&mut window, |window| {
+        window.tabs[0].title == "background title"
+    });
+    window.send(None, UiAction::None, None, false, None);
+    let serial = window.serial;
+    wait(&mut window, |window| window.snapshot.serial == serial);
+    let resized = Viewport::new(1800, 1280, 2.0);
+    window.request_frame(resized);
+    wait(&mut window, |window| window.snapshot.viewport == resized);
+    window.apply(UiAction::NewTab);
+    let serial = window.serial;
+    wait(&mut window, |window| {
+        window.snapshot.serial == serial && window.pending.is_empty()
+    });
+    assert_eq!(window.tabs.len(), 2);
+    assert_eq!(window.active, 1);
+    assert!(!window.snapshot.window_visible);
+}
+
+#[test]
+fn hidden_context_menu_payload_changes_publish_without_repeating_unchanged_wakes() {
+    let mut window = deferred_window(Viewport::new(900, 640, 1.0), true);
+    ready(&mut window);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&wakes);
+    window.set_waker(Waker::from_callback(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    }));
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    hidden_updates(&window);
+    wait(&mut window, |window| !window.snapshot.window_visible);
+    window
+        .sender
+        .send(Command::Task(Box::new(|browser| {
+            browser.ui.open_context_menu(
+                300.0,
+                170.0,
+                vec![crate::ui::ContextRow::Command(
+                    crate::ui::ContextCommand::CopySelection,
+                    true,
+                )],
+            );
+        })))
+        .unwrap();
+    wait(&mut window, |window| window.snapshot.context.is_some());
+    let before = wakes.load(Ordering::SeqCst);
+    for _ in 0..100 {
+        inspect(&window, |_| ());
+    }
+    let resume = pause_owner(&window);
+    assert_eq!(wakes.load(Ordering::SeqCst), before);
+    drop(resume);
+    window
+        .sender
+        .send(Command::Task(Box::new(|browser| {
+            browser.ui.open_context_menu(
+                300.0,
+                170.0,
+                vec![crate::ui::ContextRow::Command(
+                    crate::ui::ContextCommand::CopySelection,
+                    false,
+                )],
+            );
+        })))
+        .unwrap();
+    wait(&mut window, |window| {
+        window.snapshot.context.as_ref().is_some_and(|(_, rows)| {
+            rows == &[crate::ui::ContextRow::Command(
+                crate::ui::ContextCommand::CopySelection,
+                false,
+            )]
+        })
+    });
+    assert!(wakes.load(Ordering::SeqCst) > before);
 }

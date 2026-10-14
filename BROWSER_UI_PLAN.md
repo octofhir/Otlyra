@@ -149,8 +149,12 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   accessibility generation while continuing timers and loads. Publish metadata
   without replacing retained scenes; restore with full damage at the latest
   viewport. Geometry-bound input explicitly prepares deferred content.
+- [x] Suppress identical hidden metadata publications and native UI wakes while
+  preserving tab/load/title/viewport changes and ordered command acknowledgements.
+  Retain metadata and system descriptions behind immutable shared handles; timer
+  deadlines stay on content's scheduler without waking hidden native UI.
 - [ ] Define background timer budgets/exemptions. Timers currently continue
-  normally; hidden metadata publications still wake native UI.
+  normally; changed hidden metadata still publishes.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

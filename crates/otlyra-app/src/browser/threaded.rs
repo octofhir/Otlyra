@@ -31,7 +31,7 @@ use super::{Browser, SURFACE_CHROME, SURFACE_SYSTEM, Tab, TabId};
 const LAYER_PLACEHOLDER: u64 = 4;
 
 /// Tab metadata for native chrome; navigation histories stay with the owner.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WindowTab {
     /// Stable context identity.
     pub id: TabId,
@@ -220,13 +220,24 @@ struct Mailbox {
 }
 
 struct Snapshot {
+    scene: Option<Scene>,
+    full_damage: bool,
+    metadata: Arc<SnapshotMetadata>,
+}
+
+impl std::ops::Deref for Snapshot {
+    type Target = SnapshotMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+struct SnapshotMetadata {
     serial: u64,
     tabs: Vec<WindowTab>,
     active: usize,
     window_visible: bool,
     labels: Vec<TabLabel>,
-    scene: Option<Scene>,
-    full_damage: bool,
     viewport: Viewport,
     cursor: Cursor,
     chrome_focused: bool,
@@ -243,7 +254,7 @@ struct Snapshot {
     next: FrameRequest,
     work: PainterWork,
     document: Arc<accesskit::TreeUpdate>,
-    described: Vec<Described>,
+    described: Arc<Vec<Described>>,
     focused: Option<FocusId>,
     suggestions: Arc<Vec<Suggestion>>,
     context: Option<((f64, f64), Vec<crate::ui::ContextRow>)>,
@@ -394,33 +405,35 @@ impl WindowBrowser {
             ui.focus_address();
         }
         let snapshot = Snapshot {
-            serial: 0,
-            tabs: tabs.clone(),
-            active,
-            window_visible,
-            labels: Vec::new(),
             scene: None,
             full_damage: false,
-            viewport,
-            cursor: Cursor::Default,
-            chrome_focused: tabs[active].url.is_empty(),
-            content_chrome: tabs[active].system.is_some(),
-            find_wants_keyboard: false,
-            picking: false,
-            address_focused: tabs[active].url.is_empty(),
-            find: None,
-            find_status: Default::default(),
-            bookmark: crate::ui::Bookmarked::Impossible,
-            zoom: 1.0,
-            theme: crate::widget::theme::Theme::light(),
-            appearance: None,
-            next: FrameRequest::None,
-            work: Default::default(),
-            document: Arc::new(crate::a11y::empty_tree(&tabs[active].title)),
-            described: Vec::new(),
-            focused: None,
-            suggestions: Arc::new(Vec::new()),
-            context: None,
+            metadata: Arc::new(SnapshotMetadata {
+                serial: 0,
+                tabs: tabs.clone(),
+                active,
+                window_visible,
+                labels: Vec::new(),
+                viewport,
+                cursor: Cursor::Default,
+                chrome_focused: tabs[active].url.is_empty(),
+                content_chrome: tabs[active].system.is_some(),
+                find_wants_keyboard: false,
+                picking: false,
+                address_focused: tabs[active].url.is_empty(),
+                find: None,
+                find_status: Default::default(),
+                bookmark: crate::ui::Bookmarked::Impossible,
+                zoom: 1.0,
+                theme: crate::widget::theme::Theme::light(),
+                appearance: None,
+                next: FrameRequest::None,
+                work: Default::default(),
+                document: Arc::new(crate::a11y::empty_tree(&tabs[active].title)),
+                described: Arc::new(Vec::new()),
+                focused: None,
+                suggestions: Arc::new(Vec::new()),
+                context: None,
+            }),
         };
         Ok(Self {
             owner: Some(owner),

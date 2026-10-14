@@ -252,6 +252,13 @@ the retired document's accessibility rather than describing stale layout.
 Existing resource loads and timers continue; CSS resources discovered only by
 style/layout begin when that preparation is requested.
 
+Snapshots retain immutable metadata independently of scenes, including shared
+system descriptions. Identical hidden metadata is not republished and does not
+wake native UI. Command acknowledgements, tab/load/title/viewport changes,
+suggestions, theme, focus and context-menu payload changes still publish. Timer
+deadline changes stay on content's scheduler; showing the window always publishes
+a fresh scene and current metadata.
+
 Cookie updates schedule a coalesced revision on one `otlyra-cookies` writer.
 It clones the jar briefly under its lock, then serializes, obtains a key when
 needed, seals and atomically replaces the file outside that lock. It acknowledges
@@ -274,7 +281,7 @@ off-thread and remain a separate shutdown boundary.
 
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, background timer
-budgets, fewer hidden metadata wakes, interruptible content/raster work,
+budgets, interruptible content/raster work,
 incremental content accessibility generation and shutdown of pending download/blocking tasks
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.
