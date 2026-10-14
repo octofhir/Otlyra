@@ -344,3 +344,90 @@ fn explicit_post_loop_shutdown_waits_for_cookie_persistence() {
     assert_eq!(read(&scratch.file()).all()[0].value, "11");
     window.shutdown().unwrap();
 }
+
+#[test]
+fn transport_cancellation_finishes_before_the_final_cookie_snapshot() {
+    struct OnCancel {
+        jar: SharedJar,
+        entered: mpsc::Sender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    impl Drop for OnCancel {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            set(&self.jar, 19);
+        }
+    }
+    struct Pending {
+        jar: SharedJar,
+        started: mpsc::Sender<()>,
+        entered: mpsc::Sender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    impl crate::fetcher::AsyncLoader for Pending {
+        fn fetch(
+            self: Arc<Self>,
+            _: String,
+            _: Option<otlyra_net::Body>,
+            _: otlyra_net::CacheMode,
+            _: Vec<(String, String)>,
+        ) -> crate::fetcher::Fetching {
+            Box::pin(async move {
+                let _on_cancel = OnCancel {
+                    jar: Arc::clone(&self.jar),
+                    entered: self.entered.clone(),
+                    release: Arc::clone(&self.release),
+                };
+                self.started.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+    let scratch = Scratch::new();
+    let mut store = CookieStore::sealed_at(scratch.file(), Key::from_bytes([17; 32]));
+    set(&store.jar(), 7);
+    assert!(store.flush());
+    let (started, starts) = mpsc::channel();
+    let (entered, entries) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let loader = Pending {
+        jar: store.jar(),
+        started,
+        entered,
+        release: Arc::new(Mutex::new(gate)),
+    };
+    let mut window = crate::browser::WindowBrowser::spawn(
+        otlyra_platform::Viewport::new(800, 600, 1.0),
+        true,
+        move |text| {
+            let mut browser = crate::browser::Browser::with_async_loader_and_text(
+                loader,
+                Default::default(),
+                text,
+            );
+            browser.set_cookie_store(store);
+            otlyra_platform::Painter::on_event(
+                &mut browser,
+                otlyra_platform::PlatformEvent::VisibilityChanged(false),
+            );
+            browser.navigate("https://cancel.test/");
+            browser
+        },
+    )
+    .unwrap();
+    starts.recv_timeout(Duration::from_secs(5)).unwrap();
+    let releaser = std::thread::spawn(move || {
+        entries.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the old revision stable until shutdown has reached cancellation.
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+    });
+    window.shutdown().unwrap();
+    releaser.join().unwrap();
+    assert_eq!(read(&scratch.file()).all()[0].value, "19");
+}

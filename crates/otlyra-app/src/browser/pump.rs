@@ -42,4 +42,12 @@ impl Browser {
     pub(super) fn next_timer_deadline(&self) -> Option<std::time::Instant> {
         self.world.next_timer_deadline()
     }
+
+    /// Only called on native content's dedicated owner, outside any Tokio task.
+    /// Avoid creating the I/O runtime for a window that never fetched anything.
+    pub(super) fn shutdown_content_loads(&mut self) {
+        if self.world.fetcher.has_tasks() {
+            crate::io::shared().block_on(self.world.fetcher.shutdown());
+        }
+    }
 }

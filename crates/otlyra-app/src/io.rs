@@ -31,9 +31,10 @@ use std::sync::OnceLock;
 
 /// The process-wide background runtime, built on first use.
 ///
-/// Deliberately `&'static`: a task spawned here outlives the browser that spawned
-/// it, which is what makes a result that arrives after a tab closed a message the
-/// receiver can ignore rather than a thread someone has to join.
+/// Deliberately `&'static`: the runtime serves independent browser owners.
+/// Lifetime of the runtime does not imply lifetime of its clients' tasks: the
+/// fetch pool owns and cancels its transport futures when it goes away. Native
+/// content drains them outside the UI callback before final cookie persistence.
 pub fn shared() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {

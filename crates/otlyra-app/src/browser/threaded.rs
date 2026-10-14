@@ -375,6 +375,7 @@ impl WindowBrowser {
                     ))
                     .is_err()
                 {
+                    browser.shutdown_content_loads();
                     return;
                 }
                 browser.set_waker(Waker::from_callback(move || {

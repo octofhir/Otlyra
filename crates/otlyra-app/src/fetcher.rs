@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 pub use otlyra_net::{Body, CacheMode};
 use otlyra_platform::Waker;
+use tokio::task::JoinSet;
 
 /// What a fetch is for.
 ///
@@ -367,6 +368,9 @@ pub const FETCH_CONCURRENCY: usize = 6;
 
 /// The handle the browser keeps on the fetch pool.
 pub struct Fetcher {
+    /// Dropping the pool cancels its transport futures; native content also
+    /// drains cancellation before its final cookie persistence boundary.
+    tasks: JoinSet<()>,
     /// Every request made, oldest first, bounded.
     exchanges: Vec<Exchange>,
     loader: Arc<dyn AsyncLoader>,
@@ -422,6 +426,7 @@ impl Fetcher {
     fn over(loader: Arc<dyn AsyncLoader>) -> Self {
         let (finished, results) = channel::<Fetched>();
         Self {
+            tasks: JoinSet::new(),
             exchanges: Vec::new(),
             loader,
             permits: Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY)),
@@ -623,7 +628,7 @@ impl Fetcher {
 
     /// Put one request on the pool.
     fn launch(
-        &self,
+        &mut self,
         id: u64,
         kind: ResourceKind,
         url: String,
@@ -635,52 +640,87 @@ impl Fetcher {
         let permits = Arc::clone(&self.permits);
         let finished = self.finished.clone();
         let waker = Arc::clone(&self.waker);
-        crate::io::shared().spawn(async move {
-            // The queue is the wait for a permit, and it is deliberately outside the
-            // timing below: `took` is how slow the transport was and `waited` is how
-            // busy the pool was, and the panel shows both so neither has to stand in
-            // for the other.
-            let Ok(_permit) = permits.acquire().await else {
-                return;
-            };
-            let started = std::time::Instant::now();
-            let mut result = loader.fetch(url.clone(), body, cache, headers).await;
-            let took = started.elapsed();
-            // A picture is decoded here, on the pool the blocking work goes to,
-            // so that what reaches the window's thread is ready to draw.
-            if kind == ResourceKind::Image
-                && let Ok(loaded) = result
-            {
-                result = match tokio::task::spawn_blocking(move || {
-                    let picture = decode(&loaded.bytes);
-                    Loaded {
-                        picture: Some(picture),
-                        ..loaded
-                    }
-                })
-                .await
-                {
-                    Ok(decoded) => Ok(decoded),
-                    Err(error) => Err(format!("decoding the picture failed: {error}")),
+        self.reap_tasks();
+        self.tasks.spawn_on(
+            async move {
+                let mut completion = FetchCompletion {
+                    pending: Some((id, kind, url.clone())),
+                    finished,
+                    waker,
+                    started: None,
                 };
+                // The queue is the wait for a permit, and it is deliberately outside the
+                // timing below: `took` is how slow the transport was and `waited` is how
+                // busy the pool was, and the panel shows both so neither has to stand in
+                // for the other.
+                let Ok(_permit) = permits.acquire().await else {
+                    return;
+                };
+                let started = std::time::Instant::now();
+                completion.started = Some(started);
+                let mut result = loader.fetch(url.clone(), body, cache, headers).await;
+                let took = started.elapsed();
+                // A picture is decoded here, on the pool the blocking work goes to,
+                // so that what reaches the window's thread is ready to draw.
+                if kind == ResourceKind::Image
+                    && let Ok(loaded) = result
+                {
+                    result = match tokio::task::spawn_blocking(move || {
+                        let picture = decode(&loaded.bytes);
+                        Loaded {
+                            picture: Some(picture),
+                            ..loaded
+                        }
+                    })
+                    .await
+                    {
+                        Ok(decoded) => Ok(decoded),
+                        Err(error) => Err(format!("decoding the picture failed: {error}")),
+                    };
+                }
+                let fetched = Fetched {
+                    id,
+                    kind,
+                    url,
+                    took,
+                    result,
+                };
+                // A closed channel is a browser that has gone. Nothing to report to and
+                // nothing to wake, so the bytes are dropped here rather than kept for a
+                // receiver that will not read them.
+                completion.pending = None;
+                completion.deliver(fetched);
+            },
+            crate::io::shared().handle(),
+        );
+    }
+
+    fn reap_tasks(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            if let Err(error) = result
+                && error.is_panic()
+            {
+                // FetchCompletion already delivered a failure and woke the owner.
+                tracing::warn!("a transport task panicked");
             }
-            let fetched = Fetched {
-                id,
-                kind,
-                url,
-                took,
-                result,
-            };
-            // A closed channel is a browser that has gone. Nothing to report to and
-            // nothing to wake, so the bytes are dropped here rather than kept for a
-            // receiver that will not read them.
-            if finished.send(fetched).is_err() {
-                return;
-            }
-            if let Some(waker) = waker.lock().ok().and_then(|waker| waker.clone()) {
-                waker.wake();
-            }
-        });
+        }
+    }
+
+    pub(crate) fn has_tasks(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+
+    /// Cancel and drain transport futures before native content's final cookie
+    /// write. Started blocking loaders/decoders can still finish off-thread;
+    /// the native network loader is cooperative and runs in these futures.
+    pub(crate) async fn shutdown(&mut self) {
+        *self.waker.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        self.permits.close();
+        self.tasks.shutdown().await;
+        self.held.clear();
+        // Cookie updates happen in transport, before delivery. Do not execute
+        // scripts or start subresource loads from completed replies at shutdown.
+        while self.results.try_recv().is_ok() {}
     }
 
     /// Every request made, oldest first.
@@ -690,6 +730,7 @@ impl Fetcher {
 
     /// Everything that has finished since the last call. Never blocks.
     pub fn poll(&mut self) -> Vec<Fetched> {
+        self.reap_tasks();
         let mut finished = Vec::new();
         while let Ok(fetched) = self.results.try_recv() {
             self.record(&fetched);
@@ -748,11 +789,63 @@ impl Fetcher {
     }
 }
 
+impl Drop for Fetcher {
+    fn drop(&mut self) {
+        // Close before aborting: releasing active permits must not start queued
+        // transports while the pool itself is going away.
+        self.permits.close();
+        *self.waker.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        self.tasks.abort_all();
+    }
+}
+
+/// A terminal reply even if an async loader panics or its future is cancelled.
+/// A dropped receiver suppresses its wake, as for an ordinary completed load.
+struct FetchCompletion {
+    pending: Option<(u64, ResourceKind, String)>,
+    finished: Sender<Fetched>,
+    waker: Arc<Mutex<Option<Waker>>>,
+    started: Option<std::time::Instant>,
+}
+
+impl FetchCompletion {
+    fn deliver(&self, fetched: Fetched) {
+        if self.finished.send(fetched).is_ok()
+            && let Some(waker) = self.waker.lock().ok().and_then(|waker| waker.clone())
+        {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for FetchCompletion {
+    fn drop(&mut self) {
+        if let Some((id, kind, url)) = self.pending.take() {
+            self.deliver(Fetched {
+                id,
+                kind,
+                url,
+                took: self
+                    .started
+                    .map_or(std::time::Duration::ZERO, |at| at.elapsed()),
+                result: Err(if std::thread::panicking() {
+                    "the transport task panicked"
+                } else {
+                    "the transport task was cancelled"
+                }
+                .into()),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    mod lifecycle;
 
     /// A loader that takes its time and records how many fetches overlapped.
     struct SlowLoader {

@@ -131,10 +131,13 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   retry failures and flush pending revisions at shutdown. One coalescing writer
   runs key lookup, serialization, sealing and replacement. Native close sends
   shutdown immediately; the CLI joins content only after its event loop returns.
-- [ ] Cancel owned fetch tasks before final persistence drain and finish or
-  explicitly resolve pending download saves at process shutdown. Existing fetch
-  tasks can outlive their browser; the cookie drain covers revisions present at
-  shutdown, not future responses from those detached tasks.
+- [x] Own fetch futures and cancel/drain them on content's owner before final
+  cookie persistence. Close the permit queue before aborting, suppress teardown
+  wakes and preserve independent pools on the shared runtime. Blocking test
+  loaders and started decode jobs can still finish off-thread.
+- [ ] Finish or explicitly resolve pending download saves and other blocking
+  I/O at process shutdown. Fetch cancellation does not interrupt a started
+  `spawn_blocking` job or drain the independent download writer.
 - [x] Reflect active-tab visibility in `document.hidden` / `visibilityState`,
   including the first script and paused parsers; dispatch `visibilitychange`
   on content's owner. Retain hidden rAF callbacks until activation and exclude

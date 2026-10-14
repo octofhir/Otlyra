@@ -199,7 +199,7 @@ pub(super) fn content_loop(
     };
     let mut first = true;
     let mut published = None;
-    loop {
+    'content: loop {
         let mut snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
         let context = (snapshot.tabs[snapshot.active].id, snapshot.viewport);
         if let Some(scene) = &mut snapshot.scene {
@@ -290,7 +290,7 @@ pub(super) fn content_loop(
                         ));
                     crate::preferences::save(&browser.settings.settings);
                 }
-                Command::Shutdown => return,
+                Command::Shutdown => break 'content,
                 Command::Visibility(visible) => {
                     browser.on_event(PlatformEvent::VisibilityChanged(visible));
                 }
@@ -413,4 +413,5 @@ pub(super) fn content_loop(
             }
         }
     }
+    browser.shutdown_content_loads();
 }

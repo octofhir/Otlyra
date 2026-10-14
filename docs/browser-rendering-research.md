@@ -316,8 +316,8 @@ legacy migration. Its source is removed only after that barrier succeeds.
 startup retains the content thread handle and joins it after `run_window`
 returns; cookie-store destruction drains pending changes on content. Profile
 reads and legacy migration remain synchronous during profile loading. Fetch
-and download tasks can still outlive their browser; cancelling/draining those
-tasks before the final persistence boundary is separate work.
+ownership was addressed in the following step. Independent download saves
+and started blocking tasks remain separate shutdown work.
 
 Controlled tests hold a write while forty revisions are scheduled: scheduling
 and jar mutation continue, and only the first and latest snapshots are written.
@@ -332,6 +332,38 @@ Verification: 1,794 workspace Rust tests passed, plus the opt-in native GPU/CPU
 startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
 passed using the same immutable Otter snapshot; its working checkout was not
 edited.
+
+## Fetch ownership and shutdown follow-up
+
+Each fetch pool now retains its transport tasks in a `JoinSet` on the existing
+shared I/O runtime. Finished handles are reclaimed during normal use. Pool
+destruction closes its permit queue, suppresses its waker and aborts without
+joining. Closing permits before aborting prevents released slots from starting
+queued transports during teardown; other pools and the shared runtime continue.
+
+Native content exits its command loop before cancellation, drains cooperative
+transport futures, then drops its cookie store. It discards completed replies
+without parsing, running scripts or requesting further resources. Cookie updates
+inside native transport finish before the final snapshot. This drain runs on
+content's owner; the CLI's join remains after the native event loop returns.
+The early failed metadata-handoff path uses the same boundary.
+
+A completion guard sends one failure and wakes the owner when an async transport
+panics, so navigation does not wait indefinitely for a missing reply. Teardown
+suppresses these wakes and discards cancellation replies. Started blocking
+loaders/decoders cannot be interrupted by aborting their awaiting task;
+independent download saves and blocking I/O still need an explicit exit policy.
+
+Tests cover active/queued cancellation, isolation of two pools, handle reclamation,
+async panic delivery, and a transport cancellation held before changing the
+cookie jar. Post-loop shutdown must persist that final change rather than the
+earlier file. These tests establish task ownership and final snapshot ordering,
+not native input latency or startup performance improvements.
+
+Verification: 1,799 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
+passed against the same immutable Otter snapshot. The working Otter checkout
+was not edited.
 
 ## What the reference browsers do
 

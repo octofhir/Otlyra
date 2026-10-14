@@ -263,12 +263,19 @@ source. Cookie removals use the same asynchronous path.
 Native close remains nonblocking. Once the event loop returns, the CLI joins
 content; dropping its cookie store drains the latest pending revision. Existing
 saved-cookie reads and legacy migration still happen during profile loading.
-Outstanding detached fetch/download tasks are not yet drained by this boundary.
+The fetch pool owns its transport futures. Teardown closes the permit queue
+before aborting, so releasing active permits cannot start queued loads. Content
+drains cancellation before cookie-store destruction, suppressing teardown wakes
+and discarding replies without running scripts or requesting more resources.
+Default pool destruction aborts without joining; the shared I/O runtime and other
+pools continue. Async transport panics deliver one failure and wake their owner.
+Started blocking loaders/decoders and independent download saves can still finish
+off-thread and remain a separate shutdown boundary.
 
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, background timer
 budgets, fewer hidden metadata wakes, interruptible content/raster work,
-incremental content accessibility generation and shutdown of pending fetch/download tasks
+incremental content accessibility generation and shutdown of pending download/blocking tasks
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.
 
