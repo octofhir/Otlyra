@@ -72,6 +72,20 @@ pub(super) struct PendingLoad {
     runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
 }
 
+impl PendingLoad {
+    /// Visibility belongs to the document even before its load is complete.
+    pub(super) fn set_hidden(&mut self, document: &mut otlyra_dom::Document, hidden: bool) -> bool {
+        if let Some(parser) = self.parse.as_mut() {
+            parser.set_hidden(document, hidden)
+        } else if let Some(runner) = self.runner.as_mut() {
+            runner.set_hidden(document, hidden);
+            runner.take_mutated()
+        } else {
+            false
+        }
+    }
+}
+
 /// What a subresource is for once it lands.
 pub(super) enum PendingResource {
     /// The `<link>` whose stylesheet this is.
@@ -409,10 +423,12 @@ impl PageWorld {
         let mut parser = None;
         let parsed = match &sniffed {
             kind if kind.is_document() => {
+                let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
+                scripts.set_initial_hidden(self.environment.active != Some(tab));
                 let started = otlyra_html::start_parse(
                     &loaded.bytes,
                     loaded.charset.as_deref(),
-                    Some(Box::new(otlyra_script::PageScripts::new(final_url.clone()))),
+                    Some(scripts),
                     sources,
                 );
                 parser = Some(started.parser);

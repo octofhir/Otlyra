@@ -105,6 +105,12 @@ pub trait ScriptRunner {
         false
     }
 
+    /// Change document visibility between script turns, firing
+    /// `visibilitychange` only when the state changes.
+    fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
+        let _ = (document, hidden);
+    }
+
     /// Whether script changed the document since this was last asked.
     ///
     /// Asked after every turn the browser gives the page, and answered by
@@ -329,6 +335,17 @@ impl HtmlParser {
     /// The `<script src>` the parse is stopped at, if it is stopped at one.
     pub fn blocked_on(&self) -> Option<NodeId> {
         self.blocked
+    }
+
+    /// Update the script world while parsing waits for an external script,
+    /// returning whether the visibility listener changed the document.
+    pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) -> bool {
+        if let Some(runner) = self.script_runner.as_mut() {
+            runner.set_hidden(document, hidden);
+            runner.take_mutated()
+        } else {
+            false
+        }
     }
 
     /// Run the script the parse is stopped at, and carry on tokenizing.

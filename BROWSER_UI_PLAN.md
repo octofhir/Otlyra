@@ -129,8 +129,12 @@ This work crosses the browser/page boundary rather than replacing UI foundations
 - [ ] Remove persistent-cookie sealing/file writes from the UI pump while
   keeping serialized atomic persistence; acknowledge only successful writes,
   retry failures and flush pending revisions at shutdown.
-- [ ] Implement real document visibility and hidden-page scheduling. Current
-  bindings always say visible; pumps run rAF for inactive slots too.
+- [x] Reflect active-tab visibility in `document.hidden` / `visibilityState`,
+  including the first script and paused parsers; dispatch `visibilitychange`
+  on content's owner. Retain hidden rAF callbacks until activation and exclude
+  inactive slots from frame execution and Vsync requests.
+- [ ] Extend visibility to native window occlusion/minimization and define
+  background timer budgets/exemptions. Timers currently continue normally.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

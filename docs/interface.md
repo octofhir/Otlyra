@@ -233,9 +233,14 @@ if content arrives before its completion is handled. The first eligible frame
 carries the startup build/raster/report marks, and `early_chrome_present_complete`
 records the earlier UI accounting separately. Strict budgets remain unchanged.
 
+Tab changes update `document.hidden` and `visibilityState` on content's owner,
+including paused parsers. `visibilitychange` precedes resumed rendering; hidden
+rAF registrations wait for activation, while load events and timers continue.
+Initial visibility is set before the first script without a change event.
+
 This is one content owner per window: pages, system tabs and inspector work can
-still wait for another page's turn. Native live BiDi attachment, hidden-page
-scheduling, interruptible content/raster work,
+still wait for another page's turn. Native live BiDi attachment, window-occlusion
+visibility and background timer budgets, interruptible content/raster work,
 incremental content accessibility generation and durable nonblocking shutdown persistence
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.

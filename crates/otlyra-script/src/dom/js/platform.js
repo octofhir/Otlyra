@@ -17,14 +17,31 @@ defineGlobal('matchMedia', function matchMedia(query) {
   };
 });
 
-// Animation frames and timers, parked until the page has somewhere to run
-// them. There is no timer wheel and no frame loop yet — both are the next
-// milestone — so what this gives a page is registration that works and a
-// single flush the host performs when the document is finished. That is not
-// the event loop; it is the difference between a page whose deferred work
-// never happens and one whose deferred work throws immediately.
+// Animation callbacks stay in the isolate until the host supplies a visible
+// frame. Hiding the document keeps the registrations for its next visible frame.
 const frameCallbacks = new Map();
 let nextFrameHandle = 1;
+
+// The document's event-handler property shares the normal listener route.
+// Replacing a callback retains its position among registered listeners.
+let visibilityHandler = null;
+const visibilityListener = function (event) {
+  visibilityHandler.call(this, event);
+};
+Object.defineProperty(Document.prototype, 'onvisibilitychange', {
+  configurable: true,
+  enumerable: true,
+  get() { return visibilityHandler; },
+  set(callback) {
+    const next = typeof callback === 'function' ? callback : null;
+    if (visibilityHandler === null && next !== null) {
+      this.addEventListener('visibilitychange', visibilityListener);
+    } else if (visibilityHandler !== null && next === null) {
+      this.removeEventListener('visibilitychange', visibilityListener);
+    }
+    visibilityHandler = next;
+  },
+});
 
 defineGlobal('requestAnimationFrame', function requestAnimationFrame(callback) {
   if (typeof callback !== 'function') {
@@ -51,8 +68,7 @@ defineGlobal('cancelAnimationFrame', function cancelAnimationFrame(handle) {
 // the same scheduler. A page that feature-detects it will find it; nothing on
 // the web depends on that.
 
-// The host's one call into what is left: the two load events, and the frames
-// a page asked for before there was a frame loop to give it one.
+// Load events run even in a background tab; its rendering callbacks wait.
 let loadEventsFired = false;
 
 defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEvents) {
@@ -86,6 +102,7 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
 // registered by them — a callback that asks for another frame is asking for
 // the *next* one, and running it here would be a loop with no display in it.
 defineGlobal('__otlyraRunFrame', function __otlyraRunFrame(timestamp) {
+  if (document.hidden) return 0;
   const frames = [...frameCallbacks.entries()];
   frameCallbacks.clear();
   for (const [, callback] of frames) {

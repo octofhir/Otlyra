@@ -93,6 +93,8 @@ pub struct PageState {
     frames_owed: bool,
     /// Whether the parser has finished, which is what `readyState` reports.
     ready: bool,
+    /// Whether this document is in a background tab.
+    hidden: bool,
     /// Where the page's script thinks it is. `location` is built from it.
     document_url: String,
     /// Where script asked to go, if it asked.
@@ -132,6 +134,17 @@ impl PageState {
     /// Say whether the document has finished parsing.
     pub fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
+    }
+
+    /// Set visibility before parsing, or between script turns.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
+    /// Whether the document can receive rendering callbacks.
+    #[must_use]
+    pub fn hidden(&self) -> bool {
+        self.hidden
     }
 
     /// Where script asked to go, if it asked.
@@ -181,6 +194,10 @@ pub(crate) fn note_frame_request() {
 
 pub(crate) fn is_ready() -> bool {
     with_state(|state| state.ready)
+}
+
+pub(crate) fn is_hidden() -> bool {
+    with_state(|state| state.hidden)
 }
 
 pub(crate) fn current_script() -> Option<otlyra_dom::NodeId> {

@@ -449,4 +449,7 @@ mod find_tests;
 mod tab_tests;
 
 #[cfg(test)]
+mod visibility_tests;
+
+#[cfg(test)]
 mod markup_tests;

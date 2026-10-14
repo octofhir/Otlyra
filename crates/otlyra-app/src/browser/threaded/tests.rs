@@ -5,6 +5,65 @@ use std::time::Duration;
 
 mod accessibility;
 
+#[test]
+fn projected_tab_commands_update_visibility_on_the_content_owner() {
+    use crate::browser::visibility_tests::{HTML, attr};
+    struct Animated;
+    impl Loader for Animated {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            Ok(Loaded {
+                bytes: HTML.as_bytes().to_vec(),
+                content_type: Some("text/html".into()),
+                final_url: url.into(),
+                ..Default::default()
+            })
+        }
+    }
+    let viewport = Viewport::new(800, 600, 1.0);
+    let mut window = WindowBrowser::spawn(viewport, true, |text| {
+        let mut browser =
+            Browser::with_fetcher_and_text(Fetcher::spawn(Animated), Default::default(), text);
+        browser.navigate("https://visibility.test/");
+        browser
+    })
+    .unwrap();
+    ready(&mut window);
+    let tab = window.tabs[0].id;
+    window.apply(UiAction::NewTab);
+    let (tx, rx) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            assert_eq!(std::thread::current().name(), Some("otlyra-content"));
+            assert_eq!(attr(browser, tab, "visibility"), "hidden");
+            let frames = attr(browser, tab, "frames");
+            for _ in 0..40 {
+                browser.pump();
+            }
+            assert_eq!(attr(browser, tab, "frames"), frames);
+            assert_eq!(attr(browser, tab, "timer"), "true");
+            tx.send(()).unwrap();
+        })))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait(&mut window, |window| {
+        window.snapshot.serial == window.serial
+    });
+    assert_ne!(window.next_frame(), FrameRequest::Vsync);
+    window.apply(UiAction::SelectTab(0));
+    let (tx, rx) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            assert_eq!(attr(browser, tab, "visibility"), "visible");
+            assert_eq!(attr(browser, tab, "changes"), "2");
+            assert_eq!(browser.next_frame(), FrameRequest::Vsync);
+            tx.send(()).unwrap();
+        })))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
 const PAGE: &str = r#"<!doctype html><title>Page</title><body style="margin:0;background:#fff">
 <input id=field value=hello style="position:absolute;left:40px;top:40px;width:240px;height:32px">
 <p id=result style="margin-top:150px">before callback</p>"#;

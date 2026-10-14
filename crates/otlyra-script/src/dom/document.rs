@@ -186,15 +186,20 @@ impl DocumentRef {
         })
     }
 
-    /// Always `"visible"`, and honestly so: a page is drawn when it is open.
+    /// The visibility of this page, including while it is being parsed.
     #[getter(name = "visibilityState")]
     fn js_visibility_state(&self) -> String {
-        "visible".to_owned()
+        if super::is_hidden() {
+            "hidden"
+        } else {
+            "visible"
+        }
+        .to_owned()
     }
 
     #[getter(name = "hidden")]
     fn js_hidden(&self) -> bool {
-        false
+        super::is_hidden()
     }
 
     /// `"loading"` while the parser is still running, `"complete"` after.

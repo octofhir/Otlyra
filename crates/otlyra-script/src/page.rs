@@ -53,6 +53,35 @@ impl PageScripts {
         Self::build(document_url.into(), Some(console))
     }
 
+    /// Set the initial state before any page script runs, without an event.
+    pub fn set_initial_hidden(&mut self, hidden: bool) {
+        self.state.set_hidden(hidden);
+    }
+
+    /// A visibility transition is a script turn on this page's owner. Listeners
+    /// see the new state; their mutations and microtasks follow the usual path.
+    pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
+        if self.state.hidden() == hidden {
+            return;
+        }
+        self.state.set_hidden(hidden);
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return;
+        };
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script(
+                "document.dispatchEvent(new Event('visibilitychange', { bubbles: true }))",
+                "<visibilitychange>",
+            )
+        });
+        self.absorb_turn();
+        if let Err(error) = outcome {
+            self.failed += 1;
+            tracing::error!(target: "page.script", %error, "a visibility listener failed");
+        }
+    }
+
     fn build(document_url: String, console: Option<ConsoleSinkHandle>) -> Self {
         // The wrapper table is this thread's, and a new page on the same thread
         // inherits it otherwise: entries naming a document nobody will lend
@@ -207,6 +236,9 @@ impl PageScripts {
     /// Callbacks registered *by* these run in the next frame, not this one — a
     /// frame that ran them would be a loop with no display in it.
     pub fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
+        if self.state.hidden() {
+            return 0;
+        }
         // Cleared before the callbacks rather than after them: the frame they
         // asked for is the one being drawn now, and a callback that asks again
         // is asking for the next one. Clearing afterwards would throw that
@@ -391,6 +423,10 @@ impl ScriptRunner for PageScripts {
         PageScripts::frames_pending(self)
     }
 
+    fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
+        PageScripts::set_hidden(self, document, hidden);
+    }
+
     fn take_mutated(&mut self) -> bool {
         PageScripts::take_mutated(self)
     }
@@ -420,6 +456,8 @@ impl ScriptRunner for PageScripts {
         // And the wrappers too: they name nodes in the tree that is going,
         // and their roots belong to the isolate that is going.
         crate::dom::forget_wrappers();
+        let hidden = self.state.hidden();
         *self = Self::build(self.document_url.clone(), self.console.clone());
+        self.state.set_hidden(hidden);
     }
 }

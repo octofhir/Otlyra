@@ -531,6 +531,143 @@ fn what_a_page_defers_runs_when_the_document_is_finished() {
 }
 
 #[test]
+fn hidden_documents_keep_frames_but_still_finish_loading_and_run_timers() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = sink.clone();
+    let mut scripts = Box::new(PageScripts::with_console("https://hidden.test/", handle));
+    scripts.set_initial_hidden(true);
+    let (parsed, runner) = otlyra_html::parse_with_scripts(
+        br#"<script>
+          console.log('initial', document.hidden, document.visibilityState);
+          document.addEventListener('DOMContentLoaded', () => console.log('ready'));
+          window.addEventListener('load', () => console.log('loaded'));
+          requestAnimationFrame(() => console.log('frame', document.hidden));
+          setTimeout(() => console.log('timer', document.hidden), 0);
+        </script>"#,
+        Some("utf-8"),
+        Some(scripts),
+        Default::default(),
+    );
+    let mut document = parsed.document;
+    let mut runner = runner.unwrap();
+    runner.settle(&mut document, Duration::from_millis(20));
+    assert_eq!(
+        lines(&sink),
+        [
+            "Log: initial true hidden",
+            "Log: ready",
+            "Log: loaded",
+            "Log: timer true"
+        ]
+    );
+    assert!(runner.frames_pending());
+    assert_eq!(runner.run_frame(&mut document, 100.0), 0);
+    assert!(runner.frames_pending(), "hiding must retain the callback");
+    runner.set_hidden(&mut document, false);
+    assert_eq!(runner.run_frame(&mut document, 200.0), 1);
+    assert_eq!(lines(&sink).last().unwrap(), "Log: frame false");
+    assert!(!runner.frames_pending());
+}
+
+#[test]
+fn visibility_events_report_the_new_state_and_bubble_once_per_transition() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = sink.clone();
+    let (parsed, runner) = otlyra_html::parse_with_scripts(
+        br#"<script>
+          document.onvisibilitychange = () => console.log('replaced');
+          document.addEventListener('visibilitychange', event => {
+            console.log('document', document.visibilityState, event.target === document,
+                        event.bubbles, event.cancelable);
+            Promise.resolve().then(() => console.log('microtask', document.hidden));
+          });
+          document.onvisibilitychange = function () {
+            console.log('property', this === document, document.hidden);
+          };
+          window.addEventListener('visibilitychange', () => console.log('window'));
+        </script>"#,
+        Some("utf-8"),
+        Some(Box::new(PageScripts::with_console(
+            "https://visible.test/",
+            handle,
+        ))),
+        Default::default(),
+    );
+    let mut document = parsed.document;
+    let mut runner = runner.unwrap();
+    assert!(lines(&sink).is_empty(), "initial state has no change event");
+    runner.set_hidden(&mut document, false);
+    runner.set_hidden(&mut document, true);
+    runner.set_hidden(&mut document, true);
+    runner.set_hidden(&mut document, false);
+    assert_eq!(
+        lines(&sink),
+        [
+            "Log: property true true",
+            "Log: document hidden true true false",
+            "Log: window",
+            "Log: microtask true",
+            "Log: property true false",
+            "Log: document visible true true false",
+            "Log: window",
+            "Log: microtask false",
+        ]
+    );
+    runner.run(
+        "document.onvisibilitychange = null",
+        document.root(),
+        &mut document,
+    );
+    runner.set_hidden(&mut document, true);
+    assert_eq!(
+        &lines(&sink)[8..],
+        [
+            "Log: document hidden true true false",
+            "Log: window",
+            "Log: microtask true"
+        ]
+    );
+}
+
+#[test]
+fn visibility_survives_encoding_reset_and_frames_can_be_cancelled_while_hidden() {
+    fn run() {
+        use otlyra_html::ScriptRunner;
+        let sink = Arc::new(Captured::default());
+        let handle: ConsoleSinkHandle = sink.clone();
+        let mut runner = PageScripts::with_console("https://hidden.test/", handle);
+        runner.set_initial_hidden(true);
+        runner.reset();
+        runner
+            .host_mut()
+            .expect("the reset isolate builds")
+            .run_classic_script("1 + 1", "reset-probe")
+            .expect("the reset isolate runs");
+        let mut document = otlyra_html::parse(b"<body></body>", Some("utf-8")).document;
+        let source = r#"
+            console.log(document.hidden);
+            const handle = requestAnimationFrame(() => console.log('cancelled'));
+            cancelAnimationFrame(handle);
+            requestAnimationFrame(() => console.log('retained'));
+        "#;
+        runner.run(source, document.root(), &mut document);
+        runner.document_finished(&mut document, true);
+        assert_eq!(lines(&sink), ["Log: true"]);
+        assert_eq!(runner.run_frame(&mut document, 10.0), 0);
+        runner.set_hidden(&mut document, false);
+        assert_eq!(runner.run_frame(&mut document, 20.0), 1);
+        assert_eq!(lines(&sink), ["Log: true", "Log: retained"]);
+    }
+    // Match the native content owner while constructing both parse isolates.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn an_external_script_whose_source_is_in_hand_runs_where_the_document_names_it() {
     let sink = Arc::new(Captured::default());
     let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;

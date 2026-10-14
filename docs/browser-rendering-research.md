@@ -45,7 +45,8 @@ CPU frame-pump durations are not native input-to-present latency. One content
 owner still serializes tabs and inspector work. The retained-damage follow-up
 below now accumulates partial updates through render acknowledgements;
 Chrome accessibility now retains unchanged document nodes and publishes deltas
-as described below. Visibility, independent scrolling,
+as described below. Tab visibility and background rAF now follow the
+[visibility contract](#tab-visibility-follow-up). Native window occlusion, independent scrolling,
 content/raster interruption and shutdown persistence remain explicit follow-ups.
 An early UI-only frame can be shown before content is ready. Startup reporting
 uses the readiness captured on the submitted render job, so late content receipt
@@ -174,6 +175,49 @@ the read-only Otter snapshot `23c5a114f769`; the working engine checkout is
 unchanged. Content still regenerates full accessibility snapshots after semantic
 invalidations; equal-snapshot comparison and native initial-tree materialization
 still walk the document. Incremental DOM generation remains a separate follow-up.
+
+## Tab visibility follow-up
+
+The document's visibility is initialized from the active tab before parsing
+runs its first script. Switching tabs updates the old document to hidden before
+exposing the new one, on the content owner. This covers finished pages, parsers
+paused at an external script, and parsed documents waiting for subresources.
+Encoding reparses preserve visibility. Reordering a tab or selecting the already
+active tab emits no extra event; successive ordered tab intents retain their
+transitions even within one input batch.
+
+`visibilitychange` reports the new state, bubbles from document to window and
+uses the normal event/microtask path. The initial state fires no change event.
+Both `addEventListener` and `document.onvisibilitychange` are supported. This
+follows the [HTML visibility steps](https://html.spec.whatwg.org/multipage/interaction.html#page-visibility).
+
+The frame pump looks up only the active slot instead of entering every tab's
+isolate. Hidden documents retain their animation callbacks, including callbacks
+registered during loading. The deferred-load flush also skips hidden frames;
+load events and timers still run. Activation resumes queued callbacks with the
+normal current frame timestamp, without replaying missed frames. The
+[HTML rendering algorithm](https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering)
+excludes hidden documents before animation-frame callbacks.
+
+Regression coverage uses actual JavaScript and tab commands: forty foreground
+frame pumps execute zero callbacks in the hidden animation loop, while its timer
+runs and reports hidden. Returning to the tab resumes its pending callback and
+Vsync request. Other cases cover background document arrival, a parser-blocking
+external script, handler replacement/removal, bubbling and microtasks, encoding
+reset, cancellation while hidden, closing/reordering tabs and repeated selection.
+The window adapter is tested through its ordered command boundary; visibility
+listeners run on `otlyra-content`.
+
+Verification: 1,771 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke; all-target clippy with `-D warnings`, formatting and diff checks
+passed. Builds use the same immutable Otter snapshot as the preceding follow-ups;
+the working Otter checkout was not edited.
+
+This removes unnecessary background animation execution; it is not an
+end-to-end CPU, energy or native input-to-present benchmark. Native window
+occlusion/minimization is not wired to document visibility yet. Timer budgets,
+media exemptions and visibility performance entries remain follow-ups. One
+content owner still serializes page tasks and visibility listeners.
 
 ## What the reference browsers do
 

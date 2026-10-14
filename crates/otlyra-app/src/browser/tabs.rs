@@ -145,6 +145,7 @@ impl Browser {
     pub fn new_tab(&mut self) {
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
+        self.sync_world();
         self.ui.address.clear();
         self.ui.focus_address();
         self.activate_surface(SURFACE_CHROME);
@@ -187,6 +188,7 @@ impl Browser {
         if self.tabs.is_empty() {
             self.tabs.push(Tab::blank());
             self.active = 0;
+            self.sync_world();
             self.ui.dismiss_popup();
             self.context_target = None;
             self.ui.close_find();
@@ -315,6 +317,7 @@ impl Browser {
             self.ui.dismiss_popup();
             self.context_target = None;
             self.active = index;
+            self.sync_world();
             self.sync_address();
             let surface = self.tab_surface();
             self.activate_surface(surface);

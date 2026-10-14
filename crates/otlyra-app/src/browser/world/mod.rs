@@ -180,7 +180,38 @@ impl PageWorld {
 
     /// Take the window's preferences and size as they stand now.
     pub(super) fn set_environment(&mut self, environment: Environment) {
+        let previous = self.environment.active;
         self.environment = environment;
+        if previous != environment.active {
+            // Hide the old page before exposing the new one. This runs between
+            // turns on content's owner, including when input is batched.
+            if let Some(tab) = previous {
+                self.set_hidden(tab, true);
+            }
+            if let Some(tab) = environment.active {
+                self.set_hidden(tab, false);
+            }
+        }
+    }
+
+    fn set_hidden(&mut self, tab: TabId, hidden: bool) {
+        let Some(slot) = self.slots.get_mut(&tab) else {
+            return;
+        };
+        let Some(page) = slot.page.as_mut() else {
+            return;
+        };
+        let mutated = if let Some(scripts) = slot.scripts.as_mut() {
+            page.with_document(|document| scripts.set_hidden(document, hidden));
+            scripts.take_mutated()
+        } else if let Some(pending) = slot.pending.as_mut() {
+            page.with_document(|document| pending.set_hidden(document, hidden))
+        } else {
+            false
+        };
+        if mutated {
+            page.document_changed();
+        }
     }
 
     /// What has happened since the window was last told.
@@ -261,10 +292,12 @@ impl PageWorld {
 
     /// Whether `tab`'s page has asked for an animation frame.
     pub(super) fn frames_pending(&self, tab: TabId) -> bool {
-        self.slots
-            .get(&tab)
-            .and_then(|slot| slot.scripts.as_ref())
-            .is_some_and(|scripts| scripts.frames_pending())
+        self.environment.active == Some(tab)
+            && self
+                .slots
+                .get(&tab)
+                .and_then(|slot| slot.scripts.as_ref())
+                .is_some_and(|scripts| scripts.frames_pending())
     }
 
     /// When a page's timer next comes due, if one is waiting.
@@ -282,7 +315,7 @@ impl PageWorld {
     }
 
     /// Take in what has finished, run the timers that have come due and give
-    /// every page that asked for one the animation frame being built. Answers
+    /// the visible page its requested animation frame. Answers
     /// whether anything changed.
     pub(super) fn pump(&mut self) -> bool {
         let mut changed = false;
@@ -326,7 +359,7 @@ impl PageWorld {
         changed
     }
 
-    /// Give every page that asked for an animation frame the one being built.
+    /// Give only the visible page its requested animation frame.
     ///
     /// `requestAnimationFrame` means *before the next paint*, so this runs on
     /// the way into a frame rather than after one. The timestamp is the page's
@@ -338,25 +371,25 @@ impl PageWorld {
     /// answered from a counter the bindings keep, not by entering the isolate.
     fn run_frame_callbacks(&mut self) -> bool {
         let timestamp = self.started.elapsed().as_secs_f64() * 1000.0;
-        let mut changed = false;
-        for slot in self.slots.values_mut() {
-            let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
-                continue;
-            };
-            if !scripts.frames_pending() {
-                continue;
-            }
-            let ran = page.with_document(|document| scripts.run_frame(document, timestamp));
-            // Whether the callback *changed* anything, not whether it ran. An
-            // animation frame that only reads is most of what a
-            // `requestAnimationFrame` loop does, and restyling the document for
-            // one is how a page that draws nothing costs a whole frame.
-            if scripts.take_mutated() {
-                page.document_changed();
-            }
-            changed |= ran > 0;
+        let Some(slot) = self
+            .environment
+            .active
+            .and_then(|tab| self.slots.get_mut(&tab))
+        else {
+            return false;
+        };
+        let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
+            return false;
+        };
+        if !scripts.frames_pending() {
+            return false;
         }
-        changed
+        let ran = page.with_document(|document| scripts.run_frame(document, timestamp));
+        // A callback that only reads owes a frame, not a restyle.
+        if scripts.take_mutated() {
+            page.document_changed();
+        }
+        ran > 0
     }
 
     /// Wait for every load to finish, for callers with no event loop.
