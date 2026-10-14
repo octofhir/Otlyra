@@ -1373,6 +1373,11 @@ impl BrowserUi {
         self.focus.kind(self.focused) == Some(FocusKind::Text) && !self.find_focused()
     }
 
+    /// Address input claimed before the next frame resolves its focus id.
+    pub fn address_wants_keyboard(&self) -> bool {
+        self.address_wanted
+    }
+
     /// Whether the find bar's own field has it.
     pub fn find_focused(&self) -> bool {
         self.focus.kind(self.focused) == Some(FocusKind::Text)
@@ -1400,6 +1405,7 @@ impl BrowserUi {
     /// ⌘F is starting a search, and one who wanted to keep the old query still
     /// has it in front of them to step through.
     pub fn open_find(&mut self) {
+        self.address_wanted = false;
         if !self.finding() {
             self.open_popup(Popup::Find);
         }
@@ -1467,9 +1473,10 @@ impl BrowserUi {
     /// Put the caret in the address field, for an accelerator that names it.
     ///
     /// The whole address is selected, which is what ⌘L is *for*: the next
-    /// keystroke replaces it. Nothing happens before the first frame, because
-    /// until then no field has been drawn for the caret to be in.
+    /// keystroke replaces it. Text input is claimed immediately; the first
+    /// frame resolves the request to the field's stored focus id.
     pub fn focus_address(&mut self) {
+        self.find_takes_keyboard.set(false);
         // Now, against the ring as it stands, so a caller that never draws a
         // frame still sees the caret where it asked for it — and again after the
         // next build, which is the one that decides where the field really is.
@@ -1699,6 +1706,14 @@ impl BrowserUi {
             return;
         }
         self.open_popup(Popup::Context { at: (x, y), rows });
+    }
+
+    /// An owned description for the window that displays a content menu.
+    pub(crate) fn context_menu(&self) -> Option<((f64, f64), Vec<ContextRow>)> {
+        match &self.popup {
+            Some(Popup::Context { at, rows }) => Some((*at, rows.clone())),
+            _ => None,
+        }
     }
 
     /// Open one popup, which is what closes any other.
@@ -2000,10 +2015,14 @@ impl BrowserUi {
             // A focused field gets first claim on the editing accelerators —
             // ⌘C in the address bar is a copy, not a browser command. The rest
             // stay the browser's: ⌘L and ⌘R work from inside the field too.
-            if self.address_focused() && self.address.edit(key, modifiers, clipboard) {
+            if (self.find_focused() || self.find_wants_keyboard())
+                && self.find.edit(key, modifiers, clipboard)
+            {
                 return UiAction::None;
             }
-            if self.find_focused() && self.find.edit(key, modifiers, clipboard) {
+            if (self.address_focused() || self.address_wants_keyboard())
+                && self.address.edit(key, modifiers, clipboard)
+            {
                 return UiAction::None;
             }
             return match key {
@@ -2063,12 +2082,12 @@ impl BrowserUi {
         // address field does. Not Escape, Tab or Return: all three were answered
         // above, because what they mean here is about the bar rather than about
         // the text in it.
-        if self.find_focused() {
+        if self.find_focused() || self.find_wants_keyboard() {
             self.find.edit(key, modifiers, clipboard);
             return UiAction::None;
         }
 
-        if !self.address_focused() {
+        if !self.address_focused() && !self.address_wants_keyboard() {
             // Space and Return on anything else are what a press on it would be,
             // reported through the same path so the two cannot diverge.
             if matches!(key, Key::Enter | Key::Character(' ')) && self.focused.is_some() {
@@ -2087,7 +2106,7 @@ impl BrowserUi {
                 // it — walking never put it in the field.
                 let taken = self.marked_suggestion();
                 self.close_popup(false);
-                self.focused = None;
+                self.blur();
                 let typed = taken.unwrap_or_else(|| self.address.text().trim().to_owned());
                 if typed.is_empty() {
                     UiAction::None
@@ -2098,7 +2117,7 @@ impl BrowserUi {
                 }
             }
             Key::Escape => {
-                self.focused = None;
+                self.blur();
                 UiAction::None
             }
             _ => {
@@ -2110,11 +2129,11 @@ impl BrowserUi {
 
     /// Handle typed text. Returns whether the interface consumed it.
     pub fn text_input(&mut self, character: char) -> bool {
-        if self.find_focused() {
+        if self.find_focused() || self.find_wants_keyboard() {
             self.find.insert(character);
             return true;
         }
-        if !self.address_focused() {
+        if !self.address_focused() && !self.address_wants_keyboard() {
             return false;
         }
         self.address.insert(character);

@@ -627,10 +627,8 @@ pub struct SettingsSurface {
     press_origin: Option<(f64, f64)>,
     /// How many clicks the current press is the latest of.
     clicks: u32,
-    /// The engine `offer` needs a `Cx` to hold. Built on first use, not at
-    /// construction: nothing in the tree measures text to decide whether it was
-    /// hit, and building an engine enumerates the system's fonts — a cost this
-    /// surface's `offer` never needs and startup should not pay.
+    /// Forked from the painting engine on first draw, so the first input never
+    /// re-enumerates system fonts and keeps the same font collection as layout.
     engine: Option<TextEngine>,
     /// The focusable controls the last frame built, in the order it built them.
     ///
@@ -900,11 +898,7 @@ impl SettingsSurface {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
-        // Nothing in the tree measures text to decide whether it was hit, but
-        // the context needs an engine to exist. It is the surface's own, built
-        // on this first offer rather than at construction: building one
-        // enumerates the system's fonts, which startup should not pay for.
-        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::deferred));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;
@@ -922,6 +916,7 @@ impl SettingsSurface {
     /// is asked about are the window's. Placing it anywhere else would mean
     /// translating every press on the way in.
     pub fn build_display_list(&mut self, rect: Rect, text: &mut TextEngine, out: &mut DisplayList) {
+        self.engine.get_or_insert_with(|| text.fork());
         let appearance = Drawn {
             rect,
             settings: self.settings.clone(),

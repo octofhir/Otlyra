@@ -21,7 +21,6 @@
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use crate::compositor::{SceneCompositor, Upload};
 use crate::present::{DirectFrame, GpuContext, Presented, Presenter, PresenterSeed};
@@ -44,6 +43,7 @@ pub(crate) struct FrameJob {
     pub viewport: Viewport,
     /// The startup trace, on the first frame only.
     pub trace: Option<StartupTrace>,
+    pub startup_ready: bool,
 }
 
 /// What one frame cost and how it ended.
@@ -57,6 +57,7 @@ pub(crate) struct FrameReport {
     /// The trace the frame was submitted with, handed back for the milestones
     /// that belong to the window's thread.
     pub trace: Option<StartupTrace>,
+    pub startup_ready: bool,
 }
 
 /// What the render thread tells the window's thread.
@@ -86,15 +87,16 @@ pub(crate) struct RenderThread {
 }
 
 impl RenderThread {
-    /// Start the thread. It creates the GPU device from `seed` first — which is
-    /// the slow part of startup, and is why this happens off the window's
-    /// thread — and reports [`RenderReport::Ready`] once frames can be drawn.
+    /// Start the thread. It creates the GPU device from `seed` away from the
+    /// window's thread, and reports [`RenderReport::Ready`] once frames can be
+    /// drawn. Driver work must not hold native input processing.
     ///
     /// `wake` is called after every report is posted, to wake the window's loop.
     pub(crate) fn spawn(
         seed: PresenterSeed,
         viewport: Viewport,
         backend: RendererBackend,
+        trace: Option<StartupTrace>,
         wake: Box<dyn Fn() + Send>,
     ) -> std::io::Result<Self> {
         let (commands, inbox) = mpsc::channel::<Command>();
@@ -103,17 +105,53 @@ impl RenderThread {
             .name("otlyra-render".to_owned())
             .spawn(move || {
                 let report = |message| {
+                    let marks = match &message {
+                        RenderReport::Ready => trace.as_ref().map(|trace| {
+                            (
+                                trace.clone(),
+                                "gpu_ready_report_posted",
+                                "gpu_ready_wake_requested",
+                                "gpu_ready_wake_returned",
+                            )
+                        }),
+                        RenderReport::Frame(frame) if frame.outcome == Presented::Frame => {
+                            frame.trace.as_ref().map(|trace| {
+                                (
+                                    trace.clone(),
+                                    "render_report_posted",
+                                    "render_wake_requested",
+                                    "render_wake_returned",
+                                )
+                            })
+                        }
+                        _ => None,
+                    };
+                    // Mark before sending: the UI may consume the report before
+                    // send() returns. This is the posting attempt's start, not
+                    // an OS presentation timestamp.
+                    if let Some((trace, posted, _, _)) = marks.as_ref() {
+                        trace.mark(posted);
+                    }
                     if outbox.send(message).is_ok() {
+                        if let Some((trace, _, requested, _)) = marks.as_ref() {
+                            trace.mark(requested);
+                        }
                         wake();
+                        if let Some((trace, _, _, returned)) = marks.as_ref() {
+                            trace.mark(returned);
+                        }
                     }
                 };
-                let presenter = match Presenter::new(seed, viewport) {
+                let presenter = match Presenter::new(seed, viewport, trace.as_ref()) {
                     Ok(presenter) => presenter,
                     Err(error) => {
                         report(RenderReport::Failed(error.into()));
                         return;
                     }
                 };
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("gpu_presenter_created");
+                }
                 report(RenderReport::Ready);
 
                 let mut renderer = Renderer {
@@ -150,9 +188,26 @@ impl RenderThread {
         self.reports.try_recv().ok()
     }
 
-    /// The next report, waiting at most `timeout` for it.
-    pub(crate) fn wait_report(&self, timeout: Duration) -> Option<RenderReport> {
-        self.reports.recv_timeout(timeout).ok()
+    /// A controlled worker for event-loop tests, without native/GPU startup.
+    /// It uses the same submission/report channels as the real worker.
+    #[cfg(test)]
+    pub(crate) fn controlled(
+        mut draw: impl FnMut(FrameJob) -> FrameReport + Send + 'static,
+    ) -> Self {
+        let (commands, inbox) = mpsc::channel();
+        let (outbox, reports) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Command::Frame(job)) = inbox.recv() {
+                if outbox.send(RenderReport::Frame(draw(job))).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            commands,
+            reports,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -191,10 +246,18 @@ impl Renderer {
             content,
             viewport,
             trace,
+            startup_ready,
         } = job;
-        match content {
+        let result = match content {
             FrameContent::Scene(scene) if self.backend == RendererBackend::Gpu => {
-                match self.prepare_direct(viewport) {
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("gpu_raster_setup_started");
+                }
+                let prepared = self.prepare_direct(viewport);
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("gpu_raster_setup_complete");
+                }
+                match prepared {
                     Ok(reallocated) => self.composite_direct(scene, viewport, trace, reallocated),
                     // A GPU the rasterizer cannot draw on is a window drawn on
                     // the CPU, not a window that stops drawing: from this frame
@@ -211,7 +274,11 @@ impl Renderer {
             }
             FrameContent::Scene(scene) => self.composite(scene, viewport, trace),
             FrameContent::Pixels(pixels) => self.present_whole(pixels, viewport, trace),
-        }
+        };
+        result.map(|mut frame| {
+            frame.startup_ready = startup_ready;
+            frame
+        })
     }
 
     /// Make sure there is a GPU surface of the viewport's size, and answer
@@ -242,6 +309,9 @@ impl Renderer {
         viewport: Viewport,
         trace: Option<StartupTrace>,
     ) -> Result<FrameReport, PlatformError> {
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("chrome_raster_started");
+        }
         let composited = self.compositor.rasterize(&scene, viewport)?;
         let rasterized_pixels = composited.damage.pixels(viewport);
         if let Some(trace) = trace.as_ref() {
@@ -277,6 +347,7 @@ impl Renderer {
                 )
             }
         };
+        mark_present_scheduled(outcome, trace.as_ref());
 
         // The layers are remembered only once they reached the screen: a
         // dropped frame must be recomposed, and forcing the next one whole is
@@ -296,6 +367,7 @@ impl Renderer {
                 0
             },
             trace,
+            startup_ready: true,
         })
     }
 
@@ -308,6 +380,9 @@ impl Renderer {
         trace: Option<StartupTrace>,
         reallocated: bool,
     ) -> Result<FrameReport, PlatformError> {
+        if let Some(trace) = trace.as_ref() {
+            trace.mark("chrome_raster_started");
+        }
         let damage = self.compositor.plan(&scene, reallocated);
         let direct = self.direct.as_mut().expect("direct frame prepared");
         direct.rasterize(&scene, &damage);
@@ -320,6 +395,7 @@ impl Renderer {
 
         let _present = tracing::info_span!("present", mode = "gpu").entered();
         let outcome = self.presenter.present_direct(direct)?;
+        mark_present_scheduled(outcome, trace.as_ref());
         if outcome == Presented::Frame {
             self.compositor.commit(&scene);
         } else {
@@ -331,6 +407,7 @@ impl Renderer {
             rasterized_pixels: damage.pixels(viewport),
             uploaded_bytes: 0,
             trace,
+            startup_ready: true,
         })
     }
 
@@ -352,6 +429,7 @@ impl Renderer {
         let outcome = self
             .presenter
             .present(&pixels, viewport.width, viewport.height)?;
+        mark_present_scheduled(outcome, trace.as_ref());
         Ok(FrameReport {
             outcome,
             viewport,
@@ -362,6 +440,15 @@ impl Renderer {
                 0
             },
             trace,
+            startup_ready: true,
         })
+    }
+}
+
+fn mark_present_scheduled(outcome: Presented, trace: Option<&StartupTrace>) {
+    if outcome == Presented::Frame
+        && let Some(trace) = trace
+    {
+        trace.mark("render_present_scheduled");
     }
 }

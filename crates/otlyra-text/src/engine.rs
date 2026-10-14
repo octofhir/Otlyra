@@ -1,6 +1,8 @@
 //! Shaping and measurement over parley.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock};
 
 use otlyra_gfx::Glyph;
 use parley::{
@@ -516,12 +518,67 @@ impl ShapedText {
     }
 }
 
+/// A system collection that can be discovered after the window becomes visible.
+/// Forks made before discovery share one seed; their mutable collections and
+/// page fonts remain independent once they are used.
+struct Fonts {
+    seed: Arc<OnceLock<FontContext>>,
+    local: Option<FontContext>,
+}
+
+impl Fonts {
+    fn deferred() -> Self {
+        Self {
+            seed: Arc::new(OnceLock::new()),
+            local: None,
+        }
+    }
+
+    fn ready(fonts: FontContext) -> Self {
+        Self {
+            seed: Arc::new(OnceLock::new()),
+            local: Some(fonts),
+        }
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            seed: Arc::clone(&self.seed),
+            local: self.local.clone(),
+        }
+    }
+}
+
+fn system_fonts() -> FontContext {
+    let mut fonts = FontContext::new();
+    register_test_font(&mut fonts);
+    prefer_browser_families(&mut fonts);
+    fonts
+}
+
+impl Deref for Fonts {
+    type Target = FontContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.local
+            .as_ref()
+            .unwrap_or_else(|| self.seed.get_or_init(system_fonts))
+    }
+}
+
+impl DerefMut for Fonts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.local
+            .get_or_insert_with(|| self.seed.get_or_init(system_fonts).clone())
+    }
+}
+
 /// Owns the font collection and the shaping caches.
 ///
 /// Construction discovers system fonts, which is slow enough that this should be
 /// built once and kept, not built per paragraph.
 pub struct TextEngine {
-    fonts: FontContext,
+    fonts: Fonts,
     layout: LayoutContext<SpanBrush>,
     /// The families pages have brought with `@font-face`.
     web: WebFamilies,
@@ -545,15 +602,44 @@ impl Default for TextEngine {
 impl TextEngine {
     /// Build an engine over the system fonts, with the vendored family registered.
     pub fn new() -> Self {
-        let mut fonts = FontContext::new();
-        register_test_font(&mut fonts);
-        prefer_browser_families(&mut fonts);
         Self {
-            fonts,
+            fonts: Fonts::ready(system_fonts()),
             layout: LayoutContext::new(),
             web: WebFamilies::default(),
             font_struts: HashMap::new(),
         }
+    }
+
+    /// Build a system-font engine without discovering fonts until first use.
+    ///
+    /// A fork also defers discovery and shares its result, so constructing the
+    /// browser and its page world does no font I/O before the window is shown.
+    /// The first shape or font query gets the same collection as [`Self::new`].
+    pub fn deferred() -> Self {
+        Self {
+            fonts: Fonts::deferred(),
+            layout: LayoutContext::new(),
+            web: WebFamilies::default(),
+            font_struts: HashMap::new(),
+        }
+    }
+
+    /// Discover a deferred engine's system fonts on a worker, without waiting.
+    ///
+    /// Called once by the window bootstrap so discovery overlaps native window
+    /// creation. A shape that reaches the seed first can still initialize it;
+    /// the shared lock guarantees that discovery itself happens only once.
+    pub fn preload_system_fonts(&self) -> std::io::Result<()> {
+        if self.fonts.local.is_some() || self.fonts.seed.get().is_some() {
+            return Ok(());
+        }
+        let seed = Arc::clone(&self.fonts.seed);
+        std::thread::Builder::new()
+            .name("otlyra-fonts".to_owned())
+            .spawn(move || {
+                seed.get_or_init(system_fonts);
+            })?;
+        Ok(())
     }
 
     /// Build an engine with **only** the vendored family available.
@@ -597,7 +683,7 @@ impl TextEngine {
         }
 
         Self {
-            fonts,
+            fonts: Fonts::ready(fonts),
             layout: LayoutContext::new(),
             web: WebFamilies::default(),
             font_struts: HashMap::new(),
@@ -606,19 +692,15 @@ impl TextEngine {
 
     /// A second engine over the same fonts, for another thread to shape with.
     ///
-    /// The system's fonts were enumerated when this engine was built, and that
-    /// is the expensive part of building one: a fork shares what was found
-    /// rather than looking again. What each engine learns afterwards — the faces
+    /// A fork shares the fonts already found, or the deferred discovery, rather
+    /// than looking again. What each engine learns afterwards — the faces
     /// a page brings with `@font-face` — stays its own, which is right, since
     /// those belong to the pages the fork shapes and not to whatever shapes the
     /// browser's own interface.
     #[must_use]
     pub fn fork(&self) -> Self {
         Self {
-            fonts: FontContext {
-                collection: self.fonts.collection.clone(),
-                source_cache: self.fonts.source_cache.clone(),
-            },
+            fonts: self.fonts.fork(),
             layout: LayoutContext::new(),
             web: WebFamilies::default(),
             font_struts: HashMap::new(),
@@ -1589,6 +1671,39 @@ mod tests {
 
     fn test_stack() -> FontStack {
         FontStack::named(TEST_FAMILY)
+    }
+
+    #[test]
+    fn deferred_forks_discover_once_and_keep_independent_font_collections() {
+        let mut browser = TextEngine::deferred();
+        let mut page = browser.fork();
+        assert!(Arc::ptr_eq(&browser.fonts.seed, &page.fonts.seed));
+        assert!(browser.fonts.seed.get().is_none());
+        assert!(browser.fonts.local.is_none() && page.fonts.local.is_none());
+
+        let first = browser.shape("Browser text", &test_stack(), 16.0, None);
+        assert!(browser.fonts.seed.get().is_some());
+        assert!(
+            page.fonts.local.is_none(),
+            "the page still has not used its fonts"
+        );
+        let second = page.shape("Browser text", &test_stack(), 16.0, None);
+        assert_eq!(first.metrics.width, second.metrics.width);
+        assert_eq!(first.glyph_count(), second.glyph_count());
+        assert_ne!(
+            browser.fonts.local.as_ref().unwrap() as *const _,
+            page.fonts.local.as_ref().unwrap() as *const _,
+        );
+        let mut another_page = browser.fork();
+        assert!(page.add_web_face(
+            "Deferred Page Font",
+            &FaceDescriptors::default(),
+            0,
+            TEST_FONT.to_vec(),
+        ));
+        assert!(page.has_family("Deferred Page Font"));
+        assert!(!browser.has_family("Deferred Page Font"));
+        assert!(!another_page.has_family("Deferred Page Font"));
     }
 
     /// A run carries the characters it drew, and on the second line of a

@@ -107,6 +107,35 @@ impl Browser {
             .is_some_and(|page| page.edit_text(action, extend))
     }
 
+    /// Editing accelerators belong to a field while that field holds the caret.
+    pub(super) fn page_clipboard_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        if !modifiers.is_accelerator() || !self.active_page().is_some_and(PageScene::editing_text) {
+            return false;
+        }
+        match key {
+            Key::Character('a') => {
+                self.active_page_mut().unwrap().select_all();
+            }
+            Key::Character('c' | 'x') => {
+                if let Some(text) = self.active_page().and_then(PageScene::selected_field_text) {
+                    self.clipboard.write(text);
+                    if key == Key::Character('x') {
+                        self.active_page_mut()
+                            .unwrap()
+                            .edit_text(crate::page::EditAction::Delete, false);
+                    }
+                }
+            }
+            Key::Character('v') => {
+                if let Some(text) = self.clipboard.read() {
+                    self.active_page_mut().unwrap().paste_text(&text);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// The keys that take a selection on the page, or move the one there is.
     ///
     /// `true` means the key was one of them and the page has answered it.
@@ -160,6 +189,14 @@ impl Browser {
         else {
             return;
         };
+        if let Some(sender) = &self.native_requests {
+            let _ = sender.send(super::threaded::NativeRequest::Files {
+                tab: self.active_id(),
+                navigation: self.tabs[self.active].navigation,
+                request,
+            });
+            return;
+        }
         let chosen = choose_files(&request);
         if chosen.is_empty() {
             return;
@@ -362,11 +399,14 @@ impl Browser {
 /// was chosen is what is sent. A file too large to hold is not offered at all —
 /// this is the one place the browser reads a whole file into memory, and it is
 /// worth saying out loud rather than discovering.
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn choose_files(request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::ChosenFile> {
-    /// The most of one file the browser will hold.
-    const LARGEST: u64 = 256 * 1024 * 1024;
+pub(super) fn choose_files(
+    request: &crate::page::FileRequest,
+) -> Vec<otlyra_dom::form::ChosenFile> {
+    read_chosen_files(choose_paths(request))
+}
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub(super) fn choose_paths(request: &crate::page::FileRequest) -> Vec<std::path::PathBuf> {
     let mut dialogue = rfd::FileDialog::new();
     // Extensions are the only hint the dialogue takes; a media type or a
     // `image/*` is a hint about kinds it has no list for, so those are left to it.
@@ -378,12 +418,17 @@ fn choose_files(request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::Cho
     if !extensions.is_empty() {
         dialogue = dialogue.add_filter("Accepted", &extensions);
     }
-    let paths = if request.many {
+    if request.many {
         dialogue.pick_files().unwrap_or_default()
     } else {
         dialogue.pick_file().into_iter().collect()
-    };
+    }
+}
 
+pub(super) fn read_chosen_files(
+    paths: Vec<std::path::PathBuf>,
+) -> Vec<otlyra_dom::form::ChosenFile> {
+    const LARGEST: u64 = 256 * 1024 * 1024;
     paths
         .into_iter()
         .filter_map(|path| {
@@ -416,7 +461,7 @@ fn choose_files(request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::Cho
 
 /// The same, where there is nothing to ask.
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn choose_files(_request: &crate::page::FileRequest) -> Vec<otlyra_dom::form::ChosenFile> {
+pub(super) fn choose_paths(_request: &crate::page::FileRequest) -> Vec<std::path::PathBuf> {
     tracing::debug!("no file dialogue on this platform; the picker keeps what it held");
     Vec::new()
 }

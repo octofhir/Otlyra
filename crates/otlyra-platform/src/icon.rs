@@ -13,12 +13,12 @@
 ///
 /// Best effort: an icon that fails to load is a cosmetic problem, never a reason to
 /// fail a launch, so failures are logged and swallowed.
-pub(crate) fn set_dock_icon(encoded: &[u8]) {
+pub(crate) fn set_dock_icon(encoded: &[u8], trace: Option<&crate::StartupTrace>) {
     #[cfg(target_os = "macos")]
     {
         use objc2::AnyThread;
         use objc2_app_kit::{NSApplication, NSImage};
-        use objc2_foundation::{MainThreadMarker, NSData};
+        use objc2_foundation::{MainThreadMarker, NSData, NSSize};
 
         let Some(mtm) = MainThreadMarker::new() else {
             tracing::warn!("dock icon must be set from the main thread; skipping");
@@ -30,6 +30,19 @@ pub(crate) fn set_dock_icon(encoded: &[u8]) {
             tracing::warn!("the dock icon could not be decoded; leaving the default");
             return;
         };
+        // AppKit's icon installation cost grows with the logical canvas size.
+        // Keep the full-resolution representation and its transparent margins,
+        // but avoid asking the Dock to prepare a 1024-point canvas. The encoded
+        // pixels are untouched; a 1024px source remains a 2x representation.
+        let size = image.size();
+        let longest = size.width.max(size.height);
+        if longest > 512.0 {
+            let scale = 512.0 / longest;
+            image.setSize(NSSize::new(size.width * scale, size.height * scale));
+        }
+        if let Some(trace) = trace {
+            trace.mark("icon_image_created");
+        }
 
         // SAFETY: `setApplicationIconImage:` is only unsafe because it is an
         // Objective-C method. `mtm` proves we are on the main thread, which is the
@@ -43,6 +56,6 @@ pub(crate) fn set_dock_icon(encoded: &[u8]) {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = encoded;
+        let _ = (encoded, trace);
     }
 }

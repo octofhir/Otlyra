@@ -618,6 +618,12 @@ impl Painter for Browser {
                 }
 
                 // Copying what is selected on the page, before the interface reads
+                if self.keyboard_surface == SURFACE_PAGE && self.page_clipboard_key(key, modifiers)
+                {
+                    return;
+                }
+
+                // Copying what is selected on the page, before the interface reads
                 // the key: the address bar takes ⌘C for its own text only while it
                 // holds the caret, and the page's selection is the one on screen.
                 if key == Key::Character('c')
@@ -676,6 +682,7 @@ impl Painter for Browser {
                     // the field it claims it for exists — the bar is built by
                     // the next frame — so the wish counts as much as the fact.
                     let chrome = self.ui.address_focused()
+                        || self.ui.address_wants_keyboard()
                         || self.ui.find_focused()
                         || self.ui.find_wants_keyboard();
                     self.apply(action);
@@ -1070,6 +1077,21 @@ impl Painter for Browser {
         if !self.interface {
             return None;
         }
+        Some(self.compose_scene(viewport))
+    }
+}
+
+impl Browser {
+    /// The same retained scene for a content owner, including page-only windows.
+    pub(super) fn compose_scene(&mut self, viewport: Viewport) -> Scene {
+        self.compose_layers(viewport, true)
+    }
+
+    pub(super) fn compose_content_scene(&mut self, viewport: Viewport) -> Scene {
+        self.compose_layers(viewport, false)
+    }
+
+    fn compose_layers(&mut self, viewport: Viewport, chrome: bool) -> Scene {
         let geom = self.frame_geom(viewport);
 
         // Device bands that tile the surface top to bottom with no seam: the
@@ -1121,7 +1143,7 @@ impl Painter for Browser {
             });
         }
 
-        if geom.dock > 0.0 {
+        if self.interface && geom.dock > 0.0 {
             let inspector = self.inspector_list(&geom);
             layers.push(SceneLayer {
                 id: LayerId(LAYER_INSPECTOR),
@@ -1139,29 +1161,31 @@ impl Painter for Browser {
             });
         }
 
-        let chrome = self.chrome_list(&geom);
-        let chrome_dirty = self.chrome_dirty(&geom);
-        layers.push(SceneLayer {
-            id: LayerId(LAYER_CHROME),
-            rect: LayerRect {
-                x: 0,
-                y: 0,
-                width: viewport.width,
-                height: if self.ui.popup_open() {
-                    viewport.height
-                } else {
-                    content_top
+        if self.interface && chrome {
+            let chrome = self.chrome_list(&geom);
+            let chrome_dirty = self.chrome_dirty(&geom);
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_CHROME),
+                rect: LayerRect {
+                    x: 0,
+                    y: 0,
+                    width: viewport.width,
+                    height: if self.ui.popup_open() {
+                        viewport.height
+                    } else {
+                        content_top
+                    },
                 },
-            },
-            epoch: self.chrome_epoch(),
-            list: chrome,
-            offsets: Vec::new(),
-            background: None,
-            dirty: chrome_dirty,
-        });
+                epoch: self.chrome_epoch(),
+                list: chrome,
+                offsets: Vec::new(),
+                background: None,
+                dirty: chrome_dirty,
+            });
+        }
 
         self.after_frame();
-        Some(Scene { layers })
+        Scene { layers }
     }
 }
 

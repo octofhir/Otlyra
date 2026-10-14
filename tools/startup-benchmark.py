@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,33 @@ from typing import Any
 DEFAULT_BUDGETS = {
     "process_to_visible_ms": {"p50": 50.0, "p95": 100.0},
     "process_to_first_frame_ms": {"p50": 100.0, "p95": 150.0},
+}
+
+# These intervals can overlap. Adjacent marks alone cannot attribute work once
+# GPU discovery runs alongside native window creation.
+PHASES = {
+    "content_owner_setup": ("preferences_ready", "content_owner_ready"),
+    "first_content_scene": ("content_owner_ready", "first_content_scene_ready"),
+    "first_content_delivery": ("first_content_scene_ready", "first_content_scene_received"),
+    "first_content_to_frame": ("first_content_scene_received", "first_content_scene_composed"),
+    "event_loop_creation": ("browser_ready", "event_loop_created"),
+    "native_launch": ("event_loop_created", "event_loop_resumed"),
+    "gpu_backend_discovery": ("wgpu_instance_started", "wgpu_instance_created"),
+    "gpu_device_setup": ("surface_attached", "gpu_presenter_created"),
+    "gpu_ready_delivery": ("gpu_presenter_created", "gpu_ready"),
+    "gpu_ready_posting": ("gpu_presenter_created", "gpu_ready_report_posted"),
+    "gpu_ready_report_delivery": ("gpu_ready_report_posted", "gpu_ready"),
+    "gpu_ready_wake_call": ("gpu_ready_wake_requested", "gpu_ready_wake_returned"),
+    "first_native_event_batch": ("visibility_requested", "first_loop_idle"),
+    "redraw_dispatch": ("gpu_ready", "chrome_build_started"),
+    "chrome_build": ("chrome_build_started", "chrome_build_complete"),
+    "gpu_raster_setup": ("gpu_raster_setup_started", "gpu_raster_setup_complete"),
+    "chrome_raster": ("chrome_raster_started", "chrome_raster_complete"),
+    "first_present": ("chrome_raster_complete", "first_present_complete"),
+    "render_present_scheduling": ("chrome_raster_complete", "render_present_scheduled"),
+    "render_report_delivery": ("render_report_posted", "first_frame_report_received"),
+    "render_wake_call": ("render_wake_requested", "render_wake_returned"),
+    "first_frame_ui_accounting": ("first_frame_report_received", "first_present_complete"),
 }
 
 
@@ -57,12 +85,14 @@ def one_run(
     width: int,
     height: int,
     timeout: float,
-    direct_gpu: bool,
+    cpu_raster: bool,
 ) -> dict[str, Any]:
     environment = os.environ.copy()
     environment["OTLYRA_LOG"] = "error"
+    environment["OTLYRA_CONFIG_DIR"] = str(report.parent / "profile")
     command = [
         str(binary),
+        "--no-secrets",
         "--url",
         "about:about",
         "--width",
@@ -72,17 +102,20 @@ def one_run(
         "--startup-report",
         str(report),
     ]
-    if direct_gpu:
-        command.append("--direct-gpu")
-    subprocess.run(
-        command,
-        check=True,
-        timeout=timeout,
-        env=environment,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    if cpu_raster:
+        command.append("--cpu-raster")
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            timeout=timeout,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"browser exited with {error.returncode}: {error.stderr.strip()}") from error
     if not report.exists():
         raise RuntimeError("browser exited without writing its startup report")
     value = json.loads(report.read_text(encoding="utf-8"))
@@ -112,12 +145,11 @@ def stage_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate per-milestone cumulative times and per-stage durations.
 
     Milestones are cumulative milliseconds from the process origin; the duration
-    of a stage is the gap to its predecessor in launch order. A run whose trace
-    lacks a milestone contributes to neither that milestone nor the two durations
-    it bounds, so a stage that only some runs record still gets an honest p50/p95
-    from the runs that have it. The largest-duration stage is the one to optimize.
+    of a stage is the gap to its predecessor in that run's launch order. Worker
+    completion can change that order; aggregate each observed transition rather
+    than subtracting timestamps from unrelated turns of the event loop.
     """
-    # Launch order comes from the first run; every run marks in the same order.
+    # Representative milestone order; transitions below use each run's order.
     order: list[str] = [entry["name"] for entry in runs[0]["stages"]]
     seen = set(order)
     for run in runs:
@@ -137,21 +169,16 @@ def stage_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
         if samples:
             cumulative[name] = metric(samples)
 
-    durations: dict[str, dict[str, Any]] = {}
-    for index, name in enumerate(order):
-        previous = order[index - 1] if index > 0 else None
-        samples: list[float] = []
-        for run in runs:
-            marks = {entry["name"]: float(entry["ms"]) for entry in run["stages"]}
-            if name not in marks:
-                continue
-            base = marks[previous] if previous is not None else 0.0
-            if previous is not None and previous not in marks:
-                continue
-            samples.append(marks[name] - base)
-        if samples:
+    transitions: dict[str, list[float]] = {}
+    for run in runs:
+        previous: str | None = None
+        previous_ms = 0.0
+        for entry in run["stages"]:
+            name, ms = entry["name"], float(entry["ms"])
             label = name if previous is None else f"{previous}__to__{name}"
-            durations[label] = metric(samples)
+            transitions.setdefault(label, []).append(ms - previous_ms)
+            previous, previous_ms = name, ms
+    durations = {label: metric(samples) for label, samples in transitions.items()}
 
     return {"order": order, "cumulative": cumulative, "durations": durations}
 
@@ -166,19 +193,43 @@ def metric(values: list[float]) -> dict[str, Any]:
     }
 
 
+def phase_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    result = {}
+    timelines = [
+        {entry["name"]: float(entry["ms"]) for entry in run["stages"]}
+        for run in runs
+    ]
+    for phase, (start, end) in PHASES.items():
+        samples = [marks[end] - marks[start] for marks in timelines
+                   if start in marks and end in marks]
+        if samples:
+            result[phase] = metric(samples)
+    return result
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, default="target/release/otlyra")
+    parser.add_argument(
+        "--baseline-binary", type=pathlib.Path,
+        help="alternate candidate and baseline launches to control system load drift",
+    )
     parser.add_argument("--output", type=pathlib.Path, default="target/startup-benchmark.json")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument(
+    renderer = parser.add_mutually_exclusive_group()
+    renderer.add_argument(
+        "--cpu-raster",
+        action="store_true",
+        help="measure CPU rasterization instead of the default direct GPU path",
+    )
+    renderer.add_argument(
         "--direct-gpu",
         action="store_true",
-        help="measure the experimental direct Metal raster path",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--check", action="store_true", help="fail when a budget is exceeded")
     return parser.parse_args()
@@ -196,29 +247,38 @@ def main() -> int:
     output = (repo / args.output).resolve() if not args.output.is_absolute() else args.output
     if not binary.is_file():
         raise SystemExit(f"release binary does not exist: {binary}")
+    baseline = None
+    if args.baseline_binary is not None:
+        baseline = (repo / args.baseline_binary).resolve()
+        if not baseline.is_file():
+            raise SystemExit(f"baseline binary does not exist: {baseline}")
 
     runs: list[dict[str, Any]] = []
+    baseline_runs: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="otlyra-startup-") as directory:
         temporary = pathlib.Path(directory)
         total = args.warmups + args.samples
         for index in range(total):
-            report = temporary / f"run-{index:03}.json"
-            value = one_run(
-                binary,
-                report,
-                args.width,
-                args.height,
-                args.timeout,
-                args.direct_gpu,
-            )
-            if index >= args.warmups:
-                runs.append(value)
-            phase = "warmup" if index < args.warmups else "sample"
-            print(
-                f"{phase} {index + 1:02}/{total}: "
-                f"visible {value['process_to_visible_ms']:.2f} ms, "
-                f"frame {value['process_to_first_frame_ms']:.2f} ms"
-            )
+            launches = [("candidate", binary, runs)]
+            if baseline is not None:
+                launches.append(("baseline", baseline, baseline_runs))
+                if index % 2 == 0:
+                    launches.reverse()
+            for label, executable, collected in launches:
+                profile = temporary / label
+                profile.mkdir(exist_ok=True)
+                report = profile / f"run-{index:03}.json"
+                value = one_run(
+                    executable, report, args.width, args.height, args.timeout, args.cpu_raster,
+                )
+                if index >= args.warmups:
+                    collected.append(value)
+                phase = "warmup" if index < args.warmups else "sample"
+                print(
+                    f"{phase} {index + 1:02}/{total} {label}: "
+                    f"visible {value['process_to_visible_ms']:.2f} ms, "
+                    f"frame {value['process_to_first_frame_ms']:.2f} ms"
+                )
 
     metric_names = (
         "process_to_visible_ms",
@@ -231,7 +291,7 @@ def main() -> int:
             run["physical_height"],
             run["scale_factor"],
         )
-        for run in runs
+        for run in runs + baseline_runs
     }
     if len(geometries) != 1:
         raise RuntimeError(f"window geometry changed during the benchmark: {geometries!r}")
@@ -261,7 +321,9 @@ def main() -> int:
         "commit": git(repo, "rev-parse", "HEAD"),
         "dirty": bool(git(repo, "status", "--porcelain")),
         "profile": "release",
-        "renderer": "direct_gpu" if args.direct_gpu else "cpu",
+        "binary": str(binary),
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "renderer": "cpu" if args.cpu_raster else "direct_gpu",
         "runner": os.environ.get("RUNNER_NAME"),
         "os": platform.platform(),
         "hardware": hardware_name(),
@@ -276,8 +338,29 @@ def main() -> int:
         "budgets_ms": DEFAULT_BUDGETS,
         "metrics": metrics,
         "stages": stages,
+        "phases": phase_metrics(runs),
         "failures": failures,
     }
+    if baseline is not None:
+        summary["comparison"] = {
+            "sampling": "alternating-order matched process pairs",
+            "baseline": {
+                "binary": str(baseline),
+                "binary_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+                "sample_count": len(baseline_runs),
+                "metrics": {
+                    name: metric([float(run[name]) for run in baseline_runs])
+                    for name in metric_names
+                },
+                "stages": stage_metrics(baseline_runs),
+                "phases": phase_metrics(baseline_runs),
+            },
+            "paired_delta_ms": {
+                name: metric([after[name] - before[name]
+                              for before, after in zip(baseline_runs, runs)])
+                for name in metric_names
+            },
+        }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
@@ -289,21 +372,24 @@ def main() -> int:
             f"(min {value['min']:.2f}, max {value['max']:.2f})"
         )
 
-    print("per-stage duration (p50 / p95 ms), launch order:")
+    print("adjacent milestone gaps (p50 / p95 ms; overlapping work uses phases below):")
     ranked = sorted(
         stages["durations"].items(),
         key=lambda item: item[1]["p50"],
         reverse=True,
     )
     largest = ranked[0][0] if ranked else None
-    for index, name in enumerate(stages["order"]):
-        previous = stages["order"][index - 1] if index > 0 else None
-        label = name if previous is None else f"{previous}__to__{name}"
-        value = stages["durations"].get(label)
-        if value is None:
-            continue
+    for label, value in stages["durations"].items():
         flag = "  <- largest" if label == largest else ""
         print(f"  {label}: p50 {value['p50']:.2f}, p95 {value['p95']:.2f}{flag}")
+    print("phase durations (overlap allowed; p50 / p95 ms):")
+    for name, value in summary["phases"].items():
+        print(f"  {name}: {value['p50']:.2f} / {value['p95']:.2f}")
+    if baseline is not None:
+        for name, value in summary["comparison"]["baseline"]["metrics"].items():
+            delta = summary["comparison"]["paired_delta_ms"][name]["p50"]
+            print(f"baseline {name}: p50 {value['p50']:.2f}, p95 {value['p95']:.2f}; "
+                  f"paired candidate-baseline p50 {delta:+.2f} ms")
     print(f"wrote {output}")
 
     if args.check and failures:

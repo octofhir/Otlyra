@@ -31,11 +31,13 @@ mod painter;
 mod pump;
 mod system_pages;
 mod tabs;
+mod threaded;
 mod world;
 mod zoom;
 
 pub use devtools::Chosen;
 pub use tabs::{HistoryEntry, Readiness, Tab, TabId};
+pub use threaded::{WindowBrowser, WindowTab};
 pub use zoom::ZoomStep;
 
 use chrome::ContextTarget;
@@ -113,6 +115,8 @@ pub struct Browser {
     /// would trade clipboards with the person running it. The shell swaps in
     /// the system one at startup.
     clipboard: Box<dyn crate::clipboard::Clipboard>,
+    /// Native services are requested by the content owner and answered by UI.
+    native_requests: Option<std::sync::mpsc::Sender<threaded::NativeRequest>>,
     /// Everywhere the browser has been. Outlives every tab, which is the point.
     history: crate::history::HistoryStore,
     /// The surface that shows it.
@@ -186,11 +190,31 @@ impl Browser {
         Self::with_fetcher(Fetcher::spawn_async(loader), settings)
     }
 
+    /// Construct on a content owner with a fork of the window's font engine.
+    pub fn with_async_loader_and_text<L: crate::fetcher::AsyncLoader>(
+        loader: L,
+        settings: crate::settings::Settings,
+        text: TextEngine,
+    ) -> Self {
+        Self::with_fetcher_and_text(Fetcher::spawn_async(loader), settings, text)
+    }
+
     /// The constructor itself, over a pool that has already been built.
     fn with_fetcher(fetcher: Fetcher, settings: crate::settings::Settings) -> Self {
         // Built once, which is the expensive part: the pages shape with a fork of
         // it rather than looking at the system's fonts a second time.
-        let text = TextEngine::new();
+        let text = TextEngine::deferred();
+        if let Err(error) = text.preload_system_fonts() {
+            tracing::warn!(%error, "no font discovery worker; discovering on first use");
+        }
+        Self::with_fetcher_and_text(fetcher, settings, text)
+    }
+
+    fn with_fetcher_and_text(
+        fetcher: Fetcher,
+        settings: crate::settings::Settings,
+        text: TextEngine,
+    ) -> Self {
         let mut browser = Self {
             world: PageWorld::new(
                 fetcher,
@@ -231,6 +255,7 @@ impl Browser {
             inspector: crate::inspector::Inspector::new(),
             about: AboutSurface::new(),
             clipboard: Box::new(crate::clipboard::InMemory::default()),
+            native_requests: None,
             history: crate::history::HistoryStore::default(),
             history_page: crate::history::HistorySurface::new(),
             downloads: crate::downloads::DownloadStore::default(),

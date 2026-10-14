@@ -38,7 +38,7 @@ pub(super) type Scaled = (
 /// handed back last frame is saying nothing it draws has moved, so the scaled
 /// copy of it is still right. Free rather than a method because each layer keeps
 /// its own cache and the borrow checker should see that they are separate.
-fn scaled(
+pub(super) fn scaled(
     cache: &mut Option<Scaled>,
     logical: Arc<otlyra_gfx::DisplayList>,
     scale: f64,
@@ -357,8 +357,9 @@ impl Browser {
     pub(super) fn page_epoch(&self, g: &FrameGeom) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.active.hash(&mut hasher);
         let tab = &self.tabs[self.active];
+        tab.id.hash(&mut hasher);
+        tab.navigation.hash(&mut hasher);
         if let Some(system) = tab.system {
             match system {
                 SystemPage::Settings => 10u8,

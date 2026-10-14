@@ -96,6 +96,120 @@ pixels. A press is tested against the previous frame: draw, then press. Where a
 cache is added, add `builds()` beside it. Goldens are redrawn deliberately with
 `OTLYRA_UPDATE_GOLDEN=1`; snapshots are `cargo insta`.
 
+## Font discovery and startup
+
+The browser constructs a deferred `TextEngine` and starts system font discovery
+on one worker while AppKit creates the window. The page world shares the result
+through a deferred fork. Each engine takes its own mutable collection on first
+use, so page `@font-face` registrations stay isolated. A first shape can wait
+for discovery; worker creation failure falls back to discovery on first use.
+
+Settings, history and the inspector fork their painting engine on first draw.
+Their first input therefore uses the fonts layout used, without rediscovering
+system fonts on the UI thread. `TextEngine::new` remains eager for callers that
+need it; isolated measurement engines still use only the vendored family.
+
+On macOS the Dock icon retains its full-resolution encoded representation and
+transparent margins, with a logical canvas capped at 512 points. This bounds
+AppKit's icon installation work before visibility. The startup trace separates
+image creation from installation.
+
+Metal's layer is attached to the hidden window after AccessKit, before first
+visibility. `SurfaceTarget::DisplayAndWindow` owns both handles through the
+window; adapter/device, swapchain and shader setup stay on the render thread.
+Painting starts only after its `Ready` report. Other platforms retain their
+display-bound backend discovery worker. When an embedder supplies a native
+menu, macOS skips winit's temporary default menu; an embedder without one keeps
+the standard menu.
+
+Startup distributions use an isolated empty profile and `--no-secrets`, with
+three warmups and at least 20 fresh processes. GPU is the default;
+`tools/startup-benchmark.py --cpu-raster` measures CPU. Reports record the binary
+SHA-256 as well as the source revision. Keep profile hydration and cold driver
+cache measurements separate, and alternate before/after binaries when system
+load drifts. The strict budgets in `BROWSER_UI_PLAN.md` are unchanged.
+
+`--baseline-binary /path/to/previous/otlyra` performs that alternation within
+one benchmark, with separate temporary profiles and matched process pairs.
+The candidate stays at the report root; `comparison.baseline` records the
+control distribution and hash, and `comparison.paired_delta_ms` records
+candidate minus baseline. `--check` still enforces the candidate's budgets.
+
+Milestone gaps are elapsed intervals, not exclusive work attribution. `phases`
+uses explicit start/end marks for backend discovery, device setup, delivery of
+`Ready` to the UI, chrome construction, GPU surface preparation and raster.
+For example, a backend created in 0.01 ms can wait tens of milliseconds for
+native event dispatch; that wait must not be called GPU initialization.
+First frames and resizes are submitted asynchronously, just like steady frames.
+The previous presented image remains until the new frame is scheduled; a native
+resize can temporarily stretch it, but never waits up to 100 ms for the worker.
+Only one frame is in flight; events arriving meanwhile owe one successor built
+for the latest viewport and state. A controlled-worker regression checks input
+delivery and coalescing at 1x and 2x, and rejects the former 100 ms wait.
+
+`render_present_scheduled` marks the render thread returning from
+`Queue::present`; `render_report_posted` marks the posting attempt before the
+channel send, and `first_frame_report_received` marks UI handling. Ready has
+corresponding posting and wake-call marks. Worker wake calls can return after
+the UI handles the message; missing late marks are valid in the first-frame
+report. These milestones split render work, message delivery and UI accounting.
+`first_present_complete` and the existing startup budgets retain their previous
+UI-accounting meaning. None of these marks is OS presentation feedback.
+
+The opt-in `window_startup` test runs actual GPU/CPU windows, checks the first
+presented frame and ensures the Metal layer precedes visibility. It runs on the
+desktop performance runner; offscreen compositor tests cannot check that API
+boundary.
+
+## Window content ownership
+
+Normal window startup uses `browser::WindowBrowser`. Its factory constructs
+`Browser`, `PageWorld` and all script worlds on `otlyra-content`; live isolates
+and documents never cross threads. Native UI owns `BrowserUi`, its stored hit
+geometry, an independent text-engine fork over the shared system-font seed,
+and the system clipboard. The existing render worker owns rasterization and
+presentation. Screenshots, MCP and BiDi retain the local synchronous Browser.
+
+UI receives owned tab views without navigation-history copies, retained scenes,
+cursor/focus metadata and accessibility trees. Pending tab intents are applied
+to the read model immediately and acknowledged by sequence. Commands target
+stable tab IDs; document input and document-specific actions carry navigation
+generations. Consecutive pointer moves coalesce without crossing keys/buttons;
+viewport requests and scene publications each keep one pending value. Font,
+DOM, script and application work runs outside the shared mailbox lock.
+
+Clipboard reads happen on UI when paste is requested. Content copy/cut writes
+are posted back to UI with acknowledgements; queued paste preserves an earlier
+unacknowledged copy. File, Save As and directory dialogs stay on UI; selected
+file bytes are read on content, and old-document answers are rejected. Editable
+page fields now share cut/copy/paste between both painter modes, including UTF-8
+and normalized multiline textarea paste. Address/find focus requests claim
+input before their first frame and are cleared on submit/blur.
+
+Chrome composes over the latest ready content while its owner is busy. Empty
+or pending tabs use the existing blank-page painter, and cached content is
+rescaled once per list/scale pair during DPI changes. The owner sleeps on its
+inbox or the next content deadline; it does not poll. Closing UI signals the
+owner without joining a running script turn.
+
+`content_owner_ready`, `first_content_scene_ready`,
+`first_content_scene_received` and `first_content_scene_composed` separate
+construction, publication, receipt and use in a native frame. Receipt intervals
+include time while AppKit initializes; they are not exclusive IPC work. The
+About startup smoke requires real content in the first eligible startup frame.
+Early chrome-only frames remain interactive. Each render job captures
+`Painter::startup_ready`; an early frame cannot satisfy the startup report even
+if content arrives before its completion is handled. The first eligible frame
+carries the startup build/raster/report marks, and `early_chrome_present_complete`
+records the earlier UI accounting separately. Strict budgets remain unchanged.
+
+This is one content owner per window: pages, system tabs and inspector work can
+still wait for another page's turn. Native live BiDi attachment, hidden-page
+scheduling, interruptible content/raster work, incremental damage acknowledgements,
+incremental accessibility updates and durable nonblocking shutdown persistence
+remain follow-ups. Async content currently reports full layer damage for changed
+epochs so dropping an intermediate scene cannot leave stale pixels.
+
 ## Things that cost a stage to learn
 
 **A control with no words in it has no name.** Every icon button was reported to

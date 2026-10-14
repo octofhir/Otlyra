@@ -29,12 +29,34 @@ impl PageScene {
 
     /// The reader typed. Returns whether the page has to be drawn again.
     pub fn typed(&mut self, text: &str) -> bool {
+        self.insert_text(text, false)
+    }
+
+    pub(crate) fn paste_text(&mut self, text: &str) -> bool {
+        let multiline = self.focused_field().is_some_and(|node| {
+            otlyra_dom::form::Control::of(&self.document, node)
+                == Some(otlyra_dom::form::Control::Textarea)
+        });
+        let normalized;
+        let text = if multiline {
+            normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            &normalized
+        } else {
+            text
+        };
+        self.insert_text(text, multiline)
+    }
+
+    fn insert_text(&mut self, text: &str, multiline: bool) -> bool {
         let Some(node) = self.focused_field() else {
             return false;
         };
         // Control characters are not text: a return, a tab and an escape arrive
         // here on some platforms and none of them is a letter.
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control() || multiline && matches!(c, '\n' | '\t'))
+            .collect();
         if text.is_empty() {
             return false;
         }
@@ -285,6 +307,12 @@ impl PageScene {
             box_id,
             offset: self.caret.min(value.len()),
         })
+    }
+
+    /// The field's selection without falling back to a document selection.
+    pub(crate) fn selected_field_text(&self) -> Option<String> {
+        let (node, from, to) = self.field_selection()?;
+        Some(self.field_text(node)[from..to].to_owned())
     }
 
     /// What the focused control holds, for a panel that wants to show it.

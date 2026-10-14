@@ -11,6 +11,7 @@ on:
       - "crates/otlyra-platform/**"
       - "crates/otlyra-text/**"
       - "tools/startup-benchmark.py"
+      - "tools/test_startup_benchmark.py"
   push:
     branches: [main]
     paths:
@@ -22,6 +23,7 @@ on:
       - "crates/otlyra-platform/**"
       - "crates/otlyra-text/**"
       - "tools/startup-benchmark.py"
+      - "tools/test_startup_benchmark.py"
   workflow_dispatch:
 
 # Performance distributions are meaningful only on one reserved machine. The
@@ -38,8 +40,12 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - name: Check benchmark protocol
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
       - name: Build release browser
         run: cargo build --locked --release -p otlyra-app
+      - name: Check native window startup
+        run: cargo test -p otlyra-app --test window_startup -- --ignored
       - name: Measure and enforce startup budgets
         run: >-
           python3 tools/startup-benchmark.py

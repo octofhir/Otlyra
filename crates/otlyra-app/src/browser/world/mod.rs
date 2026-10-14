@@ -218,6 +218,12 @@ impl PageWorld {
         slot.swept_at_build = None;
     }
 
+    /// Install a runner on its owner for content-boundary regression tests.
+    #[cfg(test)]
+    pub(super) fn set_scripts(&mut self, tab: TabId, scripts: Box<dyn otlyra_html::ScriptRunner>) {
+        self.slots.entry(tab).or_default().scripts = Some(scripts);
+    }
+
     /// Forget `tab`: its document, its scripts and whatever it was waiting for.
     pub(super) fn close(&mut self, tab: TabId) {
         self.slots.remove(&tab);

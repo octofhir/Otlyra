@@ -43,6 +43,10 @@ impl Browser {
             settings::Action::Close => self.close_system_page(),
             settings::Action::ChooseDownloadDirectory => {
                 let current = self.settings.settings.download_directory();
+                if let Some(sender) = &self.native_requests {
+                    let _ = sender.send(super::threaded::NativeRequest::DownloadDirectory(current));
+                    return;
+                }
                 let Some(chosen) = choose_download_directory(current.as_deref()) else {
                     return;
                 };
@@ -258,6 +262,16 @@ impl Browser {
         match action {
             downloads::Action::Clear => self.downloads.clear(),
             downloads::Action::Save(id) => {
+                if let Some(sender) = &self.native_requests {
+                    if let Some(download) = self.downloads.get(id) {
+                        let _ = sender.send(super::threaded::NativeRequest::SaveDownload {
+                            id,
+                            filename: download.filename().to_owned(),
+                            directory: self.settings.settings.download_directory(),
+                        });
+                    }
+                    return;
+                }
                 let asked = self.downloads.get(id).and_then(|download| {
                     // The dialogue opens in the download folder, so the preference
                     // is where a manual save starts from as well as where an
@@ -326,7 +340,7 @@ impl Browser {
 /// after it closes and runs through [`downloads::DownloadWriter`], never on the
 /// browser thread.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn choose_download_path(
+pub(super) fn choose_download_path(
     filename: &str,
     directory: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
@@ -342,7 +356,7 @@ fn choose_download_path(
 
 /// The same, where the platform has no native file dialogue.
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn choose_download_path(
+pub(super) fn choose_download_path(
     _filename: &str,
     _directory: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
@@ -352,7 +366,9 @@ fn choose_download_path(
 
 /// Ask which folder automatic downloads should go into.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn choose_download_directory(current: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+pub(super) fn choose_download_directory(
+    current: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     let mut dialogue = rfd::FileDialog::new();
     if let Some(current) = current.filter(|current| current.is_dir()) {
         dialogue = dialogue.set_directory(current);
@@ -362,7 +378,9 @@ fn choose_download_directory(current: Option<&std::path::Path>) -> Option<std::p
 
 /// The same, where there is nothing to ask.
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn choose_download_directory(_current: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+pub(super) fn choose_download_directory(
+    _current: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     tracing::debug!("no folder dialogue on this platform; the download folder is unchanged");
     None
 }

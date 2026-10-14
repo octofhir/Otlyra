@@ -141,6 +141,16 @@ impl DirectFrame {
 }
 
 impl Presenter {
+    /// Metal can discover its backend before a native window exists. Other
+    /// platforms keep the display-bound bootstrap below (notably GLES/Wayland).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn instance_without_window() -> PresenterInstance {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::METAL;
+        PresenterInstance(wgpu::Instance::new(descriptor))
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn instance<W>(window: W) -> PresenterInstance
     where
         W: raw_window_handle::HasDisplayHandle + std::fmt::Debug + Send + Sync + 'static,
@@ -158,11 +168,21 @@ impl Presenter {
         W: wgpu::WindowHandle + raw_window_handle::HasDisplayHandle + std::fmt::Debug + 'static,
     {
         let PresenterInstance(instance) = instance;
-        let surface = instance.create_surface(wgpu::SurfaceTarget::Window(Box::new(window)))?;
+        // A window-independent Metal instance gets both handles here, through
+        // the safe owning target; no raw handle or borrowed window can escape.
+        #[cfg(target_os = "macos")]
+        let target = wgpu::SurfaceTarget::DisplayAndWindow(Box::new(window));
+        #[cfg(not(target_os = "macos"))]
+        let target = wgpu::SurfaceTarget::Window(Box::new(window));
+        let surface = instance.create_surface(target)?;
         Ok(PresenterSeed { instance, surface })
     }
 
-    pub(crate) fn new(seed: PresenterSeed, viewport: Viewport) -> Result<Self, PresentError> {
+    pub(crate) fn new(
+        seed: PresenterSeed,
+        viewport: Viewport,
+        trace: Option<&crate::StartupTrace>,
+    ) -> Result<Self, PresentError> {
         let PresenterSeed { instance, surface } = seed;
         // Adapter and device creation happen once on the startup worker. The
         // window event loop and the frame path never await them.
@@ -172,6 +192,9 @@ impl Presenter {
             compatible_surface: Some(&surface),
             apply_limit_buckets: false,
         }))?;
+        if let Some(trace) = trace {
+            trace.mark("gpu_adapter_ready");
+        }
 
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -183,6 +206,9 @@ impl Presenter {
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
             }))?;
+        if let Some(trace) = trace {
+            trace.mark("gpu_device_ready");
+        }
 
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -206,6 +232,9 @@ impl Presenter {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        if let Some(trace) = trace {
+            trace.mark("gpu_surface_configured");
+        }
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("otlyra-blit"),
@@ -271,6 +300,9 @@ impl Presenter {
 
         let info = adapter.get_info();
         tracing::info!(adapter = %info.name, backend = ?info.backend, ?format, "gpu surface ready");
+        if let Some(trace) = trace {
+            trace.mark("gpu_pipeline_ready");
+        }
 
         Ok(Self {
             surface,

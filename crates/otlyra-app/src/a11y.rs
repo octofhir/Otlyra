@@ -231,7 +231,7 @@ pub fn window_tree(
     let mut children = Vec::new();
     let mut interface_focus = None;
     for (index, described) in interface.iter().enumerate() {
-        let id = NodeId(INTERFACE_BASE + index as u64);
+        let id = described_node(index);
         if described.focus.is_some() && described.focus == focused {
             interface_focus = Some(id);
         }
@@ -263,6 +263,10 @@ pub fn window_tree(
 /// description, and a description is rebuilt every frame in drawing order.
 pub fn described_index(node: otlyra_platform::accesskit::NodeId) -> Option<usize> {
     (node.0 >= INTERFACE_BASE).then(|| (node.0 - INTERFACE_BASE) as usize)
+}
+
+pub(crate) fn described_node(index: usize) -> NodeId {
+    NodeId(INTERFACE_BASE + index as u64)
 }
 
 /// One described control, as a node.

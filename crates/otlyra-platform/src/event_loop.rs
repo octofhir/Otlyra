@@ -26,16 +26,6 @@ const LINE_SCROLL: f64 = 40.0;
 /// How many frames in a row the swapchain may refuse before we stop asking.
 const MAX_DROPPED_FRAMES: u32 = 8;
 
-/// How long a frame drawn at a new size is waited for before the loop goes back
-/// to its events.
-///
-/// Every other frame is handed to the render thread and forgotten until it
-/// reports. A frame at a new size is not: until it lands, the window shows the
-/// last frame stretched to the new size, which reads as the page smearing. So
-/// the loop waits for it — but not for ever, because a page that takes seconds
-/// to rasterize must not take the window's input with it.
-const RESIZE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Translate winit's theme into our own vocabulary.
 fn translate_theme(theme: winit::window::Theme) -> crate::ColorScheme {
     match theme {
@@ -80,6 +70,7 @@ enum UserEvent {
     /// Something off the loop's thread asked for a frame.
     Woken,
     /// Backend discovery completed; the main thread may attach the window.
+    #[cfg(not(target_os = "macos"))]
     PresenterInstanceReady(Box<crate::present::PresenterInstance>),
 }
 
@@ -255,8 +246,21 @@ impl FrameScheduler {
 /// unconditionally.
 pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), PlatformError> {
     let startup_origin = config.startup_origin;
-    let mut event_loop =
-        EventLoop::new().map_err(|error| PlatformError::EventLoop(error.to_string()))?;
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        // The embedder installs its complete native menu before visibility.
+        // Avoid building winit's default menu only to replace it immediately.
+        // Keep the default for simple painters that supply no menu of their own.
+        builder.with_default_menu(config.menu_bar.menus.is_empty());
+    }
+    let mut event_loop = builder
+        .build()
+        .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
+    if let Some(trace) = config.startup_trace.as_ref() {
+        trace.mark("event_loop_created");
+    }
     event_loop.set_control_flow(ControlFlow::Wait);
     let (sender, inbox) = mpsc::channel();
     let mailbox = Mailbox {
@@ -294,7 +298,6 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         a11y: None,
         render: None,
         render_ready: false,
-        last_submitted: None,
         window: None,
         mailbox,
         inbox,
@@ -343,8 +346,6 @@ struct WindowedApp<'p> {
     render: Option<RenderThread>,
     /// Whether the render thread has its device and can take frames.
     render_ready: bool,
-    /// The size of the last frame handed over, to know when one is at a new size.
-    last_submitted: Option<Viewport>,
     window: Option<Arc<dyn Window>>,
     /// Where background GPU initialization posts that it is done.
     mailbox: Mailbox,
@@ -538,7 +539,7 @@ impl WindowedApp<'_> {
     /// readback, upload, waiting for the display — is the render thread's, and
     /// this returns as soon as the frame is handed over. What became of it
     /// arrives later as a [`RenderReport`].
-    fn redraw(&mut self, event_loop: &dyn ActiveEventLoop) -> Result<(), PlatformError> {
+    fn redraw(&mut self, viewport: Viewport) -> Result<(), PlatformError> {
         if !self.render_ready {
             self.scheduler.redraw_pending = false;
             return Ok(());
@@ -554,12 +555,7 @@ impl WindowedApp<'_> {
         // Only the first frame carries startup marks. Cloning the handle (an `Arc`)
         // once here keeps the marks free of a `&self` borrow, and skips the work
         // on every later frame.
-        let trace = if self.first_frame.is_none() {
-            self.config.startup_trace.clone()
-        } else {
-            None
-        };
-        let viewport = self.viewport();
+        let build_started = self.first_frame.is_none().then(std::time::Instant::now);
 
         // Retained-layer path: a painter that publishes a scene has only what
         // moved re-rasterized. Everything else is painted whole, here, because
@@ -578,12 +574,22 @@ impl WindowedApp<'_> {
                     self.whole_surface
                         .rasterize_whole(&mut *self.painter, viewport)?
                 };
-                if let Some(trace) = trace.as_ref() {
-                    trace.mark("chrome_raster_complete");
-                }
                 FrameContent::Pixels(pixels)
             }
         };
+        let startup_ready = self.painter.startup_ready();
+        let trace = if build_started.is_some() && startup_ready {
+            self.config.startup_trace.clone()
+        } else {
+            None
+        };
+        if let Some(trace) = trace.as_ref() {
+            trace.mark_at("chrome_build_started", build_started.unwrap());
+            if matches!(&content, FrameContent::Pixels(_)) {
+                trace.mark("chrome_raster_complete");
+            }
+            trace.mark("chrome_build_complete");
+        }
         self.work.frames_started += 1;
 
         let render = self.render.as_ref().expect("ready implies a render thread");
@@ -591,19 +597,18 @@ impl WindowedApp<'_> {
             content,
             viewport,
             trace,
+            startup_ready,
         }) {
             return Err(PlatformError::RenderThread(
                 "the render thread stopped taking frames".to_owned(),
             ));
         }
 
-        // A frame at a new size is waited for; see `RESIZE_WAIT`.
-        if self.last_submitted != Some(viewport) {
-            self.last_submitted = Some(viewport);
-            if let Some(report) = render.wait_report(RESIZE_WAIT) {
-                self.handle_render_report(event_loop, report);
-            }
-        }
+        // First frames and resizes use the same asynchronous completion as any
+        // other frame. Keep the last presented image while the worker draws;
+        // input and later resize events must not wait for raster or a drawable.
+        // The scheduler coalesces them into one subsequent frame at the latest
+        // native viewport, rather than queuing every intermediate size.
         Ok(())
     }
 
@@ -624,6 +629,11 @@ impl WindowedApp<'_> {
     /// The frame in flight is done: account for it, and build the next one if
     /// anything asked for it meanwhile.
     fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
+        if frame.outcome == Presented::Frame
+            && let Some(trace) = frame.trace.as_ref()
+        {
+            trace.mark("first_frame_report_received");
+        }
         let owed = self.scheduler.frame_done();
         self.work.rasterized_pixels = self
             .work
@@ -638,6 +648,7 @@ impl WindowedApp<'_> {
                     frame.viewport,
                     frame.uploaded_bytes,
                     &frame.trace,
+                    frame.startup_ready,
                 ) {
                     self.fail(event_loop, error);
                     return;
@@ -684,6 +695,7 @@ impl WindowedApp<'_> {
         viewport: Viewport,
         upload_bytes: u64,
         trace: &Option<crate::StartupTrace>,
+        startup_ready: bool,
     ) -> Result<(), PlatformError> {
         if outcome == Presented::Frame {
             if let Some(trace) = trace.as_ref() {
@@ -693,7 +705,13 @@ impl WindowedApp<'_> {
             self.frames += 1;
             self.work.frames_presented += 1;
             let now = std::time::Instant::now();
-            self.record_first_present(now, viewport, trace)?;
+            if startup_ready {
+                self.record_first_present(now, viewport, trace)?;
+            } else if self.first_frame.is_none()
+                && let Some(trace) = &self.config.startup_trace
+            {
+                trace.mark("early_chrome_present_complete");
+            }
             self.log_frame();
         }
 
@@ -751,42 +769,49 @@ impl WindowedApp<'_> {
 
     /// Log the cumulative work counters for one presented frame.
     /// One event another thread posted.
-    fn receive(&mut self, event_loop: &dyn ActiveEventLoop, event: UserEvent) {
+    fn receive(&mut self, _event_loop: &dyn ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(id) => {
                 tracing::debug!(id = ?id, "menu command");
                 self.deliver(PlatformEvent::MenuCommand(id));
             }
             UserEvent::Woken => self.deliver(PlatformEvent::Woken),
+            #[cfg(not(target_os = "macos"))]
             UserEvent::PresenterInstanceReady(instance) => {
-                self.mark("wgpu_instance_ready");
-                let Some(window) = self.window.as_ref().map(Arc::clone) else {
-                    return;
-                };
-                let viewport = self.viewport();
-                let seed = match Presenter::prepare(*instance, window) {
-                    Ok(seed) => seed,
-                    Err(error) => {
-                        self.fail(event_loop, error.into());
-                        return;
-                    }
-                };
-                self.mark("surface_attached");
-                // The render thread makes the device itself — the slow part of
-                // startup, kept off this thread — and says when it is ready.
-                let proxy = self.mailbox.proxy.clone();
-                match RenderThread::spawn(
-                    seed,
-                    viewport,
-                    self.config.renderer,
-                    Box::new(move || proxy.wake_up()),
-                ) {
-                    Ok(render) => self.render = Some(render),
-                    Err(error) => {
-                        self.fail(event_loop, PlatformError::RenderThread(error.to_string()));
-                    }
-                }
+                self.attach_presenter(_event_loop, *instance)
             }
+        }
+    }
+
+    fn attach_presenter(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        instance: crate::present::PresenterInstance,
+    ) {
+        self.mark("wgpu_instance_ready");
+        let Some(window) = self.window.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let viewport = self.viewport();
+        let seed = match Presenter::prepare(instance, window) {
+            Ok(seed) => seed,
+            Err(error) => {
+                self.fail(event_loop, error.into());
+                return;
+            }
+        };
+        self.mark("surface_attached");
+        // Adapter, device, swapchain and shader setup stay off the UI thread.
+        let proxy = self.mailbox.proxy.clone();
+        match RenderThread::spawn(
+            seed,
+            viewport,
+            self.config.renderer,
+            self.config.startup_trace.clone(),
+            Box::new(move || proxy.wake_up()),
+        ) {
+            Ok(render) => self.render = Some(render),
+            Err(error) => self.fail(event_loop, PlatformError::RenderThread(error.to_string())),
         }
     }
 
@@ -814,6 +839,7 @@ impl WindowedApp<'_> {
 impl ApplicationHandler for WindowedApp<'_> {
     /// Read everything other threads have posted since the last wake.
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let _wake = tracing::info_span!("proxy_wake_up").entered();
         while let Ok(event) = self.inbox.try_recv() {
             self.receive(event_loop, event);
         }
@@ -824,6 +850,9 @@ impl ApplicationHandler for WindowedApp<'_> {
 
     /// Drain cross-thread work and turn a reached deadline into one redraw.
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.window.is_some() && self.first_frame.is_none() {
+            self.mark("first_loop_idle");
+        }
         // Anything a screen reader asked for arrived on its own thread and was
         // queued. Drained here, between batches of window events, so it reaches
         // the painter as an ordinary event on the loop's thread like every other.
@@ -851,7 +880,7 @@ impl ApplicationHandler for WindowedApp<'_> {
         // Both before the window, so the icon and menu bar are in place the moment
         // anything is on screen.
         if let Some(icon) = self.config.icon {
-            crate::icon::set_dock_icon(icon);
+            crate::icon::set_dock_icon(icon, self.config.startup_trace.as_ref());
         }
         self.mark("icon_ready");
 
@@ -921,6 +950,22 @@ impl ApplicationHandler for WindowedApp<'_> {
             .painter
             .handle_event(PlatformEvent::SurfaceReady(viewport));
 
+        #[cfg(target_os = "macos")]
+        {
+            // Metal's instance is inexpensive and independent of the display.
+            // Attach its layer while the window is hidden, instead of showing
+            // an ordinary AppKit backing layer and replacing it one turn later.
+            // Only layer attachment runs here; expensive setup stays on the
+            // render thread and painting still waits for its Ready report.
+            self.mark("wgpu_instance_started");
+            let instance = Presenter::instance_without_window();
+            self.mark("wgpu_instance_created");
+            self.attach_presenter(event_loop, instance);
+            if self.failure.is_some() {
+                return;
+            }
+        }
+
         window.set_visible(true);
         // A window that is key the moment it shows says nothing about it, and
         // the adapter publishes nothing until it hears the window has focus.
@@ -941,12 +986,22 @@ impl ApplicationHandler for WindowedApp<'_> {
             "window visible; gpu initialization continues in background"
         );
 
-        let mailbox = self.mailbox.clone();
-        let gpu_window = Arc::clone(&window);
-        std::thread::spawn(move || {
-            let instance = Presenter::instance(gpu_window);
-            mailbox.send(UserEvent::PresenterInstanceReady(Box::new(instance)));
-        });
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mailbox = self.mailbox.clone();
+            let gpu_window = Arc::clone(&window);
+            let trace = self.config.startup_trace.clone();
+            std::thread::spawn(move || {
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("wgpu_instance_started");
+                }
+                let instance = Presenter::instance(gpu_window);
+                if let Some(trace) = trace.as_ref() {
+                    trace.mark("wgpu_instance_created");
+                }
+                mailbox.send(UserEvent::PresenterInstanceReady(Box::new(instance)));
+            });
+        }
     }
 
     fn window_event(
@@ -1077,7 +1132,7 @@ impl ApplicationHandler for WindowedApp<'_> {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Err(error) = self.redraw(event_loop) {
+                if let Err(error) = self.redraw(self.viewport()) {
                     self.fail(event_loop, error);
                 }
             }
@@ -1192,6 +1247,209 @@ mod tests {
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseScrollDelta;
 
+    #[derive(Debug)]
+    struct TestProxy;
+
+    impl winit::event_loop::EventLoopProxyProvider for TestProxy {
+        fn wake_up(&self) {}
+    }
+
+    #[derive(Default)]
+    struct InputScene {
+        events: u64,
+        resized: Option<Viewport>,
+    }
+
+    impl Painter for InputScene {
+        fn handle_event(&mut self, event: PlatformEvent) -> FrameRequest {
+            self.events += 1;
+            if let PlatformEvent::Resized(viewport) = event {
+                self.resized = Some(viewport);
+            }
+            FrameRequest::Now
+        }
+
+        fn compose(&mut self, viewport: Viewport) -> Option<crate::Scene> {
+            if let Some(latest) = self.resized {
+                assert_eq!(viewport, latest, "compose must use the latest resize");
+            }
+            Some(crate::Scene {
+                layers: vec![crate::SceneLayer {
+                    id: crate::LayerId(1),
+                    rect: crate::LayerRect {
+                        x: 0,
+                        y: 0,
+                        width: viewport.width,
+                        height: viewport.height,
+                    },
+                    epoch: self.events,
+                    list: Arc::new(otlyra_gfx::DisplayList::new()),
+                    offsets: Vec::new(),
+                    background: None,
+                    dirty: None,
+                }],
+            })
+        }
+
+        fn paint(&mut self, _: &mut dyn otlyra_gfx::PaintTarget, _: Viewport) {
+            panic!("the scene path must run on the worker");
+        }
+    }
+
+    #[test]
+    fn first_frame_and_resizes_accept_input_while_rendering_at_both_scales() {
+        use std::time::{Duration, Instant};
+
+        for scale in [1, 2] {
+            let (started, jobs) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let render = RenderThread::controlled(move |job| {
+                let FrameContent::Scene(scene) = job.content else {
+                    panic!("a retained scene is expected");
+                };
+                started.send((job.viewport, scene.layers[0].epoch)).unwrap();
+                // Raster cannot finish until UI input has been processed. Bound
+                // the gate so a failing assertion never leaves Drop::join hung.
+                gate.recv_timeout(Duration::from_secs(2)).unwrap();
+                FrameReport {
+                    outcome: Presented::Frame,
+                    viewport: job.viewport,
+                    rasterized_pixels: 0,
+                    uploaded_bytes: 0,
+                    trace: None,
+                    startup_ready: job.startup_ready,
+                }
+            });
+            let config = WindowConfig::default();
+            let startup_origin = config.startup_origin;
+            let (sender, inbox) = mpsc::channel();
+            let mut painter = InputScene::default();
+            let mut app = WindowedApp {
+                config,
+                painter: &mut painter,
+                a11y: None,
+                render: Some(render),
+                render_ready: true,
+                window: None,
+                mailbox: Mailbox {
+                    sender,
+                    proxy: EventLoopProxy::new(Arc::new(TestProxy)),
+                },
+                inbox,
+                whole_surface: SceneCompositor::new(),
+                menu: None,
+                frames: 0,
+                startup_origin,
+                window_visible: None,
+                first_frame: None,
+                startup_report_written: false,
+                scheduler: FrameScheduler::default(),
+                work: WorkCounters::default(),
+                modifiers: crate::Modifiers::default(),
+                pointer: (-1.0, -1.0),
+                last_press: None,
+                cursor: crate::Cursor::default(),
+                pinned_scheme: None,
+                dropped_frames: 0,
+                failure: None,
+            };
+            for (index, width) in [800, 900, 1000].into_iter().enumerate() {
+                let viewport = Viewport::new(width * scale, 600 * scale, f64::from(scale));
+                let began = Instant::now();
+                app.redraw(viewport).unwrap();
+                assert!(
+                    began.elapsed() < Duration::from_millis(80),
+                    "first frame/resize must not wait 100 ms for raster completion"
+                );
+                assert_eq!(
+                    jobs.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    (viewport, (index * 3) as u64)
+                );
+                app.deliver(PlatformEvent::Resized(Viewport::new(
+                    (width + 30) * scale,
+                    600 * scale,
+                    f64::from(scale),
+                )));
+                let latest = Viewport::new((width + 100) * scale, 600 * scale, f64::from(scale));
+                app.deliver(PlatformEvent::Resized(latest));
+                app.deliver(PlatformEvent::PointerMoved { x: 40.0, y: 20.0 });
+                // More redraws while the worker is busy owe one replacement,
+                // and neither submit an obsolete frame nor build another list.
+                app.redraw(latest).unwrap();
+                assert!(jobs.try_recv().is_err());
+                assert!(app.render.as_ref().unwrap().try_report().is_none());
+                assert_eq!(app.work.events_delivered, ((index + 1) * 3) as u64);
+                assert_eq!(app.work.frames_started, (index + 1) as u64);
+                release.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Some(RenderReport::Frame(frame)) =
+                        app.render.as_ref().unwrap().try_report()
+                    {
+                        assert_eq!(frame.viewport, viewport);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "worker must complete after release"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(
+                    app.scheduler.frame_done(),
+                    "input owes exactly one successor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loading_frame_is_not_recorded_as_complete_startup() {
+        let config = WindowConfig::default();
+        let startup_origin = config.startup_origin;
+        let (sender, inbox) = mpsc::channel();
+        let mut painter = InputScene::default();
+        let mut app = WindowedApp {
+            config,
+            painter: &mut painter,
+            a11y: None,
+            render: None,
+            render_ready: false,
+            window: None,
+            mailbox: Mailbox {
+                sender,
+                proxy: EventLoopProxy::new(Arc::new(TestProxy)),
+            },
+            inbox,
+            whole_surface: SceneCompositor::new(),
+            menu: None,
+            frames: 0,
+            startup_origin,
+            window_visible: None,
+            first_frame: None,
+            startup_report_written: false,
+            scheduler: FrameScheduler::default(),
+            work: WorkCounters::default(),
+            modifiers: crate::Modifiers::default(),
+            pointer: (-1.0, -1.0),
+            last_press: None,
+            cursor: crate::Cursor::default(),
+            pinned_scheme: None,
+            dropped_frames: 0,
+            failure: None,
+        };
+        let viewport = Viewport::new(800, 600, 1.0);
+        assert!(app.painter.startup_ready());
+        app.after_present(Presented::Frame, viewport, 0, &None, false)
+            .unwrap();
+        assert_eq!(app.frames, 1);
+        assert!(app.first_frame.is_none());
+        app.after_present(Presented::Frame, viewport, 0, &None, true)
+            .unwrap();
+        assert_eq!(app.frames, 2);
+        assert!(app.first_frame.is_some());
+    }
+
     #[test]
     fn startup_report_is_stable_machine_readable_json() {
         let stages = [
@@ -1231,6 +1489,28 @@ mod tests {
         assert_eq!(stages[0].0, "main_entered");
         assert_eq!(stages[1].0, "window_created");
         assert!(stages[0].1 <= stages[1].1);
+    }
+
+    #[test]
+    fn startup_milestones_from_workers_remain_chronological() {
+        let trace = crate::StartupTrace::new(std::time::Instant::now());
+        let names = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ];
+        let barrier = std::sync::Barrier::new(names.len());
+        std::thread::scope(|scope| {
+            for name in names {
+                let trace = &trace;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    trace.mark(name);
+                });
+            }
+        });
+        let stages = trace.stages();
+        assert_eq!(stages.len(), names.len());
+        assert!(stages.windows(2).all(|pair| pair[0].1 <= pair[1].1));
     }
 
     #[test]

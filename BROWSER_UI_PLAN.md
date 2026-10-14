@@ -12,6 +12,12 @@ constraint a person picking it up would otherwise have to rediscover.
 Flutter is an architectural reference, not a dependency. Otlyra keeps one Rust
 event model, text stack, display-list format, rasterizer, and compositor.
 
+The 2026-10-14 [browser rendering/threading audit](docs/browser-rendering-research.md)
+compares Chromium, Firefox and WebKit with the current call paths. Its ownership
+baseline exposed page work on native UI. Windowed startup now creates the
+browser model, Otter, DOM, style and layout on a content owner; native chrome
+consumes immutable scenes. Headless drivers keep their synchronous API.
+
 ## Standing constraints
 
 - Do not rebuild the scheduling, retained-tree, damage, or surface foundations:
@@ -31,6 +37,9 @@ event model, text stack, display-list format, rasterizer, and compositor.
   keep stable identity plus a GPU scene, not the crate.
 - The CPU backend stays the screenshot, deterministic-test and fallback path
   whatever the GPU work decides.
+- Attach AccessKit before first visibility. Do not block the callback after
+  `set_visible(true)` to make the visibility milestone appear earlier. Do not
+  rasterize before the presenter is ready.
 - Startup budgets, enforced by `.github/workflows/startup-performance.yml` on a
   runner labelled `self-hosted`, `macOS`, `ARM64`, `otlyra-performance`:
   process to visible p50 ≤ 50 ms / p95 ≤ 100 ms; process to first complete
@@ -44,33 +53,94 @@ event model, text stack, display-list format, rasterizer, and compositor.
 
 ## Priority 1 — Finish startup isolation
 
-The measured distribution, 20 samples on Apple M1, macOS 26.5, 1024x768 at 2x:
-process → visible p50 321.53 ms / p95 368.95 ms; process → first presented
-frame p50 494.62 ms / p95 564.74 ms. The largest remaining stage is first paint
-(`visibility_requested -> chrome_raster_complete`, ~114 ms p50: chrome build,
-text shaping, CPU raster).
+The latest local distribution measured on 2026-10-14 UTC, Apple M1, macOS 26.5,
+1024x768 at 2x, release, `about:about`, isolated profile and `--no-secrets`:
+three warmups, then 40 GPU / 20 CPU fresh processes per version, with
+before/after order alternating against the `12c954b` platform runtime rebuilt
+with the same Otter Rust/manifests as the candidate. Both binary hashes and that
+source digest are in `target/async-frames-build-pair.json`. Later Otter changes
+are verified separately; the distributions refer to that fixed build pair.
+The driver cache is warm;
+these are not cold-shader measurements. Load differs between series: compare
+within each row, not across runs or against an older local distribution.
+
+| Startup, p50 / p95 | Before | Current |
+|---|---:|---:|
+| GPU process → visible | 164.43 / 183.39 ms | 165.34 / 176.29 ms |
+| GPU process → first frame report handled | 249.20 / 274.42 ms | 252.73 / 268.16 ms |
+| CPU process → visible | 163.17 / 171.52 ms | 156.60 / 168.58 ms |
+| CPU process → first frame report handled | 244.58 / 265.53 ms | 241.73 / 255.94 ms |
+
+Browser construction is ~1 ms. Explicit phase marks corrected the earlier
+attribution: Metal backend construction is ~0.01 ms, device/swapchain/pipeline
+setup ~5 ms, and delivery of its Ready report to the UI takes ~45–60 ms under
+local load. The old ~44 ms "backend discovery" interval mostly measured native
+event dispatch. Chrome construction is ~7–8 ms and GPU raster ~24–25 ms.
+The strict startup budgets still fail. Raw matched distributions are
+`target/startup-async-frames-gpu-40.json` and
+`target/startup-async-frames-cpu.json`; each includes its control distribution
+and both binary hashes. GPU paired first-frame delta p50 is -0.44 ms: startup
+is essentially unchanged; the change removes UI waiting during rendering.
+The 20-pair pilot had a higher candidate GPU p95, so the larger GPU series was
+run before accepting the startup result. Do not mix their quantiles.
 
 - [ ] Re-run the 20-sample local distribution after every startup change.
-- [ ] Split browser construction into a minimal chrome bootstrap and deferred
-  services.
-- [ ] Defer inspector, history, downloads, update checks, navigation services,
-  page accessibility, and Otter creation until first use. (Text engines are
-  already deferred; each `TextEngine::new` re-enumerates system fonts, which was
-  the largest measured stage.)
-- [ ] Audit preference loading, native menu installation, Dock icon decoding,
-  font discovery, dynamic initialization, and synchronous filesystem work.
-- [ ] Cache or bundle decoded startup assets where measurement justifies it.
-- [ ] Keep AccessKit attached before first visibility where the platform
-  requires it; do not fake the visibility milestone by blocking the event-loop
-  callback after `set_visible(true)`.
+- [ ] Profile AppKit bootstrap, native menu/window installation and dynamic
+  initialization; avoid moving their cost behind the visibility mark.
+- [ ] Profile the Ready-delivery gap in native launch/window event dispatch.
+  Backend construction is already negligible; an extra bootstrap worker and
+  draining messages before event-loop wait did not improve startup.
+- [ ] Profile the new worker posting/wake and UI-receipt intervals with native
+  traces. `first_present_complete` retains UI-accounting semantics; the separate
+  `render_present_scheduled` mark is not OS presentation feedback either.
+- [ ] Validate live resize visual quality under heavy raster. First-frame/resize
+  submissions no longer wait synchronously: the last presented image remains
+  while input continues and one latest-viewport successor is owed. Native resize
+  may temporarily stretch the old image. The controlled-worker test checks input
+  and coalescing at 1x/2x and rejects restoration of the 100 ms wait.
+- [ ] Profile first-frame shader/font work independently of chrome list
+  construction. Add overlap only when it improves distributions; an extra
+  speculative `compose` before GPU readiness did not.
+- [ ] Measure normal saved-profile loading separately from the isolated
+  distribution, including preferences, cookies, history and update services.
+- [ ] Keep page accessibility, resource services and Otter creation out of the
+  first chrome frame; defer further construction only when it has a measured
+  cost. System fonts are discovered on a worker and shared by deferred engines.
+- [ ] Audit font file opening and first shaping, beyond collection discovery.
 - [ ] Reuse raster readback and upload buffers.
-- [ ] Avoid rasterizing before the presenter is ready.
-- [ ] Decide from profiles whether the next step is direct Skia GPU rendering,
-  Skia/wgpu interop, or retained CPU tiles.
-- [ ] Ensure the first chrome frame does not initialize Otter or wait for a
-  page/network service.
 
 **Exit:** the strict startup workflow passes on the reference runner.
+
+## Page/UI isolation — prerequisite for live responsiveness
+
+Follow the [threading audit's ordered implementation](docs/browser-rendering-research.md#ordered-implementation-and-acceptance).
+This work crosses the browser/page boundary rather than replacing UI foundations.
+
+- [x] Move windowed page execution behind a content owner created on its own
+  thread: Otter, DOM, parsing, style, layout, timers and rAF. Publish retained
+  scenes, tab/navigation/viewport metadata, accessibility trees and inspector
+  output. Keep page hit testing and synchronous DOM semantics inside content.
+  Native chrome owns its input, geometry and font-engine fork; ordered tab
+  intents project immediately over the owner's read model.
+- [ ] Remove persistent-cookie sealing/file writes from the UI pump while
+  keeping serialized atomic persistence; acknowledge only successful writes,
+  retry failures and flush pending revisions at shutdown.
+- [ ] Implement real document visibility and hidden-page scheduling. Current
+  bindings always say visible; pumps run rAF for inactive slots too.
+- [ ] Add eligible compositor scrolling against retained page output, with
+  cancellable input, nested handoff and script-scroll reconciliation preserved.
+- [ ] Extend the existing bounded frame scheduler with display deadlines and
+  active/pending scene preparation; do not queue obsolete frames or share a live
+  GPU context across threads.
+- [ ] Measure omnibox/tab responsiveness during finite busy JS, slow layout,
+  slow raster and live resize, separately from empty-profile startup.
+  Finite real JS and 1x/2x CPU compositor coverage exist; native input-to-present,
+  large-document layout and active desktop resize remain to measure.
+- [ ] Preserve incremental damage across coalesced content publications and
+  acknowledged rendered frames. Current async content uses full layer damage
+  when its epoch changes, preventing stale pixels after dropped publications.
+- [ ] Avoid copying the full retained document accessibility tree when only
+  native chrome changes; retain correct activation and document generations.
 
 ## Priority 2 — Retained scene layers and damage
 
@@ -195,24 +265,25 @@ What the finished ones left behind, which is work and not history:
 **Exit:** a new browser panel is mostly composition and typed model actions,
 not new input, layout, focus, paint, or accessibility infrastructure.
 
-## Direct-GPU renderer spike
+## GPU renderer follow-up
 
-Bounded, outside the live default path, behind `--direct-gpu`. The acceptance
-corpus, the seam test, the Skia references at 1x and 2x, the Metal replay and
-the connection to the retained compositor all exist. What is left:
+The window already uses the direct GPU path by default, with automatic CPU
+fallback; `--cpu-raster` forces the fallback. Screenshots and deterministic
+tests stay on CPU. The acceptance corpus, seam test, Skia references at 1x/2x,
+Metal replay and retained compositor connection exist. What is left:
 
 - [ ] Settle 1x parity or state an explicit parity policy: 2x passes at 0.011%
   differing pixels; 1x misses the 0.2% allowance at 0.355%, concentrated on
   antialiased path and image edges. Do not weaken the gate silently.
-- [ ] Fix cold startup before considering default-on. Steady-state improves
-  (corpus p50 1.47 → 0.76 ms at 1x, 6.01 → 0.83 ms at 2x; readback and upload
-  become free), but the CPU path's overlap with GPU initialization is lost:
-  visible-to-frame p50/p95 regresses 227.99/260.88 → 250.79/298.02 ms, and
-  process-to-frame 616.90/661.81 → 632.07/779.97 ms. Test a CPU-first-frame then
-  GPU warm/switch design.
-- [ ] Adopt only if it removes CPU readback/upload and improves measured p95
-  without regressing parity or startup. Keep the retained-damage CPU path as
-  the fallback either way.
+- [ ] Profile first-frame shader/font work with a cold driver cache separately
+  from fresh-process startup with a warm driver cache. Keep the strict startup
+  gate. A CPU-first-frame/GPU switch needs measured evidence before adding a
+  second bootstrap path.
+- [ ] Measure live input-to-present p95 for cached omnibox, caret, scroll, and
+  path/image-heavy pages. The warm corpus improves p50 (1.47 → 0.76 ms at 1x,
+  6.01 → 0.83 ms at 2x) but does not establish live interaction latency.
+- [ ] Exercise device-loss fallback in the window and preserve retained damage
+  through the switch to CPU.
 
 ## Required invariants
 
@@ -224,6 +295,9 @@ the connection to the retained compositor all exist. What is left:
 - Paint and hit testing use the same stored geometry.
 - Page layout never depends on chrome layout.
 - The UI thread never blocks on page JavaScript, network, or filesystem work.
+  Windowed page execution/layout and cookie flushes now run on content. Initial
+  saved-profile setup still precedes the window handoff; native modal dialogs
+  run on UI, and file bytes are read by content after the dialog closes.
 - No frame is scheduled without visible dirty output or an explicit animation
   deadline.
 - No unchanged display list is cloned merely to assemble a frame.
@@ -244,7 +318,12 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
+python3 -m unittest discover -s tools -p 'test_*.py'
 ```
+
+On a visible macOS desktop, also run
+`cargo test -p otlyra-app --test window_startup -- --ignored`. This checks real
+GPU/CPU window startup and is enabled in the desktop performance workflow.
 
 A UI change is also checked where a person would see it: `interface_golden`,
 `surface_snapshot`, and `window_interaction`, which drives the real windowed

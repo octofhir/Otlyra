@@ -189,8 +189,8 @@ just bundle    # a macOS .app you can drag to /Applications
 ```
 
 `docs/interface.md` holds what binds a change to the interface and the inspector;
-`docs/skia-wgpu-interop.md` records why the rasterizer and the GPU do not share a
-texture, and what it would cost to make them.
+`docs/skia-wgpu-interop.md` records how Skia draws into the presenter's GPU
+texture and which parity and startup checks remain.
 
 Supply-chain gates need `just install-tools` once.
 

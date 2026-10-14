@@ -516,10 +516,8 @@ pub struct Inspector {
     pointer: (f64, f64),
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
-    /// The engine `offer` hands to a `Cx`. Built on first use, not at
-    /// construction: nothing in event handling shapes text, and building an
-    /// engine enumerates the system's fonts — dozens of milliseconds this
-    /// panel's `offer` never needs and startup should not pay.
+    /// Forked from the painting engine on first draw, so the first input never
+    /// re-enumerates system fonts and keeps the same font collection as layout.
     engine: Option<TextEngine>,
     cache: Option<(Appearance, std::sync::Arc<DisplayList>)>,
     builds: u64,
@@ -1156,7 +1154,7 @@ impl Inspector {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
-        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::deferred));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;
@@ -1372,6 +1370,7 @@ impl Inspector {
         facts: &Facts<'_>,
         text: &mut TextEngine,
     ) -> std::sync::Arc<DisplayList> {
+        self.engine.get_or_insert_with(|| text.fork());
         // Kept every frame, not only when one is built: the wheel is given to
         // whichever half the pointer is over, and a frame served from the cache
         // is still a frame the pointer is over.

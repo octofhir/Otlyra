@@ -25,7 +25,7 @@ static STARTUP_TRACE: std::sync::LazyLock<StartupTrace> =
     std::sync::LazyLock::new(|| StartupTrace::new(*PROCESS_STARTED));
 
 /// An experimental browser.
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "otlyra", version, about)]
 struct Cli {
     /// Render a single frame to this path as a PNG, then exit.
@@ -303,6 +303,26 @@ fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
     STARTUP_TRACE.mark("cli_parsed");
+
+    if !cli.mcp
+        && cli.bidi.is_none()
+        && cli.screenshot.is_none()
+        && cli.dump_display_list.is_none()
+        && cli.renderer != Renderer::Record
+        && !cli.dump_source
+        && cli.dump_dom.is_none()
+        && !cli.dump_boxes
+        && !cli.dump_fragments
+        && cli.dump_selectors.is_none()
+    {
+        return match run_content_window(&cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("otlyra: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Answering the protocol is a mode of its own: a driver navigates, so a
     // document named on the command line would be a page the first command
@@ -719,6 +739,43 @@ fn run_windowed(cli: &Cli, browser: &mut Browser) -> Result<(), otlyra_app::AppE
     run_window(window_config(cli), browser)
 }
 
+/// Construct page worlds on their owner; the native loop receives only chrome.
+fn run_content_window(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = otlyra_app::preferences::to_text(&cli.settings());
+    STARTUP_TRACE.mark("preferences_ready");
+    let content_cli = cli.clone();
+    let mut window = otlyra_app::browser::WindowBrowser::spawn_with_trace(
+        cli.viewport(),
+        !cli.no_interface,
+        Some(STARTUP_TRACE.clone()),
+        move |text| {
+            let mut browser =
+                browser_with_text(otlyra_app::preferences::from_text(&settings), Some(text));
+            browser.set_viewport(content_cli.viewport());
+            browser.set_zoom(content_cli.zoom);
+            if content_cli.no_interface {
+                browser.hide_interface();
+            }
+            if !content_cli.no_secrets && !content_cli.no_interface {
+                browser.persist_bookmarks();
+                browser.persist_cookies();
+            }
+            if let Some(url) = &content_cli.url {
+                browser.navigate(url);
+            } else if let Some(file) = &content_cli.file {
+                browser.navigate(&file.display().to_string());
+            } else if browser.settings_on_start() == otlyra_app::settings::OnStart::Home {
+                browser.go_home();
+            }
+            open_inspector(&mut browser, &content_cli);
+            browser
+        },
+    )?;
+    STARTUP_TRACE.mark("browser_ready");
+    window.set_clipboard(Box::new(otlyra_app::clipboard::System::new()));
+    Ok(run_window(window_config(cli), &mut window)?)
+}
+
 /// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.
 ///
 /// One client behind a `OnceLock`, shared by every outstanding fetch: the client
@@ -741,6 +798,13 @@ struct NetLoader {
 /// the store afterwards. In memory until a shell asks for a file: see
 /// `Browser::persist_cookies`.
 fn browser(settings: otlyra_app::settings::Settings) -> Browser {
+    browser_with_text(settings, None)
+}
+
+fn browser_with_text(
+    settings: otlyra_app::settings::Settings,
+    text: Option<otlyra_text::TextEngine>,
+) -> Browser {
     let cookies = otlyra_app::cookies::CookieStore::in_memory();
     let cache = browser_cache();
     let loader = NetLoader {
@@ -748,7 +812,10 @@ fn browser(settings: otlyra_app::settings::Settings) -> Browser {
         jar: cookies.jar(),
         cache: std::sync::Arc::clone(&cache),
     };
-    let mut browser = Browser::with_async_loader(loader, settings);
+    let mut browser = match text {
+        Some(text) => Browser::with_async_loader_and_text(loader, settings, text),
+        None => Browser::with_async_loader(loader, settings),
+    };
     browser.set_cookie_store(cookies);
     browser.set_cache(cache);
     browser

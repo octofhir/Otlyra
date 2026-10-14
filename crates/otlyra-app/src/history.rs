@@ -161,9 +161,8 @@ pub struct HistorySurface {
     pointer_down: bool,
     press_origin: Option<(f64, f64)>,
     clicks: u32,
-    /// Built on first `offer`, not at construction: event handling shapes no
-    /// text, and building an engine enumerates the system's fonts — cost this
-    /// surface's `offer` never needs and startup should not carry.
+    /// Forked from the painting engine on first draw, so the first input never
+    /// re-enumerates system fonts and keeps the same font collection as layout.
     engine: Option<TextEngine>,
     cache: Option<(Drawn, DisplayList)>,
     builds: u64,
@@ -377,7 +376,7 @@ impl HistorySurface {
         let Some(root) = self.root.as_mut() else {
             return Action::None;
         };
-        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::new));
+        let mut cx = Cx::new(self.engine.get_or_insert_with(TextEngine::deferred));
         cx.pointer = self.pointer;
         cx.pointer_down = self.pointer_down;
         cx.press_origin = self.press_origin;
@@ -396,6 +395,7 @@ impl HistorySurface {
         text: &mut TextEngine,
         out: &mut DisplayList,
     ) {
+        self.engine.get_or_insert_with(|| text.fork());
         let drawn = Drawn {
             rect,
             revision: store.revision(),

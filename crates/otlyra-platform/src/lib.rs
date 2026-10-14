@@ -247,20 +247,34 @@ pub enum PlatformEvent {
 /// The one thing a worker thread may do to the interface: say that something has
 /// finished. Everything else — what finished, what it means — stays on the thread
 /// the loop runs on, because that is where the state it changes lives.
-#[derive(Clone, Debug)]
-pub struct Waker(std::sync::mpsc::Sender<()>);
+#[derive(Clone)]
+pub struct Waker(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waker").finish_non_exhaustive()
+    }
+}
 
 impl Waker {
     /// Build a waker over a channel the loop drains. Used by the loop itself; an
     /// embedder is given one rather than making it.
     pub fn new(sender: std::sync::mpsc::Sender<()>) -> Self {
-        Self(sender)
+        Self::from_callback(move || {
+            let _ = sender.send(());
+        })
+    }
+
+    /// Wake an embedder's owner thread without a forwarding thread.
+    /// The callback should enqueue a signal without executing application work.
+    pub fn from_callback(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(callback))
     }
 
     /// Ask the loop for a frame. Cheap, and safe to call from any thread; a wake
     /// after the loop has gone is silently dropped.
     pub fn wake(&self) {
-        let _ = self.0.send(());
+        (self.0)();
     }
 }
 
@@ -578,6 +592,13 @@ pub trait Painter {
         PainterWork::default()
     }
 
+    /// Whether the last composed frame contains the initial content, rather
+    /// than a temporary loading shell. Rendering and input continue while false;
+    /// startup accounting waits for a frame submitted with true.
+    fn startup_ready(&self) -> bool {
+        true
+    }
+
     /// The accessibility tree, if it has changed since the last frame.
     ///
     /// A browser has to build this out of the DOM whatever toolkit it uses, so it
@@ -641,17 +662,31 @@ impl StartupTrace {
     /// twice — a resume that fires again, a first frame retried after a dropped
     /// swapchain — is not double-counted.
     pub fn mark(&self, name: &'static str) {
-        let ms = self.origin.elapsed().as_secs_f64() * 1000.0;
         let mut stages = self.stages.lock().expect("startup trace poisoned");
         if stages.iter().any(|(existing, _)| *existing == name) {
             return;
         }
+        let ms = self.origin.elapsed().as_secs_f64() * 1000.0;
         stages.push((name, ms));
+    }
+
+    /// Record a measured start once its operation is known to be eligible.
+    pub fn mark_at(&self, name: &'static str, at: Instant) {
+        let mut stages = self.stages.lock().expect("startup trace poisoned");
+        if stages.iter().any(|(existing, _)| *existing == name) {
+            return;
+        }
+        stages.push((
+            name,
+            at.saturating_duration_since(self.origin).as_secs_f64() * 1000.0,
+        ));
     }
 
     /// The milestones recorded so far, in the order they were reached.
     pub fn stages(&self) -> Vec<(&'static str, f64)> {
-        self.stages.lock().expect("startup trace poisoned").clone()
+        let mut stages = self.stages.lock().expect("startup trace poisoned").clone();
+        stages.sort_by(|left, right| left.1.total_cmp(&right.1));
+        stages
     }
 }
 
