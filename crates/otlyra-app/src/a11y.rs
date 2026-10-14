@@ -451,13 +451,25 @@ fn node_for(described: &Described) -> Node {
         _ => {}
     }
 
-    if described.enabled {
-        // Only the controls that can be pressed advertise the action, so a
-        // reader offering "press this" is never offering something that does
-        // nothing.
-        node.add_action(otlyra_platform::accesskit::Action::Click);
-    } else {
+    if !described.enabled {
         node.set_disabled();
+    } else if described.focus.is_some() && described.role != WidgetRole::Label {
+        use otlyra_platform::accesskit::Action;
+        node.add_action(Action::Focus);
+        if described.role == WidgetRole::Slider {
+            node.add_action(Action::Increment);
+            node.add_action(Action::Decrement);
+            if let Some(value) = described
+                .value
+                .as_ref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+            {
+                node.set_numeric_value(value);
+            }
+        } else {
+            node.add_action(Action::Click);
+        }
     }
 
     node

@@ -279,12 +279,22 @@ pools continue. Async transport panics deliver one failure and wake their owner.
 Started blocking loaders/decoders and independent download saves can still finish
 off-thread and remain a separate shutdown boundary.
 
+Browser-owned accessibility requests preserve their intent through the existing
+platform enum: Focus sets the keyboard target without activation; Activate follows
+the ordinary click path; Increment/Decrement adjust sliders by their own step.
+Disabled controls, labels and unsupported adjustments cause no focus/model change.
+Focusable interface controls advertise Focus, pressable controls advertise Click,
+and sliders advertise their numeric value and adjustments. Range values advance
+per event, so several keyboard/accessibility steps before redraw accumulate.
+
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, background timer
 budgets, interruptible content/raster work,
 incremental content accessibility generation and shutdown of pending download/blocking tasks
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.
+Dynamic interface accessibility ids and focus ids still use layout positions;
+stable semantic target identity remains separate from action intent handling.
 
 ## Things that cost a stage to learn
 

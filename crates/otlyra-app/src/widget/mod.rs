@@ -821,6 +821,29 @@ pub struct Described {
     pub enabled: bool,
 }
 
+/// Resolve a supported accessibility request through the widget's existing
+/// focus and activation/adjustment paths. `None` means no request was handled.
+pub(crate) fn accessibility_input(
+    items: &[Described],
+    index: usize,
+    action: otlyra_platform::AccessibilityAction,
+) -> Option<(FocusId, Option<Event>)> {
+    use otlyra_platform::AccessibilityAction as Action;
+    let item = items.get(index)?;
+    if !item.enabled || item.role == Role::Label {
+        return None;
+    }
+    let focus = item.focus?;
+    let event = match action {
+        Action::Focus => None,
+        Action::Activate => Some(Event::Activate),
+        Action::Increment if item.role == Role::Slider => Some(Event::Adjust(1)),
+        Action::Decrement if item.role == Role::Slider => Some(Event::Adjust(-1)),
+        _ => return None,
+    };
+    Some((focus, event))
+}
+
 /// The words that name what is inside it, for controls that carry none.
 ///
 /// A switch is a track and a knob; a slider is a line. Neither holds any text,

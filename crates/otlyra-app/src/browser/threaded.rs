@@ -1097,13 +1097,16 @@ impl Painter for WindowBrowser {
                         .scroll_tabs_by(if x.abs() > y.abs() { x } else { y });
                 }
             }
-            PlatformEvent::AccessibilityRequest { node, .. } => {
+            PlatformEvent::AccessibilityRequest { node, action } => {
                 if let Some(index) = crate::a11y::described_index(node) {
                     let chrome = self.ui.describe().len();
                     if index < chrome {
-                        self.chrome_focused = true;
-                        let action = self.ui.activate_described(index, &mut self.text);
-                        self.apply(action);
+                        if let Some(action) =
+                            self.ui.accessibility_action(index, action, &mut self.text)
+                        {
+                            self.chrome_focused = true;
+                            self.apply(action);
+                        }
                     } else {
                         self.send(
                             None,

@@ -155,6 +155,13 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   deadlines stay on content's scheduler without waking hidden native UI.
 - [ ] Define background timer budgets/exemptions. Timers currently continue
   normally; changed hidden metadata still publishes.
+- [x] Respect accessibility action intent on native chrome and all system pages:
+  Focus does not activate controls, Activate follows the click path, range steps
+  use existing adjustments and accumulate before redraw. Advertise only supported
+  actions on enabled focusable controls, including native slider adjustments.
+- [ ] Give dynamic accessibility controls stable semantic identities instead of
+  layout positions, and reject stale native/queued requests after a target retires.
+  Focus ids are positional too; substituting them for indices is insufficient.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

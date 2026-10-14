@@ -392,6 +392,34 @@ Verification: 1,802 workspace Rust tests passed, plus the opt-in native GPU/CPU
 startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
 passed on the immutable Otter snapshot, leaving its working checkout unchanged.
 
+## Browser accessibility action follow-up
+
+The interface and system-page handlers previously treated native Focus,
+Increment and Decrement like activation. Focusing an About button could navigate;
+focusing a cookie-removal control could remove cookies. The existing platform
+converter already distinguished all four intents, but browser-owned handlers
+ignored the action. They now share a resolver using the existing widget focus,
+activation and adjustment paths. Page DOM handling remains on its existing path.
+
+Focus changes no setting, navigation or cookie. Activate keeps the click behavior;
+range requests use the slider's own step. Disabled/unfocusable nodes and
+unsupported adjustments leave focus/model unchanged. Interface headings no longer
+advertise Click; enabled focusable controls advertise Focus, and sliders expose
+numeric values plus Increment/Decrement. Existing activation helpers retain their
+public API.
+
+Range widgets now advance their current value when accepting pointer or keyboard
+input. Repeated steps before another frame previously used the old value and
+collapsed to one step; they now accumulate and retain clamping. Tests cover About,
+cookie removal, settings toggles/ranges, and threaded native New-tab focus versus
+activation. Dynamic control/node ids still need semantic identity: their current
+layout indices, including focus ids, do not provide a stable queued target.
+
+Verification: 1,807 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
+passed against the same immutable Otter snapshot; its working checkout was not
+edited.
+
 ## What the reference browsers do
 
 ### Chromium

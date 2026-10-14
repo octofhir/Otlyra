@@ -236,11 +236,19 @@ impl HistorySurface {
 
     /// Activate the control a reader named, through the path a press takes.
     pub fn activate_described(&mut self, index: usize) -> Action {
-        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
-            return Action::None;
-        };
+        self.accessibility_action(index, otlyra_platform::AccessibilityAction::Activate)
+            .unwrap_or(Action::None)
+    }
+
+    /// Focus without opening a visit; activate only on Click.
+    pub(crate) fn accessibility_action(
+        &mut self,
+        index: usize,
+        action: otlyra_platform::AccessibilityAction,
+    ) -> Option<Action> {
+        let (focus, event) = crate::widget::accessibility_input(&self.describe(), index, action)?;
         self.focused = Some(focus);
-        self.deliver(&Event::Activate)
+        Some(event.map_or(Action::None, |event| self.deliver(&event)))
     }
 
     /// Note where the pointer is. A drag in the search field grows a selection.

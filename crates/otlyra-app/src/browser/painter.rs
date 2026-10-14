@@ -914,46 +914,69 @@ impl Painter for Browser {
                 // what the identifiers were handed out from.
                 let toolbar = self.ui.describe().len();
                 if index < toolbar {
-                    self.activate_surface(SURFACE_CHROME);
-                    let action = self.ui.activate_described(index, &mut self.text);
-                    self.apply(action);
+                    if let Some(action) =
+                        self.ui.accessibility_action(index, action, &mut self.text)
+                    {
+                        self.activate_surface(SURFACE_CHROME);
+                        self.apply(action);
+                    }
                     return;
                 }
 
                 let index = index - toolbar;
-                self.activate_surface(SURFACE_SYSTEM);
                 match self.tabs.get(self.active).and_then(|tab| tab.system) {
                     Some(SystemPage::Settings) => {
                         let before = self.settings.settings.clone();
-                        let action = self.settings.activate_described(index);
-                        self.save_preferences_if_changed(&before);
-                        self.handle_settings_action(&action);
+                        if let Some(action) = self.settings.accessibility_action(index, action) {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            self.save_preferences_if_changed(&before);
+                            self.handle_settings_action(&action);
+                        }
                     }
                     Some(SystemPage::History) => {
-                        let action = self.history_page.activate_described(index);
-                        self.handle_history_action(action);
+                        if let Some(action) = self.history_page.accessibility_action(index, action)
+                        {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            self.handle_history_action(action);
+                        }
                     }
                     Some(SystemPage::Downloads) => {
-                        let action = self
-                            .downloads_page
-                            .activate_described(index, &mut self.text);
-                        self.handle_downloads_action(action);
+                        if let Some(action) =
+                            self.downloads_page
+                                .accessibility_action(index, action, &mut self.text)
+                        {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            self.handle_downloads_action(action);
+                        }
                     }
                     Some(SystemPage::Bookmarks) => {
-                        let action = self
-                            .bookmarks_page
-                            .activate_described(index, &mut self.text);
-                        self.handle_bookmarks_action(action);
+                        if let Some(action) =
+                            self.bookmarks_page
+                                .accessibility_action(index, action, &mut self.text)
+                        {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            self.handle_bookmarks_action(action);
+                        }
                     }
                     Some(SystemPage::Cookies) => {
-                        let action = self.cookies_page.activate_described(index, &mut self.text);
-                        self.handle_cookies_action(action);
+                        if let Some(action) =
+                            self.cookies_page
+                                .accessibility_action(index, action, &mut self.text)
+                        {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            self.handle_cookies_action(action);
+                        }
                     }
-                    Some(SystemPage::About)
-                        if self.about.activate_described(index, &mut self.text)
-                            == about::Action::OpenSettings =>
-                    {
-                        self.open_system(SystemPage::Settings);
+                    Some(SystemPage::About) => {
+                        if let Some(action) =
+                            self.about
+                                .accessibility_action(index, action, &mut self.text)
+                        {
+                            self.activate_surface(SURFACE_SYSTEM);
+                            if action == about::Action::OpenSettings {
+                                self.open_system(SystemPage::Settings);
+                            }
+                        }
                     }
                     _ => {}
                 }

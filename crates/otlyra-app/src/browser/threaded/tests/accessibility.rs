@@ -1,5 +1,37 @@
 use super::*;
 
+#[test]
+fn focusing_native_chrome_does_not_activate_its_new_tab_button() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    window.compose(viewport);
+    let tree = window.accessibility().unwrap();
+    let (id, _) = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("New tab"))
+        .unwrap();
+    let tabs = window.tabs.len();
+    window.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Focus,
+    });
+    assert_eq!(window.tabs.len(), tabs);
+    assert!(window.chrome_focused);
+    assert!(window.ui.focused().is_some());
+    window.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Increment,
+    });
+    assert_eq!(window.tabs.len(), tabs);
+    window.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Activate,
+    });
+    assert_eq!(window.tabs.len(), tabs + 1);
+}
+
 struct IgnoreChanges;
 impl accesskit_consumer::TreeChangeHandler for IgnoreChanges {
     fn node_added(&mut self, _: &accesskit_consumer::NodeRef) {}

@@ -712,11 +712,19 @@ impl SettingsSurface {
 
     /// Activate the control a reader named, through the path a press takes.
     pub fn activate_described(&mut self, index: usize) -> Action {
-        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
-            return Action::None;
-        };
+        self.accessibility_action(index, otlyra_platform::AccessibilityAction::Activate)
+            .unwrap_or(Action::None)
+    }
+
+    /// Focus without changing preferences; adjust ranges through keyboard steps.
+    pub(crate) fn accessibility_action(
+        &mut self,
+        index: usize,
+        action: otlyra_platform::AccessibilityAction,
+    ) -> Option<Action> {
+        let (focus, event) = crate::widget::accessibility_input(&self.describe(), index, action)?;
         self.settings.focus = Some(focus);
-        self.deliver(&Event::Activate)
+        Some(event.map_or(Action::None, |event| self.deliver(&event)))
     }
 
     /// Note where the pointer is.
@@ -982,6 +990,77 @@ mod tests {
         let mut text = TextEngine::new();
         let mut list = DisplayList::new();
         surface.build_display_list(Rect::new(0.0, 0.0, 900.0, 1000.0), &mut text, &mut list);
+    }
+
+    #[test]
+    fn accessibility_range_steps_accumulate_before_the_next_frame() {
+        use otlyra_platform::AccessibilityAction;
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        let index = surface
+            .describe()
+            .iter()
+            .position(|node| {
+                node.role == crate::widget::Role::Slider && node.label.starts_with("Text size")
+            })
+            .unwrap();
+        let before = surface.settings.text_scale;
+        assert!(matches!(
+            surface.accessibility_action(index, AccessibilityAction::Focus),
+            Some(Action::None)
+        ));
+        assert_eq!(surface.settings.text_scale, before);
+        for _ in 0..5 {
+            surface
+                .accessibility_action(index, AccessibilityAction::Increment)
+                .unwrap();
+        }
+        assert!(surface.settings.text_scale > before);
+        for _ in 0..5 {
+            surface
+                .accessibility_action(index, AccessibilityAction::Decrement)
+                .unwrap();
+        }
+        assert_eq!(surface.settings.text_scale, before);
+        for _ in 0..500 {
+            surface
+                .accessibility_action(index, AccessibilityAction::Increment)
+                .unwrap();
+        }
+        let maximum = surface.settings.text_scale;
+        surface
+            .accessibility_action(index, AccessibilityAction::Increment)
+            .unwrap();
+        assert_eq!(surface.settings.text_scale, maximum);
+    }
+
+    #[test]
+    fn accessibility_focus_does_not_toggle_or_adjust_unrelated_controls() {
+        use otlyra_platform::AccessibilityAction;
+        let mut surface = SettingsSurface::new();
+        frame(&mut surface);
+        let index = surface
+            .describe()
+            .iter()
+            .position(|node| node.label == "Load images")
+            .unwrap();
+        let before = surface.settings.load_images;
+        surface
+            .accessibility_action(index, AccessibilityAction::Focus)
+            .unwrap();
+        assert_eq!(surface.settings.load_images, before);
+        let focus = surface.focused();
+        assert!(
+            surface
+                .accessibility_action(index, AccessibilityAction::Increment)
+                .is_none()
+        );
+        assert_eq!(surface.focused(), focus);
+        assert_eq!(surface.settings.load_images, before);
+        surface
+            .accessibility_action(index, AccessibilityAction::Activate)
+            .unwrap();
+        assert_ne!(surface.settings.load_images, before);
     }
 
     /// Where on a freshly drawn surface a press reports `wanted`.

@@ -171,6 +171,68 @@ fn a_reader_can_throw_a_switch_on_the_settings() {
 }
 
 #[test]
+fn accessibility_focus_does_not_open_the_about_settings_button() {
+    let mut browser = Browser::new(NoNetwork);
+    browser.open_system(SystemPage::About);
+    frame(&mut browser, 1000.0, 700.0);
+    let tree = browser.accessibility().unwrap();
+    let (id, node) = tree
+        .nodes
+        .iter()
+        .find(|(id, node)| {
+            crate::a11y::described_index(*id).is_some() && node.label() == Some("Settings")
+        })
+        .unwrap();
+    assert!(node.supports_action(otlyra_platform::accesskit::Action::Focus));
+    browser.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Focus,
+    });
+    assert_eq!(browser.tabs[browser.active].system, Some(SystemPage::About));
+    assert!(browser.about.focused().is_some());
+    browser.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Activate,
+    });
+    assert_eq!(
+        browser.tabs[browser.active].system,
+        Some(SystemPage::Settings)
+    );
+}
+
+#[test]
+fn accessibility_focus_never_removes_cookies_and_click_still_does() {
+    let mut browser = Browser::new(NoNetwork);
+    browser.cookies.with(|jar| {
+        jar.set(
+            &url::Url::parse("https://cookie.test/").unwrap(),
+            "a=one",
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    });
+    browser.open_system(SystemPage::Cookies);
+    frame(&mut browser, 1000.0, 700.0);
+    let tree = browser.accessibility().unwrap();
+    let (id, _) = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("Remove everything cookie.test is keeping"))
+        .unwrap();
+    browser.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Focus,
+    });
+    assert_eq!(browser.cookies.with(|jar| jar.len()), 1);
+    assert!(browser.cookies_page.focused().is_some());
+    browser.on_event(PlatformEvent::AccessibilityRequest {
+        node: *id,
+        action: otlyra_platform::AccessibilityAction::Activate,
+    });
+    assert_eq!(browser.cookies.with(|jar| jar.len()), 0);
+}
+
+#[test]
 fn the_menu_opens_the_pages_that_exist_and_closes_over_the_ones_that_do_not() {
     let mut browser = Browser::new(NoNetwork);
     frame(&mut browser, 1000.0, 700.0);

@@ -508,19 +508,24 @@ impl<A> Widget<A> for Slider<A> {
     fn event(&mut self, event: &Event, cx: &mut Cx) -> Option<A> {
         let inside = cx.hovered(self.rect.inflate(4.0));
         match event {
-            Event::PointerPressed if inside => Some((self.on_change)(self.value_at(cx.pointer.0))),
+            Event::PointerPressed if inside => {
+                self.value = self.value_at(cx.pointer.0);
+                Some((self.on_change)(self.value))
+            }
             // The keyboard's version of a drag. Clamped here rather than by the
             // caller, because the range is the slider's to know.
             Event::Adjust(by) if self.focus.is_some() && cx.focus == self.focus => {
                 let wanted = self.value + f64::from(*by) * self.step;
-                Some((self.on_change)(wanted.clamp(self.range.0, self.range.1)))
+                self.value = wanted.clamp(self.range.0, self.range.1);
+                Some((self.on_change)(self.value))
             }
             // A drag follows the pointer wherever it goes, as long as it began
             // on this slider: dragging past the end and holding there is how a
             // value is pinned to the maximum. No capture and no drag flag — the
             // press's origin says all of it.
             Event::PointerMoved if cx.pointer_down && cx.dragging_from(self.rect.inflate(4.0)) => {
-                Some((self.on_change)(self.value_at(cx.pointer.0)))
+                self.value = self.value_at(cx.pointer.0);
+                Some((self.on_change)(self.value))
             }
             _ => None,
         }

@@ -1901,14 +1901,30 @@ impl BrowserUi {
     /// second answer to *what does pressing this do*, and the two would agree
     /// only until one of them was changed.
     pub fn activate_described(&mut self, index: usize, text: &mut TextEngine) -> UiAction {
-        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
-            // A node with no focus id cannot be pressed: it is a label, or a
-            // field whose caret is its focus. Nothing happens, which is what a
-            // press on it would do.
-            return UiAction::None;
-        };
+        self.accessibility_action(index, otlyra_platform::AccessibilityAction::Activate, text)
+            .unwrap_or(UiAction::None)
+    }
+
+    /// Handle focus separately from activation and range adjustments.
+    pub(crate) fn accessibility_action(
+        &mut self,
+        index: usize,
+        action: otlyra_platform::AccessibilityAction,
+        text: &mut TextEngine,
+    ) -> Option<UiAction> {
+        let (focus, event) = crate::widget::accessibility_input(&self.describe(), index, action)?;
         self.focused = Some(focus);
-        self.activate(text)
+        Some(match event {
+            None => UiAction::None,
+            Some(Event::Activate) => self.activate(text),
+            Some(event) => {
+                let mut cx = self.cx(text);
+                self.root
+                    .as_mut()
+                    .and_then(|root| root.event(&event, &mut cx))
+                    .unwrap_or(UiAction::None)
+            }
+        })
     }
 
     /// Activate whatever holds the keyboard, through the path a press takes.

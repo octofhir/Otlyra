@@ -709,11 +709,20 @@ impl DownloadsSurface {
 
     /// Activate the control a reader named.
     pub fn activate_described(&mut self, index: usize, text: &mut TextEngine) -> Action {
-        let Some(focus) = self.describe().get(index).and_then(|node| node.focus) else {
-            return Action::None;
-        };
+        self.accessibility_action(index, otlyra_platform::AccessibilityAction::Activate, text)
+            .unwrap_or(Action::None)
+    }
+
+    /// Focus without invoking a download action; activate only on Click.
+    pub(crate) fn accessibility_action(
+        &mut self,
+        index: usize,
+        action: otlyra_platform::AccessibilityAction,
+        text: &mut TextEngine,
+    ) -> Option<Action> {
+        let (focus, event) = crate::widget::accessibility_input(&self.describe(), index, action)?;
         self.focused = Some(focus);
-        self.offer(&Event::Activate, text)
+        Some(event.map_or(Action::None, |event| self.offer(&event, text)))
     }
 
     /// Note where the pointer is.
