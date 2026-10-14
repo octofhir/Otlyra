@@ -264,6 +264,7 @@ struct ContentFrame {
 
 /// A native window's chrome and the channel to its content owner.
 pub struct WindowBrowser {
+    owner: Option<std::thread::JoinHandle<()>>,
     ui: BrowserUi,
     text: TextEngine,
     clipboard: Box<dyn Clipboard>,
@@ -345,7 +346,7 @@ impl WindowBrowser {
         let owner_mailbox = Arc::clone(&mailbox);
         let wake_mailbox = Arc::clone(&mailbox);
         let wake_sender = sender.clone();
-        std::thread::Builder::new()
+        let owner = std::thread::Builder::new()
             .name("otlyra-content".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
@@ -421,6 +422,7 @@ impl WindowBrowser {
             context: None,
         };
         Ok(Self {
+            owner: Some(owner),
             ui,
             text,
             clipboard: Box::new(crate::clipboard::InMemory::default()),
@@ -464,6 +466,18 @@ impl WindowBrowser {
             context_serial: None,
             started: Instant::now(),
         })
+    }
+
+    /// Stop content and drain pending cookies after the native event loop has
+    /// returned. Native close callbacks use `Drop`, which only sends shutdown.
+    pub fn shutdown(&mut self) -> std::io::Result<()> {
+        let _ = self.sender.send(Command::Shutdown);
+        if let Some(owner) = self.owner.take() {
+            owner
+                .join()
+                .map_err(|_| std::io::Error::other("content owner panicked during shutdown"))?;
+        }
+        Ok(())
     }
 
     /// Install a native clipboard on the window owner, never on content.

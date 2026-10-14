@@ -126,9 +126,15 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   output. Keep page hit testing and synchronous DOM semantics inside content.
   Native chrome owns its input, geometry and font-engine fork; ordered tab
   intents project immediately over the owner's read model.
-- [ ] Remove persistent-cookie sealing/file writes from the UI pump while
+- [x] Remove persistent-cookie sealing/file writes from the UI pump while
   keeping serialized atomic persistence; acknowledge only successful writes,
-  retry failures and flush pending revisions at shutdown.
+  retry failures and flush pending revisions at shutdown. One coalescing writer
+  runs key lookup, serialization, sealing and replacement. Native close sends
+  shutdown immediately; the CLI joins content only after its event loop returns.
+- [ ] Cancel owned fetch tasks before final persistence drain and finish or
+  explicitly resolve pending download saves at process shutdown. Existing fetch
+  tasks can outlive their browser; the cookie drain covers revisions present at
+  shutdown, not future responses from those detached tasks.
 - [x] Reflect active-tab visibility in `document.hidden` / `visibilityState`,
   including the first script and paused parsers; dispatch `visibilitychange`
   on content's owner. Retain hidden rAF callbacks until activation and exclude

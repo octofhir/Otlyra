@@ -252,10 +252,23 @@ the retired document's accessibility rather than describing stale layout.
 Existing resource loads and timers continue; CSS resources discovered only by
 style/layout begin when that preparation is requested.
 
+Cookie updates schedule a coalesced revision on one `otlyra-cookies` writer.
+It clones the jar briefly under its lock, then serializes, obtains a key when
+needed, seals and atomically replaces the file outside that lock. It acknowledges
+only successful writes, syncs file/directory on Unix and retries failures after
+one second without a browser pump. Key refusal is remembered and stops retries.
+Legacy plaintext migration waits for a successful write before removing its
+source. Cookie removals use the same asynchronous path.
+
+Native close remains nonblocking. Once the event loop returns, the CLI joins
+content; dropping its cookie store drains the latest pending revision. Existing
+saved-cookie reads and legacy migration still happen during profile loading.
+Outstanding detached fetch/download tasks are not yet drained by this boundary.
+
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, background timer
 budgets, fewer hidden metadata wakes, interruptible content/raster work,
-incremental content accessibility generation and durable nonblocking shutdown persistence
+incremental content accessibility generation and shutdown of pending fetch/download tasks
 remain follow-ups. Independent compositor scrolling and display-driven frame
 deadlines remain separate from preserving partial damage.
 

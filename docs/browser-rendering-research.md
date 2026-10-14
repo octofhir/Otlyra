@@ -296,6 +296,43 @@ clippy with `-D warnings`, formatting, diff checks and the opt-in native GPU/CPU
 startup smoke passed against the same immutable Otter snapshot. The working
 Otter checkout was not edited.
 
+## Cookie persistence follow-up
+
+Browser pumps and cookie-removal actions now schedule a revision instead of
+serializing, sealing and replacing the cookie file inline. A lazy single writer
+coalesces requests to the newest jar state. It copies the jar and revision under
+one lock, then releases both jar and scheduler locks for key lookup, formatting,
+sealing and I/O. Refused key lookup is remembered; it writes no plaintext and
+does not retry indefinitely.
+
+The written revision advances only after successful atomic replacement and sync,
+fixing the previous skipped-retry failure. Writes use unique temporary names;
+file sync precedes rename and directory sync follows it on Unix. Errors preserve
+the pending revision and retry after one second without another browser pump.
+Explicit `CookieStore::flush` remains a blocking success/failure barrier for
+legacy migration. Its source is removed only after that barrier succeeds.
+
+`WindowBrowser::Drop` still sends shutdown without joining. Normal native CLI
+startup retains the content thread handle and joins it after `run_window`
+returns; cookie-store destruction drains pending changes on content. Profile
+reads and legacy migration remain synchronous during profile loading. Fetch
+and download tasks can still outlive their browser; cancelling/draining those
+tasks before the final persistence boundary is separate work.
+
+Controlled tests hold a write while forty revisions are scheduled: scheduling
+and jar mutation continue, and only the first and latest snapshots are written.
+Other tests cover failed replacement and retry of an unchanged revision, retry
+without pumping, unscheduled final changes, session-cookie exclusion, refused
+keys, a failed worker releasing waiters, legacy migration failure/success,
+nonblocking native close and post-loop shutdown durability. These checks prove
+ownership and persistence behavior; they do not establish saved-profile startup
+or native input-to-present latency distributions.
+
+Verification: 1,794 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
+passed using the same immutable Otter snapshot; its working checkout was not
+edited.
+
 ## What the reference browsers do
 
 ### Chromium

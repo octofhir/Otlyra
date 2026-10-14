@@ -773,7 +773,9 @@ fn run_content_window(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     STARTUP_TRACE.mark("browser_ready");
     window.set_clipboard(Box::new(otlyra_app::clipboard::System::new()));
-    Ok(run_window(window_config(cli), &mut window)?)
+    let result = run_window(window_config(cli), &mut window);
+    window.shutdown()?;
+    Ok(result?)
 }
 
 /// The real loader: `otlyra-net` over HTTP, the filesystem for a `file:` URL.

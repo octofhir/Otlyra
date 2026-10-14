@@ -18,9 +18,9 @@ impl Browser {
         let mut changed = self.world.pump();
         self.apply_world_events();
         // A fetch that finished is the only moment cookies can have changed, so
-        // this is where the file catches up. Cheap when nothing did: the store
-        // compares a revision before it writes anything.
-        self.cookies.flush();
+        // this is where the writer learns it has work. The pump only schedules
+        // a revision; sealing, atomic replacement and retries run off-thread.
+        self.cookies.schedule_flush();
         for saved in self.downloads_writer.poll() {
             changed = true;
             match saved.result {

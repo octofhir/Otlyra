@@ -27,11 +27,14 @@
 //! # When it is written
 //!
 //! Not on every change, and not on a timer. The jar keeps a revision that moves
-//! only when the *persistent* set does, and [`CookieStore::flush`] writes only
-//! when it has moved since the last write. A site resetting a session cookie on
+//! only when the *persistent* set does, and [`CookieStore::schedule_flush`]
+//! coalesces changed revisions on one writer. A site resetting a session cookie on
 //! every response — which is most of them — therefore costs no disk at all, and a
 //! sign-in costs one write. Through a temporary file and a rename, like the
 //! bookmarks: a crash mid-write cannot leave half a jar where the whole one was.
+//! Successful replacement acknowledges the revision; failed writes retry.
+//! [`CookieStore::flush`] is a blocking durability barrier for migration, and
+//! dropping the store drains pending changes on its content owner at shutdown.
 //!
 //! Reading the file is the shell's job, the same rule the bookmarks, the
 //! preferences and the system clipboard already follow. A browser that read it in
@@ -41,7 +44,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use otlyra_gfx::DisplayList;
@@ -56,6 +59,9 @@ use crate::widget::{
     Align, Background, Child, Cx, Described, Event, Flex, Focus, FocusId, Gap, Insets, Label,
     Overflow, Padding, Rect, Scroll, Size, Stack, fill_rounded,
 };
+
+mod writer;
+use writer::CookieWriter;
 
 /// What the cookie file is called inside the browser's own directory.
 ///
@@ -93,13 +99,12 @@ pub struct CookieStore {
     /// there is either a file to open or something worth writing, and until then
     /// there is no reason to have asked.
     ///
-    /// `None` also means *there is no key*, which is why `asked` is separate: a
-    /// keychain that refused must not be asked again on every flush.
-    key: Option<crate::secret::Key>,
-    /// Whether the keychain has been consulted, whatever it said.
-    asked: bool,
+    /// The initialized `None` records refusal, so it is never asked repeatedly.
+    /// A fresh profile's first write unlocks on the persistence worker.
+    key: Arc<OnceLock<Option<crate::secret::Key>>>,
     /// The revision last written, so a flush with nothing to say costs nothing.
     written: u64,
+    writer: Option<CookieWriter>,
 }
 
 impl Default for CookieStore {
@@ -117,9 +122,9 @@ impl CookieStore {
         Self {
             jar: Arc::new(Mutex::new(Jar::new())),
             file: None,
-            key: None,
-            asked: false,
+            key: Arc::new(OnceLock::new()),
             written: 0,
+            writer: None,
         }
     }
 
@@ -135,6 +140,9 @@ impl CookieStore {
     /// in with; a file that cannot be read is a warning and an empty jar, because
     /// refusing to start over a cookie file would be refusing to start.
     pub fn persist(&mut self) {
+        if self.file.is_some() {
+            return;
+        }
         let Some(file) = file_path(FILE) else {
             tracing::warn!("nowhere to keep cookies; sessions will not survive this run");
             return;
@@ -156,10 +164,9 @@ impl CookieStore {
             tracing::warn!("no key to seal cookies with; sessions will not survive this run");
             return;
         }
-        // Taken out for the read below and put back after: `open` needs the key
-        // and the reads around it need the store, and the two borrows do not
-        // overlap in fact — only in the checker's view of them.
-        let key = self.key.take().expect("just unlocked");
+        // Keep the key slot alive independently while importing into the jar.
+        let keys = Arc::clone(&self.key);
+        let key = keys.get().and_then(Option::as_ref).expect("just unlocked");
 
         let now = SystemTime::now();
         let text = match existing {
@@ -194,7 +201,6 @@ impl CookieStore {
         // to do.
         self.written = revision;
         self.file = Some(file);
-        self.key = Some(key);
         self.take_over_from_a_plain_file();
     }
 
@@ -202,12 +208,10 @@ impl CookieStore {
     ///
     /// Asked once per run whatever the answer, so a keychain that refused — or a
     /// platform with none — costs one attempt rather than one per flush.
-    fn unlock(&mut self) -> Option<&crate::secret::Key> {
-        if !self.asked {
-            self.asked = true;
-            self.key = crate::secret::Key::from_keychain();
-        }
-        self.key.as_ref()
+    fn unlock(&self) -> Option<&crate::secret::Key> {
+        self.key
+            .get_or_init(crate::secret::Key::from_keychain)
+            .as_ref()
     }
 
     /// Move what an older build wrote in the clear into the sealed file, and then
@@ -221,7 +225,11 @@ impl CookieStore {
         let Some(plain) = file_path(PLAIN_FILE) else {
             return;
         };
-        let Ok(text) = std::fs::read_to_string(&plain) else {
+        self.migrate_plain(&plain);
+    }
+
+    fn migrate_plain(&mut self, plain: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(plain) else {
             return;
         };
         let read = store::from_text(&text, Capacity::default(), SystemTime::now());
@@ -238,7 +246,7 @@ impl CookieStore {
             tracing::warn!("could not seal them; the plain file is left where it is");
             return;
         }
-        if let Err(error) = std::fs::remove_file(&plain) {
+        if let Err(error) = std::fs::remove_file(plain) {
             tracing::warn!(%error, path = %plain.display(), "the plain cookie file is still there");
         }
     }
@@ -250,9 +258,9 @@ impl CookieStore {
         Self {
             jar: Arc::new(Mutex::new(Jar::new())),
             file: Some(file),
-            key: Some(key),
-            asked: true,
+            key: Arc::new(OnceLock::from(Some(key))),
             written: 0,
+            writer: None,
         }
     }
 
@@ -260,7 +268,8 @@ impl CookieStore {
     /// once it has a key.
     #[cfg(test)]
     fn reopen(&mut self) {
-        let (Some(file), Some(key)) = (self.file.clone(), self.key.as_ref()) else {
+        let (Some(file), Some(key)) = (self.file.clone(), self.key.get().and_then(Option::as_ref))
+        else {
             return;
         };
         let sealed = std::fs::read(&file).unwrap_or_default();
@@ -274,6 +283,7 @@ impl CookieStore {
                 jar.put(cookie.clone());
             }
         });
+        self.written = self.with(|jar| jar.kept_revision());
     }
 
     /// The jar itself, to give to a loader.
@@ -283,7 +293,7 @@ impl CookieStore {
 
     /// Whether this store puts anything on disk.
     pub fn is_persistent(&self) -> bool {
-        self.file.is_some()
+        self.file.is_some() && !self.key.get().is_some_and(Option::is_none)
     }
 
     /// Do something with the jar under its lock.
@@ -299,57 +309,63 @@ impl CookieStore {
         act(&mut jar)
     }
 
-    /// Write the persistent cookies down, if any of them have changed.
-    ///
-    /// Cheap to call often, which is the point: the caller does not have to know
-    /// whether a fetch set a cookie, only that one finished.
-    /// Answers whether anything reached the disk, which is what the migration
-    /// needs before it removes the plain file it read from.
-    pub fn flush(&mut self) -> bool {
-        let Some(file) = self.file.clone() else {
-            return false;
-        };
-        // The revision alone first, under the lock, and the text only if it has
-        // moved. This is called once per frame — the whole jar was being
-        // serialized to text sixty times a second so that the next line could
-        // decide it had nothing to write.
-        //
-        // Before the key, too: a flush with nothing to say must not be the thing
-        // that puts a keychain prompt on the screen, and most flushes have
-        // nothing to say. This is what makes the ask happen at the first sign-in
-        // rather than at startup.
+    /// Schedule the latest persistent revision without waiting for keychain,
+    /// serialization, sealing or disk writes. The worker coalesces requests and
+    /// retries failed writes with a one-second backoff.
+    pub fn schedule_flush(&mut self) {
         let revision = self.with(|jar| jar.kept_revision());
-        if revision == self.written {
+        if self.writer.is_none() && revision == self.written {
+            return;
+        }
+        if let Some(writer) = self.writer() {
+            writer.schedule(revision);
+        }
+    }
+
+    /// Wait for the current persistent revision to reach disk, or for its write
+    /// to fail. Used by legacy-file migration and callers needing a durable
+    /// barrier; browser pumps use [`Self::schedule_flush`] instead.
+    pub fn flush(&mut self) -> bool {
+        if self.file.is_none() {
+            return false;
+        }
+        let revision = self.with(|jar| jar.kept_revision());
+        if self.writer.is_none() && revision == self.written {
             return true;
         }
-        let now = SystemTime::now();
-        let text = self.with(|jar| store::to_text(jar, now));
-        let Some(key) = self.unlock() else {
-            return false;
-        };
-        let Some(sealed) = key.seal(PURPOSE, text.as_bytes()) else {
-            tracing::warn!("could not seal the cookies; nothing was written");
-            return false;
-        };
-        self.written = revision;
+        self.writer().is_some_and(|writer| writer.flush(revision))
+    }
 
-        if let Some(directory) = file.parent()
-            && let Err(error) = std::fs::create_dir_all(directory)
+    fn writer(&mut self) -> Option<&mut CookieWriter> {
+        if self.writer.is_none() {
+            let file = self.file.clone()?;
+            match CookieWriter::spawn(
+                Arc::clone(&self.jar),
+                Arc::clone(&self.key),
+                file,
+                self.written,
+            ) {
+                Ok(writer) => self.writer = Some(writer),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start cookie persistence worker");
+                    return None;
+                }
+            }
+        }
+        self.writer.as_mut()
+    }
+}
+
+impl Drop for CookieStore {
+    fn drop(&mut self) {
+        // A windowed store drops on content's owner, after native close. The CLI
+        // joins that owner after the event loop returns, never in its callback.
+        self.schedule_flush();
+        if let Some(mut writer) = self.writer.take()
+            && !writer.finish()
         {
-            tracing::warn!(%error, path = %directory.display(), "could not make the browser's directory");
-            return false;
+            tracing::warn!("pending cookies could not be persisted at shutdown");
         }
-        let temporary = file.with_extension("dat.writing");
-        if let Err(error) = std::fs::write(&temporary, sealed) {
-            tracing::warn!(%error, path = %temporary.display(), "could not write the cookies");
-            return false;
-        }
-        if let Err(error) = std::fs::rename(&temporary, &file) {
-            tracing::warn!(%error, path = %file.display(), "could not replace the cookies");
-            let _ = std::fs::remove_file(&temporary);
-            return false;
-        }
-        true
     }
 }
 

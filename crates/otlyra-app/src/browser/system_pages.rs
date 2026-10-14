@@ -246,11 +246,11 @@ impl Browser {
                 // Immediately, not at the next fetch: a person who asked to be rid
                 // of something should not have it on the disk while they read the
                 // page that says it is gone.
-                self.cookies.flush();
+                self.cookies.schedule_flush();
             }
             crate::cookies::Action::Clear => {
                 self.cookies.with(otlyra_net::cookie::Jar::clear);
-                self.cookies.flush();
+                self.cookies.schedule_flush();
             }
             crate::cookies::Action::Close => self.close_system_page(),
             crate::cookies::Action::None => {}
