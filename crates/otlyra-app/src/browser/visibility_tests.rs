@@ -147,6 +147,75 @@ fn a_document_arriving_in_the_background_is_hidden_before_its_first_script() {
 }
 
 #[test]
+fn hiding_a_window_pauses_its_selected_page_and_tab_changes_do_not_expose_it() {
+    on_content_stack(|| {
+        let mut browser = Browser::new(Pages);
+        browser.navigate(URL);
+        browser.wait_for_load(Duration::from_secs(5));
+        let first = browser.active_id();
+        browser.new_tab();
+        browser.navigate("https://visibility.test/second");
+        browser.wait_for_load(Duration::from_secs(5));
+        let second = browser.active_id();
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(false));
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(false));
+        assert_eq!(attr(&browser, second, "changes"), "1");
+        assert_eq!(attr(&browser, second, "visibility"), "hidden");
+        let frames = attr(&browser, second, "frames");
+        for _ in 0..40 {
+            browser.pump();
+        }
+        assert_eq!(attr(&browser, second, "frames"), frames);
+        assert_eq!(attr(&browser, second, "timer"), "true");
+        assert_eq!(browser.next_frame(), FrameRequest::None);
+        browser.select_tab(0);
+        assert_eq!(browser.active_id(), first);
+        assert_eq!(
+            attr(&browser, first, "changes"),
+            "1",
+            "selection inside a hidden window must remain hidden"
+        );
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(true));
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(true));
+        assert_eq!(attr(&browser, first, "changes"), "2");
+        assert_eq!(attr(&browser, first, "visibility"), "visible");
+        assert_eq!(attr(&browser, second, "changes"), "1");
+        assert_eq!(browser.next_frame(), FrameRequest::Vsync);
+        let frames = attr(&browser, first, "frames").parse::<usize>().unwrap();
+        browser.pump();
+        assert_eq!(
+            attr(&browser, first, "frames").parse::<usize>().unwrap(),
+            frames + 1
+        );
+    });
+}
+
+#[test]
+fn a_hidden_window_does_not_animate_loading_and_initial_scripts_observe_hidden() {
+    on_content_stack(|| {
+        let mut browser = Browser::new(Pages);
+        browser.hold_requests(Some(Box::new(|_| true)));
+        browser.navigate(URL);
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(false));
+        assert!(browser.loading());
+        assert_eq!(browser.next_frame(), FrameRequest::None);
+        browser.pump();
+        let request = browser.held().first().unwrap().id;
+        assert!(browser.fulfil_request(request, response(URL, HTML)));
+        browser.wait_for_load(Duration::from_secs(5));
+        let tab = browser.active_id();
+        assert_eq!(attr(&browser, tab, "initial"), "hidden");
+        assert_eq!(attr(&browser, tab, "changes"), "0");
+        assert_eq!(attr(&browser, tab, "frames"), "0");
+        browser.on_event(otlyra_platform::PlatformEvent::VisibilityChanged(true));
+        assert_eq!(attr(&browser, tab, "changes"), "1");
+        assert_eq!(browser.next_frame(), FrameRequest::Vsync);
+        browser.pump();
+        assert_eq!(attr(&browser, tab, "frames"), "1");
+    });
+}
+
+#[test]
 fn a_parser_waiting_for_a_script_receives_visibility_changes_before_resuming() {
     on_content_stack(|| {
         let mut browser = Browser::new(Pages);

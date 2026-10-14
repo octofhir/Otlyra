@@ -181,6 +181,7 @@ enum Command {
     DownloadDirectory(std::path::PathBuf),
     Wake,
     Frame,
+    Visibility(bool),
     Input(Box<Input>),
     Pointer(PointerSlot),
     Files {
@@ -222,6 +223,7 @@ struct Snapshot {
     serial: u64,
     tabs: Vec<WindowTab>,
     active: usize,
+    window_visible: bool,
     labels: Vec<TabLabel>,
     scene: Scene,
     viewport: Viewport,
@@ -297,6 +299,7 @@ pub struct WindowBrowser {
     chrome_description_builds: Option<u64>,
     placeholder_document: Option<(TabId, Option<u64>, String, Arc<accesskit::TreeUpdate>)>,
     visible_dirty: bool,
+    window_visible: bool,
     first_content_received: bool,
     first_content_composed: bool,
     frame_has_content: bool,
@@ -366,6 +369,7 @@ impl WindowBrowser {
                             .collect::<Vec<_>>(),
                         browser.active,
                         browser.mark.clone(),
+                        browser.window_visible,
                     ))
                     .is_err()
                 {
@@ -380,7 +384,7 @@ impl WindowBrowser {
                 }));
                 content_loop(browser, receiver, owner_mailbox, clipboard, viewport);
             })?;
-        let (tabs, active, mark) = initial.recv().map_err(std::io::Error::other)?;
+        let (tabs, active, mark, window_visible) = initial.recv().map_err(std::io::Error::other)?;
         let mut ui = BrowserUi::new();
         ui.address.set_text(tabs[active].url.clone());
         if tabs[active].url.is_empty() {
@@ -390,6 +394,7 @@ impl WindowBrowser {
             serial: 0,
             tabs: tabs.clone(),
             active,
+            window_visible,
             labels: Vec::new(),
             scene: Scene { layers: Vec::new() },
             viewport,
@@ -450,6 +455,7 @@ impl WindowBrowser {
             chrome_description_builds: None,
             placeholder_document: None,
             visible_dirty: true,
+            window_visible,
             first_content_received: false,
             first_content_composed: false,
             frame_has_content: false,
@@ -884,7 +890,12 @@ impl Painter for WindowBrowser {
     }
 
     fn next_frame(&self) -> FrameRequest {
+        if !self.window_visible {
+            // The owner schedules timers itself. Native UI has nothing to draw.
+            return FrameRequest::None;
+        }
         if (self.tabs[self.active].id == self.snapshot.tabs[self.snapshot.active].id
+            && self.snapshot.window_visible
             && self.snapshot.next == FrameRequest::Vsync)
             || self.tabs.iter().any(|tab| tab.loading)
         {
@@ -910,6 +921,14 @@ impl Painter for WindowBrowser {
         self.receive();
         self.accessibility_dirty = true;
         match event {
+            PlatformEvent::VisibilityChanged(visible) => {
+                if self.window_visible != visible {
+                    self.window_visible = visible;
+                    self.visible_dirty = true;
+                    self.pointer_slot = None;
+                    let _ = self.sender.send(Command::Visibility(visible));
+                }
+            }
             PlatformEvent::Woken => {}
             PlatformEvent::SurfaceReady(viewport) | PlatformEvent::Resized(viewport) => {
                 self.ui.dismiss_context_menu();

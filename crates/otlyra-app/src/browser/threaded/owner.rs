@@ -105,6 +105,7 @@ impl Snapshot {
                 .map(|tab| WindowTab::from_tab(tab, browser.world.loading(tab.id)))
                 .collect(),
             active: browser.active,
+            window_visible: browser.window_visible,
             labels: browser
                 .tabs
                 .iter()
@@ -244,6 +245,9 @@ pub(super) fn content_loop(
                     crate::preferences::save(&browser.settings.settings);
                 }
                 Command::Shutdown => return,
+                Command::Visibility(visible) => {
+                    browser.on_event(PlatformEvent::VisibilityChanged(visible));
+                }
                 Command::Wake => {
                     mailbox.lock().unwrap().wake_pending = false;
                 }

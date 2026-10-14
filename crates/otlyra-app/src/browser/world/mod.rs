@@ -75,6 +75,13 @@ pub(super) struct Environment {
     /// The tab the reader is looking at, which is the only one whose script may
     /// send it somewhere else.
     pub(super) active: Option<TabId>,
+    pub(super) window_visible: bool,
+}
+
+impl Environment {
+    fn visible_tab(self) -> Option<TabId> {
+        self.active.filter(|_| self.window_visible)
+    }
 }
 
 /// Something the pages did that the window has to act on.
@@ -180,15 +187,16 @@ impl PageWorld {
 
     /// Take the window's preferences and size as they stand now.
     pub(super) fn set_environment(&mut self, environment: Environment) {
-        let previous = self.environment.active;
+        let previous = self.environment.visible_tab();
         self.environment = environment;
-        if previous != environment.active {
+        let visible = environment.visible_tab();
+        if previous != visible {
             // Hide the old page before exposing the new one. This runs between
             // turns on content's owner, including when input is batched.
             if let Some(tab) = previous {
                 self.set_hidden(tab, true);
             }
-            if let Some(tab) = environment.active {
+            if let Some(tab) = visible {
                 self.set_hidden(tab, false);
             }
         }
@@ -292,7 +300,7 @@ impl PageWorld {
 
     /// Whether `tab`'s page has asked for an animation frame.
     pub(super) fn frames_pending(&self, tab: TabId) -> bool {
-        self.environment.active == Some(tab)
+        self.environment.visible_tab() == Some(tab)
             && self
                 .slots
                 .get(&tab)
@@ -373,7 +381,7 @@ impl PageWorld {
         let timestamp = self.started.elapsed().as_secs_f64() * 1000.0;
         let Some(slot) = self
             .environment
-            .active
+            .visible_tab()
             .and_then(|tab| self.slots.get_mut(&tab))
         else {
             return false;

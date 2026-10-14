@@ -133,8 +133,11 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   including the first script and paused parsers; dispatch `visibilitychange`
   on content's owner. Retain hidden rAF callbacks until activation and exclude
   inactive slots from frame execution and Vsync requests.
-- [ ] Extend visibility to native window occlusion/minimization and define
-  background timer budgets/exemptions. Timers currently continue normally.
+- [x] Propagate confirmed native window occlusion/minimization to content's
+  visibility. Stop hidden native raster/Vsync, preserve unpresented damage and
+  restore at the latest viewport. Unfocused visible windows remain visible.
+- [ ] Define background timer budgets/exemptions and defer unnecessary hidden
+  content layout/publication. Timers currently continue normally.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

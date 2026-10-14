@@ -46,7 +46,8 @@ owner still serializes tabs and inspector work. The retained-damage follow-up
 below now accumulates partial updates through render acknowledgements;
 Chrome accessibility now retains unchanged document nodes and publishes deltas
 as described below. Tab visibility and background rAF now follow the
-[visibility contract](#tab-visibility-follow-up). Native window occlusion, independent scrolling,
+[visibility contract](#tab-visibility-follow-up) and
+[native window propagation](#native-window-visibility-follow-up). Independent scrolling,
 content/raster interruption and shutdown persistence remain explicit follow-ups.
 An early UI-only frame can be shown before content is ready. Startup reporting
 uses the readiness captured on the submitted render job, so late content receipt
@@ -215,9 +216,57 @@ the working Otter checkout was not edited.
 
 This removes unnecessary background animation execution; it is not an
 end-to-end CPU, energy or native input-to-present benchmark. Native window
-occlusion/minimization is not wired to document visibility yet. Timer budgets,
+occlusion/minimization is implemented by the follow-up below. Timer budgets,
 media exemptions and visibility performance entries remain follow-ups. One
 content owner still serializes page tasks and visibility listeners.
+
+## Native window visibility follow-up
+
+Native window visibility now reaches content through an ordered, window-wide
+command. UI immediately stops its Vsync requests while the owner is busy; stale
+snapshots cannot reactivate the hidden window. Quick hide/show transitions retain
+their visibility events, and duplicate states produce no extra event. Tab
+selection stays independent: switching inside a hidden window exposes no page,
+and restoration exposes only the selected tab. New documents loaded while hidden
+report hidden in their first script.
+
+The native loop uses confirmed occlusion and minimized state, preserving unknown
+query results. Focus loss does not hide a visible window. On macOS, winit maps
+AppKit's occlusion-state changes to `Occluded`; minimize/restore is queried during
+native resize, focus, occlusion and redraw events. Platform support is bounded by
+the pinned winit version: occlusion is unavailable on Windows/Wayland, and the
+minimized query returns unknown on Wayland. Those unknown states are not inferred
+from focus or zero-sized drawable geometry.
+[Pinned event source](https://github.com/rust-windowing/winit/blob/7d20408d33210c93bf036335b88ee083ca563a90/winit-core/src/event.rs),
+[window state query](https://github.com/rust-windowing/winit/blob/7d20408d33210c93bf036335b88ee083ca563a90/winit-core/src/window.rs),
+[AppKit bridge](https://github.com/rust-windowing/winit/blob/7d20408d33210c93bf036335b88ee083ca563a90/winit-appkit/src/window_delegate.rs).
+
+Known-hidden redraw requests submit no raster jobs. Old visual deadlines and
+unsubmitted redraws are cancelled; the painter retains its pending damage.
+A job already submitted still reports, releasing the flight slot. A completion
+while hidden does not acknowledge presentation or satisfy the startup report.
+Restoration requests a fresh frame at the current native viewport, keeping the
+existing one-job limit. For synchronous painters, timer deadlines wake their
+event pump without painting; WindowBrowser's owner schedules its timers itself.
+Non-advancing visual deadlines are discarded while hidden to prevent a busy loop.
+
+Tests exercise real JavaScript visibility/rAF/timers and the native command
+boundary while content is blocked. Forty hidden pumps execute no rAF callbacks.
+A controlled render worker also receives no extra job during forty hidden redraws;
+its late completion retains damage, and restoration uses the latest viewport.
+Other checks cover loading without spinner Vsync, initial hidden state, tab
+changes, duplicate/rapid transitions, unknown native queries and hidden timer
+deadlines. These are deterministic protocol checks rather than an energy or
+input-to-present benchmark; manual native minimize/restore is not part of them.
+
+Verification: 1,778 workspace Rust tests passed, plus the opt-in native GPU/CPU
+startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
+passed against the same immutable Otter snapshot; its working checkout was not
+edited. These checks do not establish a new startup latency distribution.
+
+Timers and resource loads continue. The owner can still lay out and publish
+timer-driven document changes while hidden. Timer budgets, exemptions, deferred
+hidden scene preparation and interruptible content tasks remain separate work.
 
 ## What the reference browsers do
 

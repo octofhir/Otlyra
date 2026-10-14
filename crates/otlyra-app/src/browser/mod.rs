@@ -68,6 +68,8 @@ pub struct Browser {
     /// browser's: the page has to start at the top of the picture, or every
     /// comparison is a comparison of two toolbars.
     interface: bool,
+    /// Native visibility, independent of which tab is selected.
+    window_visible: bool,
     /// Whether the pointer is taking a selection across the page.
     ///
     /// A press on the text starts one and the release ends it, so that a drag that
@@ -230,6 +232,7 @@ impl Browser {
                         color_scheme: otlyra_css::cascade::ColorScheme::Light,
                     },
                     active: None,
+                    window_visible: true,
                 },
             ),
             text,
@@ -239,6 +242,7 @@ impl Browser {
             closed_tabs: std::collections::VecDeque::new(),
             load_started: std::time::Instant::now(),
             interface: true,
+            window_visible: true,
             selecting: false,
             last_width: 1024.0,
             last_height: 768.0,

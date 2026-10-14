@@ -424,7 +424,7 @@ impl PageWorld {
         let parsed = match &sniffed {
             kind if kind.is_document() => {
                 let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
-                scripts.set_initial_hidden(self.environment.active != Some(tab));
+                scripts.set_initial_hidden(self.environment.visible_tab() != Some(tab));
                 let started = otlyra_html::start_parse(
                     &loaded.bytes,
                     loaded.charset.as_deref(),

@@ -152,6 +152,9 @@ pub enum PlatformEvent {
     SurfaceReady(Viewport),
     /// The drawable changed size, the scale factor changed, or both.
     Resized(Viewport),
+    /// Whether the native window can be seen. Unfocused windows can still be
+    /// visible; only confirmed occlusion or minimization hides a document.
+    VisibilityChanged(bool),
     /// The user scrolled, by this many **logical** pixels. Positive `y` means the
     /// reader is going *down* the page — the scroll offset grows.
     ///

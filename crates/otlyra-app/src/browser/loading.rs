@@ -112,6 +112,7 @@ impl Browser {
             interface: self.interface,
             viewport: self.picture_viewport(),
             active: self.tabs.get(self.active).map(|tab| tab.id),
+            window_visible: self.window_visible,
         }
     }
 

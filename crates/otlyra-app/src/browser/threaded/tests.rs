@@ -5,9 +5,8 @@ use std::time::Duration;
 
 mod accessibility;
 
-#[test]
-fn projected_tab_commands_update_visibility_on_the_content_owner() {
-    use crate::browser::visibility_tests::{HTML, attr};
+fn animated_window(viewport: Viewport) -> WindowBrowser {
+    use crate::browser::visibility_tests::HTML;
     struct Animated;
     impl Loader for Animated {
         fn load(&self, url: &str) -> Result<Loaded, String> {
@@ -19,14 +18,19 @@ fn projected_tab_commands_update_visibility_on_the_content_owner() {
             })
         }
     }
-    let viewport = Viewport::new(800, 600, 1.0);
-    let mut window = WindowBrowser::spawn(viewport, true, |text| {
+    WindowBrowser::spawn(viewport, true, |text| {
         let mut browser =
             Browser::with_fetcher_and_text(Fetcher::spawn(Animated), Default::default(), text);
         browser.navigate("https://visibility.test/");
         browser
     })
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn projected_tab_commands_update_visibility_on_the_content_owner() {
+    use crate::browser::visibility_tests::attr;
+    let mut window = animated_window(Viewport::new(800, 600, 1.0));
     ready(&mut window);
     let tab = window.tabs[0].id;
     window.apply(UiAction::NewTab);
@@ -62,6 +66,77 @@ fn projected_tab_commands_update_visibility_on_the_content_owner() {
         })))
         .unwrap();
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn native_visibility_is_nonblocking_and_ordered_while_content_is_busy() {
+    use crate::browser::visibility_tests::attr;
+    let mut window = animated_window(Viewport::new(800, 600, 1.0));
+    ready(&mut window);
+    let tab = window.tabs[0].id;
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |_| {
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(3)).unwrap();
+        })))
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(window.next_frame(), FrameRequest::Vsync);
+    let started = Instant::now();
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    assert_eq!(
+        window.next_frame(),
+        FrameRequest::None,
+        "stale content Vsync must not animate a hidden native window"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "visibility must not wait for content"
+    );
+    release.send(()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            assert_eq!(std::thread::current().name(), Some("otlyra-content"));
+            assert_eq!(attr(browser, tab, "visibility"), "hidden");
+            assert_eq!(attr(browser, tab, "changes"), "1");
+            let frames = attr(browser, tab, "frames");
+            for _ in 0..40 {
+                browser.pump();
+            }
+            assert_eq!(attr(browser, tab, "frames"), frames);
+            assert_eq!(attr(browser, tab, "timer"), "true");
+            tx.send(()).unwrap();
+        })))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait(&mut window, |window| !window.snapshot.window_visible);
+    window.on_event(PlatformEvent::VisibilityChanged(true));
+    window.on_event(PlatformEvent::VisibilityChanged(false));
+    window.on_event(PlatformEvent::VisibilityChanged(true));
+    window.on_event(PlatformEvent::VisibilityChanged(true));
+    let (tx, rx) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            assert_eq!(attr(browser, tab, "visibility"), "visible");
+            assert_eq!(
+                attr(browser, tab, "changes"),
+                "4",
+                "quick transitions must not be coalesced into their final state"
+            );
+            assert_eq!(browser.next_frame(), FrameRequest::Vsync);
+            tx.send(()).unwrap();
+        })))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait(&mut window, |window| window.snapshot.window_visible);
+    assert_eq!(window.next_frame(), FrameRequest::Vsync);
 }
 
 const PAGE: &str = r#"<!doctype html><title>Page</title><body style="margin:0;background:#fff">

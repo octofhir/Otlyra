@@ -173,6 +173,32 @@ struct FrameScheduler {
     deadline: Option<std::time::Instant>,
 }
 
+/// Focus does not affect visibility. Unsupported native queries leave the
+/// last known state alone rather than guessing that an unfocused window hides.
+#[derive(Copy, Clone, Debug, Default)]
+struct WindowVisibility {
+    occluded: bool,
+    minimized: bool,
+}
+
+impl WindowVisibility {
+    fn visible(self) -> bool {
+        !self.occluded && !self.minimized
+    }
+
+    fn update(&mut self, occluded: Option<bool>, minimized: Option<bool>) -> Option<bool> {
+        let previous = self.visible();
+        if let Some(occluded) = occluded {
+            self.occluded = occluded;
+        }
+        if let Some(minimized) = minimized {
+            self.minimized = minimized;
+        }
+        let visible = self.visible();
+        (previous != visible).then_some(visible)
+    }
+}
+
 impl FrameScheduler {
     /// Record one request. `true` means winit needs a new redraw request now.
     ///
@@ -309,6 +335,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         first_frame: None,
         startup_report_written: false,
         scheduler: FrameScheduler::default(),
+        visibility: WindowVisibility::default(),
         work: WorkCounters::default(),
         modifiers: crate::Modifiers::default(),
         pointer: (-1.0, -1.0),
@@ -366,6 +393,7 @@ struct WindowedApp<'p> {
     startup_report_written: bool,
     /// The only owner of redraw requests and animation deadlines.
     scheduler: FrameScheduler,
+    visibility: WindowVisibility,
     /// Cumulative work, logged with every presented frame.
     work: WorkCounters,
     /// Modifier state, tracked here because winit reports it as its own event and
@@ -466,11 +494,22 @@ impl WindowedApp<'_> {
 
         self.sync_window_appearance();
         self.request_frame(request);
+        if !self.visibility.visible() {
+            self.request_frame(self.painter.next_frame());
+        }
     }
 
     /// The one place that calls winit's `request_redraw`.
     fn request_frame(&mut self, request: FrameRequest) {
         tracing::trace!(?request, "frame requested");
+        if !self.visibility.visible() {
+            match request {
+                FrameRequest::Now | FrameRequest::Vsync => {}
+                FrameRequest::At(deadline) => self.scheduler.set_deadline(deadline),
+                FrameRequest::None => {}
+            }
+            return;
+        }
         if !self.scheduler.request(request, std::time::Instant::now()) {
             return;
         }
@@ -478,6 +517,9 @@ impl WindowedApp<'_> {
     }
 
     fn issue_redraw(&mut self) {
+        if !self.visibility.visible() {
+            return;
+        }
         // State may change while the GPU device is being requested. The first
         // frame after the render thread is ready observes all of it; rasterizing
         // before there is somewhere to present would only burn startup time.
@@ -497,6 +539,56 @@ impl WindowedApp<'_> {
         match self.scheduler.deadline {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn wake_due(&mut self, now: std::time::Instant) {
+        if self.visibility.visible() {
+            if self.scheduler.wake_due(now) {
+                self.issue_redraw();
+            }
+        } else if self
+            .scheduler
+            .deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.scheduler.deadline = None;
+            // A synchronous painter can have timers even with no native frames.
+            // WindowBrowser's content owner schedules its own timers instead.
+            self.deliver(PlatformEvent::Woken);
+            if self
+                .scheduler
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                // Visual painters may advance their clock only when painting.
+                // Repeating the same overdue deadline would spin while hidden.
+                // Timers newly armed by this turn have a later deadline.
+                self.scheduler.deadline = None;
+            }
+        }
+    }
+
+    fn sync_visibility(&mut self, occluded: Option<bool>) {
+        let minimized = self
+            .window
+            .as_ref()
+            .and_then(|window| window.is_minimized());
+        self.update_visibility(occluded, minimized);
+    }
+
+    fn update_visibility(&mut self, occluded: Option<bool>, minimized: Option<bool>) {
+        let Some(visible) = self.visibility.update(occluded, minimized) else {
+            return;
+        };
+        // Visible animation deadlines no longer apply after a transition.
+        // A submitted frame still has to report before a successor can start.
+        self.scheduler.deadline = None;
+        self.scheduler.redraw_pending = false;
+        self.deliver(PlatformEvent::VisibilityChanged(visible));
+        if visible {
+            self.dropped_frames = 0;
+            self.request_frame(FrameRequest::Now);
         }
     }
 
@@ -540,6 +632,9 @@ impl WindowedApp<'_> {
     /// this returns as soon as the frame is handed over. What became of it
     /// arrives later as a [`RenderReport`].
     fn redraw(&mut self, viewport: Viewport) -> Result<(), PlatformError> {
+        if !self.visibility.visible() {
+            return Ok(());
+        }
         if !self.render_ready {
             self.scheduler.redraw_pending = false;
             return Ok(());
@@ -626,14 +721,12 @@ impl WindowedApp<'_> {
         self.sync_control_flow(event_loop);
     }
 
-    /// The frame in flight is done: account for it, and build the next one if
-    /// anything asked for it meanwhile.
-    fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
-        self.painter
-            .frame_complete(frame.outcome == Presented::Frame);
-        if frame.outcome == Presented::Frame
-            && let Some(trace) = frame.trace.as_ref()
-        {
+    /// Complete the submitted job without consuming damage if the window hid
+    /// before its report arrived. The render job still releases its flight slot.
+    fn complete_frame(&mut self, frame: &FrameReport) -> (bool, bool) {
+        let presented = frame.outcome == Presented::Frame && self.visibility.visible();
+        self.painter.frame_complete(presented);
+        if presented && let Some(trace) = frame.trace.as_ref() {
             trace.mark("first_frame_report_received");
         }
         let owed = self.scheduler.frame_done();
@@ -641,12 +734,23 @@ impl WindowedApp<'_> {
             .work
             .rasterized_pixels
             .saturating_add(frame.rasterized_pixels);
+        (presented, owed)
+    }
+
+    /// The frame in flight is done: account for it, and build the next one if
+    /// anything asked for it meanwhile.
+    fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
+        let (presented, owed) = self.complete_frame(&frame);
 
         match frame.outcome {
             Presented::Frame | Presented::Occluded => {
                 self.dropped_frames = 0;
                 if let Err(error) = self.after_present(
-                    frame.outcome,
+                    if presented {
+                        Presented::Frame
+                    } else {
+                        Presented::Occluded
+                    },
                     frame.viewport,
                     frame.uploaded_bytes,
                     &frame.trace,
@@ -864,9 +968,7 @@ impl ApplicationHandler for WindowedApp<'_> {
             }
         }
 
-        if self.scheduler.wake_due(std::time::Instant::now()) {
-            self.issue_redraw();
-        }
+        self.wake_due(std::time::Instant::now());
         self.sync_control_flow(event_loop);
     }
 
@@ -969,6 +1071,7 @@ impl ApplicationHandler for WindowedApp<'_> {
         }
 
         window.set_visible(true);
+        self.deliver(PlatformEvent::VisibilityChanged(true));
         // A window that is key the moment it shows says nothing about it, and
         // the adapter publishes nothing until it hears the window has focus.
         if let Some(a11y) = self.a11y.as_mut() {
@@ -1024,6 +1127,7 @@ impl ApplicationHandler for WindowedApp<'_> {
             // Both mean the same thing above us: the drawable changed. winit
             // separates them because scale and pixel size can change alone.
             WindowEvent::SurfaceResized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.sync_visibility(None);
                 let viewport = self.viewport();
                 self.work.events_delivered += 1;
                 let request = self.painter.handle_event(PlatformEvent::Resized(viewport));
@@ -1031,14 +1135,23 @@ impl ApplicationHandler for WindowedApp<'_> {
                     FrameRequest::None => FrameRequest::Now,
                     request => request,
                 });
+                if !self.visibility.visible() {
+                    self.request_frame(self.painter.next_frame());
+                }
             }
             // The window became visible or came to the front. Both mean the last
             // frame may never have reached the screen — a swapchain hands back an
             // occluded texture and the paint goes nowhere — and in a loop that
             // blocks in `Wait` nothing else will ask for another one.
-            WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
-                self.dropped_frames = 0;
-                self.request_frame(FrameRequest::Now);
+            WindowEvent::Occluded(occluded) => {
+                self.sync_visibility(Some(occluded));
+            }
+            WindowEvent::Focused(focused) => {
+                self.sync_visibility(None);
+                if focused {
+                    self.dropped_frames = 0;
+                    self.request_frame(FrameRequest::Now);
+                }
             }
             WindowEvent::ThemeChanged(theme) => {
                 // While the window is pinned, this event is our own pin coming
@@ -1134,6 +1247,7 @@ impl ApplicationHandler for WindowedApp<'_> {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.sync_visibility(None);
                 if let Err(error) = self.redraw(self.viewport()) {
                     self.fail(event_loop, error);
                 }
@@ -1260,15 +1374,31 @@ mod tests {
     struct InputScene {
         events: u64,
         resized: Option<Viewport>,
+        observed: Vec<PlatformEvent>,
+        completions: Vec<bool>,
+        deadline: Option<std::time::Instant>,
+        rearm: Option<std::time::Instant>,
     }
 
     impl Painter for InputScene {
         fn handle_event(&mut self, event: PlatformEvent) -> FrameRequest {
             self.events += 1;
+            self.observed.push(event);
+            if event == PlatformEvent::Woken {
+                self.deadline = self.rearm.take();
+            }
             if let PlatformEvent::Resized(viewport) = event {
                 self.resized = Some(viewport);
             }
             FrameRequest::Now
+        }
+
+        fn next_frame(&self) -> FrameRequest {
+            self.deadline.map_or(FrameRequest::None, FrameRequest::At)
+        }
+
+        fn frame_complete(&mut self, presented: bool) {
+            self.completions.push(presented);
         }
 
         fn compose(&mut self, viewport: Viewport) -> Option<crate::Scene> {
@@ -1296,6 +1426,203 @@ mod tests {
         fn paint(&mut self, _: &mut dyn otlyra_gfx::PaintTarget, _: Viewport) {
             panic!("the scene path must run on the worker");
         }
+    }
+
+    fn test_app(painter: &mut dyn Painter, render: Option<RenderThread>) -> WindowedApp<'_> {
+        let config = WindowConfig::default();
+        let startup_origin = config.startup_origin;
+        let (sender, inbox) = mpsc::channel();
+        WindowedApp {
+            config,
+            painter,
+            a11y: None,
+            render_ready: render.is_some(),
+            render,
+            window: None,
+            mailbox: Mailbox {
+                sender,
+                proxy: EventLoopProxy::new(Arc::new(TestProxy)),
+            },
+            inbox,
+            whole_surface: SceneCompositor::new(),
+            menu: None,
+            frames: 0,
+            startup_origin,
+            window_visible: None,
+            first_frame: None,
+            startup_report_written: false,
+            scheduler: FrameScheduler::default(),
+            visibility: WindowVisibility::default(),
+            work: WorkCounters::default(),
+            modifiers: crate::Modifiers::default(),
+            pointer: (-1.0, -1.0),
+            last_press: None,
+            cursor: crate::Cursor::default(),
+            pinned_scheme: None,
+            dropped_frames: 0,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn native_occlusion_and_minimization_must_both_clear_before_resuming() {
+        let mut visibility = WindowVisibility::default();
+        assert_eq!(visibility.update(Some(true), None), Some(false));
+        assert_eq!(visibility.update(Some(true), Some(true)), None);
+        assert_eq!(
+            visibility.update(Some(false), None),
+            None,
+            "unknown minimized state must not expose a minimized window"
+        );
+        assert_eq!(visibility.update(None, Some(false)), Some(true));
+        assert_eq!(
+            visibility.update(None, None),
+            None,
+            "focus alone changes no visibility state"
+        );
+        assert_eq!(visibility.update(None, Some(true)), Some(false));
+        assert_eq!(visibility.update(Some(false), Some(false)), Some(true));
+    }
+
+    #[test]
+    fn hidden_redraws_submit_no_jobs_and_restore_uses_the_latest_viewport() {
+        use std::time::{Duration, Instant};
+        let (submitted, jobs) = mpsc::channel();
+        let render = RenderThread::controlled(move |job| {
+            submitted.send(job.viewport).unwrap();
+            FrameReport {
+                outcome: Presented::Frame,
+                viewport: job.viewport,
+                rasterized_pixels: 0,
+                uploaded_bytes: 0,
+                trace: None,
+                startup_ready: true,
+            }
+        });
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, Some(render));
+        let initial = Viewport::new(800, 600, 1.0);
+        let latest = Viewport::new(2000, 1200, 2.0);
+        app.redraw(initial).unwrap();
+        assert_eq!(jobs.recv_timeout(Duration::from_secs(2)).unwrap(), initial);
+        app.scheduler.deadline = Some(Instant::now() + Duration::from_secs(1));
+        app.update_visibility(Some(true), Some(false));
+        assert_eq!(app.scheduler.deadline, None);
+        app.deliver(PlatformEvent::Resized(latest));
+        for _ in 0..40 {
+            app.deliver(PlatformEvent::PointerMoved { x: 40.0, y: 20.0 });
+            app.request_frame(FrameRequest::Vsync);
+            app.redraw(latest).unwrap();
+        }
+        assert_eq!(
+            app.work.frames_started, 1,
+            "hidden input/animation must submit no raster jobs"
+        );
+        assert!(jobs.try_recv().is_err());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = loop {
+            if let Some(RenderReport::Frame(frame)) = app.render.as_ref().unwrap().try_report() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            app.complete_frame(&report),
+            (false, false),
+            "a completion after hiding releases flight without consuming damage"
+        );
+        app.after_present(Presented::Occluded, report.viewport, 0, &None, true)
+            .unwrap();
+        assert!(
+            app.first_frame.is_none(),
+            "a hidden completion cannot satisfy startup"
+        );
+        assert!(!app.scheduler.in_flight);
+        app.update_visibility(Some(false), Some(false));
+        app.redraw(latest).unwrap();
+        assert_eq!(jobs.recv_timeout(Duration::from_secs(2)).unwrap(), latest);
+        assert_eq!(app.work.frames_started, 2);
+        drop(app);
+        assert_eq!(painter.completions, [false]);
+        assert_eq!(
+            painter
+                .observed
+                .iter()
+                .filter(|event| matches!(event, PlatformEvent::VisibilityChanged(_)))
+                .copied()
+                .collect::<Vec<_>>(),
+            [
+                PlatformEvent::VisibilityChanged(false),
+                PlatformEvent::VisibilityChanged(true)
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_timer_deadlines_wake_the_painter_without_a_frame() {
+        let now = std::time::Instant::now();
+        let next = now + std::time::Duration::from_secs(1);
+        let mut painter = InputScene {
+            deadline: Some(now),
+            rearm: Some(next),
+            ..Default::default()
+        };
+        let mut app = test_app(&mut painter, None);
+        app.update_visibility(Some(true), None);
+        assert_eq!(app.scheduler.deadline, Some(now));
+        app.wake_due(now);
+        assert_eq!(
+            app.scheduler.deadline,
+            Some(next),
+            "a timer rearmed by this turn must keep its next wake"
+        );
+        assert!(!app.scheduler.redraw_pending);
+        assert_eq!(app.work.frames_started, 0);
+        assert_eq!(app.work.redraw_requests, 0);
+        app.wake_due(now);
+        app.wake_due(next);
+        assert_eq!(app.scheduler.deadline, None);
+        drop(app);
+        assert_eq!(
+            painter.observed,
+            [
+                PlatformEvent::VisibilityChanged(false),
+                PlatformEvent::Woken,
+                PlatformEvent::Woken
+            ]
+        );
+    }
+
+    #[test]
+    fn a_visual_deadline_that_requires_painting_does_not_spin_while_hidden() {
+        struct PaintDeadline(std::time::Instant);
+        impl Painter for PaintDeadline {
+            fn handle_event(&mut self, _: PlatformEvent) -> FrameRequest {
+                FrameRequest::None
+            }
+            fn next_frame(&self) -> FrameRequest {
+                FrameRequest::At(self.0)
+            }
+            fn paint(&mut self, _: &mut dyn otlyra_gfx::PaintTarget, _: Viewport) {
+                panic!("hidden deadlines must not paint");
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut painter = PaintDeadline(now);
+        let mut app = test_app(&mut painter, None);
+        app.update_visibility(Some(true), None);
+        app.wake_due(now);
+        assert_eq!(app.scheduler.deadline, None);
+        assert_eq!(app.work.events_delivered, 2);
+        for _ in 0..40 {
+            app.wake_due(now);
+        }
+        assert_eq!(
+            app.work.events_delivered, 2,
+            "one consumed visual deadline must not create repeated wakes"
+        );
+        assert_eq!(app.work.frames_started, 0);
     }
 
     #[test]
@@ -1346,6 +1673,7 @@ mod tests {
                 first_frame: None,
                 startup_report_written: false,
                 scheduler: FrameScheduler::default(),
+                visibility: WindowVisibility::default(),
                 work: WorkCounters::default(),
                 modifiers: crate::Modifiers::default(),
                 pointer: (-1.0, -1.0),
@@ -1431,6 +1759,7 @@ mod tests {
             first_frame: None,
             startup_report_written: false,
             scheduler: FrameScheduler::default(),
+            visibility: WindowVisibility::default(),
             work: WorkCounters::default(),
             modifiers: crate::Modifiers::default(),
             pointer: (-1.0, -1.0),

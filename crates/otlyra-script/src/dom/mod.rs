@@ -93,7 +93,7 @@ pub struct PageState {
     frames_owed: bool,
     /// Whether the parser has finished, which is what `readyState` reports.
     ready: bool,
-    /// Whether this document is in a background tab.
+    /// Whether this document's tab or native window is hidden.
     hidden: bool,
     /// Where the page's script thinks it is. `location` is built from it.
     document_url: String,

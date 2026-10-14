@@ -32,6 +32,13 @@ impl Painter for Browser {
     /// tab wakes the loop when its model changes rather than driving the window
     /// at display pace.
     fn next_frame(&self) -> FrameRequest {
+        if !self.window_visible {
+            // Timers still have work to do, but loading marks and carets have
+            // no display to animate. The content owner waits on this deadline.
+            return self
+                .next_timer_deadline()
+                .map_or(FrameRequest::None, FrameRequest::At);
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return FrameRequest::None;
         };
@@ -153,6 +160,10 @@ impl Painter for Browser {
 
     fn on_event(&mut self, event: PlatformEvent) {
         match event {
+            PlatformEvent::VisibilityChanged(visible) => {
+                self.window_visible = visible;
+                self.sync_world();
+            }
             // Background work finished: a fetch or an attachment write. What it
             // was is the browser's business; the loop only knows it should ask.
             PlatformEvent::Woken => {
