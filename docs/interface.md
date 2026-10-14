@@ -192,6 +192,18 @@ rescaled once per list/scale pair during DPI changes. The owner sleeps on its
 inbox or the next content deadline; it does not poll. Closing UI signals the
 owner without joining a running script turn.
 
+Partial content damage survives scene coalescing. Overwritten mailbox results
+and received UI scenes accumulate the union of unacknowledged rectangles;
+unknown damage dominates, while an unchanged epoch adds no new damage.
+`Painter::frame_complete` confirms the last submitted frame before its successor
+is composed. The native render report and the offscreen FramePump use that same
+boundary. Only successful presentation clears cached damage with matching tab,
+viewport, layer, epoch and rectangle; newer cached content keeps its damage.
+Dropped/occluded frames keep pending damage and the renderer discards its retained
+baseline. Tab activation, layer changes, viewport changes and cached DPI scaling
+keep full damage where a partial rectangle cannot describe the transition.
+The implementation retains one rectangle per cached layer, not a frame history.
+
 `content_owner_ready`, `first_content_scene_ready`,
 `first_content_scene_received` and `first_content_scene_composed` separate
 construction, publication, receipt and use in a native frame. Receipt intervals
@@ -205,10 +217,10 @@ records the earlier UI accounting separately. Strict budgets remain unchanged.
 
 This is one content owner per window: pages, system tabs and inspector work can
 still wait for another page's turn. Native live BiDi attachment, hidden-page
-scheduling, interruptible content/raster work, incremental damage acknowledgements,
+scheduling, interruptible content/raster work,
 incremental accessibility updates and durable nonblocking shutdown persistence
-remain follow-ups. Async content currently reports full layer damage for changed
-epochs so dropping an intermediate scene cannot leave stale pixels.
+remain follow-ups. Independent compositor scrolling and display-driven frame
+deadlines remain separate from preserving partial damage.
 
 ## Things that cost a stage to learn
 

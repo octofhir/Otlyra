@@ -656,6 +656,7 @@ impl FramePump {
                 Damage::Full
             }
         };
+        painter.frame_complete(true);
         self.damage = damage.clone();
         Ok(damage)
     }

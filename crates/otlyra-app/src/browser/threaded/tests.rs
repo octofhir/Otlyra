@@ -733,3 +733,488 @@ fn inspector_search_keeps_its_keyboard_shortcut() {
     assert_eq!(window.tabs.len(), 2);
     assert_eq!(window.active, 1);
 }
+
+struct Fields;
+impl Loader for Fields {
+    fn load(&self, url: &str) -> Result<Loaded, String> {
+        Ok(Loaded {
+            bytes: br#"<!doctype html><title>Fields</title><body style="margin:0;background:white">
+<input id=left value=left style="position:absolute;left:40px;top:40px;width:240px;height:32px">
+<button id=right style="position:absolute;left:400px;top:200px;width:240px;height:32px">remote button</button>"#.to_vec(),
+            content_type: Some("text/html".into()),
+            final_url: url.into(),
+            ..Default::default()
+        })
+    }
+}
+
+fn fields_window(viewport: Viewport) -> WindowBrowser {
+    let mut window = WindowBrowser::spawn(viewport, true, move |text| {
+        let mut browser =
+            Browser::with_fetcher_and_text(Fetcher::spawn(Fields), Default::default(), text);
+        browser.navigate("https://fields.example/");
+        browser
+    })
+    .unwrap();
+    ready(&mut window);
+    // Focusing a control may change styles/layout. Establish that state before
+    // measuring subsequent field-only edits.
+    edit_field(&window, "#left", "prepared");
+    wait_pending_field(&window, "prepared");
+    window.receive();
+    window
+}
+
+fn edit_field(window: &WindowBrowser, selector: &'static str, text: &'static str) {
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            let page = browser.active_page_mut().unwrap();
+            let node = otlyra_css::stylo_dom::select(page.document(), selector).unwrap()[0];
+            page.focus_node(node);
+            page.select_all();
+            page.typed(text);
+            browser.activate_surface(super::super::SURFACE_PAGE);
+            browser.accessibility_dirty = true;
+        })))
+        .unwrap();
+}
+
+fn wait_pending_field(window: &WindowBrowser, value: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if window
+            .mailbox
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot
+                    .document
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.value() == Some(value))
+            })
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "field update was not published");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_pending_epoch(window: &WindowBrowser, previous: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if window
+            .mailbox
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.scene.layers[0].epoch != previous)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "scene update was not published");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct ResumeOwner(mpsc::Sender<()>);
+impl Drop for ResumeOwner {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+fn pause_owner(window: &WindowBrowser) -> ResumeOwner {
+    let (started, start_rx) = mpsc::channel();
+    let (resume, gate) = mpsc::channel();
+    window
+        .sender
+        .send(Command::Task(Box::new(move |_| {
+            started.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+        })))
+        .unwrap();
+    start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    ResumeOwner(resume)
+}
+
+fn assert_full_pixels(window: &mut WindowBrowser, pump: &mut FramePump, viewport: Viewport) {
+    let actual = pump.pixels().unwrap();
+    let mut whole = FramePump::new(viewport);
+    whole.frame(window).unwrap();
+    assert_eq!(
+        actual,
+        whole.pixels().unwrap(),
+        "partial raster must match a fresh surface"
+    );
+}
+
+#[test]
+fn field_damage_survives_coalesced_publications_at_both_scales() {
+    for scale in [1.0, 2.0] {
+        let viewport = Viewport::new((900.0 * scale) as u32, (640.0 * scale) as u32, scale);
+        let mut window = fields_window(viewport);
+        let mut pump = FramePump::new(viewport);
+        pump.frame(&mut window).unwrap();
+        edit_field(&window, "#left", "first change");
+        wait_pending_field(&window, "first change");
+        // UI intentionally does not receive the first changed publication.
+        edit_field(&window, "#left", "second change");
+        wait_pending_field(&window, "second change");
+        let resume = pause_owner(&window);
+        let began = Instant::now();
+        let damage = pump.frame(&mut window).unwrap();
+        let otlyra_platform::Damage::Region(rect) = damage else {
+            panic!("expected partial damage: {damage:?}");
+        };
+        let pixels = u64::from(rect.width) * u64::from(rect.height);
+        assert!(pixels < u64::from(viewport.width) * u64::from(viewport.height) / 2);
+        eprintln!(
+            "coalesced_fields scale={scale} pixels={pixels} frame_ms={:.2}",
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+        assert_full_pixels(&mut window, &mut pump, viewport);
+        assert!(
+            window.scenes[&window.tabs[window.active].id]
+                .1
+                .layers
+                .iter()
+                .all(|layer| layer.dirty.is_some_and(|rect| rect.is_empty()))
+        );
+        drop(resume);
+
+        edit_field(&window, "#left", "small update");
+        wait_pending_field(&window, "small update");
+        let _resume = pause_owner(&window);
+        let began = Instant::now();
+        let damage = pump.frame(&mut window).unwrap();
+        let otlyra_platform::Damage::Region(rect) = damage else {
+            panic!("expected field damage: {damage:?}");
+        };
+        let pixels = u64::from(rect.width) * u64::from(rect.height);
+        assert!(pixels < u64::from(viewport.width) * u64::from(viewport.height) / 10);
+        eprintln!(
+            "single_field scale={scale} pixels={pixels} frame_ms={:.2}",
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+        assert_full_pixels(&mut window, &mut pump, viewport);
+    }
+}
+
+#[test]
+fn completion_preserves_newer_damage_and_a_dropped_frame() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = fields_window(viewport);
+    let mut pump = FramePump::new(viewport);
+    pump.frame(&mut window).unwrap();
+    edit_field(&window, "#left", "in flight");
+    wait_pending_field(&window, "in flight");
+    window.compose(viewport).unwrap();
+    edit_field(&window, "#left", "newer scene");
+    wait_pending_field(&window, "newer scene");
+    let _resume = pause_owner(&window);
+    window.receive();
+    window.frame_complete(true);
+    let tab = window.tabs[window.active].id;
+    assert!(
+        window.scenes[&tab].1.layers[0]
+            .dirty
+            .is_some_and(|rect| !rect.is_empty())
+    );
+    let submitted = window.compose(viewport).unwrap();
+    window.frame_complete(false);
+    assert_eq!(
+        window.scenes[&tab].1.layers[0].dirty,
+        submitted.layers[0].dirty
+    );
+    pump.frame(&mut window).unwrap();
+    assert_full_pixels(&mut window, &mut pump, viewport);
+}
+
+#[test]
+fn activation_and_scale_changes_keep_full_content_damage() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = fields_window(viewport);
+    let mut pump = FramePump::new(viewport);
+    pump.frame(&mut window).unwrap();
+    edit_field(&window, "#left", "pending change");
+    wait_pending_field(&window, "pending change");
+    let _resume = pause_owner(&window);
+    window.receive();
+    window.presented_content = Some((TabId(u64::MAX), viewport));
+    assert!(window.compose(viewport).unwrap().layers[0].dirty.is_none());
+    window.presented_content = Some((window.tabs[window.active].id, viewport));
+    let scaled = Viewport::new(1800, 1280, 2.0);
+    assert!(window.compose(scaled).unwrap().layers[0].dirty.is_none());
+    window.frame_complete(true);
+    assert!(
+        window.scenes[&window.tabs[window.active].id].1.layers[0]
+            .dirty
+            .is_some_and(|rect| !rect.is_empty()),
+        "scaled cached pixels must not acknowledge source damage"
+    );
+}
+
+#[test]
+fn unchanged_publication_preserves_pending_damage_and_unknown_damage_dominates() {
+    let area = LayerRect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+    let partial = LayerRect {
+        x: 10,
+        y: 20,
+        width: 8,
+        height: 12,
+    };
+    let scene = |epoch, dirty| Scene {
+        layers: vec![SceneLayer {
+            id: LayerId(0),
+            rect: area,
+            epoch,
+            list: Arc::new(DisplayList::new()),
+            offsets: Vec::new(),
+            background: None,
+            dirty,
+        }],
+    };
+    let pending = scene(1, Some(partial));
+    let mut unchanged = scene(1, None);
+    accumulate_damage(&pending, &mut unchanged);
+    assert_eq!(unchanged.layers[0].dirty, Some(partial));
+    let mut whole = scene(2, None);
+    accumulate_damage(&pending, &mut whole);
+    let mut newer = scene(3, Some(partial));
+    accumulate_damage(&whole, &mut newer);
+    assert!(newer.layers[0].dirty.is_none());
+}
+
+struct PublishedScene {
+    scene: Arc<Scene>,
+    whole: bool,
+}
+
+impl Painter for PublishedScene {
+    fn compose(&mut self, _: Viewport) -> Option<Scene> {
+        Some(Scene {
+            layers: self
+                .scene
+                .layers
+                .iter()
+                .map(|layer| SceneLayer {
+                    id: layer.id,
+                    rect: layer.rect,
+                    epoch: layer.epoch,
+                    list: Arc::clone(&layer.list),
+                    offsets: layer.offsets.clone(),
+                    background: layer.background,
+                    dirty: if self.whole { None } else { layer.dirty },
+                })
+                .collect(),
+        })
+    }
+    fn paint(&mut self, _: &mut dyn PaintTarget, _: Viewport) {
+        unreachable!("retained scene")
+    }
+}
+
+#[test]
+fn disjoint_partial_publications_match_full_raster_pixels() {
+    use otlyra_gfx::{
+        DisplayItem,
+        kurbo::{Affine, Rect, Shape},
+        peniko::{Brush, Color, Fill},
+    };
+    let viewport = Viewport::new(32, 16, 1.0);
+    let left = LayerRect {
+        x: 2,
+        y: 2,
+        width: 4,
+        height: 4,
+    };
+    let right = LayerRect {
+        x: 24,
+        y: 8,
+        width: 4,
+        height: 4,
+    };
+    let red = Color::from_rgba8(255, 0, 0, 255);
+    let blue = Color::from_rgba8(0, 0, 255, 255);
+    let green = Color::from_rgba8(0, 255, 0, 255);
+    let scene = |epoch, a, b, dirty| {
+        let mut list = DisplayList::new();
+        for (rect, color) in [(left, a), (right, b)] {
+            list.push(DisplayItem::Fill {
+                style: Fill::NonZero,
+                transform: Affine::IDENTITY,
+                brush: Brush::Solid(color),
+                brush_transform: None,
+                shape: Rect::new(
+                    f64::from(rect.x),
+                    f64::from(rect.y),
+                    f64::from(rect.x + rect.width),
+                    f64::from(rect.y + rect.height),
+                )
+                .to_path(0.1),
+            });
+        }
+        Scene {
+            layers: vec![SceneLayer {
+                id: LayerId(0),
+                rect: LayerRect::of_viewport(viewport),
+                epoch,
+                list: Arc::new(list),
+                offsets: Vec::new(),
+                background: Some(Color::WHITE),
+                dirty,
+            }],
+        }
+    };
+    let mut pump = FramePump::new(viewport);
+    pump.frame(&mut PublishedScene {
+        scene: Arc::new(scene(0, red, red, None)),
+        whole: false,
+    })
+    .unwrap();
+    let skipped = scene(1, blue, red, Some(left));
+    let mut latest = scene(2, blue, green, Some(right));
+    accumulate_damage(&skipped, &mut latest);
+    let latest = Arc::new(latest);
+    assert_eq!(
+        pump.frame(&mut PublishedScene {
+            scene: Arc::clone(&latest),
+            whole: false
+        })
+        .unwrap(),
+        otlyra_platform::Damage::Region(left.union(&right))
+    );
+    let mut full = FramePump::new(viewport);
+    full.frame(&mut PublishedScene {
+        scene: latest,
+        whole: true,
+    })
+    .unwrap();
+    assert_eq!(pump.pixels().unwrap(), full.pixels().unwrap());
+}
+
+#[test]
+fn a_layout_change_dominates_a_coalesced_field_update() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = fields_window(viewport);
+    let mut pump = FramePump::new(viewport);
+    pump.frame(&mut window).unwrap();
+    edit_field(&window, "#left", "pending field");
+    wait_pending_field(&window, "pending field");
+    let epoch = window
+        .mailbox
+        .lock()
+        .unwrap()
+        .latest
+        .as_ref()
+        .unwrap()
+        .scene
+        .layers[0]
+        .epoch;
+    window
+        .sender
+        .send(Command::Task(Box::new(|browser| {
+            let page = browser.active_page_mut().unwrap();
+            let node = otlyra_css::stylo_dom::select(page.document(), "#right").unwrap()[0];
+            page.edit(|document| {
+                document.set_attr(
+                    node,
+                    "style",
+                    "position:absolute;left:400px;top:400px;width:240px;height:32px",
+                )
+            });
+            browser.accessibility_dirty = true;
+        })))
+        .unwrap();
+    wait_pending_epoch(&window, epoch);
+    let _resume = pause_owner(&window);
+    window.receive();
+    assert!(
+        window.scenes[&window.tabs[window.active].id].1.layers[0]
+            .dirty
+            .is_none()
+    );
+    pump.frame(&mut window).unwrap();
+    assert_full_pixels(&mut window, &mut pump, viewport);
+}
+
+#[test]
+fn partial_field_raster_matches_full_damage_and_records_cost() {
+    let mut samples = Vec::new();
+    for scale in [1.0, 2.0] {
+        let viewport = Viewport::new((900.0 * scale) as u32, (640.0 * scale) as u32, scale);
+        let mut window = fields_window(viewport);
+        let initial = Arc::new(window.compose(viewport).unwrap());
+        let mut partial = FramePump::new(viewport);
+        let mut whole = FramePump::new(viewport);
+        for (pump, force) in [(&mut partial, false), (&mut whole, true)] {
+            pump.frame(&mut PublishedScene {
+                scene: Arc::clone(&initial),
+                whole: force,
+            })
+            .unwrap();
+        }
+        window.frame_complete(true);
+        for index in 0..22 {
+            let text = if index % 2 == 0 {
+                "sample one"
+            } else {
+                "sample two"
+            };
+            edit_field(&window, "#left", text);
+            wait_pending_field(&window, text);
+            let resume = pause_owner(&window);
+            let scene = Arc::new(window.compose(viewport).unwrap());
+            let mut elapsed = [0.0; 2];
+            let mut areas = [0; 2];
+            let order = if index % 2 == 0 { [0, 1] } else { [1, 0] };
+            for mode in order {
+                let pump = if mode == 0 { &mut partial } else { &mut whole };
+                let began = Instant::now();
+                let damage = pump
+                    .frame(&mut PublishedScene {
+                        scene: Arc::clone(&scene),
+                        whole: mode == 1,
+                    })
+                    .unwrap();
+                elapsed[mode] = began.elapsed().as_secs_f64() * 1000.0;
+                let otlyra_platform::Damage::Region(rect) = damage else {
+                    panic!("expected region: {damage:?}");
+                };
+                areas[mode] = u64::from(rect.width) * u64::from(rect.height);
+            }
+            assert!(areas[0] < areas[1] / 10);
+            assert_eq!(partial.pixels().unwrap(), whole.pixels().unwrap());
+            window.frame_complete(true);
+            drop(resume);
+            if index >= 2 {
+                samples.push(serde_json::json!({
+                    "scale": scale, "sample": index - 2,
+                    "partial_ms": elapsed[0], "full_damage_ms": elapsed[1],
+                    "partial_pixels": areas[0], "full_damage_pixels": areas[1],
+                }));
+            }
+        }
+    }
+    let report = serde_json::json!({
+        "schema": 1, "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "logical_width": 900, "logical_height": 640,
+        "warmups_per_scale": 2, "sampling": "alternating-order same-scene CPU frame pairs",
+        "endpoint": "FramePump compose, raster and damage readback; no native presentation",
+        "samples": samples,
+    });
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/content-damage-cpu-pairs.json");
+    std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+}

@@ -43,11 +43,6 @@ impl Snapshot {
         scene
             .layers
             .retain(|layer| layer.id != LayerId(LAYER_CHROME));
-        // An unconsumed intermediate snapshot may have painted a different
-        // region. Full damage is safe even when that snapshot is overwritten.
-        for layer in &mut scene.layers {
-            layer.dirty = None;
-        }
         let tab = &browser.tabs[browser.active];
         if browser.accessibility_dirty || cache.tab != Some(tab.id) {
             cache.document = Arc::new(browser.world.page(tab.id).map_or_else(
@@ -168,8 +163,14 @@ pub(super) fn content_loop(
         suggestions: Arc::new(Vec::new()),
     };
     let mut first = true;
+    let mut published = None;
     loop {
-        let snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
+        let mut snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
+        let context = (snapshot.tabs[snapshot.active].id, snapshot.viewport);
+        if published != Some(context) {
+            full_damage(&mut snapshot.scene);
+        }
+        published = Some(context);
         let next = snapshot.next;
         let (previous, waker) = {
             let mut mailbox = mailbox.lock().unwrap();
@@ -178,6 +179,15 @@ pub(super) fn content_loop(
                     trace.mark("first_content_scene_ready");
                 }
                 first = false;
+            }
+            if let Some(previous) = &mailbox.latest {
+                if previous.tabs[previous.active].id == snapshot.tabs[snapshot.active].id
+                    && previous.viewport == snapshot.viewport
+                {
+                    accumulate_damage(&previous.scene, &mut snapshot.scene);
+                } else {
+                    full_damage(&mut snapshot.scene);
+                }
             }
             let previous = mailbox.latest.replace(snapshot);
             (previous, mailbox.waker.clone())

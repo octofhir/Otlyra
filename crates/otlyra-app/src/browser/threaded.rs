@@ -253,6 +253,12 @@ struct BlankScene {
     list: Arc<DisplayList>,
 }
 
+struct ContentFrame {
+    tab: Option<TabId>,
+    viewport: Viewport,
+    layers: Vec<(LayerId, u64, LayerRect)>,
+}
+
 /// A native window's chrome and the channel to its content owner.
 pub struct WindowBrowser {
     ui: BrowserUi,
@@ -282,6 +288,8 @@ pub struct WindowBrowser {
     blank_epoch: u64,
     scenes: HashMap<TabId, (Viewport, Scene)>,
     scene_device: HashMap<(TabId, LayerId), Option<Scaled>>,
+    composed_content: Option<ContentFrame>,
+    presented_content: Option<(TabId, Viewport)>,
     invalidated: HashMap<TabId, u64>,
     accessibility_dirty: bool,
     visible_dirty: bool,
@@ -429,6 +437,8 @@ impl WindowBrowser {
             blank_epoch: 0,
             scenes: HashMap::new(),
             scene_device: HashMap::new(),
+            composed_content: None,
+            presented_content: None,
             invalidated: HashMap::new(),
             accessibility_dirty: true,
             visible_dirty: true,
@@ -643,6 +653,13 @@ impl WindowBrowser {
                 .get(&tab)
                 .is_none_or(|serial| snapshot.serial >= *serial)
             {
+                if let Some((viewport, previous)) = self.scenes.get(&tab)
+                    && *viewport == snapshot.viewport
+                {
+                    accumulate_damage(previous, &mut snapshot.scene);
+                } else {
+                    full_damage(&mut snapshot.scene);
+                }
                 self.scene_device.retain(|(id, _), _| *id != tab);
                 self.scenes.insert(
                     tab,
@@ -1151,6 +1168,33 @@ impl Painter for WindowBrowser {
     fn startup_ready(&self) -> bool {
         self.frame_has_content
     }
+
+    fn frame_complete(&mut self, presented: bool) {
+        let Some(frame) = self.composed_content.take() else {
+            return;
+        };
+        if !presented {
+            return;
+        }
+        self.presented_content = frame.tab.map(|tab| (tab, frame.viewport));
+        if let Some(tab) = frame.tab
+            && let Some((viewport, scene)) = self.scenes.get_mut(&tab)
+            && *viewport == frame.viewport
+        {
+            for layer in &mut scene.layers {
+                if frame.layers.contains(&(layer.id, layer.epoch, layer.rect)) {
+                    // A newer cached epoch may have arrived while this frame
+                    // rendered. Only clear changes confirmed by this report.
+                    layer.dirty = Some(LayerRect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    });
+                }
+            }
+        }
+    }
     fn window_appearance(&self) -> Option<otlyra_platform::ColorScheme> {
         self.snapshot.appearance
     }
@@ -1184,6 +1228,19 @@ impl Painter for WindowBrowser {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if self.presented_content != Some((tab_id, viewport)) {
+            for layer in &mut layers {
+                layer.dirty = None;
+            }
+        }
+        self.composed_content = Some(ContentFrame {
+            tab: self.frame_has_content.then_some(tab_id),
+            viewport,
+            layers: layers
+                .iter()
+                .map(|layer| (layer.id, layer.epoch, layer.rect))
+                .collect(),
+        });
         if layers.is_empty() {
             let error = self.tabs[self.active].error.clone();
             if self.blank.as_ref().is_none_or(|cached| {
@@ -1304,20 +1361,53 @@ fn copy_layer(
     };
     let x = ((f64::from(layer.rect.x) * ratio).round() as u32).min(viewport.width);
     let y = ((f64::from(layer.rect.y) * ratio).round() as u32).min(viewport.height);
+    let rect = LayerRect {
+        x,
+        y,
+        width: viewport.width.saturating_sub(x),
+        height: ((f64::from(layer.rect.height) * ratio).round() as u32)
+            .min(viewport.height.saturating_sub(y)),
+    };
     SceneLayer {
         id: layer.id,
-        rect: LayerRect {
-            x,
-            y,
-            width: viewport.width.saturating_sub(x),
-            height: ((f64::from(layer.rect.height) * ratio).round() as u32)
-                .min(viewport.height.saturating_sub(y)),
-        },
+        rect,
         epoch: layer.epoch,
         list,
         offsets: layer.offsets.iter().map(|offset| *offset * ratio).collect(),
         background: layer.background,
-        dirty: None,
+        dirty: (old == viewport && rect == layer.rect)
+            .then_some(layer.dirty)
+            .flatten(),
+    }
+}
+
+fn full_damage(scene: &mut Scene) {
+    for layer in &mut scene.layers {
+        layer.dirty = None;
+    }
+}
+
+/// Keep every unacknowledged change when replacing a retained publication.
+/// Unknown damage dominates; an unchanged epoch adds no new damage.
+fn accumulate_damage(previous: &Scene, next: &mut Scene) {
+    if previous.layers.len() != next.layers.len()
+        || previous
+            .layers
+            .iter()
+            .zip(&next.layers)
+            .any(|(old, new)| old.id != new.id)
+    {
+        full_damage(next);
+        return;
+    }
+    for (old, new) in previous.layers.iter().zip(&mut next.layers) {
+        new.dirty = if old.rect != new.rect || old.background != new.background {
+            None
+        } else if old.epoch == new.epoch {
+            old.dirty
+        } else {
+            old.dirty.zip(new.dirty).map(|(a, b)| a.union(&b))
+        };
     }
 }
 

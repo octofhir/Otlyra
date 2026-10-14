@@ -42,8 +42,8 @@ composites match the synchronous path pixel for pixel at both scales.
 
 This proves separation of native input and chrome from the busy content task.
 CPU frame-pump durations are not native input-to-present latency. One content
-owner still serializes tabs and inspector work. Changed async scenes use full
-layer damage until render acknowledgements can safely accumulate partial damage;
+owner still serializes tabs and inspector work. The retained-damage follow-up
+below now accumulates partial updates through render acknowledgements;
 UI still merges owned accessibility data. Visibility, independent scrolling,
 content/raster interruption and shutdown persistence remain explicit follow-ups.
 An early UI-only frame can be shown before content is ready. Startup reporting
@@ -91,6 +91,51 @@ the opt-in native GPU/CPU startup smoke, all-target clippy, formatting, and the
 seven startup-benchmark protocol tests. The workspace has 1,746 passing tests
 and one intentionally ignored desktop smoke; explicitly running that smoke
 adds one passing test.
+
+## Retained damage follow-up
+
+The content owner previously replaced every bounded dirty rectangle with full
+layer damage, and native composition did the same. This kept coalesced updates
+correct but made a keystroke re-rasterize the entire page. Content publications
+now preserve their rectangles. Replacing an unconsumed mailbox scene or a cached
+UI scene accumulates unacknowledged damage; unknown damage dominates the union.
+An unchanged epoch preserves existing damage without adding a new change.
+
+The new `Painter::frame_complete` notification follows renderer completion,
+before another frame is composed. Successful frames clear only matching cached
+tab/viewport/layer versions. An old completion leaves newer cached changes
+pending; dropped or occluded frames acknowledge no pixels. Activation and
+geometry changes keep full redraws, including source scenes temporarily scaled
+for another DPI. There is one accumulated rectangle per cached layer, with no
+unbounded damage journal or new content-thread wait.
+
+Regression coverage compares partial rasterization with a fresh full surface,
+including two distant changed rectangles with an intermediate scene skipped,
+1x/2x field input, coalesced layout changes, dropped frames and a result arriving
+while an older frame is in flight. The shared CPU/GPU damage planner remains
+unchanged. Startup still needs a complete first raster; this change targets
+subsequent updates and does not establish native input-to-present latency.
+
+Measured on Apple M1 / macOS 26.5 with the debug CPU backend, 900×640 logical,
+two warmups and 20 alternating-order same-scene pairs per scale. The control
+forces full layer damage for the same prepared scene; both paths use the same
+binary and damage planner, and every pair matches pixel for pixel. Timings cover
+FramePump rasterization/readback and copying scene handles, excluding native
+presentation, content execution, layout and chrome construction. Values are
+p50 / p95 in milliseconds, using nearest-rank percentiles.
+
+| Scale | Full layer damage | Partial field damage | Rasterized pixels, full → partial |
+| --- | ---: | ---: | ---: |
+| 1x | 0.199 / 0.231 | 0.037 / 0.049 | 505,800 → 8,228 |
+| 2x | 0.723 / 0.791 | 0.080 / 0.108 | 2,023,200 → 32,912 |
+
+This field fixture redraws 98.37% fewer page pixels. GPU uses the same planner,
+but these CPU timings do not measure GPU speed. Raw samples and build metadata
+are in `target/content-damage-cpu-pairs.json`. Validation: 1,753 workspace tests
+passed, the one ignored desktop smoke passed explicitly for native GPU/CPU,
+all-target clippy passed with warnings denied, and the 22 boundary tests passed
+after the final test-fixture update. Builds use the earlier read-only Otter
+snapshot (`23c5a114f769`), leaving the working Otter checkout unchanged.
 
 ## What the reference browsers do
 

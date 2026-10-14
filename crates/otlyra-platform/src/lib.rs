@@ -599,6 +599,13 @@ pub trait Painter {
         true
     }
 
+    /// Complete the last composed frame before composing its successor.
+    /// `presented` confirms that the renderer committed its retained pixels;
+    /// false keeps pending damage after a dropped or occluded frame.
+    fn frame_complete(&mut self, presented: bool) {
+        let _ = presented;
+    }
+
     /// The accessibility tree, if it has changed since the last frame.
     ///
     /// A browser has to build this out of the DOM whatever toolkit it uses, so it

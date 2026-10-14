@@ -53,7 +53,7 @@ consumes immutable scenes. Headless drivers keep their synchronous API.
 
 ## Priority 1 — Finish startup isolation
 
-The latest local distribution measured on 2026-10-14 UTC, Apple M1, macOS 26.5,
+The frame-wait follow-up distribution measured on 2026-10-14 UTC, Apple M1, macOS 26.5,
 1024x768 at 2x, release, `about:about`, isolated profile and `--no-secrets`:
 three warmups, then 40 GPU / 20 CPU fresh processes per version, with
 before/after order alternating against the `12c954b` platform runtime rebuilt
@@ -83,6 +83,10 @@ and both binary hashes. GPU paired first-frame delta p50 is -0.44 ms: startup
 is essentially unchanged; the change removes UI waiting during rendering.
 The 20-pair pilot had a higher candidate GPU p95, so the larger GPU series was
 run before accepting the startup result. Do not mix their quantiles.
+The subsequent content-owner distribution and retained-damage measurements are
+in the [rendering audit](docs/browser-rendering-research.md). Its native UI frame
+construction excludes page work moved to content; the original intervals above
+describe the earlier ownership boundary.
 
 - [ ] Re-run the 20-sample local distribution after every startup change.
 - [ ] Profile AppKit bootstrap, native menu/window installation and dynamic
@@ -136,9 +140,12 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   slow raster and live resize, separately from empty-profile startup.
   Finite real JS and 1x/2x CPU compositor coverage exist; native input-to-present,
   large-document layout and active desktop resize remain to measure.
-- [ ] Preserve incremental damage across coalesced content publications and
-  acknowledged rendered frames. Current async content uses full layer damage
-  when its epoch changes, preventing stale pixels after dropped publications.
+- [x] Preserve incremental damage across coalesced content publications and
+  acknowledged rendered frames. Mailbox/UI replacements union pending damage;
+  successful render reports clear only matching cached layer versions. Unknown
+  damage and tab/viewport/layer transitions retain conservative full redraws.
+  1x/2x field edits, disjoint skipped updates, late completion and dropped frames
+  have pixel-parity coverage; CPU raster comparisons exclude native presentation.
 - [ ] Avoid copying the full retained document accessibility tree when only
   native chrome changes; retain correct activation and document generations.
 

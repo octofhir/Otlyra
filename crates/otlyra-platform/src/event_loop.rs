@@ -629,6 +629,8 @@ impl WindowedApp<'_> {
     /// The frame in flight is done: account for it, and build the next one if
     /// anything asked for it meanwhile.
     fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
+        self.painter
+            .frame_complete(frame.outcome == Presented::Frame);
         if frame.outcome == Presented::Frame
             && let Some(trace) = frame.trace.as_ref()
         {
