@@ -142,6 +142,21 @@ pub trait ScriptRunner {
         false
     }
 
+    /// Run an automation client's script in the page's realm, as WebDriver
+    /// BiDi's `script.evaluate` (`call` is `None`) or `script.callFunction`
+    /// (`call` is the arguments and `this` as JSON LocalValues). Answers the
+    /// BiDi evaluate result as JSON text, or why there is none.
+    fn automation_script(
+        &mut self,
+        document: &mut Document,
+        source: &str,
+        call: Option<(&str, &str)>,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let _ = (document, source, call, await_promise);
+        Err("this page has no script engine".to_owned())
+    }
+
     /// Whether the page listens for pointer movement at all.
     fn wants_pointer_moves(&self) -> bool {
         false

@@ -1,0 +1,17 @@
+<!doctype html>
+<title>BiDi input fixture</title>
+<body style="margin:0">
+<button id="go" style="width:120px;height:40px">Go</button>
+<input id="field" style="display:block;width:200px;height:30px;margin:0">
+<script>
+  const log = [];
+  const field = document.getElementById('field');
+  let inputs = 0;
+  document.getElementById('go').addEventListener('click', (event) => {
+    log.push(event.type + ':' + event.isTrusted);
+  });
+  field.addEventListener('input', () => {
+    inputs += 1;
+  });
+</script>
+</body>

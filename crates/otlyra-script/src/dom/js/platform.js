@@ -226,3 +226,160 @@ defineGlobal('__otlyraDispatchInput', function __otlyraDispatchInput(type, init)
   target.dispatchEvent(event);
   return event.defaultPrevented ? 1 : 0;
 });
+
+// WebDriver BiDi's `script.evaluate` and `script.callFunction`, for an
+// automation client: run in the page's realm, answer with a RemoteValue.
+// A promise is awaited across the microtask checkpoint that ends the turn;
+// the browser takes the settled answer in a second turn.
+let bidiAnswer = null;
+
+const bidiSerialize = (value, depth, seen) => {
+  switch (typeof value) {
+    case 'undefined':
+      return { type: 'undefined' };
+    case 'string':
+      return { type: 'string', value };
+    case 'boolean':
+      return { type: 'boolean', value };
+    case 'bigint':
+      return { type: 'bigint', value: value.toString() };
+    case 'symbol':
+      return { type: 'symbol' };
+    case 'function':
+      return { type: 'function' };
+    case 'number':
+      if (Number.isNaN(value)) return { type: 'number', value: 'NaN' };
+      if (Object.is(value, -0)) return { type: 'number', value: '-0' };
+      if (!Number.isFinite(value)) {
+        return { type: 'number', value: value > 0 ? 'Infinity' : '-Infinity' };
+      }
+      return { type: 'number', value };
+    default:
+      break;
+  }
+  if (value === null) return { type: 'null' };
+  if (value === globalThis) return { type: 'window' };
+  const deeper = depth < 3 && !seen.has(value);
+  if (deeper) seen.add(value);
+  const child = (item) => bidiSerialize(item, depth + 1, seen);
+  if (Array.isArray(value)) {
+    return deeper ? { type: 'array', value: value.map(child) } : { type: 'array' };
+  }
+  if (typeof Node === 'function' && value instanceof Node) {
+    const node = { nodeType: value.nodeType, childNodeCount: value.childNodes.length };
+    if (value.nodeType === 1) {
+      node.localName = value.localName;
+      node.namespaceURI = value.namespaceURI;
+      node.attributes = Object.fromEntries(
+        [...value.attributes].map((attribute) => [attribute.name, attribute.value]),
+      );
+    } else if (value.nodeValue !== null) {
+      node.nodeValue = value.nodeValue;
+    }
+    return { type: 'node', value: node };
+  }
+  if (value instanceof Error) return { type: 'error' };
+  if (value instanceof Promise) return { type: 'promise' };
+  if (value instanceof RegExp) {
+    return { type: 'regexp', value: { pattern: value.source, flags: value.flags } };
+  }
+  if (value instanceof Date) return { type: 'date', value: value.toISOString() };
+  if (value instanceof Map) {
+    return deeper
+      ? { type: 'map', value: [...value].map(([key, item]) => [typeof key === 'string' ? key : child(key), child(item)]) }
+      : { type: 'map' };
+  }
+  if (value instanceof Set) {
+    return deeper ? { type: 'set', value: [...value].map(child) } : { type: 'set' };
+  }
+  return deeper
+    ? { type: 'object', value: Object.keys(value).map((key) => [key, child(value[key])]) }
+    : { type: 'object' };
+};
+
+const bidiDeserialize = (local) => {
+  if (local === null || typeof local !== 'object') return local;
+  switch (local.type) {
+    case 'undefined':
+      return undefined;
+    case 'null':
+      return null;
+    case 'string':
+    case 'boolean':
+      return local.value;
+    case 'number':
+      return local.value === '-0' ? -0 : Number(local.value);
+    case 'bigint':
+      return BigInt(local.value);
+    case 'array':
+      return (local.value || []).map(bidiDeserialize);
+    case 'object': {
+      const object = {};
+      for (const [key, item] of local.value || []) {
+        object[typeof key === 'string' ? key : bidiDeserialize(key)] = bidiDeserialize(item);
+      }
+      return object;
+    }
+    case 'date':
+      return new Date(local.value);
+    case 'regexp':
+      return new RegExp(local.value.pattern, local.value.flags);
+    default:
+      throw new TypeError(`argument of type ${local.type} is not supported`);
+  }
+};
+
+const bidiSuccess = (value) => ({ type: 'success', result: bidiSerialize(value, 0, new Set()) });
+const bidiException = (error) => ({
+  type: 'exception',
+  exceptionDetails: {
+    text: String(error && error.message !== undefined ? `${error.name}: ${error.message}` : error),
+    lineNumber: 0,
+    columnNumber: 0,
+    exception: bidiSerialize(error, 0, new Set()),
+    stackTrace: { callFrames: [] },
+  },
+});
+
+// `run` produces the value; 1 when the answer is ready, 0 while a promise is
+// still to settle.
+const bidiRun = (run, awaitPromise) => {
+  bidiAnswer = null;
+  let value;
+  try {
+    value = run();
+  } catch (error) {
+    bidiAnswer = bidiException(error);
+    return 1;
+  }
+  if (awaitPromise && value !== null && typeof value === 'object' && typeof value.then === 'function') {
+    Promise.resolve(value).then(
+      (settled) => {
+        bidiAnswer = bidiSuccess(settled);
+      },
+      (error) => {
+        bidiAnswer = bidiException(error);
+      },
+    );
+    return 0;
+  }
+  bidiAnswer = bidiSuccess(value);
+  return 1;
+};
+
+defineGlobal('__otlyraBidiEvaluate', function __otlyraBidiEvaluate(expression, awaitPromise) {
+  return bidiRun(() => (0, eval)(expression), awaitPromise);
+});
+
+defineGlobal('__otlyraBidiCall', function __otlyraBidiCall(declaration, args, self, awaitPromise) {
+  return bidiRun(() => {
+    const callee = (0, eval)(`(${declaration})`);
+    return callee.apply(bidiDeserialize(JSON.parse(self)), JSON.parse(args).map(bidiDeserialize));
+  }, awaitPromise);
+});
+
+defineGlobal('__otlyraBidiTake', function __otlyraBidiTake() {
+  const answer = bidiAnswer;
+  bidiAnswer = null;
+  return answer === null ? '' : JSON.stringify(answer);
+});

@@ -378,7 +378,7 @@ impl Browser {
     /// reverse — is worse than neither.
     pub(super) fn link_under_pointer(&self) -> Option<String> {
         let (x, y) = self.pointer;
-        if y < UI_HEIGHT {
+        if !self.over_page() {
             return None;
         }
         let (x, y) = self.in_page(x, y);
@@ -480,8 +480,9 @@ impl Browser {
     /// Where the pointer is in the page's client coordinates, and the element
     /// under it, when it is over the active page's document.
     fn page_point(&self) -> Option<(f64, f64, otlyra_dom::NodeId)> {
-        if self.ui.owns_pointer()
-            || self.pointer.1 < UI_HEIGHT
+        // A hidden interface owns nothing: the page is the whole window.
+        if self.chrome_owns_pointer()
+            || self.pointer.1 < f64::from(self.page_top()) * f64::from(self.zoom)
             || self.tabs[self.active].system.is_some()
             || (self.inspector.open && self.pointer.1 >= self.dock_top())
         {
@@ -874,5 +875,44 @@ impl Browser {
             self.world.dispatch_input(tab, target, "mousemove", &init);
             self.apply_world_events();
         }
+    }
+}
+
+impl Browser {
+    /// Run an automation client's script in the page of the tab at `index`:
+    /// WebDriver BiDi's `script.evaluate` and `script.callFunction`. Answers
+    /// the BiDi result object as JSON text.
+    pub(crate) fn automation_script(
+        &mut self,
+        index: usize,
+        source: &str,
+        call: Option<(&str, &str)>,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let tab = self
+            .tabs
+            .get(index)
+            .ok_or_else(|| "no such tab".to_owned())?
+            .id;
+        self.sync_world();
+        let answer = self
+            .world
+            .automation_script(tab, source, call, await_promise);
+        self.apply_world_events();
+        answer
+    }
+}
+
+impl Browser {
+    /// Whether the pointer is below the browser's own interface, which is
+    /// everywhere when the interface is hidden.
+    pub(super) fn over_page(&self) -> bool {
+        !self.interface || self.pointer.1 >= UI_HEIGHT
+    }
+
+    /// Whether the browser's interface claims the pointer: never while it is
+    /// hidden, when the page is the whole window.
+    pub(super) fn chrome_owns_pointer(&self) -> bool {
+        self.interface && self.ui.owns_pointer()
     }
 }

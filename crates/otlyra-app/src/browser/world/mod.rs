@@ -521,6 +521,35 @@ impl PageWorld {
         }
     }
 
+    /// Run an automation client's script in `tab`'s page; see
+    /// [`otlyra_html::ScriptRunner::automation_script`].
+    pub(super) fn automation_script(
+        &mut self,
+        tab: TabId,
+        source: &str,
+        call: Option<(&str, &str)>,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let slot = self
+            .slots
+            .get_mut(&tab)
+            .ok_or_else(|| "the context has no document".to_owned())?;
+        if slot.pending.is_some() {
+            return Err("the context's document is still loading".to_owned());
+        }
+        let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
+            return Err("the context's document has no script engine".to_owned());
+        };
+        let answer = page.with_document(|document| {
+            scripts.automation_script(document, source, call, await_promise)
+        });
+        if scripts.take_mutated() {
+            page.document_changed();
+        }
+        self.follow_script_navigation(tab);
+        answer
+    }
+
     /// Whether `tab`'s page listens for pointer movement.
     pub(super) fn wants_pointer_moves(&self, tab: TabId) -> bool {
         self.slots.get(&tab).is_some_and(|slot| {

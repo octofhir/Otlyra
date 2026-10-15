@@ -20,12 +20,13 @@
 //!
 //! # What it cannot do yet
 //!
-//! `script.evaluate` needs M12's script engine. Stock Playwright leans on it for
-//! almost everything, so it will connect and then fail; that is stated rather
-//! than worked around. Everything that does not need a page script — tabs,
-//! navigation and history, viewports, finding nodes three ways, input,
-//! screenshots, cookies, the log, the network — does not wait for it, and is
-//! enough for an agent to do real work.
+//! `script.evaluate`, `script.callFunction` and `script.getRealms` run in the
+//! page's own isolate and answer by value: there is no remote object table,
+//! so `resultOwnership: "root"` gets no handle, a node comes back described
+//! rather than referenced, and a promise is awaited only across the microtask
+//! checkpoint of its own turn. Preload scripts, channels and `script.disown`
+//! are not built. Input actions reach the page's listeners as trusted events,
+//! so a driver can click and then read what the page did.
 //!
 //! There is one user context and one jar, so `storage.*` answers about the jar
 //! there is and `browser.createUserContext` answers *unknown command*. What a
@@ -363,6 +364,11 @@ fn context_name(id: crate::browser::TabId) -> String {
 }
 
 /// The tab a context name refers to, if it names one at all.
+/// The one window realm a context has.
+fn realm_name(context: &str) -> String {
+    format!("{context}-realm")
+}
+
 fn context_id(name: &str) -> Option<crate::browser::TabId> {
     name.strip_prefix("otlyra-context-")
         .and_then(|rest| rest.parse().ok())
@@ -928,10 +934,29 @@ impl Session {
             "storage.setCookie" => self.set_cookie(command),
             "storage.deleteCookies" => self.delete_cookies(command),
 
-            // --- what waits on a script engine -----------------------------
-            method if method.starts_with("script.") => {
-                Err(Error::not_yet(method, "a script engine, which is M12"))
+            // --- script ----------------------------------------------------
+            "script.evaluate" | "script.callFunction" => self.run_script(command),
+            "script.getRealms" => {
+                let realms = self
+                    .browser
+                    .tabs()
+                    .iter()
+                    .map(|tab| {
+                        let context = context_name(tab.id);
+                        json!({
+                            "realm": realm_name(&context),
+                            "origin": tab.url,
+                            "type": "window",
+                            "context": context,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "realms": realms }))
             }
+            method if method.starts_with("script.") => Err(Error::not_yet(
+                method,
+                "preload scripts, channels and remote object handles",
+            )),
 
             other => Err(Error::unknown_command(other)),
         }
@@ -2064,6 +2089,78 @@ impl Session {
         })
     }
 
+    /// `script.evaluate` and `script.callFunction` in a context's window realm.
+    ///
+    /// The result is by value: `resultOwnership: "root"` is answered without a
+    /// handle, since there is no remote object table to keep one in yet.
+    fn run_script(&mut self, command: &Command) -> Result<Value, Error> {
+        let target = command
+            .params
+            .get("target")
+            .ok_or_else(|| Error::invalid("a script needs a target"))?;
+        let name = target
+            .get("context")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                target
+                    .get("realm")
+                    .and_then(Value::as_str)
+                    .and_then(|realm| realm.strip_suffix("-realm"))
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| Error::invalid("a script target names a context or a realm"))?;
+        let index = self.target(&Command {
+            id: command.id,
+            method: command.method.clone(),
+            params: json!({ "context": name }),
+        })?;
+        let await_promise = command
+            .params
+            .get("awaitPromise")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::invalid("awaitPromise is required"))?;
+        let answer = if command.method == "script.evaluate" {
+            let expression = command
+                .params
+                .get("expression")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::invalid("expression must be a string"))?;
+            self.browser
+                .automation_script(index, expression, None, await_promise)
+        } else {
+            let declaration = command
+                .params
+                .get("functionDeclaration")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::invalid("functionDeclaration must be a string"))?;
+            let arguments = command
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let this = command
+                .params
+                .get("this")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "undefined" }));
+            self.browser.automation_script(
+                index,
+                declaration,
+                Some((&arguments.to_string(), &this.to_string())),
+                await_promise,
+            )
+        }
+        .map_err(Error::invalid)?;
+        let mut result: Value = serde_json::from_str(&answer)
+            .map_err(|error| Error::invalid(format!("the page answered badly: {error}")))?;
+        let context = context_name(self.browser.tabs()[index].id);
+        result["realm"] = json!(realm_name(&context));
+        // Whatever the script did is what the next command should see.
+        self.draw_frame();
+        Ok(result)
+    }
+
     /// One tab, as the protocol describes a browsing context.
     ///
     /// No children and no parent: a frame is a context of its own in BiDi and
@@ -2696,6 +2793,108 @@ mod tests {
 
     fn session() -> Session {
         Session::new(Browser::new(Pages), (800, 600))
+    }
+
+    struct Scripted;
+
+    impl Loader for Scripted {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<body style=margin:0><button id=go style='width:120px;height:40px'>Go</button>\
+                         <script>\
+                           window.clicks = [];\
+                           document.getElementById('go').addEventListener('click', (event) => {\
+                             clicks.push(event.isTrusted + ':' + event.target.id);\
+                           });\
+                         </script>"
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: url.to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A driver clicks through `input.performActions` and reads what the page
+    /// heard through `script.evaluate` and `script.callFunction`, as Playwright
+    /// and the WebDriver BiDi tests do.
+    #[test]
+    fn a_driver_clicks_and_reads_the_page_through_script() {
+        // Page script needs the content owner's stack.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut session = Session::new(Browser::new(Scripted), (800, 600));
+                session
+                    .dispatch(&command(1, "browsingContext.navigate", json!({"url": "https://scripted.example/", "wait": "complete"})))
+                    .expect("navigated");
+                let context = session
+                    .dispatch(&command(2, "browsingContext.getTree", json!({})))
+                    .unwrap()["contexts"][0]["context"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let found = session
+                    .dispatch(&command(3, "browsingContext.locateNodes", json!({"context": context, "locator": {"type": "css", "value": "#go"}})))
+                    .expect("located");
+                let shared = found["nodes"][0]["sharedId"].as_str().expect("a handle").to_owned();
+                session
+                    .dispatch(&command(4, "input.performActions", json!({
+                        "context": context,
+                        "actions": [{"type": "pointer", "id": "mouse", "actions": [
+                            {"type": "pointerMove", "x": 0, "y": 0, "origin": {"type": "element", "element": {"sharedId": shared}}},
+                            {"type": "pointerDown", "button": 0},
+                            {"type": "pointerUp", "button": 0},
+                        ]}],
+                    })))
+                    .expect("clicked");
+
+                let evaluated = session
+                    .dispatch(&command(5, "script.evaluate", json!({
+                        "expression": "clicks.join(',')",
+                        "target": {"context": context},
+                        "awaitPromise": false,
+                    })))
+                    .expect("evaluated");
+                assert_eq!(evaluated["type"], json!("success"), "{evaluated:#}");
+                assert_eq!(evaluated["result"], json!({"type": "string", "value": "true:go"}));
+                assert_eq!(evaluated["realm"], json!(format!("{context}-realm")));
+
+                let called = session
+                    .dispatch(&command(6, "script.callFunction", json!({
+                        "functionDeclaration": "async (a, b) => ({sum: a + b, title: document.querySelector('#go').textContent, nothing: null})",
+                        "arguments": [{"type": "number", "value": 2}, {"type": "number", "value": 3}],
+                        "target": {"context": context},
+                        "awaitPromise": true,
+                    })))
+                    .expect("called");
+                assert_eq!(
+                    called["result"],
+                    json!({"type": "object", "value": [
+                        ["sum", {"type": "number", "value": 5}],
+                        ["title", {"type": "string", "value": "Go"}],
+                        ["nothing", {"type": "null"}],
+                    ]}),
+                    "{called:#}"
+                );
+
+                let thrown = session
+                    .dispatch(&command(7, "script.evaluate", json!({
+                        "expression": "missing.value",
+                        "target": {"context": context},
+                        "awaitPromise": false,
+                    })))
+                    .expect("an exception is an answer");
+                assert_eq!(thrown["type"], json!("exception"), "{thrown:#}");
+                assert!(
+                    thrown["exceptionDetails"]["text"].as_str().unwrap().contains("ReferenceError"),
+                    "{thrown:#}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn command(id: u64, method: &str, params: Value) -> Command {
@@ -3691,15 +3890,15 @@ mod tests {
     }
 
     #[test]
-    fn what_needs_a_script_engine_says_so_rather_than_saying_nothing() {
+    fn what_is_not_built_yet_says_so_rather_than_saying_nothing() {
         let mut session = session();
         let error = session
-            .dispatch(&command(1, "script.evaluate", json!({})))
+            .dispatch(&command(1, "script.addPreloadScript", json!({})))
             .unwrap_err();
         // Told apart from an unknown method on purpose: this is a gap with a
         // date on it, and a client that meets it is not looking at a typo.
         assert_eq!(error.code, "unsupported operation");
-        assert!(error.message.contains("M12"), "{}", error.message);
+        assert!(error.message.contains("preload"), "{}", error.message);
 
         let unknown = session
             .dispatch(&command(2, "browser.createUserContext", json!({})))

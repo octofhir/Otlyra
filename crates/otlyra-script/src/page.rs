@@ -146,6 +146,51 @@ impl PageScripts {
         }
     }
 
+    /// Run an automation client's script — WebDriver BiDi's `script.evaluate`
+    /// or `script.callFunction` — and answer the BiDi result as JSON text.
+    ///
+    /// One turn runs it; a promise it returns is awaited across that turn's
+    /// microtask checkpoint, and a second turn takes the answer. A promise
+    /// that waits on a timer or the network has not settled by then.
+    pub fn automation_script(
+        &mut self,
+        document: &mut Document,
+        source: &str,
+        call: Option<(&str, &str)>,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let script = match call {
+            None => format!(
+                "__otlyraBidiEvaluate({}, {await_promise})",
+                js_string(source)
+            ),
+            Some((arguments, this)) => format!(
+                "__otlyraBidiCall({}, {}, {}, {await_promise})",
+                js_string(source),
+                js_string(arguments),
+                js_string(this)
+            ),
+        };
+        for turn in [script.as_str(), "__otlyraBidiTake()"] {
+            let Self { host, state, .. } = self;
+            let Some(host) = host.as_mut() else {
+                return Err("this page has no script engine".to_owned());
+            };
+            let outcome = crate::dom::loan(document, state, || {
+                host.run_classic_script(turn, "<automation>")
+            });
+            self.absorb_turn();
+            let outcome = outcome.map_err(|error| error.to_string())?;
+            if turn.starts_with("__otlyraBidiTake") {
+                if outcome.completion.is_empty() {
+                    return Err("the script's promise did not settle within its turn".to_owned());
+                }
+                return Ok(outcome.completion);
+            }
+        }
+        unreachable!("the second turn answers")
+    }
+
     /// A visibility transition is a script turn on this page's owner. Listeners
     /// see the new state; their mutations and microtasks follow the usual path.
     pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
@@ -562,6 +607,16 @@ impl ScriptRunner for PageScripts {
         PageScripts::dispatch_input(self, document, target, kind, init)
     }
 
+    fn automation_script(
+        &mut self,
+        document: &mut Document,
+        source: &str,
+        call: Option<(&str, &str)>,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        PageScripts::automation_script(self, document, source, call, await_promise)
+    }
+
     fn wants_pointer_moves(&self) -> bool {
         self.host.is_some() && self.state.wants_pointer_moves()
     }
@@ -611,4 +666,26 @@ impl ScriptRunner for PageScripts {
         self.state.set_viewport(viewport);
         self.state.set_clock(clock);
     }
+}
+
+/// `text` as a JavaScript string literal.
+fn js_string(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\u{2028}' => literal.push_str("\\u2028"),
+            '\u{2029}' => literal.push_str("\\u2029"),
+            character if character.is_control() => {
+                literal.push_str(&format!("\\u{:04x}", u32::from(character)));
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
 }

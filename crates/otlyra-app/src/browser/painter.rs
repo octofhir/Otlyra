@@ -534,7 +534,7 @@ impl Browser {
                 if !owned {
                     self.ui.dismiss_popup();
                 }
-                let surface = if owned || self.pointer.1 < UI_HEIGHT {
+                let surface = if owned || !self.over_page() {
                     SURFACE_CHROME
                 } else if self.inspector.open && self.pointer.1 >= self.dock_top() {
                     SURFACE_INSPECTOR
@@ -550,7 +550,7 @@ impl Browser {
                 // press and returns before the toolbar's own press handler runs, so
                 // without this the caret and its selection would sit in a field the
                 // reader has plainly clicked away from.
-                if self.pointer.1 >= UI_HEIGHT && !owned {
+                if self.over_page() && !owned {
                     self.ui.blur();
                 }
                 // The panel owns everything below its own top edge.
@@ -562,7 +562,7 @@ impl Browser {
                 // Armed, a press on the page chooses an element instead of
                 // following whatever is under it — which is the whole point of
                 // arming it, and why the picker disarms itself afterwards.
-                if self.inspector.picking && self.pointer.1 >= UI_HEIGHT {
+                if self.inspector.picking && self.over_page() {
                     self.pick_at(self.pointer.0, self.pointer.1);
                     // One press, one element: staying armed would make the next
                     // click on a link choose a node instead of following it.
@@ -571,7 +571,7 @@ impl Browser {
                 }
                 // A press on a scrollbar belongs to it rather than to the page
                 // behind it.
-                if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
+                if !self.chrome_owns_pointer() && self.tabs[self.active].system.is_none() {
                     let (width, height) =
                         self.in_page(self.last_width, self.last_height - UI_HEIGHT);
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1 - UI_HEIGHT);
@@ -590,7 +590,7 @@ impl Browser {
                 // The settings surface owns everything below the toolbar while it
                 // is showing, so a press there never reaches the document behind
                 // it — there is no document behind it.
-                if self.pointer.1 >= UI_HEIGHT && !owned {
+                if self.over_page() && !owned {
                     match self.tabs[self.active].system {
                         Some(SystemPage::Settings) => {
                             let before = self.settings.settings.clone();
@@ -642,14 +642,14 @@ impl Browser {
                 if self.page_pointer_pressed(clicks) {
                     return;
                 }
-                if !self.ui.owns_pointer() && self.link_under_pointer().is_some() {
+                if !self.chrome_owns_pointer() && self.link_under_pointer().is_some() {
                     return;
                 }
                 // A control takes the press before the text under it does: pressing
                 // a checkbox is not the start of selecting the word beside it.
-                if !self.ui.owns_pointer()
+                if !self.chrome_owns_pointer()
                     && self.tabs[self.active].system.is_none()
-                    && self.pointer.1 >= UI_HEIGHT
+                    && self.over_page()
                 {
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
                     let pressed = self
@@ -674,7 +674,7 @@ impl Browser {
                 // A press on the page starts a selection where it landed, and takes
                 // away whatever was selected before — which is what a press on a
                 // page means everywhere else.
-                if !self.ui.owns_pointer() && self.tabs[self.active].system.is_none() {
+                if !self.chrome_owns_pointer() && self.tabs[self.active].system.is_none() {
                     let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
                     let top = self.page_top();
                     if let Some(page) = self.active_page_mut() {
