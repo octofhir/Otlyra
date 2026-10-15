@@ -122,6 +122,9 @@ pub struct PageState {
     wants_scroll_events: bool,
     /// Whether an intersection or resize observer is watching.
     wants_geometry: bool,
+    /// Pictures asked for by `<img>` elements outside the document — a
+    /// `new Image()` preloading — which nothing else would fetch.
+    image_requests: Vec<otlyra_dom::NodeId>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -237,6 +240,11 @@ impl PageState {
         self.scroll_request.take()
     }
 
+    /// Take the pictures detached elements asked for.
+    pub fn take_image_requests(&mut self) -> Vec<otlyra_dom::NodeId> {
+        std::mem::take(&mut self.image_requests)
+    }
+
     /// Whether an intersection or resize observer is watching.
     #[must_use]
     pub fn wants_geometry(&self) -> bool {
@@ -301,6 +309,15 @@ pub(crate) fn request_scroll(x: f64, y: f64) {
     LOANED.with(|slot| {
         if let Some(document) = slot.borrow_mut().as_mut() {
             document.set_scroll_position((x, y));
+        }
+    });
+}
+
+/// A detached `<img>` was given a picture to show.
+pub(crate) fn request_image(node: otlyra_dom::NodeId) {
+    with_state_mut(|state| {
+        if !state.image_requests.contains(&node) {
+            state.image_requests.push(node);
         }
     });
 }

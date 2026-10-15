@@ -421,6 +421,7 @@ impl PageWorld {
         }
         changed |= self.run_due_timers();
         changed |= self.run_frame_callbacks();
+        self.fetch_detached_pictures();
         changed
     }
 
@@ -518,8 +519,14 @@ impl PageWorld {
         let mut events = Vec::with_capacity(pictures.len());
         page.with_document(|document| {
             for (node, src, size) in pictures {
-                events.push((node, size.is_some()));
-                document.set_image_state(node, otlyra_dom::ImageState { src, size });
+                let state = otlyra_dom::ImageState { src, size };
+                // The same answer again — a preloaded picture put in the
+                // document, a window choosing the same file — is not news.
+                if document.image_state(node) == Some(&state) {
+                    continue;
+                }
+                events.push((node, state.size.is_some()));
+                document.set_image_state(node, state);
             }
         });
         if loading {
@@ -739,6 +746,10 @@ impl PageWorld {
 fn after_script_turn(page: &mut PageScene, scripts: &mut dyn otlyra_html::ScriptRunner) {
     if scripts.take_mutated() {
         page.document_changed();
+    }
+    let detached = scripts.take_image_requests();
+    if !detached.is_empty() {
+        page.note_detached_pictures(detached);
     }
     if let Some((_, y)) = scripts.take_scroll_request() {
         page.set_scroll(y as f32);

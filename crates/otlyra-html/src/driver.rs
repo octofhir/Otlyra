@@ -157,6 +157,12 @@ pub trait ScriptRunner {
         Err("this page has no script engine".to_owned())
     }
 
+    /// The detached `<img>` elements script gave a `src` since this was last
+    /// asked.
+    fn take_image_requests(&mut self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
     /// Where script asked the window to scroll to since this was last asked.
     fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
         None

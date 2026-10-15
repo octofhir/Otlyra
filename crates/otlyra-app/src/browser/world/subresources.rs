@@ -159,6 +159,55 @@ impl PageWorld {
         }
     }
 
+    /// Fetch the pictures detached `<img>` elements asked for — `new Image()`
+    /// preloading — so their elements hear `load` or `error`.
+    pub(super) fn fetch_detached_pictures(&mut self) {
+        let tabs: Vec<TabId> = self.slots.keys().copied().collect();
+        for tab in tabs {
+            let Some(slot) = self.slots.get_mut(&tab) else {
+                continue;
+            };
+            if slot.pending.is_some() {
+                continue;
+            }
+            let generation = slot.generation;
+            let Some(page) = slot.page.as_mut() else {
+                continue;
+            };
+            let wanted = page.take_detached_pictures();
+            if wanted.is_empty() {
+                continue;
+            }
+            let (document, base) = (page.url().to_string(), page.base_url().clone());
+            // Asked now, so the sweep does not ask again once it is inserted.
+            slot.pictures_asked.extend(wanted.iter().cloned());
+            for (node, src) in wanted {
+                let Some(target) = Self::subresource_url(&document, &base, &src) else {
+                    self.record_pictures(tab, vec![(node, src, None)]);
+                    continue;
+                };
+                if !self.environment.load_images {
+                    continue;
+                }
+                if let Some(data) = self.images.get(&target) {
+                    self.record_pictures(tab, vec![(node, src, Some((data.width, data.height)))]);
+                    continue;
+                }
+                let id = self.fetcher.request(&target, ResourceKind::Image);
+                self.picture_fetches.insert(
+                    id,
+                    PictureFetch {
+                        tab,
+                        generation,
+                        node,
+                        src,
+                        density: 1.0,
+                    },
+                );
+            }
+        }
+    }
+
     /// Ask for the background pictures the pages have found they need.
     ///
     /// A background is named by a rule, so what a page wants is known only once it
@@ -313,6 +362,7 @@ impl PageWorld {
                 }
             }
         }
+        self.fetch_detached_pictures();
         // Last, because it is a question about the window this frame was drawn
         // for: the answer is for the next one. It has a guard of its own.
         self.rechoose_pictures();
@@ -372,6 +422,8 @@ impl PageWorld {
                 self.images.insert(fetched.url.clone(), data.clone());
                 let size = (data.width, data.height);
                 match self.page_mut(tab) {
+                    // A detached element shows nothing; it only hears `load`.
+                    Some(page) if !page.is_connected(node) => {}
                     Some(page) => {
                         page.set_image(node, src.clone(), otlyra_layout::Picture { data, density })
                     }

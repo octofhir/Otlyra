@@ -617,6 +617,10 @@ impl ScriptRunner for PageScripts {
         PageScripts::automation_script(self, document, source, call, await_promise)
     }
 
+    fn take_image_requests(&mut self) -> Vec<NodeId> {
+        self.state.take_image_requests()
+    }
+
     fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
         self.state.take_scroll_request()
     }

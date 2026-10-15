@@ -439,6 +439,15 @@ reflectString(HTMLHtmlElement, 'version');
 // ------------------------------------------------------------- embedded
 
 reflectUrl(HTMLImageElement, 'src');
+// A picture outside the document — `new Image()` preloading one — is fetched
+// all the same, and its element hears `load` or `error`.
+{
+  const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+  accessor(HTMLImageElement.prototype, 'src', src.get, function (value) {
+    src.set.call(this, value);
+    if (!this.isConnected) this.__otlyraRequestImage();
+  });
+}
 reflectString(HTMLImageElement, 'srcset');
 reflectString(HTMLImageElement, 'sizes');
 reflectString(HTMLImageElement, 'alt');

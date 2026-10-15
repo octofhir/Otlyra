@@ -160,6 +160,9 @@ pub struct PageScene {
     builds: u64,
     /// The build and scroll the geometry script last read was taken at.
     geometry_key: Option<(u64, u32)>,
+    /// Pictures detached elements asked for, by element and address, for the
+    /// world to fetch.
+    detached_pictures: Vec<(NodeId, String)>,
     /// Where the pointer and the focus are.
     interaction: otlyra_css::state::Interaction,
     /// Where the caret sits in the focused field, as a byte offset into its value.
@@ -399,6 +402,7 @@ impl PageScene {
             painted: None,
             builds: 0,
             geometry_key: None,
+            detached_pictures: Vec::new(),
             interaction: otlyra_css::state::Interaction::none(),
             caret: 0,
             field_anchor: None,
@@ -466,6 +470,37 @@ impl PageScene {
             .set_scroll_position((0.0, f64::from(self.scroll)));
         self.lend_geometry();
         run(&mut self.document)
+    }
+
+    /// Note that detached `<img>` elements asked for pictures, as their `src`
+    /// stands now.
+    pub fn note_detached_pictures(&mut self, nodes: Vec<NodeId>) {
+        for node in nodes {
+            if let Some(src) = self.document.attr(node, "src") {
+                let src = src.trim().to_owned();
+                if !src.is_empty() {
+                    self.detached_pictures.push((node, src));
+                }
+            }
+        }
+    }
+
+    /// Take the pictures detached elements asked for.
+    pub fn take_detached_pictures(&mut self) -> Vec<(NodeId, String)> {
+        std::mem::take(&mut self.detached_pictures)
+    }
+
+    /// Whether `node` is in the document's tree rather than held by script.
+    pub fn is_connected(&self, node: NodeId) -> bool {
+        let root = self.document.root();
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == root {
+                return true;
+            }
+            current = self.document.get(id).and_then(|data| data.parent);
+        }
+        false
     }
 
     /// Which drawing of the page geometry is read from: what an observer's

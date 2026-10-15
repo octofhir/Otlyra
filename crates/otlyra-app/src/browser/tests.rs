@@ -4506,3 +4506,46 @@ fn intersection_observers_report_what_the_reader_can_see() {
         );
     });
 }
+
+/// A picture preloaded through `new Image()`, never put in the document, is
+/// fetched and its element hears `load`.
+#[test]
+fn a_preloaded_picture_outside_the_document_loads() {
+    struct PictureLoader;
+
+    impl Loader for PictureLoader {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            if url.ends_with(".png") {
+                return Ok(Loaded {
+                    content_type: Some("image/png".to_owned()),
+                    bytes: ONE_PIXEL_PNG.to_vec(),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                });
+            }
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<body><script>\
+                           const image = new Image();\
+                           image.onload = () => { document.documentElement.dataset.log = 'loaded:' + image.naturalWidth + ':' + image.complete; };\
+                           image.src = '/preload.png';\
+                         </script>"
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: "https://pictures.example/".to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    on_content_stack(|| {
+        let mut browser = Browser::new(PictureLoader);
+        let viewport = Viewport::new(800, 600, 1.0);
+        browser.set_viewport(viewport);
+        go(&mut browser, "pictures.example");
+        for _ in 0..3 {
+            browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+        }
+        assert_eq!(page_log(&browser), "loaded:1:true");
+    });
+}

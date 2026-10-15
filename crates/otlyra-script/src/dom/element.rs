@@ -194,6 +194,12 @@ impl ElementRef {
         })
     }
 
+    /// A detached `<img>` was given a `src`: ask the browser for its picture.
+    #[method(name = "__otlyraRequestImage")]
+    fn js_request_image(&self) {
+        super::request_image(self.node.id);
+    }
+
     /// `focus()`: the element is focused for script at once, and the browser
     /// moves its own focus (and fires the events) after the turn.
     #[method(name = "__otlyraFocus")]
