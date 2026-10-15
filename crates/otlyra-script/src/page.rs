@@ -98,6 +98,45 @@ impl PageScripts {
         }
     }
 
+    /// Dispatch one user-input event at `target` as its own script turn, and
+    /// answer whether the page cancelled it.
+    ///
+    /// `kind` is an event type and `init` a JSON object, both the browser's
+    /// own: page-supplied text never reaches the script source.
+    pub fn dispatch_input(
+        &mut self,
+        document: &mut Document,
+        target: NodeId,
+        kind: &str,
+        init: &str,
+    ) -> bool {
+        debug_assert!(kind.bytes().all(|byte| byte.is_ascii_lowercase()));
+        if !kind.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return false;
+        }
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return false;
+        };
+        state.set_input_target(Some(target));
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script(
+                &format!("__otlyraDispatchInput('{kind}', {init})"),
+                "<input>",
+            )
+        });
+        self.state.set_input_target(None);
+        self.absorb_turn();
+        match outcome {
+            Ok(outcome) => outcome.completion == "1",
+            Err(error) => {
+                self.failed += 1;
+                tracing::error!(target: "page.script", %error, kind, "an input listener failed");
+                false
+            }
+        }
+    }
+
     /// A visibility transition is a script turn on this page's owner. Listeners
     /// see the new state; their mutations and microtasks follow the usual path.
     pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
@@ -489,6 +528,16 @@ impl ScriptRunner for PageScripts {
 
     fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
         PageScripts::set_viewport(self, document, width, height, scale);
+    }
+
+    fn dispatch_input(
+        &mut self,
+        document: &mut Document,
+        target: NodeId,
+        kind: &str,
+        init: &str,
+    ) -> bool {
+        PageScripts::dispatch_input(self, document, target, kind, init)
     }
 
     fn take_mutated(&mut self) -> bool {

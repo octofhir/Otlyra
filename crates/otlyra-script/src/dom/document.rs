@@ -231,6 +231,13 @@ impl DocumentRef {
         super::current_script().map(|element| JsNode::new(self.node.doc, element))
     }
 
+    /// The element a user-input event being dispatched by the browser is aimed
+    /// at; read only by the glue's `__otlyraDispatchInput`.
+    #[getter(name = "__otlyraInputTarget")]
+    fn js_input_target(&self) -> Option<JsNode> {
+        super::input_target().map(|element| JsNode::new(self.node.doc, element))
+    }
+
     /// `"BackCompat"` in quirks mode, `"CSS1Compat"` otherwise (DOM §4.5).
     #[getter(name = "compatMode")]
     fn js_compat_mode(&self) -> Result<String, JsError> {

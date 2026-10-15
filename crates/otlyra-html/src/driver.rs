@@ -122,6 +122,20 @@ pub trait ScriptRunner {
         let _ = (document, hidden);
     }
 
+    /// Dispatch a user-input event of type `kind` at `target`, with `init` a
+    /// JSON object of its init dictionary. Answers whether the page cancelled
+    /// it, which is what decides whether the browser's own action follows.
+    fn dispatch_input(
+        &mut self,
+        document: &mut Document,
+        target: NodeId,
+        kind: &str,
+        init: &str,
+    ) -> bool {
+        let _ = (document, target, kind, init);
+        false
+    }
+
     /// The CSS viewport changed between script turns or while parsing is paused.
     fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
         let _ = (document, width, height, scale);

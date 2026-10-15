@@ -76,6 +76,15 @@ pub struct Browser {
     /// wanders into the toolbar or off the window keeps selecting rather than
     /// stopping where it left.
     selecting: bool,
+    /// The press the page was told about, so its release can be, and a click
+    /// follows on the element both landed in.
+    page_press: Option<input::PagePress>,
+    /// The `keyup` owed for the last `keydown` the page heard: sent once the
+    /// key's own work, and any text it typed, is done.
+    pending_keyup: Option<(TabId, otlyra_dom::NodeId, String)>,
+    /// The page cancelled the `keydown` of a key that types, so the text the
+    /// platform sends for it next is not typed.
+    text_cancelled: bool,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
@@ -245,6 +254,9 @@ impl Browser {
             interface: true,
             window_visible: true,
             selecting: false,
+            page_press: None,
+            pending_keyup: None,
+            text_cancelled: false,
             last_width: 1024.0,
             last_height: 768.0,
             last_scale: 1.0,

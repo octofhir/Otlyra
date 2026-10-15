@@ -77,6 +77,7 @@ const DEFINES: &[&str] = &[
     "cancelAnimationFrame",
     "__otlyraFlushDeferred",
     "__otlyraRunFrame",
+    "__otlyraDispatchInput",
     "__otlyraFramesPending",
     "location",
     "CustomEvent",

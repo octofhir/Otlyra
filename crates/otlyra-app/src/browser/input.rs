@@ -465,3 +465,282 @@ pub(super) fn choose_paths(_request: &crate::page::FileRequest) -> Vec<std::path
     tracing::debug!("no file dialogue on this platform; the picker keeps what it held");
     Vec::new()
 }
+
+/// A press on a page's element, as the page was told about it.
+pub(super) struct PagePress {
+    tab: super::TabId,
+    target: otlyra_dom::NodeId,
+    clicks: u32,
+    /// The link under the press, followed only by an uncancelled click that
+    /// lands on the same one.
+    link: Option<String>,
+}
+
+impl Browser {
+    /// Where the pointer is in the page's client coordinates, and the element
+    /// under it, when it is over the active page's document.
+    fn page_point(&self) -> Option<(f64, f64, otlyra_dom::NodeId)> {
+        if self.ui.owns_pointer()
+            || self.pointer.1 < UI_HEIGHT
+            || self.tabs[self.active].system.is_some()
+            || (self.inspector.open && self.pointer.1 >= self.dock_top())
+        {
+            return None;
+        }
+        let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
+        let target = self.page(self.active)?.element_at(x, y)?;
+        Some((x, y - f64::from(self.page_top()), target))
+    }
+
+    fn pointer_init(client_x: f64, client_y: f64, buttons: u8, detail: u32) -> String {
+        serde_json::json!({
+            "clientX": client_x,
+            "clientY": client_y,
+            "screenX": client_x,
+            "screenY": client_y,
+            "button": 0,
+            "buttons": buttons,
+            "detail": detail,
+            "pointerId": 1,
+            "pointerType": "mouse",
+            "isPrimary": true,
+            "width": 1,
+            "height": 1,
+            "pressure": if buttons == 0 { 0.0 } else { 0.5 },
+        })
+        .to_string()
+    }
+
+    /// Tell the active page about a press on it. Answers whether the page
+    /// cancelled it, in which case the browser neither focuses nor selects.
+    pub(super) fn page_pointer_pressed(&mut self, clicks: u32) -> bool {
+        self.flush_keyup();
+        self.page_press = None;
+        let Some((x, y, target)) = self.page_point() else {
+            return false;
+        };
+        let tab = self.tabs[self.active].id;
+        self.page_press = Some(PagePress {
+            tab,
+            target,
+            clicks,
+            link: self.link_under_pointer(),
+        });
+        self.sync_world();
+        let init = Self::pointer_init(x, y, 1, clicks);
+        // A cancelled pointerdown suppresses only the compatibility mouse
+        // events, which is not a distinction any default action here makes.
+        self.world.dispatch_input(tab, target, "pointerdown", &init);
+        let cancelled = self.world.dispatch_input(tab, target, "mousedown", &init);
+        self.apply_world_events();
+        cancelled
+    }
+
+    /// Tell the page its press was let go, and click what both landed in.
+    /// Answers `Some(cancelled)` when a click was dispatched; the link the
+    /// press began on is followed here, after an uncancelled click.
+    pub(super) fn page_pointer_released(&mut self) -> Option<bool> {
+        let press = self.page_press.take()?;
+        if self.tabs.get(self.active).map(|tab| tab.id) != Some(press.tab) {
+            return None;
+        }
+        let point = self.page_point();
+        let (x, y) = match point {
+            Some((x, y, _)) => (x, y),
+            None => {
+                let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
+                (x, y - f64::from(self.page_top()))
+            }
+        };
+        let released_on = point.map(|(_, _, target)| target);
+        let init = Self::pointer_init(x, y, 0, press.clicks);
+        self.sync_world();
+        let up = released_on.unwrap_or(press.target);
+        self.world.dispatch_input(press.tab, up, "pointerup", &init);
+        self.world.dispatch_input(press.tab, up, "mouseup", &init);
+        let clicked = released_on.and_then(|released| {
+            self.page(self.active)?
+                .common_ancestor(press.target, released)
+        });
+        let cancelled =
+            clicked.map(|target| self.world.dispatch_input(press.tab, target, "click", &init));
+        if press.clicks == 2
+            && let Some(target) = clicked
+        {
+            self.world
+                .dispatch_input(press.tab, target, "dblclick", &init);
+        }
+        self.apply_world_events();
+        if cancelled == Some(false)
+            && let Some(link) = press.link
+            && self.link_under_pointer().as_deref() == Some(link.as_str())
+        {
+            self.navigate_from(&link, false);
+        }
+        cancelled
+    }
+}
+
+/// A key as the `KeyboardEvent` init a page reads: `key`, `code`, the legacy
+/// `keyCode`/`which`, and the modifiers.
+fn keyboard_init(key: Key, modifiers: Modifiers) -> String {
+    let (name, code, key_code): (String, String, u32) = match key {
+        Key::Enter => ("Enter".into(), "Enter".into(), 13),
+        Key::Backspace => ("Backspace".into(), "Backspace".into(), 8),
+        Key::Delete => ("Delete".into(), "Delete".into(), 46),
+        Key::Escape => ("Escape".into(), "Escape".into(), 27),
+        Key::Tab => ("Tab".into(), "Tab".into(), 9),
+        Key::Left => ("ArrowLeft".into(), "ArrowLeft".into(), 37),
+        Key::Up => ("ArrowUp".into(), "ArrowUp".into(), 38),
+        Key::Right => ("ArrowRight".into(), "ArrowRight".into(), 39),
+        Key::Down => ("ArrowDown".into(), "ArrowDown".into(), 40),
+        Key::Home => ("Home".into(), "Home".into(), 36),
+        Key::End => ("End".into(), "End".into(), 35),
+        Key::PageUp => ("PageUp".into(), "PageUp".into(), 33),
+        Key::PageDown => ("PageDown".into(), "PageDown".into(), 34),
+        Key::F5 => ("F5".into(), "F5".into(), 116),
+        Key::Character(character) => {
+            let typed = if modifiers.shift {
+                character.to_uppercase().collect::<String>()
+            } else {
+                character.to_string()
+            };
+            let (code, key_code) = match character {
+                'a'..='z' | 'A'..='Z' => (
+                    format!("Key{}", character.to_ascii_uppercase()),
+                    u32::from(character.to_ascii_uppercase()),
+                ),
+                '0'..='9' => (format!("Digit{character}"), u32::from(character)),
+                ' ' => ("Space".to_owned(), 32),
+                _ => (String::new(), 0),
+            };
+            (typed, code, key_code)
+        }
+        _ => ("Unidentified".into(), String::new(), 0),
+    };
+    serde_json::json!({
+        "key": name,
+        "code": code,
+        "keyCode": key_code,
+        "which": key_code,
+        "ctrlKey": modifiers.control,
+        "shiftKey": modifiers.shift,
+        "altKey": modifiers.alt,
+        "metaKey": modifiers.command,
+    })
+    .to_string()
+}
+
+/// Whether the platform follows this key with the text it typed.
+pub(super) fn types_text(key: Key, modifiers: Modifiers) -> bool {
+    matches!(key, Key::Character(_)) && !modifiers.command && !modifiers.control
+}
+
+impl Browser {
+    /// The focused field of the active page and what it holds, while the page
+    /// has the keyboard.
+    pub(super) fn page_field_value(&self) -> Option<(super::TabId, otlyra_dom::NodeId, String)> {
+        if self.keyboard_surface != SURFACE_PAGE || self.tabs[self.active].system.is_some() {
+            return None;
+        }
+        let page = self.page(self.active)?;
+        let node = page.focused_element()?;
+        let value = page.focused_value()?.to_owned();
+        Some((self.tabs[self.active].id, node, value))
+    }
+
+    /// Tell the active page about a key before the browser acts on it, and
+    /// answer whether the page cancelled it. The browser's own accelerators
+    /// are not the page's to cancel.
+    pub(super) fn page_key_down(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        self.flush_keyup();
+        self.text_cancelled = false;
+        if self.keyboard_surface != SURFACE_PAGE
+            || self.tabs[self.active].system.is_some()
+            || modifiers.is_accelerator()
+        {
+            return false;
+        }
+        let tab = self.tabs[self.active].id;
+        let Some(target) = self
+            .page(self.active)
+            .and_then(|page| page.focused_element().or_else(|| page.body_element()))
+        else {
+            return false;
+        };
+        let init = keyboard_init(key, modifiers);
+        self.sync_world();
+        let cancelled = self.world.dispatch_input(tab, target, "keydown", &init);
+        self.pending_keyup = Some((tab, target, init));
+        self.apply_world_events();
+        cancelled
+    }
+
+    /// After the browser's own work for a key: an `input` if it changed the
+    /// focused field, then the key's `keyup` unless text is still to come.
+    pub(super) fn after_page_key(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+        before: Option<(super::TabId, otlyra_dom::NodeId, String)>,
+    ) {
+        let input_type = match key {
+            Key::Backspace => "deleteContentBackward",
+            Key::Delete => "deleteContentForward",
+            Key::Enter => "insertLineBreak",
+            _ => "insertText",
+        };
+        self.field_input(before, input_type, None);
+        // A character's keyup follows the text it typed, which arrives next.
+        let typed = types_text(key, modifiers) && self.pending_keyup.is_some();
+        if !typed {
+            self.flush_keyup();
+        }
+    }
+
+    /// After typed text reached the page: its `input`, then the `keyup`.
+    pub(super) fn after_page_text(
+        &mut self,
+        character: char,
+        before: Option<(super::TabId, otlyra_dom::NodeId, String)>,
+    ) {
+        self.field_input(before, "insertText", Some(character));
+        self.flush_keyup();
+    }
+
+    fn field_input(
+        &mut self,
+        before: Option<(super::TabId, otlyra_dom::NodeId, String)>,
+        input_type: &str,
+        data: Option<char>,
+    ) {
+        let Some((tab, node, value)) = before else {
+            return;
+        };
+        let changed = self
+            .page_field_value()
+            .is_some_and(|(now_tab, now_node, now)| {
+                now_tab == tab && now_node == node && now != value
+            });
+        if !changed {
+            return;
+        }
+        let init = serde_json::json!({
+            "inputType": input_type,
+            "data": data.map(String::from),
+        })
+        .to_string();
+        self.sync_world();
+        self.world.dispatch_input(tab, node, "input", &init);
+        self.apply_world_events();
+    }
+
+    /// Send the `keyup` the last `keydown` is owed, if it still is.
+    pub(super) fn flush_keyup(&mut self) {
+        if let Some((tab, target, init)) = self.pending_keyup.take() {
+            self.sync_world();
+            self.world.dispatch_input(tab, target, "keyup", &init);
+            self.apply_world_events();
+        }
+    }
+}

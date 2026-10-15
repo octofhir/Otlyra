@@ -369,14 +369,14 @@ impl Painter for Browser {
                         _ => {}
                     }
                 }
-                // A link takes the press before the interface sees it, because the
-                // interface has nothing in the page area to claim it — except an
-                // open menu, which is drawn over the page and owns every press
-                // that lands on it.
-                if !self.ui.owns_pointer()
-                    && let Some(url) = self.link_under_pointer()
-                {
-                    self.navigate_from(&url, false);
+                // The page hears the press before the browser acts on it, and a
+                // page that cancels it is neither focused nor selected in. A link
+                // is followed by the click that completes the press, so a page
+                // that cancels that click keeps the reader where they are.
+                if self.page_pointer_pressed(clicks) {
+                    return;
+                }
+                if !self.ui.owns_pointer() && self.link_under_pointer().is_some() {
                     return;
                 }
                 // A control takes the press before the text under it does: pressing
@@ -448,13 +448,20 @@ impl Painter for Browser {
             PlatformEvent::PointerReleased => {
                 self.selecting = false;
                 let (x, y) = self.in_page(self.pointer.0, self.pointer.1);
+                // The page's mouseup and click come before the control's own
+                // activation, which a cancelled click withholds.
+                let click = self.page_pointer_released();
                 if let Some(page) = self.active_page_mut() {
                     page.release_scrollbar();
                     // A control is activated on the release and only where the
                     // press landed: a press that wanders off the checkbox before it
                     // is let go does not tick it, which is what every platform does
                     // and what makes a press a thing a reader can take back.
-                    page.pointer_released(x, y);
+                    if click == Some(true) {
+                        page.pointer_cancelled();
+                    } else {
+                        page.pointer_released(x, y);
+                    }
                 }
                 self.follow_submission();
                 self.answer_file_request();
@@ -464,258 +471,271 @@ impl Painter for Browser {
             }
 
             PlatformEvent::KeyPressed { key, modifiers } => {
-                if self.tab_key(key, modifiers) {
-                    return;
-                }
-                // The one accelerator that is the inspector's. Alt as well as
-                // the platform's own modifier, which is what every browser uses
-                // and what keeps it clear of ⌘I.
-                if key == Key::Character('i') && modifiers.alt && inspector_modifier(modifiers) {
-                    self.toggle_inspector();
-                    return;
-                }
-                // The zoom, before anything else reads the key: it belongs to
-                // the page whatever holds the keyboard, which is the whole point
-                // of being able to reach it while reading.
-                if modifiers.is_accelerator()
-                    && let Some(step) = match key {
-                        Key::Character('=' | '+') => Some(ZoomStep::In),
-                        Key::Character('-' | '_') => Some(ZoomStep::Out),
-                        Key::Character('0') => Some(ZoomStep::Reset),
-                        _ => None,
+                // The page hears the key first and may keep it from the browser;
+                // what the key did to a field it then hears as `input`.
+                let before = self.page_field_value();
+                'key: {
+                    if self.page_key_down(key, modifiers) {
+                        self.text_cancelled = super::input::types_text(key, modifiers);
+                        break 'key;
                     }
-                {
-                    self.step_zoom(step);
-                    return;
-                }
-                // The panel takes the keys that walk its tree, but only while it
-                // is the thing being looked at — and a caret in the address
-                // field means the field is, however open the panel may be.
-                //
-                // With or without a document: a tab whose load failed still has
-                // a console to filter and clear, and gating the panel's keys on
-                // a page would take them away exactly when they are wanted.
-                if self.keyboard_surface == SURFACE_INSPECTOR
-                    && self.inspector.open
-                    && self
-                        .inspector
-                        .key_pressed(
-                            key,
-                            modifiers,
-                            self.world
-                                .page(self.tabs[self.active].id)
-                                .map(PageScene::document),
-                            self.clipboard.as_mut(),
-                        )
-                        .is_some()
-                {
-                    if !self.inspector.open {
-                        let surface = self.tab_surface();
-                        self.activate_surface(surface);
+                    if self.tab_key(key, modifiers) {
+                        break 'key;
                     }
-                    return;
-                }
-                // A browser page shown in the tab gets the key first: it is what
-                // the reader is looking at, and Tab on it walks its own controls
-                // rather than the toolbar's.
-                if self.keyboard_surface == SURFACE_SYSTEM {
-                    match self.tabs[self.active].system {
-                        Some(SystemPage::Settings) => {
-                            let before = self.settings.settings.clone();
-                            if let Some(action) =
-                                self.settings
-                                    .key_pressed(key, modifiers, self.clipboard.as_mut())
-                            {
-                                self.save_preferences_if_changed(&before);
-                                self.handle_settings_action(&action);
-                                return;
-                            }
+                    // The one accelerator that is the inspector's. Alt as well as
+                    // the platform's own modifier, which is what every browser uses
+                    // and what keeps it clear of ⌘I.
+                    if key == Key::Character('i') && modifiers.alt && inspector_modifier(modifiers)
+                    {
+                        self.toggle_inspector();
+                        break 'key;
+                    }
+                    // The zoom, before anything else reads the key: it belongs to
+                    // the page whatever holds the keyboard, which is the whole point
+                    // of being able to reach it while reading.
+                    if modifiers.is_accelerator()
+                        && let Some(step) = match key {
+                            Key::Character('=' | '+') => Some(ZoomStep::In),
+                            Key::Character('-' | '_') => Some(ZoomStep::Out),
+                            Key::Character('0') => Some(ZoomStep::Reset),
+                            _ => None,
                         }
-                        Some(SystemPage::History) => {
-                            if let Some(action) = self.history_page.key_pressed(
+                    {
+                        self.step_zoom(step);
+                        break 'key;
+                    }
+                    // The panel takes the keys that walk its tree, but only while it
+                    // is the thing being looked at — and a caret in the address
+                    // field means the field is, however open the panel may be.
+                    //
+                    // With or without a document: a tab whose load failed still has
+                    // a console to filter and clear, and gating the panel's keys on
+                    // a page would take them away exactly when they are wanted.
+                    if self.keyboard_surface == SURFACE_INSPECTOR
+                        && self.inspector.open
+                        && self
+                            .inspector
+                            .key_pressed(
                                 key,
                                 modifiers,
+                                self.world
+                                    .page(self.tabs[self.active].id)
+                                    .map(PageScene::document),
                                 self.clipboard.as_mut(),
-                            ) {
-                                self.handle_history_action(action);
-                                return;
-                            }
+                            )
+                            .is_some()
+                    {
+                        if !self.inspector.open {
+                            let surface = self.tab_surface();
+                            self.activate_surface(surface);
                         }
-                        Some(SystemPage::Downloads) => {
-                            if let Some(action) =
-                                self.downloads_page
-                                    .key_pressed(key, modifiers, &mut self.text)
-                            {
-                                self.handle_downloads_action(action);
-                                return;
-                            }
-                        }
-                        Some(SystemPage::Bookmarks) => {
-                            if let Some(action) =
-                                self.bookmarks_page
-                                    .key_pressed(key, modifiers, &mut self.text)
-                            {
-                                self.handle_bookmarks_action(action);
-                                return;
-                            }
-                        }
-                        Some(SystemPage::Cookies) => {
-                            if let Some(action) =
-                                self.cookies_page
-                                    .key_pressed(key, modifiers, &mut self.text)
-                            {
-                                self.handle_cookies_action(action);
-                                return;
-                            }
-                        }
-                        Some(SystemPage::Cache) => {
-                            if let Some(action) =
-                                self.cache_page.key_pressed(key, modifiers, &mut self.text)
-                            {
-                                self.handle_cache_action(action);
-                                return;
-                            }
-                        }
-                        Some(SystemPage::About) => {
-                            match self.about.key_pressed(key, modifiers, &mut self.text) {
-                                Some(about::Action::OpenSettings) => {
-                                    self.open_system(SystemPage::Settings);
-                                    return;
+                        break 'key;
+                    }
+                    // A browser page shown in the tab gets the key first: it is what
+                    // the reader is looking at, and Tab on it walks its own controls
+                    // rather than the toolbar's.
+                    if self.keyboard_surface == SURFACE_SYSTEM {
+                        match self.tabs[self.active].system {
+                            Some(SystemPage::Settings) => {
+                                let before = self.settings.settings.clone();
+                                if let Some(action) = self.settings.key_pressed(
+                                    key,
+                                    modifiers,
+                                    self.clipboard.as_mut(),
+                                ) {
+                                    self.save_preferences_if_changed(&before);
+                                    self.handle_settings_action(&action);
+                                    break 'key;
                                 }
-                                Some(_) => return,
-                                None => {}
                             }
+                            Some(SystemPage::History) => {
+                                if let Some(action) = self.history_page.key_pressed(
+                                    key,
+                                    modifiers,
+                                    self.clipboard.as_mut(),
+                                ) {
+                                    self.handle_history_action(action);
+                                    break 'key;
+                                }
+                            }
+                            Some(SystemPage::Downloads) => {
+                                if let Some(action) =
+                                    self.downloads_page
+                                        .key_pressed(key, modifiers, &mut self.text)
+                                {
+                                    self.handle_downloads_action(action);
+                                    break 'key;
+                                }
+                            }
+                            Some(SystemPage::Bookmarks) => {
+                                if let Some(action) =
+                                    self.bookmarks_page
+                                        .key_pressed(key, modifiers, &mut self.text)
+                                {
+                                    self.handle_bookmarks_action(action);
+                                    break 'key;
+                                }
+                            }
+                            Some(SystemPage::Cookies) => {
+                                if let Some(action) =
+                                    self.cookies_page
+                                        .key_pressed(key, modifiers, &mut self.text)
+                                {
+                                    self.handle_cookies_action(action);
+                                    break 'key;
+                                }
+                            }
+                            Some(SystemPage::Cache) => {
+                                if let Some(action) =
+                                    self.cache_page.key_pressed(key, modifiers, &mut self.text)
+                                {
+                                    self.handle_cache_action(action);
+                                    break 'key;
+                                }
+                            }
+                            Some(SystemPage::About) => {
+                                match self.about.key_pressed(key, modifiers, &mut self.text) {
+                                    Some(about::Action::OpenSettings) => {
+                                        self.open_system(SystemPage::Settings);
+                                        break 'key;
+                                    }
+                                    Some(_) => break 'key,
+                                    None => {}
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                // Walking the document with Tab, before anything else reads the
-                // key: it is never a character, and it is what a reader without
-                // a pointer moves through a page with.
-                if key == Key::Tab
-                    && !modifiers.is_accelerator()
-                    && self.keyboard_surface == SURFACE_PAGE
-                    && self.tabs[self.active].system.is_none()
-                {
-                    let forward = !modifiers.shift;
-                    let walked = self
-                        .active_page_mut()
-                        .is_some_and(|page| page.focus_step(forward));
-                    if walked {
-                        self.accessibility_dirty = true;
-                        return;
-                    }
-                    // Off the end of the document, so the keyboard goes on to
-                    // the browser around it — which is the whole of what a
-                    // document not trapping the keyboard means.
-                    self.activate_surface(SURFACE_CHROME);
-                    self.ui.focus_edge(forward);
-                    return;
-                }
-
-                // Return on a link the keyboard reached follows it, which is
-                // the same navigation a click on it is — one route, so the two
-                // cannot come to disagree about what following a link means.
-                if key == Key::Enter
-                    && !modifiers.is_accelerator()
-                    && self.keyboard_surface == SURFACE_PAGE
-                    && self.tabs[self.active].system.is_none()
-                    && let Some(page) = self.page(self.active)
-                    && let Some(href) = page.focused_link()
-                {
-                    let url = page.resolve(&href).unwrap_or(href);
-                    self.navigate_from(&url, false);
-                    return;
-                }
-
-                // Copying what is selected on the page, before the interface reads
-                if self.keyboard_surface == SURFACE_PAGE && self.page_clipboard_key(key, modifiers)
-                {
-                    return;
-                }
-
-                // Copying what is selected on the page, before the interface reads
-                // the key: the address bar takes ⌘C for its own text only while it
-                // holds the caret, and the page's selection is the one on screen.
-                if key == Key::Character('c')
-                    && modifiers.command
-                    && self.keyboard_surface == SURFACE_PAGE
-                    && self.copy_selection()
-                {
-                    return;
-                }
-
-                // Selecting the page, and moving what is selected. Both go to the
-                // page only while the interface does not hold the caret, for the
-                // same reason ⌘C does: the address bar's own text is a selection
-                // too, and there is one keyboard between them.
-                // Return in a field sends the form it is in, which is why a search
-                // box with nothing but a field in it works at all.
-                if key == Key::Enter
-                    && self.keyboard_surface == SURFACE_PAGE
-                    && self.tabs[self.active].system.is_none()
-                    && self
-                        .active_page_mut()
-                        .is_some_and(PageScene::implicit_submit)
-                {
-                    self.follow_submission();
-                    return;
-                }
-                // Editing what is in a field in the page, before the keys that
-                // move a selection: an arrow in a focused field moves the caret
-                // and not the page's selection.
-                if self.keyboard_surface == SURFACE_PAGE
-                    && self.tabs[self.active].system.is_none()
-                    && self.page_edit_key(key, modifiers)
-                {
-                    return;
-                }
-                if self.keyboard_surface == SURFACE_PAGE
-                    && self.tabs[self.active].system.is_none()
-                    && self.page_selection_key(key, modifiers)
-                {
-                    return;
-                }
-
-                let global = key == Key::F5
-                    || modifiers.is_accelerator()
-                    || (key == Key::Escape && self.ui.popup_open());
-                if self.keyboard_surface == SURFACE_CHROME || global {
-                    let typed = self.ui.address.text().to_owned();
-                    let action = self.ui.key_pressed(
-                        key,
-                        modifiers,
-                        &mut self.text,
-                        self.clipboard.as_mut(),
-                    );
-                    let none = action == UiAction::None;
-                    // Which keyboard the chrome now claims. ⌘F claims it before
-                    // the field it claims it for exists — the bar is built by
-                    // the next frame — so the wish counts as much as the fact.
-                    let chrome = self.ui.address_focused()
-                        || self.ui.address_wants_keyboard()
-                        || self.ui.find_focused()
-                        || self.ui.find_wants_keyboard();
-                    self.apply(action);
-                    // Only when the key changed what is in the field: Escape
-                    // puts the list away, and a refresh that ran anyway would
-                    // put it straight back.
-                    if typed != self.ui.address.text() {
-                        self.refresh_suggestions();
-                    }
-                    // What the page is searching for is whatever the bar says,
-                    // and the key may have changed either — ⌘F opened it, a
-                    // letter narrowed it, Escape put it away.
-                    self.update_find();
-                    if chrome {
+                    // Walking the document with Tab, before anything else reads the
+                    // key: it is never a character, and it is what a reader without
+                    // a pointer moves through a page with.
+                    if key == Key::Tab
+                        && !modifiers.is_accelerator()
+                        && self.keyboard_surface == SURFACE_PAGE
+                        && self.tabs[self.active].system.is_none()
+                    {
+                        let forward = !modifiers.shift;
+                        let walked = self
+                            .active_page_mut()
+                            .is_some_and(|page| page.focus_step(forward));
+                        if walked {
+                            self.accessibility_dirty = true;
+                            break 'key;
+                        }
+                        // Off the end of the document, so the keyboard goes on to
+                        // the browser around it — which is the whole of what a
+                        // document not trapping the keyboard means.
                         self.activate_surface(SURFACE_CHROME);
+                        self.ui.focus_edge(forward);
+                        break 'key;
                     }
-                    if none && self.keyboard_surface == SURFACE_PAGE {
+
+                    // Return on a link the keyboard reached follows it, which is
+                    // the same navigation a click on it is — one route, so the two
+                    // cannot come to disagree about what following a link means.
+                    if key == Key::Enter
+                        && !modifiers.is_accelerator()
+                        && self.keyboard_surface == SURFACE_PAGE
+                        && self.tabs[self.active].system.is_none()
+                        && let Some(page) = self.page(self.active)
+                        && let Some(href) = page.focused_link()
+                    {
+                        let url = page.resolve(&href).unwrap_or(href);
+                        self.navigate_from(&url, false);
+                        break 'key;
+                    }
+
+                    // Copying what is selected on the page, before the interface reads
+                    if self.keyboard_surface == SURFACE_PAGE
+                        && self.page_clipboard_key(key, modifiers)
+                    {
+                        break 'key;
+                    }
+
+                    // Copying what is selected on the page, before the interface reads
+                    // the key: the address bar takes ⌘C for its own text only while it
+                    // holds the caret, and the page's selection is the one on screen.
+                    if key == Key::Character('c')
+                        && modifiers.command
+                        && self.keyboard_surface == SURFACE_PAGE
+                        && self.copy_selection()
+                    {
+                        break 'key;
+                    }
+
+                    // Selecting the page, and moving what is selected. Both go to the
+                    // page only while the interface does not hold the caret, for the
+                    // same reason ⌘C does: the address bar's own text is a selection
+                    // too, and there is one keyboard between them.
+                    // Return in a field sends the form it is in, which is why a search
+                    // box with nothing but a field in it works at all.
+                    if key == Key::Enter
+                        && self.keyboard_surface == SURFACE_PAGE
+                        && self.tabs[self.active].system.is_none()
+                        && self
+                            .active_page_mut()
+                            .is_some_and(PageScene::implicit_submit)
+                    {
+                        self.follow_submission();
+                        break 'key;
+                    }
+                    // Editing what is in a field in the page, before the keys that
+                    // move a selection: an arrow in a focused field moves the caret
+                    // and not the page's selection.
+                    if self.keyboard_surface == SURFACE_PAGE
+                        && self.tabs[self.active].system.is_none()
+                        && self.page_edit_key(key, modifiers)
+                    {
+                        break 'key;
+                    }
+                    if self.keyboard_surface == SURFACE_PAGE
+                        && self.tabs[self.active].system.is_none()
+                        && self.page_selection_key(key, modifiers)
+                    {
+                        break 'key;
+                    }
+
+                    let global = key == Key::F5
+                        || modifiers.is_accelerator()
+                        || (key == Key::Escape && self.ui.popup_open());
+                    if self.keyboard_surface == SURFACE_CHROME || global {
+                        let typed = self.ui.address.text().to_owned();
+                        let action = self.ui.key_pressed(
+                            key,
+                            modifiers,
+                            &mut self.text,
+                            self.clipboard.as_mut(),
+                        );
+                        let none = action == UiAction::None;
+                        // Which keyboard the chrome now claims. ⌘F claims it before
+                        // the field it claims it for exists — the bar is built by
+                        // the next frame — so the wish counts as much as the fact.
+                        let chrome = self.ui.address_focused()
+                            || self.ui.address_wants_keyboard()
+                            || self.ui.find_focused()
+                            || self.ui.find_wants_keyboard();
+                        self.apply(action);
+                        // Only when the key changed what is in the field: Escape
+                        // puts the list away, and a refresh that ran anyway would
+                        // put it straight back.
+                        if typed != self.ui.address.text() {
+                            self.refresh_suggestions();
+                        }
+                        // What the page is searching for is whatever the bar says,
+                        // and the key may have changed either — ⌘F opened it, a
+                        // letter narrowed it, Escape put it away.
+                        self.update_find();
+                        if chrome {
+                            self.activate_surface(SURFACE_CHROME);
+                        }
+                        if none && self.keyboard_surface == SURFACE_PAGE {
+                            self.scroll_by_key(key);
+                        }
+                    } else if self.keyboard_surface == SURFACE_PAGE {
                         self.scroll_by_key(key);
                     }
-                } else if self.keyboard_surface == SURFACE_PAGE {
-                    self.scroll_by_key(key);
                 }
+                self.after_page_key(key, modifiers, before);
             }
 
             PlatformEvent::TextInput(character) => {
@@ -726,10 +746,14 @@ impl Painter for Browser {
                         let _ = self.inspector.text_input(character);
                     }
                     SURFACE_PAGE => {
-                        if self.tabs[self.active].system.is_none()
-                            && let Some(page) = self.active_page_mut()
-                        {
-                            let _ = page.typed(&character.to_string());
+                        if std::mem::take(&mut self.text_cancelled) {
+                            self.flush_keyup();
+                        } else if self.tabs[self.active].system.is_none() {
+                            let before = self.page_field_value();
+                            if let Some(page) = self.active_page_mut() {
+                                let _ = page.typed(&character.to_string());
+                            }
+                            self.after_page_text(character, before);
                         }
                     }
                     SURFACE_SYSTEM => match self.tabs[self.active].system {

@@ -1170,7 +1170,7 @@ impl PageWorld {
     /// isolate, because the isolate is holding the document a navigation
     /// destroys. What is decided here is whether the hop is allowed and where it
     /// goes; the going is the window's, which keeps the history.
-    fn follow_script_navigation(&mut self, tab: TabId) {
+    pub(super) fn follow_script_navigation(&mut self, tab: TabId) {
         // This tab's, not the thread's. A navigation asked for by one tab was
         // once answerable by whichever tab was being pumped when it was noticed.
         let Some(request) = self

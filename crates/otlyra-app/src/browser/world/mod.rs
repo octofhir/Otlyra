@@ -456,6 +456,34 @@ impl PageWorld {
         changed
     }
 
+    /// Dispatch a user-input event at an element of `tab`'s document, as its
+    /// own script turn, and answer whether the page cancelled it. A page with
+    /// no script, or one still loading, cancels nothing.
+    pub(super) fn dispatch_input(
+        &mut self,
+        tab: TabId,
+        target: NodeId,
+        kind: &str,
+        init: &str,
+    ) -> bool {
+        let Some(slot) = self.slots.get_mut(&tab) else {
+            return false;
+        };
+        if slot.pending.is_some() {
+            return false;
+        }
+        let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
+            return false;
+        };
+        let cancelled =
+            page.with_document(|document| scripts.dispatch_input(document, target, kind, init));
+        if scripts.take_mutated() {
+            page.document_changed();
+        }
+        self.follow_script_navigation(tab);
+        cancelled
+    }
+
     /// Give only the visible page its requested animation frame.
     ///
     /// `requestAnimationFrame` means *before the next paint*, so this runs on

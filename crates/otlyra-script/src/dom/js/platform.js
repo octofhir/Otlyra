@@ -154,3 +154,53 @@ class NoopObserver {
 if (typeof IntersectionObserver === 'undefined') defineGlobal('IntersectionObserver', NoopObserver);
 if (typeof MutationObserver === 'undefined') defineGlobal('MutationObserver', NoopObserver);
 if (typeof ResizeObserver === 'undefined') defineGlobal('ResizeObserver', NoopObserver);
+
+// A user-input event the browser dispatches: what the reader did, as the event
+// a page listens for. The browser picks the target (`document.__otlyraInputTarget`)
+// and says whether the page cancelled it, which decides whether a link is
+// followed, a field focused or a selection started.
+const INPUT_EVENTS = {
+  pointerdown: [PointerEvent, true, true],
+  pointerup: [PointerEvent, true, true],
+  pointermove: [PointerEvent, true, true],
+  mousedown: [MouseEvent, true, true],
+  mouseup: [MouseEvent, true, true],
+  mousemove: [MouseEvent, true, true],
+  click: [PointerEvent, true, true],
+  auxclick: [PointerEvent, true, true],
+  dblclick: [MouseEvent, true, true],
+  contextmenu: [PointerEvent, true, true],
+  wheel: [WheelEvent, true, true],
+  keydown: [KeyboardEvent, true, true],
+  keyup: [KeyboardEvent, true, true],
+  keypress: [KeyboardEvent, true, true],
+  beforeinput: [InputEvent, true, true],
+  input: [InputEvent, true, false],
+  change: [Event, true, false],
+  focus: [FocusEvent, false, false],
+  blur: [FocusEvent, false, false],
+  focusin: [FocusEvent, true, false],
+  focusout: [FocusEvent, true, false],
+};
+
+defineGlobal('__otlyraDispatchInput', function __otlyraDispatchInput(type, init) {
+  const target = document.__otlyraInputTarget || document.body || document.documentElement;
+  const shape = INPUT_EVENTS[type];
+  if (!target || !shape) return 0;
+  const [Interface, bubbles, cancelable] = shape;
+  const event = new Interface(type, {
+    bubbles,
+    cancelable,
+    composed: true,
+    view: globalThis,
+    ...init,
+  });
+  // What the reader did, not what a script made up.
+  try {
+    Object.defineProperty(event, 'isTrusted', { value: true, enumerable: true });
+  } catch {
+    // An engine that keeps `isTrusted` to itself keeps it false.
+  }
+  target.dispatchEvent(event);
+  return event.defaultPrevented ? 1 : 0;
+});

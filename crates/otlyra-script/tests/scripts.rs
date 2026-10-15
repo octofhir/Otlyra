@@ -1212,3 +1212,42 @@ fn ui_event_interfaces_take_their_init_dictionaries() {
         ],
     );
 }
+
+/// The browser's input events reach listeners aimed at the element it names,
+/// trusted, and report whether the page cancelled them.
+#[test]
+fn input_dispatched_by_the_browser_reaches_its_target_and_reports_cancellation() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;
+    let mut parser = HtmlParser::new().with_script_runner(Box::new(PageScripts::with_console(
+        "https://example.com/",
+        handle,
+    )));
+    let mut document = otlyra_dom::Document::new();
+    parser.feed(
+        &mut document,
+        "<button id=go>Go</button><script>\
+           document.addEventListener('click', (event) => {\
+             console.log(event.type, event.target.id, event.isTrusted, event.clientX, event instanceof PointerEvent);\
+             if (event.clientX > 10) event.preventDefault();\
+           });\
+         </script>"
+            .into(),
+    );
+    let mut runner = parser.finish(&mut document).expect("a runner");
+    let mut stack = vec![document.root()];
+    let mut button = None;
+    while let Some(node) = stack.pop() {
+        if document.attr(node, "id") == Some("go") {
+            button = Some(node);
+        }
+        stack.extend(document.children(node));
+    }
+    let button = button.expect("the button");
+    assert!(!runner.dispatch_input(&mut document, button, "click", "{\"clientX\": 4}"));
+    assert!(runner.dispatch_input(&mut document, button, "click", "{\"clientX\": 40}"));
+    assert_eq!(
+        lines(&sink),
+        ["Log: click go true 4 true", "Log: click go true 40 true"]
+    );
+}

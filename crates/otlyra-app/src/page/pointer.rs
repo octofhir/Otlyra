@@ -45,6 +45,80 @@ impl PageScene {
         None
     }
 
+    /// The element a pointer event at this point is aimed at: the node the
+    /// topmost box was made for, or the element that contains that text.
+    pub fn element_at(&self, x: f64, y: f64) -> Option<NodeId> {
+        let mut current = self.node_at(x, y);
+        while let Some(node) = current {
+            let data = self.document.get(node)?;
+            if data.element().is_some() {
+                return Some(node);
+            }
+            current = data.parent;
+        }
+        None
+    }
+
+    /// Whether a checkable control is checked, for tests that press one.
+    #[cfg(test)]
+    pub(crate) fn is_checked(&self, node: NodeId) -> bool {
+        self.form.checkedness(&self.document, node)
+    }
+
+    /// The document's `<body>`, or its root element without one: where keys
+    /// go when nothing is focused.
+    pub fn body_element(&self) -> Option<NodeId> {
+        let root = self.document.first_element_child(self.document.root())?;
+        let mut child = self.document.first_element_child(root);
+        while let Some(node) = child {
+            if self
+                .document
+                .get(node)
+                .and_then(|data| data.element())
+                .is_some_and(|element| &*element.name.local == "body")
+            {
+                return Some(node);
+            }
+            child = self.document.next_element_sibling(node);
+        }
+        Some(root)
+    }
+
+    /// The element keyboard events go to: the focused one, if any.
+    pub fn focused_element(&self) -> Option<NodeId> {
+        self.interaction.focus
+    }
+
+    /// The nearest element containing both `a` and `b` (DOM order), which is
+    /// where a click whose press and release landed on different elements goes.
+    pub fn common_ancestor(&self, a: NodeId, b: NodeId) -> Option<NodeId> {
+        let mut chain = Vec::new();
+        let mut current = Some(a);
+        while let Some(node) = current {
+            chain.push(node);
+            current = self.document.get(node).and_then(|data| data.parent);
+        }
+        let mut current = Some(b);
+        while let Some(node) = current {
+            if chain.contains(&node) {
+                return self.document.get(node)?.element().map(|_| node);
+            }
+            current = self.document.get(node).and_then(|data| data.parent);
+        }
+        None
+    }
+
+    /// A press whose click the page cancelled: let it go without activating
+    /// what it was on.
+    pub fn pointer_cancelled(&mut self) -> bool {
+        self.field_dragging = false;
+        self.sliding = None;
+        self.set_interaction(otlyra_css::state::Interaction {
+            active: None,
+            ..self.interaction
+        })
+    }
+
     /// The control a press at this point acts on, if any.
     ///
     /// A `<label>` acts on the control it names, which is what makes the words

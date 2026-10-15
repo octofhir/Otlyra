@@ -443,6 +443,7 @@ fn clicking_a_link_navigates_to_it() {
     );
 
     browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    browser.on_event(PlatformEvent::PointerReleased);
     assert_eq!(browser.tabs[0].url, "https://start.example/next");
 }
 
@@ -828,6 +829,7 @@ fn a_press_on_the_page_goes_through_the_suggestions() {
     let (x, y) = link_position(&browser);
     browser.on_event(PlatformEvent::PointerMoved { x, y });
     browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    browser.on_event(PlatformEvent::PointerReleased);
     settle(&mut browser);
 
     assert!(!browser.ui().suggesting(), "the list stayed over the page");
@@ -1533,6 +1535,7 @@ fn a_base_element_moves_links_and_pictures() {
     let (x, y) = link_position(&browser);
     browser.on_event(PlatformEvent::PointerMoved { x, y });
     browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    browser.on_event(PlatformEvent::PointerReleased);
     assert_eq!(browser.tabs[0].url, "https://cdn.example/root/next.html");
 
     // A page from the network with a base on disk: its picture resolves to a
@@ -1990,73 +1993,76 @@ fn a_cached_picture_is_not_fetched_twice() {
 /// one that failed during the load is not asked for again on every frame.
 #[test]
 fn pictures_script_adds_after_the_load_are_fetched_once() {
-    struct PictureLoader {
-        requested: Requests,
-    }
-
-    impl Loader for PictureLoader {
-        fn load(&self, url: &str) -> Result<Loaded, String> {
-            self.requested
-                .lock()
-                .expect("no panic on the fetch thread")
-                .push(url.to_owned());
-            if url.ends_with("/broken.png") {
-                return Err("gone".to_owned());
-            }
-            if url.ends_with(".png") {
-                return Ok(Loaded {
-                    content_type: Some("image/png".to_owned()),
-                    bytes: ONE_PIXEL_PNG.to_vec(),
-                    final_url: url.to_owned(),
-                    ..Default::default()
-                });
-            }
-            Ok(Loaded {
-                content_type: Some("text/html".to_owned()),
-                bytes: b"<body><img id=first src=\"/first.png\"><img src=\"/broken.png\">\
-                         <script>setTimeout(() => {\
-                           const late = document.createElement('img');\
-                           late.src = '/late.png';\
-                           document.body.appendChild(late);\
-                           document.getElementById('first').src = '/swapped.png';\
-                         }, 0);</script>"
-                    .to_vec(),
-                charset: Some("utf-8".to_owned()),
-                final_url: "https://pictures.example/".to_owned(),
-                ..Default::default()
-            })
+    // Page script needs the content owner's stack; see `on_content_stack`.
+    on_content_stack(|| {
+        struct PictureLoader {
+            requested: Requests,
         }
-    }
 
-    let requested = Requests::default();
-    let mut browser = Browser::new(PictureLoader {
-        requested: std::sync::Arc::clone(&requested),
+        impl Loader for PictureLoader {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                self.requested
+                    .lock()
+                    .expect("no panic on the fetch thread")
+                    .push(url.to_owned());
+                if url.ends_with("/broken.png") {
+                    return Err("gone".to_owned());
+                }
+                if url.ends_with(".png") {
+                    return Ok(Loaded {
+                        content_type: Some("image/png".to_owned()),
+                        bytes: ONE_PIXEL_PNG.to_vec(),
+                        final_url: url.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: b"<body><img id=first src=\"/first.png\"><img src=\"/broken.png\">\
+                             <script>setTimeout(() => {\
+                               const late = document.createElement('img');\
+                               late.src = '/late.png';\
+                               document.body.appendChild(late);\
+                               document.getElementById('first').src = '/swapped.png';\
+                             }, 0);</script>"
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: "https://pictures.example/".to_owned(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let requested = Requests::default();
+        let mut browser = Browser::new(PictureLoader {
+            requested: std::sync::Arc::clone(&requested),
+        });
+        let viewport = Viewport::new(800, 600, 1.0);
+        browser.set_viewport(viewport);
+        go(&mut browser, "pictures.example");
+        for _ in 0..3 {
+            browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+        }
+
+        let asked = asked_for(&requested);
+        let count = |name: &str| asked.iter().filter(|url| url.ends_with(name)).count();
+        assert_eq!(count("/first.png"), 1, "{asked:?}");
+        assert_eq!(
+            count("/late.png"),
+            1,
+            "an added picture is fetched: {asked:?}"
+        );
+        assert_eq!(
+            count("/swapped.png"),
+            1,
+            "a changed src is fetched: {asked:?}"
+        );
+        assert_eq!(
+            count("/broken.png"),
+            1,
+            "a failed picture is not retried per frame: {asked:?}"
+        );
     });
-    let viewport = Viewport::new(800, 600, 1.0);
-    browser.set_viewport(viewport);
-    go(&mut browser, "pictures.example");
-    for _ in 0..3 {
-        browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
-    }
-
-    let asked = asked_for(&requested);
-    let count = |name: &str| asked.iter().filter(|url| url.ends_with(name)).count();
-    assert_eq!(count("/first.png"), 1, "{asked:?}");
-    assert_eq!(
-        count("/late.png"),
-        1,
-        "an added picture is fetched: {asked:?}"
-    );
-    assert_eq!(
-        count("/swapped.png"),
-        1,
-        "a changed src is fetched: {asked:?}"
-    );
-    assert_eq!(
-        count("/broken.png"),
-        1,
-        "a failed picture is not retried per frame: {asked:?}"
-    );
 }
 
 /// A window that grows past the file its pictures were chosen for asks again.
@@ -3856,4 +3862,244 @@ fn the_interface_and_the_page_both_reach_the_paint_seam() {
             >= 2,
         "the page's text and the interface's own"
     );
+}
+
+/// Serves one page, whatever is asked for, and records what was asked.
+struct OnePage {
+    html: &'static str,
+    requested: Requests,
+}
+
+impl Loader for OnePage {
+    fn load(&self, url: &str) -> Result<Loaded, String> {
+        self.requested
+            .lock()
+            .expect("no panic on the fetch thread")
+            .push(url.to_owned());
+        Ok(Loaded {
+            content_type: Some("text/html".to_owned()),
+            bytes: self.html.as_bytes().to_vec(),
+            charset: Some("utf-8".to_owned()),
+            final_url: if url.contains("://") {
+                url.to_owned()
+            } else {
+                format!("https://input.example/{url}")
+            },
+            ..Default::default()
+        })
+    }
+}
+
+fn input_page(html: &'static str) -> (Browser, Requests) {
+    let requested = Requests::default();
+    let mut browser = Browser::new(OnePage {
+        html,
+        requested: std::sync::Arc::clone(&requested),
+    });
+    go(&mut browser, "https://input.example/");
+    browser.paint(
+        &mut otlyra_gfx::RecordingPainter::new(),
+        Viewport::new(800, 600, 1.0),
+    );
+    (browser, requested)
+}
+
+/// Where in the window the element with `id` can be pressed.
+fn position_of(browser: &Browser, id: &str) -> (f64, f64) {
+    let page = browser.page(browser.active).expect("page");
+    for y in 0..200 {
+        for x in 0..400 {
+            let (x, y) = (f64::from(x), UI_HEIGHT + f64::from(y));
+            if page
+                .element_at(x, y)
+                .is_some_and(|node| page.document().attr(node, "id") == Some(id))
+            {
+                return (x + 1.0, y + 1.0);
+            }
+        }
+    }
+    panic!("no #{id} on the page");
+}
+
+fn press_and_release(browser: &mut Browser, id: &str) {
+    let (x, y) = position_of(browser, id);
+    browser.on_event(PlatformEvent::PointerMoved { x, y });
+    browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+    browser.on_event(PlatformEvent::PointerReleased);
+}
+
+/// What the page's script wrote into its `<html data-log>`.
+fn page_log(browser: &Browser) -> String {
+    let document = browser.page(browser.active).expect("page").document();
+    let mut stack = vec![document.root()];
+    while let Some(node) = stack.pop() {
+        if let Some(log) = document.attr(node, "data-log") {
+            return log.to_owned();
+        }
+        stack.extend(document.children(node));
+    }
+    String::new()
+}
+
+/// A press and its release reach the page's listeners as the events a page
+/// listens for, in order, aimed where they landed.
+#[test]
+fn a_press_on_the_page_reaches_its_script_as_pointer_mouse_and_click_events() {
+    // Page script needs the content owner's stack; see `on_content_stack`.
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=go style='width:100px;height:40px'>Go</button>\
+             <script>\
+               const seen = [];\
+               for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {\
+                 document.addEventListener(type, (event) => {\
+                   seen.push(event.type + ':' + event.target.id + ':' + event.isTrusted + ':' + (event.clientX > 0) + ':' + event.detail);\
+                   document.documentElement.dataset.log = seen.join(' ');\
+                 });\
+               }\
+             </script>",
+        );
+        press_and_release(&mut browser, "go");
+        assert_eq!(
+            page_log(&browser),
+            [
+                "pointerdown:go:true:true:1",
+                "mousedown:go:true:true:1",
+                "pointerup:go:true:true:1",
+                "mouseup:go:true:true:1",
+                "click:go:true:true:1",
+            ]
+            .join(" ")
+        );
+    });
+}
+
+/// A link whose click the page cancels is not followed; one it does not
+/// cancel is, and only by the click rather than by the press.
+#[test]
+fn a_cancelled_click_keeps_the_reader_on_the_page() {
+    // Page script needs the content owner's stack; see `on_content_stack`.
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><a id=stay href=/elsewhere onclick='document.documentElement.dataset.log=\"stayed\"; return false'>stay</a> \
+             <a id=leave href=/next>leave</a>",
+        );
+        press_and_release(&mut browser, "stay");
+        settle(&mut browser);
+        assert_eq!(page_log(&browser), "stayed");
+        assert_eq!(browser.tabs[0].url, "https://input.example/");
+
+        let (x, y) = position_of(&browser, "leave");
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerPressed { clicks: 1 });
+        assert_eq!(
+            browser.tabs[0].url, "https://input.example/",
+            "not on the press"
+        );
+        browser.on_event(PlatformEvent::PointerReleased);
+        assert_eq!(browser.tabs[0].url, "https://input.example/next");
+    });
+}
+
+/// A cancelled click does not tick a checkbox, and a cancelled press does not
+/// focus a field.
+#[test]
+fn cancelled_input_withholds_the_controls_own_behaviour() {
+    // Page script needs the content owner's stack; see `on_content_stack`.
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0>\
+             <input id=box type=checkbox style='width:30px;height:30px;margin:0'>\
+             <input id=free type=checkbox style='width:30px;height:30px;margin:0'>\
+             <input id=field style='width:100px;height:30px;margin:0'>\
+             <script>\
+               document.getElementById('box').addEventListener('click', (event) => event.preventDefault());\
+               document.getElementById('field').addEventListener('mousedown', (event) => event.preventDefault());\
+             </script>",
+        );
+        press_and_release(&mut browser, "box");
+        press_and_release(&mut browser, "free");
+        press_and_release(&mut browser, "field");
+        let page = browser.page(browser.active).expect("page");
+        let checked = |id: &str| {
+            let document = page.document();
+            let (x, y) = position_of(&browser, id);
+            let (x, y) = browser.in_page(x, y);
+            let node = page.element_at(x, y).expect("the control");
+            let _ = document;
+            page.is_checked(node)
+        };
+        assert!(!checked("box"), "a cancelled click ticked the box");
+        assert!(checked("free"), "an uncancelled click did not tick the box");
+        assert_ne!(
+            page.focused_element()
+                .and_then(|node| page.document().attr(node, "id")),
+            Some("field"),
+            "a cancelled press focused the field"
+        );
+    });
+}
+
+/// Run `run` on a thread with the native content owner's stack. Otter's debug
+/// bootstrap is deep enough that a page's isolate cannot start on the default
+/// test thread, and a page without one cancels nothing.
+fn on_content_stack(run: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("content-stack-test".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Keys reach the page as keydown, the field's input, then keyup; a page that
+/// cancels a key's keydown keeps both the browser and the field from it.
+#[test]
+fn keys_reach_the_page_and_a_cancelled_keydown_types_nothing() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><input id=field style='width:200px;height:30px;margin:0'>\
+             <script>\
+               const field = document.getElementById('field');\
+               const seen = [];\
+               const note = (event) => {\
+                 seen.push(event.type + ':' + (event.key || event.inputType + '=' + event.data));\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               };\
+               for (const type of ['keydown', 'input', 'keyup']) field.addEventListener(type, note);\
+               field.addEventListener('keydown', (event) => { if (event.key === 'x') event.preventDefault(); });\
+             </script>",
+        );
+        press_and_release(&mut browser, "field");
+        let modifiers = otlyra_platform::Modifiers::default();
+        for character in ['a', 'x', 'b'] {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Character(character),
+                modifiers,
+            });
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Backspace,
+            modifiers,
+        });
+        assert_eq!(
+            page_log(&browser),
+            [
+                "keydown:a",
+                "input:insertText=a",
+                "keyup:a",
+                "keydown:x",
+                "keyup:x",
+                "keydown:b",
+                "input:insertText=b",
+                "keyup:b",
+                "keydown:Backspace",
+                "input:deleteContentBackward=null",
+                "keyup:Backspace",
+            ]
+            .join(" ")
+        );
+    });
 }

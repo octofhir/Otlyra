@@ -107,6 +107,9 @@ pub struct PageState {
     /// `document.currentScript` answers. Bundlers find their own address
     /// through it, and load the rest of themselves relative to that.
     current_script: Option<otlyra_dom::NodeId>,
+    /// The element a user-input event the embedder is dispatching is aimed
+    /// at, for the turn that dispatches it.
+    input_target: Option<otlyra_dom::NodeId>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -216,6 +219,11 @@ impl PageState {
     pub fn set_current_script(&mut self, element: Option<otlyra_dom::NodeId>) {
         self.current_script = element;
     }
+
+    /// Aim the user-input event about to be dispatched, or clear the aim.
+    pub fn set_input_target(&mut self, element: Option<otlyra_dom::NodeId>) {
+        self.input_target = element;
+    }
 }
 
 /// Read the lent page state. A binding running outside a turn — our bug, not a
@@ -280,6 +288,10 @@ pub(crate) fn window_metric(which: u32) -> f64 {
 
 pub(crate) fn current_script() -> Option<otlyra_dom::NodeId> {
     with_state(|state| state.current_script)
+}
+
+pub(crate) fn input_target() -> Option<otlyra_dom::NodeId> {
+    with_state(|state| state.input_target)
 }
 
 /// Lend `document` and `state` to the isolate for the duration of `run`.
