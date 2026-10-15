@@ -555,6 +555,22 @@ impl HtmlParser {
             // they are here and it runs where it stands, in document order with
             // the inline ones around it. One the prescan did not see is handed
             // back to the caller to fetch, and runs after the parse.
+            // `type` names a language, and the only ones we execute are the
+            // ones the spec calls classic JavaScript. A `type="module"`, an
+            // import map, or a `<script type="text/template">` full of markup
+            // are all data as far as this is concerned — with a `src` too: a
+            // module run as a classic script fails on its first `import`, and
+            // waiting for one would hold up the parse for nothing. Without
+            // modules, a page's `nomodule` fallback is what runs instead.
+            match data.attr("type").map(str::trim) {
+                None | Some("") => {}
+                Some(kind) if is_classic_javascript(kind) => {}
+                Some(kind) => {
+                    tracing::debug!(target: "page.script", kind, "script of a type we do not run");
+                    return;
+                }
+            }
+
             if let Some(src) = data.attr("src") {
                 let src = src.trim().to_owned();
                 self.external_scripts.push(element);
@@ -574,20 +590,6 @@ impl HtmlParser {
                 external = true;
                 source.clone()
             } else {
-                // `type` names a language, and the only ones we execute are the
-                // ones the spec calls classic JavaScript. A `type="module"`, an
-                // import map, or a `<script type="text/template">` full of markup
-                // are all data as far as this is concerned.
-                match data.attr("type").map(str::trim) {
-                    None => {}
-                    Some("") => {}
-                    Some(kind) if is_classic_javascript(kind) => {}
-                    Some(kind) => {
-                        tracing::debug!(target: "page.script", kind, "script of a type we do not run");
-                        return;
-                    }
-                }
-
                 let mut source = String::new();
                 let mut child = node.first_child();
                 while let Some(id) = child {
@@ -699,7 +701,7 @@ impl HtmlParser {
 /// call the language. Anything not on it — `module`, `importmap`,
 /// `application/json`, `text/template` — is not a classic script, and the
 /// element's contents are data.
-fn is_classic_javascript(kind: &str) -> bool {
+pub(crate) fn is_classic_javascript(kind: &str) -> bool {
     const ESSENCES: [&str; 16] = [
         "application/ecmascript",
         "application/javascript",

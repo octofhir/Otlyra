@@ -559,6 +559,27 @@ mod tests {
         let _ = blocked;
     }
 
+    /// A module, with a `src` or not, neither stops the parse nor runs: it is
+    /// not a classic script. The `nomodule` fallback beside it does run.
+    #[test]
+    fn a_module_script_is_neither_waited_for_nor_run_as_a_classic_one() {
+        use otlyra_dom::Document;
+
+        let mut parser = HtmlParser::new().with_script_runner(Box::new(CountingRunner::default()));
+        let mut document = Document::new();
+        parser.feed(
+            &mut document,
+            "<body><script type=module src=app.mjs></script><script nomodule>legacy()</script>\
+             <p>after</p>"
+                .into(),
+        );
+        assert_eq!(parser.blocked_on(), None, "a module held up the parse");
+        assert!(parser.external_scripts().is_empty());
+        assert_eq!(parser.scripts_run(), 1, "only the nomodule fallback runs");
+        parser.finish(&mut document);
+        assert!(dump::serialize(&document).contains("\"after\""));
+    }
+
     /// A script whose fetch failed does not stop the page for ever.
     #[test]
     fn a_script_that_never_arrives_can_be_stepped_over() {

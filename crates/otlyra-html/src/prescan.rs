@@ -183,7 +183,13 @@ impl<'a> Scanner<'a> {
                 self.skip_past(b"-->");
             } else if self.tag_named(b"script") {
                 self.at += 1 + b"script".len();
-                let src = self.tag_attribute(b"src");
+                let [src, kind] = self.tag_attributes([b"src".as_slice(), b"type"]);
+                // A module, an import map or a data block is not fetched for
+                // the parse: it is not a classic script, and none is run.
+                let classic = kind.as_deref().is_none_or(|kind| {
+                    kind.is_empty() || crate::driver::is_classic_javascript(kind)
+                });
+                let src = src.filter(|_| classic);
                 // Whatever is between here and the close tag is source, not
                 // markup, and a `<script src=…>` written inside it is a string.
                 self.skip_past(b"</script");
@@ -212,18 +218,20 @@ impl<'a> Scanner<'a> {
         found
     }
 
-    /// Read a tag's attributes and return the value of `name`, trimmed.
+    /// Read a tag's attributes and return the values of `wanted`, trimmed.
     ///
     /// The cursor is left past the tag either way: the attributes have to be read
     /// through in any case, because `>` inside a quoted value is not the end.
-    fn tag_attribute(&mut self, wanted: &[u8]) -> Option<String> {
-        let mut value: Option<String> = None;
+    fn tag_attributes<const N: usize>(&mut self, wanted: [&[u8]; N]) -> [Option<String>; N] {
+        let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
         while let Some((name, found)) = self.attribute() {
-            if name == wanted && value.is_none() {
-                value = Some(String::from_utf8_lossy(&found).trim().to_owned());
+            for (index, wanted) in wanted.iter().enumerate() {
+                if name == *wanted && values[index].is_none() {
+                    values[index] = Some(String::from_utf8_lossy(&found).trim().to_owned());
+                }
             }
         }
-        value
+        values
     }
 
     fn looks_like_a_tag(&self) -> bool {
@@ -449,6 +457,17 @@ mod tests {
                  <script src=\"http://x/Three.js\" defer></script>"
             ),
             ["one.js", "/two.js", "http://x/Three.js"]
+        );
+    }
+
+    #[test]
+    fn a_module_or_data_block_is_not_fetched_for_the_parse() {
+        assert_eq!(
+            scripts(
+                "<script type=module src=m.js></script><script type=importmap src=i.json></script>\
+                 <script type=' text/javascript ' src=c.js></script><script nomodule src=legacy.js></script>"
+            ),
+            ["c.js", "legacy.js"]
         );
     }
 
