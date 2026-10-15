@@ -33,10 +33,8 @@ fn the_rendered_frame_is_not_blank() {
     let rendered = render_offscreen(&mut scene, viewport).expect("render a frame");
     let (_, _, pixels) = common::decode(&rendered);
 
-    let distinct: std::collections::BTreeSet<[u8; 4]> = pixels
-        .chunks_exact(4)
-        .map(|p| [p[0], p[1], p[2], p[3]])
-        .collect();
+    let distinct: std::collections::BTreeSet<[u8; 4]> =
+        pixels.as_chunks::<4>().0.iter().copied().collect();
 
     assert!(
         distinct.len() > 16,

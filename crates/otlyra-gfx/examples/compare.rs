@@ -54,8 +54,10 @@ fn main() -> ExitCode {
 
     for (index, (ours, theirs)) in ours
         .pixels
-        .chunks_exact(4)
-        .zip(theirs.pixels.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(theirs.pixels.as_chunks::<4>().0)
         .enumerate()
     {
         let apart = (0..3)

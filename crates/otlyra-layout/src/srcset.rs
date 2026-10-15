@@ -383,7 +383,7 @@ fn calc(text: &str, viewport: Viewport) -> Option<f32> {
         }
 
         // One term: a length or a number, then any run of `*` and `/`.
-        let end = rest.find(['+', '-']).map_or(rest.len(), |found| found);
+        let end = rest.find(['+', '-']).unwrap_or(rest.len());
         // A `-` inside a term belongs to the term only where it opens it, and a
         // `sizes` has no negative lengths, so the split is at the sign.
         let (term, next) = rest.split_at(end);

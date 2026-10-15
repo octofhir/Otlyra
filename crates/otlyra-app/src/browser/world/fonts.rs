@@ -213,8 +213,8 @@ mod tests {
     #[test]
     fn a_subset_is_needed_only_for_its_characters() {
         let faces = [
-            face("Split", 400.0, vec![0..=0xFF]),
-            face("Split", 400.0, vec![0x400..=0x4FF]),
+            face("Split", 400.0, std::iter::once(0..=0xFF).collect()),
+            face("Split", 400.0, std::iter::once(0x400..=0x4FF).collect()),
         ];
         assert_eq!(needed_faces(&faces, &[using("Split", 400.0, "hello")]), [0]);
         assert_eq!(

@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn subsets_match_together() {
         let subset = |start: u32, end: u32| FaceDescriptors {
-            unicode_range: vec![start..=end],
+            unicode_range: std::iter::once(start..=end).collect(),
             ..FaceDescriptors::default()
         };
         let faces = [subset(0, 0xFF), subset(0x400, 0x4FF), weighing(700.0)];

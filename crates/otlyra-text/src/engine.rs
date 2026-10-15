@@ -2156,7 +2156,7 @@ mod tests {
     fn unicode_range_decides_which_characters_a_face_sets() {
         let mut engine = engine();
         let cyrillic = FaceDescriptors {
-            unicode_range: vec![0x400..=0x4FF],
+            unicode_range: std::iter::once(0x400..=0x4FF).collect(),
             ..FaceDescriptors::default()
         };
         assert!(engine.add_web_face("Split", &cyrillic, 0, TEST_FONT.to_vec()));
@@ -2227,7 +2227,7 @@ mod tests {
     fn the_strut_comes_from_the_face_that_covers_a_space() {
         let mut engine = engine();
         let cyrillic = FaceDescriptors {
-            unicode_range: vec![0x400..=0x4FF],
+            unicode_range: std::iter::once(0x400..=0x4FF).collect(),
             ..FaceDescriptors::default()
         };
         assert!(engine.add_web_face("Strut", &cyrillic, 1, TEST_FONT.to_vec()));

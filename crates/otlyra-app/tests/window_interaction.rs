@@ -226,8 +226,10 @@ fn a_reopened_tab_returns_to_the_composited_window_at_both_scales() {
         assert_ne!(browser.active_id(), original);
         assert_eq!(browser.tabs().len(), 1);
         let differing: Vec<usize> = before
-            .chunks_exact(4)
-            .zip(restored.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(restored.as_chunks::<4>().0)
             .enumerate()
             .filter_map(|(index, (before, after))| (before != after).then_some(index))
             .collect();
