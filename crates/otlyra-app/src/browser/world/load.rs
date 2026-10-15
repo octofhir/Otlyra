@@ -448,6 +448,9 @@ impl PageWorld {
         let parsed = match &sniffed {
             kind if kind.is_document() => {
                 let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
+                // `load` waits for the document's pictures and sheets, which
+                // this world fetches; it fires it in `finish_load`.
+                scripts.hold_load_event();
                 if let Some(pending) = self.pending(tab) {
                     scripts.set_initial_time_origin(pending.started);
                 }
@@ -778,6 +781,8 @@ impl PageWorld {
         let mut resumed = false;
         // What the sheets that landed import in turn.
         let mut imports = Vec::new();
+        // What became of the pictures elements asked for, for their documents.
+        let mut pictures = Vec::new();
 
         match fetched.result {
             Ok(mut loaded) => {
@@ -829,6 +834,11 @@ impl PageWorld {
                         }
                         PendingResource::Image(node, src, density) => match decoded.as_ref() {
                             Some(image) => {
+                                pictures.push((
+                                    node,
+                                    src.clone(),
+                                    Some((image.width, image.height)),
+                                ));
                                 pending.images.insert(
                                     node,
                                     otlyra_layout::Picture {
@@ -840,6 +850,7 @@ impl PageWorld {
                             }
                             None => {
                                 tracing::warn!(url = %fetched.url, "image failed to decode");
+                                pictures.push((node, src, None));
                             }
                         },
                     }
@@ -847,8 +858,14 @@ impl PageWorld {
             }
             Err(error) => {
                 tracing::warn!(url = %fetched.url, %error, "subresource failed to load");
+                for resource in wanted {
+                    if let PendingResource::Image(node, src, _) = resource {
+                        pictures.push((node, src, None));
+                    }
+                }
             }
         }
+        self.record_pictures(tab, pictures);
 
         self.request_imports(tab, imports);
         if resumed {
@@ -1105,13 +1122,19 @@ impl PageWorld {
         // is rebuilt, so whatever they did to the document is in the first frame
         // the reader sees rather than in a second one after a flash.
         let (mut document, url) = slot.page.take().map(PageScene::into_document).unzip();
+        let pictures = std::mem::take(&mut slot.picture_events);
         if let (Some(document), Some(runner)) = (document.as_mut(), pending.runner.as_mut()) {
             for node in &pending.script_order {
                 if let Some(source) = pending.scripts.get(node) {
                     runner.run_external(source, *node, document);
                 }
             }
-            runner.document_finished(document, false);
+            // The pictures that arrived or failed during the load, before the
+            // window's load, which waits for them.
+            for (node, loaded) in pictures {
+                runner.dispatch_input(document, node, if loaded { "load" } else { "error" }, "{}");
+            }
+            runner.release_load_event(document);
         }
         // The page's own deferred work, up to a bounded budget. A page that
         // paints from a `setTimeout(…, 0)` — which is most of what a framework

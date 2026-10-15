@@ -161,6 +161,27 @@ impl ElementRef {
         self.set("class", &value)
     }
 
+    /// What became of this element's picture for the `src` it has now:
+    /// `[width, height, complete]`, with zero sizes for a picture that has
+    /// not arrived or failed. Read by the glue's image accessors.
+    #[method(name = "__otlyraImageState")]
+    fn js_image_state(&self) -> Result<Vec<f64>, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            let src = document.attr(id, "src").unwrap_or_default();
+            if src.trim().is_empty() {
+                return vec![0.0, 0.0, 1.0];
+            }
+            match document.image_state(id) {
+                Some(state) if state.src == src => {
+                    let (width, height) = state.size.unwrap_or((0, 0));
+                    vec![f64::from(width), f64::from(height), 1.0]
+                }
+                _ => vec![0.0, 0.0, 0.0],
+            }
+        })
+    }
+
     /// What a form control holds: what the reader or script put in it, or its
     /// markup's value. Read by the glue's `value` accessors.
     #[method(name = "__otlyraControlValue")]

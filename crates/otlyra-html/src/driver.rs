@@ -77,6 +77,12 @@ pub trait ScriptRunner {
         let _ = (document, more_scripts_coming);
     }
 
+    /// Everything the document waits for has arrived: fire `load` if the
+    /// runner was holding it.
+    fn release_load_event(&mut self, document: &mut Document) {
+        self.document_finished(document, false);
+    }
+
     /// Run an external script whose bytes have arrived.
     fn run_external(&mut self, source: &str, element: NodeId, document: &mut Document) {
         let _ = (source, element, document);

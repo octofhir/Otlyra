@@ -42,6 +42,10 @@ const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 const TIMER_PUMP: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// What became of one element's picture: the element, its address as spelled,
+/// and its pixel size, or `None` when it failed.
+pub(super) type PictureOutcome = (NodeId, String, Option<(u32, u32)>);
+
 /// One tab's document and what is in flight for it.
 #[derive(Default)]
 struct PageSlot {
@@ -73,6 +77,9 @@ struct PageSlot {
     /// and address as the markup spells it. A picture script adds or changes
     /// after the load is asked for once, whether or not it arrives.
     pictures_asked: HashSet<(NodeId, String)>,
+    /// Pictures that arrived (`true`) or failed during the load, whose
+    /// elements hear `load`/`error` when the load's scripts have run.
+    picture_events: Vec<(NodeId, bool)>,
 }
 
 /// What the pages are loaded into: the window's preferences and size as they
@@ -322,6 +329,7 @@ impl PageWorld {
         slot.swept_at_build = None;
         slot.generation = self.generations;
         slot.pictures_asked.clear();
+        slot.picture_events.clear();
     }
 
     /// Install a runner on its owner for content-boundary regression tests.
@@ -482,6 +490,35 @@ impl PageWorld {
         }
         self.follow_script_navigation(tab);
         cancelled
+    }
+
+    /// Record what became of element pictures in `tab`'s document, and tell
+    /// their elements: now, if the page is loaded, or when its load finishes.
+    pub(super) fn record_pictures(&mut self, tab: TabId, pictures: Vec<PictureOutcome>) {
+        if pictures.is_empty() {
+            return;
+        }
+        let Some(slot) = self.slots.get_mut(&tab) else {
+            return;
+        };
+        let loading = slot.pending.is_some();
+        let Some(page) = slot.page.as_mut() else {
+            return;
+        };
+        let mut events = Vec::with_capacity(pictures.len());
+        page.with_document(|document| {
+            for (node, src, size) in pictures {
+                events.push((node, size.is_some()));
+                document.set_image_state(node, otlyra_dom::ImageState { src, size });
+            }
+        });
+        if loading {
+            slot.picture_events.extend(events);
+            return;
+        }
+        for (node, loaded) in events {
+            self.dispatch_input(tab, node, if loaded { "load" } else { "error" }, "{}");
+        }
     }
 
     /// Whether `tab`'s page listens for pointer movement.

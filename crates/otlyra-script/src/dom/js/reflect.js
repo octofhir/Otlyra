@@ -447,12 +447,16 @@ reflectEnum(HTMLImageElement, 'loading', 'loading', ['lazy', 'eager'], 'eager');
 reflectString(HTMLImageElement, 'fetchPriority', 'fetchpriority');
 reflectUnsigned(HTMLImageElement, 'width', 'width', 0);
 reflectUnsigned(HTMLImageElement, 'height', 'height', 0);
-// What the picture's pixels are, when script can ask the browser that; until
-// it can, nothing has arrived and nothing is pending.
-define(HTMLImageElement.prototype, 'naturalWidth', 0);
-define(HTMLImageElement.prototype, 'naturalHeight', 0);
+// What became of the picture: its pixel size once it has arrived, and
+// whether there is nothing left to wait for (arrived, failed, or no `src`).
+accessor(HTMLImageElement.prototype, 'naturalWidth', function () {
+  return this.__otlyraImageState()[0];
+});
+accessor(HTMLImageElement.prototype, 'naturalHeight', function () {
+  return this.__otlyraImageState()[1];
+});
 accessor(HTMLImageElement.prototype, 'complete', function () {
-  return true;
+  return this.__otlyraImageState()[2] === 1;
 });
 accessor(HTMLImageElement.prototype, 'currentSrc', function () {
   return this.src;

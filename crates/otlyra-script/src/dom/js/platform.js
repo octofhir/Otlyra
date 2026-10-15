@@ -51,26 +51,35 @@ defineGlobal('cancelAnimationFrame', function cancelAnimationFrame(handle) {
 // the web depends on that.
 
 // Load events run even in a background tab; its rendering callbacks wait.
+let contentLoadedFired = false;
 let loadEventsFired = false;
 
+// `fireLoadEvents` is `true` for both events, `'dcl'` for DOMContentLoaded
+// alone (the browser fires `load` once the document's pictures and sheets
+// are in), and `false` while scripts the document waits for are still out.
 defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEvents) {
   let ran = 0;
 
   // The two events every page waits for. They come first because everything a
   // page defers is registered from one of them — and they happen once, when
   // the host says every script that was going to arrive has arrived.
-  if (fireLoadEvents && !loadEventsFired) {
-    loadEventsFired = true;
+  const due = [];
+  if (fireLoadEvents && !contentLoadedFired) {
+    contentLoadedFired = true;
     // A parsed `onmousemove` registers its listener only when an event finds
     // it, so its presence alone asks for moves.
     if (document.querySelector('[onmousemove], [onpointermove]')) nativePointerMovesWanted();
     // `DOMContentLoaded` bubbles and `load` does not, which is not a detail:
     // half the pages on the web listen for the first one on `window`, and
     // they hear it only because it travels up from the document.
-    for (const [target, type, bubbles] of [
-      [document, 'DOMContentLoaded', true],
-      [globalThis, 'load', false],
-    ]) {
+    due.push([document, 'DOMContentLoaded', true]);
+  }
+  if (fireLoadEvents === true && !loadEventsFired) {
+    loadEventsFired = true;
+    due.push([globalThis, 'load', false]);
+  }
+  if (due.length > 0) {
+    for (const [target, type, bubbles] of due) {
       try {
         target.dispatchEvent(new Event(type, { bubbles }));
       } catch (error) {
@@ -188,6 +197,8 @@ const INPUT_EVENTS = {
   beforeinput: [InputEvent, true, true],
   input: [InputEvent, true, false],
   change: [Event, true, false],
+  load: [Event, false, false],
+  error: [Event, false, false],
   focus: [FocusEvent, false, false],
   blur: [FocusEvent, false, false],
   focusin: [FocusEvent, true, false],

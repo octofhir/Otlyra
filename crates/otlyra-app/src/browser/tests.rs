@@ -4251,3 +4251,74 @@ fn the_pointer_crossing_elements_reaches_the_page() {
         assert_eq!(page.document().attr(below, "data-moves"), Some("2"));
     });
 }
+
+/// Pictures tell their elements what became of them: `load` with a natural
+/// size, `error` without one, during the load and after it.
+#[test]
+fn pictures_report_load_and_error_to_their_elements() {
+    struct PictureLoader;
+
+    impl Loader for PictureLoader {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            if url.ends_with("/broken.png") {
+                return Err("gone".to_owned());
+            }
+            if url.ends_with(".png") {
+                return Ok(Loaded {
+                    content_type: Some("image/png".to_owned()),
+                    bytes: ONE_PIXEL_PNG.to_vec(),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                });
+            }
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<body><img id=first src=/first.png onload=\"note('first-load', this)\">\
+                         <img id=broken src=/broken.png onerror=\"note('broken-error', this)\">\
+                         <script>\
+                           const seen = [];\
+                           function note(what, image) {\
+                             seen.push(what + ':' + image.naturalWidth + 'x' + image.naturalHeight + ':' + image.complete);\
+                             document.documentElement.dataset.log = seen.join(' ');\
+                           }\
+                           window.addEventListener('load', () => {\
+                             note('window-load', document.getElementById('first'));\
+                             const late = document.createElement('img');\
+                             late.onload = () => note('late-load', late);\
+                             late.src = '/late.png';\
+                             note('late-pending', late);\
+                             document.body.appendChild(late);\
+                           });\
+                         </script>"
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: "https://pictures.example/".to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    on_content_stack(|| {
+        let mut browser = Browser::new(PictureLoader);
+        let viewport = Viewport::new(800, 600, 1.0);
+        browser.set_viewport(viewport);
+        go(&mut browser, "pictures.example");
+        for _ in 0..3 {
+            browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+        }
+        let log = page_log(&browser);
+        for expected in [
+            "first-load:1x1:true",
+            "broken-error:0x0:true",
+            "window-load:1x1:true",
+            "late-pending:0x0:false",
+            "late-load:1x1:true",
+        ] {
+            assert!(log.contains(expected), "{expected} missing from {log}");
+        }
+        assert!(
+            log.find("first-load").unwrap() < log.find("window-load").unwrap(),
+            "{log}"
+        );
+    });
+}

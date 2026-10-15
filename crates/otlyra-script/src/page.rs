@@ -35,6 +35,9 @@ pub struct PageScripts {
     failed: usize,
     /// Whether any of them changed the document.
     mutated: bool,
+    /// The browser fires `load` itself, once the document's subresources are
+    /// in, rather than when its last script has run.
+    hold_load: bool,
     /// What this page's turns write down: whether the document changed, whether
     /// a frame is owed, where the page thinks it is, where it asked to go.
     ///
@@ -54,6 +57,12 @@ impl PageScripts {
     #[must_use]
     pub fn with_console(document_url: impl Into<String>, console: ConsoleSinkHandle) -> Self {
         Self::build(document_url.into(), Some(console))
+    }
+
+    /// Fire the window's `load` only when [`ScriptRunner::release_load_event`]
+    /// says the document's subresources are in, not when parsing ends.
+    pub fn hold_load_event(&mut self) {
+        self.hold_load = true;
     }
 
     /// Set the initial state before any page script runs, without an event.
@@ -192,6 +201,7 @@ impl PageScripts {
             seen: 0,
             failed: 0,
             mutated: false,
+            hold_load: false,
         }
     }
 
@@ -241,7 +251,14 @@ impl PageScripts {
         let Some(host) = host.as_mut() else {
             return;
         };
-        let outcome = crate::dom::loan(document, state, || host.flush_deferred(fire_load_events));
+        let hold = self.hold_load;
+        let outcome = crate::dom::loan(document, state, || {
+            if fire_load_events && hold {
+                host.run_classic_script("__otlyraFlushDeferred('dcl')", "<deferred work>")
+            } else {
+                host.flush_deferred(fire_load_events)
+            }
+        });
         self.absorb_turn();
         match outcome {
             Ok(outcome) => tracing::debug!(
@@ -497,6 +514,11 @@ impl ScriptRunner for PageScripts {
                 }
             }
         }
+    }
+
+    fn release_load_event(&mut self, document: &mut Document) {
+        self.hold_load = false;
+        PageScripts::document_finished(self, document, true);
     }
 
     fn document_finished(&mut self, document: &mut Document, more_scripts_coming: bool) {

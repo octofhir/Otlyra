@@ -47,6 +47,19 @@ pub struct Document {
     /// values, checkedness, selections. Kept with the tree so that the page's
     /// script and the browser read one answer.
     form: crate::form::FormState,
+    /// What became of each element's picture, by element.
+    images: std::collections::HashMap<NodeId, ImageState>,
+}
+
+/// What became of the picture an element asked for, and which address that
+/// answer is for: script reads `complete` and `naturalWidth` from it, and an
+/// element whose `src` has since changed is waiting again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageState {
+    /// The address as the element spelled it.
+    pub src: String,
+    /// Its intrinsic size in pixels, or `None` when it failed to load or decode.
+    pub size: Option<(u32, u32)>,
 }
 
 impl Document {
@@ -67,6 +80,7 @@ impl Document {
             limits,
             refused: 0,
             form: crate::form::FormState::new(),
+            images: std::collections::HashMap::new(),
         }
     }
 
@@ -241,6 +255,16 @@ impl Document {
 
     pub(crate) fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// What became of `node`'s picture, if anything has yet.
+    pub fn image_state(&self, node: NodeId) -> Option<&ImageState> {
+        self.images.get(&node)
+    }
+
+    /// Record what became of `node`'s picture.
+    pub fn set_image_state(&mut self, node: NodeId, state: ImageState) {
+        self.images.insert(node, state);
     }
 
     /// The state of the document's controls.

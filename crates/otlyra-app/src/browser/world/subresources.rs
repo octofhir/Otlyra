@@ -118,14 +118,16 @@ impl PageWorld {
                 if let Some(data) = self.images.get(&target)
                     && let Some(page) = self.page_mut(tab)
                 {
+                    let size = (data.width, data.height);
                     page.set_image(
                         source.node,
-                        source.src,
+                        source.src.clone(),
                         otlyra_layout::Picture {
                             data,
                             density: source.density,
                         },
                     );
+                    self.record_pictures(tab, vec![(source.node, source.src, Some(size))]);
                     continue;
                 }
                 let Some(slot) = self.slots.get_mut(&tab) else {
@@ -250,14 +252,16 @@ impl PageWorld {
                 if let Some(data) = self.images.get(&target)
                     && let Some(page) = self.page_mut(tab)
                 {
+                    let size = (data.width, data.height);
                     page.set_image(
                         source.node,
-                        source.src,
+                        source.src.clone(),
                         otlyra_layout::Picture {
                             data,
                             density: source.density,
                         },
                     );
+                    self.record_pictures(tab, vec![(source.node, source.src, Some(size))]);
                     continue;
                 }
                 let Some(slot) = self.slots.get_mut(&tab) else {
@@ -359,22 +363,26 @@ impl PageWorld {
             return false;
         }
         let Ok(mut loaded) = fetched.result else {
-            tracing::warn!(%src, "re-chosen picture failed to load");
+            tracing::warn!(%src, "picture failed to load");
+            self.record_pictures(tab, vec![(node, src, None)]);
             return false;
         };
         match loaded.picture() {
             Ok(data) => {
                 self.images.insert(fetched.url.clone(), data.clone());
+                let size = (data.width, data.height);
                 match self.page_mut(tab) {
                     Some(page) => {
-                        page.set_image(node, src, otlyra_layout::Picture { data, density })
+                        page.set_image(node, src.clone(), otlyra_layout::Picture { data, density })
                     }
                     None => tracing::warn!(%src, "no page to give the picture to"),
                 }
+                self.record_pictures(tab, vec![(node, src, Some(size))]);
                 true
             }
             Err(error) => {
-                tracing::warn!(%src, %error, "re-chosen picture failed to decode");
+                tracing::warn!(%src, %error, "picture failed to decode");
+                self.record_pictures(tab, vec![(node, src, None)]);
                 false
             }
         }
