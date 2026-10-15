@@ -14,6 +14,9 @@ use otter_runtime::ConsoleSinkHandle;
 
 use crate::host::{ScriptError, ScriptHost};
 
+/// Yield between complete timer tasks so a due cohort cannot monopolize content.
+const TIMER_SLICE: Duration = Duration::from_millis(4);
+
 /// One page's scripts, and the isolate they run in.
 #[derive(Debug)]
 pub struct PageScripts {
@@ -220,12 +223,23 @@ impl PageScripts {
         self.host.as_ref()?.timers().next_deadline()
     }
 
-    /// Run every timer this page has that is due, in order.
+    /// Run a bounded slice of due timer tasks in order, retaining the rest.
     ///
     /// Returns how many callbacks ran. A callback that throws is reported and
     /// the next one still runs, which is what the event loop does: one task's
     /// exception is not the next task's business.
     pub fn run_due_timers(&mut self, document: &mut Document) -> usize {
+        self.run_due_timers_until(document, Instant::now() + TIMER_SLICE)
+    }
+
+    /// Run complete callbacks and their microtasks until a soft deadline.
+    /// A single callback can overrun it; the watchdog retains its own limit.
+    pub fn run_due_timers_until(&mut self, document: &mut Document, deadline: Instant) -> usize {
+        let cutoff = Instant::now();
+        let deadline = deadline.min(cutoff + TIMER_SLICE);
+        if cutoff >= deadline {
+            return 0;
+        }
         // Destructured so the state can be lent while the isolate and the
         // failure tally are still reachable: they are three disjoint fields, and
         // borrowing `self` whole would make them one.
@@ -238,13 +252,12 @@ impl PageScripts {
         let Some(host) = host.as_mut() else {
             return 0;
         };
-        let due = host.timers().due(Instant::now());
-        if due.is_empty() {
+        if host.timers().next_deadline().is_none_or(|at| at > cutoff) {
             return 0;
         }
         let mut ran = 0;
         crate::dom::loan(document, state, || {
-            for token in due {
+            while let Some(token) = host.timers().take_due(cutoff) {
                 match host.fire_timer(token) {
                     // A token that named nothing was cancelled between coming
                     // due and being run, which the callback before it may have
@@ -254,6 +267,9 @@ impl PageScripts {
                         *failed += 1;
                         tracing::error!(target: "page.script", %error, "a timer callback failed");
                     }
+                }
+                if Instant::now() >= deadline {
+                    break;
                 }
             }
         });
@@ -326,7 +342,10 @@ impl PageScripts {
         let deadline = Instant::now() + budget;
         let mut ran = 0;
         loop {
-            ran += self.run_due_timers(document);
+            ran += self.run_due_timers_until(document, deadline);
+            if Instant::now() >= deadline {
+                break;
+            }
             let Some(next) = self.next_deadline() else {
                 break;
             };
@@ -449,6 +468,10 @@ impl ScriptRunner for PageScripts {
 
     fn run_due_timers(&mut self, document: &mut Document) -> usize {
         PageScripts::run_due_timers(self, document)
+    }
+
+    fn run_due_timers_until(&mut self, document: &mut Document, deadline: Instant) -> usize {
+        PageScripts::run_due_timers_until(self, document, deadline)
     }
 
     fn frames_pending(&self) -> bool {

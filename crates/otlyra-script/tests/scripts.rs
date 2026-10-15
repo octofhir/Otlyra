@@ -225,6 +225,77 @@ fn timers_run_in_the_order_their_deadlines_fall_due() {
     );
 }
 
+#[test]
+fn timer_slices_keep_unrun_tasks_cancel_neighbors_and_finish_microtasks_before_yield() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = sink.clone();
+    let (parsed, runner) = otlyra_html::parse_with_scripts(
+        br#"<script>
+      let canceled;
+      setTimeout(() => {
+        console.log('first');
+        clearTimeout(canceled);
+        const until = Date.now() + 6;
+        while (Date.now() < until) {}
+        Promise.resolve().then(() => console.log('microtask'));
+        setTimeout(() => console.log('new'), 0);
+      }, 0);
+      canceled = setTimeout(() => console.log('canceled'), 0);
+      setTimeout(() => console.log('retained'), 0);
+    </script>"#,
+        Some("utf-8"),
+        Some(Box::new(PageScripts::with_console(
+            "https://timers.test/",
+            handle,
+        ))),
+        Default::default(),
+    );
+    let mut document = parsed.document;
+    let mut runner = runner.unwrap();
+    assert_eq!(runner.run_due_timers(&mut document), 1);
+    assert_eq!(lines(&sink), ["Log: first", "Log: microtask"]);
+    assert!(runner.next_deadline().is_some());
+    runner.settle(&mut document, Duration::from_millis(100));
+    assert_eq!(
+        lines(&sink),
+        ["Log: first", "Log: microtask", "Log: retained", "Log: new"]
+    );
+    assert!(runner.next_deadline().is_none());
+}
+
+#[test]
+fn settle_stops_spending_its_budget_even_when_more_timers_are_already_due() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = sink.clone();
+    let (parsed, runner) = otlyra_html::parse_with_scripts(
+        br#"<script>
+      for (let i = 0; i < 100; i++) setTimeout(() => {
+        const until = Date.now() + 6;
+        while (Date.now() < until) {}
+        console.log('tick');
+      }, 0);
+    </script>"#,
+        Some("utf-8"),
+        Some(Box::new(PageScripts::with_console(
+            "https://settle.test/",
+            handle,
+        ))),
+        Default::default(),
+    );
+    let mut document = parsed.document;
+    let mut runner = runner.unwrap();
+    let ran = runner.settle(&mut document, Duration::from_millis(10));
+    assert!(
+        ran > 0 && ran < 100,
+        "settle consumed the whole overdue cohort: {ran}"
+    );
+    assert!(
+        runner.next_deadline().is_some(),
+        "unrun timers lost their deadlines"
+    );
+    assert_eq!(lines(&sink).len(), ran);
+}
+
 /// A timer that schedules another gets it: the wheel is turned until the page
 /// stops asking, not once.
 #[test]

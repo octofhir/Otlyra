@@ -88,6 +88,7 @@ def one_run(
     height: int,
     timeout: float,
     cpu_raster: bool,
+    workload_url: str = "about:about",
 ) -> dict[str, Any]:
     environment = os.environ.copy()
     environment["OTLYRA_LOG"] = "error"
@@ -96,7 +97,7 @@ def one_run(
         str(binary),
         "--no-secrets",
         "--url",
-        "about:about",
+        workload_url,
         "--width",
         str(width),
         "--height",
@@ -222,6 +223,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--url", default="about:about", help="startup workload URL, including file:// fixtures")
     renderer = parser.add_mutually_exclusive_group()
     renderer.add_argument(
         "--cpu-raster",
@@ -272,6 +274,7 @@ def main() -> int:
                 report = profile / f"run-{index:03}.json"
                 value = one_run(
                     executable, report, args.width, args.height, args.timeout, args.cpu_raster,
+                    args.url,
                 )
                 if index >= args.warmups:
                     collected.append(value)
@@ -323,6 +326,7 @@ def main() -> int:
         "commit": git(repo, "rev-parse", "HEAD"),
         "dirty": bool(git(repo, "status", "--porcelain")),
         "profile": "release",
+        "workload_url": args.url,
         "binary": str(binary),
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "renderer": "cpu" if args.cpu_raster else "direct_gpu",

@@ -157,6 +157,11 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   deadlines stay on content's scheduler without waking hidden native UI.
 - [ ] Define background timer budgets/exemptions. Timers currently continue
   normally; changed hidden metadata still publishes.
+- [x] Yield timer work between complete callbacks and microtasks, retaining
+  unrun deadlines. Use a four-ms page slice and an eight-ms soft shared pass,
+  resuming at the next slot so busy tabs cannot monopolize every pass. Enforce
+  elapsed settle budgets even when older deadlines remain due. A long callback
+  can overrun these scheduling deadlines; its watchdog is unchanged.
 - [x] Supply window CSS dimensions and device scale before the first script;
   update them on resize, zoom and inspector docking, including paused parsers
   and encoding resets. Retain per-tab zoom and dispatch resize with current

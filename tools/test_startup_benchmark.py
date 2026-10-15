@@ -34,11 +34,13 @@ class StartupBenchmarkTests(unittest.TestCase):
                     "stages": [],
                 }))
                 with patch.object(benchmark.subprocess, "run") as run:
-                    benchmark.one_run(pathlib.Path("otlyra"), report, 1024, 768, 30, cpu_raster)
+                    benchmark.one_run(pathlib.Path("otlyra"), report, 1024, 768, 30, cpu_raster,
+                                      "file:///tmp/timer-fixture.html")
                 command = run.call_args.args[0]
                 self.assertEqual("--cpu-raster" in command, cpu_raster)
                 self.assertNotIn("--direct-gpu", command)
                 self.assertIn("--no-secrets", command)
+                self.assertEqual(command[command.index("--url") + 1], "file:///tmp/timer-fixture.html")
                 self.assertEqual(
                     run.call_args.kwargs["env"]["OTLYRA_CONFIG_DIR"],
                     str(report.parent / "profile"),
@@ -85,7 +87,8 @@ class StartupBenchmarkTests(unittest.TestCase):
                 output = root / "result.json"
                 launches = []
 
-                def fake_run(binary, report, width, height, timeout, cpu_raster):
+                def fake_run(binary, report, width, height, timeout, cpu_raster, workload_url):
+                    self.assertEqual(workload_url, "file:///tmp/timer-fixture.html")
                     launches.append((binary.name, report.parent.name))
                     old = binary.name == baseline.name
                     return {
@@ -99,6 +102,7 @@ class StartupBenchmarkTests(unittest.TestCase):
                 arguments = ["startup", "--binary", str(candidate),
                              "--baseline-binary", str(baseline), "--samples", "20",
                              "--warmups", "0", "--output", str(output)]
+                arguments.extend(["--url", "file:///tmp/timer-fixture.html"])
                 if check:
                     arguments.append("--check")
                 with patch.object(sys, "argv", arguments), \
@@ -115,6 +119,7 @@ class StartupBenchmarkTests(unittest.TestCase):
                                                ("baseline", "baseline")])
                 summary = json.loads(output.read_text())
                 comparison = summary["comparison"]
+                self.assertEqual(summary["workload_url"], "file:///tmp/timer-fixture.html")
                 self.assertEqual(comparison["baseline"]["sample_count"], 20)
                 self.assertEqual(comparison["paired_delta_ms"][
                     "process_to_first_frame_ms"]["p50"], -80)

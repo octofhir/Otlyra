@@ -84,7 +84,7 @@ pub trait ScriptRunner {
 
     /// When the page's next timer comes due, if it has one.
     ///
-    /// This and the three below are the event loop's, not the parser's. They
+    /// These scheduling hooks are the event loop's, not the parser's. They
     /// are on this trait because the runner outlives the parse — a page keeps
     /// running after its last byte — and whoever drives the parse is left
     /// holding it as a `dyn ScriptRunner`. A parser with no engine attached
@@ -98,6 +98,17 @@ pub trait ScriptRunner {
     fn run_due_timers(&mut self, document: &mut Document) -> usize {
         let _ = document;
         0
+    }
+
+    /// Run due timer tasks until a soft deadline, retaining work not yet run.
+    /// Existing runners keep their own scheduling behavior by default.
+    fn run_due_timers_until(
+        &mut self,
+        document: &mut Document,
+        deadline: std::time::Instant,
+    ) -> usize {
+        let _ = deadline;
+        self.run_due_timers(document)
     }
 
     /// Whether the page has asked for an animation frame and not had one.

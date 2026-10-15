@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod accessibility;
 mod action_targets;
+mod content_timer_budget;
 mod download_shutdown;
 mod hidden_preparation;
 mod initial_environment;

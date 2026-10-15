@@ -28,6 +28,9 @@ mod load;
 mod subresources;
 
 #[cfg(test)]
+mod timer_tests;
+
+#[cfg(test)]
 pub(super) use subresources::IMAGE_CACHE_BUDGET;
 pub(super) use subresources::ImageCache;
 
@@ -35,6 +38,8 @@ use load::PendingLoad;
 
 /// How long a caller with no event loop waits between checks for a finished fetch.
 const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+const TIMER_PUMP: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// One tab's document and what is in flight for it.
 #[derive(Default)]
@@ -127,6 +132,7 @@ pub(super) enum ScriptNavigation {
 /// The pages, and everything that is fetched and run for them.
 pub(super) struct PageWorld {
     environment_changed: bool,
+    timer_cursor: usize,
     /// The engine pages are shaped with: a fork of the window's, so that the
     /// fonts a page brings are the pages' and the window's text is not held up
     /// by a page's layout.
@@ -173,6 +179,7 @@ impl PageWorld {
     pub(super) fn new(fetcher: Fetcher, text: TextEngine, environment: Environment) -> Self {
         Self {
             environment_changed: false,
+            timer_cursor: 0,
             text,
             fetcher,
             images: ImageCache::default(),
@@ -382,35 +389,57 @@ impl PageWorld {
         changed
     }
 
-    /// Run every page's timers that have come due.
+    /// Share a soft timer deadline across pages, resuming after the last served.
     ///
     /// Every open tab, not only the visible one: a background tab's clock does
     /// not stop, and a page that polls in one is a page that expects to have
     /// polled when the reader comes back to it.
     fn run_due_timers(&mut self) -> bool {
         let now = std::time::Instant::now();
-        let mut changed = false;
-        for slot in self.slots.values_mut() {
-            let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
-                continue;
-            };
-            if scripts
-                .next_deadline()
-                .is_none_or(|deadline| deadline > now)
-            {
-                continue;
-            }
-            let ran = page.with_document(|document| scripts.run_due_timers(document));
-            // The tree may be different now, so everything style and layout
-            // made of it is stale. Asked of the page rather than guessed at:
-            // a timer that only read the document changes nothing, and a page
-            // that polls on an interval is otherwise a page that re-cascades
-            // itself several times a second for nothing.
-            if scripts.take_mutated() {
-                page.document_changed();
-            }
-            changed |= ran > 0;
+        let count = self.slots.len();
+        if count == 0 {
+            self.timer_cursor = 0;
+            return false;
         }
+        let start = self.timer_cursor % count;
+        let deadline = now + TIMER_PUMP;
+        let mut changed = false;
+        for wrapped in [false, true] {
+            if wrapped && start == 0 {
+                break;
+            }
+            for (index, slot) in self.slots.values_mut().enumerate() {
+                if (index < start) != wrapped {
+                    continue;
+                }
+                let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut())
+                else {
+                    continue;
+                };
+                if scripts
+                    .next_deadline()
+                    .is_none_or(|deadline| deadline > now)
+                {
+                    continue;
+                }
+                let ran =
+                    page.with_document(|document| scripts.run_due_timers_until(document, deadline));
+                // The tree may be different now, so everything style and layout
+                // made of it is stale. Asked of the page rather than guessed at:
+                // a timer that only read the document changes nothing, and a page
+                // that polls on an interval is otherwise a page that re-cascades
+                // itself several times a second for nothing.
+                if scripts.take_mutated() {
+                    page.document_changed();
+                }
+                changed |= ran > 0;
+                self.timer_cursor = (index + 1) % count;
+                if std::time::Instant::now() >= deadline {
+                    return changed;
+                }
+            }
+        }
+        self.timer_cursor = 0;
         changed
     }
 

@@ -62,6 +62,23 @@ struct State {
     next_sequence: u64,
 }
 
+impl State {
+    fn take_due(&mut self, now: Instant) -> Option<u64> {
+        let (&key, &timer) = self.pending.first_key_value()?;
+        if key.0 > now {
+            return None;
+        }
+        self.pending.remove(&key);
+        if let Some(period) = timer.repeat {
+            let sequence = self.next_sequence;
+            self.next_sequence += 1;
+            let next = now + period.max(Duration::from_millis(1));
+            self.pending.insert((next, sequence), timer);
+        }
+        Some(timer.token)
+    }
+}
+
 /// How long a timer may be asked for. Anything longer is clamped rather than
 /// refused: a page that asks for a month is a page that will be closed first,
 /// and an overflowing `Instant` is a panic.
@@ -122,20 +139,18 @@ impl TimerWheel {
             .lock()
             .expect("the timer wheel is never poisoned");
         let mut due = Vec::new();
-        while let Some((&key, &timer)) = state.pending.iter().next() {
-            if key.0 > now {
-                break;
-            }
-            state.pending.remove(&key);
-            if let Some(period) = timer.repeat {
-                let sequence = state.next_sequence;
-                state.next_sequence += 1;
-                let next = now + period.max(Duration::from_millis(1));
-                state.pending.insert((next, sequence), timer);
-            }
-            due.push(timer.token);
+        while let Some(token) = state.take_due(now) {
+            due.push(token);
         }
         due
+    }
+
+    /// Take one due token, leaving the rest on their original deadlines.
+    pub(crate) fn take_due(&self, now: Instant) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("the timer wheel is never poisoned")
+            .take_due(now)
     }
 
     /// Forget everything. For a page that is going away.

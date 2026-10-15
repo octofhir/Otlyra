@@ -575,6 +575,71 @@ Verification: 1,828 workspace Rust tests, the four-case native GPU/CPU startup
 smoke, all-target clippy with `-D warnings`, formatting and diff checks passed
 on the unchanged frozen engine snapshot.
 
+## Timer task scheduling follow-up
+
+The timer wheel previously removed every due token before any callback ran, and
+the content pump executed the entire cohort before reading another command.
+Two hundred one-ms callbacks therefore occupied content for their whole cohort.
+`settle` also tested the next deadline rather than time already spent, allowing
+an overdue cohort to exceed its nominal budget.
+
+The wheel now supports taking one due token while preserving the ordering and
+deadlines of the rest. PageScripts yields after a four-ms soft slice, checking
+only after each complete callback and its microtask checkpoint. PageWorld shares
+an eight-ms soft deadline across documents and resumes from the next slot after
+exhaustion. Its rotating index uses no per-pump tab-vector allocation and tolerates
+map-size changes. Settle checks elapsed time and passes its remaining deadline.
+The ScriptRunner extension has a default preserving existing runner behavior.
+
+These are scheduling deadlines between tasks; a single long callback can overrun
+them and keeps the existing watchdog. Requested timer delays and hidden-page
+exemptions have not been changed. Timers are independently queued tasks in the
+[HTML timer algorithm](https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers),
+so unfinished work stays eligible instead of being discarded on a yield.
+
+Tests cover cancellation of a still-queued neighbor, microtasks before yielding,
+retained/new timer ordering, elapsed settle limits, fair progress through busy
+slots, cursor reset after clearing them, and a real JS cohort interrupted by an
+owner command. The same queue regression fails against `33804de`: its command
+waits for all 200 callbacks. The startup benchmark now accepts `--url`, retaining
+About as its default and the existing budget gates, to measure a local scripted
+fixture separately from an empty system page.
+
+
+The matched queue experiment used 20 alternating-order fresh-process pairs after
+three warmups, the same harness and frozen engine digest. Content-owner command
+acknowledgement p50/p95 fell from **221.25/248.64 ms to 8.74/13.53 ms**. Before
+acknowledgement the control completed all 200 callbacks; the candidate completed
+3–5. This measures owner queue responsiveness, not native input-to-presentation
+latency or faster total JavaScript execution. Raw pairs and binary hashes are in
+`target/timer-queue-pairs.json` and `target/timer-budget-build-pair.json`.
+
+Separate release startup comparisons used 20 alternating-order pairs after three
+warmups per workload/backend, at 1024×768 logical pixels and native 2× scale on
+Apple M1/macOS 26.5. The local web fixture schedules the same 200 one-ms callbacks.
+The measured interval is process launch to the first content-frame report handled
+by UI; it does not prove physical presentation or completion of the whole cohort.
+
+| Workload/backend | Control p50/p95, ms | Candidate p50/p95, ms | Paired delta p50, ms |
+| --- | --- | --- | --- |
+| About / GPU | 319.27 / 399.09 | 324.43 / 354.64 | −12.37 |
+| About / CPU | 317.05 / 357.19 | 320.27 / 349.16 | −4.57 |
+| Timer fixture / GPU | 497.30 / 530.20 | 335.57 / 376.51 | −157.81 |
+| Timer fixture / CPU | 511.31 / 536.58 | 353.61 / 405.61 | −153.30 |
+
+About startup has no demonstrated median improvement; the timer fixture can show
+its first content before completing all callbacks. Every candidate run still
+fails all four existing strict startup percentile gates, which remain unchanged.
+This is a responsiveness improvement under timer load, not a general startup
+speedup. Full artifacts are `target/startup-timer-budget-{about,web}-{gpu,cpu}.json`
+and `target/timer-startup-fixture.json`; the control is `33804de` and release
+candidate hash is `1a0931e8d350940977a0a104353acf8416c3234cd9cd2167036e566513e448f1`.
+
+Validation: 1,832 workspace tests passed, plus all-target clippy with warnings
+denied, formatting/diff checks, seven benchmark protocol tests, and native About
+and web startup smoke on both GPU and CPU. The engine snapshot digest remains
+`23c5a114f769905e46bc028b747eba16ab7525b1689ef2a17836e120fc65dcba`.
+
 ## What the reference browsers do
 
 ### Chromium
