@@ -49,6 +49,9 @@ pub struct Document {
     form: crate::form::FormState,
     /// What became of each element's picture, by element.
     images: std::collections::HashMap<NodeId, ImageState>,
+    /// The element that has the focus, as the browser last settled it or
+    /// script last asked.
+    focused: Option<NodeId>,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -81,6 +84,7 @@ impl Document {
             refused: 0,
             form: crate::form::FormState::new(),
             images: std::collections::HashMap::new(),
+            focused: None,
         }
     }
 
@@ -255,6 +259,16 @@ impl Document {
 
     pub(crate) fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// The focused element, if one is.
+    pub fn focused(&self) -> Option<NodeId> {
+        self.focused
+    }
+
+    /// Say which element has the focus.
+    pub fn set_focused(&mut self, node: Option<NodeId>) {
+        self.focused = node;
     }
 
     /// What became of `node`'s picture, if anything has yet.

@@ -297,10 +297,9 @@ const DOCUMENT = {
   get anchors() {
     return asCollection([...this.querySelectorAll('a[name]')]);
   },
-  // There is no focus model a page can see yet; the body is what a document
-  // with nothing focused reports.
+  // The focused element, or the body when nothing is focused.
   get activeElement() {
-    return this.body || this.documentElement;
+    return this.__otlyraFocused || this.body || this.documentElement;
   },
   hasFocus() {
     return true;

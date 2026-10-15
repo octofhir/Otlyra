@@ -450,9 +450,7 @@ impl PageWorld {
                 // a timer that only read the document changes nothing, and a page
                 // that polls on an interval is otherwise a page that re-cascades
                 // itself several times a second for nothing.
-                if scripts.take_mutated() {
-                    page.document_changed();
-                }
+                after_script_turn(page, scripts.as_mut());
                 changed |= ran > 0;
                 self.timer_cursor = (index + 1) % count;
                 if std::time::Instant::now() >= deadline {
@@ -485,9 +483,7 @@ impl PageWorld {
         };
         let cancelled =
             page.with_document(|document| scripts.dispatch_input(document, target, kind, init));
-        if scripts.take_mutated() {
-            page.document_changed();
-        }
+        after_script_turn(page, scripts.as_mut());
         self.follow_script_navigation(tab);
         cancelled
     }
@@ -543,9 +539,7 @@ impl PageWorld {
         let answer = page.with_document(|document| {
             scripts.automation_script(document, source, call, await_promise)
         });
-        if scripts.take_mutated() {
-            page.document_changed();
-        }
+        after_script_turn(page, scripts.as_mut());
         self.follow_script_navigation(tab);
         answer
     }
@@ -588,9 +582,7 @@ impl PageWorld {
         }
         let ran = page.with_document(|document| scripts.run_frame_at(document, timestamp, at));
         // A callback that only reads owes a frame, not a restyle.
-        if scripts.take_mutated() {
-            page.document_changed();
-        }
+        after_script_turn(page, scripts.as_mut());
         ran > 0
     }
 
@@ -711,5 +703,26 @@ impl PageWorld {
                 true
             }
         }
+    }
+}
+
+/// What a script turn left for the page: a changed document is restyled, and
+/// a focus script asked for is applied — and, if the page will not take it
+/// (the element is not focusable), script's view is put back to the page's.
+fn after_script_turn(page: &mut PageScene, scripts: &mut dyn otlyra_html::ScriptRunner) {
+    if scripts.take_mutated() {
+        page.document_changed();
+    }
+    if let Some(request) = scripts.take_focus_request() {
+        match request {
+            Some(node) => {
+                page.focus_node(node);
+            }
+            None => {
+                page.blur();
+            }
+        }
+        let focused = page.focused_element();
+        page.with_document(|document| document.set_focused(focused));
     }
 }

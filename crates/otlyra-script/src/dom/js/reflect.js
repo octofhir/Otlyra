@@ -273,10 +273,14 @@ for (const name of ['innerText', 'outerText']) {
 
 // No focus model a page can see yet, and no event the browser would send with
 // them: these keep a page that calls them running.
-method(HTMLElement.prototype, 'focus', function focus() {});
-method(HTMLElement.prototype, 'blur', function blur() {});
-method(SVGElement.prototype, 'focus', function focus() {});
-method(SVGElement.prototype, 'blur', function blur() {});
+for (const Interface of [HTMLElement, SVGElement]) {
+  method(Interface.prototype, 'focus', function focus() {
+    this.__otlyraFocus();
+  });
+  method(Interface.prototype, 'blur', function blur() {
+    this.__otlyraBlur();
+  });
+}
 
 // `click()` sends the event a click sends (HTML §6.4.3); what a click on the
 // element would *do* is the browser's, when it sends one itself.

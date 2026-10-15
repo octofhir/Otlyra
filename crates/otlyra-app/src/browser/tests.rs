@@ -4359,3 +4359,46 @@ fn a_submitted_form_is_the_page_s_to_cancel_or_change() {
         );
     });
 }
+
+/// Script moves the focus: `activeElement` answers at once, the browser's own
+/// focus follows, and the focus events are heard.
+#[test]
+fn script_focus_moves_the_browser_focus_and_is_heard() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><input id=a style='width:200px;height:30px;margin:0'>\
+             <div id=plain>not focusable</div>\
+             <script>\
+               const seen = [];\
+               document.getElementById('a').addEventListener('focus', () => {\
+                 seen.push('focus:a');\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               });\
+               document.getElementById('a').focus();\
+               seen.push('active:' + document.activeElement.id);\
+               document.documentElement.dataset.log = seen.join(' ');\
+             </script>",
+        );
+        let page = browser.page(browser.active).expect("page");
+        assert_eq!(
+            page.focused_element()
+                .and_then(|node| page.document().attr(node, "id")),
+            Some("a"),
+            "the browser's focus followed script"
+        );
+        assert!(
+            page_log(&browser).starts_with("active:a"),
+            "{}",
+            page_log(&browser)
+        );
+        // A typed key lands in the field script focused.
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Character('z'),
+            modifiers: otlyra_platform::Modifiers::default(),
+        });
+        browser.on_event(PlatformEvent::TextInput('z'));
+        let page = browser.page(browser.active).expect("page");
+        assert_eq!(page.focused_value(), Some("z"));
+        assert_eq!(page_log(&browser), "active:a focus:a");
+    });
+}

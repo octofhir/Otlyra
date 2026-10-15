@@ -1180,6 +1180,11 @@ impl PageWorld {
             .unwrap_or_default();
         if let Some(page) = slot.page.as_mut() {
             page.set_scroll(scroll);
+            // A focus the load's scripts asked for — a sign-in page focusing
+            // its first field — is the page's once it is built.
+            if let Some(scripts) = slot.scripts.as_mut() {
+                super::after_script_turn(page, scripts.as_mut());
+            }
         }
 
         self.follow_script_navigation(tab);

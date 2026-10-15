@@ -237,6 +237,18 @@ impl DocumentRef {
         super::current_script().map(|element| JsNode::new(self.node.doc, element))
     }
 
+    /// The focused element, or null; `activeElement` falls back to the body.
+    #[getter(name = "__otlyraFocused")]
+    fn js_focused(&self) -> Result<Option<JsNode>, JsError> {
+        let doc = self.node.doc;
+        super::with_document(doc, |document| {
+            document
+                .focused()
+                .filter(|&node| document.get(node).is_some())
+        })
+        .map(|node| node.map(|node| JsNode::new(doc, node)))
+    }
+
     /// The element a user-input event being dispatched by the browser is aimed
     /// at; read only by the glue's `__otlyraDispatchInput`.
     #[getter(name = "__otlyraInputTarget")]

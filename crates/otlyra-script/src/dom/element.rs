@@ -182,6 +182,28 @@ impl ElementRef {
         })
     }
 
+    /// `focus()`: the element is focused for script at once, and the browser
+    /// moves its own focus (and fires the events) after the turn.
+    #[method(name = "__otlyraFocus")]
+    fn js_focus(&self) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| document.set_focused(Some(id)))?;
+        super::request_focus(Some(id));
+        Ok(())
+    }
+
+    /// `blur()`: drop the focus if this element has it.
+    #[method(name = "__otlyraBlur")]
+    fn js_blur(&self) -> Result<(), JsError> {
+        let id = self.node.id;
+        let had = with_document(self.node.doc, |document| document.focused() == Some(id))?;
+        if had {
+            with_document_mut(self.node.doc, |document| document.set_focused(None))?;
+            super::request_focus(None);
+        }
+        Ok(())
+    }
+
     /// What a form control holds: what the reader or script put in it, or its
     /// markup's value. Read by the glue's `value` accessors.
     #[method(name = "__otlyraControlValue")]

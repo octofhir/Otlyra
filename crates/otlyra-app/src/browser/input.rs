@@ -790,11 +790,13 @@ impl Browser {
     /// Tell the page its focus moved: `change` for a field left with a value
     /// other than the one it was given the focus with, then blur/focusout on
     /// what lost it and focus/focusin on what gained it.
-    pub(super) fn sync_page_focus(&mut self, before: Option<(super::TabId, otlyra_dom::NodeId)>) {
+    pub(super) fn sync_page_focus(&mut self) {
+        let before = self.page_focus_told;
         let after = self.page_focus();
         if before == after {
             return;
         }
+        self.page_focus_told = after;
         self.sync_world();
         if let Some((tab, node)) = before {
             if let Some((focused_tab, focused, value)) = self.focus_value.take()

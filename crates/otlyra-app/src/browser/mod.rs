@@ -90,6 +90,8 @@ pub struct Browser {
     focus_value: Option<(TabId, otlyra_dom::NodeId, String)>,
     /// The page element the pointer is over, as the page was last told.
     hovered: Option<(TabId, otlyra_dom::NodeId)>,
+    /// The page focus the page was last told about.
+    page_focus_told: Option<(TabId, otlyra_dom::NodeId)>,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
@@ -264,6 +266,7 @@ impl Browser {
             text_cancelled: false,
             focus_value: None,
             hovered: None,
+            page_focus_told: None,
             last_width: 1024.0,
             last_height: 768.0,
             last_scale: 1.0,

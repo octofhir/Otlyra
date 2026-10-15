@@ -157,6 +157,12 @@ pub trait ScriptRunner {
         Err("this page has no script engine".to_owned())
     }
 
+    /// The focus script asked for since this was last asked: an element, or
+    /// `None` inside for a blur.
+    fn take_focus_request(&mut self) -> Option<Option<NodeId>> {
+        None
+    }
+
     /// Whether the page listens for pointer movement at all.
     fn wants_pointer_moves(&self) -> bool {
         false

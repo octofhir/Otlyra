@@ -113,6 +113,9 @@ pub struct PageState {
     /// Whether the page listens for pointer movement, so the browser sends it
     /// rather than entering the isolate for every move of the mouse.
     wants_pointer_moves: bool,
+    /// The focus script asked for in this turn: an element, or none for a
+    /// blur. The browser applies it, and fires the focus events, after it.
+    focus_request: Option<Option<otlyra_dom::NodeId>>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -223,6 +226,11 @@ impl PageState {
         self.current_script = element;
     }
 
+    /// Take the focus script asked for, if it asked.
+    pub fn take_focus_request(&mut self) -> Option<Option<otlyra_dom::NodeId>> {
+        self.focus_request.take()
+    }
+
     /// Whether the page listens for pointer movement.
     #[must_use]
     pub fn wants_pointer_moves(&self) -> bool {
@@ -261,6 +269,11 @@ pub(crate) fn request_navigation(navigation: Navigation) {
     // Last one wins. A script that sets `location.href` twice in a turn has
     // changed its mind, and a browser goes where it ended up.
     with_state_mut(|state| state.navigation = Some(navigation));
+}
+
+/// Script asked to move the focus to `node`, or to drop it.
+pub(crate) fn request_focus(node: Option<otlyra_dom::NodeId>) {
+    with_state_mut(|state| state.focus_request = Some(node));
 }
 
 /// The page registered a listener for pointer movement.

@@ -157,6 +157,12 @@ impl Browser {
                 url,
                 recorded,
             } => {
+                // A new document: what its predecessor was told about the
+                // focus names elements of a document that is gone.
+                if self.page_focus_told.is_some_and(|(told, _)| told == tab) {
+                    self.page_focus_told = None;
+                    self.focus_value = None;
+                }
                 let Some(index) = self.tab_index(tab) else {
                     return;
                 };

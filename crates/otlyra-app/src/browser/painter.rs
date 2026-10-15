@@ -159,13 +159,14 @@ impl Painter for Browser {
     }
 
     fn on_event(&mut self, event: PlatformEvent) {
-        let focus_before = self.page_focus();
+        // A focus script moved since the last event is heard first.
+        self.sync_page_focus();
         self.on_platform_event(event);
         if matches!(event, PlatformEvent::PointerMoved { .. }) {
             self.page_pointer_moved();
         }
         // Whatever the event did to the page's focus, the page hears.
-        self.sync_page_focus(focus_before);
+        self.sync_page_focus();
     }
     fn accessibility(&mut self) -> Option<otlyra_platform::accesskit::TreeUpdate> {
         if !self.accessibility_dirty {

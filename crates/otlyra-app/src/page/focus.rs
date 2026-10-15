@@ -168,6 +168,8 @@ impl PageScene {
             return false;
         }
         self.interaction = next;
+        // What script reads as `document.activeElement`.
+        self.document.set_focused(next.focus);
 
         let touched = otlyra_css::state::touched_nodes(&self.document, before, next);
         let control_touched = touched

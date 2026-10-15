@@ -617,6 +617,10 @@ impl ScriptRunner for PageScripts {
         PageScripts::automation_script(self, document, source, call, await_promise)
     }
 
+    fn take_focus_request(&mut self) -> Option<Option<NodeId>> {
+        self.state.take_focus_request()
+    }
+
     fn wants_pointer_moves(&self) -> bool {
         self.host.is_some() && self.state.wants_pointer_moves()
     }
