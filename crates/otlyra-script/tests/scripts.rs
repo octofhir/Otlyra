@@ -1105,3 +1105,110 @@ fn page_clock_preserves_the_bare_host_performance_fallback() {
     host.run_classic_script("console.log('bare', Number.isFinite(performance.now()), performance.timeOrigin > 0, performance.timeOrigin === performance.toJSON().timeOrigin)", "bare").unwrap();
     assert_eq!(lines(&sink), ["Log: bare true true true"]);
 }
+
+/// Event handlers (HTML §8.1.8): a content attribute and an IDL attribute set
+/// one listener that keeps its place, `return false` cancels, null removes it,
+/// and a `<body>` attribute is the window's.
+#[test]
+fn event_handler_attributes_and_properties_share_one_listener_in_its_place() {
+    let (output, ..) = parse_running_scripts(
+        "<body onload=\"console.log('body-load', this === window)\">\
+         <button id=go onclick=\"console.log('attribute', id, typeof event); return false\"></button>\
+         <script>\
+           const go = document.getElementById('go');\
+           go.addEventListener('click', () => console.log('listener'));\
+           let event = new MouseEvent('click', { bubbles: true, cancelable: true });\
+           go.dispatchEvent(event);\
+           console.log('cancelled', event.defaultPrevented, typeof go.onclick);\
+           go.onclick = (e) => console.log('property', e.type);\
+           go.dispatchEvent(new MouseEvent('click'));\
+           go.onclick = null;\
+           console.log('cleared', go.onclick);\
+           go.dispatchEvent(new MouseEvent('click'));\
+           go.setAttribute('onclick', \"console.log('again')\");\
+           go.dispatchEvent(new MouseEvent('click'));\
+           console.log('reflects', document.body.onload === window.onload, 'onclick' in window, 'ontouchstart' in window);\
+           window.dispatchEvent(new Event('load'));\
+           window.onload = () => console.log('window-load');\
+           window.dispatchEvent(new Event('load'));\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        [
+            "Log: attribute go object",
+            "Log: listener",
+            "Log: cancelled true function",
+            "Log: property click",
+            "Log: listener",
+            "Log: cleared null",
+            "Log: listener",
+            "Log: listener",
+            "Log: again",
+            "Log: reflects true true false",
+            "Log: body-load true",
+            "Log: window-load",
+            // The document's own load, which the parse fires as it finishes.
+            "Log: window-load",
+        ],
+    );
+}
+
+/// A handler that does not compile is reported and handles nothing; a
+/// non-callable value is kept and reported when the event arrives.
+#[test]
+fn a_broken_event_handler_is_reported_and_the_dispatch_continues() {
+    let (output, ..) = parse_running_scripts(
+        "<div id=box onclick=\"(\"></div><script>\
+           const box = document.getElementById('box');\
+           box.addEventListener('click', () => console.log('still heard'));\
+           console.log('compiled', box.onclick);\
+           box.dispatchEvent(new Event('click'));\
+           box.onclick = 'not a function';\
+           console.log('string', box.onclick);\
+           box.onclick = {};\
+           box.dispatchEvent(new Event('click'));\
+         </script>",
+    );
+    assert_eq!(output.len(), 6, "{output:?}");
+    assert!(output[0].starts_with("Error: "), "{output:?}");
+    assert_eq!(output[1], "Log: compiled null");
+    assert_eq!(output[2], "Log: still heard");
+    assert_eq!(output[3], "Log: string null");
+    // Cleared and set again, the handler now follows the listener.
+    assert_eq!(output[4], "Log: still heard");
+    assert!(
+        output[5].starts_with("Error: ") && output[5].contains("onclick"),
+        "{output:?}"
+    );
+}
+
+/// The UI Events interfaces construct from inheriting dictionaries.
+#[test]
+fn ui_event_interfaces_take_their_init_dictionaries() {
+    let (output, ..) = parse_running_scripts(
+        "<script>\
+           const mouse = new MouseEvent('mousedown', { bubbles: true, clientX: 4, clientY: 5, button: 2, ctrlKey: true });\
+           console.log(mouse instanceof UIEvent, mouse instanceof Event, mouse.bubbles, mouse.x, mouse.clientY, mouse.button, mouse.getModifierState('Control'), mouse.detail);\
+           const key = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, shiftKey: true });\
+           console.log(key.key, key.code, key.keyCode, key.shiftKey, key.altKey, KeyboardEvent.DOM_KEY_LOCATION_NUMPAD);\
+           const wheel = new WheelEvent('wheel', { deltaY: 120 });\
+           console.log(wheel instanceof MouseEvent, wheel.deltaY, wheel.deltaMode, WheelEvent.DOM_DELTA_LINE);\
+           const pointer = new PointerEvent('pointerdown', { pointerType: 'mouse', isPrimary: true });\
+           console.log(pointer instanceof MouseEvent, pointer.pointerType, pointer.isPrimary, pointer.width);\
+           console.log(new FocusEvent('focus').relatedTarget, new InputEvent('input', { data: 'a', inputType: 'insertText' }).inputType, typeof TouchEvent);\
+           try { new MouseEvent(); } catch (error) { console.log(error instanceof TypeError); }\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        [
+            "Log: true true true 4 5 2 true 0",
+            "Log: Enter Enter 13 true false 3",
+            "Log: true 120 0 1",
+            "Log: true mouse true 1",
+            "Log: null insertText undefined",
+            "Log: true",
+        ],
+    );
+}

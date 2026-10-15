@@ -75,6 +75,9 @@ const propagationPath = (target) => {
 // listener must stop it running — which is why the copy is consulted for the
 // order and the live list for whether an entry is still there.
 const fire = (target, event, capturing) => {
+  // Handlers are never capturing; a content attribute registers its handler
+  // the first time an event it handles arrives (see `handlers.js`).
+  if (!capturing) syncAttributeHandler(target, event.type);
   const list = listenersFor(target, event.type, false);
   if (!list || list.length === 0) return;
   event.currentTarget = target;

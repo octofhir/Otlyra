@@ -22,43 +22,8 @@ defineGlobal('matchMedia', function matchMedia(query) {
 const frameCallbacks = new Map();
 let nextFrameHandle = 1;
 
-// The document's event-handler property shares the normal listener route.
-// Replacing a callback retains its position among registered listeners.
-let visibilityHandler = null;
-const visibilityListener = function (event) {
-  visibilityHandler.call(this, event);
-};
-Object.defineProperty(Document.prototype, 'onvisibilitychange', {
-  configurable: true,
-  enumerable: true,
-  get() { return visibilityHandler; },
-  set(callback) {
-    const next = typeof callback === 'function' ? callback : null;
-    if (visibilityHandler === null && next !== null) {
-      this.addEventListener('visibilitychange', visibilityListener);
-    } else if (visibilityHandler !== null && next === null) {
-      this.removeEventListener('visibilitychange', visibilityListener);
-    }
-    visibilityHandler = next;
-  },
-});
-
-let resizeHandler = null;
-const resizeListener = function(event) { if (resizeHandler !== null) return resizeHandler.call(this, event); };
-Object.defineProperty(globalThis, 'onresize', {
-  configurable: true,
-  enumerable: true,
-  get() { return resizeHandler; },
-  set(callback) {
-    const next = typeof callback === 'function' ? callback : null;
-    if (resizeHandler === null && next !== null) {
-      this.addEventListener('resize', resizeListener);
-    } else if (resizeHandler !== null && next === null) {
-      this.removeEventListener('resize', resizeListener);
-    }
-    resizeHandler = next;
-  },
-});
+// `onvisibilitychange` and `onresize` are ordinary event handlers; see
+// `handlers.js`.
 
 defineGlobal('requestAnimationFrame', function requestAnimationFrame(callback) {
   if (typeof callback !== 'function') {
