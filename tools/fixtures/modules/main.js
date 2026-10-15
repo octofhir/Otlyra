@@ -1,0 +1,10 @@
+import { a } from './lib/a.js';
+import { util } from 'util';
+import { redirected } from '/old/r.js';
+order.push('main:' + a + ':' + util + ':' + redirected);
+results.mainMeta = import.meta.url;
+results.sawParagraph = document.getElementById('after') !== null;
+results.strict = (function () { return this === undefined; })();
+const lazy = await import('lib/lazy.js');
+results.lazy = lazy.default;
+results.done = true;

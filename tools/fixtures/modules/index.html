@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>Module graph</title>
+<script>
+  window.order = [];
+  window.results = {};
+  document.addEventListener('DOMContentLoaded', () => order.push('dcl'));
+  addEventListener('load', () => order.push('load'));
+</script>
+<script type=importmap>
+  {"imports": {"util": "/lib/util.js", "lib/": "/lib/"}}
+</script>
+<script type=module src=main.js></script>
+<script type=module>
+  import { util } from 'util';
+  order.push('inline:' + util);
+  results.inlineMeta = import.meta.url;
+  results.currentScript = document.currentScript;
+</script>
+<script nomodule>order.push('nomodule ran');</script>
+<script type=module src=lib/not-javascript.txt onerror="order.push('mime error')"></script>
+<script type=module src=missing.js onerror="order.push('404 error')"></script>
+<script>order.push('classic');</script>
+<p id=after>after</p>
