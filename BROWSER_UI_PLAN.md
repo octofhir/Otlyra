@@ -237,7 +237,8 @@ event handlers and UI Events interfaces, trusted input dispatch with
 cancellation, form values and checkedness shared with script, focus,
 hover, scroll and submit events, picture load/error with natural sizes,
 element geometry from the last frame, intersection/resize observers, and
-BiDi `script.evaluate`/`callFunction`. What is left:
+BiDi `script.evaluate`/`callFunction`, keyboard/assistive/script activation
+clicks and wheel events. What is left:
 
 - [ ] Module scripts. Blocked on the engine: the frozen Otter's synchronous
   module loader never calls the embedder load/resolve hooks, and http(s)
@@ -248,9 +249,7 @@ BiDi `script.evaluate`/`callFunction`. What is left:
 - [ ] Synchronous geometry: a measurement after a mutation in the same turn
   reads the previous frame, and elements outside the drawn band measure zero.
 - [ ] Element scrolling (`scrollTop` of anything but the scrolling element),
-  `scrollIntoView`, `wheel` events to script, and pointer modifiers.
-- [ ] Keyboard and accessibility activation dispatching `click`, and
-  `click()` from script performing activation behaviour.
+  `scrollIntoView`, and pointer modifiers on mouse events.
 - [ ] Hide the remaining `__otlyra*` bindings behind `take` so no page sees them.
 
 ## Priority 2 — Retained scene layers and damage

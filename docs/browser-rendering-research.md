@@ -958,6 +958,8 @@ and committed after the full gate:
 | `1aaf057` | `getBoundingClientRect`, `getClientRects`, `offset*`, `client*`, root `scroll*` from the last frame's boxes |
 | `c6f6434` | `IntersectionObserver` and `ResizeObserver` answered in the rendering step after rAF, owed whenever drawn geometry or scroll changed |
 | `ce4d655` | `new Image()` preloading fetches and fires `load` without drawing |
+| `e9a99d1` | Return/Space and assistive Activate dispatch a cancelable `click` before the browser's action (Space ticks a checkbox instead of paging down); script `click()` performs activation and `requestSubmit()` dispatches `submit` |
+| `ba2e8cf` | cancelable `wheel` at the element under the pointer, before the page scrolls, for pages that listen |
 
 The input path is one route for the native window, the threaded content
 owner and the BiDi session: all call `Browser::on_event`, which now compares
@@ -985,33 +987,34 @@ and the final release (see below).
 
 ### Final validation of this run
 
-The final release (`ce4d655`, binary SHA-256
-`86c196a66b97d12a4b1a091fb68c3f63232a2078a7818ddb5ce1ebeb288f83d6`, frozen
+The final release (`ba2e8cf`, binary SHA-256
+`63f26644681ca8623f657f3c1c3066785a126665558f6be4a261f162623d55c0`, frozen
 engine `23c5a114…`, Rust 1.96.0, the dom/html/script/platform/app release
-packages cleaned before building) contains no fault-injection hook. It
-completed 100 of 100 mixed native starts (60 GPU, 40 CPU, half About and half
-the timer fixture) while the machine's one-minute load rose from 92 to 148
-from unrelated work. Six of those starts hit the occluded first presentation
-on their own and recovered. `tools/bidi-smoke.py` passed against it.
+packages cleaned before building, clean tree) contains no fault-injection
+hook. It completed 100 of 100 mixed native starts (60 GPU, 40 CPU, half About
+and half the timer fixture) at a one-minute load of 69–72 from unrelated
+work; two starts hit the occluded first presentation on their own and
+recovered. An earlier checkpoint release (`ce4d655`) did the same with six
+natural recoveries at load 92–148. `tools/bidi-smoke.py` passed against both.
 
 Startup was measured against the previous run's final release (`7c0fac7`)
 in 20 alternating-order pairs after three warmups per series, 1024×768 at
-2×, Apple M1/macOS 26.5. One-minute load was 28 at the start and 70 at the
+2×, Apple M1/macOS 26.5. One-minute load was 37 at the start and 73 at the
 end, so these show the absence of a large change rather than a speed. p50/p95
 in ms, control → final, paired median delta:
 
 | Series | Process → visible | Process → first frame report |
 | --- | --- | --- |
-| About / GPU | 235.00/273.40 → 229.75/263.37, +0.95 | 348.69/407.50 → 341.21/396.10, −5.64 |
-| About / CPU | 228.45/319.67 → 216.89/269.68, −12.06 | 345.98/454.80 → 330.46/414.83, −13.89 |
-| Timer fixture / GPU | 238.60/310.80 → 237.74/259.55, −0.80 | 356.76/458.11 → 363.24/406.25, −2.33 |
-| Timer fixture / CPU | 214.74/261.79 → 231.46/284.10, +0.76 | 355.42/411.42 → 362.70/400.52, +2.26 |
+| About / GPU | 219.19/281.16 → 214.72/250.92, −12.45 | 340.85/385.89 → 326.06/367.69, −13.85 |
+| About / CPU | 227.58/280.65 → 239.88/301.03, −0.12 | 352.17/412.16 → 355.28/410.00, +9.67 |
+| Timer fixture / GPU | 206.23/227.70 → 198.71/215.85, −1.71 | 318.45/348.20 → 314.71/335.42, −3.93 |
+| Timer fixture / CPU | 215.80/274.85 → 207.99/322.39, −2.49 | 336.46/405.05 → 347.71/466.32, −1.94 |
 
 No startup speedup or regression is claimed from these; all four strict
 budgets still fail. These are UI accounting intervals, not physical
-presentation. Raw data: `target/occlusion-stall/startup-*.json`,
-`target/occlusion-stall/startup-session.json`, stress in
-`target/occlusion-stall/final-{gpu,cpu}/runs.json`.
+presentation. Raw data: `target/occlusion-stall/startup2-*.json`,
+`target/occlusion-stall/startup2-session.json` (the checkpoint's are the
+`startup-*` files), stress in `target/occlusion-stall/final2-{gpu,cpu}/runs.json`.
 
 ## What the reference browsers do
 
