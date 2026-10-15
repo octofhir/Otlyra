@@ -155,6 +155,13 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   deadlines stay on content's scheduler without waking hidden native UI.
 - [ ] Define background timer budgets/exemptions. Timers currently continue
   normally; changed hidden metadata still publishes.
+- [x] Supply window CSS dimensions and device scale before the first script;
+  update them on resize, zoom and inspector docking, including paused parsers
+  and encoding resets. Retain per-tab zoom and dispatch resize with current
+  metrics on content's owner; a pure DPR change does not resize the CSS viewport.
+- [ ] Confirm the native surface's viewport/DPI before the first page script.
+  The content factory uses the shell's requested viewport; a subsequently
+  confirmed native scale can still differ during initial loading.
 - [x] Respect accessibility action intent on native chrome and all system pages:
   Focus does not activate controls, Activate follows the click path, range steps
   use existing adjustments and accumulate before redraw. Advertise only supported

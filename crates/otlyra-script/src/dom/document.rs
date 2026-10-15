@@ -69,6 +69,11 @@ impl DocumentRef {
         super::document_url()
     }
 
+    #[static_method(name = "__windowMetric")]
+    fn js_window_metric(which: u32) -> f64 {
+        super::window_metric(which)
+    }
+
     /// Ask the browser to go somewhere. Not part of the platform: it is what
     /// `location`'s setters and methods call.
     #[static_method(name = "__navigate")]

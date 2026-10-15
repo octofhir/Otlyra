@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod accessibility;
 mod hidden_preparation;
+mod initial_environment;
 
 fn animated_window(viewport: Viewport) -> WindowBrowser {
     use crate::browser::visibility_tests::HTML;

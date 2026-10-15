@@ -111,6 +111,11 @@ pub trait ScriptRunner {
         let _ = (document, hidden);
     }
 
+    /// The CSS viewport changed between script turns or while parsing is paused.
+    fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
+        let _ = (document, width, height, scale);
+    }
+
     /// Whether script changed the document since this was last asked.
     ///
     /// Asked after every turn the browser gives the page, and answered by
@@ -342,6 +347,22 @@ impl HtmlParser {
     pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) -> bool {
         if let Some(runner) = self.script_runner.as_mut() {
             runner.set_hidden(document, hidden);
+            runner.take_mutated()
+        } else {
+            false
+        }
+    }
+
+    /// Forward dimensions to the runner retained by a paused parser.
+    pub fn set_viewport(
+        &mut self,
+        document: &mut Document,
+        width: f64,
+        height: f64,
+        scale: f64,
+    ) -> bool {
+        if let Some(runner) = self.script_runner.as_mut() {
+            runner.set_viewport(document, width, height, scale);
             runner.take_mutated()
         } else {
             false

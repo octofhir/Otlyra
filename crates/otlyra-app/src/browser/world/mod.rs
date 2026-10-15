@@ -39,6 +39,8 @@ const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// One tab's document and what is in flight for it.
 #[derive(Default)]
 struct PageSlot {
+    /// Each document keeps its zoom while another tab is selected.
+    viewport_zoom: Option<f32>,
     /// The document, absent for a blank tab, a browser page, or a load that failed.
     page: Option<PageScene>,
     /// The page's script world, kept for as long as the page is on screen.
@@ -64,6 +66,7 @@ struct PageSlot {
 /// stand, which the window keeps and hands over rather than this reaching for.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Environment {
+    pub(super) page_zoom: f32,
     /// Whether pictures are fetched at all.
     pub(super) load_images: bool,
     /// Whether the browser's interface is drawn. Without it the page is going to
@@ -123,6 +126,7 @@ pub(super) enum ScriptNavigation {
 
 /// The pages, and everything that is fetched and run for them.
 pub(super) struct PageWorld {
+    environment_changed: bool,
     /// The engine pages are shaped with: a fork of the window's, so that the
     /// fonts a page brings are the pages' and the window's text is not held up
     /// by a page's layout.
@@ -168,6 +172,7 @@ impl PageWorld {
     /// No pages yet, fetching through `fetcher` and shaping with `text`.
     pub(super) fn new(fetcher: Fetcher, text: TextEngine, environment: Environment) -> Self {
         Self {
+            environment_changed: false,
             text,
             fetcher,
             images: ImageCache::default(),
@@ -187,8 +192,18 @@ impl PageWorld {
 
     /// Take the window's preferences and size as they stand now.
     pub(super) fn set_environment(&mut self, environment: Environment) {
+        let mut viewport_changed = self.environment.viewport.width != environment.viewport.width
+            || self.environment.viewport.height != environment.viewport.height
+            || self.environment.viewport.scale != environment.viewport.scale;
         let previous = self.environment.visible_tab();
         self.environment = environment;
+        if let Some(tab) = environment.active
+            && let Some(slot) = self.slots.get_mut(&tab)
+            && slot.viewport_zoom != Some(environment.page_zoom)
+        {
+            slot.viewport_zoom = Some(environment.page_zoom);
+            viewport_changed = true;
+        }
         let visible = environment.visible_tab();
         if previous != visible {
             // Hide the old page before exposing the new one. This runs between
@@ -198,6 +213,37 @@ impl PageWorld {
             }
             if let Some(tab) = visible {
                 self.set_hidden(tab, false);
+            }
+        }
+        if viewport_changed {
+            for slot in self.slots.values_mut() {
+                let Some(page) = slot.page.as_mut() else {
+                    continue;
+                };
+                let mut viewport = environment.viewport;
+                let zoom = slot.viewport_zoom.unwrap_or(1.0);
+                viewport.width /= zoom;
+                viewport.height /= zoom;
+                viewport.scale *= zoom;
+                let mutated = if let Some(scripts) = slot.scripts.as_mut() {
+                    page.with_document(|document| {
+                        scripts.set_viewport(
+                            document,
+                            f64::from(viewport.width),
+                            f64::from(viewport.height),
+                            f64::from(viewport.scale),
+                        )
+                    });
+                    scripts.take_mutated()
+                } else if let Some(pending) = slot.pending.as_mut() {
+                    page.with_document(|document| pending.set_viewport(document, viewport))
+                } else {
+                    false
+                };
+                if mutated {
+                    page.document_changed();
+                    self.environment_changed = true;
+                }
             }
         }
     }
@@ -219,6 +265,7 @@ impl PageWorld {
         };
         if mutated {
             page.document_changed();
+            self.environment_changed = true;
         }
     }
 
@@ -326,7 +373,7 @@ impl PageWorld {
     /// the visible page its requested animation frame. Answers
     /// whether anything changed.
     pub(super) fn pump(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = std::mem::take(&mut self.environment_changed);
         for fetched in self.fetcher.poll() {
             changed |= self.receive(fetched);
         }

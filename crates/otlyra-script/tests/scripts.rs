@@ -637,6 +637,7 @@ fn visibility_survives_encoding_reset_and_frames_can_be_cancelled_while_hidden()
         let handle: ConsoleSinkHandle = sink.clone();
         let mut runner = PageScripts::with_console("https://hidden.test/", handle);
         runner.set_initial_hidden(true);
+        runner.set_initial_viewport(800.0, 600.0, 2.0);
         runner.reset();
         runner
             .host_mut()
@@ -645,18 +646,18 @@ fn visibility_survives_encoding_reset_and_frames_can_be_cancelled_while_hidden()
             .expect("the reset isolate runs");
         let mut document = otlyra_html::parse(b"<body></body>", Some("utf-8")).document;
         let source = r#"
-            console.log(document.hidden);
+            console.log(document.hidden, innerWidth, innerHeight, devicePixelRatio);
             const handle = requestAnimationFrame(() => console.log('cancelled'));
             cancelAnimationFrame(handle);
             requestAnimationFrame(() => console.log('retained'));
         "#;
         runner.run(source, document.root(), &mut document);
         runner.document_finished(&mut document, true);
-        assert_eq!(lines(&sink), ["Log: true"]);
+        assert_eq!(lines(&sink), ["Log: true 800 600 2"]);
         assert_eq!(runner.run_frame(&mut document, 10.0), 0);
         runner.set_hidden(&mut document, false);
         assert_eq!(runner.run_frame(&mut document, 20.0), 1);
-        assert_eq!(lines(&sink), ["Log: true", "Log: retained"]);
+        assert_eq!(lines(&sink), ["Log: true 800 600 2", "Log: retained"]);
     }
     // Match the native content owner while constructing both parse isolates.
     std::thread::Builder::new()
@@ -665,6 +666,56 @@ fn visibility_survives_encoding_reset_and_frames_can_be_cancelled_while_hidden()
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn paused_parsers_update_viewport_and_replaceable_window_properties_stay_overridden() {
+    let sink = Arc::new(Captured::default());
+    let mut scripts = Box::new(PageScripts::with_console(
+        "https://viewport.test/",
+        sink.clone(),
+    ));
+    scripts.set_initial_viewport(800.0, 600.0, 2.0);
+    let mut parser = HtmlParser::new().with_script_runner(scripts);
+    let mut document = otlyra_dom::Document::new();
+    parser.feed(&mut document, r#"<p id=state></p><script>
+        window.onresize = () => console.log('old');
+        window.addEventListener('resize', event => console.log('listener', event.target === window, event.bubbles, event.cancelable));
+        window.onresize = function(event) {
+            console.log('handler', this === window, innerWidth, innerHeight, devicePixelRatio);
+            document.getElementById('state').setAttribute('resized', 'yes');
+        };
+        console.log('initial', innerWidth, innerHeight, devicePixelRatio);
+    </script><script src=slow.js></script><script>
+        console.log('after', innerWidth, innerHeight, devicePixelRatio);
+        window.innerWidth = 'override';
+        window.onresize = null;
+    </script>"#.into());
+    assert!(parser.blocked_on().is_some());
+    assert!(parser.set_viewport(&mut document, 900.75, 700.25, 3.0));
+    parser.supply_script(
+        &mut document,
+        "console.log('external', innerWidth, innerHeight, devicePixelRatio)",
+    );
+    let mut runner = parser.finish(&mut document).unwrap();
+    runner.set_viewport(&mut document, 1000.0, 800.0, 4.0);
+    runner.run(
+        "console.log('overridden', innerWidth, innerHeight, devicePixelRatio)",
+        document.root(),
+        &mut document,
+    );
+    assert_eq!(
+        lines(&sink),
+        [
+            "Log: initial 800 600 2",
+            "Log: handler true 900 700 3",
+            "Log: listener true false false",
+            "Log: external 900 700 3",
+            "Log: after 900 700 3",
+            "Log: listener true false false",
+            "Log: overridden override 800 4",
+        ]
+    );
 }
 
 #[test]

@@ -11,6 +11,19 @@ define(globalThis, 'frameElement', null);
 define(globalThis, 'closed', false);
 define(globalThis, 'name', '');
 
+const nativeWindowMetric = Document.__windowMetric;
+delete Document.__windowMetric;
+for (const [name, index] of [['innerWidth', 0], ['innerHeight', 1], ['devicePixelRatio', 2]]) {
+  Object.defineProperty(globalThis, name, {
+    get() { return nativeWindowMetric(index); },
+    set(value) {
+      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 // The global's interface. The global object is the engine's own and keeps its
 // prototype; `instanceof Window` answers for it rather than for its chain.
 class Window extends EventTarget {

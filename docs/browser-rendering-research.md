@@ -420,6 +420,54 @@ startup smoke. All-target clippy with `-D warnings`, formatting and diff checks
 passed against the same immutable Otter snapshot; its working checkout was not
 edited.
 
+## Script viewport compatibility follow-up
+
+Windowed factories are aligned with the shell's requested viewport and chrome
+mode before ready loads can run their first scripts. Otlyra's DOM bindings now
+expose replaceable `innerWidth`, `innerHeight` and `devicePixelRatio` getters,
+using CSS dimensions and native scale multiplied by the document's page zoom.
+The viewport excludes chrome and the inspector dock. Each background document
+retains its own zoom when another tab is selected.
+
+Resizing updates metrics and invokes window resize listeners on content's owner,
+including handlers assigned through `onresize` and their microtasks. Paused
+parser runners receive the update; encoding resets retain both viewport and
+visibility. Identical dimensions and changes to DPR alone do not fire resize.
+Property assignment preserves the script's replacement value on later updates.
+This follows the [CSSOM View Window interface](https://drafts.csswg.org/cssom-view/#extensions-to-the-window-interface)
+and its [viewport resize steps](https://drafts.csswg.org/cssom-view/#resizing-viewports).
+
+Regression coverage checks the first inline script at 1x/2x with and without
+chrome, initially hidden loading, repeated resize and DPR changes, document zoom,
+inspector docking, parser blocking and script property replacement. Native scale
+confirmation can still arrive after the first script; this change uses the
+requested shell viewport and does not introduce a native-startup barrier.
+
+Verification: 1,813 workspace Rust tests passed, plus the native GPU/CPU startup
+smoke and seven benchmark-protocol Python tests. All-target clippy with
+`-D warnings`, formatting and diff checks passed on the immutable Otter snapshot.
+
+The startup check used three warmups and 20 alternating baseline/candidate pairs
+per renderer on Apple M1/macOS 26.5, release, 1024×768 logical at 2x,
+`about:about`, isolated profiles and `--no-secrets`. The driver cache was warm;
+local background build load was present. Both binaries use Rust 1.96.0 and the
+same frozen engine/Skia archive. Workspace packages were explicitly cleaned
+between source trees to prevent Cargo from reusing the control executable.
+Control SHA-256 begins `c07d20ee18fd`, candidate `ee9a56b8a8aa`.
+
+| Startup, p50 / p95 ms | Control `331c16d` | Candidate |
+| --- | ---: | ---: |
+| GPU visibility request | 195.35 / 226.23 | 196.28 / 234.33 |
+| GPU complete content-frame report | 291.42 / 311.54 | 290.83 / 316.77 |
+| CPU visibility request | 183.73 / 198.96 | 181.13 / 197.82 |
+| CPU complete content-frame report | 274.03 / 295.33 | 270.05 / 285.88 |
+
+Paired first-frame median changes were −2.59 ms GPU and −7.72 ms CPU. GPU tail
+latency worsened; this compatibility change establishes no startup speedup.
+All strict startup budgets still fail. The endpoints retain native visibility
+request and UI report-accounting semantics. Local artifacts are
+`target/startup-viewport-{gpu,cpu}.json` and `target/viewport-build-pair.json`.
+
 ## What the reference browsers do
 
 ### Chromium

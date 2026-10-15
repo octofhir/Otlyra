@@ -95,6 +95,8 @@ pub struct PageState {
     ready: bool,
     /// Whether this document's tab or native window is hidden.
     hidden: bool,
+    /// CSS viewport and device scale supplied by the embedder.
+    viewport: WindowViewport,
     /// Where the page's script thinks it is. `location` is built from it.
     document_url: String,
     /// Where script asked to go, if it asked.
@@ -103,6 +105,45 @@ pub struct PageState {
     /// `document.currentScript` answers. Bundlers find their own address
     /// through it, and load the rest of themselves relative to that.
     current_script: Option<otlyra_dom::NodeId>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct WindowViewport {
+    pub(crate) width: f64,
+    pub(crate) height: f64,
+    pub(crate) scale: f64,
+}
+
+impl Default for WindowViewport {
+    fn default() -> Self {
+        Self {
+            width: 0.0,
+            height: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+impl WindowViewport {
+    pub(crate) fn new(width: f64, height: f64, scale: f64) -> Self {
+        Self {
+            width: if width.is_finite() {
+                width.max(0.0)
+            } else {
+                0.0
+            },
+            height: if height.is_finite() {
+                height.max(0.0)
+            } else {
+                0.0
+            },
+            scale: if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            },
+        }
+    }
 }
 
 impl PageState {
@@ -145,6 +186,14 @@ impl PageState {
     #[must_use]
     pub fn hidden(&self) -> bool {
         self.hidden
+    }
+
+    pub(crate) fn viewport(&self) -> WindowViewport {
+        self.viewport
+    }
+
+    pub(crate) fn set_viewport(&mut self, viewport: WindowViewport) {
+        self.viewport = viewport;
     }
 
     /// Where script asked to go, if it asked.
@@ -198,6 +247,15 @@ pub(crate) fn is_ready() -> bool {
 
 pub(crate) fn is_hidden() -> bool {
     with_state(|state| state.hidden)
+}
+
+pub(crate) fn window_metric(which: u32) -> f64 {
+    let viewport = with_state(|state| state.viewport);
+    match which {
+        0 => viewport.width.floor(),
+        1 => viewport.height.floor(),
+        _ => viewport.scale,
+    }
 }
 
 pub(crate) fn current_script() -> Option<otlyra_dom::NodeId> {

@@ -73,6 +73,25 @@ pub(super) struct PendingLoad {
 }
 
 impl PendingLoad {
+    pub(super) fn set_viewport(
+        &mut self,
+        document: &mut otlyra_dom::Document,
+        viewport: otlyra_css::cascade::Viewport,
+    ) -> bool {
+        let (width, height, scale) = (
+            f64::from(viewport.width),
+            f64::from(viewport.height),
+            f64::from(viewport.scale),
+        );
+        if let Some(parser) = self.parse.as_mut() {
+            parser.set_viewport(document, width, height, scale)
+        } else if let Some(runner) = self.runner.as_mut() {
+            runner.set_viewport(document, width, height, scale);
+            runner.take_mutated()
+        } else {
+            false
+        }
+    }
     /// Visibility belongs to the document even before its load is complete.
     pub(super) fn set_hidden(&mut self, document: &mut otlyra_dom::Document, hidden: bool) -> bool {
         if let Some(parser) = self.parse.as_mut() {
@@ -256,7 +275,9 @@ impl PageWorld {
         restore_scroll: f32,
     ) {
         let id = self.fetcher.fetch(url, ResourceKind::Document, body, cache);
-        self.slots.entry(tab).or_default().pending = Some(PendingLoad {
+        let slot = self.slots.entry(tab).or_default();
+        slot.viewport_zoom = Some(self.environment.page_zoom);
+        slot.pending = Some(PendingLoad {
             document: id,
             document_arrived: false,
             previous_url,
@@ -425,6 +446,20 @@ impl PageWorld {
             kind if kind.is_document() => {
                 let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
                 scripts.set_initial_hidden(self.environment.visible_tab() != Some(tab));
+                let mut viewport = self.environment.viewport;
+                let zoom = self
+                    .slots
+                    .get(&tab)
+                    .and_then(|slot| slot.viewport_zoom)
+                    .unwrap_or(1.0);
+                viewport.width /= zoom;
+                viewport.height /= zoom;
+                viewport.scale *= zoom;
+                scripts.set_initial_viewport(
+                    f64::from(viewport.width),
+                    f64::from(viewport.height),
+                    f64::from(viewport.scale),
+                );
                 let started = otlyra_html::start_parse(
                     &loaded.bytes,
                     loaded.charset.as_deref(),

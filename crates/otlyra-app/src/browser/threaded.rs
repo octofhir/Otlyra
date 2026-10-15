@@ -362,6 +362,15 @@ impl WindowBrowser {
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
                 let mut browser = factory(content_text);
+                // The shell's viewport and chrome mode define this document's
+                // environment before ready responses can execute its first script.
+                browser.set_viewport(viewport);
+                if interface {
+                    browser.interface = true;
+                } else {
+                    browser.hide_interface();
+                }
+                browser.sync_world();
                 if let Some(trace) = &owner_mailbox.lock().unwrap().startup {
                     trace.mark("content_owner_ready");
                 }

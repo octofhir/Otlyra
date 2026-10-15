@@ -222,6 +222,7 @@ impl Browser {
                 fetcher,
                 text.fork(),
                 world::Environment {
+                    page_zoom: 1.0,
                     load_images: settings.load_images,
                     interface: true,
                     viewport: otlyra_css::cascade::Viewport {
@@ -325,10 +326,14 @@ impl Browser {
     /// The last frame's, because the choice is made when a page loads and the
     /// last frame is the best evidence of what the next one will be.
     fn picture_viewport(&self) -> otlyra_css::cascade::Viewport {
+        let content_height = self.last_height - if self.interface { UI_HEIGHT } else { 0.0 };
+        // This environment belongs to documents, including background tabs.
+        // A system tab hides the inspector without changing the dock a document
+        // will return to when selected again.
+        let dock = self.inspector.dock_height(content_height);
         otlyra_css::cascade::Viewport {
             width: self.last_width as f32,
-            height: (self.last_height - if self.interface { UI_HEIGHT } else { 0.0 }).max(0.0)
-                as f32,
+            height: (content_height - dock).max(0.0) as f32,
             scale: self.last_scale as f32,
             text_scale: (self.settings.settings.text_scale / 100.0) as f32,
             color_scheme: match self.effective_scheme() {

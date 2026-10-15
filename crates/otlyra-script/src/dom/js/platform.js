@@ -43,6 +43,23 @@ Object.defineProperty(Document.prototype, 'onvisibilitychange', {
   },
 });
 
+let resizeHandler = null;
+const resizeListener = function(event) { if (resizeHandler !== null) return resizeHandler.call(this, event); };
+Object.defineProperty(globalThis, 'onresize', {
+  configurable: true,
+  enumerable: true,
+  get() { return resizeHandler; },
+  set(callback) {
+    const next = typeof callback === 'function' ? callback : null;
+    if (resizeHandler === null && next !== null) {
+      this.addEventListener('resize', resizeListener);
+    } else if (resizeHandler !== null && next === null) {
+      this.removeEventListener('resize', resizeListener);
+    }
+    resizeHandler = next;
+  },
+});
+
 defineGlobal('requestAnimationFrame', function requestAnimationFrame(callback) {
   if (typeof callback !== 'function') {
     throw new TypeError('requestAnimationFrame expects a function');

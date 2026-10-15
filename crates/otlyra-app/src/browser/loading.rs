@@ -108,6 +108,7 @@ impl Browser {
     /// What the pages are loaded into, as the window stands now.
     pub(super) fn environment(&self) -> Environment {
         Environment {
+            page_zoom: self.zoom,
             load_images: self.settings.settings.load_images,
             interface: self.interface,
             viewport: self.picture_viewport(),

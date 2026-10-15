@@ -58,6 +58,38 @@ impl PageScripts {
         self.state.set_hidden(hidden);
     }
 
+    /// Set dimensions before the first page script, without a resize event.
+    pub fn set_initial_viewport(&mut self, width: f64, height: f64, scale: f64) {
+        self.state
+            .set_viewport(crate::dom::WindowViewport::new(width, height, scale));
+    }
+
+    /// Resize on the script owner; handlers observe the new metrics.
+    pub fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
+        let viewport = crate::dom::WindowViewport::new(width, height, scale);
+        let previous = self.state.viewport();
+        if previous == viewport {
+            return;
+        }
+        self.state.set_viewport(viewport);
+        if self.seen == 0 || previous.width == viewport.width && previous.height == viewport.height
+        {
+            return;
+        }
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return;
+        };
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script("window.dispatchEvent(new Event('resize'))", "<resize>")
+        });
+        self.absorb_turn();
+        if let Err(error) = outcome {
+            self.failed += 1;
+            tracing::error!(target: "page.script", %error, "a resize listener failed");
+        }
+    }
+
     /// A visibility transition is a script turn on this page's owner. Listeners
     /// see the new state; their mutations and microtasks follow the usual path.
     pub fn set_hidden(&mut self, document: &mut Document, hidden: bool) {
@@ -427,6 +459,10 @@ impl ScriptRunner for PageScripts {
         PageScripts::set_hidden(self, document, hidden);
     }
 
+    fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
+        PageScripts::set_viewport(self, document, width, height, scale);
+    }
+
     fn take_mutated(&mut self) -> bool {
         PageScripts::take_mutated(self)
     }
@@ -457,7 +493,9 @@ impl ScriptRunner for PageScripts {
         // and their roots belong to the isolate that is going.
         crate::dom::forget_wrappers();
         let hidden = self.state.hidden();
+        let viewport = self.state.viewport();
         *self = Self::build(self.document_url.clone(), self.console.clone());
         self.state.set_hidden(hidden);
+        self.state.set_viewport(viewport);
     }
 }

@@ -93,18 +93,17 @@ impl Browser {
     /// every region draws from. Both `paint` and `compose` start here, so they
     /// cannot disagree about what this frame is.
     pub(super) fn frame_geom(&mut self, viewport: Viewport) -> FrameGeom {
+        let width = viewport.logical_width();
+        let height = viewport.logical_height();
+        self.last_width = width;
+        self.last_height = height;
+        self.last_scale = viewport.scale_factor;
         // Every frame takes in whatever has arrived. A wake is what *asks* for a
         // frame; this is what makes a frame that happened for any other reason —
         // a resize, an animation tick — show what has landed since the last one.
         if self.pump() {
             self.accessibility_dirty = true;
         }
-
-        let width = viewport.logical_width();
-        let height = viewport.logical_height();
-        self.last_width = width;
-        self.last_height = height;
-        self.last_scale = viewport.scale_factor;
 
         // Where the page starts: under the interface, or at the top of the window
         // when there is none.
