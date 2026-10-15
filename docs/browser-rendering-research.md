@@ -1103,6 +1103,12 @@ by a timer or by an event the host dispatched.
     with the same name as an import read the import instead. Every GitHub
     rspack chunk declares `LQQ(e,t,s){s("dTr")…}` beside a top-level
     `import * as s`, and each one threw "value is not a function".
+  - An Otter compiler bug (`614a23bef`): a derived constructor initialized
+    its fields after a statement-level `super()` and otherwise only at its
+    end. Minified `super(), this.#i = …` therefore wrote a private field the
+    instance did not have yet (TanStack Query in GitHub's `landing-pages`).
+    It still applies when `super()` is nested deeper or reached through an
+    arrow function.
   - Apple's classic bundles stopped on `navigator.platform`/`vendor` and on
     `window.screen`. `d0f0ede` and `d777f64` add them as empty strings and as
     the window's size.
@@ -1115,6 +1121,9 @@ by a timer or by an event the host dispatched.
   - `fc245438d` and `6ec815691`: rustfmt-only commits after the 1.99 move.
   - `a8df8122e`: web module graphs.
   - `167a4a8bc`: imports are shadowed by local bindings.
+  - `614a23bef`: derived fields are initialized after a leading `super()` in
+    a sequence. This landed after the measurements. A release build with it,
+    SHA-256 `951153f3…83a4`, was checked on GitHub only.
 - Otlyra:
   - `330636c`: Rust 1.99.
   - `92ad418`: module scripts.
@@ -1188,7 +1197,8 @@ before and after.
   - `customElements` is not defined.
   - Reads through the elements that registry would have defined.
   - In `landing-pages`, a private-field write on an object whose class did not
-    declare it, probably a custom-element constructor.
+    declare it. That was the field-initialization bug fixed in `614a23bef`,
+    and the bundle now stops on `customElements` too.
 - **Apple.**
   - The global header, locale switcher and head bundles now run, and before
     they threw.
