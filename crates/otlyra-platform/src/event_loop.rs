@@ -181,6 +181,34 @@ struct WindowVisibility {
     minimized: bool,
 }
 
+/// A frame the presenter refused as occluded while the window was visible.
+///
+/// Metal reads `NSWindow.occlusionState` on the render thread. Right after a
+/// window is shown that state can still say *not visible* while AppKit has not
+/// yet delivered the occlusion notification to this loop; when it does arrive
+/// it changes nothing here, because this loop already believed the window
+/// visible. Without a retry the owed first frame is then never drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OccludedPresentation {
+    /// When to ask for the owed frame again; cleared once that is due.
+    retry_at: Option<std::time::Instant>,
+    /// Consecutive refusals while visible.
+    refusals: u32,
+}
+
+/// The first retry after an occluded presentation of a visible window. Each
+/// further refusal doubles it up to once a second, so a disagreement that
+/// persists costs one refused frame a second rather than a spin, and a window
+/// AppKit says is visible is never left without its owed frame.
+const OCCLUDED_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(50);
+const OCCLUDED_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn occluded_retry_delay(refusals: u32) -> std::time::Duration {
+    OCCLUDED_RETRY_FIRST
+        .saturating_mul(1 << refusals.min(16))
+        .min(OCCLUDED_RETRY_MAX)
+}
+
 impl WindowVisibility {
     fn visible(self) -> bool {
         !self.occluded && !self.minimized
@@ -328,6 +356,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         render: None,
         render_ready: false,
         bootstrap_redraw_retry: None,
+        occluded_presentation: None,
         window: None,
         mailbox,
         inbox,
@@ -379,6 +408,9 @@ struct WindowedApp<'p> {
     render_ready: bool,
     /// Reissue an initial redraw once if no native frame has started.
     bootstrap_redraw_retry: Option<std::time::Instant>,
+    /// The presenter refused the last frame as occluded although native
+    /// visibility says the window is visible, so that frame is still owed.
+    occluded_presentation: Option<OccludedPresentation>,
     window: Option<Arc<dyn Window>>,
     /// Where background GPU initialization posts that it is done.
     mailbox: Mailbox,
@@ -488,11 +520,59 @@ impl WindowedApp<'_> {
             && !self.scheduler.in_flight
     }
 
+    /// Record what the presenter did with a frame. An occluded result for a
+    /// window this loop believes visible keeps the frame owed and schedules a
+    /// backed-off retry; any presented frame ends the disagreement.
+    fn note_presentation(&mut self, outcome: Presented, now: std::time::Instant) {
+        match outcome {
+            Presented::Occluded if self.visibility.visible() => {
+                let refusals = self.occluded_presentation.map_or(0, |state| state.refusals);
+                if refusals == 0 {
+                    self.mark("presentation_occluded_while_visible");
+                }
+                let delay = occluded_retry_delay(refusals);
+                tracing::debug!(
+                    refusals = refusals + 1,
+                    retry_ms = delay.as_secs_f64() * 1000.0,
+                    "presenter reported a visible window occluded; frame still owed"
+                );
+                self.occluded_presentation = Some(OccludedPresentation {
+                    retry_at: Some(now + delay),
+                    refusals: refusals + 1,
+                });
+            }
+            Presented::Frame => self.occluded_presentation = None,
+            Presented::Occluded | Presented::Dropped => {}
+        }
+    }
+
+    fn take_occluded_retry(&mut self, now: std::time::Instant) -> bool {
+        let Some(state) = self.occluded_presentation.as_mut() else {
+            return false;
+        };
+        if state.retry_at.is_none_or(|at| now < at) || !self.visibility.visible() {
+            return false;
+        }
+        state.retry_at = None;
+        true
+    }
+
+    /// A native occlusion event. One that reports the window visible without
+    /// changing this loop's visibility still answers an occluded presentation.
+    fn occlusion_changed(&mut self, occluded: bool) {
+        self.sync_visibility(Some(occluded));
+        if !occluded && self.visibility.visible() && self.occluded_presentation.is_some() {
+            self.mark("presentation_unoccluded_redraw");
+            self.request_frame(FrameRequest::Now);
+        }
+    }
+
     fn next_deadline(&self) -> Option<std::time::Instant> {
         self.scheduler
             .deadline
             .into_iter()
             .chain(self.bootstrap_redraw_retry)
+            .chain(self.occluded_presentation.and_then(|state| state.retry_at))
             .min()
     }
 
@@ -572,6 +652,10 @@ impl WindowedApp<'_> {
             self.mark("bootstrap_redraw_reissued");
             self.issue_redraw();
         }
+        if self.take_occluded_retry(now) {
+            self.mark("presentation_occluded_retry");
+            self.request_frame(FrameRequest::Now);
+        }
         if self.visibility.visible() {
             if self.scheduler.wake_due(now) {
                 self.issue_redraw();
@@ -617,6 +701,8 @@ impl WindowedApp<'_> {
         if !visible {
             self.bootstrap_redraw_retry = None;
         }
+        // A transition either way asks for a fresh frame or none at all.
+        self.occluded_presentation = None;
         self.deliver(PlatformEvent::VisibilityChanged(visible));
         if visible {
             self.dropped_frames = 0;
@@ -781,6 +867,7 @@ impl WindowedApp<'_> {
     /// anything asked for it meanwhile.
     fn frame_finished(&mut self, event_loop: &dyn ActiveEventLoop, frame: FrameReport) {
         let (presented, owed) = self.complete_frame(&frame);
+        self.note_presentation(frame.outcome, std::time::Instant::now());
 
         match frame.outcome {
             Presented::Frame | Presented::Occluded => {
@@ -1193,7 +1280,7 @@ impl ApplicationHandler for WindowedApp<'_> {
             // occluded texture and the paint goes nowhere — and in a loop that
             // blocks in `Wait` nothing else will ask for another one.
             WindowEvent::Occluded(occluded) => {
-                self.sync_visibility(Some(occluded));
+                self.occlusion_changed(occluded);
             }
             WindowEvent::Focused(focused) => {
                 self.sync_visibility(None);
@@ -1487,6 +1574,7 @@ mod tests {
             a11y: None,
             render_ready: render.is_some(),
             bootstrap_redraw_retry: None,
+            occluded_presentation: None,
             render,
             window: None,
             mailbox: Mailbox {
@@ -1710,6 +1798,7 @@ mod tests {
                 render: Some(render),
                 render_ready: true,
                 bootstrap_redraw_retry: None,
+                occluded_presentation: None,
                 window: None,
                 mailbox: Mailbox {
                     sender,
@@ -1834,6 +1923,104 @@ mod tests {
     }
 
     #[test]
+    fn an_occluded_presentation_of_a_visible_window_stays_owed_and_backs_off() {
+        use std::time::Duration;
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        app.render_ready = true;
+        let now = std::time::Instant::now();
+        // The first frame started and its report said occluded, so the
+        // bootstrap retry no longer applies; this one must.
+        app.scheduler.redraw_started();
+        app.work.frames_started = 1;
+        app.note_presentation(Presented::Occluded, now);
+        let mut expected = now + OCCLUDED_RETRY_FIRST;
+        assert_eq!(app.next_deadline(), Some(expected));
+        assert!(!app.take_occluded_retry(expected - Duration::from_millis(1)));
+        assert!(app.take_occluded_retry(expected));
+        assert!(
+            !app.take_occluded_retry(expected),
+            "each retry is consumed once"
+        );
+        assert_eq!(app.next_deadline(), None);
+        let mut delays = Vec::new();
+        for _ in 1..40 {
+            app.note_presentation(Presented::Occluded, now);
+            expected = app.next_deadline().expect("an owed frame is retried");
+            delays.push((expected - now).as_millis());
+            assert!(app.take_occluded_retry(expected));
+        }
+        assert_eq!(delays[..6], [100, 200, 400, 800, 1000, 1000]);
+        assert!(
+            delays.iter().all(|&delay| delay <= 1000),
+            "a persistent disagreement retries at most once a second instead of spinning"
+        );
+        assert!(app.occluded_presentation.is_some());
+        app.note_presentation(Presented::Dropped, now);
+        assert!(app.occluded_presentation.is_some());
+        app.note_presentation(Presented::Frame, now);
+        assert_eq!(app.occluded_presentation, None);
+    }
+
+    #[test]
+    fn a_due_occluded_retry_owes_exactly_one_frame() {
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        app.render_ready = true;
+        let now = std::time::Instant::now();
+        app.note_presentation(Presented::Occluded, now);
+        // Keep a frame in flight so the owed request is observable without a
+        // native window: it must coalesce behind that frame, not be dropped.
+        app.scheduler.redraw_started();
+        app.wake_due(now + OCCLUDED_RETRY_FIRST);
+        assert!(app.scheduler.redraw_pending);
+        assert!(app.scheduler.frame_done(), "the retry owes one successor");
+        app.scheduler.redraw_started();
+        app.wake_due(now + OCCLUDED_RETRY_FIRST * 4);
+        assert!(
+            !app.scheduler.redraw_pending,
+            "a consumed retry does not repeat"
+        );
+    }
+
+    #[test]
+    fn a_visible_occlusion_event_answers_an_occluded_presentation() {
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        app.render_ready = true;
+        app.scheduler.redraw_started();
+        // Without an occluded presentation, a no-op visibility event asks
+        // for nothing.
+        app.occlusion_changed(false);
+        assert!(!app.scheduler.redraw_pending);
+        app.note_presentation(Presented::Occluded, std::time::Instant::now());
+        app.occlusion_changed(false);
+        assert!(
+            app.scheduler.redraw_pending,
+            "the notification that arrives after the refused frame must redraw"
+        );
+        assert_eq!(app.work.events_delivered, 0, "no visibility transition");
+    }
+
+    #[test]
+    fn hidden_windows_do_not_retry_occluded_presentations() {
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        let now = std::time::Instant::now();
+        app.note_presentation(Presented::Occluded, now);
+        assert!(app.occluded_presentation.is_some());
+        app.occlusion_changed(true);
+        assert_eq!(app.occluded_presentation, None);
+        app.note_presentation(Presented::Occluded, now);
+        assert_eq!(
+            app.occluded_presentation, None,
+            "a hidden window's occluded frames are expected"
+        );
+        assert!(!app.take_occluded_retry(now + OCCLUDED_RETRY_FIRST * 64));
+        assert_eq!(app.next_deadline(), None);
+    }
+
+    #[test]
     fn loading_frame_is_not_recorded_as_complete_startup() {
         let config = WindowConfig::default();
         let startup_origin = config.startup_origin;
@@ -1846,6 +2033,7 @@ mod tests {
             render: None,
             render_ready: false,
             bootstrap_redraw_retry: None,
+            occluded_presentation: None,
             window: None,
             mailbox: Mailbox {
                 sender,

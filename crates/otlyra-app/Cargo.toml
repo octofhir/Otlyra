@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "otlyra_app"
 path = "src/lib.rs"
 
+[features]
+# Forwards the platform's native startup fault injection; never shipped.
+fault-injection = ["otlyra-platform/fault-injection"]
+
 [dependencies]
 otlyra-css.workspace = true
 otlyra-dom.workspace = true

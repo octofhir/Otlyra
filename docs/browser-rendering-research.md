@@ -882,6 +882,55 @@ The unchanged engine snapshot was rehashed: 1,474 Rust/manifests/lock files stil
 match `23c5a114f769905e46bc028b747eba16ab7525b1689ef2a17836e120fc65dcba`.
 The live sibling Otter checkout was not modified.
 
+## Occluded first presentation
+
+The rare first-frame stall is an occlusion disagreement, not a lost native
+redraw. wgpu-hal's Metal surface reads `NSWindow.occlusionState` on the render
+thread and refuses the drawable when the Visible bit is absent. Right after
+`set_visible(true)` that state can still describe the hidden window while
+AppKit has not yet delivered `windowDidChangeOcclusionState:` to the loop. The
+render report then says *occluded*; the loop, which believed the window visible
+since showing it, asked for nothing more. The later notification reported
+`Occluded(false)`, which changed nothing in `WindowVisibility`, so it requested
+nothing either. The bootstrap retry did not apply because a frame had started.
+The `40-candidate` trace matches this: the Ready-owed frame was submitted and
+its report arrived 28 ms later requesting `None`, with no presented-frame log.
+
+A `fault-injection` cargo feature (never in shipped builds) adds
+`OTLYRA_FAULT_OCCLUDED_ACQUIRES=N`, refusing the first `N` acquisitions exactly
+as Metal does. On the unchanged `7c0fac7` platform code one refusal stalled
+8 of 10 traced About starts (GPU and CPU alternating) with the window still
+visible to AppKit; the two that completed were rescued by an unrelated later
+content redraw. Without injection the same binary completed 4 of 4.
+
+The loop now treats an occluded report for a window it considers visible as a
+frame still owed. It retries after 50 ms, doubling to at most once a second,
+and also redraws when a visible occlusion notification arrives without a
+visibility transition. A presented frame or any visibility transition ends the
+state; hidden windows keep the existing no-raster behavior. The startup trace
+records `presentation_occluded_while_visible`, `presentation_occluded_retry`
+and `presentation_unoccluded_redraw`, so stress series can count natural
+recoveries. With the fix, 30 of 30 traced injected starts completed (1, 3 and
+7 refusals; GPU/CPU; About and the timer fixture). A capped-retry pilot that
+stopped after six attempts was rejected; one apparent hang in that series was
+AppKit genuinely occluding the window (`VisibilityChanged(false)` in its
+trace), which the probe now reports separately from a visible stall.
+
+The production build (no injection hook in the binary) then completed 100 of
+100 untraced natural starts, 60 GPU and 40 CPU, half About and half the timer
+fixture, under heavy unrelated background load (one-minute load average ~88).
+One GPU start hit the race on its own: the pre-content frame was refused at
+265.5 ms and the arriving first content scene was presented 10 ms later. That
+start recovered through ordinary content work; a stall needs the refused frame
+to be the last one owed, which is what the injection forces.
+
+Four platform unit tests cover backoff and its cap, single consumption of a
+due retry behind a frame in flight, the no-op visible notification and hidden
+windows. An ignored native test, run with
+`cargo test -p otlyra-app --features fault-injection --test window_startup -- --ignored`,
+injects one and three refusals on both renderers. Artifacts are in
+`target/occlusion-stall/`.
+
 ## What the reference browsers do
 
 ### Chromium

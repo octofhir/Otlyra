@@ -192,4 +192,70 @@ mod macos {
             }
         }
     }
+
+    /// A presenter that reports a newly shown window occluded must not leave
+    /// its first frame unpainted. Needs the injection hook:
+    /// `cargo test -p otlyra-app --features fault-injection --test window_startup -- --ignored`
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    #[ignore = "requires a visible macOS desktop"]
+    fn a_first_frame_refused_as_occluded_is_redrawn() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = Profile(std::env::temp_dir().join(format!(
+            "otlyra-window-occluded-{}-{nonce}",
+            std::process::id(),
+        )));
+        std::fs::create_dir(&profile.0).unwrap();
+        for (cpu, refusals) in [(false, 1), (true, 1), (false, 3), (true, 3)] {
+            let report = profile.0.join(format!("{cpu}-{refusals}.json"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_otlyra"));
+            command
+                .args(["--no-secrets", "--url", "about:about", "--startup-report"])
+                .arg(&report)
+                .env("OTLYRA_CONFIG_DIR", profile.0.join("profile"))
+                .env("OTLYRA_FAULT_OCCLUDED_ACQUIRES", refusals.to_string())
+                .env("OTLYRA_LOG", "error");
+            if cpu {
+                command.arg("--cpu-raster");
+            }
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the browser");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut timed_out = false;
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out && output.status.success(),
+                "cpu={cpu}, refusals={refusals}: first frame never presented: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&report).expect("a presented frame writes its report"),
+            )
+            .unwrap();
+            let stages = value["stages"].as_array().unwrap();
+            let time = |name: &str| {
+                stages
+                    .iter()
+                    .find(|stage| stage["name"] == name)
+                    .and_then(|stage| stage["ms"].as_f64())
+            };
+            let refused = time("presentation_occluded_while_visible")
+                .unwrap_or_else(|| panic!("cpu={cpu}: the injected refusal was not observed"));
+            assert!(refused <= time("first_present_complete").unwrap());
+        }
+    }
 }

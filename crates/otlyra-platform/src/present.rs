@@ -519,6 +519,10 @@ impl Presenter {
 
     /// Acquire the next swapchain texture, or say why this frame cannot happen.
     fn acquire(&mut self) -> Result<Acquired, PresentError> {
+        #[cfg(feature = "fault-injection")]
+        if fault::take_occluded_acquire() {
+            return Ok(Acquired::Skip(Presented::Occluded));
+        }
         Ok(match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Acquired::Frame(frame),
@@ -809,4 +813,40 @@ pub(crate) enum PresentError {
         full_width: u32,
         full_height: u32,
     },
+}
+
+/// Native startup fault injection, compiled only with `fault-injection`.
+///
+/// `OTLYRA_FAULT_OCCLUDED_ACQUIRES=N` makes the first `N` swapchain acquisitions
+/// report occlusion without asking the surface, which is what wgpu's Metal
+/// backend reports when a newly shown window's occlusion state has not yet
+/// reached `occlusionState` on the render thread.
+#[cfg(feature = "fault-injection")]
+mod fault {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn remaining() -> &'static AtomicU32 {
+        static REMAINING: OnceLock<AtomicU32> = OnceLock::new();
+        REMAINING.get_or_init(|| {
+            AtomicU32::new(
+                std::env::var("OTLYRA_FAULT_OCCLUDED_ACQUIRES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            )
+        })
+    }
+
+    pub(super) fn take_occluded_acquire() -> bool {
+        let taken = remaining()
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if taken {
+            tracing::warn!("fault injection: swapchain acquisition reported occluded");
+        }
+        taken
+    }
 }

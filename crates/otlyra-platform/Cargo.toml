@@ -8,6 +8,10 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# Startup fault injection for native recovery tests. Never in a shipped build.
+fault-injection = []
+
 [dependencies]
 accesskit.workspace = true
 accesskit_consumer.workspace = true

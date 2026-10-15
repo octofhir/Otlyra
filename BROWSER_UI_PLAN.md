@@ -97,10 +97,17 @@ describe the earlier ownership boundary.
 - [x] Recover an initial coalesced redraw once after render readiness if native
   startup has delivered no frame. Keep its owed frame, avoid retrying started or
   hidden work, and leave later redraw/damage scheduling unchanged.
-- [ ] Reproduce the rare initial native-frame stall with controlled fault
-  injection and verify recovery end to end. Baseline/deadline-only releases
-  stalled; the new-events path completed 100 starts without exercising the
-  recovery branch. Keep this distinct from unit coverage and startup speed.
+- [x] Reproduce the rare initial native-frame stall with controlled fault
+  injection and verify recovery end to end. Metal refused the first drawable as
+  occluded while AppKit had not yet delivered the window's visible occlusion
+  state; the started frame disabled the bootstrap retry and the late visible
+  notification was a no-op. An occluded report for a visible window now keeps
+  the frame owed, retries with a 50 ms–1 s backoff and redraws on a no-op
+  visible notification. `fault-injection` builds reproduce it on demand.
+- [ ] Count natural occluded-first-presentation recoveries in long native
+  stress series (`presentation_occluded_while_visible` startup mark) and decide
+  whether the presenter should consult the UI's visibility instead of Metal's
+  render-thread read of `occlusionState`.
 - [ ] Profile the Ready-delivery gap in native launch/window event dispatch.
   Backend construction is already negligible; an extra bootstrap worker and
   draining messages before event-loop wait did not improve startup.
