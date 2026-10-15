@@ -45,7 +45,7 @@ PHASES = {
     "menu_first_submenu_attach": ("menu_first_submenu_built", "menu_first_submenu_attached"),
     "menu_item_creation": ("menu_root_created", "menu_items_created"),
     "menu_install": ("menu_items_created", "menu_installed"),
-    "window_attribute_preparation": ("menu_ready", "window_attributes_ready"),
+    "window_attribute_preparation": ("window_attributes_started", "window_attributes_ready"),
     "native_window_creation": ("window_attributes_ready", "window_created"),
     "gpu_backend_discovery": ("wgpu_instance_started", "wgpu_instance_created"),
     "gpu_device_setup": ("surface_attached", "gpu_presenter_created"),

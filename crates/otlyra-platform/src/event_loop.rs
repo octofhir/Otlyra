@@ -327,6 +327,7 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         a11y: None,
         render: None,
         render_ready: false,
+        bootstrap_redraw_retry: None,
         window: None,
         mailbox,
         inbox,
@@ -376,6 +377,8 @@ struct WindowedApp<'p> {
     render: Option<RenderThread>,
     /// Whether the render thread has its device and can take frames.
     render_ready: bool,
+    /// Reissue an initial redraw once if no native frame has started.
+    bootstrap_redraw_retry: Option<std::time::Instant>,
     window: Option<Arc<dyn Window>>,
     /// Where background GPU initialization posts that it is done.
     mailbox: Mailbox,
@@ -474,6 +477,25 @@ impl WindowedApp<'_> {
         event_loop.exit();
     }
 
+    fn take_bootstrap_redraw_retry(&mut self, now: std::time::Instant) -> bool {
+        if self.bootstrap_redraw_retry.is_none_or(|at| now < at) {
+            return false;
+        }
+        self.bootstrap_redraw_retry = None;
+        self.work.frames_started == 0
+            && self.visibility.visible()
+            && self.scheduler.redraw_pending
+            && !self.scheduler.in_flight
+    }
+
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.scheduler
+            .deadline
+            .into_iter()
+            .chain(self.bootstrap_redraw_retry)
+            .min()
+    }
+
     /// Hand an event up and schedule only the frame it asks for.
     fn deliver(&mut self, event: PlatformEvent) {
         self.work.events_delivered += 1;
@@ -539,13 +561,17 @@ impl WindowedApp<'_> {
     }
 
     fn sync_control_flow(&self, event_loop: &dyn ActiveEventLoop) {
-        match self.scheduler.deadline {
+        match self.next_deadline() {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
     fn wake_due(&mut self, now: std::time::Instant) {
+        if self.take_bootstrap_redraw_retry(now) {
+            self.mark("bootstrap_redraw_reissued");
+            self.issue_redraw();
+        }
         if self.visibility.visible() {
             if self.scheduler.wake_due(now) {
                 self.issue_redraw();
@@ -588,6 +614,9 @@ impl WindowedApp<'_> {
         // A submitted frame still has to report before a successor can start.
         self.scheduler.deadline = None;
         self.scheduler.redraw_pending = false;
+        if !visible {
+            self.bootstrap_redraw_retry = None;
+        }
         self.deliver(PlatformEvent::VisibilityChanged(visible));
         if visible {
             self.dropped_frames = 0;
@@ -649,6 +678,7 @@ impl WindowedApp<'_> {
             self.scheduler.redraw_pending = true;
             return Ok(());
         }
+        self.bootstrap_redraw_retry = None;
         self.scheduler.redraw_started();
         // Only the first frame carries startup marks. Cloning the handle (an `Arc`)
         // once here keeps the marks free of a `&self` borrow, and skips the work
@@ -717,6 +747,13 @@ impl WindowedApp<'_> {
                 self.mark("gpu_ready");
                 self.render_ready = true;
                 self.request_frame(FrameRequest::Now);
+                // A lost native launch redraw must recover even without a new
+                // input event. This one-shot deadline shares ControlFlow with
+                // normal painter deadlines and is cancelled when a frame starts.
+                if self.work.frames_started == 0 {
+                    self.bootstrap_redraw_retry =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+                }
             }
             RenderReport::Failed(error) => self.fail(event_loop, error),
             RenderReport::Frame(frame) => self.frame_finished(event_loop, frame),
@@ -1004,6 +1041,7 @@ impl ApplicationHandler for WindowedApp<'_> {
 
         // Created hidden: the accessibility adapter must exist before the window is
         // shown for the first time, and it says so by panicking otherwise.
+        self.mark("window_attributes_started");
         let attributes = WindowAttributes::default()
             .with_title(self.config.title.clone())
             .with_visible(false)
@@ -1441,6 +1479,7 @@ mod tests {
             painter,
             a11y: None,
             render_ready: render.is_some(),
+            bootstrap_redraw_retry: None,
             render,
             window: None,
             mailbox: Mailbox {
@@ -1663,6 +1702,7 @@ mod tests {
                 a11y: None,
                 render: Some(render),
                 render_ready: true,
+                bootstrap_redraw_retry: None,
                 window: None,
                 mailbox: Mailbox {
                     sender,
@@ -1738,6 +1778,55 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_retry_preserves_one_owed_frame_and_never_repeats() {
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        app.render_ready = true;
+        let due = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        app.bootstrap_redraw_retry = Some(due);
+        assert!(
+            app.scheduler
+                .request(FrameRequest::Now, std::time::Instant::now())
+        );
+        app.scheduler
+            .set_deadline(due + std::time::Duration::from_secs(1));
+        assert_eq!(app.next_deadline(), Some(due));
+        assert!(!app.take_bootstrap_redraw_retry(due - std::time::Duration::from_millis(1)));
+        assert_eq!(app.bootstrap_redraw_retry, Some(due));
+        assert!(app.take_bootstrap_redraw_retry(due));
+        assert!(app.scheduler.redraw_pending);
+        assert!(!app.scheduler.in_flight);
+        assert!(!app.take_bootstrap_redraw_retry(due));
+        app.scheduler.redraw_started();
+        app.bootstrap_redraw_retry = Some(due);
+        assert!(!app.take_bootstrap_redraw_retry(due));
+    }
+
+    #[test]
+    fn bootstrap_retry_does_not_repeat_started_or_hidden_frames() {
+        let mut painter = InputScene::default();
+        let mut app = test_app(&mut painter, None);
+        app.render_ready = true;
+        let due = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        assert!(
+            app.scheduler
+                .request(FrameRequest::Now, std::time::Instant::now())
+        );
+        app.work.frames_started = 1;
+        app.bootstrap_redraw_retry = Some(due);
+        assert!(!app.take_bootstrap_redraw_retry(due));
+        app.work.frames_started = 0;
+        app.bootstrap_redraw_retry = Some(due);
+        app.update_visibility(Some(true), Some(false));
+        assert!(!app.take_bootstrap_redraw_retry(due));
+        assert!(!app.scheduler.redraw_pending);
+        app.update_visibility(Some(false), Some(false));
+        assert!(app.visibility.visible());
+        assert_eq!(app.work.events_delivered, 2);
+        assert!(!app.take_bootstrap_redraw_retry(due));
+    }
+
+    #[test]
     fn loading_frame_is_not_recorded_as_complete_startup() {
         let config = WindowConfig::default();
         let startup_origin = config.startup_origin;
@@ -1749,6 +1838,7 @@ mod tests {
             a11y: None,
             render: None,
             render_ready: false,
+            bootstrap_redraw_retry: None,
             window: None,
             mailbox: Mailbox {
                 sender,

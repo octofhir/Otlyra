@@ -733,6 +733,74 @@ Validation: 1,838 workspace tests with one test thread, all-target clippy with
 warnings denied, formatting/diff checks, eight Python protocol tests, and native
 About/web startup smoke on both renderers passed.
 
+
+
+## Recovering the first native redraw
+
+Controlled startup work exposed an existing first-frame stall. A proposed early
+Ready path timed out after 30 seconds, then a separate paired stress run also
+stalled the original `14904a2` control. Both sampled processes had the native UI,
+content and render threads idle waiting for events, with redraw requests logged
+but no frame started. This points to a launch redraw that did not reach the
+initial native event batch; it is not evidence of a busy GPU or a content lock.
+The failed runs are retained in `target/startup-native-ready-about-gpu.log`,
+`target/native-ready-stress/07-candidate-*` and
+`target/native-ready-retry-stress/11-control-*`. No timing distribution is
+reported from that interrupted experiment.
+
+The retained fix applies to normal renderer readiness: when the initial Ready
+report owes the first frame, the loop arms a one-shot 50-ms bootstrap deadline.
+It shares the existing ControlFlow/WaitUntil wake mechanism with painter
+deadlines, so recovery does not require new input. At that deadline it reissues
+that existing redraw only if no frame has started, one is still pending and none
+is in flight. Starting a frame or hiding the window cancels the deadline. Hidden-window transitions retain their existing
+restore path. Later input, damage and frame coalescing are unchanged.
+
+The native icon/menu/window installation order remains as before. An overlap
+pilot completed four 20-pair distributions but showed no clear About benefit:
+paired first-frame medians were +1.29 ms GPU and −2.30 ms CPU. The timer fixture
+showed −11.32/−14.04 ms, with different background load between series. Those
+results do not establish a general startup win, so the reordering and manual
+early Ready consumption were not retained. Raw pilot artifacts remain in
+`target/startup-native-overlap-{about,web}-{gpu,cpu}.json` and
+`target/native-overlap-build-pair.json`.
+
+Two scheduler regressions check one-shot consumption, retention of the owed
+frame, skipping started/in-flight work and hidden/restore transitions. Native
+About/web GPU/CPU smoke also checks AccessKit, icon and menu readiness before
+visibility and verifies first-script viewport/DPI. An explicit attribute-start
+mark keeps phase attribution independent of menu completion order.
+
+The initial debug smoke during profiling exposed a stale regular platform
+library left by an older copied control tree sharing the Cargo target. The
+platform package was explicitly cleaned in dev and release profiles and the
+current native smoke repeated. The diagnostic release independently contained
+all new phase marks in every measured run; its earlier pre-clean debug smoke
+was not evidence that the debug app linked the new platform. Future copied-tree
+comparisons must clean every changed own package or use a separate target.
+
+The exact timer workload is tracked at
+[`tools/fixtures/startup-timers.html`](../tools/fixtures/startup-timers.html),
+SHA-256 `cfd7b5c1e405507b62bae6a31373755326fdcf95a469dec30d5da8a28196012c`.
+Select it with the benchmark's `--url file:///absolute/path/to/fixture` option;
+About remains the default. Its first content frame may precede all 200 callbacks.
+
+
+The event-only recovery pilot completed 100 traced starts (60 GPU, 40 CPU),
+without a failure; no retry was needed in those runs. Its untraced About
+20-sample distributions after three warmups were visible/first-frame-report
+p50/p95 190.40/208.49 and 274.74/311.86 ms GPU, 183.52/213.33 and
+272.31/299.73 ms CPU. All four strict gates still failed. These are pilot data,
+not a before/after speedup claim or coverage of the later deadline branch;
+artifacts are `target/startup-recovery-{gpu,cpu}.json` and
+`target/startup-recovery-stress/runs.json`.
+
+The retained deadline form has targeted coverage for preserving an unexpired
+retry, consuming it once when due, choosing the earliest native wake, and
+cancelling after started/in-flight/hidden work. All 48 platform unit tests,
+all-target workspace clippy with warnings denied, formatting/diff checks,
+eight Python protocol tests and all four native startup cases passed.
+
 ## What the reference browsers do
 
 ### Chromium

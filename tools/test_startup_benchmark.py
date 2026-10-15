@@ -167,7 +167,7 @@ class StartupBenchmarkTests(unittest.TestCase):
                    ("menu_first_item_created", 145), ("menu_first_submenu_built", 150),
                    ("menu_first_submenu_attached", 155), ("menu_items_created", 160),
                    ("menu_installed", 180), ("menu_ready", 181),
-                   ("window_attributes_ready", 182), ("window_created", 220)]
+                   ("window_attributes_started", 181.5), ("window_attributes_ready", 182), ("window_created", 220)]
         phases = benchmark.phase_metrics([{"stages": [
             {"name": name, "ms": ms} for name, ms in entries
         ]}])
@@ -176,7 +176,7 @@ class StartupBenchmarkTests(unittest.TestCase):
                     "menu_root_creation": 3, "menu_first_submenu_creation": 5,
                     "menu_first_item_creation": 5, "menu_first_submenu_build": 10,
                     "menu_first_submenu_attach": 5, "menu_item_creation": 25,
-                    "menu_install": 20, "window_attribute_preparation": 1,
+                    "menu_install": 20, "window_attribute_preparation": 0.5,
                     "native_window_creation": 38}
         for name, duration in expected.items():
             self.assertEqual(phases[name]["samples"], [duration])

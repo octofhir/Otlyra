@@ -148,11 +148,26 @@ mod macos {
                 );
             }
             let time = |name| {
-                stages.iter().find(|stage| stage["name"] == name).unwrap()["ms"]
+                stages
+                    .iter()
+                    .find(|stage| stage["name"] == name)
+                    .unwrap_or_else(|| panic!("cpu={cpu}, web={web}: missing startup stage {name}"))
+                    ["ms"]
                     .as_f64()
                     .unwrap()
             };
+            if stages
+                .iter()
+                .any(|stage| stage["name"] == "bootstrap_redraw_reissued")
+            {
+                assert!(time("first_loop_idle") <= time("bootstrap_redraw_reissued"));
+                assert!(time("bootstrap_redraw_reissued") <= time("chrome_build_started"));
+            }
             for (before, after) in [
+                ("accesskit_attached", "visibility_requested"),
+                ("icon_ready", "visibility_requested"),
+                ("menu_ready", "visibility_requested"),
+                ("menu_installed", "visibility_requested"),
                 ("content_owner_ready", "first_content_scene_ready"),
                 ("window_created", "content_surface_ready"),
                 ("content_owner_ready", "content_surface_ready"),

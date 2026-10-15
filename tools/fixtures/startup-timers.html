@@ -1,0 +1,9 @@
+<!doctype html><title>Timer startup workload</title><body style="margin:0;background:white"><p id=state>Callbacks 0/200</p><script>
+const state = document.getElementById('state');
+let completed = 0;
+for (let i = 0; i < 200; i++) setTimeout(() => {
+  const until = Date.now() + 1;
+  while (Date.now() < until) {}
+  state.textContent = 'Callbacks ' + (++completed) + '/200';
+}, 0);
+</script>

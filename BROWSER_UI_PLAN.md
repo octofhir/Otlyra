@@ -94,6 +94,9 @@ describe the earlier ownership boundary.
   independent startup marks. Keep worker overlap separate from adjacent stages.
 - [ ] Resolve the internal AppKit/dynamic-initialization stacks behind those
   intervals; do not move their cost behind the visibility mark.
+- [x] Recover an initial coalesced redraw once after render readiness if native
+  startup has delivered no frame. Keep its owed frame, avoid retrying started or
+  hidden work, and leave later redraw/damage scheduling unchanged.
 - [ ] Profile the Ready-delivery gap in native launch/window event dispatch.
   Backend construction is already negligible; an extra bootstrap worker and
   draining messages before event-loop wait did not improve startup.
