@@ -102,6 +102,12 @@ impl DocumentRef {
     /// JavaScript, where the collector can see them, and tells this so the
     /// browser can ask whether a frame is owed without entering the isolate to
     /// find out.
+    /// A listener for pointer movement was registered, so moves are sent.
+    #[static_method(name = "__pointerMovesWanted")]
+    fn js_pointer_moves_wanted() {
+        super::note_pointer_moves_wanted();
+    }
+
     #[static_method(name = "__frameRequested")]
     fn js_frame_requested() {
         super::note_frame_request();

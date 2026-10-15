@@ -110,6 +110,9 @@ pub struct PageState {
     /// The element a user-input event the embedder is dispatching is aimed
     /// at, for the turn that dispatches it.
     input_target: Option<otlyra_dom::NodeId>,
+    /// Whether the page listens for pointer movement, so the browser sends it
+    /// rather than entering the isolate for every move of the mouse.
+    wants_pointer_moves: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -220,6 +223,12 @@ impl PageState {
         self.current_script = element;
     }
 
+    /// Whether the page listens for pointer movement.
+    #[must_use]
+    pub fn wants_pointer_moves(&self) -> bool {
+        self.wants_pointer_moves
+    }
+
     /// Aim the user-input event about to be dispatched, or clear the aim.
     pub fn set_input_target(&mut self, element: Option<otlyra_dom::NodeId>) {
         self.input_target = element;
@@ -252,6 +261,11 @@ pub(crate) fn request_navigation(navigation: Navigation) {
     // Last one wins. A script that sets `location.href` twice in a turn has
     // changed its mind, and a browser goes where it ended up.
     with_state_mut(|state| state.navigation = Some(navigation));
+}
+
+/// The page registered a listener for pointer movement.
+pub(crate) fn note_pointer_moves_wanted() {
+    with_state_mut(|state| state.wants_pointer_moves = true);
 }
 
 /// The page asked for an animation frame.

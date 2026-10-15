@@ -540,6 +540,10 @@ impl ScriptRunner for PageScripts {
         PageScripts::dispatch_input(self, document, target, kind, init)
     }
 
+    fn wants_pointer_moves(&self) -> bool {
+        self.host.is_some() && self.state.wants_pointer_moves()
+    }
+
     fn take_mutated(&mut self) -> bool {
         PageScripts::take_mutated(self)
     }

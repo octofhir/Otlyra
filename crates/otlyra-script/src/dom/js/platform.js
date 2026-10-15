@@ -61,6 +61,9 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
   // the host says every script that was going to arrive has arrived.
   if (fireLoadEvents && !loadEventsFired) {
     loadEventsFired = true;
+    // A parsed `onmousemove` registers its listener only when an event finds
+    // it, so its presence alone asks for moves.
+    if (document.querySelector('[onmousemove], [onpointermove]')) nativePointerMovesWanted();
     // `DOMContentLoaded` bubbles and `load` does not, which is not a detail:
     // half the pages on the web listen for the first one on `window`, and
     // they hear it only because it travels up from the document.
@@ -163,6 +166,14 @@ const INPUT_EVENTS = {
   pointerdown: [PointerEvent, true, true],
   pointerup: [PointerEvent, true, true],
   pointermove: [PointerEvent, true, true],
+  pointerover: [PointerEvent, true, true],
+  pointerout: [PointerEvent, true, true],
+  pointerenter: [PointerEvent, false, false],
+  pointerleave: [PointerEvent, false, false],
+  mouseover: [MouseEvent, true, true],
+  mouseout: [MouseEvent, true, true],
+  mouseenter: [MouseEvent, false, false],
+  mouseleave: [MouseEvent, false, false],
   mousedown: [MouseEvent, true, true],
   mouseup: [MouseEvent, true, true],
   mousemove: [MouseEvent, true, true],

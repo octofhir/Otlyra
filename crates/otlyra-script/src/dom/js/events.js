@@ -19,6 +19,7 @@ const listenersFor = (target, type, create) => {
   let list = byType.get(type);
   if (!list) {
     if (!create) return undefined;
+    if (type === 'mousemove' || type === 'pointermove') nativePointerMovesWanted();
     list = [];
     byType.set(type, list);
   }

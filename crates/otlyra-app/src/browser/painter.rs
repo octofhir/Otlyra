@@ -159,6 +159,272 @@ impl Painter for Browser {
     }
 
     fn on_event(&mut self, event: PlatformEvent) {
+        let focus_before = self.page_focus();
+        self.on_platform_event(event);
+        if matches!(event, PlatformEvent::PointerMoved { .. }) {
+            self.page_pointer_moved();
+        }
+        // Whatever the event did to the page's focus, the page hears.
+        self.sync_page_focus(focus_before);
+    }
+    fn accessibility(&mut self) -> Option<otlyra_platform::accesskit::TreeUpdate> {
+        if !self.accessibility_dirty {
+            return None;
+        }
+        self.accessibility_dirty = false;
+
+        // Rebuilt only after something that can change semantics, geometry or
+        // focus. Paint-only animation leaves the last tree valid.
+        let tab = self.tabs.get(self.active)?;
+        let document = match self.world.page(tab.id) {
+            Some(page) => crate::a11y::tree_for(page, &tab.title),
+            None => crate::a11y::empty_tree(&tab.title),
+        };
+
+        // With the interface hidden there is nothing over the page, so the page
+        // is the whole window and wrapping it would add a level describing a
+        // toolbar that was never drawn.
+        if !self.interface {
+            return Some(document);
+        }
+
+        let title = tab.title.clone();
+        let system = tab.system;
+
+        // The toolbar, and then whatever is under it. A browser page is drawn by
+        // its own surface, so its controls come from that surface rather than
+        // from the document tree, which for an `about:` page has nothing in it.
+        let mut described = self.ui.describe();
+        let chrome_len = described.len();
+        let (page_focus, page_described) = match system {
+            Some(SystemPage::Settings) => (self.settings.focused(), self.settings.describe()),
+            Some(SystemPage::History) => {
+                (self.history_page.focused(), self.history_page.describe())
+            }
+            Some(SystemPage::Downloads) => (
+                self.downloads_page.focused(),
+                self.downloads_page.describe(),
+            ),
+            Some(SystemPage::Bookmarks) => (
+                self.bookmarks_page.focused(),
+                self.bookmarks_page.describe(),
+            ),
+            Some(SystemPage::Cookies) => {
+                (self.cookies_page.focused(), self.cookies_page.describe())
+            }
+            Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
+            // The pages that are still a placeholder draw no controls, so they
+            // describe none.
+            _ => (None, Vec::new()),
+        };
+        // Only the active root may publish keyboard focus. Background surfaces
+        // can retain render state, but never a second accessibility focus.
+        let focused = match self.keyboard_surface {
+            SURFACE_CHROME => self
+                .ui
+                .focused()
+                .and_then(|focus| crate::a11y::focused_index(&described, focus)),
+            SURFACE_SYSTEM => page_focus
+                .and_then(|focus| crate::a11y::focused_index(&page_described, focus))
+                .map(|index| chrome_len + index),
+            SURFACE_PAGE | SURFACE_INSPECTOR => None,
+            _ => None,
+        };
+        described.extend(page_described);
+
+        Some(crate::a11y::window_tree_at(
+            &described, focused, document, &title,
+        ))
+    }
+
+    fn cursor(&self) -> Cursor {
+        self.cursor
+    }
+
+    fn window_appearance(&self) -> Option<otlyra_platform::ColorScheme> {
+        match self.settings.settings.appearance {
+            crate::settings::Appearance::System => None,
+            crate::settings::Appearance::Light => Some(otlyra_platform::ColorScheme::Light),
+            crate::settings::Appearance::Dark => Some(otlyra_platform::ColorScheme::Dark),
+        }
+    }
+
+    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
+        let geom = self.frame_geom(viewport);
+
+        // The page first, then the interface over it. The page is inset by the
+        // interface's height and culled to what is visible, so it cannot paint
+        // underneath it — but painting in this order means a future translucent
+        // toolbar composites correctly rather than needing a clip.
+        let page = self.page_list(&geom);
+        otlyra_gfx::render_scrolled(&page, target, &self.page_offsets(&geom));
+
+        // The highlight goes over the page whether or not the panel is open. They
+        // are two things: the overlay says *this element*, the panel says
+        // everything about it.
+        if let Some(highlight) = self.highlight_list(&geom) {
+            render(&highlight, target);
+        }
+
+        if !self.interface {
+            self.after_frame();
+            return;
+        }
+
+        // The panel under the overlay, so a box that reaches the bottom of the
+        // content area is covered by the dock rather than drawn over it.
+        if geom.dock > 0.0 {
+            let inspector = self.inspector_list(&geom);
+            render(&inspector, target);
+        }
+
+        let chrome = self.chrome_list(&geom);
+        render(&chrome, target);
+
+        self.after_frame();
+    }
+
+    /// Publish the interface as retained layers so the compositor re-rasterizes
+    /// and re-uploads only what moved.
+    ///
+    /// The layers are built by the same helpers `paint` renders, in the same
+    /// order, so a full composite is pixel-for-pixel what `paint` would draw; the
+    /// only addition is a device rectangle and content epoch per layer for the
+    /// compositor's damage. Interface-less frames — a screenshot, `--no-interface`
+    /// — keep the whole-surface path.
+    fn compose(&mut self, viewport: Viewport) -> Option<Scene> {
+        if !self.interface {
+            return None;
+        }
+        Some(self.compose_scene(viewport))
+    }
+}
+
+impl Browser {
+    /// The same retained scene for a content owner, including page-only windows.
+    pub(super) fn compose_scene(&mut self, viewport: Viewport) -> Scene {
+        self.compose_layers(viewport, true)
+    }
+
+    pub(super) fn compose_content_scene(&mut self, viewport: Viewport) -> Scene {
+        self.compose_layers(viewport, false)
+    }
+
+    fn compose_layers(&mut self, viewport: Viewport, chrome: bool) -> Scene {
+        let geom = self.frame_geom(viewport);
+
+        // Device bands that tile the surface top to bottom with no seam: the
+        // chrome above the content, the content, and the dock filling the rest.
+        // An open browser menu is an overlay rather than a band, so its chrome
+        // layer temporarily covers the viewport instead of clipping at the
+        // toolbar's bottom edge.
+        let dev = |value: f64| (value * geom.scale_factor).round() as u32;
+        let content_top = dev(geom.top).min(viewport.height);
+        let content_bottom = dev(geom.top + geom.content_height).min(viewport.height);
+        let page_rect = LayerRect {
+            x: 0,
+            y: content_top,
+            width: viewport.width,
+            height: content_bottom.saturating_sub(content_top),
+        };
+
+        let mut layers = Vec::with_capacity(4);
+
+        let page = self.page_list(&geom);
+        // What the page says it changed, if it changed only part of itself: a
+        // keystroke re-shapes one field, and the paragraphs around it keep the
+        // pixels they have. Taken after the list is built, because building it is
+        // what settles the answer.
+        let page_dirty = self.page_dirty(&geom);
+        layers.push(SceneLayer {
+            id: LayerId(LAYER_PAGE),
+            rect: page_rect,
+            epoch: self.page_epoch(&geom),
+            list: page,
+            offsets: self.page_offsets(&geom),
+            background: self.page_background(),
+            dirty: page_dirty,
+        });
+
+        if let Some(highlight) = self.highlight_list(&geom) {
+            // The overlay draws within the content area and can spill a little
+            // past a box's edges (labels, handles), so it claims the whole content
+            // rect; a highlight move re-rasterizes the page under it, which only
+            // happens while a person is walking the tree with the inspector.
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_HIGHLIGHT),
+                rect: page_rect,
+                epoch: self.highlight_epoch(),
+                list: highlight,
+                offsets: Vec::new(),
+                background: None,
+                dirty: None,
+            });
+        }
+
+        if self.interface && geom.dock > 0.0 {
+            let inspector = self.inspector_list(&geom);
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_INSPECTOR),
+                rect: LayerRect {
+                    x: 0,
+                    y: content_bottom,
+                    width: viewport.width,
+                    height: viewport.height.saturating_sub(content_bottom),
+                },
+                epoch: self.inspector_epoch(),
+                list: inspector,
+                offsets: Vec::new(),
+                background: None,
+                dirty: None,
+            });
+        }
+
+        if self.interface && chrome {
+            let chrome = self.chrome_list(&geom);
+            let chrome_dirty = self.chrome_dirty(&geom);
+            layers.push(SceneLayer {
+                id: LayerId(LAYER_CHROME),
+                rect: LayerRect {
+                    x: 0,
+                    y: 0,
+                    width: viewport.width,
+                    height: if self.ui.popup_open() {
+                        viewport.height
+                    } else {
+                        content_top
+                    },
+                },
+                epoch: self.chrome_epoch(),
+                list: chrome,
+                offsets: Vec::new(),
+                background: None,
+                dirty: chrome_dirty,
+            });
+        }
+
+        self.after_frame();
+        Scene { layers }
+    }
+}
+
+/// Whether these modifiers are the platform's "open the inspector" pair.
+///
+/// Alt and the platform's own accelerator: ⌥⌘I on macOS, Ctrl-Alt-I elsewhere,
+/// which is what a person's fingers already know.
+fn inspector_modifier(modifiers: Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.command
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control
+    }
+}
+
+impl Browser {
+    fn on_platform_event(&mut self, event: PlatformEvent) {
         match event {
             PlatformEvent::VisibilityChanged(visible) => {
                 self.window_visible = visible;
@@ -1009,260 +1275,5 @@ impl Painter for Browser {
             PlatformEvent::CloseRequested => tracing::info!("close requested"),
             _ => {}
         }
-    }
-
-    fn accessibility(&mut self) -> Option<otlyra_platform::accesskit::TreeUpdate> {
-        if !self.accessibility_dirty {
-            return None;
-        }
-        self.accessibility_dirty = false;
-
-        // Rebuilt only after something that can change semantics, geometry or
-        // focus. Paint-only animation leaves the last tree valid.
-        let tab = self.tabs.get(self.active)?;
-        let document = match self.world.page(tab.id) {
-            Some(page) => crate::a11y::tree_for(page, &tab.title),
-            None => crate::a11y::empty_tree(&tab.title),
-        };
-
-        // With the interface hidden there is nothing over the page, so the page
-        // is the whole window and wrapping it would add a level describing a
-        // toolbar that was never drawn.
-        if !self.interface {
-            return Some(document);
-        }
-
-        let title = tab.title.clone();
-        let system = tab.system;
-
-        // The toolbar, and then whatever is under it. A browser page is drawn by
-        // its own surface, so its controls come from that surface rather than
-        // from the document tree, which for an `about:` page has nothing in it.
-        let mut described = self.ui.describe();
-        let chrome_len = described.len();
-        let (page_focus, page_described) = match system {
-            Some(SystemPage::Settings) => (self.settings.focused(), self.settings.describe()),
-            Some(SystemPage::History) => {
-                (self.history_page.focused(), self.history_page.describe())
-            }
-            Some(SystemPage::Downloads) => (
-                self.downloads_page.focused(),
-                self.downloads_page.describe(),
-            ),
-            Some(SystemPage::Bookmarks) => (
-                self.bookmarks_page.focused(),
-                self.bookmarks_page.describe(),
-            ),
-            Some(SystemPage::Cookies) => {
-                (self.cookies_page.focused(), self.cookies_page.describe())
-            }
-            Some(SystemPage::About) => (self.about.focused(), self.about.describe()),
-            // The pages that are still a placeholder draw no controls, so they
-            // describe none.
-            _ => (None, Vec::new()),
-        };
-        // Only the active root may publish keyboard focus. Background surfaces
-        // can retain render state, but never a second accessibility focus.
-        let focused = match self.keyboard_surface {
-            SURFACE_CHROME => self
-                .ui
-                .focused()
-                .and_then(|focus| crate::a11y::focused_index(&described, focus)),
-            SURFACE_SYSTEM => page_focus
-                .and_then(|focus| crate::a11y::focused_index(&page_described, focus))
-                .map(|index| chrome_len + index),
-            SURFACE_PAGE | SURFACE_INSPECTOR => None,
-            _ => None,
-        };
-        described.extend(page_described);
-
-        Some(crate::a11y::window_tree_at(
-            &described, focused, document, &title,
-        ))
-    }
-
-    fn cursor(&self) -> Cursor {
-        self.cursor
-    }
-
-    fn window_appearance(&self) -> Option<otlyra_platform::ColorScheme> {
-        match self.settings.settings.appearance {
-            crate::settings::Appearance::System => None,
-            crate::settings::Appearance::Light => Some(otlyra_platform::ColorScheme::Light),
-            crate::settings::Appearance::Dark => Some(otlyra_platform::ColorScheme::Dark),
-        }
-    }
-
-    fn paint(&mut self, target: &mut dyn PaintTarget, viewport: Viewport) {
-        let geom = self.frame_geom(viewport);
-
-        // The page first, then the interface over it. The page is inset by the
-        // interface's height and culled to what is visible, so it cannot paint
-        // underneath it — but painting in this order means a future translucent
-        // toolbar composites correctly rather than needing a clip.
-        let page = self.page_list(&geom);
-        otlyra_gfx::render_scrolled(&page, target, &self.page_offsets(&geom));
-
-        // The highlight goes over the page whether or not the panel is open. They
-        // are two things: the overlay says *this element*, the panel says
-        // everything about it.
-        if let Some(highlight) = self.highlight_list(&geom) {
-            render(&highlight, target);
-        }
-
-        if !self.interface {
-            self.after_frame();
-            return;
-        }
-
-        // The panel under the overlay, so a box that reaches the bottom of the
-        // content area is covered by the dock rather than drawn over it.
-        if geom.dock > 0.0 {
-            let inspector = self.inspector_list(&geom);
-            render(&inspector, target);
-        }
-
-        let chrome = self.chrome_list(&geom);
-        render(&chrome, target);
-
-        self.after_frame();
-    }
-
-    /// Publish the interface as retained layers so the compositor re-rasterizes
-    /// and re-uploads only what moved.
-    ///
-    /// The layers are built by the same helpers `paint` renders, in the same
-    /// order, so a full composite is pixel-for-pixel what `paint` would draw; the
-    /// only addition is a device rectangle and content epoch per layer for the
-    /// compositor's damage. Interface-less frames — a screenshot, `--no-interface`
-    /// — keep the whole-surface path.
-    fn compose(&mut self, viewport: Viewport) -> Option<Scene> {
-        if !self.interface {
-            return None;
-        }
-        Some(self.compose_scene(viewport))
-    }
-}
-
-impl Browser {
-    /// The same retained scene for a content owner, including page-only windows.
-    pub(super) fn compose_scene(&mut self, viewport: Viewport) -> Scene {
-        self.compose_layers(viewport, true)
-    }
-
-    pub(super) fn compose_content_scene(&mut self, viewport: Viewport) -> Scene {
-        self.compose_layers(viewport, false)
-    }
-
-    fn compose_layers(&mut self, viewport: Viewport, chrome: bool) -> Scene {
-        let geom = self.frame_geom(viewport);
-
-        // Device bands that tile the surface top to bottom with no seam: the
-        // chrome above the content, the content, and the dock filling the rest.
-        // An open browser menu is an overlay rather than a band, so its chrome
-        // layer temporarily covers the viewport instead of clipping at the
-        // toolbar's bottom edge.
-        let dev = |value: f64| (value * geom.scale_factor).round() as u32;
-        let content_top = dev(geom.top).min(viewport.height);
-        let content_bottom = dev(geom.top + geom.content_height).min(viewport.height);
-        let page_rect = LayerRect {
-            x: 0,
-            y: content_top,
-            width: viewport.width,
-            height: content_bottom.saturating_sub(content_top),
-        };
-
-        let mut layers = Vec::with_capacity(4);
-
-        let page = self.page_list(&geom);
-        // What the page says it changed, if it changed only part of itself: a
-        // keystroke re-shapes one field, and the paragraphs around it keep the
-        // pixels they have. Taken after the list is built, because building it is
-        // what settles the answer.
-        let page_dirty = self.page_dirty(&geom);
-        layers.push(SceneLayer {
-            id: LayerId(LAYER_PAGE),
-            rect: page_rect,
-            epoch: self.page_epoch(&geom),
-            list: page,
-            offsets: self.page_offsets(&geom),
-            background: self.page_background(),
-            dirty: page_dirty,
-        });
-
-        if let Some(highlight) = self.highlight_list(&geom) {
-            // The overlay draws within the content area and can spill a little
-            // past a box's edges (labels, handles), so it claims the whole content
-            // rect; a highlight move re-rasterizes the page under it, which only
-            // happens while a person is walking the tree with the inspector.
-            layers.push(SceneLayer {
-                id: LayerId(LAYER_HIGHLIGHT),
-                rect: page_rect,
-                epoch: self.highlight_epoch(),
-                list: highlight,
-                offsets: Vec::new(),
-                background: None,
-                dirty: None,
-            });
-        }
-
-        if self.interface && geom.dock > 0.0 {
-            let inspector = self.inspector_list(&geom);
-            layers.push(SceneLayer {
-                id: LayerId(LAYER_INSPECTOR),
-                rect: LayerRect {
-                    x: 0,
-                    y: content_bottom,
-                    width: viewport.width,
-                    height: viewport.height.saturating_sub(content_bottom),
-                },
-                epoch: self.inspector_epoch(),
-                list: inspector,
-                offsets: Vec::new(),
-                background: None,
-                dirty: None,
-            });
-        }
-
-        if self.interface && chrome {
-            let chrome = self.chrome_list(&geom);
-            let chrome_dirty = self.chrome_dirty(&geom);
-            layers.push(SceneLayer {
-                id: LayerId(LAYER_CHROME),
-                rect: LayerRect {
-                    x: 0,
-                    y: 0,
-                    width: viewport.width,
-                    height: if self.ui.popup_open() {
-                        viewport.height
-                    } else {
-                        content_top
-                    },
-                },
-                epoch: self.chrome_epoch(),
-                list: chrome,
-                offsets: Vec::new(),
-                background: None,
-                dirty: chrome_dirty,
-            });
-        }
-
-        self.after_frame();
-        Scene { layers }
-    }
-}
-
-/// Whether these modifiers are the platform's "open the inspector" pair.
-///
-/// Alt and the platform's own accelerator: ⌥⌘I on macOS, Ctrl-Alt-I elsewhere,
-/// which is what a person's fingers already know.
-fn inspector_modifier(modifiers: Modifiers) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        modifiers.command
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        modifiers.control
     }
 }

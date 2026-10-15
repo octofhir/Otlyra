@@ -110,4 +110,5 @@ const nativeUrl = take(Document, '__url');
 const nativeNavigate = take(Document, '__navigate');
 const nativeReload = take(Document, '__reload');
 const nativeFrameRequested = take(Document, '__frameRequested');
+const nativePointerMovesWanted = take(Document, '__pointerMovesWanted');
 const nativeAttributeRecords = take(Element.prototype, '__attributeRecords');

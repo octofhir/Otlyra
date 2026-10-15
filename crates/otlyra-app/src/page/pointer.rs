@@ -84,6 +84,22 @@ impl PageScene {
         Some(root)
     }
 
+    /// `node` and the elements it is inside, nearest first.
+    pub fn element_ancestors(&self, node: NodeId) -> Vec<NodeId> {
+        let mut chain = Vec::new();
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let Some(data) = self.document.get(id) else {
+                break;
+            };
+            if data.element().is_some() {
+                chain.push(id);
+            }
+            current = data.parent;
+        }
+        chain
+    }
+
     /// The element keyboard events go to: the focused one, if any.
     pub fn focused_element(&self) -> Option<NodeId> {
         self.interaction.focus

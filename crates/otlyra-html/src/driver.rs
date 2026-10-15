@@ -136,6 +136,11 @@ pub trait ScriptRunner {
         false
     }
 
+    /// Whether the page listens for pointer movement at all.
+    fn wants_pointer_moves(&self) -> bool {
+        false
+    }
+
     /// The CSS viewport changed between script turns or while parsing is paused.
     fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
         let _ = (document, width, height, scale);

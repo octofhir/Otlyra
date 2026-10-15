@@ -4151,3 +4151,103 @@ fn script_reads_and_writes_what_the_reader_typed_and_ticked() {
         assert!(page.is_checked(page.element_at(x, y).expect("box")));
     });
 }
+
+/// Focus moving between fields is heard as blur/focusout and focus/focusin,
+/// and leaving a field whose value changed sends `change` first.
+#[test]
+fn focus_moves_and_changed_fields_reach_the_page() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><input id=a style='width:200px;height:30px;margin:0'><br>\
+             <input id=b style='width:200px;height:30px;margin:0'>\
+             <script>\
+               const seen = [];\
+               for (const type of ['focus', 'blur', 'focusin', 'focusout', 'change']) {\
+                 document.addEventListener(type, (event) => {\
+                   seen.push(event.type + ':' + event.target.id);\
+                   document.documentElement.dataset.log = seen.join(' ');\
+                 }, true);\
+               }\
+             </script>",
+        );
+        press_and_release(&mut browser, "a");
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Character('x'),
+            modifiers: otlyra_platform::Modifiers::default(),
+        });
+        browser.on_event(PlatformEvent::TextInput('x'));
+        press_and_release(&mut browser, "b");
+        press_and_release(&mut browser, "a");
+        assert_eq!(
+            page_log(&browser),
+            [
+                "focus:a",
+                "focusin:a",
+                "change:a",
+                "blur:a",
+                "focusout:a",
+                "focus:b",
+                "focusin:b",
+                "blur:b",
+                "focusout:b",
+                "focus:a",
+                "focusin:a",
+            ]
+            .join(" ")
+        );
+    });
+}
+
+/// The pointer crossing elements is heard as over/out and enter/leave, and
+/// moves are sent to a page that listens for them.
+#[test]
+fn the_pointer_crossing_elements_reaches_the_page() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><div id=outer style='padding:20px;width:200px'>\
+             <div id=inner style='width:100px;height:40px'>in</div></div>\
+             <p id=below style='margin:0;height:40px'>below</p>\
+             <script>\
+               const seen = [];\
+               const note = (event) => {\
+                 seen.push(event.type + ':' + event.currentTarget.id);\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               };\
+               for (const id of ['outer', 'inner']) {\
+                 for (const type of ['mouseover', 'mouseout', 'mouseenter', 'mouseleave']) {\
+                   document.getElementById(id).addEventListener(type, note);\
+                 }\
+               }\
+               let moves = 0;\
+               document.getElementById('below').addEventListener('mousemove', () => {\
+                 moves += 1;\
+                 document.getElementById('below').dataset.moves = moves;\
+               });\
+             </script>",
+        );
+        let (x, y) = position_of(&browser, "inner");
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        let (x, y) = position_of(&browser, "below");
+        browser.on_event(PlatformEvent::PointerMoved { x, y });
+        browser.on_event(PlatformEvent::PointerMoved { x: x + 2.0, y });
+        assert_eq!(
+            page_log(&browser),
+            [
+                "mouseover:inner",
+                "mouseover:outer",
+                "mouseenter:outer",
+                "mouseenter:inner",
+                "mouseout:inner",
+                "mouseout:outer",
+                "mouseleave:inner",
+                "mouseleave:outer",
+            ]
+            .join(" ")
+        );
+        let page = browser.page(browser.active).expect("page");
+        let below = page
+            .element_at(browser.in_page(x, y).0, browser.in_page(x, y).1)
+            .expect("below");
+        assert_eq!(page.document().attr(below, "data-moves"), Some("2"));
+    });
+}

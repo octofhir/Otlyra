@@ -766,3 +766,113 @@ impl Browser {
         }
     }
 }
+
+impl Browser {
+    /// The active page's focused element.
+    pub(super) fn page_focus(&self) -> Option<(super::TabId, otlyra_dom::NodeId)> {
+        let tab = self.tabs.get(self.active)?;
+        if tab.system.is_some() {
+            return None;
+        }
+        let node = self.page(self.active)?.focused_element()?;
+        Some((tab.id, node))
+    }
+
+    fn control_value(&self, tab: super::TabId, node: otlyra_dom::NodeId) -> Option<String> {
+        let index = self.tabs.iter().position(|candidate| candidate.id == tab)?;
+        let document = self.page(index)?.document();
+        otlyra_dom::form::Control::of(document, node)
+            .is_some_and(otlyra_dom::form::Control::is_text_entry)
+            .then(|| document.form().value(document, node).to_owned())
+    }
+
+    /// Tell the page its focus moved: `change` for a field left with a value
+    /// other than the one it was given the focus with, then blur/focusout on
+    /// what lost it and focus/focusin on what gained it.
+    pub(super) fn sync_page_focus(&mut self, before: Option<(super::TabId, otlyra_dom::NodeId)>) {
+        let after = self.page_focus();
+        if before == after {
+            return;
+        }
+        self.sync_world();
+        if let Some((tab, node)) = before {
+            if let Some((focused_tab, focused, value)) = self.focus_value.take()
+                && (focused_tab, focused) == (tab, node)
+                && self
+                    .control_value(tab, node)
+                    .is_some_and(|now| now != value)
+            {
+                self.world.dispatch_input(tab, node, "change", "{}");
+            }
+            self.world.dispatch_input(tab, node, "blur", "{}");
+            self.world.dispatch_input(tab, node, "focusout", "{}");
+        }
+        if let Some((tab, node)) = after {
+            self.focus_value = self
+                .control_value(tab, node)
+                .map(|value| (tab, node, value));
+            self.world.dispatch_input(tab, node, "focus", "{}");
+            self.world.dispatch_input(tab, node, "focusin", "{}");
+        }
+        self.apply_world_events();
+    }
+}
+
+impl Browser {
+    /// Tell the page the pointer moved: over/out and enter/leave when the
+    /// element under it changed, and the move itself if the page listens.
+    pub(super) fn page_pointer_moved(&mut self) {
+        let point = self.page_point();
+        let tab = self.tabs[self.active].id;
+        let now = point.map(|(_, _, target)| (tab, target));
+        let (x, y) = point.map_or((0.0, 0.0), |(x, y, _)| (x, y));
+        let buttons = u8::from(self.page_press.is_some() || self.selecting);
+        let init = Self::pointer_init(x, y, buttons, 0);
+        if now != self.hovered {
+            self.sync_world();
+            let before = self.hovered.take();
+            let ancestors = |browser: &Self, (tab, node): (super::TabId, otlyra_dom::NodeId)| {
+                browser
+                    .tabs
+                    .iter()
+                    .position(|candidate| candidate.id == tab)
+                    .and_then(|index| browser.page(index))
+                    .map(|page| page.element_ancestors(node))
+                    .unwrap_or_default()
+            };
+            let left = before.map(|old| ancestors(self, old)).unwrap_or_default();
+            let entered = now.map(|new| ancestors(self, new)).unwrap_or_default();
+            if let Some((old_tab, old)) = before {
+                self.world.dispatch_input(old_tab, old, "pointerout", &init);
+                self.world.dispatch_input(old_tab, old, "mouseout", &init);
+                for &node in left.iter().filter(|node| !entered.contains(node)) {
+                    self.world
+                        .dispatch_input(old_tab, node, "pointerleave", &init);
+                    self.world
+                        .dispatch_input(old_tab, node, "mouseleave", &init);
+                }
+            }
+            if let Some((new_tab, new)) = now {
+                self.world
+                    .dispatch_input(new_tab, new, "pointerover", &init);
+                self.world.dispatch_input(new_tab, new, "mouseover", &init);
+                for &node in entered.iter().rev().filter(|node| !left.contains(node)) {
+                    self.world
+                        .dispatch_input(new_tab, node, "pointerenter", &init);
+                    self.world
+                        .dispatch_input(new_tab, node, "mouseenter", &init);
+                }
+            }
+            self.hovered = now;
+            self.apply_world_events();
+        }
+        if let Some((_, _, target)) = point
+            && self.world.wants_pointer_moves(tab)
+        {
+            self.sync_world();
+            self.world.dispatch_input(tab, target, "pointermove", &init);
+            self.world.dispatch_input(tab, target, "mousemove", &init);
+            self.apply_world_events();
+        }
+    }
+}

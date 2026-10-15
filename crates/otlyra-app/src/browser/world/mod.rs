@@ -484,6 +484,17 @@ impl PageWorld {
         cancelled
     }
 
+    /// Whether `tab`'s page listens for pointer movement.
+    pub(super) fn wants_pointer_moves(&self, tab: TabId) -> bool {
+        self.slots.get(&tab).is_some_and(|slot| {
+            slot.pending.is_none()
+                && slot
+                    .scripts
+                    .as_ref()
+                    .is_some_and(|scripts| scripts.wants_pointer_moves())
+        })
+    }
+
     /// Give only the visible page its requested animation frame.
     ///
     /// `requestAnimationFrame` means *before the next paint*, so this runs on

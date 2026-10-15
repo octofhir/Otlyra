@@ -85,6 +85,11 @@ pub struct Browser {
     /// The page cancelled the `keydown` of a key that types, so the text the
     /// platform sends for it next is not typed.
     text_cancelled: bool,
+    /// The focused page element and what it held when it took the focus, so
+    /// leaving it changed can send `change`.
+    focus_value: Option<(TabId, otlyra_dom::NodeId, String)>,
+    /// The page element the pointer is over, as the page was last told.
+    hovered: Option<(TabId, otlyra_dom::NodeId)>,
     /// The width of the last frame, so a press can be tested against the geometry
     /// the user was actually looking at.
     last_width: f64,
@@ -257,6 +262,8 @@ impl Browser {
             page_press: None,
             pending_keyup: None,
             text_cancelled: false,
+            focus_value: None,
+            hovered: None,
             last_width: 1024.0,
             last_height: 768.0,
             last_scale: 1.0,
