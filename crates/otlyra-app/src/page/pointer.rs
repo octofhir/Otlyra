@@ -62,7 +62,7 @@ impl PageScene {
     /// Whether a checkable control is checked, for tests that press one.
     #[cfg(test)]
     pub(crate) fn is_checked(&self, node: NodeId) -> bool {
-        self.form.checkedness(&self.document, node)
+        self.document.form().checkedness(&self.document, node)
     }
 
     /// The document's `<body>`, or its root element without one: where keys
@@ -106,6 +106,58 @@ impl PageScene {
             current = self.document.get(node).and_then(|data| data.parent);
         }
         None
+    }
+
+    /// HTML's legacy-pre-activation behaviour for a press released on the
+    /// checkbox or radio button it began on: the control changes before its
+    /// click is dispatched, so the page's listener reads the new state.
+    /// Answers the control and what to put back if the click is cancelled.
+    pub fn pre_activate_pressed(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Option<(NodeId, Vec<(NodeId, bool)>)> {
+        use otlyra_dom::form::{Control, InputKind};
+        let node = self.interaction.active?;
+        if self.control_at(x, y) != Some(node)
+            || !otlyra_dom::form::is_mutable(&self.document, node)
+        {
+            return None;
+        }
+        let checkbox =
+            Control::of(&self.document, node) == Some(Control::Input(InputKind::Checkbox));
+        let members = match Control::of(&self.document, node) {
+            Some(Control::Input(InputKind::Checkbox)) => vec![node],
+            Some(Control::Input(InputKind::Radio)) => {
+                otlyra_dom::form::radio_group(&self.document, node)
+            }
+            _ => return None,
+        };
+        let before: Vec<(NodeId, bool)> = members
+            .iter()
+            .map(|&member| {
+                (
+                    member,
+                    self.document.form().checkedness(&self.document, member),
+                )
+            })
+            .collect();
+        for &(member, checked) in &before {
+            // A checkbox toggles; a radio button is checked and its group is not.
+            let next = member == node && (!checkbox || !checked);
+            self.document.form_mut().set_checkedness(member, next);
+        }
+        self.document.form_mut().note_interaction(node);
+        self.invalidate_styles();
+        Some((node, before))
+    }
+
+    /// Put back what a cancelled click's pre-activation changed.
+    pub fn restore_checkedness(&mut self, before: &[(NodeId, bool)]) {
+        for &(member, checked) in before {
+            self.document.form_mut().set_checkedness(member, checked);
+        }
+        self.invalidate_styles();
     }
 
     /// A press whose click the page cancelled: let it go without activating

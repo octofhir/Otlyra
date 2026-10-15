@@ -87,7 +87,7 @@ impl PageScene {
                 _ if checkable => None,
                 Control::Select => self.chosen_option_text(node),
                 _ if control.is_text_entry() => {
-                    Some(self.form.value(&self.document, node).to_owned())
+                    Some(self.document.form().value(&self.document, node).to_owned())
                 }
                 // A slider and the two bars hold a number and say it as one: a
                 // reader that is told "fifty" can be told what it is out of, and a
@@ -95,7 +95,7 @@ impl PageScene {
                 // range.
                 Control::Input(InputKind::Range) => Some(form::format_number(form::range_value(
                     &self.document,
-                    &self.form,
+                    self.document.form(),
                     node,
                 ))),
                 Control::Progress => form::progress_position(&self.document, node)
@@ -106,25 +106,25 @@ impl PageScene {
                 // A button's own words are its label rather than a value, and the
                 // ones that carry them in `value` are the input-shaped ones.
                 Control::Input(kind) if kind.is_button() => {
-                    Some(self.form.value(&self.document, node).to_owned())
+                    Some(self.document.form().value(&self.document, node).to_owned())
                 }
                 _ => None,
             },
-            checked: checkable.then(|| self.form.checkedness(&self.document, node)),
+            checked: checkable.then(|| self.document.form().checkedness(&self.document, node)),
             // A suggestion the arrows have reached reads as the chosen one, which
             // is what it looks like on screen and what a reader walking the list
             // has to be told.
             selected: matches!(control, Control::Option).then(|| {
-                self.form.selectedness(&self.document, node)
+                self.document.form().selectedness(&self.document, node)
                     || self.interaction.suggestion == Some(node)
             }),
             disabled,
             required: form::is_required(&self.document, node),
             // Only once the reader has been through it. A form that reads as broken
             // the moment it loads is a form nobody can fill in.
-            invalid: self.form.has_interacted(node)
+            invalid: self.document.form().has_interacted(node)
                 && form::is_validated(&self.document, node)
-                && form::validity(&self.document, &self.form, node).is_invalid(),
+                && form::validity(&self.document, self.document.form(), node).is_invalid(),
             focused: self.interaction.focus == Some(node),
             actionable: !disabled && form::is_mutable(&self.document, node),
             suggests: !form::suggestions_of(&self.document, node).is_empty(),
@@ -135,7 +135,7 @@ impl PageScene {
                 Control::Input(InputKind::Range) => {
                     let (min, max, step) = form::range_bounds(&self.document, node);
                     Some(Numeric {
-                        value: form::range_value(&self.document, &self.form, node),
+                        value: form::range_value(&self.document, self.document.form(), node),
                         min,
                         max,
                         step: (step > 0.0).then_some(step),
@@ -182,7 +182,7 @@ impl PageScene {
         let chosen = options
             .iter()
             .copied()
-            .find(|&option| self.form.selectedness(&self.document, option))
+            .find(|&option| self.document.form().selectedness(&self.document, option))
             .or_else(|| options.first().copied())?;
         Some(self.text_under(chosen))
     }

@@ -738,10 +738,28 @@ reflectUnsigned(HTMLInputElement, 'size', 'size', 20, 1);
 reflectUnsigned(HTMLInputElement, 'width', 'width', 0);
 reflectUnsigned(HTMLInputElement, 'height', 'height', 0);
 reflectString(HTMLInputElement, 'defaultValue', 'value');
-// What the reader typed is the browser's, and script cannot see it yet: these
-// are the attribute's, which is what a form script builds has in it.
-reflectString(HTMLInputElement, 'value', 'value');
-reflectBoolean(HTMLInputElement, 'checked', 'checked');
+// What the reader typed and ticked, which the document's form state holds
+// beside the attributes; `defaultValue`/`defaultChecked` are the attributes.
+accessor(
+  HTMLInputElement.prototype,
+  'value',
+  function () {
+    return this.__otlyraControlValue();
+  },
+  function (value) {
+    this.__otlyraSetControlValue(value === null ? '' : String(value));
+  },
+);
+accessor(
+  HTMLInputElement.prototype,
+  'checked',
+  function () {
+    return this.__otlyraControlChecked();
+  },
+  function (value) {
+    this.__otlyraSetControlChecked(Boolean(value));
+  },
+);
 const kIndeterminate = Symbol('indeterminate');
 accessor(
   HTMLInputElement.prototype,
@@ -921,18 +939,26 @@ reflectString(HTMLTextAreaElement, 'wrap');
 accessor(HTMLTextAreaElement.prototype, 'type', function () {
   return 'textarea';
 });
-for (const name of ['defaultValue', 'value']) {
-  accessor(
-    HTMLTextAreaElement.prototype,
-    name,
-    function () {
-      return this.textContent;
-    },
-    function (value) {
-      this.textContent = value;
-    },
-  );
-}
+accessor(
+  HTMLTextAreaElement.prototype,
+  'defaultValue',
+  function () {
+    return this.textContent;
+  },
+  function (value) {
+    this.textContent = value;
+  },
+);
+accessor(
+  HTMLTextAreaElement.prototype,
+  'value',
+  function () {
+    return this.__otlyraControlValue();
+  },
+  function (value) {
+    this.__otlyraSetControlValue(value === null ? '' : String(value));
+  },
+);
 accessor(HTMLTextAreaElement.prototype, 'textLength', function () {
   return this.value.length;
 });

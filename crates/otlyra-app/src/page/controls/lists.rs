@@ -58,8 +58,8 @@ impl PageScene {
         self.caret = value.len();
         self.field_anchor = Some(self.caret);
         self.field_dragging = false;
-        self.form.set_value(field, value);
-        self.form.note_interaction(field);
+        self.document.form_mut().set_value(field, value);
+        self.document.form_mut().note_interaction(field);
         self.restart_caret();
         self.invalidate_styles();
     }
@@ -70,7 +70,9 @@ impl PageScene {
     /// the same rule a radio group follows and for the same reason.
     pub(in crate::page) fn choose_option(&mut self, select: NodeId, option: NodeId) {
         for other in otlyra_dom::form::options_of(&self.document, select) {
-            self.form.set_selectedness(other, other == option);
+            self.document
+                .form_mut()
+                .set_selectedness(other, other == option);
         }
         self.invalidate_styles();
     }
@@ -131,7 +133,7 @@ impl PageScene {
         }
         let current = options
             .iter()
-            .position(|&option| self.form.selectedness(&self.document, option))
+            .position(|&option| self.document.form().selectedness(&self.document, option))
             .unwrap_or(0);
         let next = if forward {
             (current + 1).min(options.len() - 1)
@@ -154,7 +156,8 @@ impl PageScene {
         if !otlyra_dom::form::is_mutable(&self.document, field) {
             return false;
         }
-        let suggestions = otlyra_dom::form::suggestions_for(&self.document, &self.form, field);
+        let suggestions =
+            otlyra_dom::form::suggestions_for(&self.document, self.document.form(), field);
         if suggestions.is_empty() {
             return false;
         }
@@ -193,7 +196,8 @@ impl PageScene {
             return;
         }
         let showing =
-            !otlyra_dom::form::suggestions_for(&self.document, &self.form, node).is_empty();
+            !otlyra_dom::form::suggestions_for(&self.document, self.document.form(), node)
+                .is_empty();
         self.set_interaction(otlyra_css::state::Interaction {
             open: showing.then_some(node),
             suggestion: None,
@@ -239,7 +243,7 @@ impl PageScene {
             .or_else(|| {
                 otlyra_dom::form::options_of(&self.document, select)
                     .into_iter()
-                    .find(|&option| self.form.selectedness(&self.document, option))
+                    .find(|&option| self.document.form().selectedness(&self.document, option))
             })
             .and_then(|option| self.boxes.box_for(option));
         let Some(chosen) = chosen else { return };

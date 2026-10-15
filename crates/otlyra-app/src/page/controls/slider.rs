@@ -43,17 +43,18 @@ impl PageScene {
 
     /// Write a number into a slider, if it is not the number it already holds.
     fn set_slider(&mut self, node: NodeId, value: f64) -> bool {
-        let before = otlyra_dom::form::range_value(&self.document, &self.form, node);
+        let before = otlyra_dom::form::range_value(&self.document, self.document.form(), node);
         let (min, max, _) = otlyra_dom::form::range_bounds(&self.document, node);
         let value = value.clamp(min, max);
         if (value - before).abs() < f64::EPSILON
-            && !self.form.value(&self.document, node).is_empty()
+            && !self.document.form().value(&self.document, node).is_empty()
         {
             return false;
         }
-        self.form
+        self.document
+            .form_mut()
             .set_value(node, otlyra_dom::form::format_number(value));
-        self.form.note_interaction(node);
+        self.document.form_mut().note_interaction(node);
         self.invalidate_styles();
         true
     }
@@ -92,7 +93,7 @@ impl PageScene {
         } else {
             (max - min) / 100.0
         };
-        let value = otlyra_dom::form::range_value(&self.document, &self.form, node);
+        let value = otlyra_dom::form::range_value(&self.document, self.document.form(), node);
         let wanted = match motion {
             SliderMotion::Up => value + step,
             SliderMotion::Down => value - step,

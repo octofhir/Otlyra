@@ -38,8 +38,8 @@ impl PageScene {
         if files.is_empty() {
             return false;
         }
-        self.form.set_files(node, files);
-        self.form.note_interaction(node);
+        self.document.form_mut().set_files(node, files);
+        self.document.form_mut().note_interaction(node);
         self.invalidate_styles();
         true
     }
@@ -59,12 +59,14 @@ impl PageScene {
         }
         match Control::of(&self.document, node) {
             Some(Control::Input(InputKind::Checkbox)) => {
-                let checked = self.form.checkedness(&self.document, node);
-                self.form.set_checkedness(node, !checked);
+                let checked = self.document.form().checkedness(&self.document, node);
+                self.document.form_mut().set_checkedness(node, !checked);
             }
             Some(Control::Input(InputKind::Radio)) => {
                 for member in otlyra_dom::form::radio_group(&self.document, node) {
-                    self.form.set_checkedness(member, member == node);
+                    self.document
+                        .form_mut()
+                        .set_checkedness(member, member == node);
                 }
             }
             // Pressing a picker asks for a dialogue. Asking is all it does: what
@@ -83,7 +85,7 @@ impl PageScene {
             Some(Control::Input(InputKind::Submit | InputKind::Image) | Control::Button)
                 if otlyra_dom::form::is_submit_button(&self.document, node) =>
             {
-                self.form.note_interaction(node);
+                self.document.form_mut().note_interaction(node);
                 return self.submit(Some(node));
             }
             Some(Control::Input(InputKind::Reset)) => {
@@ -105,7 +107,7 @@ impl PageScene {
             }
             _ => return false,
         }
-        self.form.note_interaction(node);
+        self.document.form_mut().note_interaction(node);
         self.invalidate_styles();
         true
     }

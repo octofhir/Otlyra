@@ -1251,3 +1251,35 @@ fn input_dispatched_by_the_browser_reaches_its_target_and_reports_cancellation()
         ["Log: click go true 4 true", "Log: click go true 40 true"]
     );
 }
+
+/// A control's value and checkedness are the document's form state, apart
+/// from the attributes that give their defaults.
+#[test]
+fn control_values_are_form_state_apart_from_their_attributes() {
+    let (output, ..) = parse_running_scripts(
+        "<input id=field value=markup><input id=box type=checkbox checked>\
+         <input type=radio name=r id=one checked><input type=radio name=r id=two>\
+         <textarea id=area>text</textarea><script>\
+           const field = document.getElementById('field');\
+           field.value = 'typed';\
+           console.log(field.value, field.defaultValue, field.getAttribute('value'));\
+           const box = document.getElementById('box');\
+           box.checked = false;\
+           console.log(box.checked, box.defaultChecked);\
+           document.getElementById('two').checked = true;\
+           console.log(document.getElementById('one').checked, document.getElementById('two').checked);\
+           const area = document.getElementById('area');\
+           area.value = 'changed';\
+           console.log(area.value, area.defaultValue);\
+         </script>",
+    );
+    assert_eq!(
+        output,
+        [
+            "Log: typed markup markup",
+            "Log: false true",
+            "Log: false true",
+            "Log: changed text",
+        ]
+    );
+}

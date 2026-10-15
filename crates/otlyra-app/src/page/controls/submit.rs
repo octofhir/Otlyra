@@ -27,7 +27,7 @@ impl PageScene {
         }
         self.pending_submit = Some(otlyra_dom::submit::submission(
             &self.document,
-            &self.form,
+            self.document.form(),
             form,
             None,
         ));
@@ -60,9 +60,10 @@ impl PageScene {
             .collect();
         let mut ok = true;
         for field in fields {
-            if otlyra_dom::form::validity(&self.document, &self.form, field).is_invalid() {
+            if otlyra_dom::form::validity(&self.document, self.document.form(), field).is_invalid()
+            {
                 ok = false;
-                self.form.note_interaction(field);
+                self.document.form_mut().note_interaction(field);
             }
         }
         if !ok {
@@ -86,7 +87,7 @@ impl PageScene {
         }
         self.pending_submit = Some(otlyra_dom::submit::submission(
             &self.document,
-            &self.form,
+            self.document.form(),
             form,
             submitter,
         ));
@@ -95,7 +96,7 @@ impl PageScene {
 
     /// Put a form back the way the markup left it.
     pub(super) fn reset(&mut self, form: NodeId) -> bool {
-        self.form.reset(&self.document, Some(form));
+        self.document.reset_form(Some(form));
         self.invalidate_styles();
         true
     }
@@ -142,7 +143,7 @@ impl PageScene {
         }
         self.pending_submit = Some(otlyra_dom::submit::submission(
             &self.document,
-            &self.form,
+            self.document.form(),
             form,
             None,
         ));

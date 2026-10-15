@@ -174,7 +174,7 @@ impl PageScene {
             .iter()
             .any(|&node| otlyra_dom::form::Control::of(&self.document, node).is_some());
         let styled_touched = self.styler.as_mut().is_some_and(|styler| {
-            styler.interaction_changes_style(&self.document, &self.form, before, next)
+            styler.interaction_changes_style(&self.document, self.document.form(), before, next)
         });
         if !control_touched && !styled_touched {
             return false;
@@ -233,7 +233,7 @@ impl PageScene {
             return false;
         };
         let Some(previous) =
-            styler.restyle_interaction(&self.document, &self.form, styled, before, next)
+            styler.restyle_interaction(&self.document, self.document.form(), styled, before, next)
         else {
             return false;
         };
@@ -299,7 +299,7 @@ impl PageScene {
     ) -> bool {
         use otlyra_css::state::{ElementState, States};
 
-        let states = States::new(&self.document, &self.form, next);
+        let states = States::new(&self.document, self.document.form(), next);
         let mut painted = false;
         for node in otlyra_css::state::touched_nodes(&self.document, before, next) {
             if otlyra_dom::form::Control::of(&self.document, node).is_none() {

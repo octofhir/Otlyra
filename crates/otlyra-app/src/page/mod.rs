@@ -158,8 +158,6 @@ pub struct PageScene {
     painted: Option<(Painted, std::sync::Arc<DisplayList>)>,
     /// How many lists have been built rather than reused.
     builds: u64,
-    /// What the reader has made the page's controls hold.
-    form: otlyra_dom::FormState,
     /// Where the pointer and the focus are.
     interaction: otlyra_css::state::Interaction,
     /// Where the caret sits in the focused field, as a byte offset into its value.
@@ -395,7 +393,6 @@ impl PageScene {
             damage: Damage::STYLE,
             painted: None,
             builds: 0,
-            form: otlyra_dom::FormState::new(),
             interaction: otlyra_css::state::Interaction::none(),
             caret: 0,
             field_anchor: None,
@@ -467,6 +464,15 @@ impl PageScene {
     /// markup's addresses resolve against the new base from here on.
     pub fn document_changed(&mut self) {
         self.base = document_base_url(&self.document, &self.url);
+        // Script may have written the focused field's value: the caret and the
+        // anchor stay inside what it now holds, on a character boundary.
+        if let Some(node) = self.focused_field() {
+            let value = self.field_text(node);
+            self.caret = floor_boundary(&value, self.caret);
+            self.field_anchor = self
+                .field_anchor
+                .map(|anchor| floor_boundary(&value, anchor));
+        }
         self.invalidate_styles();
     }
 
@@ -555,15 +561,19 @@ impl PageScene {
                 .styler
                 .as_mut()
                 .expect("a styler was just made if there was none")
-                .style_with(&self.document, &self.form, self.interaction);
+                .style_with(&self.document, self.document.form(), self.interaction);
             self.styled_document = Some(styles);
         }
         let styles = self
             .styled_document
             .as_ref()
             .expect("styled just now or before");
-        self.boxes =
-            otlyra_layout::build_page_box_tree(&self.document, styles, &self.images, &self.form);
+        self.boxes = otlyra_layout::build_page_box_tree(
+            &self.document,
+            styles,
+            &self.images,
+            self.document.form(),
+        );
         self.boxes_stale = false;
         self.styled = true;
         self.layout_stale = true;
@@ -882,11 +892,12 @@ impl PageScene {
     ///
     /// One answer, so the fast path cannot write something a rebuild would not.
     fn shown_text(&self, node: NodeId) -> Option<String> {
-        if let Some(temporal) = otlyra_dom::form::temporal_display(&self.document, &self.form, node)
+        if let Some(temporal) =
+            otlyra_dom::form::temporal_display(&self.document, self.document.form(), node)
         {
             return Some(temporal);
         }
-        let held = self.form.value(&self.document, node);
+        let held = self.document.form().value(&self.document, node);
         if held.is_empty() {
             return None;
         }
@@ -1260,4 +1271,13 @@ fn descendants_of(document: &Document, root: NodeId) -> Vec<NodeId> {
         stack.extend(document.children(node));
     }
     order
+}
+
+/// `offset` moved back onto a character boundary inside `value`.
+fn floor_boundary(value: &str, offset: usize) -> usize {
+    let mut offset = offset.min(value.len());
+    while !value.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }

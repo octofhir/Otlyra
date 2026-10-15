@@ -43,6 +43,10 @@ pub struct Document {
     quirks_mode: QuirksMode,
     limits: DomLimits,
     refused: usize,
+    /// What the reader (or script) did to the document's controls: typed
+    /// values, checkedness, selections. Kept with the tree so that the page's
+    /// script and the browser read one answer.
+    form: crate::form::FormState,
 }
 
 impl Document {
@@ -62,6 +66,7 @@ impl Document {
             quirks_mode: QuirksMode::NoQuirks,
             limits,
             refused: 0,
+            form: crate::form::FormState::new(),
         }
     }
 
@@ -236,6 +241,24 @@ impl Document {
 
     pub(crate) fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// The state of the document's controls.
+    pub fn form(&self) -> &crate::form::FormState {
+        &self.form
+    }
+
+    /// The same, to change.
+    pub fn form_mut(&mut self) -> &mut crate::form::FormState {
+        &mut self.form
+    }
+
+    /// Reset the controls of `form`, or of the whole document, to their
+    /// markup's values.
+    pub fn reset_form(&mut self, form: Option<NodeId>) {
+        let mut state = std::mem::take(&mut self.form);
+        state.reset(self, form);
+        self.form = state;
     }
 
     pub(crate) fn refuse(&mut self) {

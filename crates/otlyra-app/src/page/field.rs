@@ -23,8 +23,8 @@ impl PageScene {
     /// and holds nothing at all until every part of it is there — so a caret, a
     /// selection and a hit test all have to be counted in what is *drawn*.
     pub(super) fn field_text(&self, node: NodeId) -> String {
-        otlyra_dom::form::temporal_display(&self.document, &self.form, node)
-            .unwrap_or_else(|| self.form.value(&self.document, node).to_owned())
+        otlyra_dom::form::temporal_display(&self.document, self.document.form(), node)
+            .unwrap_or_else(|| self.document.form().value(&self.document, node).to_owned())
     }
 
     /// The reader typed. Returns whether the page has to be drawn again.
@@ -68,13 +68,13 @@ impl PageScene {
         }
         // What is typed over a selection replaces it.
         self.take_field_selection();
-        let mut value = self.form.value(&self.document, node).to_owned();
+        let mut value = self.document.form().value(&self.document, node).to_owned();
         let at = self.caret.min(value.len());
         value.insert_str(at, &text);
         self.caret = at + text.len();
         self.field_anchor = Some(self.caret);
         self.restart_caret();
-        self.form.set_value(node, value);
+        self.document.form_mut().set_value(node, value);
         self.value_changed(node);
         self.refresh_suggestions(node);
         true
@@ -115,7 +115,7 @@ impl PageScene {
             self.refresh_suggestions(node);
             return true;
         }
-        let mut value = self.form.value(&self.document, node).to_owned();
+        let mut value = self.document.form().value(&self.document, node).to_owned();
         let at = self.caret.min(value.len());
         match action {
             EditAction::Backspace => {
@@ -159,7 +159,7 @@ impl PageScene {
                 return true;
             }
         }
-        self.form.set_value(node, value);
+        self.document.form_mut().set_value(node, value);
         self.value_changed(node);
         self.refresh_suggestions(node);
         true
@@ -184,11 +184,11 @@ impl PageScene {
         let Some((node, from, to)) = self.field_selection() else {
             return false;
         };
-        let mut value = self.form.value(&self.document, node).to_owned();
+        let mut value = self.document.form().value(&self.document, node).to_owned();
         value.replace_range(from..to, "");
         self.caret = from;
         self.field_anchor = Some(from);
-        self.form.set_value(node, value);
+        self.document.form_mut().set_value(node, value);
         true
     }
 
@@ -318,7 +318,7 @@ impl PageScene {
     /// What the focused control holds, for a panel that wants to show it.
     pub fn focused_value(&self) -> Option<&str> {
         let node = self.interaction.focus?;
-        Some(self.form.value(&self.document, node))
+        Some(self.document.form().value(&self.document, node))
     }
 }
 

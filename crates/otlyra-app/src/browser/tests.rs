@@ -4103,3 +4103,51 @@ fn keys_reach_the_page_and_a_cancelled_keydown_types_nothing() {
         );
     });
 }
+
+/// What the reader typed and ticked is what script reads, and what script
+/// writes is what the field shows and the reader keeps typing into.
+#[test]
+fn script_reads_and_writes_what_the_reader_typed_and_ticked() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><input id=field value=start style='width:200px;height:30px;margin:0'>\
+             <input id=box type=checkbox style='width:30px;height:30px;margin:0'>\
+             <script>\
+               const field = document.getElementById('field');\
+               const box = document.getElementById('box');\
+               const seen = [];\
+               field.addEventListener('input', () => {\
+                 seen.push(field.value + '/' + field.defaultValue);\
+                 if (field.value.endsWith('!')) field.value = 'reset';\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               });\
+               box.addEventListener('click', () => {\
+                 seen.push('box=' + box.checked + '/' + box.defaultChecked);\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "field");
+        let modifiers = otlyra_platform::Modifiers::default();
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::End,
+            modifiers,
+        });
+        for character in ['x', '!', 'y'] {
+            browser.on_event(PlatformEvent::KeyPressed {
+                key: Key::Character(character),
+                modifiers,
+            });
+            browser.on_event(PlatformEvent::TextInput(character));
+        }
+        press_and_release(&mut browser, "box");
+        assert_eq!(
+            page_log(&browser),
+            "startx/start startx!/start resety/start box=true/false"
+        );
+        let page = browser.page(browser.active).expect("page");
+        let (x, y) = position_of(&browser, "box");
+        let (x, y) = browser.in_page(x, y);
+        assert!(page.is_checked(page.element_at(x, y).expect("box")));
+    });
+}

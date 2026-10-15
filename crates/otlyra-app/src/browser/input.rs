@@ -562,8 +562,26 @@ impl Browser {
             self.page(self.active)?
                 .common_ancestor(press.target, released)
         });
+        // A checkbox or radio button changes before its click is heard, and
+        // changes back if the click is cancelled (HTML's legacy-pre-activation).
+        let (page_x, page_y) = self.in_page(self.pointer.0, self.pointer.1);
+        let pre_activated = clicked
+            .and_then(|_| self.active_page_mut())
+            .and_then(|page| page.pre_activate_pressed(page_x, page_y));
         let cancelled =
             clicked.map(|target| self.world.dispatch_input(press.tab, target, "click", &init));
+        if let Some((control, before)) = pre_activated.as_ref() {
+            if cancelled == Some(true) {
+                if let Some(page) = self.active_page_mut() {
+                    page.restore_checkedness(before);
+                }
+            } else {
+                self.world
+                    .dispatch_input(press.tab, *control, "input", "{}");
+                self.world
+                    .dispatch_input(press.tab, *control, "change", "{}");
+            }
+        }
         if press.clicks == 2
             && let Some(target) = clicked
         {
@@ -576,6 +594,10 @@ impl Browser {
             && self.link_under_pointer().as_deref() == Some(link.as_str())
         {
             self.navigate_from(&link, false);
+        }
+        // The control's own activation has happened here, or must not.
+        if pre_activated.is_some() {
+            return Some(true);
         }
         cancelled
     }

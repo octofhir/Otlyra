@@ -110,8 +110,8 @@ impl PageScene {
             return false;
         }
         let value = otlyra_dom::form::temporal_value(&shown, kind);
-        self.form.set_draft(node, shown, value);
-        self.form.note_interaction(node);
+        self.document.form_mut().set_draft(node, shown, value);
+        self.document.form_mut().note_interaction(node);
         self.invalidate_styles();
         true
     }

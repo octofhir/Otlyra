@@ -161,6 +161,52 @@ impl ElementRef {
         self.set("class", &value)
     }
 
+    /// What a form control holds: what the reader or script put in it, or its
+    /// markup's value. Read by the glue's `value` accessors.
+    #[method(name = "__otlyraControlValue")]
+    fn js_control_value(&self) -> Result<String, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            document.form().value(document, id).to_owned()
+        })
+    }
+
+    /// Give a form control a value of its own, leaving its markup's alone
+    /// (HTML's dirty value flag).
+    #[method(name = "__otlyraSetControlValue", length = 1)]
+    fn js_set_control_value(&self, value: String) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            document.form_mut().set_value(id, value);
+        })
+    }
+
+    /// Whether a checkable control is checked.
+    #[method(name = "__otlyraControlChecked")]
+    fn js_control_checked(&self) -> Result<bool, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            document.form().checkedness(document, id)
+        })
+    }
+
+    /// Check or uncheck a control; checking a radio button unchecks the rest
+    /// of its group.
+    #[method(name = "__otlyraSetControlChecked", length = 1)]
+    fn js_set_control_checked(&self, checked: bool) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            if checked {
+                for other in otlyra_dom::form::radio_group(document, id) {
+                    if other != id {
+                        document.form_mut().set_checkedness(other, false);
+                    }
+                }
+            }
+            document.form_mut().set_checkedness(id, checked);
+        })
+    }
+
     #[method(name = "getAttribute", length = 1)]
     fn js_get_attribute(&self, name: String) -> Result<Option<String>, JsError> {
         let name = self.attribute_name(name)?;
