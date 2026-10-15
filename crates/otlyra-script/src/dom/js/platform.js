@@ -70,6 +70,7 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
     // it, so its presence alone asks for moves.
     if (document.querySelector('[onmousemove], [onpointermove]')) nativePointerMovesWanted();
     if (document.querySelector('[onscroll]')) nativeScrollEventsWanted();
+    if (document.querySelector('[onwheel]')) nativeWheelEventsWanted();
     // `DOMContentLoaded` bubbles and `load` does not, which is not a detail:
     // half the pages on the web listen for the first one on `window`, and
     // they hear it only because it travels up from the document.

@@ -122,6 +122,12 @@ impl DocumentRef {
         super::note_geometry_wanted();
     }
 
+    /// A wheel listener was registered, so the wheel is reported first.
+    #[static_method(name = "__wheelEventsWanted")]
+    fn js_wheel_events_wanted() {
+        super::note_wheel_events_wanted();
+    }
+
     /// A scroll listener was registered, so scrolling is reported.
     #[static_method(name = "__scrollEventsWanted")]
     fn js_scroll_events_wanted() {

@@ -1032,3 +1032,32 @@ impl Browser {
         true
     }
 }
+
+impl Browser {
+    /// Tell a page that listens about the wheel before it scrolls; answers
+    /// whether the page cancelled it, which keeps the page where it is.
+    pub(super) fn page_wheel(&mut self, x: f64, y: f64) -> bool {
+        let tab = self.tabs[self.active].id;
+        if !self.world.wants_wheel_events(tab) {
+            return false;
+        }
+        let Some((client_x, client_y, target)) = self.page_point() else {
+            return false;
+        };
+        let zoom = f64::from(self.zoom);
+        let init = serde_json::json!({
+            "clientX": client_x,
+            "clientY": client_y,
+            "screenX": client_x,
+            "screenY": client_y,
+            "deltaX": x / zoom,
+            "deltaY": y / zoom,
+            "deltaMode": 0,
+        })
+        .to_string();
+        self.sync_world();
+        let cancelled = self.world.dispatch_input(tab, target, "wheel", &init);
+        self.apply_world_events();
+        cancelled
+    }
+}

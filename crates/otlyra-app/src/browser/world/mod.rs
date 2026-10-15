@@ -565,6 +565,17 @@ impl PageWorld {
         answer
     }
 
+    /// Whether `tab`'s page listens for wheel events.
+    pub(super) fn wants_wheel_events(&self, tab: TabId) -> bool {
+        self.slots.get(&tab).is_some_and(|slot| {
+            slot.pending.is_none()
+                && slot
+                    .scripts
+                    .as_ref()
+                    .is_some_and(|scripts| scripts.wants_wheel_events())
+        })
+    }
+
     /// Whether `tab`'s page listens for scroll events.
     pub(super) fn wants_scroll_events(&self, tab: TabId) -> bool {
         self.slots.get(&tab).is_some_and(|slot| {

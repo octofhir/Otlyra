@@ -114,4 +114,5 @@ const nativePointerMovesWanted = take(Document, '__pointerMovesWanted');
 const nativeScrollTo = take(Document, '__scrollTo');
 const nativeGeometryWanted = take(Document, '__geometryWanted');
 const nativeScrollEventsWanted = take(Document, '__scrollEventsWanted');
+const nativeWheelEventsWanted = take(Document, '__wheelEventsWanted');
 const nativeAttributeRecords = take(Element.prototype, '__attributeRecords');

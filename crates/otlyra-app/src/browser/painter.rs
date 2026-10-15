@@ -1108,6 +1108,8 @@ impl Browser {
                     self.bookmarks_page.scroll_by(y);
                 } else if self.tabs[self.active].system == Some(SystemPage::Cookies) {
                     self.cookies_page.scroll_by(y);
+                } else if self.page_wheel(x, y) {
+                    // The page heard the wheel and kept it.
                 } else if let Some(page) = self.world.page_mut(self.tabs[self.active].id) {
                     // The wheel goes to whatever is under the pointer: a box that
                     // scrolls takes it first, and the page takes it once that box

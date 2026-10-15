@@ -122,6 +122,8 @@ pub struct PageState {
     wants_scroll_events: bool,
     /// Whether an intersection or resize observer is watching.
     wants_geometry: bool,
+    /// Whether the page listens for wheel events.
+    wants_wheel_events: bool,
     /// Pictures asked for by `<img>` elements outside the document — a
     /// `new Image()` preloading — which nothing else would fetch.
     image_requests: Vec<otlyra_dom::NodeId>,
@@ -245,6 +247,12 @@ impl PageState {
         std::mem::take(&mut self.image_requests)
     }
 
+    /// Whether the page listens for wheel events.
+    #[must_use]
+    pub fn wants_wheel_events(&self) -> bool {
+        self.wants_wheel_events
+    }
+
     /// Whether an intersection or resize observer is watching.
     #[must_use]
     pub fn wants_geometry(&self) -> bool {
@@ -320,6 +328,11 @@ pub(crate) fn request_image(node: otlyra_dom::NodeId) {
             state.image_requests.push(node);
         }
     });
+}
+
+/// The page registered a wheel listener.
+pub(crate) fn note_wheel_events_wanted() {
+    with_state_mut(|state| state.wants_wheel_events = true);
 }
 
 /// An intersection or resize observer started watching.

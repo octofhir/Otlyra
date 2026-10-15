@@ -173,6 +173,11 @@ pub trait ScriptRunner {
         false
     }
 
+    /// Whether the page listens for wheel events.
+    fn wants_wheel_events(&self) -> bool {
+        false
+    }
+
     /// Whether an intersection or resize observer is watching, so the frame
     /// step is owed whenever what was drawn moved.
     fn wants_geometry_updates(&self) -> bool {

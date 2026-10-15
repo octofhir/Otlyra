@@ -4648,3 +4648,37 @@ fn script_click_performs_the_element_s_activation() {
         );
     });
 }
+
+/// A page that listens for the wheel hears it before it scrolls, and one
+/// that cancels it is not scrolled.
+#[test]
+fn the_wheel_reaches_a_page_that_listens_and_may_be_kept() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><div id=map style=height:300px>map</div><div style=height:4000px></div>\
+             <script>\
+               let keep = true;\
+               window.addEventListener('wheel', (event) => {\
+                 document.documentElement.dataset.log = 'wheel:' + event.deltaY + ':' + event.target.id + ':' + event.cancelable;\
+                 if (keep) event.preventDefault();\
+                 keep = false;\
+               });\
+             </script>",
+        );
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: 100.0,
+            y: UI_HEIGHT + 50.0,
+        });
+        let wheel = PlatformEvent::Scroll {
+            x: 0.0,
+            y: 120.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: otlyra_platform::Modifiers::default(),
+        };
+        browser.on_event(wheel);
+        assert_eq!(page_log(&browser), "wheel:120:map:true");
+        assert_eq!(browser.page(browser.active).expect("page").scroll(), 0.0);
+        browser.on_event(wheel);
+        assert!(browser.page(browser.active).expect("page").scroll() > 0.0);
+    });
+}

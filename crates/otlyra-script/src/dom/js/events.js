@@ -21,6 +21,7 @@ const listenersFor = (target, type, create) => {
     if (!create) return undefined;
     if (type === 'mousemove' || type === 'pointermove') nativePointerMovesWanted();
     if (type === 'scroll') nativeScrollEventsWanted();
+    if (type === 'wheel') nativeWheelEventsWanted();
     list = [];
     byType.set(type, list);
   }
