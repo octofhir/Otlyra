@@ -158,6 +158,8 @@ pub struct PageScene {
     painted: Option<(Painted, std::sync::Arc<DisplayList>)>,
     /// How many lists have been built rather than reused.
     builds: u64,
+    /// The build and scroll the geometry script last read was taken at.
+    geometry_key: Option<(u64, u32)>,
     /// Where the pointer and the focus are.
     interaction: otlyra_css::state::Interaction,
     /// Where the caret sits in the focused field, as a byte offset into its value.
@@ -396,6 +398,7 @@ impl PageScene {
             damage: Damage::STYLE,
             painted: None,
             builds: 0,
+            geometry_key: None,
             interaction: otlyra_css::state::Interaction::none(),
             caret: 0,
             field_anchor: None,
@@ -461,7 +464,45 @@ impl PageScene {
         // Where the reader is, which script reads as `scrollY`.
         self.document
             .set_scroll_position((0.0, f64::from(self.scroll)));
+        self.lend_geometry();
         run(&mut self.document)
+    }
+
+    /// Give script the boxes the last frame drew, in client coordinates, once
+    /// per frame and scroll position: what `getBoundingClientRect` measures.
+    fn lend_geometry(&mut self) {
+        let key = (self.builds, self.scroll.to_bits());
+        if self.geometry_key == Some(key) {
+            return;
+        }
+        self.geometry_key = Some(key);
+        let top = self
+            .painted
+            .as_ref()
+            .map_or(0.0, |(painted, _)| painted.top);
+        let mut rects: std::collections::HashMap<NodeId, [f32; 4]> =
+            std::collections::HashMap::new();
+        for (rect, id) in self.targets_on_screen() {
+            let Some(node) = self.boxes.get(id).and_then(|layout| layout.node) else {
+                continue;
+            };
+            let next = [
+                rect.x0 as f32,
+                rect.y0 as f32 - top,
+                rect.x1 as f32,
+                rect.y1 as f32 - top,
+            ];
+            rects
+                .entry(node)
+                .and_modify(|union| {
+                    union[0] = union[0].min(next[0]);
+                    union[1] = union[1].min(next[1]);
+                    union[2] = union[2].max(next[2]);
+                    union[3] = union[3].max(next[3]);
+                })
+                .or_insert(next);
+        }
+        self.document.set_geometry(std::sync::Arc::new(rects));
     }
 
     /// Everything style and layout produced for this document is out of date,

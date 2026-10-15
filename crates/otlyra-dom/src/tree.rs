@@ -54,6 +54,9 @@ pub struct Document {
     focused: Option<NodeId>,
     /// Where the window is scrolled to, in CSS pixels, as script reads it.
     scroll: (f64, f64),
+    /// Each laid-out element's border box on the last frame, `[left, top,
+    /// right, bottom]` in client coordinates, as script measures it.
+    geometry: std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -88,6 +91,7 @@ impl Document {
             images: std::collections::HashMap::new(),
             focused: None,
             scroll: (0.0, 0.0),
+            geometry: std::sync::Arc::default(),
         }
     }
 
@@ -262,6 +266,28 @@ impl Document {
 
     pub(crate) fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// `node`'s border box on the last frame, in client coordinates.
+    pub fn client_rect(&self, node: NodeId) -> Option<[f32; 4]> {
+        self.geometry.get(&node).copied()
+    }
+
+    /// The bottom-right corner of everything laid out, in client coordinates.
+    pub fn laid_out_extent(&self) -> (f32, f32) {
+        self.geometry
+            .values()
+            .fold((0.0, 0.0), |(right, bottom), rect| {
+                (right.max(rect[2]), bottom.max(rect[3]))
+            })
+    }
+
+    /// Hand over the last frame's element boxes.
+    pub fn set_geometry(
+        &mut self,
+        geometry: std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>,
+    ) {
+        self.geometry = geometry;
     }
 
     /// Where the window is scrolled to, `(x, y)` in CSS pixels.

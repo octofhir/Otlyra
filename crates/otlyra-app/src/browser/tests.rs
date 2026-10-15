@@ -4438,3 +4438,26 @@ fn scrolling_is_read_heard_and_driven_by_script() {
         assert_eq!(log.matches("scroll:true").count(), 2, "{log}");
     });
 }
+
+/// Script measures what the last frame drew, in client coordinates.
+#[test]
+fn script_measures_the_boxes_the_page_drew() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=measure style='display:block;width:100px;height:30px;margin:0;padding:0;border:0'>m</button>\
+             <div id=box style='width:200px;height:50px;margin-left:10px'></div>\
+             <div style=height:3000px></div>\
+             <script>\
+               document.getElementById('measure').addEventListener('click', () => {\
+                 const box = document.getElementById('box');\
+                 const rect = box.getBoundingClientRect();\
+                 document.documentElement.dataset.log = [rect.left, rect.top, rect.width, rect.height,\
+                   box.offsetWidth, box.offsetTop, document.documentElement.scrollHeight > 3000,\
+                   box.getClientRects().length].join(' ');\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "measure");
+        assert_eq!(page_log(&browser), "10 30 200 50 200 30 true 1");
+    });
+}

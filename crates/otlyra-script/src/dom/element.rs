@@ -182,6 +182,18 @@ impl ElementRef {
         })
     }
 
+    /// The element's border box on the last frame, `[left, top, right,
+    /// bottom]` in client coordinates, or null when it was not drawn.
+    #[method(name = "__otlyraClientRect")]
+    fn js_client_rect(&self) -> Result<Option<Vec<f64>>, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            document
+                .client_rect(id)
+                .map(|rect| rect.iter().map(|&edge| f64::from(edge)).collect())
+        })
+    }
+
     /// `focus()`: the element is focused for script at once, and the browser
     /// moves its own focus (and fires the events) after the turn.
     #[method(name = "__otlyraFocus")]

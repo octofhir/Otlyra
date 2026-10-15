@@ -116,13 +116,65 @@ defineGlobal('__otlyraFramesPending', function __otlyraFramesPending() {
   return frameCallbacks.size;
 });
 
-// Geometry, which needs layout and has none to read yet. Zeroes rather than
-// an exception: a page that measures an element and gets zero lays itself out
-// as if the element were empty, which is wrong but renderable, where a throw
-// takes the rest of the script with it.
-define(Element.prototype, 'getBoundingClientRect', function getBoundingClientRect() {
-  return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+// Geometry, read from the boxes the last frame drew. Script that changes the
+// tree and measures in the same turn reads the frame before its change; an
+// element that was not drawn measures zero rather than throwing, which a page
+// lays out as if it were empty — wrong, but renderable.
+const clientRectOf = (element) => {
+  const edges = element.__otlyraClientRect();
+  const [left, top, right, bottom] = edges || [0, 0, 0, 0];
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    toJSON() {
+      return { x: left, y: top, left, top, right, bottom, width: right - left, height: bottom - top };
+    },
+  };
+};
+method(Element.prototype, 'getBoundingClientRect', function getBoundingClientRect() {
+  return clientRectOf(this);
 });
+method(Element.prototype, 'getClientRects', function getClientRects() {
+  return this.__otlyraClientRect() ? [clientRectOf(this)] : [];
+});
+const isScrollingRoot = (element) =>
+  element === document.documentElement || element === document.body;
+for (const [name, measure] of [
+  ['offsetWidth', (rect) => rect.width],
+  ['offsetHeight', (rect) => rect.height],
+  ['offsetLeft', (rect) => rect.left + scrollPosition()[0]],
+  ['offsetTop', (rect) => rect.top + scrollPosition()[1]],
+]) {
+  accessor(HTMLElement.prototype, name, function () {
+    return Math.round(measure(clientRectOf(this)));
+  });
+}
+accessor(HTMLElement.prototype, 'offsetParent', function () {
+  return this.isConnected && this !== document.body ? document.body : null;
+});
+for (const [name, axis] of [['clientWidth', 0], ['clientHeight', 1]]) {
+  accessor(Element.prototype, name, function () {
+    if (this === document.documentElement) return axis === 0 ? innerWidth : innerHeight;
+    const rect = clientRectOf(this);
+    return Math.round(axis === 0 ? rect.width : rect.height);
+  });
+}
+for (const [name, axis] of [['scrollWidth', 0], ['scrollHeight', 1]]) {
+  accessor(Element.prototype, name, function () {
+    if (isScrollingRoot(this)) {
+      const extent = document.__otlyraExtent[axis] + scrollPosition()[axis];
+      return Math.round(Math.max(extent, axis === 0 ? innerWidth : innerHeight));
+    }
+    const rect = clientRectOf(this);
+    return Math.round(axis === 0 ? rect.width : rect.height);
+  });
+}
 
 if (typeof CustomEvent === 'undefined' && typeof Event !== 'undefined') {
   class CustomEventShim extends Event {

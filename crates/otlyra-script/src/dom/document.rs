@@ -256,6 +256,16 @@ impl DocumentRef {
         super::current_script().map(|element| JsNode::new(self.node.doc, element))
     }
 
+    /// The right and bottom edge of everything the last frame laid out, in
+    /// client coordinates.
+    #[getter(name = "__otlyraExtent")]
+    fn js_extent(&self) -> Result<Vec<f64>, JsError> {
+        super::with_document(self.node.doc, |document| {
+            let (right, bottom) = document.laid_out_extent();
+            vec![f64::from(right), f64::from(bottom)]
+        })
+    }
+
     /// Where the window is scrolled to, `[x, y]`.
     #[getter(name = "__otlyraScroll")]
     fn js_scroll(&self) -> Result<Vec<f64>, JsError> {
