@@ -4402,3 +4402,39 @@ fn script_focus_moves_the_browser_focus_and_is_heard() {
         assert_eq!(page_log(&browser), "active:a focus:a");
     });
 }
+
+/// Script reads where the reader scrolled, hears that they did, and moves the
+/// window itself.
+#[test]
+fn scrolling_is_read_heard_and_driven_by_script() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=jump style='width:100px;height:30px'>jump</button>\
+             <div style=height:4000px></div>\
+             <script>\
+               const seen = [];\
+               const note = (text) => {\
+                 seen.push(text);\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               };\
+               window.addEventListener('scroll', () => note('scroll:' + (scrollY > 0)));\
+               document.getElementById('jump').addEventListener('click', () => {\
+                 scrollTo(0, 500);\
+                 note('after:' + scrollY + ':' + document.scrollingElement.scrollTop);\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "jump");
+        let page = browser.page(browser.active).expect("page");
+        assert_eq!(page.scroll(), 500.0, "the window went where script sent it");
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 120.0,
+            source: otlyra_platform::ScrollSource::Wheel,
+            modifiers: otlyra_platform::Modifiers::default(),
+        });
+        let log = page_log(&browser);
+        assert!(log.starts_with("after:500:500 scroll:true"), "{log}");
+        assert_eq!(log.matches("scroll:true").count(), 2, "{log}");
+    });
+}

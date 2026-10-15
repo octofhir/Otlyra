@@ -102,6 +102,25 @@ impl DocumentRef {
     /// JavaScript, where the collector can see them, and tells this so the
     /// browser can ask whether a frame is owed without entering the isolate to
     /// find out.
+    /// `scrollTo` and its kin: where script asked the window to go.
+    #[static_method(name = "__scrollTo")]
+    fn js_scroll_to(x: f64, y: f64) {
+        let finite = |value: f64| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        super::request_scroll(finite(x), finite(y));
+    }
+
+    /// A scroll listener was registered, so scrolling is reported.
+    #[static_method(name = "__scrollEventsWanted")]
+    fn js_scroll_events_wanted() {
+        super::note_scroll_events_wanted();
+    }
+
     /// A listener for pointer movement was registered, so moves are sent.
     #[static_method(name = "__pointerMovesWanted")]
     fn js_pointer_moves_wanted() {
@@ -235,6 +254,15 @@ impl DocumentRef {
     #[getter(name = "currentScript")]
     fn js_current_script(&self) -> Option<JsNode> {
         super::current_script().map(|element| JsNode::new(self.node.doc, element))
+    }
+
+    /// Where the window is scrolled to, `[x, y]`.
+    #[getter(name = "__otlyraScroll")]
+    fn js_scroll(&self) -> Result<Vec<f64>, JsError> {
+        super::with_document(self.node.doc, |document| {
+            let (x, y) = document.scroll_position();
+            vec![x, y]
+        })
     }
 
     /// The focused element, or null; `activeElement` falls back to the body.

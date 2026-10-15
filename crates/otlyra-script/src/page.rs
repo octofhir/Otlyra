@@ -617,6 +617,14 @@ impl ScriptRunner for PageScripts {
         PageScripts::automation_script(self, document, source, call, await_promise)
     }
 
+    fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
+        self.state.take_scroll_request()
+    }
+
+    fn wants_scroll_events(&self) -> bool {
+        self.host.is_some() && self.state.wants_scroll_events()
+    }
+
     fn take_focus_request(&mut self) -> Option<Option<NodeId>> {
         self.state.take_focus_request()
     }

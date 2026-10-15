@@ -918,3 +918,32 @@ impl Browser {
         self.interface && self.ui.owns_pointer()
     }
 }
+
+impl Browser {
+    /// The active page and how far down it is scrolled.
+    pub(super) fn page_scroll(&self) -> Option<(super::TabId, f32)> {
+        let tab = self.tabs.get(self.active)?;
+        Some((tab.id, self.page(self.active)?.scroll()))
+    }
+
+    /// Tell a page that listens that it scrolled: once per event, however
+    /// far, which is the coalescing a frame-paced scroll event has.
+    pub(super) fn page_scrolled(&mut self, before: Option<(super::TabId, f32)>) {
+        let after = self.page_scroll();
+        let Some((tab, _)) = after else {
+            return;
+        };
+        if before == after || before.is_none_or(|(old, _)| old != tab) {
+            return;
+        }
+        if !self.world.wants_scroll_events(tab) {
+            return;
+        }
+        let Some(root) = self.page(self.active).map(|page| page.document().root()) else {
+            return;
+        };
+        self.sync_world();
+        self.world.dispatch_input(tab, root, "scroll", "{}");
+        self.apply_world_events();
+    }
+}

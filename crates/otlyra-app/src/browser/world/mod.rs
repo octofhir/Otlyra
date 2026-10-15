@@ -544,6 +544,17 @@ impl PageWorld {
         answer
     }
 
+    /// Whether `tab`'s page listens for scroll events.
+    pub(super) fn wants_scroll_events(&self, tab: TabId) -> bool {
+        self.slots.get(&tab).is_some_and(|slot| {
+            slot.pending.is_none()
+                && slot
+                    .scripts
+                    .as_ref()
+                    .is_some_and(|scripts| scripts.wants_scroll_events())
+        })
+    }
+
     /// Whether `tab`'s page listens for pointer movement.
     pub(super) fn wants_pointer_moves(&self, tab: TabId) -> bool {
         self.slots.get(&tab).is_some_and(|slot| {
@@ -712,6 +723,9 @@ impl PageWorld {
 fn after_script_turn(page: &mut PageScene, scripts: &mut dyn otlyra_html::ScriptRunner) {
     if scripts.take_mutated() {
         page.document_changed();
+    }
+    if let Some((_, y)) = scripts.take_scroll_request() {
+        page.set_scroll(y as f32);
     }
     if let Some(request) = scripts.take_focus_request() {
         match request {

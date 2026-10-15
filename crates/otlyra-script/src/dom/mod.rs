@@ -116,6 +116,10 @@ pub struct PageState {
     /// The focus script asked for in this turn: an element, or none for a
     /// blur. The browser applies it, and fires the focus events, after it.
     focus_request: Option<Option<otlyra_dom::NodeId>>,
+    /// Where script asked the window to scroll to in this turn.
+    scroll_request: Option<(f64, f64)>,
+    /// Whether the page listens for scroll events.
+    wants_scroll_events: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -226,6 +230,17 @@ impl PageState {
         self.current_script = element;
     }
 
+    /// Take where script asked the window to scroll to, if it asked.
+    pub fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
+        self.scroll_request.take()
+    }
+
+    /// Whether the page listens for scroll events.
+    #[must_use]
+    pub fn wants_scroll_events(&self) -> bool {
+        self.wants_scroll_events
+    }
+
     /// Take the focus script asked for, if it asked.
     pub fn take_focus_request(&mut self) -> Option<Option<otlyra_dom::NodeId>> {
         self.focus_request.take()
@@ -269,6 +284,22 @@ pub(crate) fn request_navigation(navigation: Navigation) {
     // Last one wins. A script that sets `location.href` twice in a turn has
     // changed its mind, and a browser goes where it ended up.
     with_state_mut(|state| state.navigation = Some(navigation));
+}
+
+/// Script asked the window to scroll to `(x, y)`: recorded for the browser,
+/// and answered at once to script reading the lent document.
+pub(crate) fn request_scroll(x: f64, y: f64) {
+    with_state_mut(|state| state.scroll_request = Some((x, y)));
+    LOANED.with(|slot| {
+        if let Some(document) = slot.borrow_mut().as_mut() {
+            document.set_scroll_position((x, y));
+        }
+    });
+}
+
+/// The page registered a scroll listener.
+pub(crate) fn note_scroll_events_wanted() {
+    with_state_mut(|state| state.wants_scroll_events = true);
 }
 
 /// Script asked to move the focus to `node`, or to drop it.

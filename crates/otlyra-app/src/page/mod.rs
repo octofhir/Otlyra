@@ -458,6 +458,9 @@ impl PageScene {
     /// `changed` is the binding layer's answer to *did script touch the tree*.
     /// Only then is the style and layout it produced out of date.
     pub fn with_document<R>(&mut self, run: impl FnOnce(&mut Document) -> R) -> R {
+        // Where the reader is, which script reads as `scrollY`.
+        self.document
+            .set_scroll_position((0.0, f64::from(self.scroll)));
         run(&mut self.document)
     }
 

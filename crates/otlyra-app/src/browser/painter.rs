@@ -161,7 +161,9 @@ impl Painter for Browser {
     fn on_event(&mut self, event: PlatformEvent) {
         // A focus script moved since the last event is heard first.
         self.sync_page_focus();
+        let scroll_before = self.page_scroll();
         self.on_platform_event(event);
+        self.page_scrolled(scroll_before);
         if matches!(event, PlatformEvent::PointerMoved { .. }) {
             self.page_pointer_moved();
         }

@@ -111,4 +111,6 @@ const nativeNavigate = take(Document, '__navigate');
 const nativeReload = take(Document, '__reload');
 const nativeFrameRequested = take(Document, '__frameRequested');
 const nativePointerMovesWanted = take(Document, '__pointerMovesWanted');
+const nativeScrollTo = take(Document, '__scrollTo');
+const nativeScrollEventsWanted = take(Document, '__scrollEventsWanted');
 const nativeAttributeRecords = take(Element.prototype, '__attributeRecords');

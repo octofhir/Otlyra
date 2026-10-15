@@ -69,6 +69,7 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
     // A parsed `onmousemove` registers its listener only when an event finds
     // it, so its presence alone asks for moves.
     if (document.querySelector('[onmousemove], [onpointermove]')) nativePointerMovesWanted();
+    if (document.querySelector('[onscroll]')) nativeScrollEventsWanted();
     // `DOMContentLoaded` bubbles and `load` does not, which is not a detail:
     // half the pages on the web listen for the first one on `window`, and
     // they hear it only because it travels up from the document.
@@ -198,6 +199,7 @@ const INPUT_EVENTS = {
   input: [InputEvent, true, false],
   change: [Event, true, false],
   submit: [SubmitEvent, true, true],
+  scroll: [Event, true, false],
   load: [Event, false, false],
   error: [Event, false, false],
   focus: [FocusEvent, false, false],
@@ -384,3 +386,54 @@ defineGlobal('__otlyraBidiTake', function __otlyraBidiTake() {
   bidiAnswer = null;
   return answer === null ? '' : JSON.stringify(answer);
 });
+
+// The window's scroll position, which the browser settles and script asks to
+// change. Only the document scrolls: an element's own `scrollTop` is zero.
+const scrollPosition = () => document.__otlyraScroll;
+const toScrollNumber = (value, fallback) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+};
+for (const [name, axis] of [['scrollX', 0], ['pageXOffset', 0], ['scrollY', 1], ['pageYOffset', 1]]) {
+  accessor(globalThis, name, function () {
+    return scrollPosition()[axis];
+  });
+}
+const scrollWindowTo = function scrollTo(first, second) {
+  const [x, y] = scrollPosition();
+  if (first !== null && typeof first === 'object') {
+    nativeScrollTo(toScrollNumber(first.left, x), toScrollNumber(first.top, y));
+  } else {
+    nativeScrollTo(toScrollNumber(first, x), toScrollNumber(second, y));
+  }
+};
+defineGlobal('scrollTo', scrollWindowTo);
+defineGlobal('scroll', scrollWindowTo);
+defineGlobal('scrollBy', function scrollBy(first, second) {
+  const [x, y] = scrollPosition();
+  if (first !== null && typeof first === 'object') {
+    nativeScrollTo(x + toScrollNumber(first.left, 0), y + toScrollNumber(first.top, 0));
+  } else {
+    nativeScrollTo(x + toScrollNumber(first, 0), y + toScrollNumber(second, 0));
+  }
+});
+if (!('scrollingElement' in Document.prototype)) {
+  accessor(Document.prototype, 'scrollingElement', function () {
+    return this.documentElement;
+  });
+}
+for (const [name, axis] of [['scrollTop', 1], ['scrollLeft', 0]]) {
+  accessor(
+    Element.prototype,
+    name,
+    function () {
+      return this === document.scrollingElement ? scrollPosition()[axis] : 0;
+    },
+    function (value) {
+      if (this !== document.scrollingElement) return;
+      const [x, y] = scrollPosition();
+      const target = toScrollNumber(value, 0);
+      nativeScrollTo(axis === 0 ? target : x, axis === 1 ? target : y);
+    },
+  );
+}

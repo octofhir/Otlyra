@@ -52,6 +52,8 @@ pub struct Document {
     /// The element that has the focus, as the browser last settled it or
     /// script last asked.
     focused: Option<NodeId>,
+    /// Where the window is scrolled to, in CSS pixels, as script reads it.
+    scroll: (f64, f64),
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -85,6 +87,7 @@ impl Document {
             form: crate::form::FormState::new(),
             images: std::collections::HashMap::new(),
             focused: None,
+            scroll: (0.0, 0.0),
         }
     }
 
@@ -259,6 +262,16 @@ impl Document {
 
     pub(crate) fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// Where the window is scrolled to, `(x, y)` in CSS pixels.
+    pub fn scroll_position(&self) -> (f64, f64) {
+        self.scroll
+    }
+
+    /// Say where the window is scrolled to.
+    pub fn set_scroll_position(&mut self, scroll: (f64, f64)) {
+        self.scroll = scroll;
     }
 
     /// The focused element, if one is.

@@ -157,6 +157,16 @@ pub trait ScriptRunner {
         Err("this page has no script engine".to_owned())
     }
 
+    /// Where script asked the window to scroll to since this was last asked.
+    fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Whether the page listens for scroll events.
+    fn wants_scroll_events(&self) -> bool {
+        false
+    }
+
     /// The focus script asked for since this was last asked: an element, or
     /// `None` inside for a blur.
     fn take_focus_request(&mut self) -> Option<Option<NodeId>> {
