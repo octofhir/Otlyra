@@ -983,6 +983,13 @@ impl WindowedApp<'_> {
 }
 
 impl ApplicationHandler for WindowedApp<'_> {
+    // Expired timers must enqueue their redraw before native redraw dispatch.
+    // In particular, AppKit drains redraws before calling about_to_wait.
+    fn new_events(&mut self, event_loop: &dyn ActiveEventLoop, _: winit::event::StartCause) {
+        self.wake_due(std::time::Instant::now());
+        self.sync_control_flow(event_loop);
+    }
+
     /// Read everything other threads have posted since the last wake.
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
         let _wake = tracing::info_span!("proxy_wake_up").entered();
