@@ -281,6 +281,9 @@ pub fn run(config: WindowConfig, painter: &mut dyn Painter) -> Result<(), Platfo
         // Keep the default for simple painters that supply no menu of their own.
         builder.with_default_menu(config.menu_bar.menus.is_empty());
     }
+    if let Some(trace) = config.startup_trace.as_ref() {
+        trace.mark("event_loop_build_started");
+    }
     let mut event_loop = builder
         .build()
         .map_err(|error| PlatformError::EventLoop(error.to_string()))?;
@@ -989,7 +992,7 @@ impl ApplicationHandler for WindowedApp<'_> {
         self.mark("icon_ready");
 
         if !self.config.menu_bar.menus.is_empty() {
-            match NativeMenu::install(&self.config.menu_bar) {
+            match NativeMenu::install(&self.config.menu_bar, self.config.startup_trace.as_ref()) {
                 Ok(menu) => self.menu = Some(menu),
                 Err(error) => {
                     self.fail(event_loop, error.into());
@@ -1009,6 +1012,7 @@ impl ApplicationHandler for WindowedApp<'_> {
                 self.config.logical_size.1,
             ));
 
+        self.mark("window_attributes_ready");
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::<dyn Window>::from(window),
             Err(error) => {

@@ -158,6 +158,29 @@ class StartupBenchmarkTests(unittest.TestCase):
         self.assertEqual(phases["first_content_delivery"]["samples"], [15])
         self.assertEqual(phases["first_content_to_frame"]["samples"], [10])
 
+    def test_native_bootstrap_costs_keep_their_own_intervals(self):
+        entries = [("browser_ready", 1), ("event_loop_build_started", 2),
+                   ("event_loop_created", 80), ("icon_decode_started", 100),
+                   ("icon_image_created", 102), ("icon_ready", 130),
+                   ("menu_validation_started", 131), ("menu_validation_complete", 132),
+                   ("menu_root_created", 135), ("menu_first_submenu_created", 140),
+                   ("menu_first_item_created", 145), ("menu_first_submenu_built", 150),
+                   ("menu_first_submenu_attached", 155), ("menu_items_created", 160),
+                   ("menu_installed", 180), ("menu_ready", 181),
+                   ("window_attributes_ready", 182), ("window_created", 220)]
+        phases = benchmark.phase_metrics([{"stages": [
+            {"name": name, "ms": ms} for name, ms in entries
+        ]}])
+        expected = {"event_loop_preparation": 1, "native_event_loop_build": 78,
+                    "icon_decode": 2, "icon_install": 28, "menu_validation": 1,
+                    "menu_root_creation": 3, "menu_first_submenu_creation": 5,
+                    "menu_first_item_creation": 5, "menu_first_submenu_build": 10,
+                    "menu_first_submenu_attach": 5, "menu_item_creation": 25,
+                    "menu_install": 20, "window_attribute_preparation": 1,
+                    "native_window_creation": 38}
+        for name, duration in expected.items():
+            self.assertEqual(phases[name]["samples"], [duration])
+
 
 if __name__ == "__main__":
     unittest.main()

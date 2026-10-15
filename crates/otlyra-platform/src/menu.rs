@@ -231,21 +231,46 @@ pub(crate) struct NativeMenu {
 
 impl NativeMenu {
     /// Build `bar` and install it as the application menu.
-    pub(crate) fn install(bar: &MenuBar) -> Result<Self, MenuError> {
+    pub(crate) fn install(
+        bar: &MenuBar,
+        trace: Option<&crate::StartupTrace>,
+    ) -> Result<Self, MenuError> {
+        let mark = |name| {
+            if let Some(trace) = trace {
+                trace.mark(name);
+            }
+        };
+        mark("menu_validation_started");
         bar.validate()?;
+        mark("menu_validation_complete");
 
         let menu = muda::Menu::new();
-        for section in &bar.menus {
+        mark("menu_root_created");
+        for (section_index, section) in bar.menus.iter().enumerate() {
             let submenu = muda::Submenu::new(&section.title, true);
-            for entry in &section.entries {
+            if section_index == 0 {
+                mark("menu_first_submenu_created");
+            }
+            for (entry_index, entry) in section.entries.iter().enumerate() {
                 append(&submenu, entry)?;
+                if section_index == 0 && entry_index == 0 {
+                    mark("menu_first_item_created");
+                }
+            }
+            if section_index == 0 {
+                mark("menu_first_submenu_built");
             }
             menu.append(&submenu)
                 .map_err(|error| MenuError::Platform(error.to_string()))?;
+            if section_index == 0 {
+                mark("menu_first_submenu_attached");
+            }
         }
+        mark("menu_items_created");
 
         #[cfg(target_os = "macos")]
         menu.init_for_nsapp();
+        mark("menu_installed");
 
         Ok(Self { menu })
     }

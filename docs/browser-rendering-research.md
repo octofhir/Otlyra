@@ -675,6 +675,64 @@ callback remained busy for 500 ms; the full serial suite also passed. This
 contention result is retained in `target/context-menu-workspace.log`, alongside
 `target/context-menu-workspace-serial.log` and `target/context-menu-responsiveness.log`.
 
+
+## Native bootstrap phase attribution
+
+The startup trace now distinguishes event-loop preparation from the native build
+call, encoded-image preparation from Dock icon installation, and menu validation,
+root/submenu/item creation, root attachment and application-menu installation.
+Window-attribute preparation is separate from hidden native window creation.
+Optional trace marks keep the existing platform path and public startup report
+schema; the benchmark extracts intervals per run and skips unavailable pairs in
+older reports. Eight protocol tests cover the additional intervals and preserve
+the existing four strict percentile gates.
+
+These marks measure elapsed intervals around native calls, including lazy work
+performed inside them. For example, the image-creation marker does not prove
+that AppKit has eagerly decoded every representation. The separate `sample`
+probes ended without useful call graphs because the auto-exiting app completed
+too quickly, so they provide no stack-attribution evidence and are excluded from
+the timing distributions. Internal AppKit/dyld attribution remains follow-up.
+
+
+On Apple M1/macOS 26.5 at 1024×768 logical/2× native scale, the diagnostic release
+used 20 alternating-order pairs after three warmups per backend. Every phase
+below has all 20 candidate samples (p50/p95 in ms):
+
+| Elapsed native interval | GPU series | CPU series |
+| --- | --- | --- |
+| Native event-loop build | 72.82 / 88.41 | 66.17 / 76.49 |
+| Encoded-image preparation | 1.58 / 2.32 | 1.41 / 1.60 |
+| Dock icon installation | 31.32 / 37.21 | 29.51 / 30.53 |
+| Menu object creation | 6.24 / 8.86 | 6.46 / 12.22 |
+| Application-menu installation | 19.65 / 25.78 | 18.79 / 23.63 |
+| Hidden native window creation | 48.08 / 52.76 | 44.53 / 51.15 |
+| Confirmed surface → first scene | 46.32 / 61.00 | 21.13 / 29.37 |
+| GPU device/presenter setup | 20.11 / 51.42 | 8.00 / 20.13 |
+
+Menu validation is only 0.024 ms at p50, root creation 0.08 ms and first root
+attachment 0.12–0.13 ms. The larger menu cost is installation, rather than
+accelerator validation or copying the first submenu. Icon and menu setup
+currently precede hidden-window creation, so they also precede confirmed-surface
+content work and GPU setup. This identifies an overlap opportunity while
+retaining their completion before actual visibility.
+
+System load was substantial and changed between series: one-minute load average
+49.76 at the start and 56.39 at completion. Compare matched variants within a
+series, not GPU versus CPU rows. Own build/test work had finished before
+sampling. About first-frame-report p50/p95 control→candidate was
+340.42/422.30→340.08/380.48 ms GPU and 298.76/318.98→290.81/316.64 ms CPU.
+Paired median changes were −12.76/−6.04 ms respectively. This diagnostic change
+establishes attribution, not a startup speedup; both candidates still fail all
+four unchanged strict gates. The control is `ce2d2cf`, candidate parent `0f10d03`;
+release hashes, fixed engine/Skia digests and background-load observations are in
+`target/native-bootstrap-build-pair.json`. Raw distributions are
+`target/startup-native-bootstrap-{gpu,cpu}.json`.
+
+Validation: 1,838 workspace tests with one test thread, all-target clippy with
+warnings denied, formatting/diff checks, eight Python protocol tests, and native
+About/web startup smoke on both renderers passed.
+
 ## What the reference browsers do
 
 ### Chromium

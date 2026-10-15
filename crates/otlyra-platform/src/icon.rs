@@ -25,6 +25,9 @@ pub(crate) fn set_dock_icon(encoded: &[u8], trace: Option<&crate::StartupTrace>)
             return;
         };
 
+        if let Some(trace) = trace {
+            trace.mark("icon_decode_started");
+        }
         let data = NSData::with_bytes(encoded);
         let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
             tracing::warn!("the dock icon could not be decoded; leaving the default");

@@ -89,8 +89,11 @@ construction excludes page work moved to content; the original intervals above
 describe the earlier ownership boundary.
 
 - [ ] Re-run the 20-sample local distribution after every startup change.
-- [ ] Profile AppKit bootstrap, native menu/window installation and dynamic
-  initialization; avoid moving their cost behind the visibility mark.
+- [x] Attribute native event-loop construction, icon decode/installation, menu
+  validation/object creation/installation, and hidden-window creation with
+  independent startup marks. Keep worker overlap separate from adjacent stages.
+- [ ] Resolve the internal AppKit/dynamic-initialization stacks behind those
+  intervals; do not move their cost behind the visibility mark.
 - [ ] Profile the Ready-delivery gap in native launch/window event dispatch.
   Backend construction is already negligible; an extra bootstrap worker and
   draining messages before event-loop wait did not improve startup.
