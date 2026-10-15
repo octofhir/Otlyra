@@ -14,6 +14,9 @@ use otter_runtime::ConsoleSinkHandle;
 
 use crate::host::{ScriptError, ScriptHost};
 
+#[path = "page_modules.rs"]
+mod modules;
+
 /// Yield between complete timer tasks so a due cohort cannot monopolize content.
 const TIMER_SLICE: Duration = Duration::from_millis(4);
 
@@ -44,6 +47,8 @@ pub struct PageScripts {
     /// This page's, not the thread's — it is lent to the isolate alongside the
     /// document, for exactly as long.
     state: crate::dom::PageState,
+    /// The document's module scripts that have not run yet.
+    modules: modules::ModuleScripts,
 }
 
 impl PageScripts {
@@ -236,7 +241,11 @@ impl PageScripts {
                 None
             }
         };
+        if let Some(host) = host.as_ref() {
+            host.modules().set_document_base(&document_url);
+        }
         Self {
+            modules: modules::ModuleScripts::default(),
             // What `location` is built from, and what a relative navigation is
             // resolved against.
             state: crate::dom::PageState::new(document_url.clone()),
@@ -292,6 +301,11 @@ impl PageScripts {
     /// ran them would render every scripted page as its skeleton.
     pub fn document_finished(&mut self, document: &mut Document, fire_load_events: bool) {
         self.state.set_ready(true);
+        // Ordinary module scripts run after the parse and before
+        // `DOMContentLoaded`; while any of them waits for its graph, the
+        // event waits with it and is fired by the last one to run.
+        let modules_hold = self.modules_hold_content_loaded(document);
+        let fire_load_events = fire_load_events && !modules_hold;
         let Self { host, state, .. } = self;
         let Some(host) = host.as_mut() else {
             return;
@@ -317,6 +331,13 @@ impl PageScripts {
                 tracing::error!(target: "page.script", %error, "deferred work failed");
             }
         }
+    }
+
+    /// Whether ordinary module scripts are still to run before
+    /// `DOMContentLoaded`. The first call is the end of the parse, which is
+    /// when they start running.
+    fn modules_hold_content_loaded(&mut self, document: &mut Document) -> bool {
+        self.modules_after_parse(document)
     }
 
     /// When the browser must wake to run this page's next timer, if ever.
@@ -671,6 +692,31 @@ impl ScriptRunner for PageScripts {
 
     fn run_external(&mut self, source: &str, element: NodeId, document: &mut Document) {
         PageScripts::run_external(self, source, element, document);
+    }
+
+    fn module_script(&mut self, element: NodeId, document: &mut Document) {
+        self.add_module_script(element, document);
+    }
+
+    fn import_map(&mut self, element: NodeId, document: &mut Document) {
+        self.add_import_map(element, document);
+    }
+
+    fn take_module_fetches(&mut self) -> Vec<String> {
+        self.module_fetches()
+    }
+
+    fn deliver_module(
+        &mut self,
+        document: &mut Document,
+        url: &str,
+        response: Result<otlyra_html::ModuleResponse, String>,
+    ) {
+        self.module_arrived(document, url, response);
+    }
+
+    fn modules_pending(&self) -> bool {
+        self.modules.pending()
     }
 
     fn reset(&mut self) {

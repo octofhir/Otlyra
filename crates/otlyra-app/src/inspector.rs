@@ -2985,6 +2985,7 @@ fn kind_short(kind: crate::fetcher::ResourceKind) -> &'static str {
         ResourceKind::Stylesheet => "css",
         ResourceKind::Image => "img",
         ResourceKind::Script => "js",
+        ResourceKind::Module => "mjs",
         ResourceKind::Font => "font",
     }
 }

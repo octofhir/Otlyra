@@ -245,6 +245,50 @@ pub trait ScriptRunner {
         0
     }
 
+    /// The parser met a `<script type="module">`, inline or with a `src`.
+    ///
+    /// A module never stops the parse: the runner records it, asks for what
+    /// its graph needs through [`Self::take_module_fetches`], and runs it when
+    /// the graph is in — after the parse for an ordinary one, as soon as it
+    /// is ready for an `async` one.
+    fn module_script(&mut self, element: NodeId, document: &mut Document) {
+        let _ = (element, document);
+    }
+
+    /// The parser met a `<script type="importmap">`. It applies to every
+    /// module specifier resolved after it.
+    fn import_map(&mut self, element: NodeId, document: &mut Document) {
+        let _ = (element, document);
+    }
+
+    /// Module sources the page needs that nobody has asked for yet: the
+    /// entries and dependencies of its module scripts and the targets of its
+    /// `import()` calls. Taken, so each address is handed out once; whoever
+    /// fetches them answers each through [`Self::deliver_module`].
+    fn take_module_fetches(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The fetch of the module at `url` came back. `Err` is a network
+    /// failure, an error status or a response that is not JavaScript.
+    ///
+    /// The runner runs whatever this completes: module scripts whose graph
+    /// is now whole and `import()` calls that were waiting.
+    fn deliver_module(
+        &mut self,
+        document: &mut Document,
+        url: &str,
+        response: Result<ModuleResponse, String>,
+    ) {
+        let _ = (document, url, response);
+    }
+
+    /// Whether module scripts of this document have still to run. The
+    /// window's `load` waits for them.
+    fn modules_pending(&self) -> bool {
+        false
+    }
+
     /// Throw away everything script has done and start again.
     ///
     /// Called when the document is about to be parsed a second time because
@@ -252,6 +296,18 @@ pub trait ScriptRunner {
     /// pass's document is discarded, so its scripts' effects must be too — a
     /// browser that reloads a page reloads its script world with it.
     fn reset(&mut self) {}
+}
+
+/// A module source that arrived, as the network delivered it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleResponse {
+    /// Where the response came from after redirects: the module's own URL,
+    /// which its relative imports and `import.meta.url` use.
+    pub final_url: String,
+    /// The response's `Content-Type`, already checked to be JavaScript.
+    pub content_type: Option<String>,
+    /// The decoded source.
+    pub text: String,
 }
 
 /// The source of every external script whose bytes are already in hand, keyed by
@@ -565,6 +621,24 @@ impl HtmlParser {
         self.scripts_run
     }
 
+    /// Hand the runner and the tree to `run`, once the tree is not borrowed.
+    fn with_runner(&mut self, run: impl FnOnce(&mut dyn ScriptRunner, &mut Document)) {
+        let Some(runner) = self.script_runner.as_mut() else {
+            return;
+        };
+        let mut document = self.tokenizer.sink.sink.document_mut();
+        run(runner.as_mut(), &mut document);
+    }
+
+    /// The runner a stopped parse is holding, for the module sources that
+    /// arrive while it waits.
+    pub fn runner_mut(&mut self) -> Option<&mut dyn ScriptRunner> {
+        match self.script_runner.as_mut() {
+            Some(runner) => Some(runner.as_mut()),
+            None => None,
+        }
+    }
+
     /// Run the script the tokenizer stopped at, if it is one we run.
     fn execute(&mut self, element: NodeId) {
         if self.script_runner.is_none() {
@@ -574,6 +648,32 @@ impl HtmlParser {
         // The borrow of the tree ends before the runner is called. A script can
         // reach back into the document — that is the point of having one — and
         // a `Ref` still outstanding would make the first such reach a panic.
+        // A module script and an import map are the runner's to keep: neither
+        // is run here, and neither stops the parse.
+        let module_kind = {
+            let document = self.tokenizer.sink.sink.document();
+            document.node(element).element().and_then(|data| {
+                let kind = data.attr("type")?.trim();
+                if kind.eq_ignore_ascii_case("module") {
+                    Some(true)
+                } else if kind.eq_ignore_ascii_case("importmap") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
+        match module_kind {
+            Some(true) => {
+                return self
+                    .with_runner(|runner, document| runner.module_script(element, document));
+            }
+            Some(false) => {
+                return self.with_runner(|runner, document| runner.import_map(element, document));
+            }
+            None => {}
+        }
+
         let mut external = false;
         let source = {
             let document = self.tokenizer.sink.sink.document();
@@ -588,13 +688,10 @@ impl HtmlParser {
             // they are here and it runs where it stands, in document order with
             // the inline ones around it. One the prescan did not see is handed
             // back to the caller to fetch, and runs after the parse.
-            // `type` names a language, and the only ones we execute are the
-            // ones the spec calls classic JavaScript. A `type="module"`, an
-            // import map, or a `<script type="text/template">` full of markup
-            // are all data as far as this is concerned — with a `src` too: a
-            // module run as a classic script fails on its first `import`, and
-            // waiting for one would hold up the parse for nothing. Without
-            // modules, a page's `nomodule` fallback is what runs instead.
+            // `type` names a language. Modules and import maps went to the
+            // runner above; of the rest the only ones executed here are the
+            // ones the spec calls classic JavaScript, and a
+            // `<script type="text/template">` full of markup is data.
             match data.attr("type").map(str::trim) {
                 None | Some("") => {}
                 Some(kind) if is_classic_javascript(kind) => {}
@@ -602,6 +699,12 @@ impl HtmlParser {
                     tracing::debug!(target: "page.script", kind, "script of a type we do not run");
                     return;
                 }
+            }
+            // A browser that runs modules does not run the fallback written
+            // for browsers that do not.
+            if data.attr("nomodule").is_some() {
+                tracing::debug!(target: "page.script", "a nomodule script is not run");
+                return;
             }
 
             if let Some(src) = data.attr("src") {
@@ -735,6 +838,15 @@ impl HtmlParser {
 /// `application/json`, `text/template` — is not a classic script, and the
 /// element's contents are data.
 pub(crate) fn is_classic_javascript(kind: &str) -> bool {
+    is_javascript_mime(kind)
+}
+
+/// Whether a `Content-Type` (or a `type` attribute) is a JavaScript MIME type,
+/// parameters and case aside. A module whose response is anything else is a
+/// failed fetch, which is the check that stops a stylesheet or an HTML error
+/// page being run as code.
+#[must_use]
+pub fn is_javascript_mime(kind: &str) -> bool {
     const ESSENCES: [&str; 16] = [
         "application/ecmascript",
         "application/javascript",

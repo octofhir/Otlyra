@@ -94,6 +94,28 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
   return ran + __otlyraRunFrame(pageTimeMetric(0));
 });
 
+// An exception nothing caught, reported the way the HTML standard reports
+// one: an `ErrorEvent` at the window, whose `onerror` gets the five
+// arguments, and the console unless a listener cancelled the event.
+defineGlobal('__otlyraReportError', function __otlyraReportError(message, filename) {
+  const event = new ErrorEvent('error', {
+    message,
+    filename,
+    lineno: 0,
+    colno: 0,
+    error: null,
+    cancelable: true,
+  });
+  let reported = true;
+  try {
+    reported = globalThis.dispatchEvent(event);
+  } catch (error) {
+    console.error(error);
+  }
+  if (reported) console.error(message);
+  return reported;
+});
+
 // One turn of the frame loop: every callback registered up to now, and none
 // registered by them — a callback that asks for another frame is asking for
 // the *next* one, and running it here would be a loop with no display in it.

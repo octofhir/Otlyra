@@ -63,7 +63,23 @@ pub fn prescan_scripts(bytes: &[u8]) -> Vec<String> {
         at: 0,
         fold_values: false,
     };
-    scanner.scripts()
+    scanner.scripts().0
+}
+
+/// Every address a `<script type="module" src>` names, in document order,
+/// without repeats.
+///
+/// A module never blocks the parse, but its graph is fetched before it runs,
+/// and the entry is the first link in that chain: asking for it now saves the
+/// time the parser takes to reach it. Its dependencies are only known once it
+/// arrives.
+pub fn prescan_module_scripts(bytes: &[u8]) -> Vec<String> {
+    let mut scanner = Scanner {
+        bytes,
+        at: 0,
+        fold_values: false,
+    };
+    scanner.scripts().1
 }
 
 /// The elements whose contents are text rather than markup.
@@ -174,30 +190,44 @@ impl<'a> Scanner<'a> {
                 .is_none_or(|&byte| is_space(byte) || byte == b'/' || byte == b'>')
     }
 
-    /// The whole-document walk behind [`prescan_scripts`].
-    fn scripts(&mut self) -> Vec<String> {
+    /// The whole-document walk behind [`prescan_scripts`] and
+    /// [`prescan_module_scripts`]: classic sources, then module sources.
+    fn scripts(&mut self) -> (Vec<String>, Vec<String>) {
         let mut found: Vec<String> = Vec::new();
+        let mut modules: Vec<String> = Vec::new();
         while self.at < self.bytes.len() {
             if self.starts_with_ignore_ascii_case(b"<!--") {
                 self.at += 2;
                 self.skip_past(b"-->");
             } else if self.tag_named(b"script") {
                 self.at += 1 + b"script".len();
-                let [src, kind] = self.tag_attributes([b"src".as_slice(), b"type"]);
-                // A module, an import map or a data block is not fetched for
-                // the parse: it is not a classic script, and none is run.
-                let classic = kind.as_deref().is_none_or(|kind| {
-                    kind.is_empty() || crate::driver::is_classic_javascript(kind)
-                });
-                let src = src.filter(|_| classic);
+                let [src, kind, nomodule] =
+                    self.tag_attributes([b"src".as_slice(), b"type", b"nomodule"]);
+                // An import map or a data block is not fetched for the parse,
+                // and neither is a `nomodule` fallback: this browser runs the
+                // modules it stands in for.
+                let module = kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("module"));
+                let classic = nomodule.is_none()
+                    && kind.as_deref().is_none_or(|kind| {
+                        kind.is_empty() || crate::driver::is_classic_javascript(kind)
+                    });
                 // Whatever is between here and the close tag is source, not
                 // markup, and a `<script src=…>` written inside it is a string.
                 self.skip_past(b"</script");
+                let list = if module {
+                    &mut modules
+                } else if classic {
+                    &mut found
+                } else {
+                    continue;
+                };
                 if let Some(src) = src
                     && !src.is_empty()
-                    && !found.contains(&src)
+                    && !list.contains(&src)
                 {
-                    found.push(src);
+                    list.push(src);
                 }
             } else if let Some(name) = RAW_TEXT.iter().find(|name| self.tag_named(name)) {
                 self.at += 1 + name.len();
@@ -215,7 +245,7 @@ impl<'a> Scanner<'a> {
                 self.at += 1;
             }
         }
-        found
+        (found, modules)
     }
 
     /// Read a tag's attributes and return the values of `wanted`, trimmed.
@@ -461,14 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn a_module_or_data_block_is_not_fetched_for_the_parse() {
-        assert_eq!(
-            scripts(
-                "<script type=module src=m.js></script><script type=importmap src=i.json></script>\
-                 <script type=' text/javascript ' src=c.js></script><script nomodule src=legacy.js></script>"
-            ),
-            ["c.js", "legacy.js"]
-        );
+    fn a_module_import_map_data_block_or_fallback_is_not_fetched_for_the_parse() {
+        let html = "<script type=module src=m.js></script><script type=importmap src=i.json></script>\
+                    <script type=' text/javascript ' src=c.js></script><script nomodule src=legacy.js></script>\
+                    <script type=MODULE src=n.js async></script><script type=module src=m.js></script>";
+        assert_eq!(scripts(html), ["c.js"]);
+        assert_eq!(prescan_module_scripts(html.as_bytes()), ["m.js", "n.js"]);
     }
 
     #[test]

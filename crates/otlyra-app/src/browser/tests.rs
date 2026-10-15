@@ -4682,3 +4682,109 @@ fn the_wheel_reaches_a_page_that_listens_and_may_be_kept() {
         assert!(browser.page(browser.active).expect("page").scroll() > 0.0);
     });
 }
+
+/// Module scripts load their whole graph through the fetcher — the entry the
+/// preload scan found, what it imports, a bare specifier an import map names —
+/// each address once; they run after the parse in document order, before
+/// `DOMContentLoaded`, and the window's `load` waits for them. A response that
+/// is not JavaScript is a failed fetch, and its element hears `error`.
+#[test]
+fn module_scripts_load_their_graph_through_the_fetcher() {
+    on_content_stack(|| {
+        let (mut browser, requested) = table_browser(
+            &[
+                (
+                    "https://modules.example/",
+                    "text/html",
+                    b"<script>function log(x) { const h = document.documentElement;\
+                        h.setAttribute('data-log', (h.getAttribute('data-log') || '') + x + ';') }\
+                      document.addEventListener('DOMContentLoaded', () => log('dcl'));\
+                      addEventListener('load', () => log('load'));</script>\
+                      <script type=importmap>{\"imports\": {\"util\": \"/lib/util.js\"}}</script>\
+                      <script type=module src=main.js></script>\
+                      <script type=module>import { tag } from 'util'; log('inline:' + tag)</script>\
+                      <script type=module src=wrong.js onerror=\"log('error')\"></script>\
+                      <script nomodule>log('fallback')</script>\
+                      <script>log('classic')</script>",
+                ),
+                (
+                    "https://modules.example/main.js",
+                    "text/javascript",
+                    b"import { tag } from './lib/util.js'; import './side.js'; log('main:' + tag);",
+                ),
+                (
+                    "https://modules.example/lib/util.js",
+                    "application/javascript; charset=utf-8",
+                    b"export const tag = 'util';",
+                ),
+                (
+                    "https://modules.example/side.js",
+                    "text/javascript",
+                    b"log('side');",
+                ),
+                (
+                    "https://modules.example/wrong.js",
+                    "text/plain",
+                    b"log('ran wrong');",
+                ),
+            ],
+            None,
+        );
+        go(&mut browser, "https://modules.example/");
+        settle(&mut browser);
+        assert_eq!(
+            page_log(&browser),
+            "classic;side;main:util;inline:util;error;dcl;load;"
+        );
+        let asked = asked_for(&requested);
+        for url in [
+            "https://modules.example/main.js",
+            "https://modules.example/lib/util.js",
+            "https://modules.example/side.js",
+        ] {
+            assert_eq!(
+                asked.iter().filter(|asked| *asked == url).count(),
+                1,
+                "{url} once in {asked:?}"
+            );
+        }
+    });
+}
+
+/// An `import()` a page makes after its load is fetched by the same path and
+/// settles when the module arrives.
+#[test]
+fn a_dynamic_import_after_the_load_is_fetched_and_settles() {
+    on_content_stack(|| {
+        let (mut browser, requested) = table_browser(
+            &[
+                (
+                    "https://lazy.example/",
+                    "text/html",
+                    b"<script>setTimeout(() => import('./lazy.js').then(\
+                        (m) => document.documentElement.setAttribute('data-log', m.value)), 0);\
+                      </script>",
+                ),
+                (
+                    "https://lazy.example/lazy.js",
+                    "text/javascript",
+                    b"export const value = 'lazy';",
+                ),
+            ],
+            None,
+        );
+        go(&mut browser, "https://lazy.example/");
+        settle(&mut browser);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page_log(&browser) != "lazy" && std::time::Instant::now() < deadline {
+            browser.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(page_log(&browser), "lazy");
+        assert!(
+            asked_for(&requested)
+                .iter()
+                .any(|url| url == "https://lazy.example/lazy.js")
+        );
+    });
+}

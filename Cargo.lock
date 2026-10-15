@@ -3695,6 +3695,7 @@ dependencies = [
  "otter-web",
  "thiserror 2.0.19",
  "tracing",
+ "url",
 ]
 
 [[package]]

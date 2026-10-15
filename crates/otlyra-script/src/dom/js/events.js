@@ -200,10 +200,23 @@ const eventTarget = {
   },
 };
 
+// The window's own copies accept a call with no receiver: a bare
+// `addEventListener('load', …)` — which strict code, and every module, makes
+// with `this` undefined — is a call on the window, as Web IDL has it for the
+// global object's operations.
+const onWindow = (name) => {
+  const method = eventTarget[name];
+  return {
+    [name](...args) {
+      return method.apply(this ?? globalThis, args);
+    },
+  }[name];
+};
+
 for (const target of [globalThis, Node.prototype]) {
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
     Object.defineProperty(target, name, {
-      value: eventTarget[name],
+      value: target === globalThis ? onWindow(name) : eventTarget[name],
       writable: true,
       enumerable: false,
       configurable: true,

@@ -47,6 +47,8 @@ otlyra-css.workspace = true
 html5ever.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Resolving a module script's `src` against its document.
+url.workspace = true
 
 # The engine's own front end, at build time only: the page's DOM glue in
 # `src/dom/dom.js` is compiled to bytecode by `build.rs` and linked into the

@@ -46,6 +46,9 @@ pub enum ResourceKind {
     Image,
     /// A script the page links to with `<script src>`.
     Script,
+    /// An ES module: a module script's entry, something a module imports, or
+    /// the target of an `import()`. Its response must be JavaScript.
+    Module,
     /// A face a page's `@font-face` rule names.
     Font,
 }

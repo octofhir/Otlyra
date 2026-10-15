@@ -26,9 +26,11 @@ pub mod driver;
 pub mod encoding;
 pub mod prescan;
 
-pub use driver::{ExternalSources, HtmlParser, Navigation, ScriptRunner};
+pub use driver::{
+    ExternalSources, HtmlParser, ModuleResponse, Navigation, ScriptRunner, is_javascript_mime,
+};
 pub use encoding::{DEFAULT_ENCODING, EncodingDecision, EncodingSource, determine};
-pub use prescan::{prescan, prescan_scripts};
+pub use prescan::{prescan, prescan_module_scripts, prescan_scripts};
 
 use otlyra_dom::{Document, NodeId};
 
@@ -559,24 +561,28 @@ mod tests {
         let _ = blocked;
     }
 
-    /// A module, with a `src` or not, neither stops the parse nor runs: it is
-    /// not a classic script. The `nomodule` fallback beside it does run.
+    /// A module, with a `src` or not, neither stops the parse nor runs as a
+    /// classic script: it goes to the runner, and so does an import map. The
+    /// `nomodule` fallbacks beside them, inline or external, are not run.
     #[test]
-    fn a_module_script_is_neither_waited_for_nor_run_as_a_classic_one() {
+    fn a_module_script_goes_to_the_runner_and_its_fallback_does_not_run() {
         use otlyra_dom::Document;
 
         let mut parser = HtmlParser::new().with_script_runner(Box::new(CountingRunner::default()));
         let mut document = Document::new();
         parser.feed(
             &mut document,
-            "<body><script type=module src=app.mjs></script><script nomodule>legacy()</script>\
-             <p>after</p>"
+            "<body><script type=importmap>{}</script><script type=module src=app.mjs></script>\
+             <script type=module>import './x.js'</script><script nomodule>legacy()</script>\
+             <script nomodule src=legacy.js></script><p>after</p>"
                 .into(),
         );
         assert_eq!(parser.blocked_on(), None, "a module held up the parse");
         assert!(parser.external_scripts().is_empty());
-        assert_eq!(parser.scripts_run(), 1, "only the nomodule fallback runs");
-        parser.finish(&mut document);
+        assert_eq!(parser.scripts_run(), 0, "no fallback runs");
+        let mut runner = parser.finish(&mut document).expect("runner");
+        let counts = runner.take_module_fetches();
+        assert_eq!(counts, ["import maps: 1", "modules: 2"]);
         assert!(dump::serialize(&document).contains("\"after\""));
     }
 
@@ -601,9 +607,27 @@ mod tests {
     #[derive(Default)]
     struct CountingRunner {
         ran: usize,
+        modules: usize,
+        import_maps: usize,
     }
 
     impl ScriptRunner for CountingRunner {
+        fn module_script(&mut self, _element: NodeId, _document: &mut otlyra_dom::Document) {
+            self.modules += 1;
+        }
+
+        fn import_map(&mut self, _element: NodeId, _document: &mut otlyra_dom::Document) {
+            self.import_maps += 1;
+        }
+
+        /// Reports the counts, so a test holding a `dyn ScriptRunner` can read them.
+        fn take_module_fetches(&mut self) -> Vec<String> {
+            vec![
+                format!("import maps: {}", self.import_maps),
+                format!("modules: {}", self.modules),
+            ]
+        }
+
         fn run(&mut self, _source: &str, _element: NodeId, _document: &mut otlyra_dom::Document) {
             self.ran += 1;
         }

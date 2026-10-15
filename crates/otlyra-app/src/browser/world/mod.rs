@@ -25,6 +25,7 @@ use super::TabId;
 
 mod fonts;
 mod load;
+mod modules;
 mod subresources;
 
 #[cfg(test)]
@@ -73,6 +74,8 @@ struct PageSlot {
     /// Which document `page` is, so a picture fetched for the one before it is
     /// never handed to an element of this one that happens to share a node id.
     generation: u64,
+    /// How many module sources this document has fetched.
+    modules_fetched: usize,
     /// The pictures elements of this document have been asked for, by element
     /// and address as the markup spells it. A picture script adds or changes
     /// after the load is asked for once, whether or not it arrives.
@@ -184,6 +187,8 @@ pub(super) struct PageWorld {
     /// Fetches for a picture an element chose again, by request number, with the
     /// tab, the element and the address as its markup spells it.
     picture_fetches: HashMap<u64, PictureFetch>,
+    /// Module fetches for a document whose load is over, by request number.
+    module_fetches: HashMap<u64, modules::ModuleFetch>,
     /// The last document generation handed to a slot.
     generations: u64,
     /// The window the pictures on screen were last chosen against.
@@ -218,6 +223,7 @@ impl PageWorld {
             script_hops: 0,
             background_fetches: HashMap::new(),
             picture_fetches: HashMap::new(),
+            module_fetches: HashMap::new(),
             generations: 0,
             picture_window: None,
             requested_faces: Vec::new(),
@@ -341,6 +347,7 @@ impl PageWorld {
         slot.pending = None;
         slot.swept_at_build = None;
         slot.generation = self.generations;
+        slot.modules_fetched = 0;
         slot.pictures_asked.clear();
         slot.picture_events.clear();
     }
@@ -422,6 +429,7 @@ impl PageWorld {
         changed |= self.run_due_timers();
         changed |= self.run_frame_callbacks();
         self.fetch_detached_pictures();
+        self.fetch_module_imports();
         changed
     }
 
@@ -725,6 +733,9 @@ impl PageWorld {
         if let Some(fetch) = self.picture_fetches.remove(&fetched.id) {
             return self.picture_arrived(fetch, fetched);
         }
+        if let Some(fetch) = self.module_fetches.remove(&fetched.id) {
+            return self.module_arrived(fetch, fetched);
+        }
 
         let owner = self.slots.iter().find_map(|(tab, slot)| {
             slot.pending
@@ -743,6 +754,7 @@ impl PageWorld {
             crate::fetcher::ResourceKind::Stylesheet
             | crate::fetcher::ResourceKind::Image
             | crate::fetcher::ResourceKind::Script
+            | crate::fetcher::ResourceKind::Module
             | crate::fetcher::ResourceKind::Font => {
                 self.receive_subresource(tab, fetched);
                 true

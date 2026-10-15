@@ -63,14 +63,17 @@ pub(super) struct PendingLoad {
     /// A page whose parser is stopped is already on screen: everything before
     /// the script is in the tree the tab is showing. What is here is the state
     /// that carries on tokenizing once the script's bytes arrive.
-    parse: Option<otlyra_html::HtmlParser>,
+    pub(super) parse: Option<otlyra_html::HtmlParser>,
     /// The `<script src>` elements, in the order the document names them.
     script_order: Vec<NodeId>,
     /// The source of each of those that has arrived.
     scripts: HashMap<NodeId, String>,
     /// The page's script world, kept alive from the parse until the external
     /// scripts have run in it.
-    runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
+    pub(super) runner: Option<Box<dyn otlyra_html::ScriptRunner>>,
+    /// Module addresses already asked for during this load — by the preload
+    /// scan, or for the page's runner — so none is asked for twice.
+    pub(super) modules_asked: HashSet<String>,
 }
 
 impl PendingLoad {
@@ -126,6 +129,8 @@ pub(super) enum PendingResource {
     /// so it is the address, not the text, that the parse's scripts are matched
     /// against.
     ScriptSource(String),
+    /// An ES module, by its address in the page's module map.
+    Module(String),
 }
 
 /// A sheet an `@import` asked for (CSS Cascade 5 §2).
@@ -298,7 +303,9 @@ impl PageWorld {
             script_order: Vec::new(),
             scripts: HashMap::new(),
             runner: None,
+            modules_asked: HashSet::new(),
         });
+        slot.modules_fetched = 0;
     }
 
     /// The load in flight for `tab`, if there is one.
@@ -383,18 +390,33 @@ impl PageWorld {
             .take(SCRIPT_LIMIT)
             .filter_map(|src| Self::subresource_url(here.as_str(), &here, src))
             .collect();
+        // Module scripts never stop the parse, but each one's graph is
+        // fetched before it runs and its entry is the first link of it.
+        let modules: Vec<String> = otlyra_html::prescan_module_scripts(&loaded.bytes)
+            .iter()
+            .take(super::modules::MODULE_LIMIT)
+            .filter_map(|src| Self::subresource_url(here.as_str(), &here, src))
+            .collect();
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
         self.request_subresources(
             &mut outstanding,
             here.as_str(),
             &here,
-            urls.into_iter().map(|url| {
-                (
-                    url.clone(),
-                    PendingResource::ScriptSource(url),
-                    ResourceKind::Script,
-                )
-            }),
+            urls.into_iter()
+                .map(|url| {
+                    (
+                        url.clone(),
+                        PendingResource::ScriptSource(url),
+                        ResourceKind::Script,
+                    )
+                })
+                .chain(modules.iter().map(|url| {
+                    (
+                        url.clone(),
+                        PendingResource::Module(url.clone()),
+                        ResourceKind::Module,
+                    )
+                })),
         );
         if outstanding.is_empty() {
             return false;
@@ -409,6 +431,11 @@ impl PageWorld {
             "scripts asked for ahead of the parse"
         );
         pending.outstanding = outstanding;
+        let asked = modules.len();
+        pending.modules_asked.extend(modules);
+        if let Some(slot) = self.slots.get_mut(&tab) {
+            slot.modules_fetched += asked;
+        }
         true
     }
 
@@ -667,6 +694,7 @@ impl PageWorld {
             recorded,
         });
         self.request_imports(tab, imports);
+        self.request_modules(tab);
 
         if self
             .pending(tab)
@@ -783,6 +811,8 @@ impl PageWorld {
         let mut imports = Vec::new();
         // What became of the pictures elements asked for, for their documents.
         let mut pictures = Vec::new();
+        // Module sources, for the page's runner.
+        let mut modules = Vec::new();
 
         match fetched.result {
             Ok(mut loaded) => {
@@ -823,6 +853,9 @@ impl PageWorld {
                             pending.scripts.insert(node, source);
                             resumed = true;
                         }
+                        PendingResource::Module(url) => {
+                            modules.push((url, super::modules::module_response(Ok(&loaded))));
+                        }
                         PendingResource::ScriptSource(src) => {
                             // The preload scan's own entry. It answers a node
                             // only once the parse has run and told us which
@@ -859,8 +892,10 @@ impl PageWorld {
             Err(error) => {
                 tracing::warn!(url = %fetched.url, %error, "subresource failed to load");
                 for resource in wanted {
-                    if let PendingResource::Image(node, src, _) = resource {
-                        pictures.push((node, src, None));
+                    match resource {
+                        PendingResource::Image(node, src, _) => pictures.push((node, src, None)),
+                        PendingResource::Module(url) => modules.push((url, Err(error.clone()))),
+                        _ => {}
                     }
                 }
             }
@@ -868,6 +903,12 @@ impl PageWorld {
         self.record_pictures(tab, pictures);
 
         self.request_imports(tab, imports);
+        // A module that completes a graph runs here, and what it imports is
+        // asked for before the load decides whether it is over.
+        if !modules.is_empty() {
+            self.deliver_modules(tab, modules);
+            self.request_found(tab);
+        }
         if resumed {
             self.resume_parse(tab);
         }
@@ -939,6 +980,17 @@ impl PageWorld {
         // still waiting, or they would never be asked for at all.
         self.request_found(tab);
         if parser.blocked_on().is_some() {
+            if let Some(pending) = self.pending_mut(tab) {
+                pending.parse = Some(parser);
+            }
+            // Module scripts the parse just passed start their fetches now.
+            self.request_modules(tab);
+            let Some(parser) = self
+                .pending_mut(tab)
+                .and_then(|pending| pending.parse.take())
+            else {
+                return;
+            };
             // Stopped again, at the next script. Ask for that one.
             let src = self.page(tab).and_then(|page| {
                 let node = parser.blocked_on()?;
@@ -970,12 +1022,13 @@ impl PageWorld {
             pending.runner = Some(runner);
         }
         self.request_found(tab);
+        self.request_modules(tab);
     }
 
     /// Ask for the sheets and pictures the tab's document names that have not
     /// been asked for yet: the ones a parse that stopped at a script had not
     /// reached when the document was first put on screen.
-    fn request_found(&mut self, tab: TabId) {
+    pub(super) fn request_found(&mut self, tab: TabId) {
         let Some(page) = self.page(tab) else {
             return;
         };
@@ -1095,7 +1148,8 @@ impl PageWorld {
                 }
                 PendingResource::Image(..)
                 | PendingResource::Script(..)
-                | PendingResource::ScriptSource(..) => false,
+                | PendingResource::ScriptSource(..)
+                | PendingResource::Module(..) => false,
             })
     }
 

@@ -23,6 +23,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use otter_runtime::web_modules::WebModuleMap;
 use otter_runtime::{
     ConsoleSinkHandle, InterruptHandle, OtterError, Runtime, SourceInput, TimerFireOutcome,
 };
@@ -149,6 +150,10 @@ pub struct ScriptHost {
     /// Held here because the engine only knows the callbacks; when they are due
     /// is the browser's question.
     wheel: TimerWheel,
+    /// The page's module map. The engine compiles and runs modules from what
+    /// is delivered here and never fetches one itself: the browser's network
+    /// does, off this thread.
+    modules: WebModuleMap,
 }
 
 impl ScriptHost {
@@ -173,7 +178,9 @@ impl ScriptHost {
     ///
     /// As [`Self::new`].
     pub fn with_console(console: ConsoleSinkHandle) -> Result<Self, OtterError> {
+        let modules = WebModuleMap::new();
         let builder = Runtime::builder()
+            .web_modules(modules.clone())
             .capabilities(page_capabilities())
             .capability_hook(DenyPageCapabilities)
             .console_sink(console)
@@ -209,7 +216,74 @@ impl ScriptHost {
             runtime,
             watchdog,
             wheel,
+            modules,
         })
+    }
+
+    /// The page's module map: where module sources are delivered, and where
+    /// the import map is registered.
+    #[must_use]
+    pub fn modules(&self) -> &WebModuleMap {
+        &self.modules
+    }
+
+    /// Run one module graph whose every source was delivered, then take the
+    /// microtask checkpoint.
+    ///
+    /// `url` is the entry's key in the module map: its own URL, or for an
+    /// inline module the document's base URL with an inline marker.
+    ///
+    /// # Errors
+    ///
+    /// An exception the module's evaluation threw, or a turn the watchdog
+    /// stopped. A module that awaits finishes later; what it throws then is a
+    /// rejected promise, not an error here.
+    pub fn run_module(&mut self, source: &str, url: &str) -> Result<ScriptOutcome, ScriptError> {
+        let guard = self.watchdog.begin();
+        let result = self
+            .runtime
+            .run_module_source(SourceInput::from_javascript(source), url);
+        let drained = self.runtime.run_microtasks();
+        let interrupted = guard.finish();
+        let outcome = result.and_then(|result| {
+            drained.map(|()| ScriptOutcome {
+                completion: String::new(),
+                duration: result.duration,
+            })
+        });
+        outcome.map_err(|source| ScriptError {
+            specifier: url.to_owned(),
+            interrupted,
+            source,
+        })
+    }
+
+    /// Settle the `import()` calls whose modules have now been delivered,
+    /// and run what they set going.
+    ///
+    /// # Errors
+    ///
+    /// A fatal engine failure or a turn the watchdog stopped. A module that
+    /// failed to load or threw rejects its import's promise instead.
+    pub fn resume_imports(&mut self) -> Result<(), ScriptError> {
+        if !self.runtime.has_pending_web_imports() {
+            return Ok(());
+        }
+        let guard = self.watchdog.begin();
+        let result = self.runtime.resume_web_dynamic_imports();
+        let interrupted = guard.finish();
+        result.map_err(|source| ScriptError {
+            specifier: "<dynamic import>".to_owned(),
+            interrupted,
+            source,
+        })
+    }
+
+    /// Modules the page's waiting `import()` calls need that nobody asked
+    /// for yet. Each is reported once.
+    #[must_use]
+    pub fn import_fetches(&self) -> Vec<String> {
+        self.runtime.web_module_fetches()
     }
 
     /// The deadlines this page is waiting on.
