@@ -27,14 +27,29 @@ mod macos {
             std::process::id(),
         )));
         std::fs::create_dir(&profile.0).unwrap();
-        for cpu in [false, true] {
-            let report = profile.0.join(if cpu { "cpu.json" } else { "gpu.json" });
+        let fixture = profile.0.join("viewport.html");
+        std::fs::write(&fixture, "<!doctype html><title>Native viewport</title><p>Viewport probe</p><script>console.log('OTLYRA_INITIAL_VIEWPORT', innerWidth, innerHeight, devicePixelRatio)</script>").unwrap();
+        for (cpu, web) in [(false, false), (true, false), (false, true), (true, true)] {
+            let report = profile.0.join(format!(
+                "{}-{}.json",
+                if cpu { "cpu" } else { "gpu" },
+                if web { "web" } else { "about" }
+            ));
             let mut command = Command::new(env!("CARGO_BIN_EXE_otlyra"));
             command
-                .args(["--no-secrets", "--url", "about:about", "--startup-report"])
+                .args(["--no-secrets", "--startup-report"])
                 .arg(&report)
                 .env("OTLYRA_CONFIG_DIR", profile.0.join("profile"))
-                .env("OTLYRA_LOG", "error");
+                .env("OTLYRA_LOG", "error,page.console=info");
+            if web {
+                // The screenshot-only scale must never leak into native JS.
+                command
+                    .arg("--file")
+                    .arg(&fixture)
+                    .args(["--scale-factor", "3"]);
+            } else {
+                command.args(["--url", "about:about"]);
+            }
             if cpu {
                 command.arg("--cpu-raster");
             }
@@ -69,6 +84,34 @@ mod macos {
             )
             .unwrap();
             assert_eq!(value["schema"], 2);
+            if web {
+                let scale = value["scale_factor"].as_f64().unwrap();
+                let width = (value["physical_width"].as_f64().unwrap() / scale).floor();
+                let height = (value["physical_height"].as_f64().unwrap() / scale
+                    - otlyra_app::ui::UI_HEIGHT)
+                    .floor();
+                let logs = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let line = logs
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once("OTLYRA_INITIAL_VIEWPORT ")
+                            .map(|(_, metrics)| metrics)
+                    })
+                    .expect("the first inline script logs its viewport");
+                let metrics: Vec<f64> = line
+                    .split_whitespace()
+                    .map(|metric| metric.parse().unwrap())
+                    .collect();
+                assert_eq!(
+                    metrics,
+                    [width, height, scale],
+                    "cpu={cpu}: first-script viewport differs from the native surface"
+                );
+            }
             let visible = value["process_to_visible_ms"].as_f64().unwrap();
             let frame = value["process_to_first_frame_ms"].as_f64().unwrap();
             assert!(frame >= visible && visible > 0.0);
@@ -85,6 +128,7 @@ mod macos {
             );
             for name in [
                 "content_owner_ready",
+                "content_surface_ready",
                 "first_content_scene_ready",
                 "first_content_scene_received",
                 "first_content_scene_composed",
@@ -110,6 +154,9 @@ mod macos {
             };
             for (before, after) in [
                 ("content_owner_ready", "first_content_scene_ready"),
+                ("window_created", "content_surface_ready"),
+                ("content_owner_ready", "content_surface_ready"),
+                ("content_surface_ready", "first_content_scene_ready"),
                 ("first_content_scene_ready", "first_content_scene_received"),
                 (
                     "first_content_scene_received",

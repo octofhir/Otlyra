@@ -744,7 +744,7 @@ fn run_content_window(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let settings = otlyra_app::preferences::to_text(&cli.settings());
     STARTUP_TRACE.mark("preferences_ready");
     let content_cli = cli.clone();
-    let mut window = otlyra_app::browser::WindowBrowser::spawn_with_trace(
+    let mut window = otlyra_app::browser::WindowBrowser::spawn_native(
         cli.viewport(),
         !cli.no_interface,
         Some(STARTUP_TRACE.clone()),

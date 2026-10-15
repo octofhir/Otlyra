@@ -439,9 +439,8 @@ and its [viewport resize steps](https://drafts.csswg.org/cssom-view/#resizing-vi
 
 Regression coverage checks the first inline script at 1x/2x with and without
 chrome, initially hidden loading, repeated resize and DPR changes, document zoom,
-inspector docking, parser blocking and script property replacement. Native scale
-confirmation can still arrive after the first script; this change uses the
-requested shell viewport and does not introduce a native-startup barrier.
+inspector docking, parser blocking and script property replacement. This step
+used the requested shell viewport; native scale confirmation is addressed below.
 
 Verification: 1,813 workspace Rust tests passed, plus the native GPU/CPU startup
 smoke and seven benchmark-protocol Python tests. All-target clippy with
@@ -467,6 +466,60 @@ latency worsened; this compatibility change establishes no startup speedup.
 All strict startup budgets still fail. The endpoints retain native visibility
 request and UI report-accounting semantics. Local artifacts are
 `target/startup-viewport-{gpu,cpu}.json` and `target/viewport-build-pair.json`.
+
+## Native initial viewport follow-up
+
+A real-window probe confirmed that the first inline script could read DPR 3
+from `--scale-factor 3` while the native startup report said DPR 2. That CLI
+parameter belongs to screenshots; native windows must use the OS scale. The
+content factory's requested viewport alone could not guarantee that.
+
+Normal native startup now uses `WindowBrowser::spawn_native`. It hands initial
+metadata (including palette, pinned appearance, zoom and bookmark state) to
+chrome, attaches service wakers without pumping responses, and waits
+on content's owner for the existing `SurfaceReady` event. Actual dimensions and
+scale are installed before the first script or scene. Network requests may
+complete during the wait; their responses remain queued. The buffered appearance,
+visibility and input prefix is replayed before the first pump, so scripts and
+the initial scene see the OS environment. Chrome projects tab intents immediately,
+buffered commands retain order, and close before surface
+confirmation discards pending commands and performs the usual fetch shutdown.
+The known-viewport `spawn` and `spawn_with_trace` APIs keep immediate execution.
+
+Startup records `content_surface_ready`; the benchmark separates native surface
+delivery and content preparation after confirmation. The older
+`first_content_scene` interval includes waiting from owner setup and is not a
+measure of CPU work. Tests cover the mismatched nominal/confirmed scale at
+1x/2x, chrome input before confirmation and early shutdown. Native desktop smoke
+loads both About and an inline-script fixture on GPU/CPU; it checks the first
+script against actual surface metrics with the screenshot scale forced to 3.
+
+Verification: 1,818 workspace Rust tests, the four-case native GPU/CPU desktop
+smoke, all-target clippy with `-D warnings`, formatting, diff checks and seven
+Python benchmark tests passed. The frozen engine digest remains `23c5a114f769`.
+
+The final startup comparison repeats the viewport follow-up's setup: three
+warmups and 20 alternating pairs per renderer, warm driver cache, isolated
+`about:about` profiles and local background build load. Control is `c9f303a`
+(SHA-256 `ee9a56b8a8aa`); candidate SHA-256 begins `9dff2e98c5ca`.
+
+| Startup, p50 / p95 ms | Control | Candidate |
+| --- | ---: | ---: |
+| GPU visibility request | 214.50 / 235.90 | 214.82 / 229.97 |
+| GPU complete content-frame report | 321.09 / 358.50 | 329.46 / 350.02 |
+| CPU visibility request | 219.99 / 232.23 | 212.99 / 229.86 |
+| CPU complete content-frame report | 328.52 / 344.00 | 315.15 / 333.80 |
+
+Paired first-frame median changes are +0.76 ms GPU and −9.54 ms CPU. GPU median
+startup is higher in the unpaired quantile; this run establishes correct initial
+metrics, not a startup speedup. All strict startup budgets still fail. The
+confirmation-to-first-scene interval is 18.60 / 24.60 ms GPU and 15.90 / 25.81 ms
+CPU, including replayed environment commands and scene preparation. Native
+visibility and renderer-report endpoints keep their previous accounting meaning.
+Artifacts: `target/startup-native-surface-{gpu,cpu}.json`,
+`target/native-surface-build-pair.json`, and the before/after native DPR probes
+in `target/native-metrics-{before,after}.{json,log}`. Earlier pilot binaries and
+measurements are retained separately and are not mixed with this final series.
 
 ## What the reference browsers do
 

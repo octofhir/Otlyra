@@ -22,7 +22,7 @@ use crate::ui::{BrowserUi, Suggestion, SystemPage, TabLabel, UI_HEIGHT, UiAction
 use crate::widget::{Described, FocusId};
 
 mod owner;
-use owner::{ClipboardState, ContentClipboard, content_loop};
+use owner::{ClipboardState, ContentClipboard, await_surface, content_loop};
 
 use super::frame::{LAYER_CHROME, Scaled, scaled};
 use super::{Browser, SURFACE_CHROME, SURFACE_SYSTEM, Tab, TabId};
@@ -166,6 +166,13 @@ impl Intent {
     }
 }
 
+struct InitialChrome {
+    theme: crate::widget::theme::Theme,
+    appearance: Option<otlyra_platform::ColorScheme>,
+    zoom: f32,
+    bookmark: crate::ui::Bookmarked,
+}
+
 struct ChromeInput {
     address: crate::ui::TextField,
     find: Option<String>,
@@ -181,6 +188,7 @@ enum Command {
     DownloadDirectory(std::path::PathBuf),
     Wake,
     Frame,
+    SurfaceReady(Viewport),
     Visibility(bool),
     Input(Box<Input>),
     Pointer(PointerSlot),
@@ -338,6 +346,28 @@ impl WindowBrowser {
         startup: Option<otlyra_platform::StartupTrace>,
         factory: impl FnOnce(TextEngine) -> Browser + Send + 'static,
     ) -> std::io::Result<Self> {
+        Self::spawn_owner(viewport, interface, startup, false, factory)
+    }
+
+    /// Hand initial metadata to native chrome and defer page execution until
+    /// `SurfaceReady` confirms the window's real dimensions and device scale.
+    /// The factory may start loads but must not pump them or run scripts.
+    pub fn spawn_native(
+        viewport: Viewport,
+        interface: bool,
+        startup: Option<otlyra_platform::StartupTrace>,
+        factory: impl FnOnce(TextEngine) -> Browser + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::spawn_owner(viewport, interface, startup, true, factory)
+    }
+
+    fn spawn_owner(
+        viewport: Viewport,
+        interface: bool,
+        startup: Option<otlyra_platform::StartupTrace>,
+        native_surface: bool,
+        factory: impl FnOnce(TextEngine) -> Browser + Send + 'static,
+    ) -> std::io::Result<Self> {
         let text = TextEngine::deferred();
         if let Err(error) = text.preload_system_fonts() {
             tracing::warn!(%error, "no font discovery worker");
@@ -392,23 +422,59 @@ impl WindowBrowser {
                         browser.active,
                         browser.mark.clone(),
                         browser.window_visible,
+                        InitialChrome {
+                            theme: browser.theme.clone(),
+                            appearance: browser.window_appearance(),
+                            zoom: browser.zoom,
+                            bookmark: browser.ui.bookmark,
+                        },
                     ))
                     .is_err()
                 {
                     browser.shutdown_content_loads();
                     return;
                 }
-                browser.set_waker(Waker::from_callback(move || {
+                let waker = Waker::from_callback(move || {
                     let mut mailbox = wake_mailbox.lock().unwrap();
                     if !mailbox.wake_pending {
                         mailbox.wake_pending = true;
                         let _ = wake_sender.send(Command::Wake);
                     }
-                }));
-                content_loop(browser, receiver, owner_mailbox, clipboard, viewport);
+                });
+                let (viewport, queued) = if native_surface {
+                    // Painter::set_waker also pumps ready loads. Attach the
+                    // services without that pump until the OS viewport arrives.
+                    browser.world.fetcher.set_waker(waker.clone());
+                    browser.downloads_writer.set_waker(waker);
+                    let Some((viewport, queued)) = await_surface(&receiver) else {
+                        browser.shutdown_content_loads();
+                        return;
+                    };
+                    browser.set_viewport(viewport);
+                    browser.sync_world();
+                    if let Some(trace) = &owner_mailbox.lock().unwrap().startup {
+                        trace.mark("content_surface_ready");
+                    }
+                    (viewport, queued)
+                } else {
+                    browser.set_waker(waker);
+                    (viewport, VecDeque::new())
+                };
+                content_loop(
+                    browser,
+                    receiver,
+                    owner_mailbox,
+                    clipboard,
+                    viewport,
+                    queued,
+                );
             })?;
-        let (tabs, active, mark, window_visible) = initial.recv().map_err(std::io::Error::other)?;
+        let (tabs, active, mark, window_visible, chrome) =
+            initial.recv().map_err(std::io::Error::other)?;
         let mut ui = BrowserUi::new();
+        ui.set_theme(chrome.theme.clone());
+        ui.zoom = chrome.zoom;
+        ui.bookmark = chrome.bookmark;
         ui.address.set_text(tabs[active].url.clone());
         if tabs[active].url.is_empty() {
             ui.focus_address();
@@ -431,10 +497,10 @@ impl WindowBrowser {
                 address_focused: tabs[active].url.is_empty(),
                 find: None,
                 find_status: Default::default(),
-                bookmark: crate::ui::Bookmarked::Impossible,
-                zoom: 1.0,
-                theme: crate::widget::theme::Theme::light(),
-                appearance: None,
+                bookmark: chrome.bookmark,
+                zoom: chrome.zoom,
+                theme: chrome.theme,
+                appearance: chrome.appearance,
                 next: FrameRequest::None,
                 work: Default::default(),
                 document: Arc::new(crate::a11y::empty_tree(&tabs[active].title)),
@@ -971,6 +1037,9 @@ impl Painter for WindowBrowser {
                 self.ui.dismiss_context_menu();
                 self.context_serial = None;
                 self.request_frame(viewport);
+                if matches!(event, PlatformEvent::SurfaceReady(_)) {
+                    let _ = self.sender.send(Command::SurfaceReady(viewport));
+                }
             }
             PlatformEvent::PointerMoved { x, y } => {
                 self.pointer = (x, y);

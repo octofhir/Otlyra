@@ -219,12 +219,28 @@ struct MetadataCache {
     last_hidden: Option<Arc<SnapshotMetadata>>,
 }
 
+/// Keep input ordered while the native loop creates its window. Waiting is
+/// confined to content's owner, after its metadata handoff to native chrome.
+pub(super) fn await_surface(
+    receiver: &mpsc::Receiver<Command>,
+) -> Option<(Viewport, VecDeque<Command>)> {
+    let mut queued = VecDeque::new();
+    loop {
+        match receiver.recv().ok()? {
+            Command::SurfaceReady(viewport) => return Some((viewport, queued)),
+            Command::Shutdown => return None,
+            command => queued.push_back(command),
+        }
+    }
+}
+
 pub(super) fn content_loop(
     mut browser: Browser,
     receiver: mpsc::Receiver<Command>,
     mailbox: Arc<Mutex<Mailbox>>,
     clipboard_state: Rc<RefCell<ClipboardState>>,
     mut viewport: Viewport,
+    mut queued: VecDeque<Command>,
 ) {
     let mut serial = 0;
     let mut cache = MetadataCache {
@@ -240,81 +256,96 @@ pub(super) fn content_loop(
     let mut first = true;
     let mut published = None;
     'content: loop {
-        let mut snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
-        let context = (snapshot.tabs[snapshot.active].id, snapshot.viewport);
-        if let Some(scene) = &mut snapshot.scene {
-            if published != Some(context) {
-                full_damage(scene);
-                snapshot.full_damage = true;
-            }
-            published = Some(context);
-        } else {
-            // Hidden metadata can replace an unconsumed scene. Conservatively
-            // invalidate the first resumed scene, including that lost damage.
-            published = None;
-        }
-        let next = snapshot.next;
-        let publish = snapshot.window_visible
-            || cache
-                .last_hidden
-                .as_ref()
-                .is_none_or(|previous| !snapshot.metadata.unchanged_hidden(previous));
-        if snapshot.window_visible {
-            cache.last_hidden = None;
-        } else if publish {
-            cache.last_hidden = Some(Arc::clone(&snapshot.metadata));
-        }
-        if publish {
-            let (previous, waker) = {
-                let mut mailbox = mailbox.lock().unwrap();
-                if first && snapshot.scene.is_some() {
-                    if let Some(trace) = &mailbox.startup {
-                        trace.mark("first_content_scene_ready");
-                    }
-                    first = false;
+        let next = if queued.is_empty() {
+            let mut snapshot = Snapshot::capture(&mut browser, viewport, serial, &mut cache);
+            let context = (snapshot.tabs[snapshot.active].id, snapshot.viewport);
+            if let Some(scene) = &mut snapshot.scene {
+                if published != Some(context) {
+                    full_damage(scene);
+                    snapshot.full_damage = true;
                 }
-                if let Some(previous) = &mailbox.latest
-                    && let Some(scene) = &mut snapshot.scene
-                    && let Some(previous_scene) = &previous.scene
-                {
-                    if previous.tabs[previous.active].id == context.0
-                        && previous.viewport == context.1
+                published = Some(context);
+            } else {
+                // Hidden metadata can replace an unconsumed scene. Conservatively
+                // invalidate the first resumed scene, including that lost damage.
+                published = None;
+            }
+            let next = snapshot.next;
+            let publish = snapshot.window_visible
+                || cache
+                    .last_hidden
+                    .as_ref()
+                    .is_none_or(|previous| !snapshot.metadata.unchanged_hidden(previous));
+            if snapshot.window_visible {
+                cache.last_hidden = None;
+            } else if publish {
+                cache.last_hidden = Some(Arc::clone(&snapshot.metadata));
+            }
+            if publish {
+                let (previous, waker) = {
+                    let mut mailbox = mailbox.lock().unwrap();
+                    if first && snapshot.scene.is_some() {
+                        if let Some(trace) = &mailbox.startup {
+                            trace.mark("first_content_scene_ready");
+                        }
+                        first = false;
+                    }
+                    if let Some(previous) = &mailbox.latest
+                        && let Some(scene) = &mut snapshot.scene
+                        && let Some(previous_scene) = &previous.scene
                     {
-                        if previous.full_damage || snapshot.full_damage {
+                        if previous.tabs[previous.active].id == context.0
+                            && previous.viewport == context.1
+                        {
+                            if previous.full_damage || snapshot.full_damage {
+                                full_damage(scene);
+                                snapshot.full_damage = true;
+                            } else {
+                                accumulate_damage(previous_scene, scene);
+                            }
+                        } else {
                             full_damage(scene);
                             snapshot.full_damage = true;
-                        } else {
-                            accumulate_damage(previous_scene, scene);
                         }
-                    } else {
-                        full_damage(scene);
-                        snapshot.full_damage = true;
+                    }
+                    let previous = mailbox.latest.replace(snapshot);
+                    (previous, mailbox.waker.clone())
+                };
+                drop(previous);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+            next
+        } else {
+            // Apply the finite pre-surface prefix (appearance, visibility and
+            // input) before any initial script or scene can observe the world.
+            FrameRequest::None
+        };
+        let command = if let Some(command) = queued.pop_front() {
+            command
+        } else {
+            match next {
+                FrameRequest::At(at) => {
+                    match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                        Ok(command) => command,
+                        Err(mpsc::RecvTimeoutError::Timeout) => Command::Wake,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                let previous = mailbox.latest.replace(snapshot);
-                (previous, mailbox.waker.clone())
-            };
-            drop(previous);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-        let command = match next {
-            FrameRequest::At(at) => {
-                match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                _ => match receiver.recv() {
                     Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => Command::Wake,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+                    Err(_) => break,
+                },
             }
-            _ => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
         };
         // Limit input batching so a stream of pointer events cannot indefinitely
         // postpone a content result. This preserves ordered keys/navigation.
-        for command in std::iter::once(command).chain(receiver.try_iter()).take(64) {
+        for command in std::iter::once(command)
+            .chain(std::iter::from_fn(|| queued.pop_front()))
+            .chain(receiver.try_iter())
+            .take(64)
+        {
             let command = match command {
                 Command::Pointer(slot) => match slot.lock().unwrap().take() {
                     Some(input) => Command::Input(input),
@@ -360,6 +391,10 @@ pub(super) fn content_loop(
                         viewport = mailbox.viewport;
                         mailbox.frame_pending = false;
                     }
+                    browser.handle_event(PlatformEvent::Resized(viewport));
+                }
+                Command::SurfaceReady(actual) => {
+                    viewport = actual;
                     browser.handle_event(PlatformEvent::Resized(viewport));
                 }
                 Command::Input(input) => {

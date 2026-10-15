@@ -27,6 +27,8 @@ DEFAULT_BUDGETS = {
 PHASES = {
     "content_owner_setup": ("preferences_ready", "content_owner_ready"),
     "first_content_scene": ("content_owner_ready", "first_content_scene_ready"),
+    "native_surface_delivery": ("window_created", "content_surface_ready"),
+    "confirmed_content_scene": ("content_surface_ready", "first_content_scene_ready"),
     "first_content_delivery": ("first_content_scene_ready", "first_content_scene_received"),
     "first_content_to_frame": ("first_content_scene_received", "first_content_scene_composed"),
     "event_loop_creation": ("browser_ready", "event_loop_created"),
