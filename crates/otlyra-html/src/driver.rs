@@ -167,6 +167,12 @@ pub trait ScriptRunner {
         false
     }
 
+    /// Whether an intersection or resize observer is watching, so the frame
+    /// step is owed whenever what was drawn moved.
+    fn wants_geometry_updates(&self) -> bool {
+        false
+    }
+
     /// The focus script asked for since this was last asked: an element, or
     /// `None` inside for a blur.
     fn take_focus_request(&mut self) -> Option<Option<NodeId>> {

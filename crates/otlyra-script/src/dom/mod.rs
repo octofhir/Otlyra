@@ -120,6 +120,8 @@ pub struct PageState {
     scroll_request: Option<(f64, f64)>,
     /// Whether the page listens for scroll events.
     wants_scroll_events: bool,
+    /// Whether an intersection or resize observer is watching.
+    wants_geometry: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -235,6 +237,12 @@ impl PageState {
         self.scroll_request.take()
     }
 
+    /// Whether an intersection or resize observer is watching.
+    #[must_use]
+    pub fn wants_geometry(&self) -> bool {
+        self.wants_geometry
+    }
+
     /// Whether the page listens for scroll events.
     #[must_use]
     pub fn wants_scroll_events(&self) -> bool {
@@ -295,6 +303,11 @@ pub(crate) fn request_scroll(x: f64, y: f64) {
             document.set_scroll_position((x, y));
         }
     });
+}
+
+/// An intersection or resize observer started watching.
+pub(crate) fn note_geometry_wanted() {
+    with_state_mut(|state| state.wants_geometry = true);
 }
 
 /// The page registered a scroll listener.

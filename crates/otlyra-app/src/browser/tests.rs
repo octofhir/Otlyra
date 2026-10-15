@@ -4461,3 +4461,48 @@ fn script_measures_the_boxes_the_page_drew() {
         assert_eq!(page_log(&browser), "10 30 200 50 200 30 true 1");
     });
 }
+
+/// An intersection observer hears what is on screen at first, and again when
+/// scrolling changes it, without the page asking for frames.
+#[test]
+fn intersection_observers_report_what_the_reader_can_see() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><div id=near style=height:100px>near</div>\
+             <div style=height:3000px></div><div id=far style=height:100px>far</div>\
+             <div style=height:3000px></div>\
+             <script>\
+               const seen = [];\
+               const observer = new IntersectionObserver((entries) => {\
+                 for (const entry of entries) seen.push(entry.target.id + ':' + entry.isIntersecting);\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               });\
+               observer.observe(document.getElementById('near'));\
+               observer.observe(document.getElementById('far'));\
+             </script>",
+        );
+        let viewport = Viewport::new(800, 600, 1.0);
+        let mut painter = otlyra_gfx::RecordingPainter::new();
+        browser.on_event(PlatformEvent::Woken);
+        browser.paint(&mut painter, viewport);
+        assert_eq!(page_log(&browser), "near:true far:false");
+        browser.on_event(PlatformEvent::PointerMoved {
+            x: 300.0,
+            y: UI_HEIGHT + 200.0,
+        });
+        browser.on_event(PlatformEvent::Scroll {
+            x: 0.0,
+            y: 3000.0,
+            source: otlyra_platform::ScrollSource::Trackpad,
+            modifiers: otlyra_platform::Modifiers::default(),
+        });
+        for _ in 0..3 {
+            browser.paint(&mut painter, viewport);
+            browser.on_event(PlatformEvent::Woken);
+        }
+        assert_eq!(
+            page_log(&browser),
+            "near:true far:false near:false far:true"
+        );
+    });
+}

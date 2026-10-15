@@ -107,7 +107,8 @@ defineGlobal('__otlyraRunFrame', function __otlyraRunFrame(timestamp) {
       console.error(error);
     }
   }
-  return frames.length;
+  // The rendering step's observers, after the frame's own callbacks.
+  return frames.length + updateGeometryObservers(Number(timestamp) || 0);
 });
 
 // Whether a frame is owed, for a host deciding whether to enter the isolate
@@ -206,8 +207,8 @@ if (typeof performance === 'object' && performance) {
   define(performance, 'navigation', { type: 0, redirectCount: 0 });
 }
 
-// An observer that never observes. The alternative is that a page which
-// lazy-loads through one shows nothing at all.
+// An observer that never observes: what is left of MutationObserver until
+// the tree reports its own changes.
 class NoopObserver {
   observe() {}
   unobserve() {}
@@ -216,9 +217,167 @@ class NoopObserver {
     return [];
   }
 }
-if (typeof IntersectionObserver === 'undefined') defineGlobal('IntersectionObserver', NoopObserver);
 if (typeof MutationObserver === 'undefined') defineGlobal('MutationObserver', NoopObserver);
-if (typeof ResizeObserver === 'undefined') defineGlobal('ResizeObserver', NoopObserver);
+
+// IntersectionObserver and ResizeObserver, answered from the boxes the last
+// frame drew, in the rendering step after the animation-frame callbacks — as
+// the HTML event loop runs them. Observing asks for a frame, so the first
+// notification comes without waiting for the page to change; afterwards the
+// browser runs the step whenever a frame or a scroll moved what was drawn.
+const geometryObservers = new Set();
+
+const parseRootMargin = (margin) => {
+  const parts = String(margin || '0px').trim().split(/\s+/).map((part) => {
+    const value = Number.parseFloat(part);
+    if (!Number.isFinite(value)) return () => 0;
+    return part.endsWith('%')
+      ? (size) => (size * value) / 100
+      : () => value;
+  });
+  const [top, right = top, bottom = top, left = right] = parts;
+  return { top, right, bottom, left };
+};
+
+class IntersectionObserverImpl {
+  constructor(callback, options = {}) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('IntersectionObserver needs a callback');
+    }
+    this.callback = callback;
+    this.root = options && options.root ? options.root : null;
+    this.rootMargin = String((options && options.rootMargin) || '0px');
+    const threshold = options && options.threshold !== undefined ? options.threshold : 0;
+    this.thresholds = (Array.isArray(threshold) ? threshold : [threshold])
+      .map(Number)
+      .sort((a, b) => a - b);
+    this.targets = new Map();
+    this.records = [];
+  }
+  observe(target) {
+    if (!this.targets.has(target)) this.targets.set(target, null);
+    geometryObservers.add(this);
+    nativeGeometryWanted();
+    nativeFrameRequested();
+  }
+  unobserve(target) {
+    this.targets.delete(target);
+  }
+  disconnect() {
+    this.targets.clear();
+    geometryObservers.delete(this);
+  }
+  takeRecords() {
+    const records = this.records;
+    this.records = [];
+    return records;
+  }
+  update(time) {
+    const margin = parseRootMargin(this.rootMargin);
+    const rootRect = this.root
+      ? clientRectOf(this.root)
+      : { left: 0, top: 0, right: innerWidth, bottom: innerHeight, width: innerWidth, height: innerHeight };
+    const width = rootRect.right - rootRect.left;
+    const height = rootRect.bottom - rootRect.top;
+    const bounds = {
+      left: rootRect.left - margin.left(width),
+      top: rootRect.top - margin.top(height),
+      right: rootRect.right + margin.right(width),
+      bottom: rootRect.bottom + margin.bottom(height),
+    };
+    for (const [target, previous] of this.targets) {
+      const drawn = target.isConnected && target.__otlyraClientRect() !== null;
+      const rect = clientRectOf(target);
+      const left = Math.max(rect.left, bounds.left);
+      const top = Math.max(rect.top, bounds.top);
+      const right = Math.min(rect.right, bounds.right);
+      const bottom = Math.min(rect.bottom, bounds.bottom);
+      const isIntersecting = drawn && right >= left && bottom >= top;
+      const area = rect.width * rect.height;
+      const ratio = !isIntersecting ? 0 : area > 0 ? ((right - left) * (bottom - top)) / area : 1;
+      const index = this.thresholds.filter((value) => ratio >= value && (isIntersecting || value > 0)).length;
+      const state = `${isIntersecting}:${index}`;
+      if (state === previous) continue;
+      this.targets.set(target, state);
+      const intersection = isIntersecting
+        ? { x: left, y: top, left, top, right, bottom, width: right - left, height: bottom - top }
+        : { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      this.records.push({
+        target,
+        time,
+        isIntersecting,
+        intersectionRatio: ratio,
+        boundingClientRect: rect,
+        intersectionRect: intersection,
+        rootBounds: { x: bounds.left, y: bounds.top, ...bounds, width: bounds.right - bounds.left, height: bounds.bottom - bounds.top },
+      });
+    }
+    const records = this.takeRecords();
+    if (records.length > 0) this.callback(records, this);
+    return records.length;
+  }
+}
+Object.defineProperty(IntersectionObserverImpl, 'name', { value: 'IntersectionObserver' });
+defineGlobal('IntersectionObserver', IntersectionObserverImpl);
+
+class ResizeObserverImpl {
+  constructor(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('ResizeObserver needs a callback');
+    }
+    this.callback = callback;
+    this.targets = new Map();
+  }
+  observe(target) {
+    if (!this.targets.has(target)) this.targets.set(target, null);
+    geometryObservers.add(this);
+    nativeGeometryWanted();
+    nativeFrameRequested();
+  }
+  unobserve(target) {
+    this.targets.delete(target);
+  }
+  disconnect() {
+    this.targets.clear();
+    geometryObservers.delete(this);
+  }
+  update() {
+    const entries = [];
+    for (const [target, previous] of this.targets) {
+      const rect = clientRectOf(target);
+      const size = `${rect.width}x${rect.height}`;
+      if (size === previous) continue;
+      this.targets.set(target, size);
+      const box = { inlineSize: rect.width, blockSize: rect.height };
+      entries.push({
+        target,
+        contentRect: { x: 0, y: 0, left: 0, top: 0, right: rect.width, bottom: rect.height, width: rect.width, height: rect.height },
+        borderBoxSize: [box],
+        contentBoxSize: [box],
+        devicePixelContentBoxSize: [box],
+      });
+    }
+    if (entries.length > 0) this.callback(entries, this);
+    return entries.length;
+  }
+}
+Object.defineProperty(ResizeObserverImpl, 'name', { value: 'ResizeObserver' });
+defineGlobal('ResizeObserver', ResizeObserverImpl);
+
+const updateGeometryObservers = (time) => {
+  if (geometryObservers.size === 0) return 0;
+  // Nothing drawn yet: the browser runs this again once something is.
+  const [right, bottom] = document.__otlyraExtent;
+  if (right === 0 && bottom === 0) return 0;
+  let notified = 0;
+  for (const observer of [...geometryObservers]) {
+    try {
+      notified += observer.update(time);
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  return notified;
+};
 
 // A user-input event the browser dispatches: what the reader did, as the event
 // a page listens for. The browser picks the target (`document.__otlyraInputTarget`)

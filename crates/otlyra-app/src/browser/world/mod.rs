@@ -80,6 +80,19 @@ struct PageSlot {
     /// Pictures that arrived (`true`) or failed during the load, whose
     /// elements hear `load`/`error` when the load's scripts have run.
     picture_events: Vec<(NodeId, bool)>,
+    /// The page geometry its observers were last updated against.
+    observed_epoch: Option<(u64, u32)>,
+}
+
+impl PageSlot {
+    /// Whether the page's intersection or resize observers are owed a turn
+    /// because what was drawn moved since they last ran.
+    fn observers_owed(&self) -> bool {
+        self.scripts
+            .as_ref()
+            .is_some_and(|scripts| scripts.wants_geometry_updates())
+            && self.page.as_ref().map(PageScene::geometry_epoch) != self.observed_epoch
+    }
 }
 
 /// What the pages are loaded into: the window's preferences and size as they
@@ -376,11 +389,12 @@ impl PageWorld {
     /// Whether `tab`'s page has asked for an animation frame.
     pub(super) fn frames_pending(&self, tab: TabId) -> bool {
         self.environment.visible_tab() == Some(tab)
-            && self
-                .slots
-                .get(&tab)
-                .and_then(|slot| slot.scripts.as_ref())
-                .is_some_and(|scripts| scripts.frames_pending())
+            && self.slots.get(&tab).is_some_and(|slot| {
+                slot.scripts
+                    .as_ref()
+                    .is_some_and(|scripts| scripts.frames_pending())
+                    || slot.observers_owed()
+            })
     }
 
     /// When a page's timer next comes due, if one is waiting.
@@ -585,12 +599,14 @@ impl PageWorld {
         else {
             return false;
         };
+        let observers = slot.observers_owed();
         let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
             return false;
         };
-        if !scripts.frames_pending() {
+        if !scripts.frames_pending() && !observers {
             return false;
         }
+        slot.observed_epoch = Some(page.geometry_epoch());
         let ran = page.with_document(|document| scripts.run_frame_at(document, timestamp, at));
         // A callback that only reads owes a frame, not a restyle.
         after_script_turn(page, scripts.as_mut());

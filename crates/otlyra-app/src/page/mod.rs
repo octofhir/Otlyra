@@ -468,6 +468,12 @@ impl PageScene {
         run(&mut self.document)
     }
 
+    /// Which drawing of the page geometry is read from: what an observer's
+    /// rendering step has to run again for when it changes.
+    pub fn geometry_epoch(&self) -> (u64, u32) {
+        (self.builds, self.scroll.to_bits())
+    }
+
     /// Give script the boxes the last frame drew, in client coordinates, once
     /// per frame and scroll position: what `getBoundingClientRect` measures.
     fn lend_geometry(&mut self) {

@@ -621,6 +621,10 @@ impl ScriptRunner for PageScripts {
         self.state.take_scroll_request()
     }
 
+    fn wants_geometry_updates(&self) -> bool {
+        self.host.is_some() && self.state.wants_geometry()
+    }
+
     fn wants_scroll_events(&self) -> bool {
         self.host.is_some() && self.state.wants_scroll_events()
     }

@@ -115,6 +115,13 @@ impl DocumentRef {
         super::request_scroll(finite(x), finite(y));
     }
 
+    /// An intersection or resize observer is watching, so the rendering step
+    /// runs when what was drawn moves.
+    #[static_method(name = "__geometryWanted")]
+    fn js_geometry_wanted() {
+        super::note_geometry_wanted();
+    }
+
     /// A scroll listener was registered, so scrolling is reported.
     #[static_method(name = "__scrollEventsWanted")]
     fn js_scroll_events_wanted() {
