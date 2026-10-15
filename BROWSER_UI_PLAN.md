@@ -135,9 +135,11 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   cookie persistence. Close the permit queue before aborting, suppress teardown
   wakes and preserve independent pools on the shared runtime. Blocking test
   loaders and started decode jobs can still finish off-thread.
-- [ ] Finish or explicitly resolve pending download saves and other blocking
-  I/O at process shutdown. Fetch cancellation does not interrupt a started
-  `spawn_blocking` job or drain the independent download writer.
+- [x] Own accepted download-save tasks and finish them on content shutdown,
+  including exit before native surface confirmation. Keep native Drop
+  nonblocking; collect terminal success/failure before final cookie persistence.
+- [ ] Resolve other started blocking I/O at process shutdown. Fetch cancellation
+  cannot interrupt a running `spawn_blocking` loader/decode job.
 - [x] Reflect active-tab visibility in `document.hidden` / `visibilityState`,
   including the first script and paused parsers; dispatch `visibilitychange`
   on content's owner. Retain hidden rAF callbacks until activation and exclude

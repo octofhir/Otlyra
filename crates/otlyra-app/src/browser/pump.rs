@@ -21,8 +21,14 @@ impl Browser {
         // this is where the writer learns it has work. The pump only schedules
         // a revision; sealing, atomic replacement and retries run off-thread.
         self.cookies.schedule_flush();
-        for saved in self.downloads_writer.poll() {
-            changed = true;
+        changed |= self.collect_download_saves();
+        changed
+    }
+
+    fn collect_download_saves(&mut self) -> bool {
+        let saved = self.downloads_writer.poll();
+        let changed = !saved.is_empty();
+        for saved in saved {
             match saved.result {
                 Ok(path) => {
                     tracing::info!(file = %path.display(), "attachment saved");
@@ -44,10 +50,15 @@ impl Browser {
     }
 
     /// Only called on native content's dedicated owner, outside any Tokio task.
-    /// Avoid creating the I/O runtime for a window that never fetched anything.
-    pub(super) fn shutdown_content_loads(&mut self) {
+    /// Avoid creating the I/O runtime when the window neither fetched nor saved.
+    pub(super) fn shutdown_content_services(&mut self) {
+        self.downloads_writer.suppress_wakes();
         if self.world.fetcher.has_tasks() {
             crate::io::shared().block_on(self.world.fetcher.shutdown());
         }
+        if self.downloads_writer.has_tasks() {
+            crate::io::shared().block_on(self.downloads_writer.finish());
+        }
+        self.collect_download_saves();
     }
 }

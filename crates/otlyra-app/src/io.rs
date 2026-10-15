@@ -34,7 +34,8 @@ use std::sync::OnceLock;
 /// Deliberately `&'static`: the runtime serves independent browser owners.
 /// Lifetime of the runtime does not imply lifetime of its clients' tasks: the
 /// fetch pool owns and cancels its transport futures when it goes away. Native
-/// content drains them outside the UI callback before final cookie persistence.
+/// content drains them outside the UI callback and finishes accepted download
+/// writes before final cookie persistence.
 pub fn shared() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {

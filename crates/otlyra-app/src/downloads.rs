@@ -20,6 +20,8 @@
 //! - a failed write leaves nothing behind and says why, and the row offers to try
 //!   again.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -339,6 +341,7 @@ pub struct DownloadWriter {
     results: Receiver<SaveResult>,
     sender: Sender<SaveResult>,
     waker: Arc<Mutex<Option<Waker>>>,
+    tasks: RefCell<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for DownloadWriter {
@@ -355,6 +358,7 @@ impl DownloadWriter {
             results,
             sender,
             waker: Arc::new(Mutex::new(None)),
+            tasks: RefCell::new(Vec::new()),
         }
     }
 
@@ -367,24 +371,114 @@ impl DownloadWriter {
 
     /// Start writing `bytes` to `destination` and return immediately.
     pub fn save(&self, id: DownloadId, destination: Destination, bytes: Arc<[u8]>) {
-        let sender = self.sender.clone();
-        let waker = Arc::clone(&self.waker);
-        crate::io::shared().spawn(async move {
-            let result = write(destination, bytes).await;
-            let _ = sender.send(SaveResult { id, result });
-            if let Some(waker) = waker.lock().ok().and_then(|slot| slot.clone()) {
-                waker.wake();
-            }
+        self.launch(id, write(destination, bytes));
+    }
+
+    fn launch(
+        &self,
+        id: DownloadId,
+        work: impl Future<Output = Result<PathBuf, String>> + Send + 'static,
+    ) {
+        self.reap();
+        let completion = SaveCompletion {
+            id,
+            sender: Some(self.sender.clone()),
+            waker: Arc::clone(&self.waker),
+        };
+        let task = crate::io::shared().spawn(async move {
+            completion.complete(work.await);
+        });
+        self.tasks.borrow_mut().push(task);
+    }
+
+    fn reap(&self) {
+        self.tasks.borrow_mut().retain(|task| !task.is_finished());
+    }
+
+    pub(crate) fn has_tasks(&self) -> bool {
+        self.reap();
+        !self.tasks.borrow().is_empty()
+    }
+
+    pub(crate) fn suppress_wakes(&self) {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Finish accepted writes without aborting filesystem operations or waking UI.
+    /// Call outside the native event callback. Dropping this future retains
+    /// unfinished handles, so a later call can resume waiting for them.
+    pub async fn finish(&mut self) {
+        self.suppress_wakes();
+        while let Some(task) = self.tasks.get_mut().last_mut() {
+            // Await by reference: canceling this drain must not detach a save.
+            let _ = task.await;
+            self.tasks.get_mut().pop();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_with_gate(
+        &self,
+        id: DownloadId,
+        destination: Destination,
+        bytes: Arc<[u8]>,
+        started: std::sync::mpsc::Sender<()>,
+        gate: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.launch(id, async move {
+            let _ = started.send(());
+            gate.await
+                .map_err(|_| "controlled write was canceled".to_owned())?;
+            write(destination, bytes).await
         });
     }
 
     /// Everything that finished since the browser last checked.
     pub fn poll(&self) -> Vec<SaveResult> {
+        self.reap();
         let mut finished = Vec::new();
         while let Ok(result) = self.results.try_recv() {
             finished.push(result);
         }
         finished
+    }
+}
+
+struct SaveCompletion {
+    id: DownloadId,
+    sender: Option<Sender<SaveResult>>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl SaveCompletion {
+    fn complete(mut self, result: Result<PathBuf, String>) {
+        self.report(result);
+    }
+
+    fn report(&mut self, result: Result<PathBuf, String>) {
+        if let Some(sender) = self.sender.take()
+            && sender
+                .send(SaveResult {
+                    id: self.id,
+                    result,
+                })
+                .is_ok()
+            && let Some(waker) = self.waker.lock().ok().and_then(|slot| slot.clone())
+        {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for SaveCompletion {
+    fn drop(&mut self) {
+        if self.sender.is_some() {
+            self.report(Err(
+                "download write task stopped before completion".to_owned()
+            ));
+        }
     }
 }
 
@@ -1208,6 +1302,88 @@ mod tests {
             std::fs::read(&path).expect("the saved file"),
             b"async bytes"
         );
+    }
+
+    #[test]
+    fn finishing_downloads_waits_for_all_files_and_releases_handles() {
+        let scratch = Scratch::new("download-drain");
+        let mut writer = DownloadWriter::new();
+        for id in 0..16 {
+            writer.save(
+                DownloadId(id),
+                Destination::Exact(scratch.path().join(format!("{id}.bin"))),
+                payload(b"complete bytes"),
+            );
+        }
+        crate::io::shared().block_on(writer.finish());
+        let results = writer.poll();
+        assert_eq!(results.len(), 16);
+        assert!(results.into_iter().all(|result| result.result.is_ok()));
+        assert!(writer.tasks.borrow().is_empty());
+        for id in 0..16 {
+            assert_eq!(
+                std::fs::read(scratch.path().join(format!("{id}.bin"))).unwrap(),
+                b"complete bytes"
+            );
+        }
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 16);
+    }
+
+    #[test]
+    fn a_canceled_download_drain_retains_ownership_and_can_resume_quietly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let scratch = Scratch::new("download-resume-drain");
+        let path = scratch.path().join("saved.bin");
+        let destination = Destination::Exact(path.clone());
+        let (allow, gate) = tokio::sync::oneshot::channel();
+        let mut writer = DownloadWriter::new();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        writer.set_waker(Waker::from_callback(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        writer.launch(DownloadId(7), async move {
+            gate.await.map_err(|_| "gate canceled".to_owned())?;
+            write(destination, payload(b"after drain resumed")).await
+        });
+        crate::io::shared().block_on(async {
+            {
+                let drain = writer.finish();
+                tokio::pin!(drain);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(writer.has_tasks(), "dropping a drain detached the write");
+            allow.send(()).unwrap();
+            writer.finish().await;
+        });
+        let results = writer.poll();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].result.is_ok());
+        assert_eq!(std::fs::read(path).unwrap(), b"after drain resumed");
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn panicked_and_aborted_download_jobs_each_report_one_terminal_failure() {
+        let mut writer = DownloadWriter::new();
+        writer.launch(DownloadId(1), async {
+            panic!("controlled download writer panic")
+        });
+        writer.launch(DownloadId(2), std::future::pending());
+        writer.tasks.borrow().last().unwrap().abort();
+        crate::io::shared().block_on(writer.finish());
+        let mut results = writer.poll();
+        results.sort_by_key(|saved| saved.id.0);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, DownloadId(1));
+        assert_eq!(results[1].id, DownloadId(2));
+        assert!(results.into_iter().all(|saved| saved.result.is_err()));
+        assert!(writer.poll().is_empty());
+        assert!(writer.tasks.borrow().is_empty());
     }
 
     /// The part file is a means, not a leftover: once the bytes are all there the

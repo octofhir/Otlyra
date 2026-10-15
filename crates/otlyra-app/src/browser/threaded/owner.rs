@@ -506,5 +506,5 @@ pub(super) fn content_loop(
             }
         }
     }
-    browser.shutdown_content_loads();
+    browser.shutdown_content_services();
 }

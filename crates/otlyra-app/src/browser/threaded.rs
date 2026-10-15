@@ -443,7 +443,7 @@ impl WindowBrowser {
                     ))
                     .is_err()
                 {
-                    browser.shutdown_content_loads();
+                    browser.shutdown_content_services();
                     return;
                 }
                 let waker = Waker::from_callback(move || {
@@ -459,7 +459,7 @@ impl WindowBrowser {
                     browser.world.fetcher.set_waker(waker.clone());
                     browser.downloads_writer.set_waker(waker);
                     let Some((viewport, queued)) = await_surface(&receiver) else {
-                        browser.shutdown_content_loads();
+                        browser.shutdown_content_services();
                         return;
                     };
                     browser.set_viewport(viewport);

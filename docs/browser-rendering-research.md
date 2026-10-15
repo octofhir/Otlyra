@@ -547,6 +547,34 @@ goldens, surface snapshots and compositor interaction tests, plus the four-case
 native GPU/CPU startup smoke. All-target clippy with `-D warnings`, formatting
 and diff checks passed against the unchanged frozen engine snapshot.
 
+## Download write ownership follow-up
+
+Download saves previously discarded their Tokio handles. Ending the content
+owner therefore did not wait for accepted filesystem writes, even though native
+CLI shutdown joined that owner. The download writer now retains its tasks and
+reaps completed handles on save/poll. Shutdown suppresses its completion wakes,
+cancels/drains fetch work, then finishes accepted saves and collects their
+terminal results before final cookie persistence. Unused writers create no I/O
+runtime just to shut down.
+
+`DownloadWriter::finish` awaits handles by mutable reference; dropping the drain
+retains unfinished writes so it can be resumed. This uses Tokio's documented
+[JoinHandle cancellation guarantee](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html#cancel-safety),
+also checked in the pinned 1.53.0 source. Normal shutdown does not abort file
+operations. A completion guard reports a terminal failure for a panicked or
+externally aborted task, including one canceled before its first poll.
+
+Tests hold writes behind a gate and prove that native Drop returns while the
+owner stays alive, then that file replacement completes before owner exit. Both
+known-viewport owners and close before native `SurfaceReady` are covered. Other
+tests check a multi-file drain, canceled/resumed drain with no teardown wake,
+and single terminal replies for panic/abort. Started blocking loader/decode jobs
+remain outside this download-specific drain policy.
+
+Verification: 1,828 workspace Rust tests, the four-case native GPU/CPU startup
+smoke, all-target clippy with `-D warnings`, formatting and diff checks passed
+on the unchanged frozen engine snapshot.
+
 ## What the reference browsers do
 
 ### Chromium
