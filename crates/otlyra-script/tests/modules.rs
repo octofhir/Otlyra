@@ -343,3 +343,13 @@ fn navigator_answers_the_strings_sniffing_code_reads() {
     );
     assert_eq!(log, ["string string -1 0"]);
 }
+
+#[test]
+fn screen_reports_the_window_size() {
+    let log = run(
+        "<script>console.log(screen.width === Math.round(innerWidth), \
+           screen.height === Math.round(innerHeight), screen.colorDepth, screen instanceof Screen)</script>",
+        &[],
+    );
+    assert_eq!(log, ["true true 24 true"]);
+}

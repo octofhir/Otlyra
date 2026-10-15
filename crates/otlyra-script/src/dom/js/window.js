@@ -45,6 +45,28 @@ for (const [name, index] of [['innerWidth', 0], ['innerHeight', 1], ['devicePixe
   });
 }
 
+// `screen`: the window's own size, as Firefox reports it when it resists
+// fingerprinting. The page has no business knowing the display it is on, and
+// the code that reads `screen.width` is choosing a layout for the window.
+class Screen {
+  constructor() {
+    throw new TypeError('Illegal constructor');
+  }
+}
+const screenObject = Object.create(Screen.prototype);
+for (const [name, index] of [['width', 0], ['height', 1], ['availWidth', 0], ['availHeight', 1]]) {
+  Object.defineProperty(Screen.prototype, name, {
+    get() { return Math.round(nativeWindowMetric(index)); },
+    enumerable: true,
+    configurable: true,
+  });
+}
+for (const [name, value] of [['colorDepth', 24], ['pixelDepth', 24], ['availLeft', 0], ['availTop', 0]]) {
+  Object.defineProperty(Screen.prototype, name, { get() { return value; }, enumerable: true, configurable: true });
+}
+defineGlobal('Screen', Screen);
+defineGlobal('screen', screenObject);
+
 // The global's interface. The global object is the engine's own and keeps its
 // prototype; `instanceof Window` answers for it rather than for its chain.
 class Window extends EventTarget {
