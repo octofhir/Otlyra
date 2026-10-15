@@ -218,6 +218,13 @@ if (typeof navigator === 'object' && navigator) {
   define(navigator, 'languages', ['en-US']);
   define(navigator, 'onLine', true);
   define(navigator, 'cookieEnabled', true);
+  // Strings, as every browser has them, because sniffing code calls
+  // `navigator.platform.indexOf(…)` without asking first. Empty is what the
+  // standard allows a browser that does not say, and what Firefox's
+  // `vendor` is.
+  define(navigator, 'platform', '');
+  define(navigator, 'vendor', '');
+  define(navigator, 'maxTouchPoints', 0);
 }
 
 if (typeof performance === 'object' && performance) {

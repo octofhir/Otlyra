@@ -333,3 +333,13 @@ fn top_level_await_does_not_hold_content_loaded() {
     );
     assert_eq!(log, ["before await", "dcl", "after await"]);
 }
+
+#[test]
+fn navigator_answers_the_strings_sniffing_code_reads() {
+    let log = run(
+        "<script>console.log(typeof navigator.platform, typeof navigator.vendor, \
+           navigator.platform.indexOf('Linux'), navigator.maxTouchPoints)</script>",
+        &[],
+    );
+    assert_eq!(log, ["string string -1 0"]);
+}
