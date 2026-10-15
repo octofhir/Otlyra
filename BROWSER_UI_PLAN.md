@@ -171,6 +171,10 @@ This work crosses the browser/page boundary rather than replacing UI foundations
 - [ ] Give dynamic accessibility controls stable semantic identities instead of
   layout positions, and reject stale native/queued requests after a target retires.
   Focus ids are positional too; substituting them for indices is insufficient.
+- [x] Bind retained tab select/close actions to TabId, preserving their targets
+  through model reorder and ignoring retired ids. Include system-page kind in
+  queued content contexts and accessibility retirement; about-page transitions
+  can retain a prior navigation id.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

@@ -400,8 +400,12 @@ pub enum UiAction {
     },
     /// Close a tab by index.
     CloseTab(usize),
+    /// Close the tab identified when its control was built. Retired ids do nothing.
+    CloseTabId(u64),
     /// Make a tab active.
     SelectTab(usize),
+    /// Select the tab identified when its control was built. Retired ids do nothing.
+    SelectTabId(u64),
     /// Load the active tab's address again.
     Reload,
     /// Stop waiting for the active tab's current navigation.
@@ -2747,16 +2751,7 @@ fn tab_strip(
     // builds and only those.
     places.borrow_mut().clear();
     for (index, label) in tabs.iter().enumerate() {
-        let one = tab(
-            theme,
-            focus,
-            cx,
-            label,
-            index,
-            index == active,
-            each,
-            spinner,
-        );
+        let one = tab(theme, focus, cx, label, index == active, each, spinner);
         // Every tab reports where it landed, which is what a drag reads to ask
         // which tab the pointer is over.
         let one: Child<UiAction> = Box::new(crate::widget::Track::new(
@@ -3211,13 +3206,11 @@ fn separator(theme: &Theme) -> Child<UiAction> {
 }
 
 /// One tab: a mark, a title, and a cross.
-#[allow(clippy::too_many_arguments)]
 fn tab(
     theme: &Theme,
     focus: &Focus,
     cx: &mut Cx,
     label: &TabLabel,
-    index: usize,
     active: bool,
     width: f64,
     spinner: Option<f32>,
@@ -3250,7 +3243,7 @@ fn tab(
     let close = controls::icon_button(
         theme,
         focus,
-        UiAction::CloseTab(index),
+        UiAction::CloseTabId(label.id),
         true,
         "Close tab",
         icon::cross,
@@ -3290,7 +3283,7 @@ fn tab(
     Box::new(Fixed::width(
         width,
         Box::new(
-            Button::new(UiAction::SelectTab(index), Box::new(background))
+            Button::new(UiAction::SelectTabId(label.id), Box::new(background))
                 .role(Role::Tab)
                 .value(if active { "selected" } else { "not selected" })
                 .focus(id)
@@ -3658,7 +3651,7 @@ mod tests {
 
         assert_eq!(
             ui.activate_described(index, &mut text),
-            UiAction::SelectTab(2)
+            UiAction::SelectTabId(3)
         );
     }
 
@@ -3951,7 +3944,7 @@ mod tests {
         let x = 6.0 + TAB_MAX_WIDTH + TAB_GAP + 30.0;
         assert_eq!(
             press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
-            UiAction::SelectTab(1)
+            UiAction::SelectTabId(2)
         );
     }
 
@@ -3965,7 +3958,7 @@ mod tests {
         let x = 6.0 + TAB_MAX_WIDTH - 16.0;
         assert_eq!(
             press(&mut ui, &mut text, x, TAB_STRIP_HEIGHT / 2.0),
-            UiAction::CloseTab(0)
+            UiAction::CloseTabId(1)
         );
     }
 
@@ -4196,7 +4189,7 @@ mod tests {
         ui.pointer_moved(start, first.y + first.height / 2.0, &mut text);
         assert_eq!(
             ui.pointer_pressed(&mut text, 1),
-            UiAction::SelectTab(0),
+            UiAction::SelectTabId(1),
             "a press on a tab is still a press on a tab"
         );
 
@@ -4437,11 +4430,11 @@ mod tests {
                 &mut text,
                 &mut crate::clipboard::InMemory::default()
             ),
-            UiAction::SelectTab(0)
+            UiAction::SelectTabId(1)
         );
         assert_eq!(
             press(&mut ui, &mut text, 40.0, TAB_STRIP_HEIGHT / 2.0),
-            UiAction::SelectTab(0)
+            UiAction::SelectTabId(1)
         );
     }
 
@@ -4955,10 +4948,12 @@ mod tests {
         let mut seen = Vec::new();
         let mut x = 0.0;
         while x < width {
-            if let Some(UiAction::SelectTab(index)) = ui.action_at(x, TAB_STRIP_HEIGHT / 2.0, text)
-                && !seen.contains(&index)
-            {
-                seen.push(index);
+            if let Some(UiAction::SelectTabId(id)) = ui.action_at(x, TAB_STRIP_HEIGHT / 2.0, text) {
+                // This fixture numbers ids from one and indices from zero.
+                let index = (id - 1) as usize;
+                if !seen.contains(&index) {
+                    seen.push(index);
+                }
             }
             x += 4.0;
         }

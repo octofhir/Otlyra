@@ -206,10 +206,22 @@ enum Command {
 
 type PointerSlot = Arc<Mutex<Option<Box<Input>>>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ContentContext {
+    navigation: Option<u64>,
+    system: Option<SystemPage>,
+}
+
+impl ContentContext {
+    fn matches(self, tab: &Tab) -> bool {
+        self.navigation == tab.navigation && self.system == tab.system
+    }
+}
+
 struct Input {
     serial: u64,
     tab: TabId,
-    navigation: Option<Option<u64>>,
+    context: Option<ContentContext>,
     intent: Option<Intent>,
     chrome: Option<ChromeInput>,
     action: UiAction,
@@ -628,7 +640,10 @@ impl WindowBrowser {
         let input = Box::new(Input {
             serial: self.serial,
             tab,
-            navigation: page_event.then_some(self.tabs[self.active].navigation),
+            context: page_event.then_some(ContentContext {
+                navigation: self.tabs[self.active].navigation,
+                system: self.tabs[self.active].system,
+            }),
             intent,
             chrome: chrome.then(|| ChromeInput {
                 address: self.ui.address.clone(),
@@ -668,6 +683,21 @@ impl WindowBrowser {
                 .get(*index)
                 .map(|tab| Intent::Close(tab.id, (self.tabs.len() == 1).then(Tab::blank))),
             UiAction::SelectTab(index) => self.tabs.get(*index).map(|tab| Intent::Select(tab.id)),
+            UiAction::SelectTabId(id) => {
+                if !self.tabs.iter().any(|tab| tab.id == TabId(*id)) {
+                    return;
+                }
+                Some(Intent::Select(TabId(*id)))
+            }
+            UiAction::CloseTabId(id) => {
+                if !self.tabs.iter().any(|tab| tab.id == TabId(*id)) {
+                    return;
+                }
+                Some(Intent::Close(
+                    TabId(*id),
+                    (self.tabs.len() == 1).then(Tab::blank),
+                ))
+            }
             UiAction::MoveTab { id, to } => Some(Intent::Move(TabId(*id), *to)),
             _ => None,
         };

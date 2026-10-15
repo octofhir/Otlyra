@@ -55,6 +55,16 @@ impl Browser {
             UiAction::NewTab => self.new_tab(),
             UiAction::CloseTab(index) => self.close_tab(index),
             UiAction::SelectTab(index) => self.select_tab(index),
+            UiAction::CloseTabId(id) => {
+                if let Some(index) = self.tab_index(TabId(id)) {
+                    self.close_tab(index);
+                }
+            }
+            UiAction::SelectTabId(id) => {
+                if let Some(index) = self.tab_index(TabId(id)) {
+                    self.select_tab(index);
+                }
+            }
             UiAction::MoveTab { id, to } => self.move_tab(TabId(id), to),
             UiAction::Reload => self.reload(),
             UiAction::Context(command) => self.apply_context(command),

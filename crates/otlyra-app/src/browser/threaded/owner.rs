@@ -56,7 +56,11 @@ impl Snapshot {
             None
         };
         let tab = &browser.tabs[browser.active];
-        let context_changed = cache.tab != Some((tab.id, tab.navigation));
+        let context = ContentContext {
+            navigation: tab.navigation,
+            system: tab.system,
+        };
+        let context_changed = cache.tab != Some((tab.id, context));
         if browser.window_visible && (browser.accessibility_dirty || context_changed) {
             let document = browser.world.page(tab.id).map_or_else(
                 || crate::a11y::empty_tree(&tab.title),
@@ -71,7 +75,7 @@ impl Snapshot {
             cache.document = Arc::new(crate::a11y::empty_tree(&tab.title));
             browser.accessibility_dirty = true;
         }
-        cache.tab = Some((tab.id, tab.navigation));
+        cache.tab = Some((tab.id, context));
         if browser.window_visible {
             let (focused, described) = match tab.system {
                 Some(SystemPage::Settings) => {
@@ -209,7 +213,7 @@ impl SnapshotMetadata {
 }
 
 struct MetadataCache {
-    tab: Option<(TabId, Option<u64>)>,
+    tab: Option<(TabId, ContentContext)>,
     document: Arc<accesskit::TreeUpdate>,
     revision: Option<(u64, u64)>,
     suggestions: Arc<Vec<Suggestion>>,
@@ -401,7 +405,7 @@ pub(super) fn content_loop(
                     let Input {
                         serial: received,
                         tab,
-                        navigation,
+                        context,
                         intent,
                         chrome,
                         action,
@@ -410,10 +414,10 @@ pub(super) fn content_loop(
                         system_index,
                     } = *input;
                     serial = received;
-                    if navigation.is_some_and(|expected| {
+                    if context.is_some_and(|expected| {
                         browser
                             .tab_index(tab)
-                            .is_none_or(|index| browser.tabs[index].navigation != expected)
+                            .is_none_or(|index| !expected.matches(&browser.tabs[index]))
                     }) {
                         continue;
                     }
@@ -425,7 +429,7 @@ pub(super) fn content_loop(
                         };
                         browser.select_tab(index);
                     }
-                    if cache.deferred && navigation.is_some() {
+                    if cache.deferred && context.is_some() {
                         // Restore and input may share a command batch. Hit tests,
                         // focus traversal and accessibility actions need current
                         // layout even before the next visible publication.
@@ -465,6 +469,8 @@ pub(super) fn content_loop(
                         UiAction::NewTab
                         | UiAction::CloseTab(_)
                         | UiAction::SelectTab(_)
+                        | UiAction::CloseTabId(_)
+                        | UiAction::SelectTabId(_)
                         | UiAction::MoveTab { .. } => {}
                         UiAction::NavigateInNewTab(url) => browser.navigate(&url),
                         UiAction::OpenPage(page) => browser.open_system(page),

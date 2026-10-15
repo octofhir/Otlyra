@@ -4,6 +4,7 @@ use otlyra_platform::FramePump;
 use std::time::Duration;
 
 mod accessibility;
+mod action_targets;
 mod hidden_preparation;
 mod initial_environment;
 

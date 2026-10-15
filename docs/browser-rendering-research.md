@@ -521,6 +521,32 @@ Artifacts: `target/startup-native-surface-{gpu,cpu}.json`,
 in `target/native-metrics-{before,after}.{json,log}`. Earlier pilot binaries and
 measurements are retained separately and are not mixed with this final series.
 
+## Retained action target follow-up
+
+Tab buttons previously stored layout indices. Receiving a reordered model before
+the next chrome frame could make a click on the retained second tab select or
+close a different tab. Controls now store their TabId; native projections and
+the synchronous Browser resolve it when acting. Closed targets are ignored.
+Existing index actions retain their API for current-index commands and shortcuts.
+
+Content input contexts now include system-page kind as well as navigation id.
+About pages retain the last navigation id, which previously allowed queued
+document or system-page input to cross a replacement. The owner rejects those
+commands while acknowledging their serial. Accessibility metadata uses the same
+context, clearing retired document nodes and hidden system descriptions instead
+of retaining them under the new surface's title.
+
+Tests exercise 1x/2x retained tab controls after owner reorder, a retired close
+button, synchronous Browser routing, queued pointer input across document/about
+replacements, hidden system navigation and document accessibility retirement.
+This secures targets captured when commands enter the queue; positional native
+accessibility ids still need stable semantic identity across tree publications.
+
+Verification: 1,824 workspace Rust tests passed, including existing interface
+goldens, surface snapshots and compositor interaction tests, plus the four-case
+native GPU/CPU startup smoke. All-target clippy with `-D warnings`, formatting
+and diff checks passed against the unchanged frozen engine snapshot.
+
 ## What the reference browsers do
 
 ### Chromium
