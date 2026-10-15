@@ -13,7 +13,7 @@
 //! and what the window needs to hear back from it comes back as a
 //! [`WorldEvent`] rather than as a reach into the window's own state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use otlyra_dom::NodeId;
 use otlyra_text::TextEngine;
@@ -33,6 +33,7 @@ mod timer_tests;
 #[cfg(test)]
 pub(super) use subresources::IMAGE_CACHE_BUDGET;
 pub(super) use subresources::ImageCache;
+use subresources::PictureFetch;
 
 use load::PendingLoad;
 
@@ -65,6 +66,13 @@ struct PageSlot {
     /// list it was built from is being reused. Without this the walk happened
     /// for every open tab on every frame.
     swept_at_build: Option<u64>,
+    /// Which document `page` is, so a picture fetched for the one before it is
+    /// never handed to an element of this one that happens to share a node id.
+    generation: u64,
+    /// The pictures elements of this document have been asked for, by element
+    /// and address as the markup spells it. A picture script adds or changes
+    /// after the load is asked for once, whether or not it arrives.
+    pictures_asked: HashSet<(NodeId, String)>,
 }
 
 /// What the pages are loaded into: the window's preferences and size as they
@@ -155,7 +163,9 @@ pub(super) struct PageWorld {
     background_fetches: HashMap<u64, (TabId, String)>,
     /// Fetches for a picture an element chose again, by request number, with the
     /// tab, the element and the address as its markup spells it.
-    picture_fetches: HashMap<u64, (TabId, NodeId, String, f32)>,
+    picture_fetches: HashMap<u64, PictureFetch>,
+    /// The last document generation handed to a slot.
+    generations: u64,
     /// The window the pictures on screen were last chosen against.
     ///
     /// The choice is a question about the window, so it is put again only when
@@ -188,6 +198,7 @@ impl PageWorld {
             script_hops: 0,
             background_fetches: HashMap::new(),
             picture_fetches: HashMap::new(),
+            generations: 0,
             picture_window: None,
             requested_faces: Vec::new(),
             font_fetches: HashMap::new(),
@@ -303,11 +314,14 @@ impl PageWorld {
     /// Put `page` in `tab`, in place of whatever was there and of any load in
     /// flight for it.
     pub(super) fn set_page(&mut self, tab: TabId, page: Option<PageScene>) {
+        self.generations += 1;
         let slot = self.slots.entry(tab).or_default();
         slot.page = page;
         slot.scripts = None;
         slot.pending = None;
         slot.swept_at_build = None;
+        slot.generation = self.generations;
+        slot.pictures_asked.clear();
     }
 
     /// Install a runner on its owner for content-boundary regression tests.
@@ -566,8 +580,8 @@ impl PageWorld {
         if let Some((tab, url)) = self.background_fetches.remove(&fetched.id) {
             return self.background_arrived(tab, url, fetched);
         }
-        if let Some((tab, node, src, density)) = self.picture_fetches.remove(&fetched.id) {
-            return self.picture_arrived(tab, node, src, density, fetched);
+        if let Some(fetch) = self.picture_fetches.remove(&fetched.id) {
+            return self.picture_arrived(fetch, fetched);
         }
 
         let owner = self.slots.iter().find_map(|(tab, slot)| {

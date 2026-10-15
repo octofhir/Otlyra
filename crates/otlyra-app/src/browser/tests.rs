@@ -1986,6 +1986,79 @@ fn a_cached_picture_is_not_fetched_twice() {
     );
 }
 
+/// A picture script adds, or swaps in, after the load is asked for once, and
+/// one that failed during the load is not asked for again on every frame.
+#[test]
+fn pictures_script_adds_after_the_load_are_fetched_once() {
+    struct PictureLoader {
+        requested: Requests,
+    }
+
+    impl Loader for PictureLoader {
+        fn load(&self, url: &str) -> Result<Loaded, String> {
+            self.requested
+                .lock()
+                .expect("no panic on the fetch thread")
+                .push(url.to_owned());
+            if url.ends_with("/broken.png") {
+                return Err("gone".to_owned());
+            }
+            if url.ends_with(".png") {
+                return Ok(Loaded {
+                    content_type: Some("image/png".to_owned()),
+                    bytes: ONE_PIXEL_PNG.to_vec(),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                });
+            }
+            Ok(Loaded {
+                content_type: Some("text/html".to_owned()),
+                bytes: b"<body><img id=first src=\"/first.png\"><img src=\"/broken.png\">\
+                         <script>setTimeout(() => {\
+                           const late = document.createElement('img');\
+                           late.src = '/late.png';\
+                           document.body.appendChild(late);\
+                           document.getElementById('first').src = '/swapped.png';\
+                         }, 0);</script>"
+                    .to_vec(),
+                charset: Some("utf-8".to_owned()),
+                final_url: "https://pictures.example/".to_owned(),
+                ..Default::default()
+            })
+        }
+    }
+
+    let requested = Requests::default();
+    let mut browser = Browser::new(PictureLoader {
+        requested: std::sync::Arc::clone(&requested),
+    });
+    let viewport = Viewport::new(800, 600, 1.0);
+    browser.set_viewport(viewport);
+    go(&mut browser, "pictures.example");
+    for _ in 0..3 {
+        browser.prepare_frame(viewport, std::time::Duration::from_secs(5));
+    }
+
+    let asked = asked_for(&requested);
+    let count = |name: &str| asked.iter().filter(|url| url.ends_with(name)).count();
+    assert_eq!(count("/first.png"), 1, "{asked:?}");
+    assert_eq!(
+        count("/late.png"),
+        1,
+        "an added picture is fetched: {asked:?}"
+    );
+    assert_eq!(
+        count("/swapped.png"),
+        1,
+        "a changed src is fetched: {asked:?}"
+    );
+    assert_eq!(
+        count("/broken.png"),
+        1,
+        "a failed picture is not retried per frame: {asked:?}"
+    );
+}
+
 /// A window that grows past the file its pictures were chosen for asks again.
 ///
 /// The choice among the several a `srcset` offers is made against the window

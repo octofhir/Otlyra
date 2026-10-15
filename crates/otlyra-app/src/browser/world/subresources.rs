@@ -66,7 +66,97 @@ impl ImageCache {
     }
 }
 
+/// A picture one element asked for outside its document's load.
+pub(super) struct PictureFetch {
+    tab: TabId,
+    /// The slot generation of the document whose element asked.
+    generation: u64,
+    node: NodeId,
+    /// The address as the markup spells it.
+    src: String,
+    density: f32,
+}
+
 impl PageWorld {
+    /// Ask for the pictures elements want and do not have, once the load that
+    /// asked for the markup's own pictures is over.
+    ///
+    /// A page's script adds pictures and changes the one an element shows long
+    /// after its load: a gallery, a framework rendering its first view, a
+    /// placeholder swapped for the real thing. Each element and address is
+    /// asked for once; a decoded picture already kept is handed over directly.
+    fn fetch_element_pictures(&mut self, tabs: &[TabId]) {
+        if !self.environment.load_images {
+            return;
+        }
+        let viewport = self.environment.viewport;
+        for &tab in tabs {
+            let Some(slot) = self.slots.get(&tab) else {
+                continue;
+            };
+            if slot.pending.is_some() {
+                continue;
+            }
+            let Some(page) = slot.page.as_ref() else {
+                continue;
+            };
+            let generation = slot.generation;
+            let (document, base) = (page.url().to_string(), page.base_url().clone());
+            let wanted: Vec<otlyra_layout::ImageSource> =
+                otlyra_layout::image_sources(page.document(), viewport)
+                    .into_iter()
+                    .take(IMAGE_LIMIT)
+                    .filter(|source| {
+                        page.picture_source(source.node)
+                            != Some((source.src.as_str(), source.density))
+                    })
+                    .collect();
+            for source in wanted {
+                let Some(target) = Self::subresource_url(&document, &base, &source.src) else {
+                    continue;
+                };
+                if let Some(data) = self.images.get(&target)
+                    && let Some(page) = self.page_mut(tab)
+                {
+                    page.set_image(
+                        source.node,
+                        source.src,
+                        otlyra_layout::Picture {
+                            data,
+                            density: source.density,
+                        },
+                    );
+                    continue;
+                }
+                let Some(slot) = self.slots.get_mut(&tab) else {
+                    break;
+                };
+                if !slot
+                    .pictures_asked
+                    .insert((source.node, source.src.clone()))
+                {
+                    continue;
+                }
+                tracing::debug!(
+                    target: "page.subresource",
+                    url = %target,
+                    "asking for a picture an element wants after its load"
+                );
+                let id = self.fetcher.request(&target, ResourceKind::Image);
+                self.picture_fetches.insert(
+                    id,
+                    PictureFetch {
+                        tab,
+                        generation,
+                        node: source.node,
+                        src: source.src,
+                        density: source.density,
+                    },
+                );
+            }
+        }
+    }
+
     /// Ask for the background pictures the pages have found they need.
     ///
     /// A background is named by a rule, so what a page wants is known only once it
@@ -170,9 +260,23 @@ impl PageWorld {
                     );
                     continue;
                 }
+                let Some(slot) = self.slots.get_mut(&tab) else {
+                    break;
+                };
+                slot.pictures_asked
+                    .insert((source.node, source.src.clone()));
+                let generation = slot.generation;
                 let id = self.fetcher.request(&target, ResourceKind::Image);
-                self.picture_fetches
-                    .insert(id, (tab, source.node, source.src, source.density));
+                self.picture_fetches.insert(
+                    id,
+                    PictureFetch {
+                        tab,
+                        generation,
+                        node: source.node,
+                        src: source.src,
+                        density: source.density,
+                    },
+                );
             }
         }
     }
@@ -196,6 +300,7 @@ impl PageWorld {
             .map(|(tab, _)| *tab)
             .collect();
         if !sweep.is_empty() {
+            self.fetch_element_pictures(&sweep);
             self.fetch_backgrounds(&sweep);
             self.fetch_fonts(&sweep);
             for tab in sweep {
@@ -232,16 +337,27 @@ impl PageWorld {
         }
     }
 
-    /// A picture an element chose again after the page was built arrived: the
-    /// same element, a different file.
-    pub(super) fn picture_arrived(
-        &mut self,
-        tab: TabId,
-        node: NodeId,
-        src: String,
-        density: f32,
-        fetched: Fetched,
-    ) -> bool {
+    /// A picture an element asked for after its document's load arrived.
+    pub(super) fn picture_arrived(&mut self, fetch: PictureFetch, fetched: Fetched) -> bool {
+        let PictureFetch {
+            tab,
+            generation,
+            node,
+            src,
+            density,
+        } = fetch;
+        // The element's document is gone, or is being replaced: node ids name
+        // elements of one document only.
+        let current = self.slots.get(&tab).is_some_and(|slot| {
+            slot.generation == generation
+                && slot
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| !pending.document_arrived)
+        });
+        if !current {
+            return false;
+        }
         let Ok(mut loaded) = fetched.result else {
             tracing::warn!(%src, "re-chosen picture failed to load");
             return false;

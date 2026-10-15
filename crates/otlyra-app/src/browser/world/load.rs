@@ -1089,6 +1089,9 @@ impl PageWorld {
         self.background_requests.clear();
 
         let interface = self.environment.interface;
+        let viewport = self.environment.viewport;
+        self.generations += 1;
+        let generation = self.generations;
         let Some(slot) = self.slots.get_mut(&tab) else {
             return;
         };
@@ -1137,6 +1140,21 @@ impl PageWorld {
                 interface,
             ));
         }
+        slot.generation = generation;
+        slot.swept_at_build = None;
+        // What the load asked for and did not get stays asked: a picture that
+        // failed is not fetched again by the sweep that follows each frame.
+        slot.pictures_asked = slot
+            .page
+            .as_ref()
+            .map(|page| {
+                otlyra_layout::image_sources(page.document(), viewport)
+                    .into_iter()
+                    .filter(|source| pending.pictures_asked.contains(&source.node))
+                    .map(|source| (source.node, source.src))
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(page) = slot.page.as_mut() {
             page.set_scroll(scroll);
         }
