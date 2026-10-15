@@ -230,6 +230,29 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   changes. The owner still builds a full snapshot for semantic invalidations;
   equal snapshots retain their Arc, but generation/comparison still walks it.
 
+## Page compatibility — what script can see and do
+
+Landed this run (see the [rendering audit](docs/browser-rendering-research.md#page-script-compatibility-follow-up)):
+event handlers and UI Events interfaces, trusted input dispatch with
+cancellation, form values and checkedness shared with script, focus,
+hover, scroll and submit events, picture load/error with natural sizes,
+element geometry from the last frame, intersection/resize observers, and
+BiDi `script.evaluate`/`callFunction`. What is left:
+
+- [ ] Module scripts. Blocked on the engine: the frozen Otter's synchronous
+  module loader never calls the embedder load/resolve hooks, and http(s)
+  imports exist only behind the asynchronous handle. Until then a module is
+  skipped and `nomodule` runs.
+- [ ] `MutationObserver` records (still a stub), and `keypress`,
+  `beforeinput` and IME composition events.
+- [ ] Synchronous geometry: a measurement after a mutation in the same turn
+  reads the previous frame, and elements outside the drawn band measure zero.
+- [ ] Element scrolling (`scrollTop` of anything but the scrolling element),
+  `scrollIntoView`, `wheel` events to script, and pointer modifiers.
+- [ ] Keyboard and accessibility activation dispatching `click`, and
+  `click()` from script performing activation behaviour.
+- [ ] Hide the remaining `__otlyra*` bindings behind `take` so no page sees them.
+
 ## Priority 2 — Retained scene layers and damage
 
 - [ ] Keep device scale, translation, clip, opacity, and simple animation in

@@ -931,6 +931,88 @@ windows. An ignored native test, run with
 injects one and three refusals on both renderers. Artifacts are in
 `target/occlusion-stall/`.
 
+## Page script compatibility follow-up
+
+A probe of ordinary page behaviour found the page's script blind and mute
+toward the reader. Nothing the reader did reached a listener; handlers set as
+`onclick` attributes or properties never ran; `MouseEvent` and the other UI
+Events interfaces did not exist; `<img>` never fired `load` and reported
+`complete` with a zero size; a field's typed value was invisible to its own
+page; focus, scroll position and element geometry were constants; and the
+lazy-loading observers never called back. Each was fixed as its own stage
+and committed after the full gate:
+
+| Commit | What now works |
+| --- | --- |
+| `6a05b03` | pictures an `<img>` gains after the load (inserted, or `src` changed) are fetched once each |
+| `f4e9ce3` | HTML event handlers: `on*` content attributes (lazily compiled with the element/form/document scope) and IDL properties, `return false`, `<body>`→window forwarding; `UIEvent`, `MouseEvent`, `PointerEvent`, `WheelEvent`, `KeyboardEvent`, `FocusEvent`, `InputEvent` and the HTML event interfaces. No touch handlers, so feature detection still sees a desktop |
+| `849b347` | trusted pointerdown/mousedown/mouseup/click and keydown/input/keyup reach page listeners through `ScriptRunner::dispatch_input`; a cancelled mousedown withholds focus and selection, a cancelled click withholds link navigation and control activation, a cancelled keydown withholds the browser's handling and the typed text. Links are followed on the click, not the press |
+| `36c9e08` | `FormState` lives in the `Document`, so `input.value`/`checked` and `textarea.value` are what the reader typed and what script writes; checkboxes and radios change before their click and revert if it is cancelled |
+| `000148f` | focus/blur/focusin/focusout, `change` for an edited field, mouseover/out/enter/leave, and mousemove only for pages that listen |
+| `6b9cdb8` | `<img>` `load`/`error`, `naturalWidth/Height`, `complete`; the window's `load` now waits for the document's subresources, `DOMContentLoaded` still fires when parsing ends |
+| `62d11fe` | WebDriver BiDi `script.evaluate`, `script.callFunction` and `script.getRealms` (by value), and input actions reaching page elements with the interface hidden |
+| `302d91b` | `<script type=module src>` is neither prefetched, waited for nor run as a classic script; the `nomodule` fallback runs |
+| `0ca9936` | a form the reader sends dispatches a cancelable `submit` first and is rebuilt from what its listeners left |
+| `a0b3f6a` | `document.activeElement`, `focus()` and `blur()`; the browser's focus follows script |
+| `bb9d8a1` | `scrollX/scrollY`, `scrollTo/scrollBy/scroll`, the scrolling element's `scrollTop`, and coalesced `scroll` events for pages that listen |
+| `1aaf057` | `getBoundingClientRect`, `getClientRects`, `offset*`, `client*`, root `scroll*` from the last frame's boxes |
+| `c6f6434` | `IntersectionObserver` and `ResizeObserver` answered in the rendering step after rAF, owed whenever drawn geometry or scroll changed |
+| `ce4d655` | `new Image()` preloading fetches and fires `load` without drawing |
+
+The input path is one route for the native window, the threaded content
+owner and the BiDi session: all call `Browser::on_event`, which now compares
+the page focus, scroll and hover with what the page was last told. Script
+turns for input are separate turns on content's owner and never run on the
+native UI thread. Pointer moves and scroll events cost a turn only when the
+page registered for them.
+
+Module scripts remain engine-blocked on the frozen Otter snapshot: its
+`RuntimeLoadHook`/`RuntimeResolveHook` are declared but the synchronous
+module loader never calls them, and http(s) imports are wired only through
+the asynchronous handle's remote provider. Running modules needs that
+engine change, which this run did not make.
+
+Geometry is a snapshot of the last frame, not a synchronous layout: a script
+that mutates and measures in the same turn reads the previous frame, and an
+element outside the drawn band measures zero (observers report it as not
+intersecting). `MutationObserver` is still a stub.
+
+`tools/bidi-smoke.py` drives a release or debug `otlyra --bidi 0` over a real
+WebSocket with a standard-library client: it clicks a button and types into
+a field through `input.performActions` and reads the page back through
+`script.evaluate`/`script.callFunction`. It passed against the debug build
+and the final release (see below).
+
+### Final validation of this run
+
+The final release (`ce4d655`, binary SHA-256
+`86c196a66b97d12a4b1a091fb68c3f63232a2078a7818ddb5ce1ebeb288f83d6`, frozen
+engine `23c5a114…`, Rust 1.96.0, the dom/html/script/platform/app release
+packages cleaned before building) contains no fault-injection hook. It
+completed 100 of 100 mixed native starts (60 GPU, 40 CPU, half About and half
+the timer fixture) while the machine's one-minute load rose from 92 to 148
+from unrelated work. Six of those starts hit the occluded first presentation
+on their own and recovered. `tools/bidi-smoke.py` passed against it.
+
+Startup was measured against the previous run's final release (`7c0fac7`)
+in 20 alternating-order pairs after three warmups per series, 1024×768 at
+2×, Apple M1/macOS 26.5. One-minute load was 28 at the start and 70 at the
+end, so these show the absence of a large change rather than a speed. p50/p95
+in ms, control → final, paired median delta:
+
+| Series | Process → visible | Process → first frame report |
+| --- | --- | --- |
+| About / GPU | 235.00/273.40 → 229.75/263.37, +0.95 | 348.69/407.50 → 341.21/396.10, −5.64 |
+| About / CPU | 228.45/319.67 → 216.89/269.68, −12.06 | 345.98/454.80 → 330.46/414.83, −13.89 |
+| Timer fixture / GPU | 238.60/310.80 → 237.74/259.55, −0.80 | 356.76/458.11 → 363.24/406.25, −2.33 |
+| Timer fixture / CPU | 214.74/261.79 → 231.46/284.10, +0.76 | 355.42/411.42 → 362.70/400.52, +2.26 |
+
+No startup speedup or regression is claimed from these; all four strict
+budgets still fail. These are UI accounting intervals, not physical
+presentation. Raw data: `target/occlusion-stall/startup-*.json`,
+`target/occlusion-stall/startup-session.json`, stress in
+`target/occlusion-stall/final-{gpu,cpu}/runs.json`.
+
 ## What the reference browsers do
 
 ### Chromium
