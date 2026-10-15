@@ -968,11 +968,9 @@ turns for input are separate turns on content's owner and never run on the
 native UI thread. Pointer moves and scroll events cost a turn only when the
 page registered for them.
 
-Module scripts remain engine-blocked on the frozen Otter snapshot: its
-`RuntimeLoadHook`/`RuntimeResolveHook` are declared but the synchronous
-module loader never calls them, and http(s) imports are wired only through
-the asynchronous handle's remote provider. Running modules needs that
-engine change, which this run did not make.
+Module scripts were engine-blocked on the frozen Otter snapshot at the time
+of this run; they run since `92ad418` — see
+[Module scripts follow-up](#module-scripts-follow-up).
 
 Geometry is a snapshot of the last frame, not a synchronous layout: a script
 that mutates and measures in the same turn reads the previous frame, and an
@@ -1015,6 +1013,208 @@ budgets still fail. These are UI accounting intervals, not physical
 presentation. Raw data: `target/occlusion-stall/startup2-*.json`,
 `target/occlusion-stall/startup2-session.json` (the checkpoint's are the
 `startup-*` files), stress in `target/occlusion-stall/final2-{gpu,cpu}/runs.json`.
+
+## Module scripts follow-up
+
+Most of the modern web ships its JavaScript as ES modules, and until this run
+Otlyra skipped every `<script type=module>` and ran the `nomodule` fallback
+instead. GitHub and Apple are two of the sites that broke this way. Two things
+blocked modules, and both were in the engine. Otter's synchronous module loader
+never called the embedder's resolve and load hooks. Its http(s) imports also
+existed only behind the asynchronous handle, which fetches from the network
+itself. A browser cannot accept either. Its network belongs to the browser,
+with the browser's cache, policy and limits, and the content owner's thread
+must never wait on a socket.
+
+### The engine boundary (Otter `a8df8122e`)
+
+Otter now has a `WebModuleMap` (`otter-runtime/src/web_modules.rs`) and WHATWG
+import maps (`otter-runtime/src/import_map.rs`). An embedder enables them with
+`RuntimeBuilder::web_modules(map)`. Loading a graph is two-phase and never
+blocks:
+
+1. **Prepare.** The embedder calls `WebModuleMap::graph_status(entry)`. It
+   walks what has been delivered, parsing each module once for its static
+   requests and resolving them through the import map. The answer is either
+   `Ready` or `Pending { fetch }`. `fetch` lists the URLs that nobody has asked
+   for yet, and each one is reported once.
+2. **Deliver.** The embedder fetches those URLs however it wants. It hands
+   each result back with `deliver(request_url, Ok(source) | Err(reason))`,
+   giving the final URL after redirects. Then it repeats step 1.
+3. **Run.** `Runtime::run_module_source` compiles, links and evaluates the
+   graph from the delivered sources.
+
+In this mode every specifier resolves by the HTML rules (relative, absolute,
+import-map bare and prefix keys, and scopes), and every module is an ES module
+in JavaScript. The loader never reads the filesystem or the network. It skips
+CommonJS sniffing, `package.json` scopes and the compile cache, so what a
+person browsed is not written to disk. The module map is keyed by request URL,
+which deduplicates both fetches and evaluation within a document. Inline
+modules are separate records. Each one is keyed by the document URL plus an
+`#otter-inline-module=N` marker, and `import.meta.url` strips that marker.
+
+A dynamic `import()` is parked rather than rejected. `Runtime::web_module_fetches`
+reports what parked imports need, and `Runtime::resume_web_dynamic_imports`
+settles them once their graph has been delivered. A failed fetch rejects the
+promise with a `TypeError`. Literal `import("./x")` targets are no longer
+preloaded with the static graph in this mode, so they are fetched when the call
+runs, as browsers do. The microtask checkpoint now also pumps imports queued
+by a timer or by an event the host dispatched.
+
+### The browser side (Otlyra)
+
+- **Parser.** `type=module` and `type=importmap` go to the `ScriptRunner`
+  (`module_script` and `import_map`), and neither stops the parse. A classic
+  script with `nomodule` is not run. The preload scan
+  (`prescan_module_scripts`) starts the fetch of each module entry before the
+  parse begins.
+- **Ordering.** This lives in `otlyra-script/src/page_modules.rs`. Ordinary
+  modules run after the parse, in document order, and `DOMContentLoaded` waits
+  for them. Async modules run as soon as their graph is in. A module that
+  awaits does not hold up the next one, and it does not hold up
+  `DOMContentLoaded`. The window's `load` waits for every module script,
+  because module fetches made during a load are part of what the load is
+  waiting for.
+- **Errors.**
+  - A failed fetch fires `error` at the element. That covers a network
+    failure, a non-2xx status, and a response whose MIME type is not a
+    JavaScript MIME type.
+  - An external module that ran fires `load`.
+  - A parse error, an unresolvable specifier, or an exception during
+    evaluation is reported to the window as an `ErrorEvent`, so
+    `window.onerror` sees it, and to the console unless a listener cancels the
+    event. This follows the HTML Standard. The brief for this run asked for an
+    `error` event on the element for compile errors as well, but browsers do
+    not do that, so this run followed the standard.
+  - `document.currentScript` is `null` while a module runs.
+- **Network.** Module sources are fetched as a new `ResourceKind::Module`
+  through the same `Fetcher`, so they share its concurrency of 6 and the
+  page's scheme policy. There is a limit of 1024 modules per document. A
+  module fetched during a load is recorded in `PendingLoad::outstanding`, and
+  one fetched after the load goes through `PageWorld::module_fetches`. Each
+  response is decoded as UTF-8 whatever its charset says.
+- **Found on the way.**
+  - Calling `addEventListener(…)` with no receiver on the window registered
+    nothing. Strict code makes that call with `this` undefined, and every
+    module is strict. The window's EventTarget methods now treat a missing
+    receiver as the window, which is what Web IDL does for the operations of
+    the global object.
+  - An Otter compiler bug (`167a4a8bc`): inside a module, a parameter or local
+    with the same name as an import read the import instead. Every GitHub
+    rspack chunk declares `LQQ(e,t,s){s("dTr")…}` beside a top-level
+    `import * as s`, and each one threw "value is not a function".
+  - Apple's classic bundles stopped on `navigator.platform`/`vendor` and on
+    `window.screen`. `d0f0ede` and `d777f64` add them as empty strings and as
+    the window's size.
+
+### Validation of this run
+
+**Commits.**
+
+- Otter:
+  - `fc245438d` and `6ec815691`: rustfmt-only commits after the 1.99 move.
+  - `a8df8122e`: web module graphs.
+  - `167a4a8bc`: imports are shadowed by local bindings.
+- Otlyra:
+  - `330636c`: Rust 1.99.
+  - `92ad418`: module scripts.
+  - `d0f0ede`: navigator strings.
+  - `7f76038`: the module smoke tool.
+  - `d777f64`: `window.screen`.
+
+**Gate.** Every Otlyra commit passed the full gate:
+
+- `cargo test --workspace -- --test-threads=1`, with 1890 tests at the end.
+- Clippy `-D warnings`, plain and with `fault-injection`.
+- fmt, `git diff --check`, and the Python tools tests.
+- Native `window_startup`, plain and fault (`window_interaction` runs in the workspace suite).
+
+**Otter tests.** The full `otter-runtime` suite (218 test binaries) does not
+fit on this machine's disk, so it ran in parts:
+
+- Passed: the lib tests, every module-related suite, `web_modules` (18), the `import_map` unit tests and `otter-compiler` lib (137).
+- Failed, and fail identically on the pre-run engine `8029082b0` built separately:
+  - `uncaught` ×3, `process_lifecycle`, `browser_event_turn`, `eval_value` and `realm_embedding`. These tests call `queueMicrotask`, which now lives in otter-web.
+  - `dependency_graph`: otter-web depends on otter-vm.
+  - The reentrant-transition counter in `jit_module_ops`, whose output does match the interpreter.
+
+**Smoke.** `tools/module-smoke.py` passed 9/9 against the final release, and
+`tools/bidi-smoke.py` passed 4/4.
+
+**Binaries and engine sources.** The Otter source hash is the SHA-256 of
+`git ls-tree -r` restricted to `crates/**/*.rs`, `crates/**/Cargo.toml` and the
+root `Cargo.toml`/`Cargo.lock`.
+
+| | Control | Candidate |
+| --- | --- | --- |
+| Otlyra source | `c2b1aaf` (toolchain pin changed to 1.99.0) | `d777f64` |
+| Otter commit | `8029082b0` | `167a4a8bc` |
+| Otter source hash | `f060a563…` | `8082d1cd…` at `a8df8122e`, plus the compiler fix |
+| Build | separate snapshot and target dir, `--locked --offline` | `target/release`, rebuilt after each engine change |
+| Binary SHA-256 | `83fef7c6…53c1` | `9de80d36…02b6` |
+
+Markers in the binaries confirm which is which. The candidate contains
+`otter-inline-module=`, `__otlyraReportError` and the new `screen` and
+`navigator` glue, and the control contains none of them. The candidate was
+also seen running modules: the startup fixture draws its list in the
+candidate and its `no modules` fallback in the control. Binaries, raw JSON
+and logs are in `~/otlyra-mirrors/modules-run/`.
+
+**Startup.** Twenty alternating-order pairs per series after three warmups,
+1024×768 at 2×, Apple M1, macOS 26.5. The one-minute load was 5.4 at the start
+and 9.4 at the end, with macOS storage daemons still busy after a full disk.
+Values are p50/p95 in ms, control → candidate, then the paired median delta:
+
+| Series | Process → visible | Process → first frame report |
+| --- | --- | --- |
+| About / GPU | 153.79/164.41 → 150.86/159.06, +0.45 | 227.78/237.54 → 224.68/243.60, +1.05 |
+| About / CPU | 154.96/174.18 → 150.64/156.50, −8.14 | 232.41/250.70 → 225.84/243.05, −1.96 |
+| Module fixture / GPU | 154.72/168.40 → 154.78/170.52, −1.65 | 234.66/255.33 → 236.72/269.56, −0.36 |
+| Module fixture / CPU | 157.98/184.30 → 154.11/165.32, −1.14 | 236.25/275.04 → 235.90/248.53, −3.21 |
+
+These show no regression and claim no speedup. Every strict budget still
+fails in all four series. These are UI accounting intervals, not physical
+presentation. The module fixture lives at `tools/fixtures/startup-modules`.
+It is a four-module graph behind an import map. The control runs its
+`nomodule` fallback instead, so this series compares like pages, not like work.
+
+**Live sites.** Screenshots were taken with `--screenshot` at 1024×768 ×2,
+before and after.
+
+- **GitHub.** The page looks exactly as it did, because it draws server
+  HTML. Its module graph (`environment`, `github-elements`,
+  `element-registry`, `behaviors`, `landing-pages`, React through the import
+  map) now loads and evaluates. It stops on APIs that are not modules:
+  - `customElements` is not defined.
+  - Reads through the elements that registry would have defined.
+  - In `landing-pages`, a private-field write on an object whose class did not
+    declare it, probably a custom-element constructor.
+- **Apple.**
+  - The global header, locale switcher and head bundles now run, and before
+    they threw.
+  - The hero picture is the one `inline-media.built.js` picks.
+  - `main.built.js` and the entertainment gallery stop on `getComputedStyle`,
+    which is missing.
+  - The global navigation still lays out as a vertical list over the hero.
+    That is a style and layout problem, not a script one.
+
+**Left open.**
+
+- `customElements` and `getComputedStyle`. Each now stops the next layer of
+  GitHub and Apple respectively.
+- `modulepreload`, CORS mode and `crossorigin`/`integrity` on module fetches.
+- JSON and CSS module types over the network.
+- Module scripts inserted by script, since inserted scripts do not run at all
+  yet.
+- The request scan parses each module on the content owner. It parses each
+  one once, but on that thread.
+- Untested: `import.meta.resolve` against the import map, and a dynamic import
+  from an inline event handler, whose referrer is not a module.
+- Redirected entries are keyed by request URL. Two different request URLs that
+  redirect to the same module are evaluated once, but fetched twice.
+- Disk pressure on this machine limited the Otter verification to the parts
+  listed above.
+
 
 ## What the reference browsers do
 

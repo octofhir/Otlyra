@@ -240,10 +240,19 @@ element geometry from the last frame, intersection/resize observers, and
 BiDi `script.evaluate`/`callFunction`, keyboard/assistive/script activation
 clicks and wheel events. What is left:
 
-- [ ] Module scripts. Blocked on the engine: the frozen Otter's synchronous
-  module loader never calls the embedder load/resolve hooks, and http(s)
-  imports exist only behind the asynchronous handle. Until then a module is
-  skipped and `nomodule` runs.
+- [x] Module scripts (see the [module audit](docs/browser-rendering-research.md#module-scripts-follow-up)):
+  inline and external `<script type=module>`, static and dynamic `import`,
+  import maps, top-level await, HTML ordering (deferred by default, `async`
+  when ready, `DOMContentLoaded` and `load` waiting), `nomodule` skipped,
+  `error`/`load` on the element and `window.onerror` for exceptions. Otter
+  loads the graph only from sources the browser's fetcher delivers.
+- [ ] `customElements` (define/get/whenDefined with upgrades) and
+  `getComputedStyle`: with modules running, these are what GitHub's and
+  Apple's scripts stop on next.
+- [ ] Module follow-ups: `modulepreload` links, CORS and `crossorigin`/
+  `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
+  the network, dynamically inserted module scripts, and moving the request
+  scan off the content owner (it parses each module once there today).
 - [ ] `MutationObserver` records (still a stub), and `keypress`,
   `beforeinput` and IME composition events.
 - [ ] Synchronous geometry: a measurement after a mutation in the same turn
