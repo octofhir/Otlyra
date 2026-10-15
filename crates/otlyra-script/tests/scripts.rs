@@ -1021,3 +1021,87 @@ fn an_external_or_non_javascript_script_is_not_run() {
     );
     assert_eq!(output, vec!["Log: classic".to_owned()]);
 }
+
+#[test]
+fn page_clock_does_not_follow_a_replaced_date_now() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;
+    let _ = otlyra_html::parse_with_scripts(
+        br#"<script>
+      const before = performance.now();
+      const origin = performance.timeOrigin;
+      Date.now = () => -123;
+      console.log('monotonic', performance.now() >= before);
+      console.log('origin', performance.timeOrigin === origin,
+        performance.toJSON().timeOrigin === origin, origin > 0);
+    </script>"#,
+        None,
+        Some(Box::new(PageScripts::with_console(
+            "https://clock.test/",
+            handle,
+        ))),
+        Default::default(),
+    );
+    assert_eq!(
+        lines(&sink),
+        ["Log: monotonic true", "Log: origin true true true"]
+    );
+}
+
+#[test]
+fn page_clock_navigation_origin_survives_an_encoding_reset() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;
+    let mut scripts = PageScripts::with_console("https://clock.test/", handle);
+    scripts.set_initial_time_origin(Instant::now() - Duration::from_secs(10));
+    let (mut parsed, runner) = otlyra_html::parse_with_scripts(
+        br#"<script>console.log('initial', performance.now() >= 10000); console.log('origin', performance.timeOrigin); requestAnimationFrame(t => console.log('deferred', t >= 10000))</script>"#,
+        None, Some(Box::new(scripts)), Default::default());
+    let mut runner = runner.unwrap();
+    runner.reset();
+    let node = parsed.document.root();
+    runner.run(
+        "console.log('origin', performance.timeOrigin)",
+        node,
+        &mut parsed.document,
+    );
+    let captured = lines(&sink);
+    assert_eq!(captured[0], "Log: initial true");
+    assert_eq!(captured[2], "Log: deferred true");
+    assert_eq!(captured[1], captured[3]);
+}
+
+#[test]
+fn page_clock_keeps_its_receiver_after_replacing_the_global() {
+    let sink = Arc::new(Captured::default());
+    let handle: ConsoleSinkHandle = Arc::clone(&sink) as ConsoleSinkHandle;
+    let _ = otlyra_html::parse_with_scripts(
+        br#"<script>
+      let rejected = 0;
+      for (const call of [
+        () => Performance.prototype.now.call({}),
+        () => Object.getOwnPropertyDescriptor(Performance.prototype, 'timeOrigin').get.call({}),
+        () => Performance.prototype.toJSON.call({}),
+        () => new performance.now(),
+      ]) { try { call(); } catch (error) { if (error instanceof TypeError) rejected++; } }
+      const saved = performance;
+      performance = { now() { return -1; } };
+      console.log('brand', rejected === 4, saved.now() >= 0,
+        saved.timeOrigin === saved.toJSON().timeOrigin);
+    </script>"#,
+        None,
+        Some(Box::new(PageScripts::with_console(
+            "https://clock.test/",
+            handle,
+        ))),
+        Default::default(),
+    );
+    assert_eq!(lines(&sink), ["Log: brand true true true"]);
+}
+
+#[test]
+fn page_clock_preserves_the_bare_host_performance_fallback() {
+    let (mut host, sink) = capturing();
+    host.run_classic_script("console.log('bare', Number.isFinite(performance.now()), performance.timeOrigin > 0, performance.timeOrigin === performance.toJSON().timeOrigin)", "bare").unwrap();
+    assert_eq!(lines(&sink), ["Log: bare true true true"]);
+}

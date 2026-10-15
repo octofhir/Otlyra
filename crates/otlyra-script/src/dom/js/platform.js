@@ -112,7 +112,7 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
     }
   }
 
-  return ran + __otlyraRunFrame(0);
+  return ran + __otlyraRunFrame(pageTimeMetric(0));
 });
 
 // One turn of the frame loop: every callback registered up to now, and none

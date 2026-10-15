@@ -36,6 +36,8 @@
 // `::otter_vm::…`, and `otter-runtime` re-exports everything those paths name.
 extern crate otter_runtime as otter_vm;
 
+mod clock;
+
 pub mod capabilities;
 pub mod console;
 pub mod dom;

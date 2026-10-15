@@ -22,6 +22,7 @@ use super::{PageWorld, ScriptNavigation, WorldEvent};
 
 /// A load in flight, and everything it is still waiting for.
 pub(super) struct PendingLoad {
+    pub(super) started: std::time::Instant,
     /// The request the document itself was asked for under.
     pub(super) document: u64,
     /// Whether that request has come back.
@@ -274,10 +275,12 @@ impl PageWorld {
         record: bool,
         restore_scroll: f32,
     ) {
+        let started = std::time::Instant::now();
         let id = self.fetcher.fetch(url, ResourceKind::Document, body, cache);
         let slot = self.slots.entry(tab).or_default();
         slot.viewport_zoom = Some(self.environment.page_zoom);
         slot.pending = Some(PendingLoad {
+            started,
             document: id,
             document_arrived: false,
             previous_url,
@@ -445,6 +448,9 @@ impl PageWorld {
         let parsed = match &sniffed {
             kind if kind.is_document() => {
                 let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
+                if let Some(pending) = self.pending(tab) {
+                    scripts.set_initial_time_origin(pending.started);
+                }
                 scripts.set_initial_hidden(self.environment.visible_tab() != Some(tab));
                 let mut viewport = self.environment.viewport;
                 let zoom = self

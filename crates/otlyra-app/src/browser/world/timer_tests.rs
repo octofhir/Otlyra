@@ -72,3 +72,76 @@ fn busy_tabs_share_the_timer_deadline_without_starving_later_slots() {
     browser.world.slots.clear();
     assert!(!browser.world.run_due_timers());
 }
+
+struct ClockPage;
+impl crate::fetcher::Loader for ClockPage {
+    fn load(&self, url: &str) -> Result<crate::fetcher::Loaded, String> {
+        Ok(crate::fetcher::Loaded {
+            bytes: br#"<p id=clock></p><script>
+              document.getElementById('clock').setAttribute('initial', String(performance.now()));
+              function tick(timestamp) {
+                const node = document.getElementById('clock');
+                if (!node.hasAttribute('first')) node.setAttribute('first', String(timestamp));
+                node.setAttribute('frame', String(timestamp));
+                node.setAttribute('now', String(performance.now()));
+                requestAnimationFrame(tick);
+              }
+              requestAnimationFrame(tick);
+            </script>"#
+                .to_vec(),
+            content_type: Some("text/html".into()),
+            final_url: url.into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[test]
+fn page_clock_frames_use_the_documents_origin_in_an_older_world() {
+    let mut browser = crate::browser::Browser::with_fetcher_and_text(
+        Fetcher::spawn(ClockPage),
+        Default::default(),
+        TextEngine::isolated(),
+    );
+    browser.world.started = Instant::now() - Duration::from_secs(600);
+    browser.navigate("https://clock.test/");
+    browser.wait_for_load(Duration::from_secs(5));
+    browser.compose_content_scene(otlyra_platform::Viewport::new(800, 600, 1.0));
+    let document = browser.active_page().unwrap().document();
+    let node = otlyra_css::stylo_dom::select(document, "#clock").unwrap()[0];
+    let frame: f64 = document
+        .attr(node, "frame")
+        .expect("frame ran")
+        .parse()
+        .unwrap();
+    let now: f64 = document.attr(node, "now").unwrap().parse().unwrap();
+    assert!(
+        frame >= 0.0 && now >= frame && now - frame < 1000.0,
+        "page performance.now={now}, frame timestamp={frame}"
+    );
+}
+
+#[test]
+fn page_clock_first_script_includes_the_navigation_wait() {
+    let mut browser = crate::browser::Browser::with_fetcher_and_text(
+        Fetcher::spawn(ClockPage),
+        Default::default(),
+        TextEngine::isolated(),
+    );
+    browser.navigate("https://clock.test/");
+    let tab = browser.active_id();
+    browser.world.pending_mut(tab).unwrap().started = Instant::now() - Duration::from_secs(10);
+    browser.wait_for_load(Duration::from_secs(5));
+    let document = browser.active_page().unwrap().document();
+    let node = otlyra_css::stylo_dom::select(document, "#clock").unwrap()[0];
+    let initial: f64 = document.attr(node, "initial").unwrap().parse().unwrap();
+    let first: f64 = document.attr(node, "first").unwrap().parse().unwrap();
+    assert!(
+        first >= 10000.0,
+        "deferred first frame used a zero timestamp: {first}"
+    );
+    assert!(
+        initial >= 10000.0,
+        "initial performance.now ignored navigation wait: {initial}"
+    );
+}

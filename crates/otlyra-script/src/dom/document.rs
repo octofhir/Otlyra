@@ -69,6 +69,11 @@ impl DocumentRef {
         super::document_url()
     }
 
+    #[static_method(name = "__timeMetric")]
+    fn js_time_metric(which: u32) -> f64 {
+        super::time_metric(which)
+    }
+
     #[static_method(name = "__windowMetric")]
     fn js_window_metric(which: u32) -> f64 {
         super::window_metric(which)

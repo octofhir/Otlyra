@@ -11,6 +11,27 @@ define(globalThis, 'frameElement', null);
 define(globalThis, 'closed', false);
 define(globalThis, 'name', '');
 
+// Page turns use the browser's monotonic clock. Bare ScriptHost embedders
+// without a document loan retain the engine's fallback performance clock.
+const nativeTimeMetric = Document.__timeMetric;
+delete Document.__timeMetric;
+const performanceObject = globalThis.performance;
+const fallbackPerformanceNow = Performance.prototype.now;
+const fallbackPerformanceOrigin = Object.getOwnPropertyDescriptor(Performance.prototype, 'timeOrigin').get;
+function pageTimeMetric(which) {
+  const value = nativeTimeMetric(which);
+  if (value === value) return value;
+  return which === 0 ? fallbackPerformanceNow.call(performanceObject) : fallbackPerformanceOrigin.call(performanceObject);
+}
+function performanceReceiver(value) {
+  if (value !== performanceObject) throw new TypeError('Illegal invocation');
+}
+Object.defineProperties(Performance.prototype, Object.getOwnPropertyDescriptors({
+  now() { performanceReceiver(this); return pageTimeMetric(0); },
+  get timeOrigin() { performanceReceiver(this); return pageTimeMetric(1); },
+  toJSON() { performanceReceiver(this); return { timeOrigin: pageTimeMetric(1) }; },
+}));
+
 const nativeWindowMetric = Document.__windowMetric;
 delete Document.__windowMetric;
 for (const [name, index] of [['innerWidth', 0], ['innerHeight', 1], ['devicePixelRatio', 2]]) {

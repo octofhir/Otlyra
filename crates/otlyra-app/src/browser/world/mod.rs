@@ -167,8 +167,7 @@ pub(super) struct PageWorld {
     requested_faces: Vec<otlyra_css::cascade::FontFace>,
     /// Face fetches in flight, by request number.
     font_fetches: HashMap<u64, fonts::FaceLoad>,
-    /// When the pages' clock started: the zero every page's animation
-    /// integrates against.
+    /// Legacy elapsed clock for runners without their own document origin.
     started: std::time::Instant,
     /// What has happened that the window has not been told.
     events: Vec<WorldEvent>,
@@ -446,15 +445,15 @@ impl PageWorld {
     /// Give only the visible page its requested animation frame.
     ///
     /// `requestAnimationFrame` means *before the next paint*, so this runs on
-    /// the way into a frame rather than after one. The timestamp is the page's
-    /// own clock — milliseconds since the pages started, which is what
-    /// `performance.now` reports and what every animation on the web integrates
-    /// against.
+    /// the way into a frame rather than after one. Clock-aware runners convert
+    /// the shared frame instant to their own document's origin; other runners
+    /// retain the legacy world-relative elapsed timestamp.
     ///
     /// A page with no frame outstanding costs nothing here: the question is
     /// answered from a counter the bindings keep, not by entering the isolate.
     fn run_frame_callbacks(&mut self) -> bool {
-        let timestamp = self.started.elapsed().as_secs_f64() * 1000.0;
+        let at = std::time::Instant::now();
+        let timestamp = at.saturating_duration_since(self.started).as_secs_f64() * 1000.0;
         let Some(slot) = self
             .environment
             .visible_tab()
@@ -468,7 +467,7 @@ impl PageWorld {
         if !scripts.frames_pending() {
             return false;
         }
-        let ran = page.with_document(|document| scripts.run_frame(document, timestamp));
+        let ran = page.with_document(|document| scripts.run_frame_at(document, timestamp, at));
         // A callback that only reads owes a frame, not a restyle.
         if scripts.take_mutated() {
             page.document_changed();

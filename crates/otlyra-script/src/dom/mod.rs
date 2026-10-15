@@ -97,6 +97,8 @@ pub struct PageState {
     hidden: bool,
     /// CSS viewport and device scale supplied by the embedder.
     viewport: WindowViewport,
+    // None in the cheap default placeholder used while a state is loaned.
+    clock: Option<crate::clock::PageClock>,
     /// Where the page's script thinks it is. `location` is built from it.
     document_url: String,
     /// Where script asked to go, if it asked.
@@ -152,6 +154,7 @@ impl PageState {
     pub fn new(document_url: String) -> Self {
         Self {
             document_url,
+            clock: Some(crate::clock::PageClock::new()),
             ..Self::default()
         }
     }
@@ -194,6 +197,13 @@ impl PageState {
 
     pub(crate) fn set_viewport(&mut self, viewport: WindowViewport) {
         self.viewport = viewport;
+    }
+
+    pub(crate) fn clock(&self) -> Option<crate::clock::PageClock> {
+        self.clock
+    }
+    pub(crate) fn set_clock(&mut self, clock: Option<crate::clock::PageClock>) {
+        self.clock = clock;
     }
 
     /// Where script asked to go, if it asked.
@@ -247,6 +257,16 @@ pub(crate) fn is_ready() -> bool {
 
 pub(crate) fn is_hidden() -> bool {
     with_state(|state| state.hidden)
+}
+
+pub(crate) fn time_metric(which: u32) -> f64 {
+    with_state(|state| {
+        state.clock.map_or(f64::NAN, |clock| match which {
+            0 => clock.now(),
+            1 => clock.time_origin(),
+            _ => f64::NAN,
+        })
+    })
 }
 
 pub(crate) fn window_metric(which: u32) -> f64 {

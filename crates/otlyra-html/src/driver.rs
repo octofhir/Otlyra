@@ -151,6 +151,18 @@ pub trait ScriptRunner {
         0
     }
 
+    /// Give clock-aware runners the shared monotonic instant of this frame.
+    /// Existing runners retain their elapsed timestamp through the default.
+    fn run_frame_at(
+        &mut self,
+        document: &mut Document,
+        timestamp: f64,
+        at: std::time::Instant,
+    ) -> usize {
+        let _ = at;
+        self.run_frame(document, timestamp)
+    }
+
     /// Run the page's deferred work to a standstill, or until `budget` is spent.
     ///
     /// For a caller with no event loop to be woken from: a screenshot, a dump,

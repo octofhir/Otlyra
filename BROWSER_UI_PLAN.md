@@ -97,6 +97,10 @@ describe the earlier ownership boundary.
 - [x] Recover an initial coalesced redraw once after render readiness if native
   startup has delivered no frame. Keep its owed frame, avoid retrying started or
   hidden work, and leave later redraw/damage scheduling unchanged.
+- [ ] Reproduce the rare initial native-frame stall with controlled fault
+  injection and verify recovery end to end. Baseline/deadline-only releases
+  stalled; the new-events path completed 100 starts without exercising the
+  recovery branch. Keep this distinct from unit coverage and startup speed.
 - [ ] Profile the Ready-delivery gap in native launch/window event dispatch.
   Backend construction is already negligible; an extra bootstrap worker and
   draining messages before event-loop wait did not improve startup.
@@ -168,6 +172,10 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   resuming at the next slot so busy tabs cannot monopolize every pass. Enforce
   elapsed settle budgets even when older deadlines remain due. A long callback
   can overrun these scheduling deadlines; its watchdog is unchanged.
+- [x] Align `performance.now()`, `timeOrigin` and rAF timestamps to each
+  document's navigation origin on a shared monotonic 100-microsecond grid.
+  Include fetch wait, timestamp the first deferred frame, preserve the origin
+  across encoding resets and retain legacy runner/bare-host contracts.
 - [x] Supply window CSS dimensions and device scale before the first script;
   update them on resize, zoom and inspector docking, including paused parsers
   and encoding resets. Retain per-tab zoom and dispatch resize with current

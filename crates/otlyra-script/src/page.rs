@@ -61,6 +61,11 @@ impl PageScripts {
         self.state.set_hidden(hidden);
     }
 
+    /// Set the navigation's monotonic origin before parsing begins.
+    pub fn set_initial_time_origin(&mut self, at: Instant) {
+        self.state.set_clock(Some(crate::clock::PageClock::at(at)));
+    }
+
     /// Set dimensions before the first page script, without a resize event.
     pub fn set_initial_viewport(&mut self, width: f64, height: f64, scale: f64) {
         self.state
@@ -498,6 +503,14 @@ impl ScriptRunner for PageScripts {
         PageScripts::run_frame(self, document, timestamp)
     }
 
+    fn run_frame_at(&mut self, document: &mut Document, timestamp: f64, at: Instant) -> usize {
+        let timestamp = self
+            .state
+            .clock()
+            .map_or(timestamp, |clock| clock.relative(at));
+        PageScripts::run_frame(self, document, timestamp)
+    }
+
     fn settle(&mut self, document: &mut Document, budget: Duration) -> usize {
         PageScripts::settle(self, document, budget)
     }
@@ -517,8 +530,10 @@ impl ScriptRunner for PageScripts {
         crate::dom::forget_wrappers();
         let hidden = self.state.hidden();
         let viewport = self.state.viewport();
+        let clock = self.state.clock();
         *self = Self::build(self.document_url.clone(), self.console.clone());
         self.state.set_hidden(hidden);
         self.state.set_viewport(viewport);
+        self.state.set_clock(clock);
     }
 }

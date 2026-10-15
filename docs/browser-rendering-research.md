@@ -801,6 +801,87 @@ cancelling after started/in-flight/hidden work. All 48 platform unit tests,
 all-target workspace clippy with warnings denied, formatting/diff checks,
 eight Python protocol tests and all four native startup cases passed.
 
+
+## Document animation clocks
+
+The browser inherited an engine fallback where `performance.now()` subtracted a
+captured epoch value from `Date.now()`. Replacing Date.now made the result go
+backwards. Browser rAF timestamps separately used PageWorld creation time, so a
+document opened in an older world used another origin. A regression reproduced
+performance.now=177 ms versus a frame timestamp of 600225.80 ms. The deferred
+load flush also supplied a constant zero to its first frame callbacks.
+
+Otlyra page turns now use a native monotonic clock with a process-wide estimated
+Unix anchor and a shared 100-microsecond grid. Each document records navigation
+start before its fetch; the origin therefore includes network/parse wait, not
+just isolate construction. Signed ticks support origins preceding first clock
+initialization. `performance.now`, timeOrigin/toJSON, normal host frame instants
+and the first deferred frame use that same document origin. This follows the
+clock separation/coarsening in [High Resolution Time](https://w3c.github.io/hr-time/)
+and the callback timestamps in the [HTML animation-frame algorithm](https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#animation-frames).
+
+The existing Performance singleton and prototype are retained with receiver
+checks. Replacing the global performance object does not invalidate saved methods
+on the original singleton. Bare ScriptHost turns without a document loan retain
+the engine fallback. ScriptRunner gains a default run_frame_at hook delegating to
+its old elapsed-timestamp method; explicit legacy frame callers keep their API.
+No Otter source changes are required.
+
+PageState stores an optional clock so the default placeholder created for each
+DOM loan does not query system time or create a new clock. Encoding resets keep
+the original clock while replacing the isolate. Six regressions/contracts cover
+Date.now replacement, late document frames, navigation wait in the first script
+and deferred frame, reset continuity, receiver/global replacement and the bare
+host fallback. The two defect checks fail against `81b694b` before the fix.
+
+
+### Final integrated native validation
+
+The deadline-only integrated release still stalled in GPU/About trial 40; its
+binary and metadata are preserved as `target/page-clock-before-wake-release`
+and `target/page-clock-before-wake-build.json`, with the failed trace/sample in
+`target/page-clock-final-stress/40-candidate-*`. It is not a successful stress
+series. The native handler now also services due work in `new_events`, before
+native redraw dispatch, retaining the existing idle hook.
+
+That final version completed 100 mixed starts: 60 GPU/40 CPU, 50 About/50 timer
+fixture, every process successful with a first-frame report. None needed the
+bootstrap retry, so this series does not directly cover the rare recovery path;
+controlled native fault injection/upstream tracing remains follow-up. All
+attempts are retained; failed earlier series were not averaged into results.
+
+The final release also completed 20 fresh processes after three warmups for each
+workload/backend, 1024×768 logical pixels at native 2× on Apple M1/macOS 26.5.
+These are unpaired distributions, p50/p95 in ms:
+
+| Workload/backend | Process → visible | Process → first content-frame report |
+| --- | --- | --- |
+| About / GPU | 161.21 / 172.35 | 242.59 / 268.52 |
+| About / CPU | 165.21 / 170.98 | 240.98 / 267.83 |
+| Timer fixture / GPU | 165.50 / 179.71 | 254.55 / 279.89 |
+| Timer fixture / CPU | 166.17 / 179.89 | 263.25 / 282.42 |
+
+Every series still fails all four strict startup percentile gates, unchanged.
+These intervals are UI accounting, not physical presentation, and the timer
+fixture can show content before all callbacks finish. No general startup
+speedup is established from these unpaired data. One-minute system load was
+18.13 at series start and 19.79 at completion; own build/check jobs were done.
+
+Final binary SHA-256 is
+`bdd5be60e1488d0704794ab7909ac3e2dad3711db244048ba6708b5541f1b6c8`;
+source hashes, Rust/Skia/engine provenance and load are in
+`target/page-clock-final-build.json`. Raw stress/distributions are
+`target/page-clock-wake-stress/runs.json` and
+`target/startup-final-{about,web}-{gpu,cpu}.json`.
+
+
+Final integrated validation: 1,846 workspace tests with one test thread,
+all-target clippy with warnings denied, formatting/diff checks, eight benchmark
+protocol tests and four native About/web GPU/CPU startup scenarios passed.
+The unchanged engine snapshot was rehashed: 1,474 Rust/manifests/lock files still
+match `23c5a114f769905e46bc028b747eba16ab7525b1689ef2a17836e120fc65dcba`.
+The live sibling Otter checkout was not modified.
+
 ## What the reference browsers do
 
 ### Chromium
