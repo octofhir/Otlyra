@@ -236,3 +236,134 @@ fn queued_content_input_cannot_cross_a_system_page_replacement() {
         assert_eq!(inspect(&window, |browser| browser.pointer), (810.0, 550.0));
     }
 }
+
+fn open_page_menu(window: &mut WindowBrowser, viewport: Viewport) {
+    window.compose(viewport);
+    window.on_event(PlatformEvent::PointerMoved {
+        x: 100.0,
+        y: UI_HEIGHT + 180.0,
+    });
+    window.on_event(PlatformEvent::ContextMenuRequested);
+    wait(window, |window| window.ui.context_menu().is_some());
+}
+
+#[test]
+fn owner_navigation_retires_the_native_content_menu() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    for destination in ["https://replacement.example/", "about:cookies"] {
+        let mut window = window(viewport, "https://page.example/");
+        ready(&mut window);
+        open_page_menu(&mut window, viewport);
+        let old = window.tabs[window.active].navigation;
+        inspect(&window, move |browser| browser.navigate(destination));
+        wait(&mut window, |window| {
+            window.tabs[window.active].url == destination
+        });
+        if destination.starts_with("about:") {
+            assert_eq!(window.tabs[window.active].navigation, old);
+        }
+        assert!(
+            window.ui.context_menu().is_none(),
+            "retired document left native menu open"
+        );
+    }
+}
+
+#[test]
+fn owner_dismissal_retires_a_native_menu_without_navigation() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    open_page_menu(&mut window, viewport);
+    let resume = pause_owner(&window);
+    window
+        .sender
+        .send(Command::Task(Box::new(|browser| {
+            browser.ui.dismiss_context_menu();
+            browser.context_target = None;
+        })))
+        .unwrap();
+    window.send(None, UiAction::None, None, false, None);
+    drop(resume);
+    settled(&mut window);
+    assert!(window.ui.context_menu().is_none());
+}
+
+#[test]
+fn queued_context_command_cannot_use_a_replacements_menu_target() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    open_page_menu(&mut window, viewport);
+    let resume = pause_owner(&window);
+    window
+        .sender
+        .send(Command::Task(Box::new(move |browser| {
+            browser.navigate("https://replacement.example/");
+            browser.wait_for_load(Duration::from_secs(5));
+            browser.compose_content_scene(viewport);
+            browser.context_menu_requested();
+            assert!(browser.context_target.is_some());
+            assert!(!browser.active_page().unwrap().has_selection());
+        })))
+        .unwrap();
+    // A retained row has already closed its native popup when it returns the action.
+    window.ui.dismiss_context_menu();
+    window.apply(UiAction::Context(crate::ui::ContextCommand::SelectAll));
+    drop(resume);
+    settled(&mut window);
+    assert!(
+        !inspect(&window, |browser| browser
+            .active_page()
+            .unwrap()
+            .has_selection()),
+        "old menu selected the replacement document"
+    );
+}
+
+#[test]
+fn current_context_commands_still_execute_after_native_popup_closes() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    open_page_menu(&mut window, viewport);
+    window.ui.dismiss_context_menu();
+    window.apply(UiAction::Context(crate::ui::ContextCommand::SelectAll));
+    settled(&mut window);
+    assert!(inspect(&window, |browser| browser
+        .active_page()
+        .unwrap()
+        .has_selection()));
+    assert!(window.ui.context_menu().is_none());
+}
+
+#[test]
+fn an_unoffered_context_menu_ack_does_not_remain_pending() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    window.on_event(PlatformEvent::PointerMoved { x: 100.0, y: 20.0 });
+    window.on_event(PlatformEvent::ContextMenuRequested);
+    settled(&mut window);
+    assert!(window.ui.context_menu().is_none());
+    assert!(window.context_serial.is_none());
+    assert!(window.context_source.is_none());
+}
+
+#[test]
+fn retiring_content_menus_preserves_the_native_browser_menu() {
+    let viewport = Viewport::new(900, 640, 1.0);
+    let mut window = window(viewport, "https://page.example/");
+    ready(&mut window);
+    open_page_menu(&mut window, viewport);
+    window.ui.open_menu();
+    window.apply(UiAction::None);
+    settled(&mut window);
+    inspect(&window, |browser| {
+        browser.navigate("https://replacement.example/")
+    });
+    wait(&mut window, |window| {
+        window.tabs[window.active].url == "https://replacement.example/"
+    });
+    assert!(window.ui.menu_open());
+}

@@ -337,6 +337,7 @@ pub struct WindowBrowser {
     first_content_composed: bool,
     frame_has_content: bool,
     context_serial: Option<u64>,
+    context_source: Option<(TabId, ContentContext)>,
     started: Instant,
 }
 
@@ -565,6 +566,7 @@ impl WindowBrowser {
             first_content_composed: false,
             frame_has_content: false,
             context_serial: None,
+            context_source: None,
             started: Instant::now(),
         })
     }
@@ -599,6 +601,27 @@ impl WindowBrowser {
         &self.ui
     }
 
+    fn content_context(&self) -> (TabId, ContentContext) {
+        let tab = &self.tabs[self.active];
+        (
+            tab.id,
+            ContentContext {
+                navigation: tab.navigation,
+                system: tab.system,
+            },
+        )
+    }
+
+    fn dismiss_content_menu(&mut self) {
+        if self.ui.context_menu().is_some() {
+            self.visible_dirty = true;
+            self.accessibility_dirty = true;
+        }
+        self.ui.dismiss_context_menu();
+        self.context_serial = None;
+        self.context_source = None;
+    }
+
     fn send(
         &mut self,
         intent: Option<Intent>,
@@ -617,7 +640,10 @@ impl WindowBrowser {
         let clipboard = paste.then(|| self.clipboard.read());
         let page_event = matches!(
             action,
-            UiAction::ToggleBookmark | UiAction::ResetZoom | UiAction::FindStep(_)
+            UiAction::ToggleBookmark
+                | UiAction::ResetZoom
+                | UiAction::FindStep(_)
+                | UiAction::Context(_)
         ) || !chrome
             && event.is_some_and(|event| match event {
                 PlatformEvent::KeyPressed { key, modifiers } => {
@@ -674,6 +700,12 @@ impl WindowBrowser {
     }
 
     fn apply(&mut self, action: UiAction) {
+        if matches!(action, UiAction::Context(_))
+            && self.context_source != Some(self.content_context())
+        {
+            self.dismiss_content_menu();
+            return;
+        }
         let intent = match &action {
             UiAction::NewTab | UiAction::NavigateInNewTab(_) | UiAction::OpenPage(_) => {
                 Some(Intent::Open(Tab::blank()))
@@ -732,8 +764,8 @@ impl WindowBrowser {
             _ => {}
         }
         self.send(intent, action.clone(), None, true, None);
-        if !matches!(action, UiAction::Context(_)) && self.ui.context_menu().is_none() {
-            self.context_serial = None;
+        if matches!(action, UiAction::Context(_)) || self.ui.context_menu().is_none() {
+            self.dismiss_content_menu();
         }
         self.visible_dirty = true;
         self.accessibility_dirty = true;
@@ -855,13 +887,33 @@ impl WindowBrowser {
                     None => self.ui.close_find(),
                     _ => {}
                 }
-                if let Some((at, rows)) = &snapshot.context
-                    && self
-                        .context_serial
-                        .is_some_and(|serial| serial <= snapshot.serial)
+            }
+            // Menu rows belong to the document that produced them. Reconcile
+            // this independently of keyboard-focus acknowledgements: a newer
+            // native input must not keep an obsolete page menu alive.
+            let current_context = self.content_context();
+            if self
+                .context_source
+                .is_some_and(|source| source != current_context)
+                || (self.context_source.is_some()
+                    && self.context_serial.is_none()
+                    && snapshot.context.is_none())
+            {
+                self.dismiss_content_menu();
+            }
+            if self
+                .context_serial
+                .is_some_and(|serial| serial <= snapshot.serial)
+            {
+                self.context_serial = None;
+                if self.context_source == Some(current_context)
+                    && current_context.0 == tab
+                    && let Some((at, rows)) = &snapshot.context
                 {
-                    self.context_serial = None;
                     self.ui.open_context_menu(at.0, at.1, rows.clone());
+                    self.visible_dirty = true;
+                } else {
+                    self.dismiss_content_menu();
                 }
             }
             let current = self.tabs[self.active].id == tab;
@@ -1064,8 +1116,7 @@ impl Painter for WindowBrowser {
             }
             PlatformEvent::Woken => {}
             PlatformEvent::SurfaceReady(viewport) | PlatformEvent::Resized(viewport) => {
-                self.ui.dismiss_context_menu();
-                self.context_serial = None;
+                self.dismiss_content_menu();
                 self.request_frame(viewport);
                 if matches!(event, PlatformEvent::SurfaceReady(_)) {
                     let _ = self.sender.send(Command::SurfaceReady(viewport));
@@ -1099,6 +1150,7 @@ impl Painter for WindowBrowser {
             }
             PlatformEvent::ContextMenuRequested => {
                 self.ui.dismiss_popup();
+                self.context_source = Some(self.content_context());
                 self.send(None, UiAction::None, Some(event), false, None);
                 self.context_serial = Some(self.serial);
             }
@@ -1282,7 +1334,7 @@ impl Painter for WindowBrowser {
                         );
                     self.chrome_focused = false;
                     self.ui.dismiss_popup();
-                    self.context_serial = None;
+                    self.dismiss_content_menu();
                     self.ui.blur();
                 }
                 self.send(None, UiAction::None, Some(event), false, None);

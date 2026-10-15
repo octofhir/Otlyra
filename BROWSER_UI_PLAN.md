@@ -182,6 +182,10 @@ This work crosses the browser/page boundary rather than replacing UI foundations
   through model reorder and ignoring retired ids. Include system-page kind in
   queued content contexts and accessibility retirement; about-page transitions
   can retain a prior navigation id.
+- [x] Bind native content menus to their tab/document/system-page context.
+  Retire them on owner dismissal or replacement, acknowledge requests with no
+  offered menu, and reject stale queued commands even if a replacement opens
+  another menu. Preserve the browser menu's existing lifecycle.
 - [ ] Add eligible compositor scrolling against retained page output, with
   cancellable input, nested handoff and script-scroll reconciliation preserved.
 - [ ] Extend the existing bounded frame scheduler with display deadlines and

@@ -640,6 +640,41 @@ denied, formatting/diff checks, seven benchmark protocol tests, and native About
 and web startup smoke on both GPU and CPU. The engine snapshot digest remains
 `23c5a114f769905e46bc028b747eba16ab7525b1689ef2a17836e120fc65dcba`.
 
+
+## Native context-menu lifetime follow-up
+
+An owner-side navigation already discarded its context target and menu, but the
+native shell only copied an offered menu when acknowledging a request. It did
+not retire a previously displayed menu when a later publication removed it.
+Context row commands also lacked the document guard used by page input: if a
+replacement page opened its own menu before a queued old command ran, that
+command could consume the replacement's target.
+
+The shell now remembers the TabId and content context (navigation plus system
+page kind) for each native menu request. It retires the native content menu when
+that source changes or the owner dismisses it, independently of newer keyboard
+focus commands. An acknowledgement without rows clears the pending request.
+Row commands validate the source on UI and carry the existing content-context
+guard through the owner queue. The shared BrowserUi popup/dismissal machinery
+is retained, including the distinct lifetime of the browser menu.
+
+Three regressions reproduce the old behavior against `ce2d2cf`: owner navigation
+left old rows visible, explicit owner dismissal did not close the native copy,
+and a queued Select All could select a replacement document through its new menu
+target. All pass with the fix. Additional coverage checks DOM-to-system
+replacement with an unchanged navigation ID, successful current-menu commands
+after native dismissal, empty-menu acknowledgements, and browser-menu retention.
+
+
+Validation: 1,838 workspace tests passed with one test thread, all-target clippy
+with warnings denied, formatting/diff checks, and native GPU/CPU About/web
+startup smoke. The first parallel suite hit the pre-existing two-CPU-frame
+responsiveness threshold at 2× (220.16 ms versus its unchanged 200 ms limit).
+Isolated execution passed at 39.49 ms (1×) and 36.62 ms (2×) while the real JS
+callback remained busy for 500 ms; the full serial suite also passed. This
+contention result is retained in `target/context-menu-workspace.log`, alongside
+`target/context-menu-workspace-serial.log` and `target/context-menu-responsiveness.log`.
+
 ## What the reference browsers do
 
 ### Chromium
