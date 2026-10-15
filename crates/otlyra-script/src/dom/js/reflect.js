@@ -282,11 +282,44 @@ for (const Interface of [HTMLElement, SVGElement]) {
   });
 }
 
-// `click()` sends the event a click sends (HTML §6.4.3); what a click on the
-// element would *do* is the browser's, when it sends one itself.
+// `click()` (HTML §6.4.3): the event a click sends, then — unless it was
+// cancelled — what clicking the element does: a checkbox or radio button
+// changes first and changes back if cancelled; a link is followed; a submit
+// button asks its form to submit. The reader's own clicks take the browser's
+// route to the same actions, so this is script's only.
+const isCheckable = (element) =>
+  element.localName === 'input' && (element.type === 'checkbox' || element.type === 'radio');
+const isSubmitter = (element) =>
+  (element.localName === 'button' && element.type === 'submit') ||
+  (element.localName === 'input' && (element.type === 'submit' || element.type === 'image'));
 method(HTMLElement.prototype, 'click', function click() {
-  const Click = typeof MouseEvent === 'function' ? MouseEvent : Event;
-  this.dispatchEvent(new Click('click', { bubbles: true, cancelable: true, composed: true }));
+  if ('disabled' in this && this.disabled === true) return;
+  const checkable = isCheckable(this);
+  const before = checkable ? this.checked : null;
+  if (checkable) this.checked = this.type === 'checkbox' ? !before : true;
+  const Click = typeof PointerEvent === 'function' ? PointerEvent : Event;
+  const proceed = this.dispatchEvent(
+    new Click('click', { bubbles: true, cancelable: true, composed: true, view: globalThis }),
+  );
+  if (!proceed) {
+    if (checkable) this.checked = before;
+    return;
+  }
+  if (checkable) {
+    if (this.checked !== before) {
+      this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return;
+  }
+  const link = this.closest('a[href], area[href]');
+  if (link) {
+    location.assign(link.href);
+    return;
+  }
+  if (isSubmitter(this) && this.form) {
+    this.form.requestSubmit(this);
+  }
 });
 
 // ------------------------------------------------- links and addresses
@@ -716,8 +749,13 @@ accessor(HTMLFormElement.prototype, 'elements', function () {
 accessor(HTMLFormElement.prototype, 'length', function () {
   return this.elements.length;
 });
-method(HTMLFormElement.prototype, 'requestSubmit', function requestSubmit() {
-  this.submit();
+// `requestSubmit()` is a submission the page can cancel, unlike `submit()`.
+method(HTMLFormElement.prototype, 'requestSubmit', function requestSubmit(submitter) {
+  const Submit = typeof SubmitEvent === 'function' ? SubmitEvent : Event;
+  const proceed = this.dispatchEvent(
+    new Submit('submit', { bubbles: true, cancelable: true, submitter: submitter || null }),
+  );
+  if (proceed) this.submit();
 });
 method(HTMLFormElement.prototype, 'reset', function reset() {});
 method(HTMLFormElement.prototype, 'checkValidity', function checkValidity() {

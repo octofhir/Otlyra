@@ -748,6 +748,9 @@ impl Browser {
                         self.text_cancelled = super::input::types_text(key, modifiers);
                         break 'key;
                     }
+                    if self.page_key_activation(key, modifiers) {
+                        break 'key;
+                    }
                     if self.tab_key(key, modifiers) {
                         break 'key;
                     }
@@ -910,7 +913,11 @@ impl Browser {
                         && let Some(href) = page.focused_link()
                     {
                         let url = page.resolve(&href).unwrap_or(href);
-                        self.navigate_from(&url, false);
+                        // The link hears the click Return is, and may keep it.
+                        let link = page.focused_element();
+                        if !link.is_some_and(|link| self.activation_click(link)) {
+                            self.navigate_from(&url, false);
+                        }
                         break 'key;
                     }
 

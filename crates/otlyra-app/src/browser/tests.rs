@@ -4549,3 +4549,102 @@ fn a_preloaded_picture_outside_the_document_loads() {
         assert_eq!(page_log(&browser), "loaded:1:true");
     });
 }
+
+/// Return and Space on focused controls are clicks the page hears and may
+/// cancel; Space on a checkbox ticks it rather than paging down.
+#[test]
+fn keyboard_activation_is_a_click_the_page_hears() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=b>b</button><input id=box type=checkbox>\
+             <input id=keep type=checkbox><div style=height:4000px></div>\
+             <script>\
+               const seen = [];\
+               document.addEventListener('click', (event) => {\
+                 seen.push('click:' + event.target.id + ':' + event.isTrusted);\
+                 if (event.target.id === 'keep') event.preventDefault();\
+                 document.documentElement.dataset.log = seen.join(' ');\
+               });\
+               document.getElementById('box').addEventListener('change', () => seen.push('change:box'));\
+               document.getElementById('b').focus();\
+             </script>",
+        );
+        let modifiers = otlyra_platform::Modifiers::default();
+        let key = |browser: &mut Browser, key: Key| {
+            browser.on_event(PlatformEvent::KeyPressed { key, modifiers });
+            if key == Key::Character(' ') {
+                browser.on_event(PlatformEvent::TextInput(' '));
+            }
+        };
+        key(&mut browser, Key::Enter);
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Tab,
+            modifiers,
+        });
+        key(&mut browser, Key::Character(' '));
+        browser.on_event(PlatformEvent::KeyPressed {
+            key: Key::Tab,
+            modifiers,
+        });
+        key(&mut browser, Key::Character(' '));
+        let page = browser.page(browser.active).expect("page");
+        assert_eq!(page.scroll(), 0.0, "Space on a control paged down");
+        let checked = |id: &str| {
+            let document = page.document();
+            let mut stack = vec![document.root()];
+            while let Some(node) = stack.pop() {
+                if document.attr(node, "id") == Some(id) {
+                    return page.is_checked(node);
+                }
+                stack.extend(document.children(node));
+            }
+            panic!("no #{id}");
+        };
+        assert!(checked("box"));
+        assert!(
+            !checked("keep"),
+            "a cancelled keyboard click ticked the box"
+        );
+        assert_eq!(
+            page_log(&browser),
+            "click:b:true click:box:true change:box click:keep:true"
+        );
+    });
+}
+
+/// `click()` from script does what a click does: a checkbox changes and says
+/// so, a submit button submits through `submit`, a link is followed.
+#[test]
+fn script_click_performs_the_element_s_activation() {
+    on_content_stack(|| {
+        let (mut browser, requested) = input_page(
+            "<body><input id=box type=checkbox><form action=/sent><button id=send>s</button></form>\
+             <a id=go href=/followed>go</a>\
+             <script>\
+               const seen = [];\
+               const box = document.getElementById('box');\
+               box.addEventListener('change', () => seen.push('change'));\
+               document.forms[0].addEventListener('submit', (event) => { seen.push('submit'); event.preventDefault(); });\
+               box.click();\
+               seen.push('checked:' + box.checked);\
+               document.getElementById('send').click();\
+               document.documentElement.dataset.log = seen.join(' ');\
+               setTimeout(() => document.getElementById('go').click(), 0);\
+             </script>",
+        );
+        assert_eq!(page_log(&browser), "change checked:true submit");
+        settle(&mut browser);
+        assert!(
+            asked_for(&requested)
+                .iter()
+                .any(|url| url.ends_with("/followed")),
+            "{:?}",
+            asked_for(&requested)
+        );
+        assert!(
+            !asked_for(&requested)
+                .iter()
+                .any(|url| url.contains("/sent"))
+        );
+    });
+}

@@ -133,11 +133,18 @@ impl PageScene {
         x: f64,
         y: f64,
     ) -> Option<(NodeId, Vec<(NodeId, bool)>)> {
-        use otlyra_dom::form::{Control, InputKind};
         let node = self.interaction.active?;
-        if self.control_at(x, y) != Some(node)
-            || !otlyra_dom::form::is_mutable(&self.document, node)
-        {
+        if self.control_at(x, y) != Some(node) {
+            return None;
+        }
+        self.pre_activate(node)
+    }
+
+    /// Change a checkbox or radio button as its click is about to be heard,
+    /// answering what to put back if the click is cancelled.
+    pub fn pre_activate(&mut self, node: NodeId) -> Option<(NodeId, Vec<(NodeId, bool)>)> {
+        use otlyra_dom::form::{Control, InputKind};
+        if !otlyra_dom::form::is_mutable(&self.document, node) {
             return None;
         }
         let checkbox =

@@ -250,6 +250,13 @@ impl Browser {
                 changed
             }
             otlyra_platform::AccessibilityAction::Activate => {
+                // The page hears the click an activation is, and may keep it.
+                if self.activation_click(element) {
+                    return;
+                }
+                let Some(page) = self.active_page_mut() else {
+                    return;
+                };
                 // A link is followed rather than activated: there is no control
                 // behind it, and what pressing one means is a navigation.
                 if let Some(href) = box_id.and_then(|box_id| page.href_of(box_id)) {
@@ -945,5 +952,83 @@ impl Browser {
         self.sync_world();
         self.world.dispatch_input(tab, root, "scroll", "{}");
         self.apply_world_events();
+    }
+}
+
+impl Browser {
+    /// The `click` an activation that is not a pointer's — a key, an
+    /// assistive technology — is, at `node`. Answers whether it was cancelled.
+    pub(super) fn activation_click(&mut self, node: otlyra_dom::NodeId) -> bool {
+        let tab = self.tabs[self.active].id;
+        self.sync_world();
+        let cancelled = self
+            .world
+            .dispatch_input(tab, node, "click", "{\"detail\":0}");
+        self.apply_world_events();
+        cancelled
+    }
+
+    /// Space or Return on a focused button, Space on a focused checkbox or
+    /// radio button: its click, then — unless cancelled — what it does.
+    /// Answers whether the key was such an activation.
+    pub(super) fn page_key_activation(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        use otlyra_dom::form::{Control, InputKind};
+        if modifiers.is_accelerator()
+            || self.keyboard_surface != SURFACE_PAGE
+            || self.tabs[self.active].system.is_some()
+        {
+            return false;
+        }
+        let Some(page) = self.page(self.active) else {
+            return false;
+        };
+        let Some(node) = page.focused_element() else {
+            return false;
+        };
+        let space = key == Key::Character(' ');
+        let (activates, checkable) = match Control::of(page.document(), node) {
+            Some(
+                Control::Button
+                | Control::Input(
+                    InputKind::Submit | InputKind::Reset | InputKind::Image | InputKind::Button,
+                ),
+            ) => (space || key == Key::Enter, false),
+            Some(Control::Input(InputKind::Checkbox | InputKind::Radio)) => (space, true),
+            _ => (false, false),
+        };
+        if !activates || !otlyra_dom::form::is_mutable(page.document(), node) {
+            return false;
+        }
+        // The space the platform types after this key is not text.
+        self.text_cancelled = types_text(key, modifiers);
+        let before = if checkable {
+            self.active_page_mut()
+                .and_then(|page| page.pre_activate(node))
+        } else {
+            None
+        };
+        let cancelled = self.activation_click(node);
+        let tab = self.tabs[self.active].id;
+        match before {
+            Some((_, previous)) if cancelled => {
+                if let Some(page) = self.active_page_mut() {
+                    page.restore_checkedness(&previous);
+                }
+            }
+            Some(_) => {
+                self.world.dispatch_input(tab, node, "input", "{}");
+                self.world.dispatch_input(tab, node, "change", "{}");
+                self.apply_world_events();
+            }
+            None if !cancelled => {
+                if let Some(page) = self.active_page_mut() {
+                    page.activate_node(node);
+                }
+                self.follow_submission();
+                self.answer_file_request();
+            }
+            None => {}
+        }
+        true
     }
 }
