@@ -197,6 +197,7 @@ const INPUT_EVENTS = {
   beforeinput: [InputEvent, true, true],
   input: [InputEvent, true, false],
   change: [Event, true, false],
+  submit: [SubmitEvent, true, true],
   load: [Event, false, false],
   error: [Event, false, false],
   focus: [FocusEvent, false, false],

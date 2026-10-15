@@ -220,6 +220,9 @@ pub struct PageScene {
     caret_since: std::time::Instant,
     /// A form the reader has asked to send, waiting for whoever navigates.
     pending_submit: Option<otlyra_dom::Submission>,
+    /// The form and submitter of a submission the reader made, which the page
+    /// hears as `submit` before it is sent. None for `form.submit()`.
+    submit_source: Option<(NodeId, Option<NodeId>)>,
     /// A file picker the reader pressed, waiting for whoever can open a dialogue.
     ///
     /// The page does not open one and must not: which dialogue a reader gets is a
@@ -408,6 +411,7 @@ impl PageScene {
             segment_typed: 0,
             caret_since: std::time::Instant::now(),
             pending_submit: None,
+            submit_source: None,
             pending_pick: None,
             keyboard: false,
         }

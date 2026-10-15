@@ -31,6 +31,7 @@ impl PageScene {
             form,
             None,
         ));
+        self.submit_source = None;
         true
     }
 
@@ -41,6 +42,7 @@ impl PageScene {
     ///
     /// The form the page has just sent, if it has sent one.
     pub fn take_submission(&mut self) -> Option<otlyra_dom::Submission> {
+        self.submit_source = None;
         self.pending_submit.take()
     }
 
@@ -91,6 +93,7 @@ impl PageScene {
             form,
             submitter,
         ));
+        self.submit_source = Some((form, submitter));
         true
     }
 
@@ -147,6 +150,29 @@ impl PageScene {
             form,
             None,
         ));
+        self.submit_source = Some((form, None));
         true
+    }
+
+    /// The form a submission the reader made is for, which hears `submit`
+    /// before it is sent.
+    pub fn submission_form(&self) -> Option<NodeId> {
+        self.pending_submit.as_ref()?;
+        self.submit_source.map(|(form, _)| form)
+    }
+
+    /// Build the reader's submission again from the form as it now stands:
+    /// `submit` listeners may have changed what it holds.
+    pub fn rebuild_submission(&mut self) {
+        if let (Some((form, submitter)), Some(_)) =
+            (self.submit_source, self.pending_submit.as_ref())
+        {
+            self.pending_submit = Some(otlyra_dom::submit::submission(
+                &self.document,
+                self.document.form(),
+                form,
+                submitter,
+            ));
+        }
     }
 }

@@ -4322,3 +4322,40 @@ fn pictures_report_load_and_error_to_their_elements() {
         );
     });
 }
+
+/// A form the reader sends is heard as `submit` first: cancelled, nothing is
+/// sent; otherwise what the listener left in it is what goes.
+#[test]
+fn a_submitted_form_is_the_page_s_to_cancel_or_change() {
+    on_content_stack(|| {
+        let (mut browser, requested) = input_page(
+            "<body style=margin:0><form id=f action=/search>\
+             <input id=q name=q value=first style='width:200px;height:30px;margin:0'>\
+             <button id=send style='width:100px;height:30px'>Send</button></form>\
+             <script>\
+               let cancel = true;\
+               document.getElementById('f').addEventListener('submit', (event) => {\
+                 document.documentElement.dataset.log = 'submit:' + event.isTrusted;\
+                 if (cancel) { event.preventDefault(); cancel = false; return; }\
+                 document.getElementById('q').value = 'changed';\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "send");
+        settle(&mut browser);
+        assert_eq!(page_log(&browser), "submit:true");
+        assert_eq!(
+            browser.tabs[0].url, "https://input.example/",
+            "a cancelled form was sent"
+        );
+        press_and_release(&mut browser, "send");
+        settle(&mut browser);
+        assert!(
+            asked_for(&requested)
+                .iter()
+                .any(|url| url.ends_with("/search?q=changed")),
+            "{:?}",
+            asked_for(&requested)
+        );
+    });
+}

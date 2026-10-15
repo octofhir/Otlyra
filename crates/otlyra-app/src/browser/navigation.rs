@@ -196,6 +196,21 @@ impl Browser {
     /// without a script. An action of nothing at all means the page's own address,
     /// which is what reloads a page with its answers in the query.
     pub(super) fn follow_submission(&mut self) {
+        // A form the reader sent is the page's to cancel: its `submit` comes
+        // first, and what it leaves in the form is what is sent.
+        if let Some(form) = self.page(self.active).and_then(PageScene::submission_form) {
+            let tab = self.tabs[self.active].id;
+            self.sync_world();
+            let cancelled = self.world.dispatch_input(tab, form, "submit", "{}");
+            self.apply_world_events();
+            if cancelled {
+                let _ = self.active_page_mut().and_then(PageScene::take_submission);
+                return;
+            }
+            if let Some(page) = self.active_page_mut() {
+                page.rebuild_submission();
+            }
+        }
         let Some(sent) = self.active_page_mut().and_then(PageScene::take_submission) else {
             return;
         };
