@@ -292,7 +292,11 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
             .last()
             .is_some_and(|open| !open.fragment.layer.contains(&fragment.layer))
         {
-            close(groups.pop().expect("just looked"), &mut list);
+            close(
+                groups.pop().expect("just looked"),
+                &mut list,
+                frame.background,
+            );
         }
         // What this fragment moves with. A fixed box is on the screen already; a
         // sticky one answers to its own rule; what is inside a scroll port moves
@@ -315,10 +319,17 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         };
         if matches!(fragment.kind, FragmentKind::Box) {
             let faded = fragment.style.opacity < 1.0;
+            // A mask cuts the box and everything in it down to the alpha of its
+            // pictures, which is done to the group as a whole once it is drawn.
+            let masked = fragment
+                .style
+                .masks
+                .iter()
+                .any(|layer| layer.image.is_some());
             // About the box's own origin, where the box is drawn — in the
             // coordinates of what it moves with, which is where its items are.
             let moved = transform_of(fragment);
-            if faded || moved.is_some() {
+            if faded || masked || moved.is_some() {
                 // What an ancestor cuts a transformed box off at is outside the
                 // transform: the edge stays where the ancestor is while the box
                 // moves under it. Pushed here, before the group, so moving what
@@ -340,7 +351,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                         .to_path(PATH_TOLERANCE),
                     });
                 }
-                if faded {
+                if faded || masked {
                     // The group's bound is the screen, and the screen does not
                     // scroll.
                     list.set_spatial(SpatialId::VIEWPORT);
@@ -357,7 +368,8 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                 }
                 groups.push(Group {
                     fragment,
-                    layer: faded,
+                    layer: faded || masked,
+                    masked: masked.then_some(spatial),
                     transform: moved,
                     outer_clip,
                     from: list.len(),
@@ -416,7 +428,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
     }
 
     while let Some(group) = groups.pop() {
-        close(group, &mut list);
+        close(group, &mut list, frame.background);
     }
 
     // Scrollbars last, over everything: the page's, and one for each port that has

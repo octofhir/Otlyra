@@ -1255,14 +1255,16 @@ impl PageScene {
             .and_then(|fragment| fragment.used)
     }
 
-    /// The background pictures this page names and has not been given.
+    /// The background and mask pictures this page names and has not been
+    /// given.
     ///
     /// Asked for after a frame, because the styles that name them are computed on
     /// the way to one.
     pub fn wanted_pictures(&self) -> Vec<String> {
         let mut wanted: Vec<String> = Vec::new();
         for id in self.boxes.descendants(self.boxes.root()) {
-            for layer in &self.boxes.node(id).style.backgrounds {
+            let style = &self.boxes.node(id).style;
+            for layer in style.backgrounds.iter().chain(&style.masks) {
                 let Some(url) = layer.image.as_deref() else {
                     continue;
                 };

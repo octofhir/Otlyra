@@ -19,6 +19,9 @@ pub(super) struct Group<'a> {
     pub(super) layer: bool,
     /// What to move everything it drew by, if it is transformed.
     pub(super) transform: Option<Affine>,
+    /// Where a masked box is drawn, when it is masked: the space its mask
+    /// pictures are laid out in.
+    pub(super) masked: Option<otlyra_gfx::SpatialId>,
     /// The clip its ancestors cut a transformed box off at, pushed as a
     /// layer outside the transform.
     pub(super) outer_clip: Option<otlyra_layout::Rect>,
@@ -31,7 +34,46 @@ pub(super) struct Group<'a> {
 /// In that order. The layer is a compositing step around the drawing, and the
 /// transform is a property of the drawing itself — applied after the layer was
 /// closed it would move the boundary rather than the contents.
-pub(super) fn close(group: Group<'_>, list: &mut DisplayList) {
+pub(super) fn close(
+    group: Group<'_>,
+    list: &mut DisplayList,
+    pictures: Option<crate::BackgroundLookup<'_>>,
+) {
+    // The mask, over what the group drew, keeping it only where the mask's
+    // pictures are opaque (CSS Masking §7, alpha masks): drawn into a layer
+    // that is composited `destination-in`, inside the group's own layer.
+    if let Some(spatial) = group.masked {
+        use otlyra_gfx::kurbo::Shape as _;
+        let fragment = group.fragment;
+        let rect = fragment.rect;
+        // Over the box: the mask's painting area is its border box.
+        list.set_spatial(spatial);
+        list.push(DisplayItem::PushLayer {
+            blend: otlyra_gfx::peniko::BlendMode::new(
+                otlyra_gfx::peniko::Mix::Normal,
+                otlyra_gfx::peniko::Compose::DestIn,
+            ),
+            alpha: 1.0,
+            transform: Affine::IDENTITY,
+            clip: otlyra_gfx::kurbo::Rect::new(
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.right()),
+                f64::from(rect.bottom()),
+            )
+            .to_path(crate::PATH_TOLERANCE),
+        });
+        for layer in fragment.style.masks.iter().rev() {
+            crate::background::paint_background_layer(
+                list,
+                layer,
+                fragment,
+                fragment.rect,
+                pictures,
+            );
+        }
+        list.push(DisplayItem::PopLayer);
+    }
     if let Some(transform) = group.transform {
         list.transform_from(group.from, transform);
     }

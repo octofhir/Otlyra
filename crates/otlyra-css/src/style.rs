@@ -1440,6 +1440,10 @@ pub struct ComputedStyle {
     /// The layers of `background-image`, topmost first — the order the page wrote
     /// them, which is the reverse of the order they are painted in.
     pub backgrounds: Vec<BackgroundLayer>,
+    /// `mask-image` and its sizes, repeats and positions, as layers laid out
+    /// like a background's (CSS Masking §6): what of the box and everything
+    /// in it shows is the alpha of these pictures. Not inherited.
+    pub masks: Vec<BackgroundLayer>,
     /// How a replaced element's picture is fitted into its box.
     pub object_fit: ObjectFit,
     /// And where inside the box what is left of it sits. Its initial value is
@@ -1626,6 +1630,7 @@ impl Default for ComputedStyle {
             color: Color::from_rgb8(0, 0, 0),
             background_color: Color::TRANSPARENT,
             backgrounds: Vec::new(),
+            masks: Vec::new(),
             object_fit: ObjectFit::Fill,
             object_position: BackgroundPosition::CENTER,
             shadows: Vec::new(),

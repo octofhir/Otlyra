@@ -1442,3 +1442,91 @@ fn each_text_run_gets_its_own_target() {
         );
     }
 }
+
+/// A box with a `mask-image` (or `-webkit-mask`) is drawn, and then its mask
+/// picture is drawn over it into a layer composited `destination-in`, inside
+/// the box's own group: what is left is the box where the picture is opaque.
+/// YouTube draws its logo and its icons this way.
+#[test]
+fn a_mask_is_drawn_destination_in_over_the_box() {
+    let source = "<style>body { margin: 0 } div { width: 40px; height: 20px; \
+         background: rgb(255, 0, 0); -webkit-mask: url(https://x.test/logo.svg) no-repeat center / contain }</style>\
+         <div></div>";
+    let parsed = otlyra_html::parse(source.as_bytes(), Some("utf-8"));
+    let styles = otlyra_css::cascade::style_document(
+        &parsed.document,
+        otlyra_css::cascade::Viewport {
+            width: 800.0,
+            height: 600.0,
+            scale: 1.0,
+            text_scale: 1.0,
+            color_scheme: Default::default(),
+        },
+    );
+    let mut boxes = build_box_tree(&parsed.document, &styles);
+    let mut text = TextEngine::isolated();
+    let fragments = layout(
+        &mut boxes,
+        &mut text,
+        Viewport {
+            width: 800.0,
+            height: 600.0,
+        },
+    );
+    let picture = otlyra_gfx::peniko::ImageData {
+        data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![255u8; 4 * 4 * 4])),
+        format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+        alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+        width: 4,
+        height: 4,
+    };
+    let list = build_display_list_with(
+        &fragments,
+        &Frame {
+            viewport: (800.0, 600.0),
+            background: Some(&|url: &str| {
+                (url == "https://x.test/logo.svg").then(|| picture.clone())
+            }),
+            ..Frame::default()
+        },
+    )
+    .at(0.0);
+
+    let kinds: Vec<&str> = list
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Fill {
+                brush: Brush::Solid(colour),
+                ..
+            } if *colour == Color::from_rgb8(255, 0, 0) => Some("red"),
+            DisplayItem::Fill {
+                brush: Brush::Image(_),
+                ..
+            } => Some("mask picture"),
+            DisplayItem::PushLayer { blend, .. }
+                if blend.compose == otlyra_gfx::peniko::Compose::DestIn =>
+            {
+                Some("destination-in")
+            }
+            DisplayItem::PushLayer { .. } => Some("layer"),
+            DisplayItem::PopLayer => Some("pop"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        // The mask picture keeps the clip of the area it is painted in.
+        [
+            "layer",
+            "red",
+            "destination-in",
+            "layer",
+            "mask picture",
+            "pop",
+            "pop",
+            "pop"
+        ],
+        "{kinds:?}"
+    );
+}

@@ -36,11 +36,9 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
     ComputedStyle {
         display,
         color: colour(values.clone_color()),
-        background_color: values
-            .get_background()
-            .background_color
-            .as_absolute()
-            .map_or(Color::TRANSPARENT, |value| colour(*value)),
+        // `currentcolor` included, which is how an icon drawn as a masked
+        // box takes the colour of the text around it.
+        background_color: colour(values.resolve_color(&values.get_background().background_color)),
         font_family: font_family(values),
         font_size,
         font_weight: font.font_weight.value().round() as u16,
@@ -135,6 +133,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         overflow: overflow_of(values),
         radius: corners(values),
         backgrounds: backgrounds(values),
+        masks: masks(values),
         object_fit: object_fit(values),
         object_position: object_position(values),
         shadows: shadows(values),
@@ -790,6 +789,41 @@ fn backgrounds(values: &ComputedValues) -> Vec<BackgroundLayer> {
                 _ => None,
             },
             gradient: background_gradient(image),
+            size: cycled(sizes.len(), index)
+                .map_or(BackgroundSize::Auto, |at| background_size(&sizes[at])),
+            repeat: background_repeat(cycled(repeats.len(), index).map(|at| &repeats[at])),
+            position: background_position(
+                cycled(xs.len(), index).map(|at| &xs[at]),
+                cycled(ys.len(), index).map(|at| &ys[at]),
+            ),
+        })
+        .collect()
+}
+
+/// The mask layers (CSS Masking §6), laid out as background layers are:
+/// pictures only, since a gradient mask is rare enough to leave out.
+fn masks(values: &ComputedValues) -> Vec<BackgroundLayer> {
+    use style::values::generics::image::GenericImage as Image;
+
+    let svg = values.get_svg();
+    let images = &svg.mask_image.0;
+    if images.iter().all(|image| !matches!(image, Image::Url(_))) {
+        return Vec::new();
+    }
+    let cycled = |length: usize, index: usize| (length > 0).then(|| index % length);
+    let sizes = &svg.mask_size.0;
+    let repeats = &svg.mask_repeat.0;
+    let xs = &svg.mask_position_x.0;
+    let ys = &svg.mask_position_y.0;
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| BackgroundLayer {
+            image: match image {
+                Image::Url(url) => url.url().map(|resolved| Arc::from(resolved.as_str())),
+                _ => None,
+            },
+            gradient: None,
             size: cycled(sizes.len(), index)
                 .map_or(BackgroundSize::Auto, |at| background_size(&sizes[at])),
             repeat: background_repeat(cycled(repeats.len(), index).map(|at| &repeats[at])),
@@ -2351,5 +2385,31 @@ pub(crate) mod tests {
         assert_eq!(mode("pre-line"), WhiteSpace::PreserveBreaks);
         assert_eq!(mode("break-spaces"), WhiteSpace::BreakSpaces);
         assert_eq!(layout_style("<p>x", "p").white_space, WhiteSpace::Collapse);
+    }
+
+    #[test]
+    fn a_background_of_currentcolor_is_the_text_colour() {
+        let style = layout_style(
+            "<p style='color: rgb(10, 20, 30); background-color: currentcolor'>x</p>",
+            "p",
+        );
+        assert_eq!(
+            style.background_color.to_rgba8().to_u8_array(),
+            [10, 20, 30, 255]
+        );
+    }
+
+    #[test]
+    fn mask_images_become_layers() {
+        let style = layout_style(
+            "<p style='-webkit-mask: url(https://x.test/m.svg) no-repeat center / cover'>x</p>",
+            "p",
+        );
+        assert_eq!(style.masks.len(), 1);
+        assert_eq!(
+            style.masks[0].image.as_deref(),
+            Some("https://x.test/m.svg")
+        );
+        assert_eq!(style.masks[0].size, BackgroundSize::Cover);
     }
 }
