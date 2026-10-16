@@ -257,6 +257,7 @@ pub(crate) fn receives_decorations(style: &ComputedStyle, replaced: bool) -> boo
         Display::Inline => replaced,
         Display::InlineBlock | Display::InlineFlex | Display::InlineGrid => true,
         Display::None
+        | Display::Contents
         | Display::Block
         | Display::Flex
         | Display::Grid
@@ -1128,6 +1129,26 @@ impl Builder<'_> {
                 // That is the whole of it: the subtree is not laid out, not painted,
                 // and not hit-testable.
                 if style.display == Display::None {
+                    return;
+                }
+
+                // `display: contents` generates no box, and its children are
+                // boxed where it would have been, under its parent, with its
+                // style to inherit (CSS Display §2.5). A replaced element or a
+                // control has nothing to give its children that way, and
+                // generates nothing at all (Appendix B).
+                if style.display == Display::Contents {
+                    if self.replaced_content(element, node).is_some()
+                        || self.control_of(node).is_some()
+                    {
+                        return;
+                    }
+                    let style = Arc::new(style);
+                    if has_renderable_children(element) {
+                        for child in self.document.children(node) {
+                            self.walk(child, parent_box, &style);
+                        }
+                    }
                     return;
                 }
 

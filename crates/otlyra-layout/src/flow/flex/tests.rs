@@ -978,3 +978,61 @@ fn a_height_attribute_keeps_a_picture_out_of_the_stretch() {
     let img = rect_of(&tree, &boxes, "img");
     assert_eq!((img.width, img.height), (32.0, 16.0));
 }
+
+/// `display: contents` takes its own box out and leaves its children: Apple's
+/// global navigation is a flex row whose middle item is a `contents` list,
+/// and its links are the row's items. Laid out as a block, that item held
+/// every link in one column over the page.
+#[test]
+fn the_children_of_a_contents_element_are_items_of_the_row_around_it() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 } ul { display: flex; margin: 0; padding: 0; list-style: none }\
+           li { width: 50px; height: 20px } .menu { display: contents }</style>\
+         <ul><li>a</li><div class=menu><li>b</li><li>c</li></div><li>d</li></ul>",
+        800.0,
+    );
+    let items = boxes_of(&tree, &boxes, "li");
+    let places: Vec<(f32, f32)> = items
+        .iter()
+        .map(|item| (item.rect.x, item.rect.y))
+        .collect();
+    assert_eq!(
+        places,
+        [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0)]
+    );
+    assert!(
+        boxes_of(&tree, &boxes, "div").is_empty(),
+        "the contents element has no box"
+    );
+}
+
+/// The "visually hidden" pattern — a label kept for assistive technology and
+/// clipped to nothing — paints nothing, whichever of `clip` and `clip-path`
+/// it is written with, and takes its place in layout as before.
+#[test]
+fn a_box_clipped_to_nothing_paints_nothing_inside() {
+    let (tree, _) = laid_out(
+        "<style>body { margin: 0 } span { display: block; overflow: hidden; height: 20px; width: 1px }\
+           .rect { position: absolute; clip: rect(1px, 1px, 1px, 1px) }\
+           .inset { clip-path: inset(0 0 99.9% 99.9%) } .kept { clip-path: inset(10%) }</style>\
+         <span class=rect>gone</span><span class=inset>also</span><span class=kept>shown</span>",
+        800.0,
+    );
+    let clipped: Vec<(String, bool)> = texts(&tree)
+        .into_iter()
+        .map(|(text, fragment)| {
+            let away = fragment
+                .clip
+                .is_some_and(|clip| clip.width == 0.0 || clip.height == 0.0);
+            (text.trim().to_owned(), away)
+        })
+        .collect();
+    assert_eq!(
+        clipped,
+        [
+            ("gone".to_owned(), true),
+            ("also".to_owned(), true),
+            ("shown".to_owned(), false)
+        ]
+    );
+}

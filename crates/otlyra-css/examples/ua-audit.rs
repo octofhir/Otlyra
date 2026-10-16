@@ -82,6 +82,7 @@ fn display(value: Display) -> &'static str {
         Display::TableRow => "table-row",
         Display::TableCell => "table-cell",
         Display::TableCaption => "table-caption",
+        Display::Contents => "contents",
     }
 }
 

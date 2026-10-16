@@ -207,6 +207,7 @@ fn applied_aspect_ratio(style: &ComputedStyle) -> AspectRatio {
     match style.display {
         Display::TableRowGroup | Display::TableRow | Display::TableCell => AspectRatio::Auto,
         Display::None
+        | Display::Contents
         | Display::Block
         | Display::Inline
         | Display::InlineBlock

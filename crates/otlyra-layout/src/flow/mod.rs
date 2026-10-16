@@ -111,6 +111,7 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         Arc::clone(&tree.node(root).style),
         children,
     );
+    clip_away_hidden(&mut root_fragment);
     // Where every box sits in the painting order, which is a question about its
     // ancestors as much as about itself and so cannot be answered until they are
     // all here.
@@ -344,6 +345,21 @@ fn is_popup(tree: &crate::box_tree::BoxTree, fragment: &Fragment) -> bool {
         let node = tree.node(id);
         node.anonymous && node.control.as_ref().is_some_and(|control| control.open)
     })
+}
+
+/// Cut away every box whose `clip` or `clip-path` leaves nothing of it to see,
+/// with everything inside it: an empty rectangle at its corner.
+fn clip_away_hidden(fragment: &mut Fragment) {
+    if fragment.style.clipped_away {
+        set_clip(
+            fragment,
+            Rect::new(fragment.rect.x, fragment.rect.y, 0.0, 0.0),
+        );
+        return;
+    }
+    for child in &mut fragment.children {
+        clip_away_hidden(child);
+    }
 }
 
 /// Cut a fragment and everything inside it off at `clip`.

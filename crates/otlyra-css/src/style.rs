@@ -47,6 +47,9 @@ pub enum Display {
     TableCell,
     /// A table's caption, laid out above it and as wide as it is.
     TableCaption,
+    /// Generates no box of its own: its children are boxed as if they were
+    /// its parent's (CSS Display §2.5), and inherit its style as ever.
+    Contents,
 }
 
 impl Display {
@@ -1515,6 +1518,11 @@ pub struct ComputedStyle {
     /// `text-overflow`. Not inherited: it is a property of the block container
     /// whose lines it cuts.
     pub text_overflow: TextOverflow,
+    /// Whether `clip` or `clip-path` leaves nothing of the box to see: the
+    /// "visually hidden" pattern, `clip: rect(1px, 1px, 1px, 1px)` or
+    /// `clip-path: inset(50%)`, which keeps a label for assistive technology
+    /// and draws none of it. Layout is unaffected; nothing in the box paints.
+    pub clipped_away: bool,
     /// `white-space-collapse`. Inherited.
     pub white_space: WhiteSpace,
     /// `text-wrap-mode`. Inherited.
@@ -1657,6 +1665,7 @@ impl Default for ComputedStyle {
             text_indent: TextIndent::NONE,
             tab_size: TabSize::Spaces(8.0),
             text_overflow: TextOverflow::Clip,
+            clipped_away: false,
             width: Size::Auto,
             height: Size::Auto,
             min_width: Size::Auto,

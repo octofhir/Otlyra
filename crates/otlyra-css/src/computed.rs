@@ -111,6 +111,7 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
         text_indent: text_indent(values),
         tab_size: tab_size(values),
         text_overflow: text_overflow(values),
+        clipped_away: clipped_away(values),
         width: size(&values.get_position().width),
         height: size(&values.get_position().height),
         min_width: size(&values.get_position().min_width),
@@ -181,6 +182,9 @@ fn display_of(values: &ComputedValues) -> Display {
     let display = values.clone_display();
     if display == Computed::None {
         return Display::None;
+    }
+    if display == Computed::Contents {
+        return Display::Contents;
     }
     // A flex container is a flex container whichever way round it sits in its
     // parent; `inline-flex` differs only in how it is placed, which is where an
@@ -1073,6 +1077,43 @@ fn overflow_of(values: &ComputedValues) -> Overflow {
         (Overflow::Clip, _) | (_, Overflow::Clip) => Overflow::Clip,
         (Overflow::Visible, Overflow::Visible) => Overflow::Visible,
     }
+}
+
+/// Whether `clip` (CSS 2 §11.1.2, on an absolutely positioned box) or a
+/// `clip-path` inset (CSS Masking §5) cuts the whole box away.
+///
+/// Only that much of either is taken: a clip that leaves something to see is
+/// drawn unclipped, which shows a page more than it asked for rather than
+/// less. A cut leaving under a hundredth of the box counts as all of it — the
+/// pattern is written with `inset(0 0 99.9% 99.9%)` as often as `inset(50%)`.
+fn clipped_away(values: &ComputedValues) -> bool {
+    use style::values::computed::basic_shape::{BasicShape, ClipPath};
+    use style::values::generics::ClipRectOrAuto;
+    use style::values::generics::length::GenericLengthPercentageOrAuto as OrAuto;
+
+    let positioned = matches!(position_of(values), Position::Absolute | Position::Fixed);
+    if positioned && let ClipRectOrAuto::Rect(rect) = values.clone_clip() {
+        let px = |value: &OrAuto<style::values::computed::Length>| match value {
+            OrAuto::LengthPercentage(length) => Some(length.px()),
+            OrAuto::Auto => None,
+        };
+        let empty = |start: Option<f32>, end: Option<f32>| matches!((start, end), (Some(start), Some(end)) if end <= start);
+        if empty(px(&rect.top), px(&rect.bottom)) || empty(px(&rect.left), px(&rect.right)) {
+            return true;
+        }
+    }
+    if let ClipPath::Shape(shape, _) = values.clone_clip_path()
+        && let BasicShape::Rect(inset) = &*shape
+    {
+        let fraction = |value: &style::values::computed::LengthPercentage| {
+            value.to_percentage().map_or(0.0, |percentage| percentage.0)
+        };
+        let sides = &inset.rect;
+        const ALL: f32 = 0.99;
+        return fraction(&sides.0) + fraction(&sides.2) >= ALL
+            || fraction(&sides.1) + fraction(&sides.3) >= ALL;
+    }
+    false
 }
 
 fn position_of(values: &ComputedValues) -> Position {
