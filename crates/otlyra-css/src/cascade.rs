@@ -1340,6 +1340,10 @@ fn author_stylesheets<'a>(
 
 /// What a `<style>` element says: its child text, in order.
 fn style_text(document: &Document, style: NodeId) -> String {
+    // What script made of the element's sheet, when it made something of it.
+    if let Some(text) = document.cssom_text(style) {
+        return text.to_owned();
+    }
     let mut text = String::new();
     for child in document.children(style) {
         if let Some(NodeData::Text(chunk)) = document.get(child).map(|node| &node.data) {

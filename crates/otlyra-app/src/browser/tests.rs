@@ -4629,6 +4629,29 @@ fn script_measures_the_boxes_the_page_drew() {
     });
 }
 
+/// A rule script inserts into a `<style>` element's sheet styles the page,
+/// as styled-components does.
+#[test]
+fn a_rule_inserted_through_the_cssom_styles_the_page() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<style id=s></style><body style=margin:0><button id=measure style='display:block;width:100px;height:30px;margin:0;padding:0;border:0'>m</button>\
+             <div id=box style='height:10px'></div>\
+             <script>\
+               document.getElementById('measure').addEventListener('click', () => {\
+                 const sheet = document.getElementById('s').sheet;\
+                 sheet.insertRule('#box { width: 77px }', 0);\
+                 queueMicrotask(() => queueMicrotask(() => {\
+                   document.documentElement.dataset.log = String(document.getElementById('box').offsetWidth);\
+                 }));\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "measure");
+        assert_eq!(page_log(&browser), "77");
+    });
+}
+
 /// A box with `visibility: hidden` is not drawn and not hit, but it keeps
 /// its place, and script measures it from the frame like any other.
 #[test]
