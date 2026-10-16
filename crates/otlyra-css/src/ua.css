@@ -117,6 +117,9 @@ h6 { display: block; font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
 
 p { margin: 1em 0; }
 blockquote { margin: 1em 40px; }
+/* HTML §15.3.6: a quotation is marked by the quotes around it, generated. */
+q::before { content: open-quote; }
+q::after { content: close-quote; }
 ul, menu { list-style-type: disc; }
 ol { list-style-type: decimal; }
 ul, menu, ol { margin: 1em 0; padding-left: 40px; }

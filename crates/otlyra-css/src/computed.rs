@@ -35,6 +35,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
 
     ComputedStyle {
         display,
+        was_inline: values.get_box().original_display.outside()
+            == style::values::specified::box_::DisplayOutside::Inline,
         color: colour(values.clone_color()),
         // `currentcolor` included, which is how an icon drawn as a masked
         // box takes the colour of the text around it.
@@ -1467,6 +1469,39 @@ fn aspect_ratio(value: &style::values::computed::position::AspectRatio) -> Aspec
     }
 }
 
+/// The text a `::before` or `::after` generates, from its `content`, with
+/// `attr()` answered by `attribute` (CSS Content 3 §2).
+///
+/// `None` when it generates no box at all: `normal` and `none`. A picture
+/// (`url()`) and a counter generate nothing yet; their place is kept, so a
+/// string beside them still shows.
+pub fn generated_text(
+    values: &ComputedValues,
+    attribute: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use style::values::generics::counters::{Content, ContentItem};
+
+    let Content::Items(items) = &values.get_counters().content else {
+        return None;
+    };
+    let mut text = String::new();
+    // What follows `alt_start` is the alternative text for a reader, not
+    // something drawn.
+    for item in items.items.iter().take(items.alt_start) {
+        match item {
+            ContentItem::String(value) => text.push_str(value),
+            ContentItem::Attr(attr) => match attribute(&attr.attribute) {
+                Some(value) => text.push_str(&value),
+                None => text.push_str(&attr.fallback),
+            },
+            ContentItem::OpenQuote => text.push('\u{201C}'),
+            ContentItem::CloseQuote => text.push('\u{201D}'),
+            _ => {}
+        }
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1849,6 +1884,18 @@ pub(crate) mod tests {
         )
         .font_family;
         assert_eq!(read_back, declared);
+    }
+
+    /// `:has()` reaches the cascade, and an absolutely positioned box keeps
+    /// the level it was written at.
+    #[test]
+    fn has_applies_and_a_positioned_box_remembers_it_was_inline() {
+        let html = "<style>div:has(> p:nth-child(2)) { display: flex } \
+                    span { position: absolute }</style><div><p>a</p><p>b<span>c</span></p></div>";
+        assert_eq!(layout_style(html, "div").display, Display::Flex);
+        let span = layout_style(html, "span");
+        assert_eq!(span.display, Display::Block, "blockified");
+        assert!(span.was_inline);
     }
 
     /// `display: none` has to survive the narrowing: it is the one display value

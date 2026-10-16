@@ -723,13 +723,10 @@ fn parse_selector_list(
     .map_err(|error| format!("{selector:?} is not a valid selector: {error:?}"))
 }
 
-/// Stylo's selector parser, with `:has()` for script.
-///
-/// The cascade leaves `:has()` off (see `cascade::enable_features`): a rule
-/// that depends on an element's descendants needs invalidation the engine
-/// does not do. A selector script hands to `querySelector`, `matches` or
-/// `closest` is matched once, against the tree as it is, and needs none —
-/// and pages use `:has()` there, where a browser without it throws.
+/// Stylo's selector parser, with `:has()` for script whatever the
+/// preference says: a selector script hands to `querySelector`, `matches` or
+/// `closest` is matched once, against the tree as it is, and pages use
+/// `:has()` there, where a browser without it throws.
 struct ScriptSelectorParser<'a>(style::selector_parser::SelectorParser<'a>);
 
 impl<'i> selectors::Parser<'i> for ScriptSelectorParser<'_> {

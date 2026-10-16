@@ -105,8 +105,12 @@ impl<'a> Flow<'a> {
             _ => {}
         }
 
-        // The invariant from the box tree: all block-level, or all inline-level.
-        if self.tree.node(children[0]).is_inline_level() {
+        // The invariant from the box tree: all block-level, or all inline-level
+        // with the absolutely positioned boxes among them.
+        if children
+            .iter()
+            .any(|&child| self.tree.node(child).is_inline_level())
+        {
             return self.layout_inline(parent, width, x, y, out);
         }
 
@@ -134,7 +138,7 @@ impl<'a> Flow<'a> {
             // room and its siblings stack as though it did not exist. It is placed
             // against a containing block rather than against the cursor.
             if style.position.is_out_of_flow() {
-                let fragment = self.layout_positioned(child, cursor + pending);
+                let fragment = self.layout_positioned(child, x, cursor + pending);
                 out.push(fragment);
                 continue;
             }
@@ -381,8 +385,8 @@ impl<'a> Flow<'a> {
         let node = self.tree.node(id);
         if node
             .children
-            .first()
-            .is_some_and(|&child| self.tree.node(child).is_inline_level())
+            .iter()
+            .any(|&child| self.tree.node(child).is_inline_level())
         {
             return (false, BottomEdge::Closed);
         }

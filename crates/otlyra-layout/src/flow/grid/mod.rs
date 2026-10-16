@@ -268,7 +268,7 @@ impl<'a> Flow<'a> {
         let mut children = Vec::new();
         for child in self.tree.node(parent).children.clone() {
             if self.tree.node(child).style.position.is_out_of_flow() {
-                let fragment = self.layout_positioned(child, y);
+                let fragment = self.layout_positioned(child, x, y);
                 out.push(fragment);
             } else {
                 children.push(child);

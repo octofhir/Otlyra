@@ -50,7 +50,7 @@ impl<'a> Flow<'a> {
             };
             Some(available)
         };
-        let spacers = inline_spacers(&content.inlines, &content.replaced);
+        let spacers = inline_spacers(content);
         let shaped =
             self.text
                 .shape_spans_wrapping(&content.spans, &spacers, paragraph, &mut collect_band);

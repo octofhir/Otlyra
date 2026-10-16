@@ -1427,6 +1427,10 @@ impl LineHeight {
 pub struct ComputedStyle {
     /// `display`.
     pub display: Display,
+    /// Whether `display` was inline-level before the box was blockified for
+    /// being positioned or floated: where an absolutely positioned box's static
+    /// position is, in the line or below it (CSS 2.2 §10.3.7).
+    pub was_inline: bool,
     /// `color`. Inherited.
     pub color: Color,
     /// `background-color`.
@@ -1631,6 +1635,7 @@ impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
             display: Display::Inline,
+            was_inline: true,
             color: Color::from_rgb8(0, 0, 0),
             background_color: Color::TRANSPARENT,
             backgrounds: Vec::new(),

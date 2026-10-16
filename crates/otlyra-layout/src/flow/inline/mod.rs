@@ -56,6 +56,12 @@ impl<'a> Flow<'a> {
     ) -> f32 {
         let mut content = self.collect_inline(parent, width);
         if content.is_phantom() {
+            // No line, so what is out of the flow stands where the line would
+            // have started.
+            for (child, _) in std::mem::take(&mut content.positioned) {
+                let fragment = self.layout_positioned(child, x, y);
+                out.push(fragment);
+            }
             return 0.0;
         }
         let levels = self.level_line_heights(parent, &mut content);
@@ -97,6 +103,7 @@ impl<'a> Flow<'a> {
                 .collect(),
             width,
         };
+        let mut line_origins = Vec::with_capacity(shaped.lines.len());
         for (index, metrics) in shaped.lines.iter().enumerate() {
             let band = bands
                 .get(index)
@@ -117,10 +124,32 @@ impl<'a> Flow<'a> {
                     .get(index + 1)
                     .map_or(metrics.bottom - metrics.top, |next| next.top - metrics.top),
             };
+            line_origins.push((line.x, line.y));
             let mut fragment = placement.line_fragment(&line);
             if let Some(marker) = &marker {
                 ellipsis::elide_line(&mut fragment, x + band.start + band.width, marker);
             }
+            out.push(fragment);
+        }
+
+        // The absolutely positioned boxes, each from where the shaper put the
+        // place it would have had: its static position (CSS 2.2 §10.3.7), with
+        // its top at the top of that line.
+        let statics: Vec<(f32, f32)> = (0..content.positioned.len())
+            .map(|index| {
+                placement
+                    .spacers
+                    .get(&collect::positioned_spacer(index))
+                    .and_then(|spacer| {
+                        let (line_x, line_y) = line_origins.get(spacer.line)?;
+                        Some((line_x + spacer.x, *line_y))
+                    })
+                    .unwrap_or((x, y))
+            })
+            .collect();
+        drop(placement);
+        for ((child, _), (static_x, static_y)) in content.positioned.iter().zip(statics) {
+            let fragment = self.layout_positioned(*child, static_x, static_y);
             out.push(fragment);
         }
 

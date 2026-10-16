@@ -278,7 +278,7 @@ impl<'a> Flow<'a> {
         &mut self,
         parent: BoxId,
         container: Container,
-        static_y: f32,
+        (static_x, static_y): (f32, f32),
         out: &mut Vec<Fragment>,
     ) -> Vec<FlexItem> {
         let children = self.tree.node(parent).children.clone();
@@ -286,7 +286,7 @@ impl<'a> Flow<'a> {
         for child in children {
             let style = Arc::clone(&self.tree.node(child).style);
             if style.position.is_out_of_flow() {
-                let fragment = self.layout_positioned(child, static_y);
+                let fragment = self.layout_positioned(child, static_x, static_y);
                 out.push(fragment);
                 continue;
             }

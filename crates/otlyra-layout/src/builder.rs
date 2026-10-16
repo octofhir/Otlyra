@@ -11,7 +11,7 @@ use std::sync::Arc;
 use html5ever::ns;
 use otlyra_css::ComputedStyle;
 use otlyra_css::Display;
-use otlyra_css::cascade::{StyledDocument, Viewport};
+use otlyra_css::cascade::{Generated, StyledDocument, Viewport};
 use otlyra_dom::{Document, ElementData, FormState, NodeData, NodeId};
 
 use crate::box_tree::{
@@ -1182,6 +1182,73 @@ impl Builder<'_> {
         false
     }
 
+    /// The box an element's `::before` or `::after` generates, as its first or
+    /// last child (CSS Pseudo 4 §4.1), with the text its `content` names.
+    ///
+    /// It has no node of its own: what it hits, selects and is found as is the
+    /// element around it.
+    fn push_generated(
+        &mut self,
+        node: NodeId,
+        parent_box: BoxId,
+        parent_style: &Arc<ComputedStyle>,
+        which: Generated,
+    ) {
+        let Some(values) = self.styles.generated_style_of(node, which) else {
+            return;
+        };
+        let document = self.document;
+        let attribute = |name: &str| document.attr(node, name).map(str::to_owned);
+        let Some(text) = otlyra_css::computed::generated_text(values, &attribute) else {
+            return;
+        };
+        let mut style = otlyra_css::computed::to_layout_style(values);
+        if style.display == Display::None {
+            return;
+        }
+        if style.display == Display::Contents {
+            style.display = Display::Inline;
+        }
+        style.decorations = decorations_for(
+            &parent_style.decorations,
+            style.text_decoration,
+            receives_decorations(&style, false),
+        );
+        let style = Arc::new(style);
+        let kind = match style.display {
+            Display::Inline => BoxKind::Inline,
+            _ => BoxKind::Block,
+        };
+        let id = self.tree.push(
+            parent_box,
+            BoxNode {
+                kind,
+                control: None,
+                style: Arc::clone(&style),
+                node: None,
+                tag: None,
+                anonymous: false,
+                children: Vec::new(),
+                parent: None,
+            },
+        );
+        if !text.is_empty() {
+            self.tree.push(
+                id,
+                BoxNode {
+                    kind: BoxKind::Text(text.into()),
+                    control: None,
+                    style,
+                    node: None,
+                    tag: None,
+                    anonymous: false,
+                    children: Vec::new(),
+                    parent: None,
+                },
+            );
+        }
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -1367,10 +1434,17 @@ impl Builder<'_> {
                         self.walk(child, popup, &style);
                     }
                 } else if !replaced && has_renderable_children(element) && !closed {
+                    let generates = generates_pseudo_boxes(name);
+                    if generates {
+                        self.push_generated(node, id, &style, Generated::Before);
+                    }
                     // The flat tree: a host lays out its shadow tree, and a
                     // slot what is assigned to it.
                     for child in self.document.flat_children(node) {
                         self.walk(child, id, &style);
+                    }
+                    if generates {
+                        self.push_generated(node, id, &style, Generated::After);
                     }
                 }
             }
@@ -1404,6 +1478,16 @@ impl Builder<'_> {
             }
         }
     }
+}
+
+/// Whether an element can hold a `::before` and an `::after`: not a void
+/// element or a control drawn as a widget, which have no content for one to
+/// stand at the edge of.
+fn generates_pseudo_boxes(name: &str) -> bool {
+    !matches!(
+        name,
+        "input" | "textarea" | "select" | "img" | "br" | "wbr" | "meter" | "progress"
+    )
 }
 
 /// Whether an element's children are content at all, whatever its style says.
@@ -1466,10 +1550,15 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
     // a page collapsing into one enormous paragraph — `<center><table>` is on the
     // front page of Hacker News, and `<a>` wrapped around a `<div>` is legal HTML5
     // and everywhere.
-    if children
-        .iter()
-        .any(|&child| tree.node(child).is_block_level())
-    {
+    //
+    // A box that is absolutely positioned is out of the flow, and splits
+    // nothing: the engine blockifies its `display`, but the badge or the arrow
+    // it is stays in the line it was written in (CSS 2.2 §9.2.1.1).
+    let in_flow_block = |tree: &BoxTree, child: BoxId| {
+        let node = tree.node(child);
+        node.is_block_level() && !node.is_absolutely_positioned()
+    };
+    if children.iter().any(|&child| in_flow_block(tree, child)) {
         tree.blockify(id);
     }
 
@@ -1480,9 +1569,7 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
         tree.node(id).style.display,
         Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid
     );
-    let has_block = children
-        .iter()
-        .any(|&child| tree.node(child).is_block_level());
+    let has_block = children.iter().any(|&child| in_flow_block(tree, child));
     let has_inline = children
         .iter()
         .any(|&child| tree.node(child).is_inline_level());
@@ -1501,11 +1588,18 @@ pub(crate) fn fix_anonymous_boxes(tree: &mut BoxTree, id: BoxId) {
     let mut run: Vec<BoxId> = Vec::new();
 
     for child in children {
-        if tree.node(child).is_block_level() {
+        let node = tree.node(child);
+        // A positioned box written in the middle of a run stays in it, where
+        // its static position is; a flex or grid container's are never items.
+        let joins_run = match node.is_absolutely_positioned() {
+            true => !flex && !run.is_empty() && node.style.was_inline,
+            false => !node.is_block_level(),
+        };
+        if joins_run {
+            run.push(child);
+        } else {
             flush_run(tree, &mut run, &mut rebuilt, &style);
             rebuilt.push(child);
-        } else {
-            run.push(child);
         }
     }
     flush_run(tree, &mut run, &mut rebuilt, &style);
@@ -1584,6 +1678,49 @@ mod tests {
         let dump = crate::dump::serialize(&tree);
         assert!(!dump.contains("text"), "{dump}");
         assert!(dump.contains("kept"), "{dump}");
+    }
+
+    #[test]
+    fn before_and_after_put_their_content_around_the_elements() {
+        let html = "<style>p::before { content: '[' attr(data-x) '] ' } \
+                    p::after { content: ' →'; color: red }</style><p data-x=hi>text";
+        assert_eq!(text_of(html), "[hi] text →");
+        let tree = styled(html);
+        let arrow = tree
+            .descendants(tree.root())
+            .into_iter()
+            .find(|&id| matches!(&tree.node(id).kind, BoxKind::Text(text) if &**text == " →"))
+            .expect("the ::after text");
+        let rgba = tree.node(arrow).style.color.to_rgba8();
+        assert_eq!(
+            [rgba.r, rgba.g, rgba.b],
+            [255, 0, 0],
+            "the pseudo-element's own style"
+        );
+    }
+
+    #[test]
+    fn content_none_and_normal_generate_nothing() {
+        let html = "<style>p::before { content: none } p::after { color: red }</style><p>text";
+        assert_eq!(text_of(html), "text");
+        assert_eq!(styled(html).len(), styled("<p>text").len());
+    }
+
+    #[test]
+    fn an_empty_string_still_generates_a_box() {
+        let html = "<style>div::after { content: ''; display: block; height: 10px }</style><div>";
+        assert_eq!(styled(html).len(), styled("<div>").len() + 1);
+    }
+
+    #[test]
+    fn a_quotation_is_quoted() {
+        assert_eq!(text_of("<p><q>said</q>"), "\u{201C}said\u{201D}");
+    }
+
+    #[test]
+    fn a_void_element_has_no_generated_boxes() {
+        let html = "<style>input::before, img::after { content: 'x' }</style><input><img alt=''>";
+        assert!(!text_of(html).contains('x'));
     }
 
     #[test]

@@ -169,7 +169,7 @@ impl<'a> Flow<'a> {
             align_items: style.align_items,
         };
 
-        let mut items = self.collect_items(parent, container, y, out);
+        let mut items = self.collect_items(parent, container, (x, y), out);
         if items.is_empty() {
             return 0.0;
         }

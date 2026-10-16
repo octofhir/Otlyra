@@ -41,6 +41,21 @@ pub(super) fn relative_offset(style: &ComputedStyle, containing: f32) -> (f32, f
     (x, y)
 }
 
+/// Move the fragment `id` made, wherever it is among `fragments`, down by
+/// `delta`. Whether it was found.
+fn move_fragment_of(fragments: &mut [Fragment], id: BoxId, delta: f32) -> bool {
+    for fragment in fragments {
+        if fragment.box_id == Some(id) {
+            offset(fragment, 0.0, delta);
+            return true;
+        }
+        if move_fragment_of(&mut fragment.children, id, delta) {
+            return true;
+        }
+    }
+    false
+}
+
 impl<'a> Flow<'a> {
     /// Lay out a box's children, making it the containing block for the absolutely
     /// positioned ones if its `position` says so.
@@ -102,17 +117,37 @@ impl<'a> Flow<'a> {
             height: content_height.map(|height| height + padding.top + padding.bottom),
         });
 
+        let first = out.len();
         let used = self.layout_children(id, content_width, content_x, content_y, out);
+        // What was placed by its `bottom` against the rest of the page goes to
+        // this box's real bottom, now that its contents have measured it.
+        let depth = self.containing_blocks.len();
+        let anchored: Vec<BoxId> = self
+            .bottom_anchored
+            .extract_if(.., |(at, _)| *at == depth)
+            .map(|(_, id)| id)
+            .collect();
+        if content_height.is_none() && !anchored.is_empty() {
+            let delta = used - height;
+            for id in anchored {
+                move_fragment_of(&mut out[first..], id, delta);
+            }
+        }
         self.containing_blocks.pop();
         used
     }
 
     /// Place an absolutely or fixed positioned box against its containing block.
     ///
-    /// `static_y` is where the box would have been in the flow, which is what an
-    /// `auto` inset resolves to — a positioned box with no insets stays where it
-    /// was and only leaves the flow.
-    pub(super) fn layout_positioned(&mut self, id: BoxId, static_y: f32) -> Fragment {
+    /// `static_x` and `static_y` are where the box would have been in the flow,
+    /// which is what an `auto` inset resolves to — a positioned box with no
+    /// insets stays where it was and only leaves the flow.
+    pub(super) fn layout_positioned(
+        &mut self,
+        id: BoxId,
+        static_x: f32,
+        static_y: f32,
+    ) -> Fragment {
         let style = Arc::clone(&self.tree.node(id).style);
         let block = if style.position == otlyra_css::Position::Fixed {
             ContainingBlock {
@@ -188,8 +223,17 @@ impl<'a> Flow<'a> {
         let x = match (left, right) {
             (Some(left), _) => area.x + left,
             (None, Some(right)) => area.x + area.width - right - fragment.rect.width,
-            (None, None) => area.x,
+            // No inset at all: where the flow would have put it.
+            (None, None) => static_x,
         };
+        if style.position != otlyra_css::Position::Fixed
+            && block.height.is_none()
+            && top.is_none()
+            && bottom.is_some()
+        {
+            self.bottom_anchored
+                .push((self.containing_blocks.len(), id));
+        }
         let y = match (top, bottom) {
             (Some(top), _) => area.y + top,
             (None, Some(bottom)) => area.y + area.height - bottom - fragment.rect.height,

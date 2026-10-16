@@ -67,7 +67,7 @@ impl Flow<'_> {
         content: &InlineContent<'_>,
         paragraph: &otlyra_text::Paragraph,
     ) -> f32 {
-        let spacers = inline_spacers(&content.inlines, &content.replaced);
+        let spacers = inline_spacers(content);
         if content.spans.is_empty() && spacers.is_empty() {
             return 0.0;
         }
@@ -94,7 +94,7 @@ impl Flow<'_> {
         content: &InlineContent<'_>,
         paragraph: &otlyra_text::Paragraph,
     ) -> f32 {
-        let spacers = inline_spacers(&content.inlines, &content.replaced);
+        let spacers = inline_spacers(content);
         if content.spans.is_empty() && spacers.is_empty() {
             return 0.0;
         }

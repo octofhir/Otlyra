@@ -54,6 +54,22 @@ pub struct StyledDocument {
     devolved: std::collections::HashSet<NodeId>,
     /// The `::placeholder` style of each field showing a placeholder.
     placeholders: HashMap<NodeId, Arc<ComputedValues>>,
+    /// The `::before` and `::after` styles of each element that generates
+    /// either, in that order.
+    generated: HashMap<NodeId, GeneratedStyles>,
+}
+
+/// An element's `::before` and `::after` styles, each present only when its
+/// `content` generates something (CSS Pseudo 4 §4.1).
+pub type GeneratedStyles = [Option<Arc<ComputedValues>>; 2];
+
+/// One of the two pseudo-elements that put content into their element's box.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Generated {
+    /// `::before`: the element's first child.
+    Before,
+    /// `::after`: the element's last child.
+    After,
 }
 
 /// The computed styles of one styling of a document, kept for script after
@@ -190,6 +206,16 @@ impl StyledDocument {
         self.placeholders.get(&node)
     }
 
+    /// The style of the `::before` or `::after` of `node`, when it
+    /// generates a box.
+    pub fn generated_style_of(
+        &self,
+        node: NodeId,
+        which: Generated,
+    ) -> Option<&Arc<ComputedValues>> {
+        self.generated.get(&node)?[which as usize].as_ref()
+    }
+
     /// The computed style of one element, if it has one.
     pub fn style_of(&self, node: NodeId) -> Option<&Arc<ComputedValues>> {
         self.styles.get(&node)
@@ -321,6 +347,10 @@ pub struct Styler {
     /// Each shadow root's own rules, and the text they were built from, so a
     /// restyle that changed none of its `<style>` elements parses nothing.
     shadow_styles: HashMap<NodeId, (u64, Arc<style::stylist::CascadeData>)>,
+    /// Whether a `:has()` in the page's sheets looks at the pointer, the focus
+    /// or a control's state: then moving either can restyle an element far from
+    /// the one that changed, and a restyle in place cannot tell which.
+    has_reads_state: bool,
 }
 
 /// A `@font-face` rule: a face of a family the page brings with it, what the
@@ -445,7 +475,9 @@ impl Styler {
             imported: &imported,
         };
         let mut font_faces = Vec::new();
+        let mut has_reads_state = false;
         for author in author_stylesheets(document, sources) {
+            has_reads_state |= has_reads_state_in(&author.text);
             let media = parse.media(author.media.unwrap_or_default());
             let sheet = Arc::new(parse.sheet(
                 &author.text,
@@ -467,6 +499,7 @@ impl Styler {
             selectors,
             font_faces,
             shadow_styles: HashMap::new(),
+            has_reads_state,
         }
     }
 
@@ -762,6 +795,7 @@ impl Styler {
             .collect();
         let mut styles = HashMap::new();
         let mut placeholders = HashMap::new();
+        let mut generated = HashMap::new();
         self.build_shadow_styles(document);
         self.resolve_from(
             document,
@@ -769,6 +803,7 @@ impl Styler {
             &starts,
             &mut styles,
             &mut placeholders,
+            &mut generated,
         );
 
         tracing::debug!(elements = styles.len(), "styled");
@@ -788,6 +823,7 @@ impl Styler {
             styles,
             devolved,
             placeholders,
+            generated,
         }
     }
 
@@ -798,7 +834,8 @@ impl Styler {
     /// What can have changed is an element whose state did, everything inside
     /// it — `.menu:hover .item`, and whatever inherits from it — and, where a
     /// selector reaches that way, everything after it among its siblings —
-    /// `:hover + .tip` — and nothing else, since `:has()` is off. Those are
+    /// `:hover + .tip` — and nothing else, unless a `:has()` reads the
+    /// state, which restyles the whole page. Those are
     /// restyled from their parents' styles, which did not change, with the
     /// engine's resolver the whole-document cascade uses. A pointer moving from
     /// one word of a paragraph to the next restyles the two words rather than the
@@ -817,7 +854,7 @@ impl Styler {
         // What a restyle in place starts from is found by walking the
         // document's tree, and a shadow tree is styled through the flat one:
         // a page with shadow trees is styled whole.
-        if document.has_shadow_trees() {
+        if document.has_shadow_trees() || self.has_reads_state {
             return None;
         }
         let _span = tracing::info_span!("recalc_style").entered();
@@ -904,13 +941,38 @@ impl Styler {
             })
             .collect();
         let mut fresh = HashMap::new();
+        let mut generated = HashMap::new();
         self.resolve_from(
             document,
             &styled.style_data,
             &starts,
             &mut fresh,
             &mut styled.placeholders,
+            &mut generated,
         );
+        // A generated box is not one the caller can find by its element and
+        // repaint in place, so a change to one restyles the whole page. Most
+        // hovers leave them as they were.
+        for node in fresh.keys() {
+            let old = styled.generated.get(node);
+            let new = generated.get(node);
+            let same = match (old, new) {
+                (None, None) => true,
+                (Some(old), Some(new)) => old.iter().zip(new).all(|pair| match pair {
+                    (None, None) => true,
+                    (Some(old), Some(new)) => {
+                        crate::computed::to_layout_style(old)
+                            == crate::computed::to_layout_style(new)
+                            && old.get_counters().content == new.get_counters().content
+                    }
+                    _ => false,
+                }),
+                _ => false,
+            };
+            if !same {
+                return None;
+            }
+        }
 
         let mut previous = Vec::with_capacity(fresh.len());
         for (node, style) in fresh {
@@ -994,6 +1056,7 @@ impl Styler {
         starts: &[(NodeId, Option<Arc<ComputedValues>>, usize)],
         styles: &mut HashMap<NodeId, Arc<ComputedValues>>,
         placeholders: &mut HashMap<NodeId, Arc<ComputedValues>>,
+        generated: &mut HashMap<NodeId, GeneratedStyles>,
     ) {
         let guard = self.lock.read();
         self.stylist.flush(&StylesheetGuards::same(&guard));
@@ -1030,7 +1093,15 @@ impl Styler {
             thread_local: &mut thread_local,
         };
         for (node, parent, depth) in starts {
-            resolve(&tree, *node, parent.as_ref(), *depth, &mut context, styles);
+            resolve(
+                &tree,
+                *node,
+                parent.as_ref(),
+                *depth,
+                &mut context,
+                styles,
+                generated,
+            );
         }
         // `::placeholder` is a lazy pseudo-element (CSS Pseudo 4 §4.3): only
         // a field that has a placeholder has one, so only those are asked.
@@ -1092,6 +1163,47 @@ fn shadow_style_texts(document: &Document, root: NodeId) -> Vec<String> {
 
 /// Whether `node` is a field a placeholder can show in: an `<input>` or a
 /// `<textarea>` with a `placeholder` attribute.
+/// Whether any `:has()` in `text` reads an element's state: the pointer, the
+/// focus, or what a control holds. Read off the text, which errs towards yes —
+/// a `:has(` in a comment or a string costs a whole restyle, not a wrong one.
+fn has_reads_state_in(text: &str) -> bool {
+    const STATES: [&str; 11] = [
+        ":hover",
+        ":focus",
+        ":active",
+        ":checked",
+        ":indeterminate",
+        ":open",
+        ":popover-open",
+        ":placeholder-shown",
+        ":valid",
+        ":invalid",
+        ":user-",
+    ];
+    let mut rest = text;
+    while let Some(at) = rest.find(":has(") {
+        let inside = &rest[at + 5..];
+        let mut depth = 1usize;
+        let end = inside
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map_or(inside.len(), |(index, _)| index);
+        let argument = &inside[..end];
+        if STATES.iter().any(|state| argument.contains(state)) {
+            return true;
+        }
+        rest = &inside[end..];
+    }
+    false
+}
+
 fn has_placeholder(document: &Document, node: NodeId) -> bool {
     document
         .get(node)
@@ -1122,9 +1234,10 @@ fn has_placeholder(document: &Document, node: NodeId) -> bool {
 /// nothing for layout to learn: colours made from other colours (relative colour
 /// syntax, `color-mix()` of several, `alpha()`, `contrast-color()`),
 /// `:nth-child(… of S)`, `@custom-media`, `sibling-index()` and
-/// `sibling-count()`, `@scope`, and `attr()` in any property. `:has()` and
-/// container queries stay off: one needs invalidation this engine does not do
-/// yet, the other asks layout a question in the middle of the cascade.
+/// `sibling-count()`, `@scope`, `attr()` in any property, and `:has()` —
+/// whose invalidation is a whole restyle, which is what a change to the tree
+/// gets anyway. Container queries stay off: they ask layout a question in the
+/// middle of the cascade.
 fn enable_features() {
     use std::sync::Once;
 
@@ -1142,6 +1255,7 @@ fn enable_features() {
         stylo_static_prefs::set_pref!("layout.css.tree-counting-functions.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.at-scope.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.attr.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.has-selector.enabled", true);
     });
 }
 
@@ -1230,6 +1344,7 @@ fn resolve<'a>(
     depth: usize,
     context: &mut StyleContext<'_, NodeRef<'a>>,
     styles: &mut HashMap<NodeId, Arc<ComputedValues>>,
+    generated: &mut HashMap<NodeId, GeneratedStyles>,
 ) {
     let document = tree.document;
     let is_element = document
@@ -1252,9 +1367,22 @@ fn resolve<'a>(
             style::stylist::RuleInclusion::All,
             style::style_resolver::PseudoElementResolution::IfApplicable,
         )
-        .resolve_primary_style(parent.map(|style| &**style), parent.map(|style| &**style));
+        .resolve_style(parent.map(|style| &**style), parent.map(|style| &**style));
 
-        let style = resolved.style.0;
+        // `::before` and `::after` are cascaded with their element, from its
+        // style; the engine leaves out one whose `content` generates nothing.
+        let pseudo =
+            |which: &style::selector_parser::PseudoElement| resolved.pseudos.get(which).cloned();
+        let pseudos = [
+            pseudo(&style::selector_parser::PseudoElement::Before),
+            pseudo(&style::selector_parser::PseudoElement::After),
+        ];
+        if pseudos.iter().any(Option::is_some) {
+            generated.insert(node, pseudos);
+        } else {
+            generated.remove(&node);
+        }
+        let style = resolved.primary.style.0;
 
         // `rem` is the *root element's* font size, and the engine reads it from
         // the device rather than from the tree — so somebody has to put it there
@@ -1289,7 +1417,15 @@ fn resolve<'a>(
     // The flat tree: a host's shadow tree is styled under it, and what a
     // slot is assigned under the slot.
     for child in document.flat_children(node) {
-        resolve(tree, child, inherited, child_depth, context, styles);
+        resolve(
+            tree,
+            child,
+            inherited,
+            child_depth,
+            context,
+            styles,
+            generated,
+        );
     }
 }
 
@@ -2169,6 +2305,20 @@ mod tests {
 
     /// The rules that decide whether an element renders like itself, checked
     /// against the reference's own answers for the ones that were wrong.
+    #[test]
+    fn a_has_that_reads_state_is_told_from_one_that_does_not() {
+        assert!(!has_reads_state_in(
+            ".a:has(> img, :nth-child(2)) { color: red }"
+        ));
+        assert!(has_reads_state_in("li:has(a:hover) { color: red }"));
+        assert!(has_reads_state_in(
+            "form:has(input:focus-visible) { outline: 0 }"
+        ));
+        assert!(!has_reads_state_in(
+            "a:hover { color: red } p:has(b) { color: blue }"
+        ));
+    }
+
     #[test]
     fn the_built_in_sheet_says_what_a_browser_says() {
         use crate::Display;

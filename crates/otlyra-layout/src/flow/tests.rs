@@ -1066,6 +1066,45 @@ fn absolute_leaves_the_flow_and_measures_from_its_ancestor() {
     assert_eq!(paragraph.y, 0.0, "the flow did not notice it");
 }
 
+/// A box positioned by its `bottom` in a containing block as tall as its
+/// content is placed against that content's bottom, not the page's.
+#[test]
+fn bottom_is_measured_from_a_containing_block_its_content_measures() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 } p { margin: 0; height: 100px } \
+         .frame { position: relative } \
+         .pinned { position: absolute; bottom: 10px; width: 50px; height: 30px }</style>\
+         <div class=frame><p>text</p><div class=pinned>x</div></div>",
+        400.0,
+    );
+    let pinned = boxes_of(&tree, &boxes, "div")
+        .into_iter()
+        .find(|fragment| fragment.rect.width == 50.0)
+        .expect("the pinned box");
+    assert_eq!(
+        pinned.rect.y, 60.0,
+        "ten up from a frame its paragraph made 100px"
+    );
+}
+
+/// An absolutely positioned box written in a line is out of the flow but not
+/// out of the line: it splits nothing, and with no insets it stands where its
+/// text would have.
+#[test]
+fn an_absolute_box_in_a_line_keeps_the_line_whole() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0; font: 16px/20px sans-serif } \
+         i { position: absolute; width: 10px; height: 10px }</style>\
+         <p style='margin: 0'>before<i></i> after</p>",
+        400.0,
+    );
+    let paragraph = rect_of(&tree, &boxes, "p");
+    assert_eq!(paragraph.height, 20.0, "one line, not two");
+    let badge = rect_of(&tree, &boxes, "i");
+    assert!(badge.x > 20.0, "after the word before it, at {}", badge.x);
+    assert_eq!(badge.y, 0.0, "at the top of its line");
+}
+
 /// `top` and `bottom` with an `auto` height is a height too: the box
 /// stretches between them, less its margins, and a percentage inside it is
 /// of that height.

@@ -158,6 +158,16 @@ pub(super) fn replaced_spacer(index: usize) -> u64 {
     REPLACED_SPACERS | index as u64
 }
 
+/// The bit that puts an absolutely positioned box's spacer in a range of its
+/// own.
+const POSITIONED_SPACERS: u64 = 1 << 61;
+
+/// The spacer identifier for the `index`th absolutely positioned box: the
+/// place in the line it would have had, which is its static position.
+pub(super) fn positioned_spacer(index: usize) -> u64 {
+    POSITIONED_SPACERS | index as u64
+}
+
 /// The room the things in a paragraph that are not text take up.
 ///
 /// Each inline box asks for two spacers, one at each edge, carrying the margin,
@@ -169,7 +179,8 @@ pub(super) fn replaced_spacer(index: usize) -> u64 {
 ///
 /// The same list is used to measure a paragraph and to lay it out, because a
 /// measurement taken without them is a measurement of a different paragraph.
-pub(super) fn inline_spacers(inlines: &[InlineBox], replaced: &[ReplacedBox]) -> Vec<Spacer> {
+pub(super) fn inline_spacers(content: &InlineContent<'_>) -> Vec<Spacer> {
+    let (inlines, replaced) = (&content.inlines, &content.replaced);
     inlines
         .iter()
         .enumerate()
@@ -201,6 +212,22 @@ pub(super) fn inline_spacers(inlines: &[InlineBox], replaced: &[ReplacedBox]) ->
             width: box_.outer_width(),
             height: box_.baseline,
         }))
+        // An absolutely positioned box takes no room in its line; its spacer is
+        // only there to be told where in the line it would have been. It holds
+        // on to what goes before it, so it is no place to break.
+        .chain(
+            content
+                .positioned
+                .iter()
+                .enumerate()
+                .map(|(index, &(_, at))| Spacer {
+                    id: positioned_spacer(index),
+                    kind: SpacerKind::Closing,
+                    at,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+        )
         .collect()
 }
 
@@ -225,6 +252,9 @@ pub(super) struct InlineContent<'a> {
     pub(super) inlines: Vec<InlineBox>,
     /// The pictures, inline blocks and widgets.
     pub(super) replaced: Vec<ReplacedBox>,
+    /// The absolutely positioned boxes among the content, and the span each
+    /// sits before. Out of the flow: they are placed once the lines are.
+    pub(super) positioned: Vec<(BoxId, usize)>,
 }
 
 impl<'a> InlineContent<'a> {
@@ -235,6 +265,7 @@ impl<'a> InlineContent<'a> {
             starts: vec![0],
             inlines: Vec::new(),
             replaced: Vec::new(),
+            positioned: Vec::new(),
         }
     }
 
@@ -347,6 +378,10 @@ impl<'a> Flow<'a> {
     fn collect_spans(&mut self, id: BoxId, containing_width: f32, content: &mut InlineContent<'a>) {
         for &child in &self.tree.node(id).children {
             let node = self.tree.node(child);
+            if node.is_absolutely_positioned() {
+                content.positioned.push((child, content.spans.len()));
+                continue;
+            }
             match &node.kind {
                 BoxKind::Replaced(replaced) => {
                     // A picture in a line is a box the shaper has to make room for,

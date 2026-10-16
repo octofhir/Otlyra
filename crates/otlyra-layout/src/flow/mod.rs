@@ -82,6 +82,7 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         text,
         font_stacks: FontStacks::default(),
         floats: Vec::new(),
+        bottom_anchored: Vec::new(),
         containing_blocks: vec![ContainingBlock {
             rect: initial,
             height: Some(initial.height),
@@ -157,6 +158,7 @@ pub fn relayout_contained(
         text,
         font_stacks: FontStacks::default(),
         floats: Vec::new(),
+        bottom_anchored: Vec::new(),
         containing_blocks: vec![ContainingBlock {
             rect: content,
             height: None,
@@ -234,6 +236,10 @@ struct Flow<'a> {
     /// box measures its insets against. The first entry is the initial
     /// containing block, so the stack is never empty.
     containing_blocks: Vec<ContainingBlock>,
+    /// The positioned boxes placed by their `bottom` against a containing block
+    /// whose height was not known yet, with how deep in the stack that block
+    /// is: moved to its real bottom once it has been measured.
+    bottom_anchored: Vec<(usize, BoxId)>,
     /// The viewport, which is what a fixed box measures against.
     viewport: Rect,
     /// The boxes that cut their contents off and have more than they can show.
