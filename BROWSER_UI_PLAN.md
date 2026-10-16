@@ -277,9 +277,10 @@ clicks and wheel events. What is left:
   components render.
 - [ ] Shadow DOM follow-ups: event retargeting, `slotchange`,
   `document.adoptedStyleSheets`, `ElementInternals`.
-- [ ] A real `DOMParser` (a second document), persistent `localStorage`, and
-  session history across documents (the back button over `pushState`
-  entries).
+- [x] The back and forward buttons move through the entries a page made with
+  `pushState` (`popstate`, no reload), and load the entry when the page no
+  longer has it.
+- [ ] A real `DOMParser` (a second document) and persistent `localStorage`.
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of
