@@ -25,7 +25,7 @@ const STYLE_PROPERTIES = [
   'boxShadow', 'boxSizing', 'breakAfter', 'breakBefore', 'breakInside', 'captionSide',
   'caretColor', 'clear', 'clip', 'clipPath', 'color', 'colorScheme', 'columnCount',
   'columnGap', 'columnRule', 'columnWidth', 'columns', 'contain', 'container',
-  'containerType', 'content', 'contentVisibility', 'counterIncrement', 'counterReset',
+  'containerName', 'containerType', 'content', 'contentVisibility', 'counterIncrement', 'counterReset',
   'cursor', 'direction', 'display', 'emptyCells', 'fill', 'filter', 'flex', 'flexBasis',
   'flexDirection', 'flexFlow', 'flexGrow', 'flexShrink', 'flexWrap', 'float', 'font',
   'fontFamily', 'fontFeatureSettings', 'fontKerning', 'fontSize', 'fontStretch',
@@ -209,6 +209,16 @@ for (const Interface of [HTMLElement, SVGElement, MathMLElement]) {
 // then — detached, or met before the page's first frame — answers from its
 // own `style` attribute, and with the empty string beyond that.
 const sideNames = { width: ['left', 'right'], height: ['top', 'bottom'] };
+// Properties the style system parses only behind a switch that is off, and
+// so never computes, answered with their initial values — what they compute
+// to on every element until it is on. Container queries are off (see
+// `cascade::enable_features`); a page that walks up looking for its query
+// container reads these and splits the name.
+const UNCOMPUTED_INITIAL = new Map([
+  ['container', 'none'],
+  ['container-name', 'none'],
+  ['container-type', 'normal'],
+]);
 const pixels = (value) => {
   const number = parseFloat(value);
   return Number.isFinite(number) ? number : 0;
@@ -260,6 +270,7 @@ class ComputedStyleDeclaration extends CSSStyleDeclaration {
       }
     }
     if (value !== null && value !== undefined) return value;
+    if (UNCOMPUTED_INITIAL.has(property)) return UNCOMPUTED_INITIAL.get(property);
     return super.getPropertyValue(property);
   }
 

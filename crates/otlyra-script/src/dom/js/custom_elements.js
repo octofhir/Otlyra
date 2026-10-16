@@ -52,7 +52,7 @@ const report = (error) => {
       ? 'Uncaught ' + (error.name || 'Error') + ': ' + error.message
       : 'Uncaught ' + String(error);
   try {
-    __otlyraReportError(message, nativeUrl());
+    __otlyraReportError(message, nativeUrl(), error);
   } catch (_) {
     console.error(error);
   }

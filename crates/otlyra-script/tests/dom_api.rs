@@ -784,3 +784,42 @@ fn script_selectors_take_has() {
     );
     assert_all_ok(&lines, 4);
 }
+
+#[test]
+fn object_urls_name_blobs_for_fetch() {
+    let lines = run(r#"<script>
+  const blob = new Blob(['hello'], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  check('an object URL is a blob: address of this origin', url.startsWith('blob:'), true);
+  fetch(url).then((response) => response.text()).then((text) => {
+    check('fetch reads the blob', [text, URL.createObjectURL(blob) !== url], ['hello', true]);
+    URL.revokeObjectURL(url);
+    return fetch(url).then(() => 'fetched', () => 'refused');
+  }).then((after) => check('a revoked URL is refused', after, 'refused'));
+</script>"#);
+    assert_all_ok(&lines, 3);
+}
+
+#[test]
+fn container_properties_compute_to_their_initial_values() {
+    let lines = run(r#"<div id=d></div><script>
+  const style = getComputedStyle(document.getElementById('d'));
+  check('container-type and -name are there', [style.containerType, style.containerName, style.getPropertyValue('container')], ['normal', 'none', 'none']);
+  check('a page splitting the name can', style.containerName.split(' ').includes('homepage'), false);
+</script>"#);
+    assert_all_ok(&lines, 2);
+}
+
+#[test]
+fn an_error_event_carries_the_exception() {
+    let lines = run(r#"<div id=host></div><script>
+  let seen = null;
+  window.addEventListener('error', (event) => { seen = event; event.preventDefault(); });
+  const broken = document.createElement('script');
+  broken.text = 'throw new TypeError("from an inserted script")';
+  document.getElementById('host').appendChild(broken);
+  check('event.error is the exception', [seen && seen.error instanceof TypeError, seen && seen.error.message], [true, 'from an inserted script']);
+  check('event.message names it', seen && seen.message, 'Uncaught TypeError: from an inserted script');
+</script>"#);
+    assert_all_ok(&lines, 2);
+}

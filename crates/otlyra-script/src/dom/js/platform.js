@@ -141,13 +141,17 @@ defineGlobal('__otlyraFlushDeferred', function __otlyraFlushDeferred(fireLoadEve
 // An exception nothing caught, reported the way the HTML standard reports
 // one: an `ErrorEvent` at the window, whose `onerror` gets the five
 // arguments, and the console unless a listener cancelled the event.
-defineGlobal('__otlyraReportError', function __otlyraReportError(message, filename) {
+// HTML §8.1.4.6 "report an exception": an `error` event on the window that
+// carries the exception itself — error trackers read `event.error` — and,
+// unless a listener cancels it, the exception in the console with where it
+// was thrown, as a browser's console has it.
+defineGlobal('__otlyraReportError', function __otlyraReportError(message, filename, thrown = null) {
   const event = new ErrorEvent('error', {
     message,
     filename,
     lineno: 0,
     colno: 0,
-    error: null,
+    error: thrown,
     cancelable: true,
   });
   let reported = true;
@@ -156,7 +160,10 @@ defineGlobal('__otlyraReportError', function __otlyraReportError(message, filena
   } catch (error) {
     console.error(error);
   }
-  if (reported) console.error(message);
+  if (reported) {
+    const stack = thrown && typeof thrown === 'object' ? thrown.stack : undefined;
+    console.error(typeof stack === 'string' && stack.includes('\n    at ') ? 'Uncaught ' + stack : message);
+  }
   return reported;
 });
 
@@ -495,7 +502,7 @@ defineGlobal('__otlyraNotifyMutationObservers', function __otlyraNotifyMutationO
         error && typeof error === 'object' && 'message' in error
           ? 'Uncaught ' + (error.name || 'Error') + ': ' + error.message
           : 'Uncaught ' + String(error);
-      __otlyraReportError(message, String(location.href));
+      __otlyraReportError(message, String(location.href), error);
     }
   }
 });

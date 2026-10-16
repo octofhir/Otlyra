@@ -105,8 +105,49 @@ const requestBody = (body, pairs) => {
 
 const resolveAddress = (url) => new URL(String(url), documentBase()).href;
 
+// Object URLs (File API §8): `blob:` addresses for the Blobs this document
+// made, which `fetch` answers from here. The browser never sees them: an
+// object URL means something only to the document that minted it.
+const objectUrls = new Map();
+const mintObjectUrl = () => {
+  const origin = location.origin;
+  return 'blob:' + (origin && origin !== 'null' ? origin : 'null') + '/' + crypto.randomUUID();
+};
+Object.defineProperty(URL, 'createObjectURL', {
+  value: function createObjectURL(object) {
+    if (!(object instanceof Blob)) {
+      throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+    }
+    const url = mintObjectUrl();
+    objectUrls.set(url, object);
+    return url;
+  },
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(URL, 'revokeObjectURL', {
+  value: function revokeObjectURL(url) {
+    objectUrls.delete(String(url));
+  },
+  writable: true,
+  configurable: true,
+});
+
 // HTML §4 "fetch()" through the browser.
 defineGlobal('fetch', function fetch(input, init = {}) {
+  const address = typeof input === 'string' || input instanceof URL ? String(input) : null;
+  if (address !== null && address.startsWith('blob:')) {
+    const blob = objectUrls.get(address.split('#')[0]);
+    if (!blob) return Promise.reject(new TypeError('Failed to fetch'));
+    const response = new Response(blob, {
+      status: 200,
+      headers: blob.type ? { 'content-type': blob.type } : {},
+    });
+    try {
+      Object.defineProperty(response, 'url', { value: address.split('#')[0], configurable: true });
+    } catch (_) {}
+    return Promise.resolve(response);
+  }
   return new Promise((resolve, reject) => {
     let url;
     let method = 'GET';
@@ -424,7 +465,7 @@ const reportScriptError = (error, url) => {
     error && typeof error === 'object' && 'message' in error
       ? 'Uncaught ' + (error.name || 'Error') + ': ' + error.message
       : 'Uncaught ' + String(error);
-  __otlyraReportError(message, url);
+  __otlyraReportError(message, url, error);
 };
 const fireScriptEvent = (script, type) => {
   try {
