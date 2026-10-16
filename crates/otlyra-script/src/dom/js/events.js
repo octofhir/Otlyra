@@ -73,7 +73,10 @@ const propagationPath = (target) => {
     path.push(parent);
     node = parent;
   }
-  if (!path.includes(globalThis)) path.push(globalThis);
+  // The window is the document's parent for events (HTML §7.2.1 "get the
+  // parent"); a node outside the document, or a target that is not a node at
+  // all, has no window above it.
+  if (path[path.length - 1] === globalThis.document) path.push(globalThis);
   return path;
 };
 
@@ -219,10 +222,16 @@ const onWindow = (name) => {
   }[name];
 };
 
-for (const target of [globalThis, Node.prototype]) {
+// One implementation for every event target. `EventTarget.prototype` gets it
+// too, not only nodes and the window: polyfills copy the methods from there
+// (ShadyDOM keeps `__shady_native_addEventListener` and calls it on the
+// window), and a target the engine made — an `AbortSignal`, a `MessagePort` —
+// then keeps its listeners where a page's own listeners are.
+for (const target of [globalThis, Window.prototype, Node.prototype, EventTarget.prototype]) {
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
     Object.defineProperty(target, name, {
-      value: target === globalThis ? onWindow(name) : eventTarget[name],
+      value:
+        target === globalThis || target === Window.prototype ? onWindow(name) : eventTarget[name],
       writable: true,
       enumerable: false,
       configurable: true,

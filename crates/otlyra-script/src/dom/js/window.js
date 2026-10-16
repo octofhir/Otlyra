@@ -67,18 +67,16 @@ for (const [name, value] of [['colorDepth', 24], ['pixelDepth', 24], ['availLeft
 defineGlobal('Screen', Screen);
 defineGlobal('screen', screenObject);
 
-// The global's interface. The global object is the engine's own and keeps its
-// prototype; `instanceof Window` answers for it rather than for its chain.
+// The global's interface. The global object is the engine's own; it is put
+// on `Window.prototype`, so what a page reads from `Window.prototype` or
+// `EventTarget.prototype` is what the window has.
 class Window extends EventTarget {
   constructor() {
     throw new TypeError('Illegal constructor');
   }
-
-  static [Symbol.hasInstance](value) {
-    return value === globalThis;
-  }
 }
 defineGlobal('Window', Window);
+Object.setPrototypeOf(globalThis, Window.prototype);
 
 // `document` is fetched on first use rather than now: this script is
 // evaluated while the isolate is being built, and at that moment there is no

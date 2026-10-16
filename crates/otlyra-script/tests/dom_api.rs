@@ -531,3 +531,51 @@ fn legacy_create_event_and_init_methods_build_dispatchable_events() {
 </script>"#);
     assert_all_ok(&lines, 5);
 }
+
+#[test]
+fn every_event_target_shares_one_listener_implementation() {
+    let lines = run(r#"<div id=target></div><script>
+  check('the window is an EventTarget', [window instanceof Window, window instanceof EventTarget, Object.getPrototypeOf(window) === Window.prototype], [true, true, true]);
+  const copied = Object.getOwnPropertyDescriptor(EventTarget.prototype, 'addEventListener').value;
+  let windowHeard = 0;
+  copied.call(window, 'ping', () => { windowHeard++; });
+  window.dispatchEvent(new Event('ping'));
+  check('a method copied from EventTarget.prototype works on the window', windowHeard, 1);
+  class Bus extends EventTarget {}
+  const bus = new Bus();
+  let busHeard = 0;
+  bus.addEventListener('ping', () => { busHeard++; });
+  bus.dispatchEvent(new Event('ping', { bubbles: true }));
+  check('a page-made target hears its event and the window does not', [busHeard, windowHeard], [1, 1]);
+  const detached = document.createElement('span');
+  detached.dispatchEvent(new Event('ping', { bubbles: true }));
+  check('a detached node does not reach the window', windowHeard, 1);
+  document.getElementById('target').dispatchEvent(new Event('ping', { bubbles: true }));
+  check('a connected node does', windowHeard, 2);
+  const controller = new AbortController();
+  let aborted = false;
+  controller.signal.addEventListener('abort', () => { aborted = true; });
+  controller.abort();
+  check('engine-made targets still fire', [aborted, controller.signal.aborted], [true, true]);
+  check('the global still has Object methods', [typeof window.hasOwnProperty, String(window) === '[object Window]' || String(window).length > 0], ['function', true]);
+</script>"#);
+    assert_all_ok(&lines, 7);
+}
+
+#[test]
+fn cloning_a_template_clones_its_contents() {
+    let lines = run(r#"<script>
+  const outer = document.createElement('template');
+  outer.innerHTML = '<div><template><b>x</b><i>y</i></template></div>';
+  const stamped = document.importNode(outer.content, true);
+  check('importNode copies a nested template', stamped.querySelector('template').content.childNodes.length, 2);
+  const copy = outer.content.cloneNode(true);
+  check('cloneNode copies a nested template', copy.querySelector('template').content.textContent, 'xy');
+  const element = outer.cloneNode(true);
+  check('a cloned template has the contents', element.content.firstChild.localName, 'div');
+  check('the copy is its own', element.content === outer.content, false);
+  const shallow = outer.cloneNode(false);
+  check('a shallow clone has empty contents', shallow.content.childNodes.length, 0);
+</script>"#);
+    assert_all_ok(&lines, 5);
+}
