@@ -290,9 +290,16 @@ clicks and wheel events. What is left:
 - [ ] `keypress`, `beforeinput` and IME composition events.
 - [x] Synchronous geometry: measuring after a change lays the tree out
   again (budgeted), and elements outside the drawn band measure.
-- [ ] YouTube follow-ups: search results stay hidden, the masthead logo,
-  web fonts in the script layout, and the optimizing tier's re-run of a
-  call in a constructing record (Otter).
+- [x] Painting fixes from Apple and YouTube: `mask-image` (alpha masks of
+  pictures), `background-color: currentcolor`, ancestor clips outside a
+  transform, stacking contexts only where `z-index` (or opacity/transform)
+  makes one, flex and grid items lifted by `position: relative`/`z-index`,
+  absolute boxes stretched between `top` and `bottom`, `complete`/
+  `currentSrc` for picked pictures.
+- [ ] YouTube follow-ups: search results stay hidden, web fonts in the
+  script layout, SVG pictures rasterized at device density (masks and
+  backgrounds blur on HiDPI), gradient masks, and the optimizing tier's
+  re-run of a call in a constructing record (Otter).
 - [ ] Element scrolling (`scrollTop` of anything but the scrolling element),
   `scrollIntoView`, and pointer modifiers on mouse events.
 - [ ] Hide the remaining `__otlyra*` bindings behind `take` so no page sees them.

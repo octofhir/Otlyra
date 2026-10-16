@@ -1534,7 +1534,11 @@ Still open:
 
 - On the search page the results stay `hidden`. The binding
   `[[data.hideContents]]` never clears it.
-- The masthead logo is not drawn.
+- ~~The masthead logo is not drawn.~~ The logo is a box filled with
+  `currentcolor` and cut down by `-webkit-mask: url(logo.svg)`. Both halves
+  were missing: `currentcolor` in `background-color` came out transparent,
+  and masks were ignored (`619d976`). The mask SVG is rasterized at its own
+  size, so on a 2× screen it is soft.
 - Fonts a page loads with `@font-face` after the fork are not used by the
   script layout.
 
