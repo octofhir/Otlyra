@@ -164,6 +164,8 @@ fn build(
         images,
         form,
         tree,
+        root_overflow: None,
+        body_overflow_taken: false,
     };
     for child in document.children(document.root()) {
         builder.walk(child, root, &root_style);
@@ -187,6 +189,11 @@ struct Builder<'a> {
     /// markup says a control holds.
     form: &'a FormState,
     tree: BoxTree,
+    /// The root element's `overflow`, once it has been met: whether the
+    /// `<body>` may give its own to the viewport.
+    root_overflow: Option<otlyra_css::Overflow>,
+    /// Whether a `<body>` already has, which only the first one does.
+    body_overflow_taken: bool,
 }
 
 /// Remove the whitespace-only boxes that sit between block-level boxes.
@@ -1135,6 +1142,46 @@ impl Builder<'_> {
             .map(|values| otlyra_css::computed::to_layout_style(values))
     }
 
+    /// Whether `node`'s `overflow` belongs to the viewport rather than to its
+    /// own box (CSS Overflow 3 §3.3): the root element's always, and the
+    /// `<body>`'s when the root's is `visible`. The box itself is then
+    /// `visible` — a page that writes `body { overflow: auto }` over a body
+    /// with no height of its own means the window's scroll bar, not a
+    /// zero-height box that cuts everything off.
+    fn gives_overflow_to_viewport(&mut self, node: NodeId, style: &ComputedStyle) -> bool {
+        let parent = self.document.get(node).and_then(|dom| dom.parent);
+        if parent == Some(self.document.root()) {
+            self.root_overflow = Some(style.overflow);
+            return true;
+        }
+        if self.root_overflow != Some(otlyra_css::Overflow::Visible) || self.body_overflow_taken {
+            return false;
+        }
+        let is_body = |id: NodeId| {
+            self.document
+                .get(id)
+                .and_then(otlyra_dom::Node::element)
+                .is_some_and(|element| {
+                    element.name.ns == ns!(html) && &*element.name.local == "body"
+                })
+        };
+        let root_is_html = parent.is_some_and(|parent| {
+            self.document
+                .get(parent)
+                .and_then(otlyra_dom::Node::element)
+                .is_some_and(|element| {
+                    element.name.ns == ns!(html) && &*element.name.local == "html"
+                })
+                && self.document.get(parent).and_then(|dom| dom.parent)
+                    == Some(self.document.root())
+        });
+        if root_is_html && is_body(node) {
+            self.body_overflow_taken = true;
+            return true;
+        }
+        false
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -1191,6 +1238,9 @@ impl Builder<'_> {
                     style.text_decoration,
                     receives_decorations(&style, replaced_content.is_some()),
                 );
+                if self.gives_overflow_to_viewport(node, &style) {
+                    style.overflow = otlyra_css::Overflow::Visible;
+                }
                 let style = Arc::new(style);
 
                 let kind = match replaced_content {

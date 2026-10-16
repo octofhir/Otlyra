@@ -243,6 +243,37 @@ mod tests {
         );
     }
 
+    /// The root's `overflow`, and the body's when the root's is `visible`,
+    /// belong to the viewport: neither box clips. A body that is not the
+    /// first, or whose root has an `overflow` of its own, keeps its own.
+    #[test]
+    fn root_and_body_overflow_go_to_the_viewport() {
+        let overflows = |html: &str| -> Vec<(String, bool)> {
+            let tree = tree_of(html);
+            tree.descendants(tree.root())
+                .into_iter()
+                .filter_map(|id| {
+                    let node = tree.node(id);
+                    let tag = node.tag.as_deref()?.to_owned();
+                    matches!(tag.as_str(), "html" | "body" | "div")
+                        .then(|| (tag, node.style.overflow.clips()))
+                })
+                .collect()
+        };
+        assert_eq!(
+            overflows("<body style='overflow-y: scroll'><div style='overflow: hidden'>x</div>"),
+            [
+                ("html".to_owned(), false),
+                ("body".to_owned(), false),
+                ("div".to_owned(), true)
+            ]
+        );
+        assert_eq!(
+            overflows("<html style='overflow: hidden'><body style='overflow: hidden'>x"),
+            [("html".to_owned(), false), ("body".to_owned(), true)]
+        );
+    }
+
     /// The document styles what a shadow tree exposes as a part, and what an
     /// inner host passes on with `exportparts`; an undefined custom element
     /// is hidden by `:not(:defined)`.
