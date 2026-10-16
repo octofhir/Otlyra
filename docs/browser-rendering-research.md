@@ -1344,6 +1344,75 @@ table the glue leaves (`__otlyraInterfacePrototypes`).
 - Same-tab, same-host fairness inside one page, which is ordinary FIFO.
 - The remaining GitHub error, which has no stack yet.
 
+## Computed style, page requests, and Apple's navigation
+
+### getComputedStyle
+
+`getComputedStyle` returns a live read-only declaration. Its values come from
+Stylo's `computed_value_to_string`. A shorthand is built from its longhands.
+`width` and `height` are the used size of a box the last frame drew.
+
+Freshness follows the browser model rather than the geometry one:
+
+- The page lends its last styling with the document's mutation count at
+  styling time. `DocumentMutator::new` bumps that count.
+- A read after a change restyles the tree there and then, through a
+  `StyleResolver` the document holds (`otlyra_css::ScriptStyler`). It styles
+  with the sheets the load has fetched so far. Those sheets are shared with
+  `PendingLoad` through an `Rc`, so they are not copied.
+- A parser-blocking script now waits for style sheets still loading (HTML's
+  "style sheet that is blocking scripts"). Without that, a script after a
+  `<link>` read the styles from before the sheet arrived.
+
+**Found on Apple.** The global navigation measures its own font size when it
+mounts, to scale its SVG labels for text zoom. That ran before the header
+sheet had arrived, read `''`, and set `--r-globalnav-text-zoom-scale: NaN`.
+Every label's `height: calc(var(...) * 1em)` then collapsed to zero.
+
+How it was found:
+
+- a reproduction narrowed with delta debugging over the CSS rules;
+- the same over the navigation markup, which left the `NaN` custom property.
+
+### display: contents and clipped-away boxes
+
+`display: contents` was laid out as a block. That put Apple's whole menu in
+one column over the hero. It now generates no box: its children are boxed
+under its parent.
+
+A box whose `clip` (when absolutely positioned) or `clip-path: inset()`
+leaves nothing to see paints nothing. That is the visually hidden label
+pattern; Apple's leaves a one-pixel sliver of text next to each label.
+
+### Page requests
+
+`fetch` and `XMLHttpRequest` live in the glue (`network.js`). The browser
+does the networking:
+
+1. The runner hands requests over (`ScriptRunner::take_page_requests`).
+2. The world sends them through the fetcher as `ResourceKind::Fetch`, in the
+   tab's lanes.
+3. The answer comes back through `deliver_page_response`, which settles the
+   promise or fires the XHR events.
+
+A cross-origin answer reaches script only if it carries
+`Access-Control-Allow-Origin` naming the page's origin or `*`. Anything else
+is a network error to the page.
+
+**Gap found on the way, and older than this work.** The loader is never told
+the initiator. Every subresource, and now every page request, is treated as
+same-site for cookies.
+
+### Validation
+
+- **Apple.** The home page renders its navigation as a single row, like the
+  real site, and runs with no script errors (it had 6).
+- **GitHub.** One error, which has no stack yet.
+- **BiDi against a local server.** `fetch` and XHR returned the server's
+  JSON.
+- **Smokes.** Modules 9/9 and BiDi 4/4. The two-tab load took 0.22 s, and
+  cookies stayed as before.
+
 ## What the reference browsers do
 
 ### Chromium

@@ -260,12 +260,20 @@ clicks and wheel events. What is left:
 - [x] Fetch lanes: documents never queue behind subresources, subresources
   queue per tab and host, and a tab that closes or moves on cancels what it
   asked for. A second tab no longer waits for the first one's pictures.
-- [ ] `getComputedStyle`: Apple's `main.built.js` and gallery stop on it. It
-  needs the computed styles of the last frame exposed to the isolate the way
-  geometry already is.
-- [ ] `XMLHttpRequest` (Apple's locale switcher), `attachShadow`/
-  `ElementInternals`, `DOMParser`, persistent `localStorage`, and session
-  history across documents (the back button over `pushState` entries).
+- [x] `getComputedStyle`, synchronous: resolved values from Stylo, the tree
+  restyled on read after a change, with the sheets fetched so far; parser
+  scripts wait for the style sheets that block them. `DOMMatrix`/`DOMPoint`.
+- [x] `display: contents`, and boxes `clip`/`clip-path` cut to nothing
+  (the visually-hidden pattern) paint nothing.
+- [x] `fetch` and `XMLHttpRequest` through the browser's fetcher, with the
+  CORS read check on cross-origin answers.
+- [ ] Page requests: streaming and binary bodies, methods other than
+  GET/HEAD/POST, preflight, synchronous XHR, and an initiator for the
+  loader so `SameSite` and third-party cookies apply to subresources and page
+  requests (today every request is treated as same-site).
+- [ ] `attachShadow`/`ElementInternals`, `DOMParser`, persistent
+  `localStorage`, and session history across documents (the back button
+  over `pushState` entries).
 - [ ] Module follow-ups: `modulepreload` links, CORS and `crossorigin`/
   `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
   the network, dynamically inserted module scripts, and moving the request
