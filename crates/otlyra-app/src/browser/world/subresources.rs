@@ -112,11 +112,14 @@ impl PageWorld {
             let wanted: Vec<otlyra_layout::ImageSource> =
                 otlyra_layout::image_sources(page.document(), viewport)
                     .into_iter()
-                    .take(IMAGE_LIMIT)
+                    // The limit is on what is asked for at once, so it counts
+                    // only what still has to be: a page that has shown 256
+                    // pictures and adds one more is shown that one too.
                     .filter(|source| {
                         page.picture_source(source.node)
                             != Some((source.src.as_str(), source.density))
                     })
+                    .take(IMAGE_LIMIT)
                     .collect();
             for source in wanted {
                 let Some(target) = Self::subresource_url(&document, &base, &source.src) else {
@@ -292,13 +295,13 @@ impl PageWorld {
             let changed: Vec<otlyra_layout::ImageSource> =
                 otlyra_layout::image_sources(page.document(), viewport)
                     .into_iter()
-                    .take(IMAGE_LIMIT)
                     .filter(|source| {
                         page.picture_source(source.node)
                             .is_some_and(|(src, density)| {
                                 src != source.src || density != source.density
                             })
                     })
+                    .take(IMAGE_LIMIT)
                     .collect();
 
             for source in changed {
