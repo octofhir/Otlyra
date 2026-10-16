@@ -284,10 +284,15 @@ clicks and wheel events. What is left:
   `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
   the network, dynamically inserted module scripts, and moving the request
   scan off the content owner (it parses each module once there today).
-- [ ] `MutationObserver` records (still a stub), and `keypress`,
-  `beforeinput` and IME composition events.
-- [ ] Synchronous geometry: a measurement after a mutation in the same turn
-  reads the previous frame, and elements outside the drawn band measure zero.
+- [x] `MutationObserver` (see [YouTube](docs/browser-rendering-research.md#youtube)):
+  child list, attributes, character data, subtree, filters, old values;
+  delivered at the microtask checkpoint.
+- [ ] `keypress`, `beforeinput` and IME composition events.
+- [x] Synchronous geometry: measuring after a change lays the tree out
+  again (budgeted), and elements outside the drawn band measure.
+- [ ] YouTube follow-ups: search results stay hidden, the masthead logo,
+  web fonts in the script layout, and the optimizing tier's re-run of a
+  call in a constructing record (Otter).
 - [ ] Element scrolling (`scrollTop` of anything but the scrolling element),
   `scrollIntoView`, and pointer modifiers on mouse events.
 - [ ] Hide the remaining `__otlyra*` bindings behind `take` so no page sees them.

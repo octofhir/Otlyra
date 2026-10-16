@@ -1479,6 +1479,65 @@ Not done: event retargeting (a listener outside a root sees the inner
 target), `slotchange`, `document.adoptedStyleSheets` (stored, not applied),
 `ElementInternals`, and imperative slot assignment.
 
+## YouTube
+
+YouTube showed its loading skeleton and nothing else. Each fix below
+uncovered the next problem.
+
+1. **The main bundle did not load.** Otter's source-map metadata copied the
+   module URL into each of the 10.9 MB bundle's 46,000 functions. That made
+   35 MB against a 32 MB ceiling, reported as out of memory. Otter
+   `bf4b2cd17` stores the URL once and raises the ceiling to 64 MiB.
+2. **The web components polyfill stopped at its first line.** It needed
+   `document.createEvent` and `initEvent` (`cde9139`), then
+   `document.implementation.createHTMLDocument` (`fdb57cd`).
+3. **ShadyDOM** (YouTube forces it) calls `addEventListener` copied from
+   `EventTarget.prototype` on the window. The window did not inherit from
+   that prototype, and the prototype held the engine's own registry.
+   `EventTarget.prototype` now carries the page's implementation, and the
+   global inherits from `Window.prototype` (`0d1dcb0`).
+4. **A white page.** `body { overflow: auto scroll }` on a zero-height body
+   made a scroll container that cut off the whole app. The root's overflow,
+   and the body's when the root's is `visible`, now belong to the viewport
+   (`c308abf`).
+5. **Polymer threw `VM_BYTECODE_INVARIANT`, which no `try` catches.** The
+   module-graph linker did not move the name constant of `super.x` reads and
+   writes, so in every module after the first, `super.connectedCallback`
+   read a foreign constant. Otter `e10d3f2fc` lists those opcodes as
+   const-pool operands.
+6. **`dom-if` and `dom-repeat` never rendered.** Polymer schedules its
+   microtasks by changing a text node it observes, and `MutationObserver`
+   was a stub. A real one now exists (`d475436`): registrations and records
+   live in otlyra-dom and are matched where each change happens; callbacks
+   run at the microtask checkpoint, after the promise jobs queued so far.
+7. **"The constructor was called twice for one element".** There were two
+   causes:
+   - Upgrades were re-entered from their own constructor (`0fcba37`).
+   - Otter emitted a proper tail call for `return f()` in class
+     constructors, and once such a constructor was hot the optimizing tier
+     ran `f` a second time. A class constructor always owes construct
+     completion, so it no longer gets tail calls (Otter `95e66fc3c`). Why
+     the optimizing tier re-runs the call there is still open; the
+     interpreter and the template tier were right.
+8. **The consent dialog sat with its corner in the middle of the window.**
+   Iron overlays measure themselves right after insertion, and measuring read
+   the last frame. It now lays the tree out again (`bfbb660`; see
+   `page/script_layout.rs`). That layout is limited to 100 ms at once,
+   refilled at a quarter of the time that passes. On the home page there
+   are 21 such layouts, mostly 4–15 ms each.
+
+Now the home page runs with no script errors. The consent dialog is centred
+and its buttons work, and the page behind it renders as the real site does
+for a visitor with history off.
+
+Still open:
+
+- On the search page the results stay `hidden`. The binding
+  `[[data.hideContents]]` never clears it.
+- The masthead logo is not drawn.
+- Fonts a page loads with `@font-face` after the fork are not used by the
+  script layout.
+
 ## What the reference browsers do
 
 ### Chromium
