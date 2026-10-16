@@ -385,6 +385,12 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
         if std::ptr::eq(fragment, &tree.root) {
             continue;
         }
+        // A hidden box draws nothing of its own and is not hit, though it keeps
+        // its place, and what is visible inside it is drawn as it comes
+        // (CSS 2.2 §11.2). Its group, above, still holds them.
+        if !fragment.style.visible {
+            continue;
+        }
         // Whichever background went to the canvas is not painted again by the box
         // it came from.
         let is_root_element = canvas_from.is_some_and(|from| std::ptr::eq(fragment, from))

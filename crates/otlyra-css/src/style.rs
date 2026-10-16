@@ -1496,6 +1496,10 @@ pub struct ComputedStyle {
     /// a half-transparent box with overlapping children does not show the overlap
     /// through itself.
     pub opacity: f32,
+    /// Whether the box is drawn (`visibility: visible`): a hidden one keeps its
+    /// place and draws nothing, is not hit, and what inside it is visible again
+    /// is drawn (CSS 2.2 §11.2). Inherited.
+    pub visible: bool,
     /// `transform`, in the order the steps were written. Empty for `none`.
     ///
     /// Shared: a page that transforms a hundred cards writes one list and every
@@ -1652,6 +1656,7 @@ impl Default for ComputedStyle {
             border_collapse: BorderCollapse::Separate,
             box_sizing: BoxSizing::Content,
             opacity: 1.0,
+            visible: true,
             transform: Arc::from(Vec::new()),
             transform_origin: TransformOrigin::default(),
             white_space: WhiteSpace::Collapse,
@@ -1789,6 +1794,7 @@ impl ComputedStyle {
         Self {
             text_shadows: parent.text_shadows.clone(),
             color: parent.color,
+            visible: parent.visible,
             font_family: parent.font_family.clone(),
             font_size: parent.font_size,
             font_weight: parent.font_weight,

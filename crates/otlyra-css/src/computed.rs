@@ -81,6 +81,8 @@ pub fn to_layout_style(values: &ComputedValues) -> ComputedStyle {
             style::computed_values::box_sizing::T::ContentBox => BoxSizing::Content,
         },
         opacity: values.get_effects().opacity.clamp(0.0, 1.0),
+        visible: values.get_inherited_box().visibility
+            == style::computed_values::visibility::T::Visible,
         transform: transform(values),
         transform_origin: transform_origin(values),
         white_space: white_space(values),

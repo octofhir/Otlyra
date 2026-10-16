@@ -1530,3 +1530,31 @@ fn a_mask_is_drawn_destination_in_over_the_box() {
         "{kinds:?}"
     );
 }
+
+/// `visibility: hidden` draws nothing of the box, and nothing is hit there,
+/// while a `visible` child inside it is drawn.
+#[test]
+fn a_hidden_box_draws_nothing_but_its_visible_children() {
+    let list = page(
+        "<style>body { margin: 0 } .veil { visibility: hidden; width: 100px; height: 100px; \
+         background: rgb(255, 0, 0) } .peek { visibility: visible; width: 20px; height: 20px; \
+         background: rgb(0, 0, 255) }</style><div class=veil><div class=peek></div></div>",
+        0.0,
+    );
+    let order = fill_order(&list);
+    assert!(
+        !order.contains(&Color::from_rgb8(255, 0, 0)),
+        "the hidden box is not drawn: {order:?}"
+    );
+    assert!(
+        order.contains(&Color::from_rgb8(0, 0, 255)),
+        "its visible child is: {order:?}"
+    );
+    let hit = otlyra_gfx::hit_test(&list, (60.0, 60.0));
+    let child = otlyra_gfx::hit_test(&list, (10.0, 10.0));
+    assert!(child.is_some(), "the visible child is hit");
+    assert!(
+        hit.is_none_or(|hit| Some(hit.id) != child.map(|c| c.id)),
+        "nothing hidden is hit there"
+    );
+}

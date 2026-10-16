@@ -4629,6 +4629,26 @@ fn script_measures_the_boxes_the_page_drew() {
     });
 }
 
+/// A box with `visibility: hidden` is not drawn and not hit, but it keeps
+/// its place, and script measures it from the frame like any other.
+#[test]
+fn script_measures_a_hidden_box() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=measure style='display:block;width:100px;height:30px;margin:0;padding:0;border:0'>m</button>\
+             <div id=veil style='visibility:hidden;width:120px;height:40px;margin-left:5px'></div>\
+             <script>\
+               document.getElementById('measure').addEventListener('click', () => {\
+                 const rect = document.getElementById('veil').getBoundingClientRect();\
+                 document.documentElement.dataset.log = [rect.left, rect.top, rect.width, rect.height].join(' ');\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "measure");
+        assert_eq!(page_log(&browser), "5 30 120 40");
+    });
+}
+
 /// Script that measures right after a change measures the tree it left: an
 /// element it just inserted, one it just resized, and one far below what
 /// the frame drew.

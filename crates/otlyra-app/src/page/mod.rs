@@ -603,6 +603,33 @@ impl PageScene {
                 })
                 .or_insert(next);
         }
+        // A hidden box is not hit, so it left no target, but it is laid out and
+        // script measures it: `visibility: hidden` keeps the box.
+        if let Some((_, tree)) = &self.layout {
+            for fragment in tree.iter().filter(|fragment| !fragment.style.visible) {
+                let Some(node) = fragment
+                    .box_id
+                    .and_then(|id| self.boxes.get(id))
+                    .and_then(|layout| layout.node)
+                else {
+                    continue;
+                };
+                // Page coordinates, so the page's scroll is what makes them
+                // client ones; a fixed box is on the screen already.
+                let dy = if fragment.fixed { 0.0 } else { self.scroll };
+                let rect = fragment.rect;
+                let next = [rect.x, rect.y - dy, rect.right(), rect.bottom() - dy];
+                rects
+                    .entry(node)
+                    .and_modify(|union| {
+                        union[0] = union[0].min(next[0]);
+                        union[1] = union[1].min(next[1]);
+                        union[2] = union[2].max(next[2]);
+                        union[3] = union[3].max(next[3]);
+                    })
+                    .or_insert(next);
+            }
+        }
         self.document
             .set_geometry(std::sync::Arc::new(rects), self.styled_at);
     }
