@@ -1568,6 +1568,48 @@ There were four bugs in the way:
    The same commit also stretches an absolutely positioned box between
    `top` and `bottom` when its height is `auto`.
 
+## BBC
+
+BBC's home page is a Next.js app built with turbopack and styled with
+styled-components. It was black, then it was static: the server-rendered
+markup with grey placeholders, and no React. Each fix below uncovered the
+next problem.
+
+1. **`visibility` was not read at all.** The menu's 95% black backdrop
+   covers the page with `visibility: hidden` until the menu opens. Hidden
+   boxes are now neither drawn nor hit; visible descendants still draw, and
+   script still measures them (`83b750d`).
+2. **`defer` and `async` scripts ran where they stood.** Next reads
+   `#__NEXT_DATA__`, written at the end of the body, from deferred scripts in
+   the head. Such scripts now wait for the end of the parse (`e6f95fd`).
+3. **Scripts inserted by script never ran.** turbopack loads its chunks
+   with `<script src>` elements and waits for `load`. Inserted scripts now
+   run:
+   - inline ones at once;
+   - external ones once fetched as scripts (no CORS check), followed by
+     `load` or `error`;
+   - module ones through `import()`.
+
+   Scripts the parser or `innerHTML` made never run a second time
+   (`efc42e2`).
+4. **`style.sheet` was null and `document.styleSheets` missing.**
+   styled-components failed to start. A `<style>` element's sheet now
+   supports `insertRule` and `deleteRule`, and the cascade sees the result,
+   flushed once a turn (`c991a3e`). The same commit adds User Timing
+   (`performance.mark`, `measure`, `clear*`, the `getEntries*` family), which
+   React's profiling calls.
+5. **`console.error(error)` printed no stack**, so the failures above could
+   not be located. Otter `3ff369d70` prints the stack.
+
+Now React hydrates with no script errors.
+
+Still open:
+
+- The pictures in the client-rendered variant draw as their `alt` text,
+  although `complete` is true.
+- BBC serves different variants from one load to the next.
+- The 278 px advertising slot at the top stays empty.
+
 ## What the reference browsers do
 
 ### Chromium

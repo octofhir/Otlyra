@@ -280,10 +280,18 @@ clicks and wheel events. What is left:
 - [ ] A real `DOMParser` (a second document), persistent `localStorage`, and
   session history across documents (the back button over `pushState`
   entries).
+- [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
+  `defer`/`async` after the parse, scripts inserted by script (inline,
+  external, module) with `load`/`error`, nothing run twice; the CSSOM of
+  `<style>` elements (`insertRule`/`deleteRule` reach the cascade) and
+  `document.styleSheets`; User Timing; `visibility: hidden`.
+- [ ] Script loading follow-ups: `async=false` ordering of inserted scripts,
+  `async` scripts running as soon as they arrive rather than after the parse,
+  inline module scripts inserted by script.
 - [ ] Module follow-ups: `modulepreload` links, CORS and `crossorigin`/
   `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
-  the network, dynamically inserted module scripts, and moving the request
-  scan off the content owner (it parses each module once there today).
+  the network, and moving the request scan off the content owner (it parses
+  each module once there today).
 - [x] `MutationObserver` (see [YouTube](docs/browser-rendering-research.md#youtube)):
   child list, attributes, character data, subtree, filters, old values;
   delivered at the microtask checkpoint.
