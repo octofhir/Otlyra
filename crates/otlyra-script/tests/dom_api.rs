@@ -506,3 +506,28 @@ fn character_data_counts_in_utf16() {
 </script>");
     assert_all_ok(&lines, 10);
 }
+
+#[test]
+fn legacy_create_event_and_init_methods_build_dispatchable_events() {
+    let lines = run(r#"<div id=target></div><script>
+  const target = document.getElementById('target');
+  const plain = document.createEvent('Event');
+  plain.initEvent('foo', true, true);
+  plain.preventDefault();
+  check('initEvent sets type and flags', [plain.type, plain.bubbles, plain.cancelable, plain.defaultPrevented], ['foo', true, true, true]);
+  const custom = document.createEvent('CustomEvent');
+  custom.initCustomEvent('bar', false, false, { n: 1 });
+  let heard = null;
+  target.addEventListener('bar', (event) => { heard = event.detail.n; });
+  target.dispatchEvent(custom);
+  check('a custom event carries its detail', heard, 1);
+  const mouse = document.createEvent('MouseEvents');
+  mouse.initMouseEvent('click', true, true, window, 1, 0, 0, 7, 9, false, false, true, false, 0, null);
+  check('mouse fields', [mouse instanceof MouseEvent, mouse.clientX, mouse.clientY, mouse.shiftKey, mouse.detail], [true, 7, 9, true, 1]);
+  check('HTMLEvents is Event', document.createEvent('HTMLEvents') instanceof Event, true);
+  let refused;
+  try { document.createEvent('TouchEvent'); } catch (error) { refused = error.name; }
+  check('TouchEvent is refused', refused, 'NotSupportedError');
+</script>"#);
+    assert_all_ok(&lines, 5);
+}

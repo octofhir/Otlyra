@@ -189,3 +189,130 @@ eventInterface('PopStateEvent', Event, { state: null });
 eventInterface('PageTransitionEvent', Event, { persisted: false });
 eventInterface('AnimationEvent', Event, { animationName: '', elapsedTime: 0, pseudoElement: '' });
 eventInterface('TransitionEvent', Event, { propertyName: '', elapsedTime: 0, pseudoElement: '' });
+
+// The legacy way to make an event (DOM §4.5 `createEvent`, and the `init*`
+// methods): older libraries and polyfills still build events like this, and
+// YouTube's web components polyfill tests `initEvent` before anything else.
+const setInit = (event, values) => {
+  const record = event[kEventInit] || {};
+  Object.assign(record, values);
+  Object.defineProperty(event, kEventInit, {
+    value: record,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+};
+method(Event.prototype, 'initEvent', function initEvent(type, bubbles, cancelable) {
+  this.type = String(type);
+  this.bubbles = Boolean(bubbles);
+  this.cancelable = Boolean(cancelable);
+  this.defaultPrevented = false;
+});
+method(CustomEvent.prototype, 'initCustomEvent', function initCustomEvent(
+  type,
+  bubbles,
+  cancelable,
+  detail,
+) {
+  this.initEvent(type, bubbles, cancelable);
+  Object.defineProperty(this, 'detail', {
+    value: detail === undefined ? null : detail,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
+});
+method(UIEventInterface.prototype, 'initUIEvent', function initUIEvent(
+  type,
+  bubbles,
+  cancelable,
+  view,
+  detail,
+) {
+  this.initEvent(type, bubbles, cancelable);
+  setInit(this, { view: view === undefined ? null : view, detail: Number(detail) || 0 });
+});
+method(MouseEventInterface.prototype, 'initMouseEvent', function initMouseEvent(
+  type,
+  bubbles,
+  cancelable,
+  view,
+  detail,
+  screenX,
+  screenY,
+  clientX,
+  clientY,
+  ctrlKey,
+  altKey,
+  shiftKey,
+  metaKey,
+  button,
+  relatedTarget,
+) {
+  this.initUIEvent(type, bubbles, cancelable, view, detail);
+  setInit(this, {
+    screenX: Number(screenX) || 0,
+    screenY: Number(screenY) || 0,
+    clientX: Number(clientX) || 0,
+    clientY: Number(clientY) || 0,
+    ctrlKey: Boolean(ctrlKey),
+    altKey: Boolean(altKey),
+    shiftKey: Boolean(shiftKey),
+    metaKey: Boolean(metaKey),
+    button: Number(button) || 0,
+    relatedTarget: relatedTarget === undefined ? null : relatedTarget,
+  });
+});
+method(KeyboardEventInterface.prototype, 'initKeyboardEvent', function initKeyboardEvent(
+  type,
+  bubbles,
+  cancelable,
+  view,
+  key,
+  location,
+  ctrlKey,
+  altKey,
+  shiftKey,
+  metaKey,
+) {
+  this.initUIEvent(type, bubbles, cancelable, view, 0);
+  setInit(this, {
+    key: key === undefined ? '' : String(key),
+    location: Number(location) || 0,
+    ctrlKey: Boolean(ctrlKey),
+    altKey: Boolean(altKey),
+    shiftKey: Boolean(shiftKey),
+    metaKey: Boolean(metaKey),
+  });
+});
+
+// The names `createEvent` knows (DOM §4.5), lowercased. `TouchEvent` is
+// refused on purpose, which is how pages ask whether the screen is touched.
+const LEGACY_EVENT_INTERFACES = {
+  beforeunloadevent: 'Event',
+  compositionevent: 'CompositionEvent',
+  customevent: 'CustomEvent',
+  event: 'Event',
+  events: 'Event',
+  focusevent: 'FocusEvent',
+  hashchangeevent: 'HashChangeEvent',
+  htmlevents: 'Event',
+  keyboardevent: 'KeyboardEvent',
+  mouseevent: 'MouseEvent',
+  mouseevents: 'MouseEvent',
+  svgevents: 'Event',
+  uievent: 'UIEvent',
+  uievents: 'UIEvent',
+};
+method(Document.prototype, 'createEvent', function createEvent(name) {
+  const interfaceName = LEGACY_EVENT_INTERFACES[String(name).toLowerCase()];
+  const Interface = interfaceName && globalThis[interfaceName];
+  if (typeof Interface !== 'function') {
+    throw new DOMException(
+      "The provided event type ('" + String(name) + "') is invalid.",
+      'NotSupportedError',
+    );
+  }
+  return new Interface('');
+});
