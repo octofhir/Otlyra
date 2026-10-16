@@ -151,6 +151,258 @@ class DOMRect extends DOMRectReadOnly {}
 defineGlobal('DOMRectReadOnly', DOMRectReadOnly);
 defineGlobal('DOMRect', DOMRect);
 
+// ---------------------------------------------------------------- Matrices
+// Geometry Interfaces §4–6: DOMPoint and DOMMatrix, which pages build from
+// `getComputedStyle(element).transform` to read or compose a transform.
+// Values are kept column-major as the specification names them, m11..m44.
+class DOMPointReadOnly {
+  constructor(x = 0, y = 0, z = 0, w = 1) {
+    this.x = Number(x);
+    this.y = Number(y);
+    this.z = Number(z);
+    this.w = Number(w);
+  }
+  static fromPoint(point = {}) {
+    return new this(point.x, point.y, point.z, point.w);
+  }
+  matrixTransform(matrix) {
+    return DOMMatrixReadOnly.fromMatrix(matrix).transformPoint(this);
+  }
+  toJSON() {
+    return { x: this.x, y: this.y, z: this.z, w: this.w };
+  }
+}
+class DOMPoint extends DOMPointReadOnly {}
+defineGlobal('DOMPointReadOnly', DOMPointReadOnly);
+defineGlobal('DOMPoint', DOMPoint);
+
+const MATRIX_NAMES = [
+  'm11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24',
+  'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44',
+];
+const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+const kValues = Symbol('matrix');
+const kIs2D = Symbol('is2D');
+// The sixteen values a transform list's serialization stands for, if it is
+// one a computed `transform` serializes as.
+const parseTransform = (text) => {
+  const source = String(text).trim();
+  if (source === '' || source === 'none') return [IDENTITY.slice(), true];
+  const match = /^(matrix|matrix3d)\(([^)]*)\)$/.exec(source);
+  if (!match) throw new DOMException("'" + source + "' is not a transform matrix", 'SyntaxError');
+  const numbers = match[2].split(',').map((part) => Number(part.trim()));
+  if (numbers.some((number) => !Number.isFinite(number))) {
+    throw new DOMException("'" + source + "' is not a transform matrix", 'SyntaxError');
+  }
+  if (match[1] === 'matrix' && numbers.length === 6) {
+    const [a, b, c, d, e, f] = numbers;
+    return [[a, b, 0, 0, c, d, 0, 0, 0, 0, 1, 0, e, f, 0, 1], true];
+  }
+  if (match[1] === 'matrix3d' && numbers.length === 16) return [numbers, false];
+  throw new DOMException("'" + source + "' is not a transform matrix", 'SyntaxError');
+};
+const multiply = (left, right) => {
+  const out = new Array(16).fill(0);
+  for (let column = 0; column < 4; column++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) sum += left[k * 4 + row] * right[column * 4 + k];
+      out[column * 4 + row] = sum;
+    }
+  }
+  return out;
+};
+const invert = (m) => {
+  const inv = new Array(16);
+  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+  const determinant = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+  if (determinant === 0) return null;
+  return inv.map((value) => value / determinant);
+};
+class DOMMatrixReadOnly {
+  constructor(init) {
+    let values = IDENTITY.slice();
+    let is2D = true;
+    if (typeof init === 'string') {
+      [values, is2D] = parseTransform(init);
+    } else if (init !== undefined) {
+      const list = Array.from(init, Number);
+      if (list.length === 6) {
+        const [a, b, c, d, e, f] = list;
+        values = [a, b, 0, 0, c, d, 0, 0, 0, 0, 1, 0, e, f, 0, 1];
+      } else if (list.length === 16) {
+        values = list;
+        is2D = false;
+      } else {
+        throw new TypeError('a matrix needs 6 or 16 values');
+      }
+    }
+    this[kValues] = values;
+    this[kIs2D] = is2D;
+  }
+  static fromMatrix(other = {}) {
+    if (other instanceof DOMMatrixReadOnly) return new this(other[kValues].slice());
+    const has3D = MATRIX_NAMES.some((name) => name in other) && other.is2D === false;
+    if (has3D) return new this(MATRIX_NAMES.map((name, index) => other[name] ?? IDENTITY[index]));
+    return new this([other.a ?? other.m11 ?? 1, other.b ?? other.m12 ?? 0, other.c ?? other.m21 ?? 0,
+      other.d ?? other.m22 ?? 1, other.e ?? other.m41 ?? 0, other.f ?? other.m42 ?? 0]);
+  }
+  static fromFloat32Array(array) {
+    return new this(Array.from(array));
+  }
+  static fromFloat64Array(array) {
+    return new this(Array.from(array));
+  }
+  get is2D() {
+    return this[kIs2D];
+  }
+  get isIdentity() {
+    return this[kValues].every((value, index) => value === IDENTITY[index]);
+  }
+  get a() { return this[kValues][0]; }
+  get b() { return this[kValues][1]; }
+  get c() { return this[kValues][4]; }
+  get d() { return this[kValues][5]; }
+  get e() { return this[kValues][12]; }
+  get f() { return this[kValues][13]; }
+  multiply(other) {
+    return new DOMMatrix(this[kValues]).multiplySelf(other);
+  }
+  translate(x = 0, y = 0, z = 0) {
+    return new DOMMatrix(this[kValues]).translateSelf(x, y, z);
+  }
+  scale(x = 1, y = x, z = 1) {
+    return new DOMMatrix(this[kValues]).scaleSelf(x, y, z);
+  }
+  inverse() {
+    return new DOMMatrix(this[kValues]).invertSelf();
+  }
+  flipX() {
+    return this.multiply(new DOMMatrix([-1, 0, 0, 1, 0, 0]));
+  }
+  flipY() {
+    return this.multiply(new DOMMatrix([1, 0, 0, -1, 0, 0]));
+  }
+  transformPoint(point = {}) {
+    const m = this[kValues];
+    const x = point.x ?? 0;
+    const y = point.y ?? 0;
+    const z = point.z ?? 0;
+    const w = point.w ?? 1;
+    return new DOMPoint(
+      m[0] * x + m[4] * y + m[8] * z + m[12] * w,
+      m[1] * x + m[5] * y + m[9] * z + m[13] * w,
+      m[2] * x + m[6] * y + m[10] * z + m[14] * w,
+      m[3] * x + m[7] * y + m[11] * z + m[15] * w,
+    );
+  }
+  toFloat32Array() {
+    return new Float32Array(this[kValues]);
+  }
+  toFloat64Array() {
+    return new Float64Array(this[kValues]);
+  }
+  toString() {
+    const m = this[kValues];
+    return this.is2D
+      ? 'matrix(' + [m[0], m[1], m[4], m[5], m[12], m[13]].join(', ') + ')'
+      : 'matrix3d(' + m.join(', ') + ')';
+  }
+  toJSON() {
+    const out = { a: this.a, b: this.b, c: this.c, d: this.d, e: this.e, f: this.f, is2D: this.is2D };
+    MATRIX_NAMES.forEach((name, index) => {
+      out[name] = this[kValues][index];
+    });
+    return out;
+  }
+}
+MATRIX_NAMES.forEach((name, index) => {
+  Object.defineProperty(DOMMatrixReadOnly.prototype, name, {
+    get() {
+      return this[kValues][index];
+    },
+    enumerable: true,
+    configurable: true,
+  });
+});
+class DOMMatrix extends DOMMatrixReadOnly {
+  multiplySelf(other) {
+    const right = DOMMatrixReadOnly.fromMatrix(other);
+    this[kValues] = multiply(this[kValues], right[kValues]);
+    this[kIs2D] = this[kIs2D] && right.is2D;
+    return this;
+  }
+  preMultiplySelf(other) {
+    const left = DOMMatrixReadOnly.fromMatrix(other);
+    this[kValues] = multiply(left[kValues], this[kValues]);
+    this[kIs2D] = this[kIs2D] && left.is2D;
+    return this;
+  }
+  translateSelf(x = 0, y = 0, z = 0) {
+    this.multiplySelf(new DOMMatrix([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, Number(x), Number(y), Number(z), 1]));
+    if (Number(z) === 0) this[kIs2D] = this[kIs2D] !== false && this[kValues].every((value, index) => [2, 3, 6, 7, 8, 9, 11, 14].includes(index) ? value === 0 : true);
+    return this;
+  }
+  scaleSelf(x = 1, y = x, z = 1) {
+    this[kValues] = multiply(this[kValues], [Number(x), 0, 0, 0, 0, Number(y), 0, 0, 0, 0, Number(z), 0, 0, 0, 0, 1]);
+    if (Number(z) !== 1) this[kIs2D] = false;
+    return this;
+  }
+  invertSelf() {
+    const inverse = invert(this[kValues]);
+    this[kValues] = inverse || new Array(16).fill(NaN);
+    if (!inverse) this[kIs2D] = false;
+    return this;
+  }
+  setMatrixValue(text) {
+    [this[kValues], this[kIs2D]] = parseTransform(text);
+    return this;
+  }
+}
+MATRIX_NAMES.forEach((name, index) => {
+  Object.defineProperty(DOMMatrix.prototype, name, {
+    get() {
+      return this[kValues][index];
+    },
+    set(value) {
+      this[kValues][index] = Number(value);
+      if (![0, 1, 4, 5, 12, 13, 10, 15].includes(index) && Number(value) !== 0) this[kIs2D] = false;
+    },
+    enumerable: true,
+    configurable: true,
+  });
+});
+for (const [name, index] of [['a', 0], ['b', 1], ['c', 4], ['d', 5], ['e', 12], ['f', 13]]) {
+  Object.defineProperty(DOMMatrix.prototype, name, {
+    get() {
+      return this[kValues][index];
+    },
+    set(value) {
+      this[kValues][index] = Number(value);
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
+defineGlobal('DOMMatrixReadOnly', DOMMatrixReadOnly);
+defineGlobal('DOMMatrix', DOMMatrix);
+defineGlobal('WebKitCSSMatrix', DOMMatrix);
+
 // ---------------------------------------------------------------- Traversal
 // DOM §6: NodeFilter, TreeWalker and NodeIterator, over the tree accessors.
 const NODE_FILTER = {

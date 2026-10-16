@@ -438,3 +438,38 @@ fn the_interfaces_pages_reach_for_on_their_way_are_there() {
         ]
     );
 }
+
+#[test]
+fn a_computed_style_before_any_frame_falls_back_to_the_style_attribute() {
+    let log = run(
+        "<div id=d style='color: red; width: 10px'></div>\
+         <script>\
+           const style = getComputedStyle(document.getElementById('d'));\
+           let refused;\
+           try { getComputedStyle(document); } catch (e) { refused = e.name; }\
+           console.log(style.color, style.width, JSON.stringify(style.opacity), style instanceof CSSStyleDeclaration, refused);\
+         </script>",
+        &[],
+    );
+    assert_eq!(log, ["red 10px \"\" true TypeError"]);
+}
+
+#[test]
+fn a_matrix_reads_a_computed_transform_and_composes() {
+    let log = run(
+        "<script>\
+           const m = new DOMMatrix('matrix(2, 0, 0, 2, 10, 20)');\
+           const p = m.transformPoint({ x: 1, y: 1 });\
+           const moved = m.translate(5, 5);\
+           const back = m.inverse().multiply(m);\
+           console.log(m.a, m.e, m.is2D, p.x, p.y, moved.e, moved.f, back.isIdentity,\
+             new DOMMatrix('none').isIdentity, String(new DOMMatrixReadOnly([1, 0, 0, 1, 3, 4])),\
+             new DOMMatrix('matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,7,8,9,1)').m43);\
+         </script>",
+        &[],
+    );
+    assert_eq!(
+        log,
+        ["2 10 true 12 22 20 30 true true matrix(1, 0, 0, 1, 3, 4) 9"]
+    );
+}

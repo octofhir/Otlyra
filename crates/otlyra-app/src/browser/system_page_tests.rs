@@ -646,13 +646,15 @@ fn bookmarks_address_opens_the_native_surface_without_fetching() {
 /// and rebuilt its box tree sixty times a second for it.
 #[test]
 fn an_animation_frame_that_changes_nothing_rebuilds_nothing() {
-    struct Page;
+    // Otter's debug bootstrap is deeper than a default test thread's stack.
+    super::tests::on_content_stack(|| {
+        struct Page;
 
-    impl Loader for Page {
-        fn load(&self, url: &str) -> Result<Loaded, String> {
-            Ok(Loaded {
-                content_type: Some("text/html".to_owned()),
-                bytes: br#"<title>Reading</title><p id=p>hello</p><script>
+        impl Loader for Page {
+            fn load(&self, url: &str) -> Result<Loaded, String> {
+                Ok(Loaded {
+                    content_type: Some("text/html".to_owned()),
+                    bytes: br#"<title>Reading</title><p id=p>hello</p><script>
                         let seen = 0;
                         function tick() {
                           // Reads, and only reads.
@@ -661,46 +663,47 @@ fn an_animation_frame_that_changes_nothing_rebuilds_nothing() {
                         }
                         requestAnimationFrame(tick);
                     </script>"#
-                    .to_vec(),
-                charset: Some("utf-8".to_owned()),
-                final_url: url.to_owned(),
-                ..Default::default()
-            })
+                        .to_vec(),
+                    charset: Some("utf-8".to_owned()),
+                    final_url: url.to_owned(),
+                    ..Default::default()
+                })
+            }
         }
-    }
 
-    let viewport = Viewport::new(800, 600, 1.0);
-    let mut browser = Browser::new(Page);
-    browser.navigate("https://example.test/raf");
-    browser.wait_for_load(std::time::Duration::from_secs(5));
-    browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
-
-    let builds = browser
-        .page(browser.active)
-        .expect("the page is loaded")
-        .builds();
-    assert!(
-        browser.next_frame() == FrameRequest::Vsync,
-        "a page with a frame callback outstanding asks for the next frame"
-    );
-
-    for _ in 0..10 {
+        let viewport = Viewport::new(800, 600, 1.0);
+        let mut browser = Browser::new(Page);
+        browser.navigate("https://example.test/raf");
+        browser.wait_for_load(std::time::Duration::from_secs(5));
         browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
-    }
 
-    let page = browser
-        .page(browser.active)
-        .expect("the page is still loaded");
-    assert_eq!(
-        page.builds(),
-        builds,
-        "ten frames of a read-only animation loop rebuilt the page's display list"
-    );
-    assert_eq!(
-        browser.next_frame(),
-        FrameRequest::Vsync,
-        "and the loop is still running, so the frames must keep coming"
-    );
+        let builds = browser
+            .page(browser.active)
+            .expect("the page is loaded")
+            .builds();
+        assert!(
+            browser.next_frame() == FrameRequest::Vsync,
+            "a page with a frame callback outstanding asks for the next frame"
+        );
+
+        for _ in 0..10 {
+            browser.paint(&mut otlyra_gfx::RecordingPainter::new(), viewport);
+        }
+
+        let page = browser
+            .page(browser.active)
+            .expect("the page is still loaded");
+        assert_eq!(
+            page.builds(),
+            builds,
+            "ten frames of a read-only animation loop rebuilt the page's display list"
+        );
+        assert_eq!(
+            browser.next_frame(),
+            FrameRequest::Vsync,
+            "and the loop is still running, so the frames must keep coming"
+        );
+    });
 }
 
 /// ⌘D keeps the page, and ⌘D again stops keeping it. One command both ways,

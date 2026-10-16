@@ -557,6 +557,19 @@ pub(crate) fn with_document_mut<R>(
     })
 }
 
+/// Change the lent document's bookkeeping without marking it changed: what a
+/// read that has to style the tree first does, which leaves the tree as it
+/// was.
+pub(crate) fn with_document_unmarked<R>(
+    owner: DocumentId,
+    change: impl FnOnce(&mut Document) -> R,
+) -> Result<R, JsError> {
+    LOANED.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(document) if document.id() == owner => Ok(change(document)),
+        _ => Err(detached()),
+    })
+}
+
 /// Which document is lent to this isolate right now, if any.
 pub(crate) fn lent_document() -> Option<DocumentId> {
     LOANED.with(|slot| slot.borrow().as_ref().map(Document::id))

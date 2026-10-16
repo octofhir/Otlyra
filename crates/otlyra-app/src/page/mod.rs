@@ -160,6 +160,13 @@ pub struct PageScene {
     builds: u64,
     /// The build and scroll the geometry script last read was taken at.
     geometry_key: Option<(u64, u32)>,
+    /// How many stylings this page has had, and which of them script was
+    /// last handed: what `getComputedStyle` reads is given again only when
+    /// the styles changed.
+    style_epoch: u64,
+    styles_lent: Option<u64>,
+    /// The document's mutation count when it was last styled.
+    styled_at: u64,
     /// Pictures detached elements asked for, by element and address, for the
     /// world to fetch.
     detached_pictures: Vec<(NodeId, String)>,
@@ -402,6 +409,9 @@ impl PageScene {
             painted: None,
             builds: 0,
             geometry_key: None,
+            style_epoch: 0,
+            styles_lent: None,
+            styled_at: 0,
             detached_pictures: Vec::new(),
             interaction: otlyra_css::state::Interaction::none(),
             caret: 0,
@@ -477,6 +487,7 @@ impl PageScene {
         self.document
             .set_scroll_position((0.0, f64::from(self.scroll)));
         self.lend_geometry();
+        self.lend_computed_styles();
         run(&mut self.document)
     }
 
@@ -515,6 +526,28 @@ impl PageScene {
     /// rendering step has to run again for when it changes.
     pub fn geometry_epoch(&self) -> (u64, u32) {
         (self.builds, self.scroll.to_bits())
+    }
+
+    /// Give script the computed styles of the last styling, once per styling:
+    /// what `getComputedStyle` reads. Shared with the styling rather than
+    /// copied, and only taken when there is a new one.
+    fn lend_computed_styles(&mut self) {
+        if self.styles_lent == Some(self.style_epoch) {
+            return;
+        }
+        let Some(styled) = self.styled_document.as_ref() else {
+            return;
+        };
+        self.styles_lent = Some(self.style_epoch);
+        self.document
+            .set_computed_styles(self.styled_at, std::sync::Arc::new(styled.snapshot()));
+    }
+
+    /// Note that the page was styled again, so script is handed the new
+    /// styles on its next turn.
+    pub(crate) fn restyled(&mut self) {
+        self.style_epoch += 1;
+        self.styled_at = self.document.mutations();
     }
 
     /// Give script the boxes the last frame drew, in client coordinates, once
@@ -660,6 +693,7 @@ impl PageScene {
                 .expect("a styler was just made if there was none")
                 .style_with(&self.document, self.document.form(), self.interaction);
             self.styled_document = Some(styles);
+            self.restyled();
         }
         let styles = self
             .styled_document

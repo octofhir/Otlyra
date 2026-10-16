@@ -197,3 +197,84 @@ for (const Interface of [HTMLElement, SVGElement, MathMLElement]) {
     },
   );
 }
+
+// `getComputedStyle` (CSSOM §9): a live, read-only declaration whose values
+// are the element's resolved values on the last frame the browser styled.
+// Like geometry, a change script made in this turn shows on the next frame,
+// not on this read.
+//
+// What the style system cannot say, layout does: `width` and `height` of an
+// element that was drawn are its used size (CSSOM §9's resolved value for
+// them), from the box the last frame drew. An element that was not styled
+// then — detached, or met before the page's first frame — answers from its
+// own `style` attribute, and with the empty string beyond that.
+const sideNames = { width: ['left', 'right'], height: ['top', 'bottom'] };
+const pixels = (value) => {
+  const number = parseFloat(value);
+  return Number.isFinite(number) ? number : 0;
+};
+class ComputedStyleDeclaration extends CSSStyleDeclaration {
+  #element;
+
+  constructor(element) {
+    super(element);
+    this.#element = element;
+  }
+
+  #computed(property) {
+    return this.#element.__otlyraComputedStyle(property);
+  }
+
+  get cssText() {
+    return '';
+  }
+
+  set cssText(_) {
+    throw new DOMException('a computed style cannot be changed', 'NoModificationAllowedError');
+  }
+
+  get length() {
+    return STYLE_PROPERTIES.length;
+  }
+
+  item(index) {
+    const property = STYLE_PROPERTIES[index];
+    return property === undefined ? '' : hyphenate(property);
+  }
+
+  getPropertyValue(name) {
+    const property = propertyName(name);
+    const value = this.#computed(property);
+    const sides = sideNames[property];
+    if (sides && value !== null && this.#computed('display') !== 'none') {
+      const rect = this.#element.__otlyraClientRect();
+      if (rect) {
+        let size = property === 'width' ? rect[2] - rect[0] : rect[3] - rect[1];
+        if (this.#computed('box-sizing') !== 'border-box') {
+          for (const side of sides) {
+            size -= pixels(this.#computed('padding-' + side));
+            size -= pixels(this.#computed('border-' + side + '-width'));
+          }
+        }
+        return Math.max(0, size) + 'px';
+      }
+    }
+    if (value !== null && value !== undefined) return value;
+    return super.getPropertyValue(property);
+  }
+
+  setProperty() {
+    throw new DOMException('a computed style cannot be changed', 'NoModificationAllowedError');
+  }
+
+  removeProperty() {
+    throw new DOMException('a computed style cannot be changed', 'NoModificationAllowedError');
+  }
+}
+
+defineGlobal('getComputedStyle', function getComputedStyle(element, pseudoElement) {
+  if (!(element instanceof Element)) {
+    throw new TypeError("getComputedStyle's argument is not an element");
+  }
+  return new ComputedStyleDeclaration(element);
+});

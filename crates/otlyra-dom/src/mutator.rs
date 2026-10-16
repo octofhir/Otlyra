@@ -18,6 +18,7 @@ pub struct DocumentMutator<'a> {
 impl<'a> DocumentMutator<'a> {
     /// Borrow `document` for mutation.
     pub fn new(document: &'a mut Document) -> Self {
+        document.note_mutation();
         Self { document }
     }
 

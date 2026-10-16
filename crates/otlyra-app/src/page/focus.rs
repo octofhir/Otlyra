@@ -239,6 +239,8 @@ impl PageScene {
         else {
             return false;
         };
+        self.style_epoch += 1;
+        self.styled_at = self.document.mutations();
 
         let mut swaps = Vec::new();
         for (node, old) in previous {

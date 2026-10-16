@@ -54,7 +54,126 @@ pub struct StyledDocument {
     devolved: std::collections::HashSet<NodeId>,
 }
 
+/// The computed styles of one styling of a document, kept for script after
+/// the frame that used them: what `getComputedStyle` reads.
+///
+/// Values are shared with the styling they came from, so taking one is a
+/// table of reference counts and no style is copied.
+#[allow(missing_debug_implementations)]
+pub struct StyleSnapshot {
+    styles: HashMap<NodeId, Arc<ComputedValues>>,
+}
+
+impl otlyra_dom::ComputedStyles for StyleSnapshot {
+    fn value(&self, node: NodeId, property: &str) -> Option<String> {
+        computed_value(self.styles.get(&node)?, property)
+    }
+}
+
+/// `property`'s computed value in `style`, serialized the way CSSOM's
+/// `getPropertyValue` serializes a resolved value (CSSOM §9).
+///
+/// A shorthand is its longhands: one value when they agree, the side values
+/// in order for a shorthand of up to four, and the empty string beyond that,
+/// which is what a browser answers for a shorthand it cannot put together.
+/// `None` for a name that is no property.
+pub fn computed_value(style: &ComputedValues, property: &str) -> Option<String> {
+    use style::properties::{PropertyDeclarationId, PropertyId};
+    let id = PropertyId::parse_enabled_for_all_content(property).ok()?;
+    match id.as_shorthand() {
+        Err(declaration) => Some(style.computed_value_to_string(declaration)),
+        Ok(shorthand) => {
+            let values: Vec<String> = shorthand
+                .longhands()
+                .map(|longhand| {
+                    style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand))
+                })
+                .collect();
+            Some(match values.as_slice() {
+                [] => String::new(),
+                [first, rest @ ..] if rest.iter().all(|value| value == first) => first.clone(),
+                sides if sides.len() <= 4 => sides.join(" "),
+                _ => String::new(),
+            })
+        }
+    }
+}
+
+/// Styles a document for script when it reads a style after changing the
+/// tree, with the sheets the page has so far: what makes `getComputedStyle`
+/// synchronous, as it is in a browser.
+///
+/// The sheets are shared with whoever fetches them, so a page still loading
+/// is styled with every sheet that has arrived, which is what a script after
+/// a `<link>` sees in a browser. The parsed sheets are kept until a sheet
+/// comes or goes, and the document is styled again on every call, which the
+/// caller makes only for a tree that changed since the last styling.
+#[allow(missing_debug_implementations)]
+pub struct ScriptStyler {
+    sources: std::rc::Rc<std::cell::RefCell<StyleSources>>,
+    viewport: std::cell::Cell<Viewport>,
+    /// The sheets as last parsed, and what they were parsed from.
+    parsed: std::cell::RefCell<Option<(SheetsKey, Styler)>>,
+}
+
+/// What a parse of a document's sheets depends on: their number, their
+/// size, and where they resolve against.
+type SheetsKey = (usize, usize, Url);
+
+impl ScriptStyler {
+    /// A styler over `sources`, for a window of `viewport`.
+    pub fn new(sources: std::rc::Rc<std::cell::RefCell<StyleSources>>, viewport: Viewport) -> Self {
+        Self {
+            sources,
+            viewport: std::cell::Cell::new(viewport),
+            parsed: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The window changed.
+    pub fn set_viewport(&self, viewport: Viewport) {
+        self.viewport.set(viewport);
+    }
+}
+
+impl otlyra_dom::StyleResolver for ScriptStyler {
+    fn resolve(
+        &self,
+        document: &Document,
+    ) -> Option<std::sync::Arc<dyn otlyra_dom::ComputedStyles>> {
+        let sources = self.sources.try_borrow().ok()?;
+        let sheets = author_stylesheets(document, &sources);
+        let key = (
+            sheets.len(),
+            sheets.iter().map(|sheet| sheet.text.len()).sum(),
+            sources.base.clone(),
+        );
+        let mut parsed = self.parsed.try_borrow_mut().ok()?;
+        let viewport = self.viewport.get();
+        match parsed.as_mut() {
+            Some((built_from, styler)) if *built_from == key => {
+                styler.resize(viewport);
+            }
+            _ => *parsed = Some((key, Styler::new(document, viewport, &sources))),
+        }
+        let styler = &mut parsed.as_mut()?.1;
+        let styled = styler.style_with(
+            document,
+            document.form(),
+            crate::state::Interaction::default(),
+        );
+        Some(std::sync::Arc::new(styled.snapshot()))
+    }
+}
+
 impl StyledDocument {
+    /// What script reads of this styling, once this frame is drawn.
+    pub fn snapshot(&self) -> StyleSnapshot {
+        StyleSnapshot {
+            styles: self.styles.clone(),
+        }
+    }
+
     /// The computed style of one element, if it has one.
     pub fn style_of(&self, node: NodeId) -> Option<&Arc<ComputedValues>> {
         self.styles.get(&node)

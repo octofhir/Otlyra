@@ -4173,7 +4173,7 @@ fn cancelled_input_withholds_the_controls_own_behaviour() {
 /// Run `run` on a thread with the native content owner's stack. Otter's debug
 /// bootstrap is deep enough that a page's isolate cannot start on the default
 /// test thread, and a page without one cancels nothing.
-fn on_content_stack(run: impl FnOnce() + Send + 'static) {
+pub(super) fn on_content_stack(run: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .name("content-stack-test".into())
         .stack_size(8 * 1024 * 1024)
@@ -4592,6 +4592,34 @@ fn script_measures_the_boxes_the_page_drew() {
     });
 }
 
+/// `getComputedStyle` reads what the cascade resolved on the last frame, and
+/// the used size of a box the frame drew.
+#[test]
+fn script_reads_the_computed_style_of_the_last_frame() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<style>#box { color: rgb(10, 20, 30); opacity: .5; padding: 5px; margin: 1px 2px 3px 4px; }\
+               .hidden { display: none }</style>\
+             <body style=margin:0><button id=measure style='display:block;width:100px;height:30px'>m</button>\
+             <div id=box style='width:200px;height:50%;--accent: red'>box</div><p class=hidden id=gone>x</p>\
+             <script>\
+               document.getElementById('measure').addEventListener('click', () => {\
+                 const style = getComputedStyle(document.getElementById('box'));\
+                 document.documentElement.dataset.log = [style.color, style.opacity, style.display,\
+                   style.width, style.paddingLeft, style.getPropertyValue('margin'),\
+                   style.getPropertyValue('--accent').trim(), getComputedStyle(document.getElementById('gone')).display,\
+                   (() => { try { style.color = 'red'; return 'wrote'; } catch (e) { return e.name; } })()].join('|');\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "measure");
+        assert_eq!(
+            page_log(&browser),
+            "rgb(10, 20, 30)|0.5|block|200px|5px|1px 2px 3px 4px|red|none|NoModificationAllowedError"
+        );
+    });
+}
+
 /// An intersection observer hears what is on screen at first, and again when
 /// scrolling changes it, without the page asking for frames.
 #[test]
@@ -4923,6 +4951,42 @@ fn document_cookie_reads_and_writes_the_browsers_jar() {
             header.as_deref(),
             Some("session=server; seen=1; written=yes")
         );
+    });
+}
+
+/// `getComputedStyle` styles the tree as script left it, with the sheets
+/// that have arrived: a script after a `<link>` reads that sheet's custom
+/// property, and a class it changes shows in the very next read.
+#[test]
+fn computed_style_follows_the_tree_and_the_sheets_script_has() {
+    on_content_stack(|| {
+        let (mut browser, _) = table_browser(
+            &[
+                (
+                    "https://styled.example/",
+                    "text/html",
+                    b"<link rel=stylesheet href=s.css><div id=d class=a>x</div>\
+                      <script src=late.js></script>",
+                ),
+                (
+                    "https://styled.example/s.css",
+                    "text/css",
+                    b":root { --size: 17px } .a { color: rgb(1, 2, 3) } .b { color: rgb(4, 5, 6) }",
+                ),
+                (
+                    "https://styled.example/late.js",
+                    "text/javascript",
+                    b"const d = document.getElementById('d');\
+                      const size = getComputedStyle(document.documentElement).getPropertyValue('--size').trim();\
+                      const before = getComputedStyle(d).color;\
+                      d.className = 'b';\
+                      document.documentElement.setAttribute('data-log', [size, before, getComputedStyle(d).color].join('|'));",
+                ),
+            ],
+            None,
+        );
+        go(&mut browser, "https://styled.example/");
+        assert_eq!(page_log(&browser), "17px|rgb(1, 2, 3)|rgb(4, 5, 6)");
     });
 }
 

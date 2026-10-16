@@ -194,6 +194,18 @@ impl ElementRef {
         })
     }
 
+    /// `property`'s computed value, serialized, from the tree as script left
+    /// it — styled again first if it changed since the last styling — or null
+    /// when the element has no style: what `getComputedStyle` reads before it
+    /// fills in what the cascade cannot say.
+    #[method(name = "__otlyraComputedStyle")]
+    fn js_computed_style(&self, property: String) -> Result<Option<String>, JsError> {
+        let id = self.node.id;
+        super::with_document_unmarked(self.node.doc, |document| {
+            document.computed_value(id, &property)
+        })
+    }
+
     /// A detached `<img>` was given a `src`: ask the browser for its picture.
     #[method(name = "__otlyraRequestImage")]
     fn js_request_image(&self) {

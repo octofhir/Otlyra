@@ -28,6 +28,40 @@ impl DocumentId {
     }
 }
 
+/// The computed styles of one styling of a document, as script reads them.
+///
+/// A trait so this crate keeps no style engine: the cascade lives above it,
+/// and hands down an answer, the way the geometry of the last frame is
+/// handed down.
+pub trait ComputedStyles: Send + Sync {
+    /// `property`'s computed value on `node`, serialized, if `node` was
+    /// styled and `property` names one.
+    fn value(&self, node: NodeId, property: &str) -> Option<String>;
+}
+
+impl std::fmt::Debug for dyn ComputedStyles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ComputedStyles")
+    }
+}
+
+/// Styles a document as it stands, for script that asks after changing it.
+///
+/// A browser answers `getComputedStyle` from the tree as script left it, not
+/// from the last frame, and styles synchronously to do it. The cascade lives
+/// above this crate, so it is handed down as this: whoever lends the document
+/// to script says how to style it with the sheets it has.
+pub trait StyleResolver {
+    /// The computed styles of `document` as it is now, if it can be styled.
+    fn resolve(&self, document: &Document) -> Option<std::sync::Arc<dyn ComputedStyles>>;
+}
+
+impl std::fmt::Debug for dyn StyleResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StyleResolver")
+    }
+}
+
 /// A parsed document: one arena of nodes, plus the handful of facts that belong to
 /// the document rather than to any node in it.
 ///
@@ -57,6 +91,14 @@ pub struct Document {
     /// Each laid-out element's border box on the last frame, `[left, top,
     /// right, bottom]` in client coordinates, as script measures it.
     geometry: std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>,
+    /// How many times the tree has been changed: what tells a styling of it
+    /// from one of an older tree.
+    mutations: u64,
+    /// The computed styles script reads, and the mutation count of the tree
+    /// they were computed from.
+    computed: Option<(u64, std::sync::Arc<dyn ComputedStyles>)>,
+    /// How to style the tree again when script reads a style after changing it.
+    style_resolver: Option<std::rc::Rc<dyn StyleResolver>>,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -92,6 +134,9 @@ impl Document {
             focused: None,
             scroll: (0.0, 0.0),
             geometry: std::sync::Arc::default(),
+            mutations: 0,
+            computed: None,
+            style_resolver: None,
         }
     }
 
@@ -280,6 +325,49 @@ impl Document {
             .fold((0.0, 0.0), |(right, bottom), rect| {
                 (right.max(rect[2]), bottom.max(rect[3]))
             })
+    }
+
+    /// How many times the tree has been changed so far.
+    pub fn mutations(&self) -> u64 {
+        self.mutations
+    }
+
+    /// Note one change to the tree. Every [`crate::DocumentMutator`] is one.
+    pub(crate) fn note_mutation(&mut self) {
+        self.mutations += 1;
+    }
+
+    /// Hand over computed styles of the tree as it was at mutation count
+    /// `at`: the last frame's, which script reads while the tree has not
+    /// changed since.
+    pub fn set_computed_styles(&mut self, at: u64, styles: std::sync::Arc<dyn ComputedStyles>) {
+        self.computed = Some((at, styles));
+    }
+
+    /// Say how to style the tree again for script, or that it cannot be.
+    pub fn set_style_resolver(&mut self, resolver: Option<std::rc::Rc<dyn StyleResolver>>) {
+        self.style_resolver = resolver;
+    }
+
+    /// `property`'s computed value on `node`, serialized as CSSOM serializes
+    /// it: what `getComputedStyle` reads.
+    ///
+    /// From the tree as it is: when it has changed since the styles were
+    /// computed, it is styled again first, through the resolver, as a browser
+    /// does when script asks. Without one, the last styles answer. `None` for
+    /// an element that was not styled, or a property that is not one.
+    pub fn computed_value(&mut self, node: NodeId, property: &str) -> Option<String> {
+        let current = self
+            .computed
+            .as_ref()
+            .is_some_and(|(at, _)| *at == self.mutations);
+        if !current
+            && let Some(resolver) = self.style_resolver.clone()
+            && let Some(styles) = resolver.resolve(self)
+        {
+            self.computed = Some((self.mutations, styles));
+        }
+        self.computed.as_ref()?.1.value(node, property)
     }
 
     /// Hand over the last frame's element boxes.

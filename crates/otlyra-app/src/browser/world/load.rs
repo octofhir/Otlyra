@@ -41,7 +41,7 @@ pub(super) struct PendingLoad {
     restore_scroll: f32,
     /// The base the page's style resolves against, and the stylesheets fetched
     /// for it so far.
-    sources: StyleSources,
+    sources: std::rc::Rc<std::cell::RefCell<StyleSources>>,
     /// Every sheet an `@import` has asked for, by address: a sheet imported
     /// twice, or by a sheet it imports itself, is fetched once.
     imports_asked: HashSet<Url>,
@@ -295,7 +295,7 @@ impl PageWorld {
             previous_url,
             record,
             restore_scroll,
-            sources: StyleSources::default(),
+            sources: std::rc::Rc::new(std::cell::RefCell::new(StyleSources::default())),
             imports_asked: HashSet::new(),
             sheets_asked: 0,
             links_asked: HashSet::new(),
@@ -320,6 +320,20 @@ impl PageWorld {
     /// The same, to change.
     pub(super) fn pending_mut(&mut self, tab: TabId) -> Option<&mut PendingLoad> {
         self.slots.get_mut(&tab)?.pending.as_mut()
+    }
+
+    /// The CSS viewport `tab`'s script sees: the window, at the tab's zoom.
+    fn script_viewport(&self, tab: TabId) -> otlyra_css::cascade::Viewport {
+        let mut viewport = self.environment.viewport;
+        let zoom = self
+            .slots
+            .get(&tab)
+            .and_then(|slot| slot.viewport_zoom)
+            .unwrap_or(1.0);
+        viewport.width /= zoom;
+        viewport.height /= zoom;
+        viewport.scale *= zoom;
+        viewport
     }
 
     /// The page itself arrived.
@@ -527,6 +541,17 @@ impl PageWorld {
         // parser can be blocked; both of those finish here.
         let mut page_scripts: Option<Box<dyn otlyra_html::ScriptRunner>> = None;
         let mut parsed = parsed;
+        // `getComputedStyle` after a change styles the tree there and then,
+        // with the sheets this load has fetched so far — the ones a script
+        // after a `<link>` sees in a browser.
+        if let Some(pending) = self.pending(tab) {
+            parsed.set_style_resolver(Some(std::rc::Rc::new(
+                otlyra_css::cascade::ScriptStyler::new(
+                    std::rc::Rc::clone(&pending.sources),
+                    self.script_viewport(tab),
+                ),
+            )));
+        }
         let blocked = match parser.as_mut() {
             Some(parser) => parser.blocked_on().is_some(),
             None => false,
@@ -683,7 +708,7 @@ impl PageWorld {
         // already on screen; this is what carries on tokenizing into it when
         // the script it is waiting for arrives.
         pending.parse = parser;
-        pending.sources.base = base;
+        pending.sources.borrow_mut().base = base;
         pending.sheets_asked = links.len().min(STYLESHEET_LIMIT);
         pending.links_asked = links
             .iter()
@@ -825,6 +850,15 @@ impl PageWorld {
         let mut pictures = Vec::new();
         // Module sources, for the page's runner.
         let mut modules = Vec::new();
+        // A sheet settled, which a script may have been waiting for.
+        if wanted.iter().any(|resource| {
+            matches!(
+                resource,
+                PendingResource::Stylesheet(_) | PendingResource::Import(_)
+            )
+        }) {
+            resumed = true;
+        }
 
         match fetched.result {
             Ok(mut loaded) => {
@@ -851,13 +885,17 @@ impl PageWorld {
                         PendingResource::Stylesheet(node) => {
                             if let Some(sheet) = fetched_sheet(&loaded, &fetched.url) {
                                 imports.extend(Import::all_in(&sheet, 0, node));
-                                pending.sources.links.insert(node, sheet);
+                                pending.sources.borrow_mut().links.insert(node, sheet);
                             }
                         }
                         PendingResource::Import(import) => {
                             if let Some(sheet) = fetched_sheet(&loaded, &fetched.url) {
                                 imports.extend(Import::all_in(&sheet, import.depth, import.owner));
-                                pending.sources.imports.insert(import.url, sheet);
+                                pending
+                                    .sources
+                                    .borrow_mut()
+                                    .imports
+                                    .insert(import.url, sheet);
                             }
                         }
                         PendingResource::Script(node) => {
@@ -951,6 +989,19 @@ impl PageWorld {
             let Some(blocked) = parser.blocked_on() else {
                 return;
             };
+            // A style sheet still loading blocks scripts (HTML §4.2.4 "has a
+            // style sheet that is blocking scripts"): a script runs against
+            // the style the sheets before it give, which it reads through
+            // `getComputedStyle`. The sheet that settles resumes the parse.
+            let sheets_loading = pending.outstanding.values().flatten().any(|resource| {
+                matches!(
+                    resource,
+                    PendingResource::Stylesheet(_) | PendingResource::Import(_)
+                )
+            });
+            if sheets_loading {
+                return;
+            }
             // The bytes, or the knowledge that they will not come: a fetch that
             // failed must not stop the page for ever.
             let source = pending.scripts.get(&blocked).cloned();
@@ -1222,7 +1273,11 @@ impl PageWorld {
                 PageScene::with_resources(
                     document,
                     url,
-                    pending.sources,
+                    // The script styler keeps its share, so the page takes a
+                    // copy only when one is still held.
+                    std::rc::Rc::try_unwrap(pending.sources)
+                        .map(std::cell::RefCell::into_inner)
+                        .unwrap_or_else(|shared| shared.borrow().clone()),
                     pending.images,
                     pending.picture_sources,
                 ),
