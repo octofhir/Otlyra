@@ -132,6 +132,15 @@ pub struct Document {
     pub(crate) customized: std::collections::HashSet<NodeId>,
     /// Who observes changes to which nodes, and the records waiting for them.
     pub(crate) observers: crate::observe::MutationObservers,
+    /// What script made of a `<style>` element's sheet through the CSSOM
+    /// (`insertRule`, `deleteRule`), as text, by the element: the sheet the
+    /// cascade reads in place of the element's own text, until that text
+    /// changes and the sheet is made from it again (CSSOM §6.1).
+    pub(crate) cssom: std::collections::HashMap<NodeId, String>,
+    /// The `<script>` elements that are past being prepared (HTML §4.12.1.1
+    /// "already started"): the parser's, the ones markup made, and the ones
+    /// script has run. Inserting one again does not run it again.
+    pub(crate) started_scripts: std::collections::HashSet<NodeId>,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -175,6 +184,8 @@ impl Document {
             shadow: crate::shadow::ShadowTrees::default(),
             customized: std::collections::HashSet::new(),
             observers: crate::observe::MutationObservers::default(),
+            cssom: std::collections::HashMap::new(),
+            started_scripts: std::collections::HashSet::new(),
         }
     }
 
@@ -318,6 +329,18 @@ impl Document {
         element.name.ns != html5ever::ns!(html)
             || !is_valid_custom_element_name(&element.name.local)
             || self.customized.contains(&id)
+    }
+
+    /// Whether a `<script>` element is already started: it will not run on
+    /// being inserted.
+    pub fn script_started(&self, script: NodeId) -> bool {
+        self.started_scripts.contains(&script)
+    }
+
+    /// The text of the sheet script built for a `<style>` element through
+    /// the CSSOM, when it built one.
+    pub fn cssom_text(&self, style: NodeId) -> Option<&str> {
+        self.cssom.get(&style).map(String::as_str)
     }
 
     /// Whether `id` has no children that count as content — no elements, and no

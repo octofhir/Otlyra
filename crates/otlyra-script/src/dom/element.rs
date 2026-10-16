@@ -121,6 +121,39 @@ impl ElementRef {
         Ok(self.get("class")?.unwrap_or_default())
     }
 
+    /// Whether this `<script>` element is already started, and mark it so
+    /// when `mark` is set. Not part of the platform: the glue that runs the
+    /// scripts script inserts asks it.
+    #[method(name = "__scriptStarted")]
+    fn js_script_started(&self, mark: bool) -> Result<bool, JsError> {
+        let id = self.node.id;
+        super::with_document_unmarked(self.node.doc, |document| {
+            let started = document.script_started(id);
+            if mark && !started {
+                otlyra_dom::DocumentMutator::new(document).mark_script_started(id);
+            }
+            started
+        })
+    }
+
+    /// Make this `<script>` element `document.currentScript`. Not part of the
+    /// platform.
+    #[method(name = "__becomeCurrentScript")]
+    fn js_become_current_script(&self) {
+        super::set_current_script(Some(self.node.id));
+    }
+
+    /// Hand the cascade what script made of this `<style>` element's sheet,
+    /// as text. Not part of the platform: the CSSOM glue calls it once a
+    /// turn after `insertRule` or `deleteRule`.
+    #[method(name = "__setCssomText")]
+    fn js_set_cssom_text(&self, text: String) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            otlyra_dom::DocumentMutator::new(document).set_cssom_text(id, text);
+        })
+    }
+
     /// Record that a custom element definition has run on this element, so
     /// that it matches `:defined`. Not part of the platform: the custom
     /// element glue calls it once the element's constructor has succeeded.

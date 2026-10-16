@@ -272,12 +272,88 @@ if (typeof navigator === 'object' && navigator) {
 }
 
 if (typeof performance === 'object' && performance) {
-  define(performance, 'getEntriesByType', () => []);
-  define(performance, 'getEntriesByName', () => []);
-  define(performance, 'getEntries', () => []);
-  define(performance, 'mark', () => undefined);
-  define(performance, 'measure', () => undefined);
-  define(performance, 'timing', {});
+  // User Timing (W3C User Timing 3): marks and measures a page records and
+  // reads back. No resource or navigation entries are recorded.
+  const timingEntries = [];
+  class PerformanceEntry {
+    constructor(name, entryType, startTime, duration, detail) {
+      this.name = name;
+      this.entryType = entryType;
+      this.startTime = startTime;
+      this.duration = duration;
+      this.detail = detail === undefined ? null : detail;
+    }
+    toJSON() {
+      return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+    }
+  }
+  class PerformanceMark extends PerformanceEntry {}
+  class PerformanceMeasure extends PerformanceEntry {}
+  defineGlobal('PerformanceEntry', PerformanceEntry);
+  defineGlobal('PerformanceMark', PerformanceMark);
+  defineGlobal('PerformanceMeasure', PerformanceMeasure);
+  // The names of `PerformanceTiming`'s attributes stand for those moments
+  // (User Timing 3 §4.3, "convert a mark to a timestamp"). Each is taken as
+  // the start of the navigation: nothing finer is recorded.
+  const TIMING_NAMES = [
+    'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+    'loadEventStart', 'loadEventEnd',
+  ];
+  const markTime = (name) => {
+    if (name === undefined) return undefined;
+    if (typeof name === 'number') return name;
+    if (TIMING_NAMES.includes(String(name))) return 0;
+    for (let index = timingEntries.length - 1; index >= 0; index--) {
+      const entry = timingEntries[index];
+      if (entry.entryType === 'mark' && entry.name === String(name)) return entry.startTime;
+    }
+    throw new DOMException("The mark '" + name + "' does not exist.", 'SyntaxError');
+  };
+  const clearEntries = (type, name) => {
+    for (let index = timingEntries.length - 1; index >= 0; index--) {
+      const entry = timingEntries[index];
+      if (entry.entryType === type && (name === undefined || entry.name === String(name))) {
+        timingEntries.splice(index, 1);
+      }
+    }
+  };
+  define(performance, 'mark', function mark(name, options = {}) {
+    const startTime = options && options.startTime !== undefined ? Number(options.startTime) : performance.now();
+    const entry = new PerformanceMark(String(name), 'mark', startTime, 0, options && options.detail);
+    timingEntries.push(entry);
+    return entry;
+  });
+  define(performance, 'measure', function measure(name, start, end) {
+    let startTime = 0;
+    let endTime = performance.now();
+    let detail = null;
+    if (start && typeof start === 'object') {
+      if (start.start !== undefined) startTime = markTime(start.start);
+      if (start.end !== undefined) endTime = markTime(start.end);
+      if (start.duration !== undefined) endTime = startTime + Number(start.duration);
+      detail = start.detail;
+    } else {
+      if (start !== undefined) startTime = markTime(start);
+      if (end !== undefined) endTime = markTime(end);
+    }
+    const entry = new PerformanceMeasure(String(name), 'measure', startTime, endTime - startTime, detail);
+    timingEntries.push(entry);
+    return entry;
+  });
+  define(performance, 'clearMarks', (name) => clearEntries('mark', name));
+  define(performance, 'clearMeasures', (name) => clearEntries('measure', name));
+  define(performance, 'clearResourceTimings', () => undefined);
+  define(performance, 'setResourceTimingBufferSize', () => undefined);
+  define(performance, 'getEntries', () => timingEntries.slice());
+  define(performance, 'getEntriesByType', (type) => timingEntries.filter((entry) => entry.entryType === String(type)));
+  define(performance, 'getEntriesByName', (name, type) =>
+    timingEntries.filter((entry) => entry.name === String(name) && (type === undefined || entry.entryType === String(type))),
+  );
+  const origin = typeof performance.timeOrigin === 'number' ? performance.timeOrigin : Date.now() - performance.now();
+  define(performance, 'timing', Object.fromEntries(TIMING_NAMES.map((name) => [name, Math.round(origin)])));
   define(performance, 'navigation', { type: 0, redirectCount: 0 });
 }
 

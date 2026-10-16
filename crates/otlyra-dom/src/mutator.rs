@@ -59,6 +59,25 @@ impl<'a> DocumentMutator<'a> {
         self.document.customized.insert(element);
     }
 
+    /// Mark a `<script>` element already started: it does not run when it is
+    /// inserted, now or again.
+    pub fn mark_script_started(&mut self, script: NodeId) {
+        self.document.started_scripts.insert(script);
+    }
+
+    /// Say what script made of a `<style>` element's sheet, as text.
+    pub fn set_cssom_text(&mut self, style: NodeId, text: String) {
+        self.document.cssom.insert(style, text);
+    }
+
+    /// A `<style>` element's text changed: the sheet is made from it again,
+    /// and what script did to the old one is gone.
+    fn forget_cssom(&mut self, parent: NodeId) {
+        if !self.document.cssom.is_empty() {
+            self.document.cssom.remove(&parent);
+        }
+    }
+
     /// Point a `<template>` at `contents` as what it holds: a declarative
     /// shadow root, which the parser then fills as it would a template's
     /// own contents.
@@ -124,6 +143,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(child),
         }
         self.document.nodes_mut()[parent].last_child = Some(child);
+        self.forget_cssom(parent);
         self.child_list(parent, &[child], &[], last, None);
         true
     }
@@ -170,6 +190,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(new_node),
         }
         self.document.nodes_mut()[sibling].prev_sibling = Some(new_node);
+        self.forget_cssom(parent);
         self.child_list(parent, &[new_node], &[], previous, Some(sibling));
         true
     }
@@ -211,6 +232,7 @@ impl<'a> DocumentMutator<'a> {
             Some(next) => self.document.nodes_mut()[next].prev_sibling = previous,
             None => self.document.nodes_mut()[parent].last_child = previous,
         }
+        self.forget_cssom(parent);
         self.child_list(parent, &[], &[target], previous, next);
     }
 
@@ -301,6 +323,9 @@ impl<'a> DocumentMutator<'a> {
         {
             Some(NodeData::Text(data) | NodeData::Comment(data)) => {
                 let old = std::mem::replace(data, text);
+                if let Some(parent) = self.document.get(target).and_then(|node| node.parent) {
+                    self.forget_cssom(parent);
+                }
                 if self.document.observed() {
                     self.character_data(target, Some(&old));
                 }

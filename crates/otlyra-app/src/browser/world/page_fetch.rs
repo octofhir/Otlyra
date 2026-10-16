@@ -38,6 +38,9 @@ pub(super) struct PageFetch {
     /// The origin of the document that asked, which a cross-origin answer
     /// has to name to be read.
     origin: url::Origin,
+    /// Whether a `<script>` element asked: its answer is not the page's to
+    /// read, only to run, so no CORS check applies.
+    script: bool,
 }
 
 impl PageFetch {
@@ -119,7 +122,11 @@ impl PageWorld {
         let fetch = self.fetcher.fetch_with_headers(
             tab.0,
             address.as_str(),
-            ResourceKind::Fetch,
+            if request.script {
+                ResourceKind::Script
+            } else {
+                ResourceKind::Fetch
+            },
             body,
             otlyra_net::CacheMode::Default,
             headers,
@@ -131,6 +138,7 @@ impl PageWorld {
                 generation,
                 id: request.id,
                 origin,
+                script: request.script,
             },
         );
     }
@@ -155,7 +163,9 @@ impl PageWorld {
                     .collect(),
                 body: loaded.bytes,
             };
-            readable(&fetch.origin, &response)?;
+            if !fetch.script {
+                readable(&fetch.origin, &response)?;
+            }
             Ok(response)
         });
         if let Err(error) = &response {

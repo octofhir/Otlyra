@@ -129,12 +129,18 @@ fn import(
             let template = element
                 .template_contents
                 .map(|_| mutator.create(NodeData::Document));
-            return mutator.create_element(
+            let created = mutator.create_element(
                 element.name.clone(),
                 element.attrs.clone(),
                 template,
                 element.mathml_annotation_xml_integration_point,
             );
+            // A script markup makes is already started (HTML §8.5 fragment
+            // parsing): `innerHTML` does not run what it writes.
+            if element.name.ns == ns!(html) && &*element.name.local == "script" {
+                mutator.mark_script_started(created);
+            }
+            return created;
         }
         mutator.create(data)
     };

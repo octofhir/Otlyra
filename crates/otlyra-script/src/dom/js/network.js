@@ -375,3 +375,176 @@ for (const [name, value] of Object.entries(XHR_STATES)) {
 }
 defineGlobal('XMLHttpRequestEventTarget', XMLHttpRequestEventTarget);
 defineGlobal('XMLHttpRequest', XMLHttpRequest);
+
+// Scripts that script inserts (HTML §4.12.1.1 "prepare the script element"
+// for a script that is not parser-inserted). The parser runs its own; one a
+// page makes and connects runs when it is connected — at once when it
+// carries its text, once fetched when it names a file, after which it hears
+// `load`, or `error` when the fetch failed. A chunk loader (webpack, Next,
+// turbopack), an analytics snippet and a JSONP call are all this.
+//
+// Inserted external scripts all run as soon as they arrive, which is what
+// one without `async=false` does; the ordered queue `async=false` asks for is
+// not kept.
+const nativeFetchScript = take(Document, '__fetchScript');
+const nativeClearCurrentScript = take(Document, '__clearCurrentScript');
+const nativeScriptStarted = take(Element.prototype, '__scriptStarted');
+const nativeBecomeCurrentScript = take(Element.prototype, '__becomeCurrentScript');
+
+const CLASSIC_SCRIPT_TYPES = new Set([
+  '',
+  'text/javascript',
+  'application/javascript',
+  'application/ecmascript',
+  'application/x-ecmascript',
+  'application/x-javascript',
+  'text/ecmascript',
+  'text/javascript1.0',
+  'text/javascript1.1',
+  'text/javascript1.2',
+  'text/javascript1.3',
+  'text/javascript1.4',
+  'text/javascript1.5',
+  'text/jscript',
+  'text/livescript',
+  'text/x-ecmascript',
+  'text/x-javascript',
+]);
+const scriptKind = (script) => {
+  const type = script.getAttribute('type');
+  const kind = (type === null ? script.getAttribute('language') === null ? '' : 'text/' + script.getAttribute('language') : type)
+    .trim()
+    .toLowerCase();
+  if (CLASSIC_SCRIPT_TYPES.has(kind)) return 'classic';
+  if (kind === 'module') return 'module';
+  return null;
+};
+const reportScriptError = (error, url) => {
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? 'Uncaught ' + (error.name || 'Error') + ': ' + error.message
+      : 'Uncaught ' + String(error);
+  __otlyraReportError(message, url);
+};
+const fireScriptEvent = (script, type) => {
+  try {
+    script.dispatchEvent(new Event(type));
+  } catch (error) {
+    console.error(error);
+  }
+};
+// Run a classic script's text as a script of its own: in the global scope,
+// with `document.currentScript` the element.
+const runClassicScript = (script, source, url) => {
+  nativeBecomeCurrentScript.call(script);
+  try {
+    (0, eval)(source + '\n//# sourceURL=' + url);
+  } catch (error) {
+    reportScriptError(error, url);
+  } finally {
+    nativeClearCurrentScript();
+  }
+};
+const prepareInsertedScript = (script) => {
+  if (!script.isConnected || nativeScriptStarted.call(script, false)) return;
+  const kind = scriptKind(script);
+  if (kind === null) return;
+  const src = script.getAttribute('src');
+  // A script with neither a file nor text waits: its text may come later.
+  if (src === null && !script.text) return;
+  nativeScriptStarted.call(script, true);
+  if (kind === 'classic' && script.hasAttribute('nomodule')) return;
+  if (src === null) {
+    if (kind === 'classic') runClassicScript(script, script.text, String(location.href));
+    return;
+  }
+  const url = script.src;
+  if (!url) {
+    queueMicrotask(() => fireScriptEvent(script, 'error'));
+    return;
+  }
+  if (kind === 'module') {
+    import(url).then(
+      () => fireScriptEvent(script, 'load'),
+      (error) => {
+        reportScriptError(error, url);
+        fireScriptEvent(script, 'error');
+      },
+    );
+    return;
+  }
+  const id = nativeFetchScript(url);
+  awaitingResponse.set(id, {
+    succeed(response) {
+      if (response.status < 200 || response.status >= 300) {
+        fireScriptEvent(script, 'error');
+        return;
+      }
+      runClassicScript(script, response.body, response.url || url);
+      fireScriptEvent(script, 'load');
+    },
+    fail() {
+      fireScriptEvent(script, 'error');
+    },
+  });
+};
+// What an insertion may have connected: the nodes handed to it, or a
+// fragment's children, taken before it empties.
+const insertedCandidates = (nodes) => {
+  const found = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== 'object' || typeof node.nodeType !== 'number') continue;
+    if (node.nodeType === 11) found.push(...Array.from(node.childNodes));
+    else if (node.nodeType === 1) found.push(node);
+  }
+  return found;
+};
+const startInsertedScripts = (candidates) => {
+  for (const node of candidates) {
+    if (node.nodeType !== 1 || !node.isConnected) continue;
+    if (node.localName === 'script') {
+      prepareInsertedScript(node);
+    } else if (node.firstElementChild) {
+      for (const script of Array.from(node.getElementsByTagName('script'))) {
+        prepareInsertedScript(script);
+      }
+    }
+  }
+};
+for (const [name, at] of [['appendChild', 0], ['insertBefore', 0], ['replaceChild', 0]]) {
+  const native = Node.prototype[name];
+  if (typeof native !== 'function') continue;
+  method(Node.prototype, name, {
+    [name](...args) {
+      const candidates = insertedCandidates([args[at]]);
+      const result = native.apply(this, args);
+      if (candidates.length > 0) startInsertedScripts(candidates);
+      return result;
+    },
+  }[name]);
+}
+if (typeof Element.prototype.insertAdjacentElement === 'function') {
+  const native = Element.prototype.insertAdjacentElement;
+  method(Element.prototype, 'insertAdjacentElement', function insertAdjacentElement(where, element) {
+    const result = native.call(this, where, element);
+    startInsertedScripts(insertedCandidates([element]));
+    return result;
+  });
+}
+// A connected script given its text or its `src` after the fact is
+// prepared then (HTML §4.12.1.1: "becomes connected", "src set").
+for (const property of ['text', 'textContent', 'src']) {
+  for (const proto of [HTMLScriptElement.prototype, Node.prototype]) {
+    if (property !== 'textContent' && proto === Node.prototype) continue;
+    if (property === 'textContent' && proto !== Node.prototype) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
+    if (!descriptor || !descriptor.set) continue;
+    Object.defineProperty(proto, property, {
+      ...descriptor,
+      set(value) {
+        descriptor.set.call(this, value);
+        if (this.localName === 'script' && this.isConnected) prepareInsertedScript(this);
+      },
+    });
+  }
+}

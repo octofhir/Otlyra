@@ -460,8 +460,6 @@ HTMLScriptElement.supports = function supports(type) {
 reflectString(HTMLStyleElement, 'media');
 reflectString(HTMLStyleElement, 'type');
 reflectBoolean(HTMLStyleElement, 'disabled');
-define(HTMLStyleElement.prototype, 'sheet', null);
-define(HTMLLinkElement.prototype, 'sheet', null);
 
 reflectString(HTMLMetaElement, 'name');
 reflectString(HTMLMetaElement, 'httpEquiv', 'http-equiv');

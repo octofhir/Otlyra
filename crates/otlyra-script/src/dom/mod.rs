@@ -383,6 +383,7 @@ pub(crate) fn request_page_fetch(
     url: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
+    script: bool,
 ) -> u64 {
     let mut id = 0;
     with_state_mut(|state| {
@@ -394,6 +395,7 @@ pub(crate) fn request_page_fetch(
             url,
             headers,
             body,
+            script,
         });
     });
     id
@@ -533,6 +535,11 @@ pub(crate) fn window_metric(which: u32) -> f64 {
         1 => viewport.height.floor(),
         _ => viewport.scale,
     }
+}
+
+/// Say which `<script>` element script is running now, for one it inserted.
+pub(crate) fn set_current_script(element: Option<otlyra_dom::NodeId>) {
+    with_state_mut(|state| state.current_script = element);
 }
 
 pub(crate) fn current_script() -> Option<otlyra_dom::NodeId> {

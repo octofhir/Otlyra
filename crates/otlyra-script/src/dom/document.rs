@@ -80,7 +80,21 @@ impl DocumentRef {
             .filter_map(|line| line.split_once(':'))
             .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
             .collect();
-        super::request_page_fetch(method, url, headers, body.map(String::into_bytes)) as f64
+        super::request_page_fetch(method, url, headers, body.map(String::into_bytes), false) as f64
+    }
+
+    /// Ask the browser for a script a `<script>` element inserted by script
+    /// names, as a script fetch: its answer is taken like `__fetch`'s. Not
+    /// part of the platform.
+    #[static_method(name = "__fetchScript")]
+    fn js_fetch_script(url: String) -> f64 {
+        super::request_page_fetch("GET".to_owned(), url, Vec::new(), None, true) as f64
+    }
+
+    /// No `<script>` element is running any more. Not part of the platform.
+    #[static_method(name = "__clearCurrentScript")]
+    fn js_clear_current_script() {
+        super::set_current_script(None);
     }
 
     /// Take the answer to request `id`: `["ok", status, url, count, name,

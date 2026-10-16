@@ -57,15 +57,25 @@ accessor(ShadowRoot.prototype, 'activeElement', function () {
   const active = document.activeElement;
   return active && this.contains(active) ? active : null;
 });
-// Constructed style sheets (CSSOM §6.1.2): a sheet script builds from text
-// and a shadow root adopts. What the cascade is given is each adopting
-// root's sheets' text, sent again whenever one of them is replaced.
-const kSheetText = Symbol('text');
+// Style sheets as script sees them (CSSOM §6.1). One class for both kinds:
+// a sheet script constructs and a shadow root adopts, whose text the cascade
+// is sent again whenever it changes, and the sheet of a `<style>` element,
+// whose rules `insertRule` and `deleteRule` change in place — which is how
+// styled-components and emotion style a page once it runs. The rules are
+// kept as a list; the text the cascade is given is joined from it once a
+// turn, not once per rule, since a page inserts thousands.
+const kSheetRules = Symbol('rules');
 const kSheetRoots = Symbol('roots');
+const kSheetOwner = Symbol('owner');
+const kSheetBase = Symbol('base');
+const kSheetDirty = Symbol('dirty');
+const kSheetCached = Symbol('cached');
 const kAdopted = Symbol('adoptedStyleSheets');
+const nativeSetCssomText = take(Element.prototype, '__setCssomText');
+const sheetText = (sheet) => sheet[kSheetRules].join('\n');
 const sendAdopted = (root) => {
   const sheets = root[kAdopted] || [];
-  nativeSetAdoptedStyles.call(root, sheets.map((sheet) => sheet[kSheetText]).join('\n'));
+  nativeSetAdoptedStyles.call(root, sheets.map(sheetText).join('\n'));
 };
 // The top-level rules of a sheet's text, split where a rule ends.
 const splitRules = (text) => {
@@ -89,41 +99,144 @@ const splitRules = (text) => {
   }
   return rules.filter((rule) => rule.length > 0);
 };
+class CSSRule {
+  constructor() {
+    throw new TypeError('Illegal constructor');
+  }
+}
+const makeRule = (cssText, sheet) => {
+  const rule = Object.create(CSSRule.prototype);
+  const brace = cssText.indexOf('{');
+  Object.defineProperties(rule, {
+    cssText: { value: cssText, enumerable: true },
+    selectorText: { value: brace > 0 && !cssText.startsWith('@') ? cssText.slice(0, brace).trim() : undefined, enumerable: true },
+    parentStyleSheet: { value: sheet },
+    type: { value: cssText.startsWith('@media') ? 4 : cssText.startsWith('@') ? 0 : 1 },
+  });
+  return rule;
+};
+// What changed a sheet has to reach: the roots that adopt it now, and its
+// element's cascade at the end of this turn.
+const sheetChanged = (sheet) => {
+  sheet[kSheetCached] = null;
+  for (const root of sheet[kSheetRoots]) sendAdopted(root);
+  const owner = sheet[kSheetOwner];
+  if (owner && !sheet[kSheetDirty]) {
+    sheet[kSheetDirty] = true;
+    queueMicrotask(() => {
+      sheet[kSheetDirty] = false;
+      nativeSetCssomText.call(owner, sheetText(sheet));
+    });
+  }
+};
 class CSSStyleSheet {
   constructor(options = {}) {
-    this[kSheetText] = '';
+    this[kSheetRules] = [];
     this[kSheetRoots] = new Set();
+    this[kSheetOwner] = null;
     this.disabled = Boolean(options.disabled);
     this.media = options.media || '';
   }
+  get ownerNode() {
+    return this[kSheetOwner];
+  }
+  get href() {
+    const owner = this[kSheetOwner];
+    return owner && owner.localName === 'link' ? owner.href : null;
+  }
+  get type() {
+    return 'text/css';
+  }
   get cssRules() {
-    return splitRules(this[kSheetText]).map((cssText) => ({ cssText }));
+    if (!this[kSheetCached]) {
+      this[kSheetCached] = this[kSheetRules].map((cssText) => makeRule(cssText, this));
+    }
+    return this[kSheetCached];
   }
   get rules() {
     return this.cssRules;
   }
   replaceSync(text) {
-    this[kSheetText] = String(text);
-    for (const root of this[kSheetRoots]) sendAdopted(root);
+    this[kSheetRules] = splitRules(String(text));
+    sheetChanged(this);
   }
   replace(text) {
     this.replaceSync(text);
     return Promise.resolve(this);
   }
   insertRule(rule, index = 0) {
-    const rules = splitRules(this[kSheetText]);
-    const at = Math.max(0, Math.min(Number(index) || 0, rules.length));
-    rules.splice(at, 0, String(rule));
-    this.replaceSync(rules.join('\n'));
+    const rules = this[kSheetRules];
+    const at = Number(index) || 0;
+    if (at < 0 || at > rules.length) {
+      throw new DOMException('The index provided (' + at + ') is larger than the maximum index (' + rules.length + ').', 'IndexSizeError');
+    }
+    const text = String(rule).trim();
+    if (!text.includes('{') && !text.startsWith('@')) {
+      throw new DOMException("Failed to parse the rule '" + text + "'.", 'SyntaxError');
+    }
+    rules.splice(at, 0, text);
+    sheetChanged(this);
     return at;
   }
   deleteRule(index) {
-    const rules = splitRules(this[kSheetText]);
-    rules.splice(Number(index) || 0, 1);
-    this.replaceSync(rules.join('\n'));
+    const rules = this[kSheetRules];
+    const at = Number(index) || 0;
+    if (at < 0 || at >= rules.length) {
+      throw new DOMException('The index provided (' + at + ') is outside the range.', 'IndexSizeError');
+    }
+    rules.splice(at, 1);
+    sheetChanged(this);
+  }
+  addRule(selector, style, index) {
+    return this.insertRule(selector + ' { ' + style + ' }', index === undefined ? this[kSheetRules].length : index);
+  }
+  removeRule(index) {
+    this.deleteRule(index === undefined ? 0 : index);
   }
 }
 defineGlobal('CSSStyleSheet', CSSStyleSheet);
+defineGlobal('CSSRule', CSSRule);
+defineGlobal('StyleSheet', CSSStyleSheet);
+
+// A `<style>` element's sheet (CSSOM §6.1 "create a CSS style sheet"),
+// made from its text the first time script asks and again whenever that
+// text has changed since; a `<link rel=stylesheet>`'s, whose rules a page
+// does not read (its text is the network's, not script's).
+const elementSheets = new WeakMap();
+const sheetOf = (element) => {
+  if (!element.isConnected) return null;
+  const isStyle = element.localName === 'style';
+  if (!isStyle) {
+    const rel = (element.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+    if (!rel.includes('stylesheet')) return null;
+  }
+  const text = isStyle ? element.textContent : '';
+  let sheet = elementSheets.get(element);
+  if (!sheet || (isStyle && sheet[kSheetBase] !== text && !sheet[kSheetDirty])) {
+    sheet = new CSSStyleSheet({ media: element.getAttribute('media') || '' });
+    sheet[kSheetRules] = isStyle ? splitRules(text) : [];
+    sheet[kSheetBase] = text;
+    sheet[kSheetOwner] = isStyle ? element : null;
+    Object.defineProperty(sheet, 'ownerNode', { value: element });
+    elementSheets.set(element, sheet);
+  }
+  return sheet;
+};
+accessor(HTMLStyleElement.prototype, 'sheet', function () {
+  return sheetOf(this);
+});
+accessor(HTMLLinkElement.prototype, 'sheet', function () {
+  return sheetOf(this);
+});
+// `document.styleSheets` (CSSOM §6.2.2): the sheets of the document's own
+// `<style>` and `<link rel=stylesheet>` elements, in tree order.
+accessor(Document.prototype, 'styleSheets', function () {
+  const sheets = Array.from(this.querySelectorAll('style, link[rel~="stylesheet" i]'))
+    .map(sheetOf)
+    .filter(Boolean);
+  sheets.item = (index) => sheets[index] || null;
+  return sheets;
+});
 accessor(
   ShadowRoot.prototype,
   'adoptedStyleSheets',

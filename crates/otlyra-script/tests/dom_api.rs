@@ -661,3 +661,83 @@ fn mutation_observers_hear_what_they_asked_for() {
 </script>"#);
     assert_all_ok(&lines, 6);
 }
+
+#[test]
+fn a_style_element_has_a_sheet_script_can_change() {
+    let lines = run(
+        r#"<style id=s>p { color: red } div { margin: 0 }</style><script>
+  const style = document.getElementById('s');
+  const sheet = style.sheet;
+  check('a style element has a sheet', [sheet instanceof CSSStyleSheet, sheet.ownerNode === style, sheet.cssRules.length], [true, true, 2]);
+  check('the same sheet each time', style.sheet === sheet, true);
+  check('document.styleSheets lists it', [document.styleSheets.length >= 1, Array.from(document.styleSheets).includes(sheet)], [true, true]);
+  sheet.insertRule('.made { color: blue }', sheet.cssRules.length);
+  sheet.insertRule('.first { color: green }', 0);
+  check('inserted rules are in place', [sheet.cssRules.length, sheet.cssRules[0].cssText, sheet.cssRules[0].selectorText], [4, '.first { color: green }', '.first']);
+  sheet.deleteRule(1);
+  check('a deleted rule is gone', sheet.cssRules.length, 3);
+  let threw = '';
+  try { sheet.insertRule('.x {}', 99); } catch (e) { threw = e.name; }
+  check('an index past the end is refused', threw, 'IndexSizeError');
+  const made = document.createElement('style');
+  document.head.appendChild(made);
+  made.appendChild(document.createTextNode(''));
+  check('a styled-components style element gets a sheet', made.sheet.cssRules.length, 0);
+</script>"#,
+    );
+    assert_all_ok(&lines, 7);
+}
+
+#[test]
+fn scripts_script_inserts_run_once_and_markup_ones_do_not() {
+    let lines = run(
+        r#"<div id=host></div><script id=parsed>window.parsedRuns = (window.parsedRuns || 0) + 1;</script><script>
+  const host = document.getElementById('host');
+  const inline = document.createElement('script');
+  inline.textContent = 'window.inlineRan = document.currentScript === inlineScript;';
+  window.inlineScript = inline;
+  host.appendChild(inline);
+  check('an inserted inline script runs at once, as the current script', window.inlineRan, true);
+  check('the current script is cleared after', document.currentScript && document.currentScript.id, null);
+  host.innerHTML = '<script>window.fromMarkup = true<\/script>';
+  check('markup does not run what it writes', window.fromMarkup, undefined);
+  host.appendChild(document.getElementById('parsed'));
+  check('moving a parsed script does not run it again', window.parsedRuns, 1);
+  const frag = document.createDocumentFragment();
+  const inFragment = document.createElement('script');
+  inFragment.text = 'window.fragmentRan = (window.fragmentRan || 0) + 1';
+  frag.appendChild(inFragment);
+  check('a script in a detached fragment waits', window.fragmentRan, undefined);
+  host.append(frag);
+  host.appendChild(inFragment);
+  check('it runs when connected, once', window.fragmentRan, 1);
+  const data = document.createElement('script');
+  data.type = 'text/template';
+  data.text = 'window.templateRan = true';
+  host.appendChild(data);
+  check('a script of another type is data', window.templateRan, undefined);
+  const broken = document.createElement('script');
+  broken.text = 'throw new Error("inner")';
+  let reported = '';
+  window.onerror = (message) => { reported = message; return true; };
+  host.appendChild(broken);
+  check('its error is reported like a script error', reported, 'Uncaught Error: inner');
+</script>"#,
+    );
+    assert_all_ok(&lines, 8);
+}
+
+#[test]
+fn user_timing_marks_and_measures() {
+    let lines = run(r#"<script>
+  const a = performance.mark('a');
+  performance.mark('b', { startTime: a.startTime + 5 });
+  const m = performance.measure('a-b', 'a', 'b');
+  check('a measure spans its marks', [m.entryType, m.duration], ['measure', 5]);
+  check('entries are listed', [performance.getEntriesByType('mark').length, performance.getEntriesByName('a-b').length], [2, 1]);
+  performance.clearMarks('a');
+  performance.clearMeasures();
+  check('cleared', [performance.getEntriesByType('mark').map((e) => e.name), performance.getEntriesByType('measure').length], [['b'], 0]);
+</script>"#);
+    assert_all_ok(&lines, 3);
+}
