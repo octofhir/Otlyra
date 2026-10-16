@@ -280,7 +280,19 @@ clicks and wheel events. What is left:
 - [x] The back and forward buttons move through the entries a page made with
   `pushState` (`popstate`, no reload), and load the entry when the page no
   longer has it.
-- [ ] A real `DOMParser` (a second document) and persistent `localStorage`.
+- [x] `localStorage` shared by an origin's documents in every tab and
+  `sessionStorage` per tab, with the quota and named-property access;
+  cleared with the site's cookies.
+- [ ] A real `DOMParser` (a second document); `localStorage` and IndexedDB
+  that outlive the run (sealed like the cookie file); the `storage` event.
+- [x] [Sixteen more sites](docs/browser-rendering-research.md#a-sweep-of-sixteen-more-sites):
+  no Node `process` in pages, `delete`/`in` on every heap kind, linear
+  regex name checks, `await` in async arrows in static blocks, hostless
+  ready futures, `:has()` for script, `Path2D`, object URLs, IndexedDB in
+  memory, `event.error` with stacks, `//# sourceURL=`, `Intl` default zone.
+- [ ] Sweep follow-ups: a canvas 2D backend (Stripe), AES in
+  `crypto.subtle` (Amazon), The Verge's hydration mismatches, the scripts
+  Notion and CNN load that still throw.
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of

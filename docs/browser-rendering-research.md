@@ -1610,6 +1610,66 @@ Still open:
 - BBC serves different variants from one load to the next.
 - The 278 px advertising slot at the top stays empty.
 
+## A sweep of sixteen more sites
+
+After BBC, sixteen more sites were loaded with the release binary and their
+script errors counted: The New York Times, CNN, Amazon, Stripe, Vercel, npm,
+crates.io, Figma, Airbnb, Spotify, The Verge, Medium, Notion, X, Twitch and
+eBay. Five had none. The rest had 1 to 92 errors each, and most traced back
+to a few shared causes rather than one cause per site.
+
+1. **The page looked like Node.** Otter installs Node's `process` global by
+   default, and the page runtime kept it. `process.versions.node` was set, so
+   libraries took their Node path: `require`, `Buffer`, `module.exports`.
+   js-md5 on The Verge, and Airbnb's and Notion's bundles, all failed this
+   way. The page runtime is now built without it (`process_global(false)`).
+2. **`delete value[key]` threw "type mismatch"** when `value` was a Map,
+   Promise, ArrayBuffer, generator or Intl object. lodash's `getRawTag` does
+   `delete value[Symbol.toStringTag]` on every value it tags, and that
+   produced 91 errors on Figma plus failures on CNN and The Verge. Otter
+   `a793c4ed8` makes delete, `in` and own keys work on every heap kind.
+3. **Two bundles were stopped by the 10 s watchdog.** A sample of the
+   process showed the time was spent compiling a regular expression, not
+   running it. The duplicate-named-groups check enumerated every path
+   through the pattern, so the work doubled with each alternation in a row.
+   Otter `ed6214226` checks the names in linear time. Twitch and Stripe now
+   run.
+4. **Stripe's bundle did not compile** because of `await` in an async arrow
+   inside a class `static {}` block. Otter `eda13b592`.
+5. **Amazon called `crypto.subtle.digest` and `Blob.text()`.** These are
+   async natives, and they refused to run without an executor. A future that
+   is ready on its first poll now settles anyway (Otter `872e6002d`).
+6. **Small interfaces that pages call at load:**
+   - `:has()` in `querySelector`, `matches` and `closest`. It is enabled for
+     script only; the cascade still lacks the invalidation `:has()` rules
+     need.
+   - `Path2D`.
+   - `removeAttributeNode`.
+   - `URL.createObjectURL`, with `fetch` of `blob:` URLs.
+   - `containerType` and `containerName` in `getComputedStyle`, which Vercel
+     splits.
+   - `indexedDB`, kept in memory for the document's lifetime.
+7. **Errors from inserted scripts had no place.** Two changes fix that:
+   - An `error` event now carries the exception in `event.error`.
+   - The console shows the stack, and code run through `eval` with a
+     `//# sourceURL=` comment is named by that URL (Otter `beefaa0fe`).
+8. **`Intl.DateTimeFormat` with no `timeZone`** computed local time but
+   called it UTC, giving "3:00 PM, UTC" for noon UTC in Moscow.
+   `resolvedOptions()` also said UTC. It now resolves the host's zone
+   (Otter `5904b819e`).
+
+Still open from the sweep:
+
+- Stripe draws into a canvas, and `getContext` returns null because there
+  is no canvas backend.
+- Amazon imports an AES-CBC key, which Otter's `crypto.subtle` does not
+  support.
+- The Verge logs React hydration mismatches (#418/#425). Its times differ
+  from the server's because the zone differs; the source of the others has
+  not been found.
+- Notion and CNN fail in scripts loaded by script. These can now be located
+  by URL; the causes are not found yet.
+
 ## What the reference browsers do
 
 ### Chromium
