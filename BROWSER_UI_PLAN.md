@@ -290,9 +290,13 @@ clicks and wheel events. What is left:
   regex name checks, `await` in async arrows in static blocks, hostless
   ready futures, `:has()` for script, `Path2D`, object URLs, IndexedDB in
   memory, `event.error` with stacks, `//# sourceURL=`, `Intl` default zone.
-- [ ] Sweep follow-ups: a canvas 2D backend (Stripe), AES in
-  `crypto.subtle` (Amazon), The Verge's hydration mismatches, the scripts
-  Notion and CNN load that still throw.
+- [x] Real `matchMedia` with `change` events, `postMessage`,
+  `elementFromPoint(s)`, `XMLSerializer`, `FileReader`, `FontFace`,
+  `StorageEvent`, failing `WebSocket`/`EventSource`, named
+  `attributes[...]`, AES-CBC/CTR (Otter).
+- [ ] Sweep follow-ups: a canvas 2D backend (Stripe), workers (Twitch),
+  The Verge's hydration mismatches, real WebSocket/EventSource, dark mode
+  in `matchMedia`.
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of

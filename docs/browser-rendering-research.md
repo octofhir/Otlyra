@@ -1662,13 +1662,16 @@ Still open from the sweep:
 
 - Stripe draws into a canvas, and `getContext` returns null because there
   is no canvas backend.
-- Amazon imports an AES-CBC key, which Otter's `crypto.subtle` does not
-  support.
 - The Verge logs React hydration mismatches (#418/#425). Its times differ
   from the server's because the zone differs; the source of the others has
   not been found.
-- Notion and CNN fail in scripts loaded by script. These can now be located
-  by URL; the causes are not found yet.
+- The Verge also lacked `window.postMessage` and `elementFromPoint`, and
+  `matchMedia` always answered `false`. These are now implemented, and
+  `matchMedia` asks the cascade's media evaluator. Notion's consent script
+  needed `XMLSerializer`, and CNN's jQuery 1.x reads `attributes[name]`;
+  both are added. Amazon's AES-CBC key now imports (Otter `f5bd106dc`).
+- Workers have no runtime here, so Twitch's `new Worker` throws.
+- `matchMedia` does not see the browser's dark mode yet.
 
 ## What the reference browsers do
 
