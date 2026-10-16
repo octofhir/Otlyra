@@ -1088,8 +1088,8 @@ by a timer or by an event the host dispatched.
     not do that, so this run followed the standard.
   - `document.currentScript` is `null` while a module runs.
 - **Network.** Module sources are fetched as a new `ResourceKind::Module`
-  through the same `Fetcher`, so they share its concurrency of 6 and the
-  page's scheme policy. There is a limit of 1024 modules per document. A
+  through the same `Fetcher`, so they share its limit of 6 per tab and host
+  and the page's scheme policy. There is a limit of 1024 modules per document. A
   module fetched during a load is recorded in `PendingLoad::outstanding`, and
   one fetched after the load goes through `PageWorld::module_fetches`. Each
   response is decoded as UTF-8 whatever its charset says.
@@ -1225,6 +1225,124 @@ before and after.
 - Disk pressure on this machine limited the Otter verification to the parts
   listed above.
 
+
+## Web platform batch after modules
+
+With modules running, GitHub and Apple stopped on the next missing pieces.
+They were fixed in the order the live pages hit them, and the screenshots
+were checked after each one. The pages went backwards once on the way: more
+of GitHub's React ran, failed on a missing interface, and its error boundary
+replaced the server-rendered page with "Looks like something went wrong!".
+That is why the small interfaces below exist. A framework turns one missing
+function into a blank page.
+
+### Fetch lanes
+
+A second tab sat blank while the first was loading. Every fetch shared one
+FIFO semaphore of six permits. A page with thirty slow pictures put the next
+tab's document behind all thirty: 14.6 s on a local repro, which is 30
+pictures at 3 s each over 6 permits.
+
+Now there are separate lanes:
+
+- documents have a lane of their own;
+- subresources queue per tab and host (`Fetcher::request_for`), six each;
+- a tab that closes, navigates or stops cancels its outstanding requests
+  (`Fetcher::cancel`), which frees their places.
+
+The same repro now takes 0.11 s, and 0.21 s with same-host pictures in the
+second tab. Over HTTP/2, six requests per tab to one host are streams on one
+connection, not more sockets.
+
+### document.cookie
+
+`document.cookie` did not exist, while `navigator.cookieEnabled` was true.
+Yandex SSO (`document.cookie.replace(...)`) and GitHub's banner script
+(`document.cookie.match(...)`) threw on it. It now reads and writes the
+browser's jar through `otlyra_script::DocumentCookies`:
+
+- reads see what a request would carry, without the `HttpOnly` cookies;
+- writes go through the storage model as a non-HTTP API, so script can
+  neither set an `HttpOnly` cookie nor overwrite one;
+- a document that is not http(s) has no cookies.
+
+### Custom elements
+
+These live in the glue (`custom_elements.js`), over the natives. An upgrade
+swaps the wrapper's prototype for the definition's, and wrappers live as long
+as the page, so the swap sticks.
+
+- **Construction.** `HTMLElement`'s constructor is the HTML element
+  constructor, with construction stacks for upgrades.
+- **Reactions.** Tree and attribute reactions run in wrappers of the
+  mutation methods, `innerHTML`/`outerHTML` and the attribute setters.
+- **Parser-made elements.** These are upgraded at a checkpoint at the start
+  of each task, once a page has defined something. A node-count guard makes
+  the checkpoint free when nothing new was parsed.
+
+One bug this exposed was ours. Wrappers took their prototype from the global
+by the interface's name. GitHub's Web Components polyfill replaces
+`window.HTMLElement` with a plain function, so every `header`, `nav`, `main`
+or undefined custom element met after that had a null prototype, and no
+`getAttribute`. Wrappers now take the realm's own prototypes from a frozen
+table the glue leaves (`__otlyraInterfacePrototypes`).
+
+### Engine fixes found on the way (Otter)
+
+- `4322684de`: the module-graph linker dropped every fragment's
+  template-site table. Every tagged template in a module failed with
+  `VM_BYTECODE_INVARIANT: invalid operand`. `String.raw` was spared only
+  because it is inlined. Turbo's progress bar was the first casualty.
+- `fffe766c3`: "value is not a function" now names the callee as the source
+  spells it ("window.requestIdleCallback is not a function"). Without that,
+  none of the missing interfaces below could have been found on minified
+  pages.
+
+### Small interfaces
+
+- `history`: `pushState`/`replaceState` move the document within its origin
+  (`location` follows, the browser's address bar follows through
+  `ScriptRunner::take_url_change`), and `back`/`forward`/`go` traverse the
+  document's own entries with `popstate`.
+- `requestIdleCallback` runs as a task of its own, with the 50 ms budget an
+  idle browser gives.
+- `compat.js`:
+  - `CSS.supports`/`CSS.escape`;
+  - `localStorage`/`sessionStorage`, in memory, as a private window gives a
+    page;
+  - `TreeWalker`/`NodeIterator`;
+  - `Range` with `createContextualFragment`, and an empty `Selection`;
+  - `DOMRect`, `scrollIntoView`, `checkVisibility`, the pointer-capture
+    no-ops, and `animate`, which finishes at once;
+  - `alert`/`confirm`/`prompt` answering as a dismissed dialog, and
+    `open` → `null`;
+  - `PerformanceObserver`, `visualViewport`, `document.fonts`, and
+    `navigator.javaEnabled()`.
+
+### Validation of this batch
+
+- **GitHub.** Script errors on the home page went from 11 to 1 ("Cannot read
+  properties of undefined", no stack). The hero renders as before, now with
+  the hero video's pause control.
+- **Apple.** Unchanged visually. What is left is `getComputedStyle`,
+  `XMLHttpRequest`, and the navigation layout.
+- **Smokes.** `module-smoke` 9/9 and `bidi-smoke` 4/4. A BiDi two-tab repro
+  went from 14.69 s to 0.22 s. A BiDi cookie check showed the `HttpOnly`
+  cookie hidden from script but sent, and a script cookie sent on the next
+  request.
+
+**Left open.**
+
+- `getComputedStyle`, which needs the last frame's computed styles exposed to
+  the isolate the way geometry is.
+- `XMLHttpRequest`.
+- Shadow DOM and `ElementInternals`.
+- `DOMParser`.
+- Persistent `localStorage`.
+- Back-button integration of `pushState` entries.
+- `MutationObserver` records, still a stub.
+- Same-tab, same-host fairness inside one page, which is ordinary FIFO.
+- The remaining GitHub error, which has no stack yet.
 
 ## What the reference browsers do
 

@@ -246,9 +246,26 @@ clicks and wheel events. What is left:
   when ready, `DOMContentLoaded` and `load` waiting), `nomodule` skipped,
   `error`/`load` on the element and `window.onerror` for exceptions. Otter
   loads the graph only from sources the browser's fetcher delivers.
-- [ ] `customElements` (define/get/whenDefined with upgrades) and
-  `getComputedStyle`: with modules running, these are what GitHub's and
-  Apple's scripts stop on next.
+- [x] `customElements` (see the [web platform batch](docs/browser-rendering-research.md#web-platform-batch-after-modules)):
+  define/get/getName/whenDefined/upgrade, upgrades of parsed, cloned and
+  markup-made elements, connected/disconnected/attributeChanged reactions.
+  Shadow trees, customized built-ins and form-associated elements are not
+  there.
+- [x] `document.cookie` over the browser's jar (HttpOnly hidden and
+  protected), `history` within one document (`pushState`/`replaceState`/
+  traversal with `popstate`, address bar follows), `requestIdleCallback`, and
+  a batch of small interfaces (`CSS`, in-memory `localStorage`/
+  `sessionStorage`, `TreeWalker`, `Range`, `Selection`, `DOMRect`,
+  `animate`, `document.fonts`, dialogs).
+- [x] Fetch lanes: documents never queue behind subresources, subresources
+  queue per tab and host, and a tab that closes or moves on cancels what it
+  asked for. A second tab no longer waits for the first one's pictures.
+- [ ] `getComputedStyle`: Apple's `main.built.js` and gallery stop on it. It
+  needs the computed styles of the last frame exposed to the isolate the way
+  geometry already is.
+- [ ] `XMLHttpRequest` (Apple's locale switcher), `attachShadow`/
+  `ElementInternals`, `DOMParser`, persistent `localStorage`, and session
+  history across documents (the back button over `pushState` entries).
 - [ ] Module follow-ups: `modulepreload` links, CORS and `crossorigin`/
   `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
   the network, dynamically inserted module scripts, and moving the request
