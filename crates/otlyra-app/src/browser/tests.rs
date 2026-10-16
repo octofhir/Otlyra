@@ -4071,6 +4071,32 @@ fn page_log(browser: &Browser) -> String {
     String::new()
 }
 
+/// The first character typed over a placeholder is drawn as typed text, in
+/// the field's colour, and not in the placeholder's — which here is
+/// transparent, so a rewrite in place would have typed invisibly.
+#[test]
+fn typing_over_a_hidden_placeholder_shows_what_was_typed() {
+    let (mut browser, _) = input_page(
+        "<style>body { margin: 0 } input { color: rgb(0, 0, 255); display: block; width: 200px }\
+           input::placeholder { opacity: 0 }</style><input id=field placeholder=hint>",
+    );
+    press_and_release(&mut browser, "field");
+    browser.on_event(PlatformEvent::TextInput('x'));
+    browser.paint(
+        &mut otlyra_gfx::RecordingPainter::new(),
+        Viewport::new(800, 600, 1.0),
+    );
+    let page = browser.page(browser.active).expect("page");
+    let boxes = page.boxes();
+    let typed: Vec<[u8; 4]> = boxes
+        .descendants(boxes.root())
+        .into_iter()
+        .filter(|&id| matches!(&boxes.node(id).kind, otlyra_layout::BoxKind::Text(text) if text.contains('x')))
+        .map(|id| boxes.node(id).style.color.to_rgba8().to_u8_array())
+        .collect();
+    assert_eq!(typed, [[0, 0, 255, 255]]);
+}
+
 /// A press and its release reach the page's listeners as the events a page
 /// listens for, in order, aimed where they landed.
 #[test]

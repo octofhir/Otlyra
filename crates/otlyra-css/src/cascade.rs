@@ -52,6 +52,8 @@ pub struct StyledDocument {
     styles: HashMap<NodeId, Arc<ComputedValues>>,
     /// The controls whose own look an author rule has taken away.
     devolved: std::collections::HashSet<NodeId>,
+    /// The `::placeholder` style of each field showing a placeholder.
+    placeholders: HashMap<NodeId, Arc<ComputedValues>>,
 }
 
 /// The computed styles of one styling of a document, kept for script after
@@ -172,6 +174,11 @@ impl StyledDocument {
         StyleSnapshot {
             styles: self.styles.clone(),
         }
+    }
+
+    /// The `::placeholder` style of a field that has a placeholder.
+    pub fn placeholder_style_of(&self, node: NodeId) -> Option<&Arc<ComputedValues>> {
+        self.placeholders.get(&node)
     }
 
     /// The computed style of one element, if it has one.
@@ -741,7 +748,14 @@ impl Styler {
             .map(|child| (child, None, 0))
             .collect();
         let mut styles = HashMap::new();
-        self.resolve_from(document, &style_data, &starts, &mut styles);
+        let mut placeholders = HashMap::new();
+        self.resolve_from(
+            document,
+            &style_data,
+            &starts,
+            &mut styles,
+            &mut placeholders,
+        );
 
         tracing::debug!(elements = styles.len(), "styled");
         // Only a control can devolve, and a page has a handful of them — so the
@@ -759,6 +773,7 @@ impl Styler {
             style_data,
             styles,
             devolved,
+            placeholders,
         }
     }
 
@@ -869,7 +884,13 @@ impl Styler {
             })
             .collect();
         let mut fresh = HashMap::new();
-        self.resolve_from(document, &styled.style_data, &starts, &mut fresh);
+        self.resolve_from(
+            document,
+            &styled.style_data,
+            &starts,
+            &mut fresh,
+            &mut styled.placeholders,
+        );
 
         let mut previous = Vec::with_capacity(fresh.len());
         for (node, style) in fresh {
@@ -895,6 +916,7 @@ impl Styler {
         style_data: &StyleData,
         starts: &[(NodeId, Option<Arc<ComputedValues>>, usize)],
         styles: &mut HashMap<NodeId, Arc<ComputedValues>>,
+        placeholders: &mut HashMap<NodeId, Arc<ComputedValues>>,
     ) {
         let guard = self.lock.read();
         self.stylist.flush(&StylesheetGuards::same(&guard));
@@ -928,7 +950,41 @@ impl Styler {
         for (node, parent, depth) in starts {
             resolve(&tree, *node, parent.as_ref(), *depth, &mut context, styles);
         }
+        // `::placeholder` is a lazy pseudo-element (CSS Pseudo 4 §4.3): only
+        // a field that has a placeholder has one, so only those are asked.
+        let guards = StylesheetGuards::same(&guard);
+        for (node, style) in styles.iter() {
+            if !has_placeholder(document, *node) {
+                continue;
+            }
+            match self.stylist.lazily_compute_pseudo_element_style(
+                &guards,
+                tree.node(*node),
+                &style::selector_parser::PseudoElement::Placeholder,
+                style::stylist::RuleInclusion::All,
+                style,
+                false,
+                None,
+            ) {
+                Some(pseudo) => {
+                    placeholders.insert(*node, pseudo);
+                }
+                None => {
+                    placeholders.remove(node);
+                }
+            }
+        }
     }
+}
+
+/// Whether `node` is a field a placeholder can show in: an `<input>` or a
+/// `<textarea>` with a `placeholder` attribute.
+fn has_placeholder(document: &Document, node: NodeId) -> bool {
+    document
+        .get(node)
+        .and_then(|data| data.element())
+        .is_some_and(|element| matches!(&*element.name.local, "input" | "textarea"))
+        && document.attr(node, "placeholder").is_some()
 }
 
 /// Turn on the parts of the engine that ship switched off.

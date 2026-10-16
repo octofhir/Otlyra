@@ -199,6 +199,12 @@ input, button, select, textarea, meter, progress {
   --otlyra-appearance: auto;
 }
 
+/* The hint a field shows while it holds nothing, in the grey every browser
+   draws it in (HTML §15.5.4 leaves the colour to the user agent). */
+::placeholder {
+  color: #757575;
+}
+
 input {
   display: inline-block;
   box-sizing: content-box;

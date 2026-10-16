@@ -285,7 +285,8 @@ pub(crate) fn receives_decorations(style: &ComputedStyle, replaced: bool) -> boo
 /// Returns whether there was exactly one such text box to rewrite. There is not
 /// when a field with no placeholder is empty — it generates no text box at all —
 /// and that is a change of shape rather than of text, which the caller answers
-/// by rebuilding.
+/// by rebuilding. Nor is the placeholder's box one, which is drawn in a style of
+/// its own.
 pub fn set_generated_text(tree: &mut BoxTree, id: BoxId, text: &str) -> bool {
     let children = tree.node(id).children.clone();
     let mut texts = children
@@ -295,6 +296,11 @@ pub fn set_generated_text(tree: &mut BoxTree, id: BoxId, text: &str) -> bool {
         return false;
     };
     if texts.next().is_some() {
+        return false;
+    }
+    // A placeholder is drawn in its own colour; typed text is not, so the
+    // first character typed over one is a rebuild rather than a rewrite.
+    if !Arc::ptr_eq(&tree.node(only).style, &tree.node(id).style) {
         return false;
     }
     tree.set_text(only, text.into());
@@ -1100,6 +1106,22 @@ impl Builder<'_> {
         into.extend(std::iter::repeat_n(Arc::new(style), span));
     }
 
+    /// The style a field's placeholder text is drawn in, while it shows one:
+    /// the field's own, in the colour its `::placeholder` rule gives it.
+    fn placeholder_text_style(
+        &self,
+        node: NodeId,
+        style: &Arc<ComputedStyle>,
+    ) -> Option<Arc<ComputedStyle>> {
+        if !otlyra_dom::form::is_placeholder_shown(self.document, self.form, node) {
+            return None;
+        }
+        let pseudo = otlyra_css::computed::to_layout_style(self.styles.placeholder_style_of(node)?);
+        let mut text = ComputedStyle::clone(style);
+        text.color = pseudo.color.multiply_alpha(pseudo.opacity.clamp(0.0, 1.0));
+        Some(Arc::new(text))
+    }
+
     /// The style the cascade computed for one element.
     ///
     /// `None` for an element the cascade did not reach — one put into the
@@ -1210,12 +1232,19 @@ impl Builder<'_> {
                     .then(|| self.generated_text(name, node))
                     .flatten();
                 if let Some(text) = generated {
+                    // A placeholder is drawn in its `::placeholder` colour, as
+                    // faint as that rule's opacity makes it: a page that hides
+                    // the hint until the field has the focus writes
+                    // `::placeholder { opacity: 0 }`.
+                    let text_style = self
+                        .placeholder_text_style(node, &style)
+                        .unwrap_or_else(|| Arc::clone(&style));
                     self.tree.push(
                         id,
                         BoxNode {
                             kind: BoxKind::Text(text.into()),
                             control: None,
-                            style: Arc::clone(&style),
+                            style: text_style,
                             node: None,
                             tag: None,
                             anonymous: true,

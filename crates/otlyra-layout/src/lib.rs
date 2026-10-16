@@ -205,6 +205,40 @@ mod tests {
             .join("")
     }
 
+    /// A placeholder is drawn in its `::placeholder` colour — the grey of the
+    /// browser's own rule unless the page says otherwise, and not at all
+    /// where the page made it transparent — and what a field holds is drawn
+    /// in the field's colour.
+    #[test]
+    fn a_placeholder_takes_its_pseudo_element_colour() {
+        let tree = tree_of(
+            "<style>input { color: rgb(0, 0, 255) } .own::placeholder { color: rgb(200, 0, 0) }\
+               .hidden::placeholder { opacity: 0 }</style>\
+             <input placeholder=grey><input class=own placeholder=red>\
+             <input class=hidden placeholder=gone><input class=own value=held placeholder=x>",
+        );
+        let colours: Vec<(String, [u8; 4])> = tree
+            .descendants(tree.root())
+            .into_iter()
+            .filter_map(|id| match &tree.node(id).kind {
+                BoxKind::Text(text) => Some((
+                    text.to_string(),
+                    tree.node(id).style.color.to_rgba8().to_u8_array(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            colours,
+            [
+                ("grey".to_owned(), [0x75, 0x75, 0x75, 255]),
+                ("red".to_owned(), [200, 0, 0, 255]),
+                ("gone".to_owned(), [0x75, 0x75, 0x75, 0]),
+                ("held".to_owned(), [0, 0, 255, 255]),
+            ]
+        );
+    }
+
     /// An `<input>` is a void element: without generated content a field shows
     /// nothing at all, and a form becomes a page of labels with no fields.
     #[test]
