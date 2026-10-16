@@ -250,12 +250,13 @@ impl ElementRef {
         })
     }
 
-    /// The element's border box on the last frame, `[left, top, right,
-    /// bottom]` in client coordinates, or null when it was not drawn.
+    /// The element's border box, `[left, top, right, bottom]` in client
+    /// coordinates — laid out again first when the tree changed since the
+    /// last layout — or null when it has no box.
     #[method(name = "__otlyraClientRect")]
     fn js_client_rect(&self) -> Result<Option<Vec<f64>>, JsError> {
         let id = self.node.id;
-        with_document(self.node.doc, |document| {
+        super::with_document_unmarked(self.node.doc, |document| {
             document
                 .client_rect(id)
                 .map(|rect| rect.iter().map(|&edge| f64::from(edge)).collect())

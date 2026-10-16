@@ -4618,6 +4618,35 @@ fn script_measures_the_boxes_the_page_drew() {
     });
 }
 
+/// Script that measures right after a change measures the tree it left: an
+/// element it just inserted, one it just resized, and one far below what
+/// the frame drew.
+#[test]
+fn script_measures_what_it_just_changed() {
+    on_content_stack(|| {
+        let (mut browser, _) = input_page(
+            "<body style=margin:0><button id=measure style='display:block;width:100px;height:30px;margin:0;padding:0;border:0'>m</button>\
+             <div id=grow style='width:10px;height:10px'></div>\
+             <div style=height:5000px></div><div id=far style='width:40px;height:20px'></div>\
+             <script>\
+               document.getElementById('measure').addEventListener('click', () => {\
+                 const dialog = document.createElement('div');\
+                 dialog.style.cssText = 'position:fixed;width:300px;height:120px';\
+                 document.body.appendChild(dialog);\
+                 const added = dialog.getBoundingClientRect();\
+                 const grow = document.getElementById('grow');\
+                 grow.style.width = '77px';\
+                 const far = document.getElementById('far').getBoundingClientRect();\
+                 document.documentElement.dataset.log = [added.width, added.height, grow.offsetWidth,\
+                   far.top, far.width].join(' ');\
+               });\
+             </script>",
+        );
+        press_and_release(&mut browser, "measure");
+        assert_eq!(page_log(&browser), "300 120 77 5040 40");
+    });
+}
+
 /// `getComputedStyle` reads what the cascade resolved on the last frame, and
 /// the used size of a box the frame drew.
 #[test]

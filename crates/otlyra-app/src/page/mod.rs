@@ -14,6 +14,7 @@ mod field;
 mod find;
 mod focus;
 mod pointer;
+mod script_layout;
 mod scroll;
 mod selection;
 
@@ -48,8 +49,15 @@ pub struct PageScene {
     sources: StyleSources,
     /// The pictures its `<img>` elements asked for, already decoded. Kept for the
     /// same reason as the sheets: rebuilding the box tree must not wait on a
-    /// network either.
-    images: Images,
+    /// network either. Shared with the layout script measures with.
+    images: std::rc::Rc<std::cell::RefCell<Images>>,
+    /// What styles the document for script, when the load made one: with it
+    /// the page lays the document out for script that measures after a
+    /// change (see `script_layout.rs`).
+    script_styler: Option<std::rc::Rc<otlyra_css::cascade::ScriptStyler>>,
+    /// The width and height the page was last laid out at, which a layout
+    /// for script uses too.
+    script_size: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
     /// Which file each of those pictures came from, and the density it was chosen
     /// for.
     ///
@@ -378,7 +386,9 @@ impl PageScene {
             base: document_base_url(&document, &url),
             url,
             sources,
-            images,
+            images: std::rc::Rc::new(std::cell::RefCell::new(images)),
+            script_styler: None,
+            script_size: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0))),
             picture_sources,
             // Nothing is styled until the first frame says how wide the page is,
             // and nothing unstyled has a box: until then the page is its initial
@@ -543,6 +553,15 @@ impl PageScene {
             .set_computed_styles(self.styled_at, std::sync::Arc::new(styled.snapshot()));
     }
 
+    /// Share the styler the load made for script, so that the page can lay
+    /// the document out for script that measures after a change.
+    pub(crate) fn set_script_styler(
+        &mut self,
+        styler: std::rc::Rc<otlyra_css::cascade::ScriptStyler>,
+    ) {
+        self.script_styler = Some(styler);
+    }
+
     /// Note that the page was styled again, so script is handed the new
     /// styles on its next turn.
     pub(crate) fn restyled(&mut self) {
@@ -584,7 +603,8 @@ impl PageScene {
                 })
                 .or_insert(next);
         }
-        self.document.set_geometry(std::sync::Arc::new(rects));
+        self.document
+            .set_geometry(std::sync::Arc::new(rects), self.styled_at);
     }
 
     /// Everything style and layout produced for this document is out of date,
@@ -643,6 +663,19 @@ impl PageScene {
             self.layout = Some((width, tree));
             self.layout_took = started.elapsed();
             self.layout_stale = false;
+            self.script_size.set((width, height));
+            if !self.document.has_geometry_resolver()
+                && let Some(styler) = &self.script_styler
+            {
+                self.document.set_geometry_resolver(Some(std::rc::Rc::new(
+                    script_layout::ScriptLayout::new(
+                        std::rc::Rc::clone(styler),
+                        text.fork(),
+                        std::rc::Rc::clone(&self.images),
+                        std::rc::Rc::clone(&self.script_size),
+                    ),
+                )));
+            }
             // Every path to a new layout comes through here, which is what makes
             // this the one place a search has to be asked again — and the one
             // place the reader can be put back where they were.
@@ -702,7 +735,7 @@ impl PageScene {
         self.boxes = otlyra_layout::build_page_box_tree(
             &self.document,
             styles,
-            &self.images,
+            &self.images.borrow(),
             self.document.form(),
         );
         self.boxes_stale = false;
@@ -1281,7 +1314,7 @@ impl PageScene {
     /// a page whose pictures arrive one by one was being cascaded once for each.
     pub fn set_image(&mut self, node: NodeId, src: String, picture: otlyra_layout::Picture) {
         self.picture_sources.insert(node, (src, picture.density));
-        self.images.insert(node, picture);
+        self.images.borrow_mut().insert(node, picture);
         self.boxes_stale = true;
         self.layout_stale = true;
         self.damage.add(Damage::of(

@@ -42,6 +42,9 @@ pub(super) struct PendingLoad {
     /// The base the page's style resolves against, and the stylesheets fetched
     /// for it so far.
     sources: std::rc::Rc<std::cell::RefCell<StyleSources>>,
+    /// What styles the document for script, over `sources`: shared with the
+    /// page once it is shown, which lays the document out for script with it.
+    script_styler: Option<std::rc::Rc<otlyra_css::cascade::ScriptStyler>>,
     /// Every sheet an `@import` has asked for, by address: a sheet imported
     /// twice, or by a sheet it imports itself, is fetched once.
     imports_asked: HashSet<Url>,
@@ -301,6 +304,7 @@ impl PageWorld {
             record,
             restore_scroll,
             sources: std::rc::Rc::new(std::cell::RefCell::new(StyleSources::default())),
+            script_styler: None,
             imports_asked: HashSet::new(),
             sheets_asked: 0,
             links_asked: HashSet::new(),
@@ -551,13 +555,16 @@ impl PageWorld {
         // `getComputedStyle` after a change styles the tree there and then,
         // with the sheets this load has fetched so far — the ones a script
         // after a `<link>` sees in a browser.
-        if let Some(pending) = self.pending(tab) {
-            parsed.set_style_resolver(Some(std::rc::Rc::new(
-                otlyra_css::cascade::ScriptStyler::new(
-                    std::rc::Rc::clone(&pending.sources),
-                    self.script_viewport(tab),
-                ),
-            )));
+        let viewport = self.script_viewport(tab);
+        if let Some(pending) = self.pending_mut(tab) {
+            let styler = std::rc::Rc::new(otlyra_css::cascade::ScriptStyler::new(
+                std::rc::Rc::clone(&pending.sources),
+                viewport,
+            ));
+            parsed.set_style_resolver(Some(
+                std::rc::Rc::clone(&styler) as std::rc::Rc<dyn otlyra_dom::StyleResolver>
+            ));
+            pending.script_styler = Some(styler);
         }
         let blocked = match parser.as_mut() {
             Some(parser) => parser.blocked_on().is_some(),
@@ -1276,20 +1283,21 @@ impl PageWorld {
         slot.scripts = pending.runner.take();
 
         if let (Some(document), Some(url)) = (document, url) {
-            slot.page = Some(shown(
-                PageScene::with_resources(
-                    document,
-                    url,
-                    // The script styler keeps its share, so the page takes a
-                    // copy only when one is still held.
-                    std::rc::Rc::try_unwrap(pending.sources)
-                        .map(std::cell::RefCell::into_inner)
-                        .unwrap_or_else(|shared| shared.borrow().clone()),
-                    pending.images,
-                    pending.picture_sources,
-                ),
-                interface,
-            ));
+            let mut page = PageScene::with_resources(
+                document,
+                url,
+                // The script styler keeps its share, so the page takes a
+                // copy only when one is still held.
+                std::rc::Rc::try_unwrap(pending.sources)
+                    .map(std::cell::RefCell::into_inner)
+                    .unwrap_or_else(|shared| shared.borrow().clone()),
+                pending.images,
+                pending.picture_sources,
+            );
+            if let Some(styler) = pending.script_styler {
+                page.set_script_styler(styler);
+            }
+            slot.page = Some(shown(page, interface));
         }
         slot.generation = generation;
         slot.swept_at_build = None;

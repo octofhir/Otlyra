@@ -56,6 +56,28 @@ pub trait StyleResolver {
     fn resolve(&self, document: &Document) -> Option<std::sync::Arc<dyn ComputedStyles>>;
 }
 
+/// Lays a document out as it stands, for script that measures after changing
+/// it.
+///
+/// `getBoundingClientRect` after an insertion measures the element where it
+/// now is, not where the last frame drew the tree before it. Layout lives
+/// above this crate, so whoever lends the document to script says how.
+pub trait GeometryResolver {
+    /// Every laid-out node's border box, `[left, top, right, bottom]` in
+    /// client coordinates, for `document` as it is now — or `None` when it
+    /// cannot be laid out now, and the last frame's answer stands.
+    fn resolve(
+        &self,
+        document: &Document,
+    ) -> Option<std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>>;
+}
+
+impl std::fmt::Debug for dyn GeometryResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GeometryResolver")
+    }
+}
+
 impl std::fmt::Debug for dyn StyleResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StyleResolver")
@@ -91,6 +113,10 @@ pub struct Document {
     /// Each laid-out element's border box on the last frame, `[left, top,
     /// right, bottom]` in client coordinates, as script measures it.
     geometry: std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>,
+    /// The mutation count of the tree `geometry` was laid out from.
+    geometry_at: u64,
+    /// How to lay the tree out again when script measures after changing it.
+    geometry_resolver: Option<std::rc::Rc<dyn GeometryResolver>>,
     /// How many times the tree has been changed: what tells a styling of it
     /// from one of an older tree.
     mutations: u64,
@@ -141,6 +167,8 @@ impl Document {
             focused: None,
             scroll: (0.0, 0.0),
             geometry: std::sync::Arc::default(),
+            geometry_at: 0,
+            geometry_resolver: None,
             mutations: 0,
             computed: None,
             style_resolver: None,
@@ -336,13 +364,16 @@ impl Document {
         self.quirks_mode = mode;
     }
 
-    /// `node`'s border box on the last frame, in client coordinates.
-    pub fn client_rect(&self, node: NodeId) -> Option<[f32; 4]> {
+    /// `node`'s border box in client coordinates, laid out again first if
+    /// the tree changed since the last layout and a resolver can.
+    pub fn client_rect(&mut self, node: NodeId) -> Option<[f32; 4]> {
+        self.refresh_geometry();
         self.geometry.get(&node).copied()
     }
 
     /// The bottom-right corner of everything laid out, in client coordinates.
-    pub fn laid_out_extent(&self) -> (f32, f32) {
+    pub fn laid_out_extent(&mut self) -> (f32, f32) {
+        self.refresh_geometry();
         self.geometry
             .values()
             .fold((0.0, 0.0), |(right, bottom), rect| {
@@ -393,12 +424,40 @@ impl Document {
         self.computed.as_ref()?.1.value(node, property)
     }
 
-    /// Hand over the last frame's element boxes.
+    /// Hand over the last frame's element boxes, laid out from the tree at
+    /// mutation count `at`.
     pub fn set_geometry(
         &mut self,
         geometry: std::sync::Arc<std::collections::HashMap<NodeId, [f32; 4]>>,
+        at: u64,
     ) {
         self.geometry = geometry;
+        self.geometry_at = at;
+    }
+
+    /// Say how to lay the tree out again for script, or that it cannot be.
+    pub fn set_geometry_resolver(&mut self, resolver: Option<std::rc::Rc<dyn GeometryResolver>>) {
+        self.geometry_resolver = resolver;
+    }
+
+    /// Whether script measuring now would be answered from a layout of the
+    /// tree as it is.
+    pub fn has_geometry_resolver(&self) -> bool {
+        self.geometry_resolver.is_some()
+    }
+
+    /// Lay the tree out again if it changed since the boxes script reads were
+    /// laid out (CSSOM View: measuring flushes layout).
+    fn refresh_geometry(&mut self) {
+        if self.geometry_at == self.mutations {
+            return;
+        }
+        if let Some(resolver) = self.geometry_resolver.clone()
+            && let Some(geometry) = resolver.resolve(self)
+        {
+            self.geometry = geometry;
+            self.geometry_at = self.mutations;
+        }
     }
 
     /// Where the window is scrolled to, `(x, y)` in CSS pixels.

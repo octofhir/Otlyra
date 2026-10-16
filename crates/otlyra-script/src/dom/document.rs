@@ -422,7 +422,7 @@ impl DocumentRef {
     /// client coordinates.
     #[getter(name = "__otlyraExtent")]
     fn js_extent(&self) -> Result<Vec<f64>, JsError> {
-        super::with_document(self.node.doc, |document| {
+        super::with_document_unmarked(self.node.doc, |document| {
             let (right, bottom) = document.laid_out_extent();
             vec![f64::from(right), f64::from(bottom)]
         })

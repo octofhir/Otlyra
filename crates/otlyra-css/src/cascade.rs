@@ -138,11 +138,10 @@ impl ScriptStyler {
     }
 }
 
-impl otlyra_dom::StyleResolver for ScriptStyler {
-    fn resolve(
-        &self,
-        document: &Document,
-    ) -> Option<std::sync::Arc<dyn otlyra_dom::ComputedStyles>> {
+impl ScriptStyler {
+    /// Style `document` as it is now, with the sheets fetched so far: what a
+    /// layout for script works from as well as what `getComputedStyle` reads.
+    pub fn styled(&self, document: &Document) -> Option<StyledDocument> {
         let sources = self.sources.try_borrow().ok()?;
         let sheets = author_stylesheets(document, &sources);
         let key = (
@@ -159,12 +158,22 @@ impl otlyra_dom::StyleResolver for ScriptStyler {
             _ => *parsed = Some((key, Styler::new(document, viewport, &sources))),
         }
         let styler = &mut parsed.as_mut()?.1;
-        let styled = styler.style_with(
+        Some(styler.style_with(
             document,
             document.form(),
             crate::state::Interaction::default(),
-        );
-        Some(std::sync::Arc::new(styled.snapshot()))
+        ))
+    }
+}
+
+impl otlyra_dom::StyleResolver for ScriptStyler {
+    fn resolve(
+        &self,
+        document: &Document,
+    ) -> Option<std::sync::Arc<dyn otlyra_dom::ComputedStyles>> {
+        self.styled(document).map(|styled| {
+            std::sync::Arc::new(styled.snapshot()) as std::sync::Arc<dyn otlyra_dom::ComputedStyles>
+        })
     }
 }
 
