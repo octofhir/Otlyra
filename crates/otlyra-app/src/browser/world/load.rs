@@ -510,6 +510,9 @@ impl PageWorld {
                         std::sync::Arc::clone(jar),
                     )));
                 }
+                let session =
+                    std::sync::Arc::clone(&self.slots.entry(tab).or_default().session_storage);
+                scripts.set_storage(std::sync::Arc::clone(&self.local_storage), session);
                 // `load` waits for the document's pictures and sheets, which
                 // this world fetches; it fires it in `finish_load`.
                 scripts.hold_load_event();

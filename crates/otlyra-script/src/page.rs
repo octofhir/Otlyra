@@ -75,6 +75,16 @@ impl PageScripts {
         self.state.set_cookies(cookies);
     }
 
+    /// Give `localStorage` and `sessionStorage` the browser's areas: one for
+    /// every tab, and one for this tab.
+    pub fn set_storage(
+        &mut self,
+        local: std::sync::Arc<crate::storage::StorageArea>,
+        session: std::sync::Arc<crate::storage::StorageArea>,
+    ) {
+        self.state.set_storage(local, session);
+    }
+
     /// Set the initial state before any page script runs, without an event.
     pub fn set_initial_hidden(&mut self, hidden: bool) {
         self.state.set_hidden(hidden);

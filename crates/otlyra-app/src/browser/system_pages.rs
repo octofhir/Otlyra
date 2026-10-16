@@ -244,6 +244,14 @@ impl Browser {
         match action {
             crate::cookies::Action::ClearSite(site) => {
                 self.cookies.with(|jar| jar.clear_site(&site));
+                // A site's data is its storage as much as its cookies: a
+                // token left in `localStorage` signs the reader back in.
+                self.world.forget_storage(|origin| {
+                    url::Url::parse(origin)
+                        .ok()
+                        .and_then(|url| url.host_str().map(str::to_owned))
+                        .is_some_and(|host| otlyra_net::cookie::site_of(&host) == site)
+                });
                 // Immediately, not at the next fetch: a person who asked to be rid
                 // of something should not have it on the disk while they read the
                 // page that says it is gone.
@@ -251,6 +259,7 @@ impl Browser {
             }
             crate::cookies::Action::Clear => {
                 self.cookies.with(otlyra_net::cookie::Jar::clear);
+                self.world.forget_storage(|_| true);
                 self.cookies.schedule_flush();
             }
             crate::cookies::Action::Close => self.close_system_page(),

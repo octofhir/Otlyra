@@ -72,50 +72,129 @@ defineGlobal(
 );
 
 // ---------------------------------------------------------------- Storage
-// `localStorage` and `sessionStorage` (HTML §12.2): kept in memory for as
-// long as this document is, which is what a private window gives a page. A
-// page reads what it wrote; nothing survives the page.
-const storageMaps = new WeakMap();
+// `localStorage` and `sessionStorage` (HTML §12.2). The browser keeps the
+// items: `localStorage` for every document of the origin in every tab, and
+// `sessionStorage` for the documents of one tab. A document with no origin to
+// share, or no browser, keeps its own. Items are also the object's own
+// properties (`localStorage.token`), which is how a good many pages read
+// them, so each Storage is a proxy over a plain object.
+const storageNatives = {
+  length: take(Document, '__storageLength'),
+  key: take(Document, '__storageKey'),
+  get: take(Document, '__storageGet'),
+  set: take(Document, '__storageSet'),
+  remove: take(Document, '__storageRemove'),
+  clear: take(Document, '__storageClear'),
+};
+const storageAreas = new WeakMap();
 const storageOf = (storage) => {
-  const map = storageMaps.get(storage);
-  if (!map) throw new TypeError('Illegal invocation');
-  return map;
+  const area = storageAreas.get(storage);
+  if (area === undefined) throw new TypeError('Illegal invocation');
+  return area;
 };
 class Storage {
   constructor() {
     throw new TypeError('Illegal constructor');
   }
   get length() {
-    return storageOf(this).size;
+    return storageNatives.length(storageOf(this));
   }
   key(index) {
-    const keys = [...storageOf(this).keys()];
-    return index >= 0 && index < keys.length ? keys[index] : null;
+    const area = storageOf(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'key' on 'Storage': 1 argument required");
+    return storageNatives.key(area, Number(index) >>> 0) ?? null;
   }
   getItem(key) {
-    const map = storageOf(this);
-    key = String(key);
-    return map.has(key) ? map.get(key) : null;
+    const area = storageOf(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required");
+    return storageNatives.get(area, String(key)) ?? null;
   }
   setItem(key, value) {
-    storageOf(this).set(String(key), String(value));
+    const area = storageOf(this);
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'setItem' on 'Storage': 2 arguments required");
+    try {
+      storageNatives.set(area, String(key), String(value));
+    } catch (error) {
+      throw domException(error);
+    }
   }
   removeItem(key) {
-    storageOf(this).delete(String(key));
+    const area = storageOf(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'removeItem' on 'Storage': 1 argument required");
+    storageNatives.remove(area, String(key));
   }
   clear() {
-    storageOf(this).clear();
+    storageNatives.clear(storageOf(this));
   }
 }
 Object.defineProperty(Storage.prototype, Symbol.toStringTag, { value: 'Storage', configurable: true });
 defineGlobal('Storage', Storage);
-const makeStorage = () => {
-  const storage = Object.create(Storage.prototype);
-  storageMaps.set(storage, new Map());
+// A named item is a property only where the prototype does not have one by
+// that name (WebIDL's legacy override-builtins is not set on Storage).
+const storageItemName = (key) => typeof key === 'string' && !(key in Storage.prototype);
+const makeStorage = (area) => {
+  const target = Object.create(Storage.prototype);
+  const keys = () => {
+    const out = [];
+    const length = storageNatives.length(area);
+    for (let index = 0; index < length; index += 1) out.push(storageNatives.key(area, index));
+    return out;
+  };
+  const storage = new Proxy(target, {
+    get(target, key, receiver) {
+      if (storageItemName(key)) {
+        const value = storageNatives.get(area, key);
+        if (value != null) return value;
+      }
+      return Reflect.get(target, key, receiver === storage ? target : receiver);
+    },
+    set(target, key, value, receiver) {
+      if (storageItemName(key) && receiver === storage) {
+        try {
+          storageNatives.set(area, key, String(value));
+        } catch (error) {
+          throw domException(error);
+        }
+        return true;
+      }
+      return Reflect.set(target, key, value, receiver === storage ? target : receiver);
+    },
+    has(target, key) {
+      if (storageItemName(key) && storageNatives.get(area, key) != null) return true;
+      return Reflect.has(target, key);
+    },
+    deleteProperty(target, key) {
+      if (storageItemName(key) && storageNatives.get(area, key) != null) {
+        storageNatives.remove(area, key);
+        return true;
+      }
+      return Reflect.deleteProperty(target, key);
+    },
+    defineProperty(target, key, descriptor) {
+      if (storageItemName(key) && 'value' in descriptor) {
+        storageNatives.set(area, key, String(descriptor.value));
+        return true;
+      }
+      return Reflect.defineProperty(target, key, descriptor);
+    },
+    ownKeys(target) {
+      const own = Reflect.ownKeys(target);
+      return [...keys().filter((key) => !own.includes(key)), ...own];
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (storageItemName(key)) {
+        const value = storageNatives.get(area, key);
+        if (value != null) return { value, writable: true, enumerable: true, configurable: true };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  storageAreas.set(storage, area);
+  storageAreas.set(target, area);
   return storage;
 };
-defineGlobal('localStorage', makeStorage());
-defineGlobal('sessionStorage', makeStorage());
+defineGlobal('localStorage', makeStorage(0));
+defineGlobal('sessionStorage', makeStorage(1));
 
 // ---------------------------------------------------------------- Geometry
 class DOMRectReadOnly {

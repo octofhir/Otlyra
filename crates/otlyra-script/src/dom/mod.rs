@@ -130,6 +130,13 @@ pub struct PageState {
     /// Where `document.cookie` reads and writes. `None` is a document with no
     /// cookies at all, which reads as empty and keeps nothing.
     cookies: Option<Cookies>,
+    /// `localStorage` and `sessionStorage` as the browser keeps them, shared
+    /// with the origin's other documents. `None` keeps them in
+    /// [`PageState::own_storage`].
+    storage: Option<[std::sync::Arc<crate::storage::StorageArea>; 2]>,
+    /// Storage that is this document's alone: for a document the browser
+    /// gave none, and for one with no origin to share it under.
+    own_storage: [std::sync::Arc<crate::storage::StorageArea>; 2],
     /// Whether the page has defined a custom element, so that elements the
     /// parser made since script last ran are looked at before it runs again.
     custom_elements: bool,
@@ -220,6 +227,16 @@ impl PageState {
     /// Give `document.cookie` somewhere to read and write.
     pub fn set_cookies(&mut self, cookies: std::sync::Arc<dyn DocumentCookies>) {
         self.cookies = Some(Cookies(cookies));
+    }
+
+    /// Give `localStorage` and `sessionStorage` the browser's areas, which
+    /// the origin's other documents share.
+    pub fn set_storage(
+        &mut self,
+        local: std::sync::Arc<crate::storage::StorageArea>,
+        session: std::sync::Arc<crate::storage::StorageArea>,
+    ) {
+        self.storage = Some([local, session]);
     }
 
     /// Whether script changed the document, clearing the answer.
@@ -442,6 +459,27 @@ pub(crate) fn read_cookies() -> String {
             .as_ref()
             .map(|cookies| cookies.0.read(&state.document_url))
             .unwrap_or_default()
+    })
+}
+
+/// The area `localStorage` (0) or `sessionStorage` (1) keeps this document's
+/// items in, and the origin they are kept under. Only an http(s) document
+/// shares an origin's storage; any other keeps its own for as long as it is
+/// open.
+pub(crate) fn storage_area(which: u32) -> (std::sync::Arc<crate::storage::StorageArea>, String) {
+    with_state(|state| {
+        let which = usize::from(which != 0);
+        let origin = url::Url::parse(&state.document_url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .map(|url| url.origin().ascii_serialization());
+        match (&state.storage, origin) {
+            (Some(shared), Some(origin)) => (std::sync::Arc::clone(&shared[which]), origin),
+            _ => (
+                std::sync::Arc::clone(&state.own_storage[which]),
+                String::new(),
+            ),
+        }
     })
 }
 

@@ -900,11 +900,25 @@ fn the_page_can_be_rid_of_one_site_or_of_everything() {
         }
     });
     assert_eq!(browser.cookies.with(|jar| jar.len()), 2);
+    let storage = browser.world.local_storage();
+    for origin in [
+        "https://one.test",
+        "https://www.one.test",
+        "https://two.test",
+    ] {
+        storage.set(origin, "token", "t").expect("under the quota");
+    }
 
     browser.handle_cookies_action(crate::cookies::Action::ClearSite("one.test".into()));
     assert_eq!(browser.cookies.with(|jar| jar.len()), 1);
+    assert_eq!(
+        browser.world.local_storage().origins(),
+        ["https://two.test"],
+        "the site's storage goes with its cookies"
+    );
     browser.handle_cookies_action(crate::cookies::Action::Clear);
     assert!(browser.cookies.with(|jar| jar.is_empty()));
+    assert!(browser.world.local_storage().origins().is_empty());
 }
 
 /// The switch in the preferences is the switch in the jar. Two places that

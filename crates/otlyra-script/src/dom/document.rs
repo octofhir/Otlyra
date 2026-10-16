@@ -136,6 +136,49 @@ impl DocumentRef {
         super::set_document_url(href, kind);
     }
 
+    /// How many items `localStorage` (0) or `sessionStorage` (1) keeps. Not
+    /// part of the platform: the `Storage` glue calls these.
+    #[static_method(name = "__storageLength")]
+    fn js_storage_length(which: u32) -> f64 {
+        let (area, origin) = super::storage_area(which);
+        area.length(&origin) as f64
+    }
+
+    #[static_method(name = "__storageKey")]
+    fn js_storage_key(which: u32, index: u32) -> Option<String> {
+        let (area, origin) = super::storage_area(which);
+        area.key(&origin, index as usize)
+    }
+
+    #[static_method(name = "__storageGet")]
+    fn js_storage_get(which: u32, key: String) -> Option<String> {
+        let (area, origin) = super::storage_area(which);
+        area.get(&origin, &key)
+    }
+
+    #[static_method(name = "__storageSet")]
+    fn js_storage_set(which: u32, key: String, value: String) -> Result<(), JsError> {
+        let (area, origin) = super::storage_area(which);
+        area.set(&origin, &key, &value).map_err(|_| {
+            tree::exception(
+                "QuotaExceededError",
+                format!("setting {key:?} would go over the storage quota"),
+            )
+        })
+    }
+
+    #[static_method(name = "__storageRemove")]
+    fn js_storage_remove(which: u32, key: String) {
+        let (area, origin) = super::storage_area(which);
+        area.remove(&origin, &key);
+    }
+
+    #[static_method(name = "__storageClear")]
+    fn js_storage_clear(which: u32) {
+        let (area, origin) = super::storage_area(which);
+        area.clear(&origin);
+    }
+
     /// How many nodes the document has made, for the custom element
     /// checkpoint's "anything new?" — see `custom_elements.js`.
     #[static_method(name = "__nodeCount")]

@@ -86,6 +86,9 @@ struct PageSlot {
     picture_events: Vec<(NodeId, bool)>,
     /// The page geometry its observers were last updated against.
     observed_epoch: Option<(u64, u32)>,
+    /// What `sessionStorage` keeps for this tab: the tab's documents share it,
+    /// and it goes when the tab does (HTML §12.2.2).
+    session_storage: std::sync::Arc<otlyra_script::storage::StorageArea>,
 }
 
 impl PageSlot {
@@ -214,6 +217,8 @@ pub(super) struct PageWorld {
     font_fetches: HashMap<u64, fonts::FaceLoad>,
     /// The jar `document.cookie` reads and writes, once the browser has one.
     cookie_jar: Option<otlyra_net::SharedJar>,
+    /// What `localStorage` keeps, for every origin, shared by every tab.
+    local_storage: std::sync::Arc<otlyra_script::storage::StorageArea>,
     /// Legacy elapsed clock for runners without their own document origin.
     started: std::time::Instant,
     /// What has happened that the window has not been told.
@@ -243,6 +248,7 @@ impl PageWorld {
             requested_faces: Vec::new(),
             font_fetches: HashMap::new(),
             cookie_jar: None,
+            local_storage: std::sync::Arc::default(),
             started: std::time::Instant::now(),
             events: Vec::new(),
         }
@@ -360,6 +366,21 @@ impl PageWorld {
     /// next load on.
     pub(super) fn set_cookie_jar(&mut self, jar: otlyra_net::SharedJar) {
         self.cookie_jar = Some(jar);
+    }
+
+    /// Forget what the origins `wanted` says yes to keep in `localStorage` and
+    /// in every tab's `sessionStorage`: clearing a site's data.
+    pub(super) fn forget_storage(&self, wanted: impl Fn(&str) -> bool) {
+        self.local_storage.forget(&wanted);
+        for slot in self.slots.values() {
+            slot.session_storage.forget(&wanted);
+        }
+    }
+
+    /// What `localStorage` keeps, for tests that look.
+    #[cfg(test)]
+    pub(super) fn local_storage(&self) -> &otlyra_script::storage::StorageArea {
+        &self.local_storage
     }
 
     /// Put `page` in `tab`, in place of whatever was there and of any load in
