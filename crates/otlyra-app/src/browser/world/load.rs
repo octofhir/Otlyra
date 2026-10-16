@@ -1312,27 +1312,41 @@ impl PageWorld {
     /// a navigation and earns no hop; the page keeps its document and its
     /// scripts, and only its address changes.
     fn follow_history_move(&mut self, tab: TabId) {
-        let Some(url) = self
+        let changes = self
             .slots
             .get_mut(&tab)
             .and_then(|slot| slot.scripts.as_mut())
-            .and_then(|scripts| scripts.take_url_change())
-        else {
-            return;
-        };
-        let Ok(parsed) = url::Url::parse(&url) else {
-            return;
-        };
-        let Some(page) = self.page_mut(tab) else {
-            return;
-        };
-        if page.url().origin() != parsed.origin() {
-            tracing::warn!(%url, "a history entry left its document's origin");
-            return;
+            .map(|scripts| scripts.take_url_changes())
+            .unwrap_or_default();
+        for change in changes {
+            let Ok(parsed) = url::Url::parse(&change.url) else {
+                continue;
+            };
+            let Some(page) = self.page_mut(tab) else {
+                return;
+            };
+            if page.url().origin() != parsed.origin() {
+                tracing::warn!(url = %change.url, "a history entry left its document's origin");
+                continue;
+            }
+            page.set_url(parsed);
+            self.fetcher.set_initiator(tab.0, Some(change.url.clone()));
+            self.events.push(WorldEvent::Moved {
+                tab,
+                url: change.url,
+                how: change.kind,
+            });
         }
-        page.set_url(parsed);
-        self.fetcher.set_initiator(tab.0, Some(url.clone()));
-        self.events.push(WorldEvent::Moved { tab, url });
+    }
+
+    /// Move `tab`'s document `delta` entries through the history entries it
+    /// made, for the back and forward buttons. False when it cannot, and
+    /// the entry is to be loaded instead.
+    pub(in crate::browser) fn traverse_in_page(&mut self, tab: TabId, delta: i32) -> bool {
+        self.with_page_runner(tab, |runner, document| {
+            runner.traverse_history(document, delta)
+        })
+        .unwrap_or(false)
     }
 
     /// Go where the page's script said to go.

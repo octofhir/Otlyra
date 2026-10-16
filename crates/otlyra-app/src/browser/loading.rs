@@ -143,11 +143,37 @@ impl Browser {
 
     pub(super) fn apply_world_event(&mut self, event: WorldEvent) {
         match event {
-            WorldEvent::Moved { tab, url } => {
+            WorldEvent::Moved { tab, url, how } => {
                 let Some(index) = self.tab_index(tab) else {
                     return;
                 };
-                self.tabs[index].url = url;
+                let tab = &mut self.tabs[index];
+                match how {
+                    // A new entry after this one, as a navigation makes, but
+                    // one the page will move back from itself.
+                    otlyra_html::HistoryMove::Push if !tab.history.is_empty() => {
+                        tab.position += 1;
+                        tab.history.truncate(tab.position);
+                        tab.history.push(super::tabs::HistoryEntry {
+                            url: url.clone(),
+                            scroll: 0.0,
+                            in_page: true,
+                        });
+                    }
+                    otlyra_html::HistoryMove::Replace => {
+                        if let Some(entry) = tab.history.get_mut(tab.position) {
+                            entry.url.clone_from(&url);
+                        }
+                    }
+                    otlyra_html::HistoryMove::Traverse(delta) => {
+                        let target = tab.position as isize + delta as isize;
+                        if target >= 0 && (target as usize) < tab.history.len() {
+                            tab.position = target as usize;
+                        }
+                    }
+                    otlyra_html::HistoryMove::Push | otlyra_html::HistoryMove::Followed => {}
+                }
+                tab.url = url;
             }
             WorldEvent::Failed { tab, error } => {
                 let Some(index) = self.tab_index(tab) else {

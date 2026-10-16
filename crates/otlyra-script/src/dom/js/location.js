@@ -96,10 +96,17 @@ Object.defineProperty(Document.prototype, 'location', {
 // entries it made itself with `pushState`, each with its address and its
 // state. The document is not fetched again for any of them; `location` and
 // the browser's address bar follow its URL, and moving between them fires
-// `popstate`. Going back past the first of them is the browser's back
-// button, which script does not reach yet.
+// `popstate`. The browser keeps an entry for each of them, so its back and
+// forward buttons move through them too (`__otlyraTraverse`); past the first
+// of them is the document before, which the browser loads.
 const nativeSetUrl = take(Document, '__setUrl');
 const HISTORY_LIMIT = 100;
+// How the browser is told an address moved: a new entry, the current one
+// changed, the page's own traversal by so many, or the browser's own.
+const MOVE_PUSH = 0;
+const MOVE_REPLACE = 1;
+const MOVE_TRAVERSE = 2;
+const MOVE_FOLLOWED = 3;
 let historyEntries = null;
 let historyIndex = 0;
 let scrollRestoration = 'auto';
@@ -140,6 +147,34 @@ const historyTarget = (url) => {
   return target.href;
 };
 
+// Move `step` entries, if there is an entry there; whether there was. A
+// traversal is a task of its own: `popstate` arrives after the script that
+// asked has finished.
+const traverseHistory = (step, how) => {
+  const entries = sessionEntries();
+  const next = historyIndex + step;
+  if (next < 0 || next >= entries.length) return false;
+  setTimeout(() => {
+    const from = entries[historyIndex];
+    historyIndex = next;
+    const to = entries[historyIndex];
+    nativeSetUrl(to.url, how, step);
+    globalThis.dispatchEvent(new PopStateEvent('popstate', { state: to.state }));
+    const strip = (href) => href.split('#')[0];
+    if (strip(from.url) === strip(to.url) && from.url !== to.url) {
+      globalThis.dispatchEvent(
+        new HashChangeEvent('hashchange', { oldURL: from.url, newURL: to.url }),
+      );
+    }
+  }, 0);
+  return true;
+};
+// The browser's back and forward buttons, between entries this document
+// made: the browser has moved to the entry already.
+defineGlobal('__otlyraTraverse', function __otlyraTraverse(step) {
+  return traverseHistory(Math.trunc(Number(step)) || 0, MOVE_FOLLOWED);
+});
+
 class History {
   constructor() {
     throw new TypeError('Illegal constructor');
@@ -170,14 +205,14 @@ class History {
       entries.shift();
       historyIndex -= 1;
     }
-    nativeSetUrl(href);
+    nativeSetUrl(href, MOVE_PUSH, 0);
   }
 
   replaceState(state, unused, url) {
     const entries = sessionEntries();
     const href = historyTarget(url);
     entries[historyIndex] = { url: href, state: serializeState(state) };
-    nativeSetUrl(href);
+    nativeSetUrl(href, MOVE_REPLACE, 0);
   }
 
   go(delta) {
@@ -186,24 +221,7 @@ class History {
       location.reload();
       return;
     }
-    const entries = sessionEntries();
-    const next = historyIndex + step;
-    if (next < 0 || next >= entries.length) return;
-    // A traversal is a task of its own: `popstate` arrives after the
-    // script that asked has finished.
-    setTimeout(() => {
-      const from = entries[historyIndex];
-      historyIndex = next;
-      const to = entries[historyIndex];
-      nativeSetUrl(to.url);
-      globalThis.dispatchEvent(new PopStateEvent('popstate', { state: to.state }));
-      const strip = (href) => href.split('#')[0];
-      if (strip(from.url) === strip(to.url) && from.url !== to.url) {
-        globalThis.dispatchEvent(
-          new HashChangeEvent('hashchange', { oldURL: from.url, newURL: to.url }),
-        );
-      }
-    }, 0);
+    traverseHistory(step, MOVE_TRAVERSE);
   }
 
   back() {

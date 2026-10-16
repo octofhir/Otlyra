@@ -149,7 +149,11 @@ pub(super) enum WorldEvent {
     Navigate { tab: TabId, to: ScriptNavigation },
     /// The page's script moved its document to `url` through the session
     /// history, without a load.
-    Moved { tab: TabId, url: String },
+    Moved {
+        tab: TabId,
+        url: String,
+        how: otlyra_html::HistoryMove,
+    },
 }
 
 /// Where a page's script asked to go, resolved against the page.

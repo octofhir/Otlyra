@@ -220,9 +220,18 @@ pub trait ScriptRunner {
 
     /// Where the session history moved the document without loading it —
     /// `history.pushState`, `replaceState`, a traversal between entries the
-    /// document made — if it moved since the last time this was asked.
-    fn take_url_change(&mut self) -> Option<String> {
-        None
+    /// document made — since the last time this was asked, in order.
+    fn take_url_changes(&mut self) -> Vec<UrlChange> {
+        Vec::new()
+    }
+
+    /// Move the document `delta` entries through the session history entries
+    /// it made itself, as the browser's back and forward buttons do. False
+    /// when it has no such entry there — it was loaded again since — and the
+    /// browser loads the entry instead.
+    fn traverse_history(&mut self, document: &mut Document, delta: i32) -> bool {
+        let _ = (document, delta);
+        false
     }
 
     /// Run the animation-frame callbacks the page asked for.
@@ -322,6 +331,28 @@ pub trait ScriptRunner {
     ) {
         let _ = (document, id, response);
     }
+}
+
+/// The document's address moving without a load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrlChange {
+    /// The document's address now.
+    pub url: String,
+    /// What moved it.
+    pub kind: HistoryMove,
+}
+
+/// How a document's address moved without a load (HTML §7.4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryMove {
+    /// `pushState`: a new entry after the current one, which drops any after it.
+    Push,
+    /// `replaceState`: the current entry's address changed.
+    Replace,
+    /// The page's own `history.go`/`back`/`forward`, by this many entries.
+    Traverse(i32),
+    /// A traversal the browser asked for, whose entry it already moved to.
+    Followed,
 }
 
 /// A request a page's script made, as the browser is to send it.

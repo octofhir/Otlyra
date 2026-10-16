@@ -88,6 +88,29 @@ impl Browser {
         };
 
         self.remember_scroll();
+        // Between entries the page made itself, the page moves: it fires
+        // `popstate` and shows the state it kept, and nothing is loaded. Only
+        // when it no longer has them — it was loaded again since — does the
+        // entry load.
+        let tab = &self.tabs[self.active];
+        let (low, high) = if target < tab.position {
+            (target, tab.position)
+        } else {
+            (tab.position, target)
+        };
+        let same_document = (low + 1..=high).all(|index| tab.history[index].in_page);
+        let id = tab.id;
+        if same_document
+            && self
+                .world
+                .traverse_in_page(id, (target as isize - tab.position as isize) as i32)
+        {
+            let tab = &mut self.tabs[self.active];
+            tab.position = target;
+            tab.url = entry.url.clone();
+            self.apply_world_events();
+            return;
+        }
         self.tabs[self.active].position = target;
         // The entry was reached once, so its scheme was allowed once; going back to
         // it is the reader's own request and not the page's.
@@ -315,6 +338,7 @@ impl Browser {
         tab.history.push(HistoryEntry {
             url: tab.url.clone(),
             scroll: 0.0,
+            in_page: false,
         });
         tab.position = tab.history.len() - 1;
 

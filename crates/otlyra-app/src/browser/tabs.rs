@@ -17,6 +17,10 @@ pub struct HistoryEntry {
     /// How far down the reader had got when they left it. Restored on the way
     /// back, which is the difference between going back and starting over.
     pub scroll: f32,
+    /// Whether the entry before this one is the same document: the page made
+    /// this one with `pushState`, and back from here is the page's to take,
+    /// not a load.
+    pub in_page: bool,
 }
 
 /// One tab.

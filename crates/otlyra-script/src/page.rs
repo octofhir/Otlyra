@@ -483,10 +483,26 @@ impl PageScripts {
         self.state.take_navigation()
     }
 
-    /// Where `history.pushState` or `replaceState` moved the document since
-    /// the browser last asked, without a load.
-    pub fn take_url_change(&mut self) -> Option<String> {
-        self.state.take_url_change()
+    /// Where `history.pushState`, `replaceState` and the page's own
+    /// traversals moved the document since the browser last asked, without a
+    /// load, in order.
+    pub fn take_url_changes(&mut self) -> Vec<otlyra_html::UrlChange> {
+        self.state.take_url_changes()
+    }
+
+    /// Move the document `delta` entries through the session history entries
+    /// it made, for the browser's back and forward buttons. False when it has
+    /// no entry there.
+    pub fn traverse_history(&mut self, document: &mut Document, delta: i32) -> bool {
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return false;
+        };
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script(&format!("__otlyraTraverse({delta})"), "<history>")
+        });
+        self.absorb_turn();
+        outcome.is_ok_and(|outcome| outcome.completion == "true")
     }
 
     /// Run this page's deferred work to a standstill, or until `budget` is
@@ -709,8 +725,12 @@ impl ScriptRunner for PageScripts {
         PageScripts::take_navigation(self)
     }
 
-    fn take_url_change(&mut self) -> Option<String> {
-        PageScripts::take_url_change(self)
+    fn take_url_changes(&mut self) -> Vec<otlyra_html::UrlChange> {
+        PageScripts::take_url_changes(self)
+    }
+
+    fn traverse_history(&mut self, document: &mut Document, delta: i32) -> bool {
+        PageScripts::traverse_history(self, document, delta)
     }
 
     fn take_page_requests(&mut self) -> Vec<otlyra_html::PageRequest> {

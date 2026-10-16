@@ -126,8 +126,14 @@ impl DocumentRef {
     /// `history.pushState` does to the URL. Not part of the platform; the
     /// glue checks the address first.
     #[static_method(name = "__setUrl")]
-    fn js_set_url(href: String) {
-        super::set_document_url(href);
+    fn js_set_url(href: String, kind: u32, delta: f64) {
+        let kind = match kind {
+            0 => otlyra_html::HistoryMove::Push,
+            1 => otlyra_html::HistoryMove::Replace,
+            2 => otlyra_html::HistoryMove::Traverse(delta as i32),
+            _ => otlyra_html::HistoryMove::Followed,
+        };
+        super::set_document_url(href, kind);
     }
 
     /// How many nodes the document has made, for the custom element

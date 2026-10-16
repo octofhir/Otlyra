@@ -27,8 +27,8 @@ pub mod encoding;
 pub mod prescan;
 
 pub use driver::{
-    ExternalSources, HtmlParser, ModuleResponse, Navigation, PageRequest, PageResponse,
-    ScriptRunner, is_javascript_mime,
+    ExternalSources, HistoryMove, HtmlParser, ModuleResponse, Navigation, PageRequest,
+    PageResponse, ScriptRunner, UrlChange, is_javascript_mime,
 };
 pub use encoding::{DEFAULT_ENCODING, EncodingDecision, EncodingSource, determine};
 pub use prescan::{prescan, prescan_module_scripts, prescan_scripts};

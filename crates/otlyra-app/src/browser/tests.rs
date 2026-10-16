@@ -4629,6 +4629,65 @@ fn script_measures_the_boxes_the_page_drew() {
     });
 }
 
+/// Back and forward move through the entries a page made with `pushState`
+/// without loading it again: the page hears `popstate` with the state it
+/// kept, and the address follows.
+#[test]
+fn back_and_forward_move_through_the_entries_a_page_pushed() {
+    on_content_stack(|| {
+        let (mut browser, requested) = input_page(
+            "<body><script>\
+               window.loads = (window.loads || 0) + 1;\
+               const heard = [];\
+               addEventListener('popstate', (event) => {\
+                 heard.push(JSON.stringify(event.state) + '@' + location.pathname + ':' + window.loads);\
+                 document.documentElement.dataset.log = heard.join(' ');\
+               });\
+               history.pushState({ page: 1 }, '', '/one');\
+               history.pushState({ page: 2 }, '', '/two');\
+             </script>",
+        );
+        let viewport = Viewport::new(800, 600, 1.0);
+        let pump = |browser: &mut Browser| {
+            for _ in 0..3 {
+                browser.prepare_frame(viewport, std::time::Duration::from_millis(50));
+            }
+        };
+        pump(&mut browser);
+        assert_eq!(
+            browser.tabs[browser.active].url,
+            "https://input.example/two"
+        );
+        assert!(browser.can_go_back());
+        let loads_before = requested.lock().expect("requests").len();
+
+        browser.go_back();
+        pump(&mut browser);
+        assert_eq!(
+            browser.tabs[browser.active].url,
+            "https://input.example/one"
+        );
+        assert_eq!(page_log(&browser), "{\"page\":1}@/one:1");
+
+        browser.go_back();
+        pump(&mut browser);
+        assert_eq!(browser.tabs[browser.active].url, "https://input.example/");
+        assert_eq!(page_log(&browser), "{\"page\":1}@/one:1 null@/:1");
+
+        browser.go_forward();
+        pump(&mut browser);
+        assert_eq!(
+            browser.tabs[browser.active].url,
+            "https://input.example/one"
+        );
+        assert_eq!(
+            requested.lock().expect("requests").len(),
+            loads_before,
+            "nothing was loaded again"
+        );
+    });
+}
+
 /// A rule script inserts into a `<style>` element's sheet styles the page,
 /// as styled-components does.
 #[test]

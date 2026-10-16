@@ -135,7 +135,7 @@ pub struct PageState {
     custom_elements: bool,
     /// Where `history.pushState` or `replaceState` moved the document, for
     /// the browser to show; the document itself was not fetched again.
-    url_change: Option<String>,
+    url_changes: Vec<otlyra_html::UrlChange>,
     /// Requests `fetch` and `XMLHttpRequest` made that the browser has not
     /// taken yet, and the number the next one gets.
     page_requests: Vec<otlyra_html::PageRequest>,
@@ -285,8 +285,8 @@ impl PageState {
 
     /// Where the session history moved the document without a load, if it
     /// moved since the browser last asked.
-    pub fn take_url_change(&mut self) -> Option<String> {
-        self.url_change.take()
+    pub fn take_url_changes(&mut self) -> Vec<otlyra_html::UrlChange> {
+        std::mem::take(&mut self.url_changes)
     }
 
     /// Where script asked to go, if it asked.
@@ -369,10 +369,10 @@ pub(crate) fn document_url() -> String {
 
 /// `history.pushState` and its kin moved the document to `url`, which the
 /// caller already checked is same-origin.
-pub(crate) fn set_document_url(url: String) {
+pub(crate) fn set_document_url(url: String, kind: otlyra_html::HistoryMove) {
     with_state_mut(|state| {
         state.document_url.clone_from(&url);
-        state.url_change = Some(url);
+        state.url_changes.push(otlyra_html::UrlChange { url, kind });
     });
 }
 
