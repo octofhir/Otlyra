@@ -24,6 +24,7 @@ impl AsyncLoader for Pending {
         _: Option<Body>,
         _: CacheMode,
         _: Vec<(String, String)>,
+        _context: crate::fetcher::RequestContext,
     ) -> Fetching {
         Box::pin(async move {
             self.live.fetch_add(1, Ordering::SeqCst);
@@ -107,6 +108,7 @@ fn an_async_transport_panic_delivers_a_failure_and_wakes_the_owner() {
             _: Option<Body>,
             _: CacheMode,
             _: Vec<(String, String)>,
+            _context: crate::fetcher::RequestContext,
         ) -> Fetching {
             Box::pin(async { panic!("injected async transport failure") })
         }

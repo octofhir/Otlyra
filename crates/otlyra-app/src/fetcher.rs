@@ -133,6 +133,8 @@ pub struct Held {
     owner: u64,
     /// The headers it was made with.
     headers: Vec<(String, String)>,
+    /// Who caused it.
+    context: RequestContext,
 }
 
 /// What a driver changed about a held request before letting it go.
@@ -322,13 +324,32 @@ pub trait AsyncLoader: Send + Sync + 'static {
     /// `headers` are what a caller wants on the request over and above what the
     /// transport puts there itself. Empty for everything the browser fetches on
     /// its own; a driver rewriting a held request is what fills it.
+    ///
+    /// `context` says who caused it, which the transport needs for `SameSite`.
     fn fetch(
         self: Arc<Self>,
         url: String,
         body: Option<Body>,
         cache: CacheMode,
         headers: Vec<(String, String)>,
+        context: RequestContext,
     ) -> Fetching;
+}
+
+/// Who caused a request, which is what decides the cookies it carries.
+///
+/// `SameSite` (RFC 6265bis §5.2) is a question about the page that caused a
+/// request and the address it goes to, and only the browser knows the page: a
+/// transport looking at a URL cannot tell a picture on another site from a
+/// link the reader typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestContext {
+    /// The address of the page that caused it. `None` is nobody: a typed
+    /// address, a bookmark, a session restored.
+    pub initiator: Option<String>,
+    /// Whether it is a top-level navigation the reader will be looking at,
+    /// rather than something a page loads into itself.
+    pub navigation: bool,
 }
 
 /// A blocking [`Loader`] made to look like an [`AsyncLoader`].
@@ -346,6 +367,7 @@ impl<L: Loader> AsyncLoader for Blocking<L> {
         body: Option<Body>,
         cache: CacheMode,
         headers: Vec<(String, String)>,
+        _context: RequestContext,
     ) -> Fetching {
         // A canned loader has nothing to cache and nothing to bypass, and no
         // socket to put a header on. Taken rather than ignored silently, so a
@@ -476,6 +498,9 @@ pub struct Fetcher {
     /// The requests being held, oldest first.
     held: Vec<Held>,
     next: u64,
+    /// The address of the page each owner — a tab — is showing: what its
+    /// requests are caused by.
+    initiators: HashMap<u64, String>,
 }
 
 impl std::fmt::Debug for Fetcher {
@@ -521,6 +546,7 @@ impl Fetcher {
             gate: None,
             held: Vec::new(),
             next: 0,
+            initiators: HashMap::new(),
         }
     }
 
@@ -534,6 +560,44 @@ impl Fetcher {
     /// Ask for `url`. The number returned is what the result will carry.
     pub fn request(&mut self, url: &str, kind: ResourceKind) -> u64 {
         self.send(url, kind, None)
+    }
+
+    /// Say which page `owner` — a tab — is showing, whose address its requests
+    /// from now on are caused by, or that it shows none.
+    pub fn set_initiator(&mut self, owner: u64, page: Option<String>) {
+        match page {
+            Some(page) => {
+                self.initiators.insert(owner, page);
+            }
+            None => {
+                self.initiators.remove(&owner);
+            }
+        }
+    }
+
+    /// Navigate `owner` to `url`: a document, caused by `initiator` — the page
+    /// that sent the reader, or `None` when the reader did.
+    pub fn navigate(
+        &mut self,
+        owner: u64,
+        url: &str,
+        body: Option<Body>,
+        cache: CacheMode,
+        initiator: Option<String>,
+    ) -> u64 {
+        let context = RequestContext {
+            initiator,
+            navigation: true,
+        };
+        self.fetch_in_context(
+            owner,
+            url,
+            ResourceKind::Document,
+            body,
+            cache,
+            Vec::new(),
+            context,
+        )
     }
 
     /// Ask for `url` on `owner`'s behalf: a tab, whose requests wait in lanes of
@@ -585,6 +649,28 @@ impl Fetcher {
         body: Option<Body>,
         cache: CacheMode,
         headers: Vec<(String, String)>,
+    ) -> u64 {
+        // A document is asked for by `navigate`, which knows who sent the
+        // reader; everything else is caused by the page the owner shows.
+        let context = RequestContext {
+            initiator: (kind != ResourceKind::Document)
+                .then(|| self.initiators.get(&owner).cloned())
+                .flatten(),
+            navigation: kind == ResourceKind::Document,
+        };
+        self.fetch_in_context(owner, url, kind, body, cache, headers, context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_in_context(
+        &mut self,
+        owner: u64,
+        url: &str,
+        kind: ResourceKind,
+        body: Option<Body>,
+        cache: CacheMode,
+        headers: Vec<(String, String)>,
+        context: RequestContext,
     ) -> u64 {
         self.next += 1;
         let id = self.next;
@@ -639,11 +725,21 @@ impl Fetcher {
                 cache,
                 owner,
                 headers: headers.clone(),
+                context: context.clone(),
             });
             return id;
         }
 
-        self.launch(id, owner, kind, url.to_owned(), body, cache, headers);
+        self.launch(
+            id,
+            owner,
+            kind,
+            url.to_owned(),
+            body,
+            cache,
+            headers,
+            context,
+        );
         id
     }
 
@@ -702,6 +798,7 @@ impl Fetcher {
             } else {
                 change.headers
             },
+            held.context,
         );
         true
     }
@@ -768,6 +865,7 @@ impl Fetcher {
         body: Option<Body>,
         cache: CacheMode,
         headers: Vec<(String, String)>,
+        context: RequestContext,
     ) {
         let loader = Arc::clone(&self.loader);
         let lane = self.lanes.lane(owner, kind, &url);
@@ -791,7 +889,9 @@ impl Fetcher {
                 };
                 let started = std::time::Instant::now();
                 completion.started = Some(started);
-                let mut result = loader.fetch(url.clone(), body, cache, headers).await;
+                let mut result = loader
+                    .fetch(url.clone(), body, cache, headers, context)
+                    .await;
                 let took = started.elapsed();
                 // A picture is decoded here, on the pool the blocking work goes to,
                 // so that what reaches the window's thread is ready to draw.
@@ -1107,6 +1207,7 @@ mod tests {
                 body: Option<Body>,
                 _cache: CacheMode,
                 _headers: Vec<(String, String)>,
+                _context: RequestContext,
             ) -> Fetching {
                 Box::pin(async move {
                     assert!(body.is_none(), "nothing here posts");
@@ -1285,6 +1386,7 @@ mod tests {
             _body: Option<Body>,
             _cache: CacheMode,
             _headers: Vec<(String, String)>,
+            _context: RequestContext,
         ) -> Fetching {
             Box::pin(async move {
                 if url.contains("stuck.test") {
@@ -1396,6 +1498,88 @@ mod tests {
         assert!(
             settles(|| lane.available_permits() == FETCH_CONCURRENCY - 1),
             "only the request still wanted holds a place"
+        );
+    }
+
+    /// A transport that answers at once and remembers who caused each
+    /// request.
+    struct Witness(Arc<Mutex<Vec<(String, RequestContext)>>>);
+
+    impl AsyncLoader for Witness {
+        fn fetch(
+            self: Arc<Self>,
+            url: String,
+            _body: Option<Body>,
+            _cache: CacheMode,
+            _headers: Vec<(String, String)>,
+            context: RequestContext,
+        ) -> Fetching {
+            self.0.lock().unwrap().push((url.clone(), context));
+            Box::pin(async move {
+                Ok(Loaded {
+                    final_url: url,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// What a tab asks for is caused by the page it shows, and a navigation
+    /// says it is one: the two facts `SameSite` is decided on.
+    #[test]
+    fn requests_carry_the_page_that_caused_them() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut fetcher = Fetcher::spawn_async(Witness(Arc::clone(&seen)));
+        fetcher.navigate(7, "https://site.test/", None, CacheMode::Default, None);
+        fetcher.set_initiator(7, Some("https://site.test/".to_owned()));
+        fetcher.request_for(7, "https://cdn.test/a.png", ResourceKind::Image);
+        fetcher.request_for(8, "https://cdn.test/b.png", ResourceKind::Image);
+        fetcher.navigate(
+            7,
+            "https://bank.test/transfer",
+            Some(Body {
+                content_type: "application/x-www-form-urlencoded".to_owned(),
+                bytes: b"to=me".to_vec(),
+            }),
+            CacheMode::Default,
+            Some("https://site.test/".to_owned()),
+        );
+        drain(&mut fetcher, 4);
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let page = || Some("https://site.test/".to_owned());
+        assert_eq!(
+            seen,
+            [
+                (
+                    "https://bank.test/transfer".to_owned(),
+                    RequestContext {
+                        initiator: page(),
+                        navigation: true
+                    }
+                ),
+                (
+                    "https://cdn.test/a.png".to_owned(),
+                    RequestContext {
+                        initiator: page(),
+                        navigation: false
+                    }
+                ),
+                (
+                    "https://cdn.test/b.png".to_owned(),
+                    RequestContext {
+                        initiator: None,
+                        navigation: false
+                    }
+                ),
+                (
+                    "https://site.test/".to_owned(),
+                    RequestContext {
+                        initiator: None,
+                        navigation: true
+                    }
+                ),
+            ]
         );
     }
 }

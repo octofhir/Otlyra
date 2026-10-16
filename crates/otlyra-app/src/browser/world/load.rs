@@ -283,9 +283,14 @@ impl PageWorld {
         let started = std::time::Instant::now();
         // A load this one replaces is one nobody will read.
         self.cancel_load(tab);
-        let id = self
-            .fetcher
-            .fetch_for(tab.0, url, ResourceKind::Document, body, cache);
+        // A form's post comes from the page that holds the form, which is what
+        // keeps a cross-site post from carrying the reader's `SameSite`
+        // cookies. A plain navigation is taken as the reader's own.
+        let initiator = body
+            .is_some()
+            .then(|| previous_url.clone())
+            .filter(|page| !page.is_empty());
+        let id = self.fetcher.navigate(tab.0, url, body, cache, initiator);
         let slot = self.slots.entry(tab).or_default();
         slot.viewport_zoom = Some(self.environment.page_zoom);
         slot.pending = Some(PendingLoad {
@@ -483,6 +488,8 @@ impl PageWorld {
             &loaded.bytes,
         );
         let final_url = loaded.final_url;
+        // What this document asks for from now on is caused by it.
+        self.fetcher.set_initiator(tab.0, Some(final_url.clone()));
         tracing::debug!(kind = sniffed.essence(), url = %final_url, "response sniffed");
         // The page's own code runs at the parser's script points, in an isolate
         // of this document's own with no capabilities. The parse begins here and
@@ -1336,6 +1343,7 @@ impl PageWorld {
             return;
         }
         page.set_url(parsed);
+        self.fetcher.set_initiator(tab.0, Some(url.clone()));
         self.events.push(WorldEvent::Moved { tab, url });
     }
 

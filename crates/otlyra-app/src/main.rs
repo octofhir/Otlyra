@@ -962,6 +962,7 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
         body: Option<otlyra_net::Body>,
         cache: otlyra_net::CacheMode,
         headers: Vec<(String, String)>,
+        context: otlyra_app::fetcher::RequestContext,
     ) -> otlyra_app::fetcher::Fetching {
         Box::pin(async move {
             // A path typed into the address bar becomes the `file:` URL it names, so
@@ -1015,6 +1016,17 @@ impl otlyra_app::fetcher::AsyncLoader for NetLoader {
             }
             .caching(cache)
             .with_headers(headers);
+            // Who caused it, which is what `SameSite` and the third-party
+            // switch are decided against.
+            let request = match context.initiator.as_deref().map(url::Url::parse) {
+                Some(Ok(initiator)) => request.from(initiator),
+                _ => request,
+            };
+            let request = if context.navigation {
+                request.navigating()
+            } else {
+                request
+            };
             // The transport on the browser's own runtime: no thread is held while
             // the server thinks, and no runtime is created to wait for it.
             let resource = loader

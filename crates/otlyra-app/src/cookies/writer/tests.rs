@@ -376,6 +376,7 @@ fn transport_cancellation_finishes_before_the_final_cookie_snapshot() {
             _: Option<otlyra_net::Body>,
             _: otlyra_net::CacheMode,
             _: Vec<(String, String)>,
+            _context: crate::fetcher::RequestContext,
         ) -> crate::fetcher::Fetching {
             Box::pin(async move {
                 let _on_cancel = OnCancel {

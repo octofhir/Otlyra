@@ -378,6 +378,7 @@ impl PageWorld {
     /// Forget `tab`: its document, its scripts and whatever it was waiting for.
     pub(super) fn close(&mut self, tab: TabId) {
         self.cancel_fetches(tab);
+        self.fetcher.set_initiator(tab.0, None);
         self.slots.remove(&tab);
     }
 
