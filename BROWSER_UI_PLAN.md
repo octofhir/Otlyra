@@ -267,10 +267,11 @@ clicks and wheel events. What is left:
   (the visually-hidden pattern) paint nothing.
 - [x] `fetch` and `XMLHttpRequest` through the browser's fetcher, with the
   CORS read check on cross-origin answers.
+- [x] Every request carries the page that caused it, so `SameSite` and the
+  third-party switch apply to subresources, page requests and form posts
+  (`tools/cookie-smoke.py`). `::placeholder` styles.
 - [ ] Page requests: streaming and binary bodies, methods other than
-  GET/HEAD/POST, preflight, synchronous XHR, and an initiator for the
-  loader so `SameSite` and third-party cookies apply to subresources and page
-  requests (today every request is treated as same-site).
+  GET/HEAD/POST, preflight, synchronous XHR.
 - [ ] `attachShadow`/`ElementInternals`, `DOMParser`, persistent
   `localStorage`, and session history across documents (the back button
   over `pushState` entries).

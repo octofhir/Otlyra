@@ -1413,6 +1413,37 @@ same-site for cookies.
 - **Smokes.** Modules 9/9 and BiDi 4/4. The two-tab load took 0.22 s, and
   cookies stayed as before.
 
+## Cookies follow the page that caused a request
+
+The loader has always decided `SameSite` and the third-party switch from the
+initiator of a request, but the browser never passed one. Every request
+counted as the reader's own and carried every cookie. A picture or a `fetch`
+on one site sent another site's `Lax` cookies, and a cross-site form post
+carried the reader's session, which is the CSRF that `Lax` exists to stop.
+
+`AsyncLoader::fetch` now takes a `RequestContext`. Each request is marked as
+follows:
+
+- A tab's subresources and page requests carry the page it shows
+  (`Fetcher::set_initiator`, set when the document arrives).
+- A navigation is marked as one.
+- A form post carries the page that held the form.
+
+`tools/cookie-smoke.py` checks it over BiDi, with `localhost` and
+`127.0.0.1` as two sites. The build before this sent the `Lax` cookie with
+the cross-site picture and with the form post.
+
+## ::placeholder
+
+GitHub's sign-up field hides its placeholder (`::placeholder { opacity: 0 }`)
+until the field has the focus, and shows a floating label instead. We drew
+the placeholder in the field's own colour, over the label.
+
+- Stylo now computes `::placeholder` lazily, for fields that have a
+  placeholder.
+- The text is drawn in that colour, scaled by the rule's opacity.
+- A UA rule supplies the usual grey, `#757575`.
+
 ## What the reference browsers do
 
 ### Chromium
