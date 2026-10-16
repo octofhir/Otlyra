@@ -1444,6 +1444,41 @@ the placeholder in the field's own colour, over the label.
 - The text is drawn in that colour, scaled by the rule's opacity.
 - A UA rule supplies the usual grey, `#757575`.
 
+## Shadow DOM
+
+Lit, and every component library built on it, renders into shadow roots.
+Without `attachShadow` lit.dev threw 34 errors and drew nothing of its
+components.
+
+- The DOM keeps shadow roots beside the tree (`otlyra-dom/src/shadow.rs`):
+  the host of each root, its mode, slot assignment by name, the flat tree
+  (`flat_children`/`flat_parent`), `is_connected` across roots, and the text
+  of the sheets a root adopts.
+- `<template shadowrootmode>` attaches a declarative root as the parser
+  meets it (`DomSink::attach_declarative_shadow`).
+- Stylo sees the flat tree: traversal goes through hosts and slots, and each
+  root gets its own cascade data built from its `<style>` elements and
+  adopted sheets, cached by text. `:host`, `::slotted` and `::part` match, and
+  styles do not cross a root in either direction. Layout walks the same flat
+  tree. `slot` is `display: contents`.
+- Script gets `attachShadow` (with the valid-host check), `shadowRoot` (open
+  roots only), `ShadowRoot` with `innerHTML`/`getHTML`/`adoptedStyleSheets`,
+  `assignedSlot`, `assignedNodes`/`assignedElements`, and `getRootNode`.
+  Events climb from a root to its host. The custom element walks descend into
+  shadow trees, so a component built inside another is upgraded and connected.
+- Constructable `CSSStyleSheet` (`replace`, `replaceSync`, `insertRule`,
+  `deleteRule`, `cssRules`), which Lit uses whenever `adoptedStyleSheets`
+  exists.
+- `:defined` matches only elements that are built in or upgraded. Before
+  this, every element matched, and `mwc-drawer:not(:defined){display:none}`
+  left lit.dev's mobile menu drawn over the desktop page.
+- `DOMParser` is an approximation: a detached `html`/`head`/`body` object with
+  the queries a page reaches for, not a second `Document`.
+
+Not done: event retargeting (a listener outside a root sees the inner
+target), `slotchange`, `document.adoptedStyleSheets` (stored, not applied),
+`ElementInternals`, and imperative slot assignment.
+
 ## What the reference browsers do
 
 ### Chromium

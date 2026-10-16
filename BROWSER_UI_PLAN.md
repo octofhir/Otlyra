@@ -249,8 +249,7 @@ clicks and wheel events. What is left:
 - [x] `customElements` (see the [web platform batch](docs/browser-rendering-research.md#web-platform-batch-after-modules)):
   define/get/getName/whenDefined/upgrade, upgrades of parsed, cloned and
   markup-made elements, connected/disconnected/attributeChanged reactions.
-  Shadow trees, customized built-ins and form-associated elements are not
-  there.
+  Customized built-ins and form-associated elements are not there.
 - [x] `document.cookie` over the browser's jar (HttpOnly hidden and
   protected), `history` within one document (`pushState`/`replaceState`/
   traversal with `popstate`, address bar follows), `requestIdleCallback`, and
@@ -272,9 +271,15 @@ clicks and wheel events. What is left:
   (`tools/cookie-smoke.py`). `::placeholder` styles.
 - [ ] Page requests: streaming and binary bodies, methods other than
   GET/HEAD/POST, preflight, synchronous XHR.
-- [ ] `attachShadow`/`ElementInternals`, `DOMParser`, persistent
-  `localStorage`, and session history across documents (the back button
-  over `pushState` entries).
+- [x] Shadow DOM (see [the audit](docs/browser-rendering-research.md#shadow-dom)):
+  open, closed and declarative roots, slots, scoped styles with `:host`/
+  `::slotted`/`::part`, adopted constructable sheets, `:defined`. Lit
+  components render.
+- [ ] Shadow DOM follow-ups: event retargeting, `slotchange`,
+  `document.adoptedStyleSheets`, `ElementInternals`.
+- [ ] A real `DOMParser` (a second document), persistent `localStorage`, and
+  session history across documents (the back button over `pushState`
+  entries).
 - [ ] Module follow-ups: `modulepreload` links, CORS and `crossorigin`/
   `integrity`/`referrerpolicy` on module fetches, JSON/CSS module types from
   the network, dynamically inserted module scripts, and moving the request
