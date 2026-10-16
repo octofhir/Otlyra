@@ -77,6 +77,13 @@ pub(super) struct PictureFetch {
     density: f32,
 }
 
+impl PictureFetch {
+    /// Whether this was asked for by `tab`'s page.
+    pub(super) fn of(&self, tab: TabId) -> bool {
+        self.tab == tab
+    }
+}
+
 impl PageWorld {
     /// Ask for the pictures elements want and do not have, once the load that
     /// asked for the markup's own pictures is over.
@@ -144,7 +151,9 @@ impl PageWorld {
                     url = %target,
                     "asking for a picture an element wants after its load"
                 );
-                let id = self.fetcher.request(&target, ResourceKind::Image);
+                let id = self
+                    .fetcher
+                    .request_for(tab.0, &target, ResourceKind::Image);
                 self.picture_fetches.insert(
                     id,
                     PictureFetch {
@@ -193,7 +202,9 @@ impl PageWorld {
                     self.record_pictures(tab, vec![(node, src, Some((data.width, data.height)))]);
                     continue;
                 }
-                let id = self.fetcher.request(&target, ResourceKind::Image);
+                let id = self
+                    .fetcher
+                    .request_for(tab.0, &target, ResourceKind::Image);
                 self.picture_fetches.insert(
                     id,
                     PictureFetch {
@@ -247,7 +258,7 @@ impl PageWorld {
                     self.background_requests.insert(url, tab);
                     continue;
                 }
-                let id = self.fetcher.request(&url, ResourceKind::Image);
+                let id = self.fetcher.request_for(tab.0, &url, ResourceKind::Image);
                 self.background_requests.insert(url.clone(), tab);
                 self.background_fetches.insert(id, (tab, url));
             }
@@ -319,7 +330,9 @@ impl PageWorld {
                 slot.pictures_asked
                     .insert((source.node, source.src.clone()));
                 let generation = slot.generation;
-                let id = self.fetcher.request(&target, ResourceKind::Image);
+                let id = self
+                    .fetcher
+                    .request_for(tab.0, &target, ResourceKind::Image);
                 self.picture_fetches.insert(
                     id,
                     PictureFetch {

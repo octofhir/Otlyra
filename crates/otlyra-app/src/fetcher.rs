@@ -24,6 +24,7 @@
 //! page is not worth a future — and it reaches the same pool through
 //! [`Fetcher::spawn`], which runs it on Tokio's blocking pool.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -126,6 +127,8 @@ pub struct Held {
     pub method: &'static str,
     body: Option<Body>,
     cache: CacheMode,
+    /// Whose request it is; see [`Fetcher::request_for`].
+    owner: u64,
 }
 
 /// What a driver changed about a held request before letting it go.
@@ -357,17 +360,87 @@ impl<L: Loader> AsyncLoader for Blocking<L> {
     }
 }
 
-/// How many fetches may be in flight at once.
+/// How many fetches may be in flight at once in one lane.
 ///
 /// Six, which is the number browsers settled on per host over HTTP/1.1: enough that
 /// a page of pictures does not arrive one at a time, few enough that a page can
-/// point only so many connections at a server. Ours is a total rather than a
-/// per-host count, which is stricter and simpler; per-host queues belong with a
-/// real connection pool underneath.
+/// point only so many connections at a server.
+///
+/// A lane is a host as one owner — a tab — reaches it, for everything a page
+/// asks for, and one more lane for the pages themselves. It was one total
+/// across every tab, and a total is a queue every tab stands in: a page with
+/// thirty slow pictures put the next tab's document behind all thirty, and the
+/// second tab sat blank until the first had finished. Per tab and host, a page
+/// waits only for its own requests, and a navigation waits for no subresource
+/// at all. A server reached from several tabs sees six requests from each,
+/// which over HTTP/2 is streams on one connection and not more sockets.
 ///
 /// A semaphore rather than a thread count, so the limit says what it means: six
 /// requests may be *outstanding*, and a suspended one holds nothing but a permit.
 pub const FETCH_CONCURRENCY: usize = 6;
+
+/// How many idle host lanes are kept before they are swept.
+const IDLE_LANES: usize = 64;
+
+/// The queues a request waits in for a permit: one for documents, one per host
+/// for the rest.
+#[derive(Debug)]
+struct Lanes {
+    documents: Arc<tokio::sync::Semaphore>,
+    hosts: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Set once the pool is going away; a lane made after it is born closed.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl Lanes {
+    fn new() -> Self {
+        Self {
+            documents: Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY)),
+            hosts: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The lane a request for `url` of `kind`, made for `owner`, waits in.
+    fn lane(&self, owner: u64, kind: ResourceKind, url: &str) -> Arc<tokio::sync::Semaphore> {
+        if kind == ResourceKind::Document {
+            return Arc::clone(&self.documents);
+        }
+        let origin = url::Url::parse(url)
+            .ok()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let host = format!("{owner} {origin}");
+        let mut hosts = self.hosts.lock().unwrap_or_else(|error| error.into_inner());
+        if hosts.len() >= IDLE_LANES {
+            // A lane nobody holds is one with nothing queued and nothing on the
+            // wire; its next request starts it again from six.
+            hosts.retain(|_, lane| Arc::strong_count(lane) > 1);
+        }
+        let lane = hosts.entry(host).or_insert_with(|| {
+            let lane = tokio::sync::Semaphore::new(FETCH_CONCURRENCY);
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                lane.close();
+            }
+            Arc::new(lane)
+        });
+        Arc::clone(lane)
+    }
+
+    /// Start no more requests, in any lane.
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.documents.close();
+        for lane in self
+            .hosts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            lane.close();
+        }
+    }
+}
 
 /// The handle the browser keeps on the fetch pool.
 pub struct Fetcher {
@@ -377,9 +450,13 @@ pub struct Fetcher {
     /// Every request made, oldest first, bounded.
     exchanges: Vec<Exchange>,
     loader: Arc<dyn AsyncLoader>,
-    /// How many fetches may be awake at once. Held by the task for as long as its
-    /// transport runs, which is what makes it a limit rather than a rate.
-    permits: Arc<tokio::sync::Semaphore>,
+    /// How many fetches may be awake at once, per lane. A permit is held by the
+    /// task for as long as its transport runs, which is what makes it a limit
+    /// rather than a rate.
+    lanes: Arc<Lanes>,
+    /// The tasks still running, so one can be stopped. Emptied as their replies
+    /// are taken.
+    running: HashMap<u64, tokio::task::AbortHandle>,
     /// Kept beside the receiver so each task can be handed a clone. The channel
     /// therefore never disconnects while the browser is alive, which is what
     /// [`Fetcher::wait`] relies on to mean *nothing finished yet* rather than
@@ -432,7 +509,8 @@ impl Fetcher {
             tasks: JoinSet::new(),
             exchanges: Vec::new(),
             loader,
-            permits: Arc::new(tokio::sync::Semaphore::new(FETCH_CONCURRENCY)),
+            lanes: Arc::new(Lanes::new()),
+            running: HashMap::new(),
             finished,
             results,
             waker: Arc::new(Mutex::new(None)),
@@ -454,6 +532,12 @@ impl Fetcher {
         self.send(url, kind, None)
     }
 
+    /// Ask for `url` on `owner`'s behalf: a tab, whose requests wait in lanes of
+    /// their own so that another tab's never hold them up.
+    pub fn request_for(&mut self, owner: u64, url: &str, kind: ResourceKind) -> u64 {
+        self.fetch_for(owner, url, kind, None, CacheMode::Default)
+    }
+
     /// Ask for `url`, sending `body` with it. The number returned is what the
     /// result will carry.
     pub fn send(&mut self, url: &str, kind: ResourceKind, body: Option<Body>) -> u64 {
@@ -467,6 +551,18 @@ impl Fetcher {
     /// saw the reload knows one happened.
     pub fn fetch(
         &mut self,
+        url: &str,
+        kind: ResourceKind,
+        body: Option<Body>,
+        cache: CacheMode,
+    ) -> u64 {
+        self.fetch_for(0, url, kind, body, cache)
+    }
+
+    /// The same, on `owner`'s behalf; see [`Fetcher::request_for`].
+    pub fn fetch_for(
+        &mut self,
+        owner: u64,
         url: &str,
         kind: ResourceKind,
         body: Option<Body>,
@@ -523,11 +619,12 @@ impl Fetcher {
                 method,
                 body,
                 cache,
+                owner,
             });
             return id;
         }
 
-        self.launch(id, kind, url.to_owned(), body, cache, Vec::new());
+        self.launch(id, owner, kind, url.to_owned(), body, cache, Vec::new());
         id
     }
 
@@ -574,7 +671,15 @@ impl Fetcher {
             exchange.url.clone_from(&url);
             exchange.method = if body.is_some() { "POST" } else { "GET" };
         }
-        self.launch(id, held.kind, url, body, held.cache, change.headers);
+        self.launch(
+            id,
+            held.owner,
+            held.kind,
+            url,
+            body,
+            held.cache,
+            change.headers,
+        );
         true
     }
 
@@ -630,9 +735,11 @@ impl Fetcher {
     }
 
     /// Put one request on the pool.
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
         id: u64,
+        owner: u64,
         kind: ResourceKind,
         url: String,
         body: Option<Body>,
@@ -640,11 +747,11 @@ impl Fetcher {
         headers: Vec<(String, String)>,
     ) {
         let loader = Arc::clone(&self.loader);
-        let permits = Arc::clone(&self.permits);
+        let lane = self.lanes.lane(owner, kind, &url);
         let finished = self.finished.clone();
         let waker = Arc::clone(&self.waker);
         self.reap_tasks();
-        self.tasks.spawn_on(
+        let task = self.tasks.spawn_on(
             async move {
                 let mut completion = FetchCompletion {
                     pending: Some((id, kind, url.clone())),
@@ -656,7 +763,7 @@ impl Fetcher {
                 // timing below: `took` is how slow the transport was and `waited` is how
                 // busy the pool was, and the panel shows both so neither has to stand in
                 // for the other.
-                let Ok(_permit) = permits.acquire().await else {
+                let Ok(_permit) = lane.acquire().await else {
                     return;
                 };
                 let started = std::time::Instant::now();
@@ -696,6 +803,27 @@ impl Fetcher {
             },
             crate::io::shared().handle(),
         );
+        self.running.insert(id, task);
+    }
+
+    /// Stop a request nobody wants any more: one held for a driver is dropped,
+    /// and one queued or on the wire is cancelled, which frees its place in its
+    /// lane for a request someone is waiting for.
+    ///
+    /// What a page asked for and then left is the case: a tab closed, or moved
+    /// on, mid-load. Its reply, if one still comes, is the failure a cancelled
+    /// task delivers, and the browser drops it as a reply to nobody.
+    pub fn cancel(&mut self, id: u64) {
+        if let Some(index) = self.held.iter().position(|held| held.id == id) {
+            self.held.remove(index);
+            if let Some(exchange) = self.exchanges.iter_mut().find(|one| one.id == id) {
+                exchange.status = Status::Failed("cancelled".to_owned());
+            }
+            return;
+        }
+        if let Some(task) = self.running.remove(&id) {
+            task.abort();
+        }
     }
 
     fn reap_tasks(&mut self) {
@@ -718,8 +846,9 @@ impl Fetcher {
     /// the native network loader is cooperative and runs in these futures.
     pub(crate) async fn shutdown(&mut self) {
         *self.waker.lock().unwrap_or_else(|error| error.into_inner()) = None;
-        self.permits.close();
+        self.lanes.close();
         self.tasks.shutdown().await;
+        self.running.clear();
         self.held.clear();
         // Cookie updates happen in transport, before delivery. Do not execute
         // scripts or start subresource loads from completed replies at shutdown.
@@ -736,6 +865,7 @@ impl Fetcher {
         self.reap_tasks();
         let mut finished = Vec::new();
         while let Ok(fetched) = self.results.try_recv() {
+            self.running.remove(&fetched.id);
             self.record(&fetched);
             finished.push(fetched);
         }
@@ -782,6 +912,7 @@ impl Fetcher {
     pub fn wait(&mut self, timeout: std::time::Duration) -> Vec<Fetched> {
         match self.results.recv_timeout(timeout) {
             Ok(first) => {
+                self.running.remove(&first.id);
                 self.record(&first);
                 let mut finished = vec![first];
                 finished.extend(self.poll());
@@ -796,7 +927,7 @@ impl Drop for Fetcher {
     fn drop(&mut self) {
         // Close before aborting: releasing active permits must not start queued
         // transports while the pool itself is going away.
-        self.permits.close();
+        self.lanes.close();
         *self.waker.lock().unwrap_or_else(|error| error.into_inner()) = None;
         self.tasks.abort_all();
     }
@@ -1117,6 +1248,131 @@ mod tests {
                 (first, "https://example.test/one".to_owned()),
                 (second, "https://example.test/two".to_owned()),
             ]
+        );
+    }
+
+    /// A transport where `stuck.test` never answers and everything else answers
+    /// at once.
+    struct Stuck;
+
+    impl AsyncLoader for Stuck {
+        fn fetch(
+            self: Arc<Self>,
+            url: String,
+            _body: Option<Body>,
+            _cache: CacheMode,
+            _headers: Vec<(String, String)>,
+        ) -> Fetching {
+            Box::pin(async move {
+                if url.contains("stuck.test") {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Loaded {
+                    final_url: url,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// The ids among `fetched` that succeeded.
+    fn answered(fetched: Vec<Fetched>) -> Vec<u64> {
+        fetched
+            .into_iter()
+            .filter(|fetched| fetched.result.is_ok())
+            .map(|fetched| fetched.id)
+            .collect()
+    }
+
+    /// One page's subresources that never come must not keep another tab's
+    /// document, or another site's pictures, waiting: they used to share one
+    /// queue of six, and the second tab stayed blank until the first was done.
+    #[test]
+    fn a_stuck_host_holds_up_neither_documents_nor_other_hosts() {
+        let mut fetcher = Fetcher::spawn_async(Stuck);
+        for index in 0..FETCH_CONCURRENCY * 4 {
+            fetcher.request(
+                &format!("https://stuck.test/{index}.png"),
+                ResourceKind::Image,
+            );
+        }
+        fetcher.request("https://stuck.test/page", ResourceKind::Document);
+        let other = fetcher.request("https://other.test/a.png", ResourceKind::Image);
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.is_empty() && std::time::Instant::now() < deadline {
+            seen.extend(answered(
+                fetcher.wait(std::time::Duration::from_millis(100)),
+            ));
+        }
+        assert_eq!(seen, [other], "another host's picture arrived");
+
+        // The document is in a lane of its own, even on the stuck host: it
+        // waits only for its own transport, never for a picture's permit.
+        let documents = fetcher
+            .lanes
+            .lane(0, ResourceKind::Document, "https://stuck.test/");
+        let pictures = fetcher
+            .lanes
+            .lane(0, ResourceKind::Image, "https://stuck.test/x.png");
+        assert!(settles(|| documents.available_permits()
+            == FETCH_CONCURRENCY - 1
+            && pictures.available_permits() == 0));
+    }
+
+    /// Whether `done` becomes true within a few seconds.
+    fn settles(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Cancelling what a page left frees its places for what the next page
+    /// asks of the same host.
+    #[test]
+    fn cancelled_requests_free_their_lane() {
+        let mut fetcher = Fetcher::spawn_async(Stuck);
+        let stuck: Vec<u64> = (0..FETCH_CONCURRENCY * 2)
+            .map(|index| {
+                fetcher.request(&format!("https://stuck.test/{index}"), ResourceKind::Image)
+            })
+            .collect();
+        let waiting = fetcher.request("https://stuck.test/next?answer", ResourceKind::Image);
+        assert!(
+            fetcher
+                .wait(std::time::Duration::from_millis(200))
+                .is_empty()
+        );
+        for id in stuck {
+            fetcher.cancel(id);
+        }
+        // `stuck.test` never answers, so the only answer that can come is a
+        // cancellation; what is checked is that the queued one gets a permit
+        // and its transport starts.
+        let mut cancelled = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cancelled < FETCH_CONCURRENCY * 2 && std::time::Instant::now() < deadline {
+            for fetched in fetcher.wait(std::time::Duration::from_millis(100)) {
+                assert_ne!(
+                    fetched.id, waiting,
+                    "the one left waiting was not cancelled"
+                );
+                assert!(fetched.result.is_err());
+                cancelled += 1;
+            }
+        }
+        assert_eq!(cancelled, FETCH_CONCURRENCY * 2);
+        let lane = fetcher
+            .lanes
+            .lane(0, ResourceKind::Image, "https://stuck.test/");
+        assert!(
+            settles(|| lane.available_permits() == FETCH_CONCURRENCY - 1),
+            "only the request still wanted holds a place"
         );
     }
 }

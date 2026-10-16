@@ -440,6 +440,14 @@ impl PageScene {
         &self.url
     }
 
+    /// Move the document to `url` without loading it, as the session history
+    /// does for `history.pushState`: what it fetches and resolves from now on
+    /// is relative to the new address.
+    pub fn set_url(&mut self, url: url::Url) {
+        self.url = url;
+        self.base = document_base_url(&self.document, &self.url);
+    }
+
     /// The document base URL (HTML §2.4.1): what the addresses in its markup
     /// resolve against.
     pub fn base_url(&self) -> &url::Url {

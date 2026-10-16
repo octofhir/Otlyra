@@ -61,6 +61,9 @@ use super::node::{
 };
 use super::tree::{self, Kind};
 
+/// Where the glue keeps each interface's own prototype — see `compat.js`.
+const INTERFACE_PROTOTYPES: &str = "__otlyraInterfacePrototypes";
+
 thread_local! {
     /// The wrapper each node has been given.
     static WRAPPERS: RefCell<HashMap<(DocumentId, NodeId), PersistentRootId>> =
@@ -160,6 +163,14 @@ impl IntoJs for JsNode {
             Kind::Fragment => class_instance(cx, interface, DocumentFragmentRef { node })?,
             Kind::Doctype => class_instance(cx, interface, DocumentTypeRef { node })?,
         };
+        // The realm's own prototype for the interface, which a page that put
+        // something else at the global by its name has not changed.
+        let global = cx.global_this();
+        if let Some(prototypes) = cx.data_property(global, INTERFACE_PROTOTYPES)
+            && let Some(prototype) = cx.data_property(prototypes, interface)
+        {
+            cx.set_prototype(instance, Some(prototype))?;
+        }
         let value = cx.escape(instance);
         // Inserted before the handle is returned: the insertion may allocate,
         // and a `Local` is what survives an allocation — the raw value above is

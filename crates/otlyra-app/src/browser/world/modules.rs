@@ -49,6 +49,13 @@ pub(super) struct ModuleFetch {
     url: String,
 }
 
+impl ModuleFetch {
+    /// Whether this was asked for by `tab`'s page.
+    pub(super) fn of(&self, tab: TabId) -> bool {
+        self.tab == tab
+    }
+}
+
 impl PageWorld {
     /// Lend `tab`'s script runner and document to `run`: the parser's while
     /// the parse is stopped, the load's after the parse, the page's after the
@@ -123,7 +130,9 @@ impl PageWorld {
                 continue;
             };
             slot.modules_fetched += 1;
-            let id = self.fetcher.request(&address, ResourceKind::Module);
+            let id = self
+                .fetcher
+                .request_for(tab.0, &address, ResourceKind::Module);
             let slot = self.slots.get_mut(&tab).expect("looked up above");
             match slot.pending.as_mut() {
                 Some(pending) => {

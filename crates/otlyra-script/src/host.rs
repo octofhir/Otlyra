@@ -240,6 +240,7 @@ impl ScriptHost {
     /// rejected promise, not an error here.
     pub fn run_module(&mut self, source: &str, url: &str) -> Result<ScriptOutcome, ScriptError> {
         let guard = self.watchdog.begin();
+        custom_element_checkpoint(&mut self.runtime);
         let result = self
             .runtime
             .run_module_source(SourceInput::from_javascript(source), url);
@@ -307,6 +308,7 @@ impl ScriptHost {
     /// it. Neither is fatal to the page: the next timer still runs.
     pub fn fire_timer(&mut self, token: u64) -> Result<bool, ScriptError> {
         let guard = self.watchdog.begin();
+        custom_element_checkpoint(&mut self.runtime);
         let fired = self.runtime.fire_timer(token);
         let drained = self.runtime.run_microtasks();
         let interrupted = guard.finish();
@@ -338,6 +340,7 @@ impl ScriptHost {
         specifier: &str,
     ) -> Result<ScriptOutcome, ScriptError> {
         let guard = self.watchdog.begin();
+        custom_element_checkpoint(&mut self.runtime);
         let result = self
             .runtime
             .run_script(SourceInput::from_javascript(source), specifier);
@@ -404,6 +407,24 @@ impl ScriptHost {
     /// The isolate underneath, for the DOM bindings that land at M13.
     pub fn runtime_mut(&mut self) -> &mut Runtime {
         &mut self.runtime
+    }
+}
+
+/// Upgrade the custom elements the parser made since script last ran, so that
+/// script never meets a defined element that is still undefined.
+///
+/// Before each task, inside its turn: the parser makes elements between tasks
+/// without entering the isolate, and the upgrade is script — the definition's
+/// constructor. Nothing for a page that defined none.
+fn custom_element_checkpoint(runtime: &mut Runtime) {
+    if !crate::dom::custom_elements_defined() {
+        return;
+    }
+    if let Err(error) = runtime.run_script(
+        SourceInput::from_javascript("__otlyraCustomElementsCheckpoint()"),
+        "<custom elements>",
+    ) {
+        tracing::warn!(target: "page.script", %error, "the custom element checkpoint failed");
     }
 }
 

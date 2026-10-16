@@ -353,3 +353,88 @@ fn screen_reports_the_window_size() {
     );
     assert_eq!(log, ["true true 24 true"]);
 }
+
+#[test]
+fn a_document_with_no_jar_has_an_empty_cookie_string() {
+    let log = run(
+        "<script>document.cookie = 'a=1';\
+           console.log(JSON.stringify(document.cookie), typeof document.cookie.match)</script>",
+        &[],
+    );
+    assert_eq!(log, ["\"\" function"]);
+}
+
+#[test]
+fn history_moves_the_document_within_its_origin_and_traverses_its_entries() {
+    let log = run(
+        "<script>\
+           addEventListener('popstate', (e) => console.log('popstate', JSON.stringify(e.state), location.pathname));\
+           console.log(history.length, history.state, history instanceof History);\
+           history.replaceState({ n: 0 }, '', 'start');\
+           history.pushState({ n: 1 }, '', '/app/next?q=1#h');\
+           console.log(history.length, JSON.stringify(history.state), location.href);\
+           let refused;\
+           try { history.pushState(null, '', 'https://elsewhere.example/'); } catch (e) { refused = e.name; }\
+           console.log(refused, history.length);\
+           history.back();\
+         </script>",
+        &[],
+    );
+    assert_eq!(
+        log,
+        [
+            "1 null true",
+            "2 {\"n\":1} https://example.com/app/next?q=1#h",
+            "SecurityError 2",
+            "popstate {\"n\":0} /app/start",
+        ]
+    );
+}
+
+#[test]
+fn idle_callbacks_run_after_the_current_task_and_can_be_cancelled() {
+    let log = run(
+        "<script>\
+           requestIdleCallback((deadline) => console.log('idle', deadline.didTimeout,\
+             deadline.timeRemaining() > 0, deadline instanceof IdleDeadline));\
+           cancelIdleCallback(requestIdleCallback(() => console.log('cancelled')));\
+           console.log('task');\
+         </script>",
+        &[],
+    );
+    assert_eq!(log, ["task", "idle false true true"]);
+}
+
+#[test]
+fn the_interfaces_pages_reach_for_on_their_way_are_there() {
+    let log = run(
+        "<div id=a><p>one</p><!-- c --><p>two</p></div>\
+         <script>\
+           console.log(CSS.supports('display', 'grid'), CSS.supports('(color: red)'),\
+             CSS.supports('no-such-thing', '1'), CSS.supports('selector(p > a)'), CSS.escape('1a.b'));\
+           localStorage.setItem('k', 1);\
+           console.log(localStorage.getItem('k'), localStorage.length, sessionStorage.getItem('k'));\
+           const walker = document.createTreeWalker(document.getElementById('a'), NodeFilter.SHOW_ELEMENT);\
+           const seen = [];\
+           while (walker.nextNode()) seen.push(walker.currentNode.textContent);\
+           console.log(seen.join(','));\
+           const fragment = document.createRange().createContextualFragment('<b>x</b><i>y</i>');\
+           console.log(fragment.childNodes.length, fragment.firstChild.localName);\
+           console.log(getSelection().rangeCount, new DOMRect(1, 2, 3, 4).right, confirm('?'));\
+           document.fonts.ready.then(() => console.log('fonts', document.fonts.status));\
+         </script>",
+        &[],
+    );
+    assert_eq!(
+        log,
+        [
+            "true true false true \\31 a\\.b",
+            "1 1 null",
+            "one,two",
+            "2 b",
+            "confirm: ?",
+            "0 4 false",
+            "fonts loaded",
+        ]
+    );
+}

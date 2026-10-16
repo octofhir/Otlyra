@@ -841,6 +841,48 @@ fn by_site(cookies: &[Cookie]) -> Vec<Site> {
     sites
 }
 
+/// The jar as `document.cookie` reaches it: from the page's own thread, for
+/// the page's own address, with the rules for script a server's
+/// `Set-Cookie` does not have.
+pub(crate) struct ScriptCookies(pub(crate) SharedJar);
+
+impl ScriptCookies {
+    /// The address a document's cookies belong to: only an http(s) document
+    /// has any. Anything else — `about:`, `data:`, a file — reads as empty and
+    /// keeps nothing.
+    fn address(url: &str) -> Option<url::Url> {
+        url::Url::parse(url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+    }
+}
+
+impl otlyra_script::DocumentCookies for ScriptCookies {
+    fn read(&self, url: &str) -> String {
+        let Some(url) = Self::address(url) else {
+            return String::new();
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .for_script(&url, SystemTime::now())
+    }
+
+    fn write(&self, url: &str, line: &str) {
+        let Some(url) = Self::address(url) else {
+            return;
+        };
+        let kept = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_from_script(&url, line, SystemTime::now());
+        if let Err(error) = kept {
+            tracing::debug!(target: "page.script", %url, %error, "document.cookie not kept");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

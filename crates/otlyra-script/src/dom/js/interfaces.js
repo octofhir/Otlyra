@@ -35,14 +35,30 @@ for (const name of Object.keys(NODE_CONSTANTS)) {
   Object.defineProperty(Node.prototype, name, constant);
 }
 
+// What `new` on `HTMLElement` does. Nothing may construct one, until
+// `custom_elements.js` replaces this with the HTML element constructor, which
+// lets a defined custom element's class through (HTML §3.2.3).
+let htmlElementConstructor = () => {
+  throw new TypeError('Illegal constructor');
+};
+
 // An interface nobody may construct: the class exists so that `instanceof`
 // and the prototype chain work, and `new` throws, as the platform's do.
+// `HTMLElement` is the exception a custom element's class reaches through
+// `super()`.
 const makeInterface = (name, Parent) => {
-  const Interface = class extends Parent {
-    constructor() {
-      throw new TypeError('Illegal constructor');
-    }
-  };
+  const Interface =
+    name === 'HTMLElement'
+      ? class extends Parent {
+          constructor() {
+            return htmlElementConstructor(new.target);
+          }
+        }
+      : class extends Parent {
+          constructor() {
+            throw new TypeError('Illegal constructor');
+          }
+        };
   Object.defineProperty(Interface, 'name', { value: name });
   Object.defineProperty(Interface.prototype, Symbol.toStringTag, {
     value: name,

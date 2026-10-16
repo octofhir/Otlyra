@@ -146,6 +146,9 @@ pub(super) enum WorldEvent {
     },
     /// The page's script asked to go somewhere, and the hop is allowed.
     Navigate { tab: TabId, to: ScriptNavigation },
+    /// The page's script moved its document to `url` through the session
+    /// history, without a load.
+    Moved { tab: TabId, url: String },
 }
 
 /// Where a page's script asked to go, resolved against the page.
@@ -202,6 +205,8 @@ pub(super) struct PageWorld {
     requested_faces: Vec<otlyra_css::cascade::FontFace>,
     /// Face fetches in flight, by request number.
     font_fetches: HashMap<u64, fonts::FaceLoad>,
+    /// The jar `document.cookie` reads and writes, once the browser has one.
+    cookie_jar: Option<otlyra_net::SharedJar>,
     /// Legacy elapsed clock for runners without their own document origin.
     started: std::time::Instant,
     /// What has happened that the window has not been told.
@@ -228,6 +233,7 @@ impl PageWorld {
             picture_window: None,
             requested_faces: Vec::new(),
             font_fetches: HashMap::new(),
+            cookie_jar: None,
             started: std::time::Instant::now(),
             events: Vec::new(),
         }
@@ -337,9 +343,16 @@ impl PageWorld {
         Some((page, &mut self.text))
     }
 
+    /// Let pages read and write `jar` through `document.cookie`, from their
+    /// next load on.
+    pub(super) fn set_cookie_jar(&mut self, jar: otlyra_net::SharedJar) {
+        self.cookie_jar = Some(jar);
+    }
+
     /// Put `page` in `tab`, in place of whatever was there and of any load in
     /// flight for it.
     pub(super) fn set_page(&mut self, tab: TabId, page: Option<PageScene>) {
+        self.cancel_fetches(tab);
         self.generations += 1;
         let slot = self.slots.entry(tab).or_default();
         slot.page = page;
@@ -360,13 +373,57 @@ impl PageWorld {
 
     /// Forget `tab`: its document, its scripts and whatever it was waiting for.
     pub(super) fn close(&mut self, tab: TabId) {
+        self.cancel_fetches(tab);
         self.slots.remove(&tab);
+    }
+
+    /// Stop fetching what `tab`'s load asked for, so a tab that closed or moved
+    /// on stops holding places in the fetcher's lanes that another page is
+    /// waiting for.
+    fn cancel_load(&mut self, tab: TabId) {
+        let Some(pending) = self.slots.get(&tab).and_then(|slot| slot.pending.as_ref()) else {
+            return;
+        };
+        let ids: Vec<u64> = std::iter::once(pending.document)
+            .chain(pending.outstanding.keys().copied())
+            .collect();
+        for id in ids {
+            self.fetcher.cancel(id);
+        }
+    }
+
+    /// The same, and the pictures and modules `tab`'s page asked for after its
+    /// load as well.
+    ///
+    /// Not a picture or a face several pages share, which another page may
+    /// still be waiting for.
+    fn cancel_fetches(&mut self, tab: TabId) {
+        self.cancel_load(tab);
+        let mut ids = Vec::new();
+        self.picture_fetches.retain(|id, fetch| {
+            let keep = !fetch.of(tab);
+            if !keep {
+                ids.push(*id);
+            }
+            keep
+        });
+        self.module_fetches.retain(|id, fetch| {
+            let keep = !fetch.of(tab);
+            if !keep {
+                ids.push(*id);
+            }
+            keep
+        });
+        for id in ids {
+            self.fetcher.cancel(id);
+        }
     }
 
     /// Stop `tab`'s load, and answer whether there was one. Whatever it asked
     /// for that still arrives is let fall: a response is only taken for a load
     /// that is still waiting for it.
     pub(super) fn stop(&mut self, tab: TabId) -> bool {
+        self.cancel_load(tab);
         self.slots
             .get_mut(&tab)
             .is_some_and(|slot| slot.pending.take().is_some())

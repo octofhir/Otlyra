@@ -281,7 +281,11 @@ impl PageWorld {
         restore_scroll: f32,
     ) {
         let started = std::time::Instant::now();
-        let id = self.fetcher.fetch(url, ResourceKind::Document, body, cache);
+        // A load this one replaces is one nobody will read.
+        self.cancel_load(tab);
+        let id = self
+            .fetcher
+            .fetch_for(tab.0, url, ResourceKind::Document, body, cache);
         let slot = self.slots.entry(tab).or_default();
         slot.viewport_zoom = Some(self.environment.page_zoom);
         slot.pending = Some(PendingLoad {
@@ -399,6 +403,7 @@ impl PageWorld {
             .collect();
         let mut outstanding: HashMap<u64, Vec<PendingResource>> = HashMap::new();
         self.request_subresources(
+            tab,
             &mut outstanding,
             here.as_str(),
             &here,
@@ -475,6 +480,11 @@ impl PageWorld {
         let parsed = match &sniffed {
             kind if kind.is_document() => {
                 let mut scripts = Box::new(otlyra_script::PageScripts::new(final_url.clone()));
+                if let Some(jar) = &self.cookie_jar {
+                    scripts.set_cookies(std::sync::Arc::new(crate::cookies::ScriptCookies(
+                        std::sync::Arc::clone(jar),
+                    )));
+                }
                 // `load` waits for the document's pictures and sheets, which
                 // this world fetches; it fires it in `finish_load`.
                 scripts.hold_load_event();
@@ -548,6 +558,7 @@ impl PageWorld {
         let mut ready = Images::default();
         let links = otlyra_css::cascade::stylesheet_links(document);
         self.request_subresources(
+            tab,
             &mut outstanding,
             &here,
             &base,
@@ -594,7 +605,7 @@ impl PageWorld {
                 )
             })
             .collect();
-        self.request_subresources(&mut outstanding, &here, &base, wanted.into_iter());
+        self.request_subresources(tab, &mut outstanding, &here, &base, wanted.into_iter());
 
         // The scripts the parse did not run where they stood, because their
         // bytes were not in yet. They run after it, in document order, which is
@@ -637,7 +648,7 @@ impl PageWorld {
             }
         }
         outstanding.extend(preloaded);
-        self.request_subresources(&mut outstanding, &here, &base, wanted.into_iter());
+        self.request_subresources(tab, &mut outstanding, &here, &base, wanted.into_iter());
         report_limit(links.len(), STYLESHEET_LIMIT, "stylesheets");
         report_limit(pictures.len(), IMAGE_LIMIT, "pictures");
         let imports: Vec<Import> = otlyra_css::cascade::style_element_imports(document, &base)
@@ -711,6 +722,7 @@ impl PageWorld {
     /// the document at `document`.
     fn request_subresources(
         &mut self,
+        tab: TabId,
         outstanding: &mut HashMap<u64, Vec<PendingResource>>,
         document: &str,
         base: &Url,
@@ -732,7 +744,7 @@ impl PageWorld {
             };
             let id = *asked
                 .entry(url.clone())
-                .or_insert_with(|| self.fetcher.request(&url, kind));
+                .or_insert_with(|| self.fetcher.request_for(tab.0, &url, kind));
             outstanding.entry(id).or_default().push(resource);
         }
     }
@@ -752,7 +764,7 @@ impl PageWorld {
         };
         let (document, base) = (page.url().to_string(), page.base_url().clone());
         let mut outstanding = HashMap::new();
-        self.request_subresources(&mut outstanding, &document, &base, wanted);
+        self.request_subresources(tab, &mut outstanding, &document, &base, wanted);
         if let Some(pending) = self.pending_mut(tab) {
             for (id, resources) in outstanding {
                 pending.outstanding.entry(id).or_default().extend(resources);
@@ -1244,6 +1256,34 @@ impl PageWorld {
         self.follow_script_navigation(tab);
     }
 
+    /// Show where `history.pushState` and its kin moved `tab`'s document.
+    ///
+    /// The glue only moves a document within its own origin, so this is not
+    /// a navigation and earns no hop; the page keeps its document and its
+    /// scripts, and only its address changes.
+    fn follow_history_move(&mut self, tab: TabId) {
+        let Some(url) = self
+            .slots
+            .get_mut(&tab)
+            .and_then(|slot| slot.scripts.as_mut())
+            .and_then(|scripts| scripts.take_url_change())
+        else {
+            return;
+        };
+        let Ok(parsed) = url::Url::parse(&url) else {
+            return;
+        };
+        let Some(page) = self.page_mut(tab) else {
+            return;
+        };
+        if page.url().origin() != parsed.origin() {
+            tracing::warn!(%url, "a history entry left its document's origin");
+            return;
+        }
+        page.set_url(parsed);
+        self.events.push(WorldEvent::Moved { tab, url });
+    }
+
     /// Go where the page's script said to go.
     ///
     /// A redirector page is a page whose whole content is an instruction to be
@@ -1253,6 +1293,7 @@ impl PageWorld {
     /// destroys. What is decided here is whether the hop is allowed and where it
     /// goes; the going is the window's, which keeps the history.
     pub(super) fn follow_script_navigation(&mut self, tab: TabId) {
+        self.follow_history_move(tab);
         // This tab's, not the thread's. A navigation asked for by one tab was
         // once answerable by whichever tab was being pumped when it was noticed.
         let Some(request) = self

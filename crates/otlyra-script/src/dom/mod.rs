@@ -127,6 +127,38 @@ pub struct PageState {
     /// Pictures asked for by `<img>` elements outside the document — a
     /// `new Image()` preloading — which nothing else would fetch.
     image_requests: Vec<otlyra_dom::NodeId>,
+    /// Where `document.cookie` reads and writes. `None` is a document with no
+    /// cookies at all, which reads as empty and keeps nothing.
+    cookies: Option<Cookies>,
+    /// Whether the page has defined a custom element, so that elements the
+    /// parser made since script last ran are looked at before it runs again.
+    custom_elements: bool,
+    /// Where `history.pushState` or `replaceState` moved the document, for
+    /// the browser to show; the document itself was not fetched again.
+    url_change: Option<String>,
+}
+
+/// The browser's cookie jar, as `document.cookie` reaches it.
+///
+/// A trait rather than the jar itself so that this crate keeps no network: the
+/// browser owns the jar, and decides which document may see which cookies.
+pub trait DocumentCookies: Send + Sync {
+    /// The cookies a document at `url` may read, as `document.cookie` spells
+    /// them: `name=value` pairs joined by `"; "`.
+    fn read(&self, url: &str) -> String;
+    /// One cookie written to `document.cookie` by a document at `url`, as a
+    /// `Set-Cookie` line. One that may not be kept is dropped.
+    fn write(&self, url: &str, line: &str);
+}
+
+/// A handle on [`DocumentCookies`], which the state can carry and print.
+#[derive(Clone)]
+pub(crate) struct Cookies(pub(crate) std::sync::Arc<dyn DocumentCookies>);
+
+impl std::fmt::Debug for Cookies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cookies")
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -179,6 +211,11 @@ impl PageState {
         }
     }
 
+    /// Give `document.cookie` somewhere to read and write.
+    pub fn set_cookies(&mut self, cookies: std::sync::Arc<dyn DocumentCookies>) {
+        self.cookies = Some(Cookies(cookies));
+    }
+
     /// Whether script changed the document, clearing the answer.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
@@ -224,6 +261,12 @@ impl PageState {
     }
     pub(crate) fn set_clock(&mut self, clock: Option<crate::clock::PageClock>) {
         self.clock = clock;
+    }
+
+    /// Where the session history moved the document without a load, if it
+    /// moved since the browser last asked.
+    pub fn take_url_change(&mut self) -> Option<String> {
+        self.url_change.take()
     }
 
     /// Where script asked to go, if it asked.
@@ -302,6 +345,51 @@ pub(crate) fn with_state_mut(change: impl FnOnce(&mut PageState)) {
 
 pub(crate) fn document_url() -> String {
     with_state(|state| state.document_url.clone())
+}
+
+/// `history.pushState` and its kin moved the document to `url`, which the
+/// caller already checked is same-origin.
+pub(crate) fn set_document_url(url: String) {
+    with_state_mut(|state| {
+        state.document_url.clone_from(&url);
+        state.url_change = Some(url);
+    });
+}
+
+/// The page defined a custom element.
+pub(crate) fn note_custom_elements() {
+    with_state_mut(|state| state.custom_elements = true);
+}
+
+/// Whether the page lent to this isolate has defined a custom element.
+pub(crate) fn custom_elements_defined() -> bool {
+    with_state(|state| state.custom_elements)
+}
+
+/// How many nodes the lent document has ever made. The arena only grows, so
+/// a count that has not moved is a document with no new elements in it.
+pub(crate) fn node_count() -> usize {
+    LOANED.with(|slot| slot.borrow().as_ref().map_or(0, Document::len))
+}
+
+/// What `document.cookie` reads now.
+pub(crate) fn read_cookies() -> String {
+    with_state(|state| {
+        state
+            .cookies
+            .as_ref()
+            .map(|cookies| cookies.0.read(&state.document_url))
+            .unwrap_or_default()
+    })
+}
+
+/// One write to `document.cookie`.
+pub(crate) fn write_cookie(line: &str) {
+    with_state(|state| {
+        if let Some(cookies) = &state.cookies {
+            cookies.0.write(&state.document_url, line);
+        }
+    });
 }
 
 pub(crate) fn request_navigation(navigation: Navigation) {

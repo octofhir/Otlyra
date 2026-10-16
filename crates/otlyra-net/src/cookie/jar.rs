@@ -241,6 +241,12 @@ pub enum Refused {
     /// The reader has said no to cookies a page on another site asks for.
     #[error("this browser refuses cookies from another site")]
     ThirdParty,
+
+    /// Script tried to write an `HttpOnly` cookie, or one in the place of an
+    /// `HttpOnly` cookie. That attribute is the server saying script may not
+    /// touch it, which writing is as much as reading.
+    #[error("script cannot set or replace an HttpOnly cookie")]
+    HttpOnlyFromScript,
 }
 
 /// A jar of cookies.
@@ -443,6 +449,58 @@ impl Jar {
             return Err(Refused::ThirdParty);
         }
         let parsed = SetCookie::parse(line).map_err(Refused::Unreadable)?;
+        self.store(url, parsed, now)
+    }
+
+    /// What `document.cookie` reads for a document at `url`: the cookies a
+    /// request to it would carry, except the `HttpOnly` ones, which are the
+    /// server's and not the page's.
+    pub fn for_script(&self, url: &Url, now: SystemTime) -> String {
+        let mut text = String::new();
+        for cookie in self
+            .matching(url, Context::SameSite, now)
+            .into_iter()
+            .filter(|cookie| !cookie.http_only)
+        {
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            if !cookie.name.is_empty() {
+                text.push_str(&cookie.name);
+                text.push('=');
+            }
+            text.push_str(&cookie.value);
+        }
+        text
+    }
+
+    /// Take one cookie written to `document.cookie` by a document at `url`.
+    ///
+    /// The storage model a `Set-Cookie` line goes through, as a non-HTTP API:
+    /// script may neither set an `HttpOnly` cookie nor overwrite one.
+    pub fn set_from_script(
+        &mut self,
+        url: &Url,
+        line: &str,
+        now: SystemTime,
+    ) -> Result<(), Refused> {
+        let parsed = SetCookie::parse(line).map_err(Refused::Unreadable)?;
+        if parsed.http_only {
+            return Err(Refused::HttpOnlyFromScript);
+        }
+        let host = url.host_str().ok_or(Refused::NoHost)?.to_ascii_lowercase();
+        let shadows_http_only = self.cookies.iter().any(|cookie| {
+            cookie.http_only
+                && cookie.name == parsed.name
+                && if cookie.host_only {
+                    cookie.domain == host
+                } else {
+                    domain_match(&host, &cookie.domain)
+                }
+        });
+        if shadows_http_only {
+            return Err(Refused::HttpOnlyFromScript);
+        }
         self.store(url, parsed, now)
     }
 
@@ -1645,5 +1703,59 @@ mod tests {
         set(&mut jar, "https://EXAMPLE.com/", "a=1");
         assert_eq!(jar.all()[0].domain, "example.com");
         assert_eq!(header(&mut jar, "https://Example.COM/"), Some("a=1".into()));
+    }
+
+    // --- document.cookie -------------------------------------------------
+
+    /// Script reads what a request would carry, without what the server kept
+    /// from it.
+    #[test]
+    fn script_reads_every_cookie_but_the_http_only_ones() {
+        let mut jar = Jar::new();
+        set(&mut jar, "https://example.com/", "session=secret; HttpOnly");
+        set(&mut jar, "https://example.com/", "theme=dark");
+        set(
+            &mut jar,
+            "https://example.com/",
+            "lang=en; Domain=example.com",
+        );
+        set(&mut jar, "https://example.com/admin", "deep=1; Path=/admin");
+        assert_eq!(
+            jar.for_script(&url("https://www.example.com/"), now()),
+            "lang=en"
+        );
+        assert_eq!(
+            jar.for_script(&url("https://example.com/"), now()),
+            "theme=dark; lang=en"
+        );
+        assert_eq!(
+            jar.for_script(&url("https://example.com/admin/page"), now()),
+            "deep=1; theme=dark; lang=en"
+        );
+    }
+
+    /// Script writes through the same storage model, and cannot reach a
+    /// cookie the server marked as its own.
+    #[test]
+    fn script_writes_but_not_over_http_only() {
+        let mut jar = Jar::new();
+        let page = url("https://example.com/");
+        jar.set_from_script(&page, "a=1; Path=/", now())
+            .expect("an ordinary cookie is kept");
+        assert_eq!(header(&mut jar, "https://example.com/"), Some("a=1".into()));
+        assert_eq!(
+            jar.set_from_script(&page, "b=2; HttpOnly", now()),
+            Err(Refused::HttpOnlyFromScript)
+        );
+        set(&mut jar, "https://example.com/", "session=server; HttpOnly");
+        assert_eq!(
+            jar.set_from_script(&page, "session=forged", now()),
+            Err(Refused::HttpOnlyFromScript)
+        );
+        assert!(matches!(
+            jar.set_from_script(&page, "c=3; Domain=other.test", now()),
+            Err(Refused::NotOurDomain { .. })
+        ));
+        assert_eq!(jar.for_script(&page, now()), "a=1");
     }
 }

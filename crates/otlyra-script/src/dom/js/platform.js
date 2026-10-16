@@ -36,6 +36,50 @@ defineGlobal('requestAnimationFrame', function requestAnimationFrame(callback) {
   return handle;
 });
 
+// Cooperative scheduling's `requestIdleCallback`: work a page puts off until
+// nothing else is waiting. There is no idle period to measure here, so a
+// callback runs as a task of its own after the current one, with the 50 ms
+// an idle browser gives it (Cooperative Scheduling §5.4) — the same order a
+// quiet page sees, and never in the middle of another task.
+const IDLE_BUDGET_MS = 50;
+const idleTimers = new Map();
+let nextIdleHandle = 1;
+class IdleDeadline {
+  constructor() {
+    throw new TypeError('Illegal constructor');
+  }
+}
+Object.defineProperty(IdleDeadline.prototype, Symbol.toStringTag, {
+  value: 'IdleDeadline',
+  configurable: true,
+});
+defineGlobal('IdleDeadline', IdleDeadline);
+defineGlobal('requestIdleCallback', function requestIdleCallback(callback, options) {
+  if (typeof callback !== 'function') {
+    throw new TypeError('requestIdleCallback expects a function');
+  }
+  const handle = nextIdleHandle++;
+  const timer = setTimeout(() => {
+    idleTimers.delete(handle);
+    const started = performance.now();
+    const deadline = Object.create(IdleDeadline.prototype, {
+      didTimeout: { value: false, enumerable: true },
+      timeRemaining: {
+        value: () => Math.max(0, IDLE_BUDGET_MS - (performance.now() - started)),
+      },
+    });
+    callback(deadline);
+  }, 1);
+  idleTimers.set(handle, timer);
+  return handle;
+});
+defineGlobal('cancelIdleCallback', function cancelIdleCallback(handle) {
+  const timer = idleTimers.get(handle);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  idleTimers.delete(handle);
+});
+
 defineGlobal('cancelAnimationFrame', function cancelAnimationFrame(handle) {
   frameCallbacks.delete(handle);
 });

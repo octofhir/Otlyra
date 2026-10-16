@@ -218,6 +218,13 @@ pub trait ScriptRunner {
         None
     }
 
+    /// Where the session history moved the document without loading it —
+    /// `history.pushState`, `replaceState`, a traversal between entries the
+    /// document made — if it moved since the last time this was asked.
+    fn take_url_change(&mut self) -> Option<String> {
+        None
+    }
+
     /// Run the animation-frame callbacks the page asked for.
     fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {
         let _ = (document, timestamp);

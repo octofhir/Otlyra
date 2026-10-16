@@ -3503,6 +3503,136 @@ fn stopping_a_load_rejects_its_late_document() {
     );
 }
 
+/// A site whose pictures take two seconds each, beside sites that answer at
+/// once. Its front page asks for a dozen of them.
+struct SlowPictures;
+
+impl Loader for SlowPictures {
+    fn load(&self, url: &str) -> Result<Loaded, String> {
+        if url.contains("slow.example/pic") {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let (content_type, bytes) = if url.ends_with(".png") {
+            ("image/png", Vec::new())
+        } else if url.contains("slow.example") && !url.contains("next") {
+            let pictures: String = (0..12)
+                .map(|index| format!("<img src=/pic{index}.png>"))
+                .collect();
+            (
+                "text/html",
+                format!("<title>Slow</title>{pictures}").into_bytes(),
+            )
+        } else {
+            (
+                "text/html",
+                b"<title>Quick</title><img src=quick.png>".to_vec(),
+            )
+        };
+        Ok(Loaded {
+            content_type: Some(content_type.to_owned()),
+            bytes,
+            charset: Some("utf-8".to_owned()),
+            final_url: if url.contains("://") {
+                url.to_owned()
+            } else {
+                format!("https://{url}/")
+            },
+            ..Default::default()
+        })
+    }
+}
+
+/// Pump `browser` until the active tab has a document.
+fn until_shown(browser: &mut Browser) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while browser.page(browser.active).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the document never came"
+        );
+        browser.pump();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Another tab loads while one is still waiting for its pictures, from the
+/// same site. Every fetch used to stand in one queue of six, so the second
+/// tab's page waited for the first tab's twelve slow pictures, four seconds of
+/// a blank tab.
+#[test]
+fn a_tab_loads_while_another_waits_for_its_pictures() {
+    let mut browser = Browser::new(SlowPictures);
+    browser.navigate("slow.example");
+    until_shown(&mut browser);
+    assert!(browser.world.loading(browser.tabs[0].id));
+
+    browser.open_tab();
+    browser.select_tab(1);
+    let started = std::time::Instant::now();
+    browser.navigate("https://slow.example/next");
+    // `settle` waits for every tab; this waits for the second one only.
+    while browser.world.loading(browser.tabs[1].id)
+        && started.elapsed() < std::time::Duration::from_secs(5)
+    {
+        browser.pump();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the second tab took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        crate::page::title_of(browser.page(1).expect("a page").document()).as_deref(),
+        Some("Quick")
+    );
+    assert!(
+        browser.world.loading(browser.tabs[0].id),
+        "the first tab is still waiting for its own pictures"
+    );
+}
+
+/// Leaving a page mid-load lets go of what it asked for, so the next page on
+/// the same site is not queued behind pictures nobody will see.
+#[test]
+fn leaving_a_page_mid_load_cancels_its_requests() {
+    let mut browser = Browser::new(SlowPictures);
+    browser.navigate("slow.example");
+    until_shown(&mut browser);
+    browser.navigate("https://slow.example/next");
+    let started = std::time::Instant::now();
+    settle(&mut browser);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the next page took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        crate::page::title_of(browser.page(0).expect("a page").document()).as_deref(),
+        Some("Quick")
+    );
+    let cancelled = |browser: &Browser| {
+        browser
+            .exchanges()
+            .iter()
+            .filter(|exchange| {
+                exchange.url.contains("/pic")
+                    && matches!(&exchange.status, crate::fetcher::Status::Failed(why) if why.contains("cancelled"))
+            })
+            .count()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while cancelled(&browser) < 12 && std::time::Instant::now() < deadline {
+        browser.pump();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        cancelled(&browser),
+        12,
+        "every picture of the page left was cancelled"
+    );
+}
+
 /// A reload keeps your place. For a page you are editing that is the whole
 /// value of the key.
 #[test]
@@ -4748,6 +4878,51 @@ fn module_scripts_load_their_graph_through_the_fetcher() {
                 "{url} once in {asked:?}"
             );
         }
+    });
+}
+
+/// `document.cookie` is the browser's jar: script reads what a request would
+/// carry, less the `HttpOnly` cookies, and what it writes goes out on the
+/// next request. It was missing, and every page that read it threw.
+#[test]
+fn document_cookie_reads_and_writes_the_browsers_jar() {
+    on_content_stack(|| {
+        let (mut browser, _) = table_browser(
+            &[(
+                "https://jar.example/",
+                "text/html",
+                b"<script>const before = document.cookie;\
+                    document.cookie = 'written=yes; Path=/';\
+                    document.cookie = 'forged=1; HttpOnly';\
+                    document.documentElement.setAttribute('data-log',\
+                      before + '|' + document.cookie + '|' + typeof document.cookie.match);</script>",
+            )],
+            None,
+        );
+        let page = url::Url::parse("https://jar.example/").expect("a url");
+        browser.cookies().with(|jar| {
+            jar.set(
+                &page,
+                "session=server; HttpOnly",
+                std::time::SystemTime::now(),
+            )
+            .expect("kept");
+            jar.set(&page, "seen=1", std::time::SystemTime::now())
+                .expect("kept");
+        });
+        go(&mut browser, "https://jar.example/");
+        assert_eq!(page_log(&browser), "seen=1|seen=1; written=yes|function");
+        let header = browser.cookies().with(|jar| {
+            jar.header_for(
+                &page,
+                otlyra_net::cookie::Context::SameSite,
+                std::time::SystemTime::now(),
+            )
+        });
+        assert_eq!(
+            header.as_deref(),
+            Some("session=server; seen=1; written=yes")
+        );
     });
 }
 

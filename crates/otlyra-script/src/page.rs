@@ -70,6 +70,11 @@ impl PageScripts {
         self.hold_load = true;
     }
 
+    /// Give `document.cookie` the browser's jar.
+    pub fn set_cookies(&mut self, cookies: std::sync::Arc<dyn crate::dom::DocumentCookies>) {
+        self.state.set_cookies(cookies);
+    }
+
     /// Set the initial state before any page script runs, without an event.
     pub fn set_initial_hidden(&mut self, hidden: bool) {
         self.state.set_hidden(hidden);
@@ -454,6 +459,12 @@ impl PageScripts {
         self.state.take_navigation()
     }
 
+    /// Where `history.pushState` or `replaceState` moved the document since
+    /// the browser last asked, without a load.
+    pub fn take_url_change(&mut self) -> Option<String> {
+        self.state.take_url_change()
+    }
+
     /// Run this page's deferred work to a standstill, or until `budget` is
     /// spent.
     ///
@@ -672,6 +683,10 @@ impl ScriptRunner for PageScripts {
 
     fn take_navigation(&mut self) -> Option<crate::dom::Navigation> {
         PageScripts::take_navigation(self)
+    }
+
+    fn take_url_change(&mut self) -> Option<String> {
+        PageScripts::take_url_change(self)
     }
 
     fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {

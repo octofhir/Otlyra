@@ -69,6 +69,34 @@ impl DocumentRef {
         super::document_url()
     }
 
+    /// Move the document to `href` without loading it: what
+    /// `history.pushState` does to the URL. Not part of the platform; the
+    /// glue checks the address first.
+    #[static_method(name = "__setUrl")]
+    fn js_set_url(href: String) {
+        super::set_document_url(href);
+    }
+
+    /// How many nodes the document has made, for the custom element
+    /// checkpoint's "anything new?" — see `custom_elements.js`.
+    #[static_method(name = "__nodeCount")]
+    fn js_node_count() -> f64 {
+        super::node_count() as f64
+    }
+
+    /// The page defined a custom element; elements the parser makes from now
+    /// on are upgraded before script next runs.
+    #[static_method(name = "__customElementsDefined")]
+    fn js_custom_elements_defined() {
+        super::note_custom_elements();
+    }
+
+    /// Whether `name` is a valid custom element name (HTML §4.13.2).
+    #[static_method(name = "__isCustomElementName")]
+    fn js_is_custom_element_name(name: String) -> bool {
+        super::interfaces::is_valid_custom_element_name(&name)
+    }
+
     #[static_method(name = "__timeMetric")]
     fn js_time_metric(which: u32) -> f64 {
         super::time_metric(which)
@@ -232,6 +260,19 @@ impl DocumentRef {
             };
             tree::set_text_content(document, title, &value);
         })
+    }
+
+    /// The cookies this document may read (HTML §3.1.4).
+    #[getter(name = "cookie")]
+    fn js_cookie(&self) -> String {
+        super::read_cookies()
+    }
+
+    /// Set one cookie, as a `Set-Cookie` line would (HTML §3.1.4).
+    #[setter(name = "cookie")]
+    fn js_set_cookie(&mut self, value: String) -> Result<(), JsError> {
+        super::write_cookie(&value);
+        Ok(())
     }
 
     /// The visibility of this page, including while it is being parsed.

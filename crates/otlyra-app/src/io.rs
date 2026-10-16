@@ -17,7 +17,7 @@
 //! Two worker threads: the work is waiting rather than computing, so the count is
 //! about how many wakeups can be dispatched at once and not about how many requests
 //! can be outstanding. Concurrency limits belong to whoever is asking — the fetcher
-//! keeps its own [`crate::fetcher::FETCH_CONCURRENCY`] semaphore — because "how many
+//! keeps [`crate::fetcher::FETCH_CONCURRENCY`] permits per tab and host — because "how many
 //! sockets a page may point at a server" is a browser policy and not a thread count.
 //!
 //! Two holds only because nothing that blocks runs on them. A worker parked in a

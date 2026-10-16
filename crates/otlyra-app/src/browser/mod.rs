@@ -306,6 +306,7 @@ impl Browser {
             inspector_device: None,
         };
         browser.apply_theme();
+        browser.world.set_cookie_jar(browser.cookies.jar());
         browser.sync_cookie_policy();
         browser
     }

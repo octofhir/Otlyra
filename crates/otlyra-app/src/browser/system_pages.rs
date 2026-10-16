@@ -185,6 +185,7 @@ impl Browser {
     /// the ordinary case, since a loader is built before the browser that holds it.
     pub fn set_cookie_store(&mut self, store: crate::cookies::CookieStore) {
         self.cookies = store;
+        self.world.set_cookie_jar(self.cookies.jar());
         self.sync_cookie_policy();
     }
 

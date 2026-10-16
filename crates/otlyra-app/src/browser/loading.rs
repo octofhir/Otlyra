@@ -143,6 +143,12 @@ impl Browser {
 
     pub(super) fn apply_world_event(&mut self, event: WorldEvent) {
         match event {
+            WorldEvent::Moved { tab, url } => {
+                let Some(index) = self.tab_index(tab) else {
+                    return;
+                };
+                self.tabs[index].url = url;
+            }
             WorldEvent::Failed { tab, error } => {
                 let Some(index) = self.tab_index(tab) else {
                     return;
