@@ -333,3 +333,16 @@ fn only_upgraded_custom_elements_are_defined() {
     );
     assert_eq!(log, ["true false 2", "true false true false"]);
 }
+
+#[test]
+fn an_upgrade_is_not_reentered_from_its_own_constructor() {
+    let log = run("<x-outer id=o></x-outer>\
+         <script>\
+           customElements.define('x-inner', class extends HTMLElement {});\
+           customElements.define('x-outer', class extends HTMLElement {\
+             constructor() { super(); console.log('outer'); this.inner = document.createElement('x-inner'); this.innerHTML = '<x-inner></x-inner>'; document.body.insertAdjacentHTML('beforeend', '<i></i>'); }\
+           });\
+           console.log('defined', document.getElementById('o') !== null);\
+         </script>");
+    assert_eq!(log, ["outer", "defined true"]);
+}

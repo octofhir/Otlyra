@@ -87,6 +87,10 @@ const disconnect = (element, definition) => {
 const upgrade = (element, definition) => {
   if (!definition || definition.localName !== definition.name) return;
   if (customState.has(element)) return;
+  // Failed until the constructor returns (step 3): an element whose
+  // constructor reaches the checkpoint — by connecting something, say — is
+  // not upgraded a second time from inside its own upgrade.
+  customState.set(element, 'failed');
   definition.stack.push(element);
   let failure = null;
   try {
