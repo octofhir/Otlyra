@@ -1538,6 +1538,32 @@ Still open:
 - Fonts a page loads with `@font-face` after the fork are not used by the
   script layout.
 
+## Apple's hero picture
+
+Apple's home page showed its hero copy over an empty grey tile. A mirror of
+the DOM after its scripts ran reproduced it; delta debugging over the
+stylesheet rules (`ddmin` with a pixel probe) narrowed it to four rules.
+There were four bugs in the way:
+
+1. **`complete` stayed false** for an `<img>` in a `<picture>` or with a
+   `srcset`. The recorded state is for the file the browser picked, and the
+   accessor compared it with `src`. `currentSrc` answered `src`
+   (`861a6c1`).
+2. **The clip moved with the transform.** The picture is centred with
+   `left: 50%; transform: translate(-50%)` inside a tile with `overflow:
+   clip`. Moving the group moved the clip layers its fragments pushed, so
+   the picture was cut in half. The ancestors' clip of a transformed box is
+   now pushed outside its group (`eefea43`).
+3. **Every positioned box was a stacking context**, including those with
+   `z-index: auto`. The copy's `z-index: 2` sat inside such a box and could
+   not rise above the picture after it. Such boxes now keep their own
+   contents but let positioned descendants into the outer context
+   (`2b09fc9`).
+4. **Flex and grid items never got a layer.** `position: relative` and
+   `z-index` on an item did nothing, and the copy wrapper is a flex item.
+   The same commit also stretches an absolutely positioned box between
+   `top` and `bottom` when its height is `auto`.
+
 ## What the reference browsers do
 
 ### Chromium
