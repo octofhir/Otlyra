@@ -19,6 +19,9 @@ pub(super) struct Group<'a> {
     pub(super) layer: bool,
     /// What to move everything it drew by, if it is transformed.
     pub(super) transform: Option<Affine>,
+    /// The clip its ancestors cut a transformed box off at, pushed as a
+    /// layer outside the transform.
+    pub(super) outer_clip: Option<otlyra_layout::Rect>,
     /// The first item drawn inside it.
     pub(super) from: usize,
 }
@@ -33,6 +36,9 @@ pub(super) fn close(group: Group<'_>, list: &mut DisplayList) {
         list.transform_from(group.from, transform);
     }
     if group.layer {
+        list.push(DisplayItem::PopLayer);
+    }
+    if group.outer_clip.is_some() {
         list.push(DisplayItem::PopLayer);
     }
 }

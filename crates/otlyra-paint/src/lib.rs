@@ -319,6 +319,27 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
             // coordinates of what it moves with, which is where its items are.
             let moved = transform_of(fragment);
             if faded || moved.is_some() {
+                // What an ancestor cuts a transformed box off at is outside the
+                // transform: the edge stays where the ancestor is while the box
+                // moves under it. Pushed here, before the group, so moving what
+                // the group drew does not move it; the box and what is inside it
+                // do not push it again.
+                let outer_clip = moved.and(fragment.clip);
+                if let Some(clip) = outer_clip {
+                    list.set_spatial(clip_spatial);
+                    list.push(DisplayItem::PushLayer {
+                        blend: BlendMode::default(),
+                        alpha: 1.0,
+                        transform: Affine::IDENTITY,
+                        clip: KurboRect::new(
+                            f64::from(clip.x),
+                            f64::from(clip.y),
+                            f64::from(clip.right()),
+                            f64::from(clip.bottom()),
+                        )
+                        .to_path(PATH_TOLERANCE),
+                    });
+                }
                 if faded {
                     // The group's bound is the screen, and the screen does not
                     // scroll.
@@ -338,6 +359,7 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                     fragment,
                     layer: faded,
                     transform: moved,
+                    outer_clip,
                     from: list.len(),
                 });
             }
@@ -377,8 +399,15 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                 });
             }
         }
+        // Inside a transformed box, the part of the clip that is its ancestors'
+        // was pushed outside the transform with the group; a fragment cut off
+        // at nothing more is not cut off again, inside it, where the edge would
+        // move with the box.
+        let outer = groups.iter().rev().find_map(|group| group.outer_clip);
+        let clip = fragment.clip.filter(|clip| Some(*clip) != outer);
         paint(
             fragment,
+            clip,
             (clip_spatial, spatial),
             is_root_element,
             frame.background,
@@ -465,6 +494,7 @@ fn content_box_of(rect: Rect, style: &otlyra_css::ComputedStyle) -> Rect {
 /// port, whose edge is the port's box and moves with the page.
 fn paint(
     fragment: &Fragment,
+    clip: Option<Rect>,
     (clip_spatial, spatial): (SpatialId, SpatialId),
     background_on_canvas: bool,
     background_picture: Option<BackgroundLookup<'_>>,
@@ -481,7 +511,6 @@ fn paint(
     // rectangle — and that was wrong the moment the box scrolled: a fragment that
     // fits where the flow put it does not fit once it has been moved, and the
     // answer was computed before the move.
-    let clip = fragment.clip;
     if let Some(clip) = clip {
         list.set_spatial(clip_spatial);
         list.push(DisplayItem::PushLayer {
