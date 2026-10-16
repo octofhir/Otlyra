@@ -99,6 +99,11 @@ pub struct Document {
     computed: Option<(u64, std::sync::Arc<dyn ComputedStyles>)>,
     /// How to style the tree again when script reads a style after changing it.
     style_resolver: Option<std::rc::Rc<dyn StyleResolver>>,
+    /// The shadow roots attached to its elements.
+    pub(crate) shadow: crate::shadow::ShadowTrees,
+    /// The elements a custom element definition has run on: what makes one
+    /// whose name is a custom element name `:defined`.
+    pub(crate) customized: std::collections::HashSet<NodeId>,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -137,6 +142,8 @@ impl Document {
             mutations: 0,
             computed: None,
             style_resolver: None,
+            shadow: crate::shadow::ShadowTrees::default(),
+            customized: std::collections::HashSet::new(),
         }
     }
 
@@ -267,6 +274,19 @@ impl Document {
     pub fn first_element_child(&self, id: NodeId) -> Option<NodeId> {
         self.children(id)
             .find(|&child| self.get(child).is_some_and(|node| node.element().is_some()))
+    }
+
+    /// Whether `id` is a defined element (DOM §4.9 "defined"): a built-in one,
+    /// or a custom element its definition has run on. An HTML element whose
+    /// name is a custom element name and that nothing has upgraded is not,
+    /// and `:not(:defined)` is how a page hides it until its script arrives.
+    pub fn is_defined(&self, id: NodeId) -> bool {
+        let Some(element) = self.get(id).and_then(Node::element) else {
+            return false;
+        };
+        element.name.ns != html5ever::ns!(html)
+            || !is_valid_custom_element_name(&element.name.local)
+            || self.customized.contains(&id)
     }
 
     /// Whether `id` has no children that count as content — no elements, and no
@@ -452,4 +472,27 @@ impl Iterator for Children<'_> {
         self.next = self.document.get(current).and_then(Node::next_sibling);
         Some(current)
     }
+}
+
+/// Whether `name` is a valid custom element name (HTML §4.13.2).
+///
+/// The full grammar also allows `.`, `_`, digits and a long list of
+/// non-ASCII ranges; every one of them is outside `A`–`Z`, which is all the
+/// check below needs to know about them.
+#[must_use]
+pub fn is_valid_custom_element_name(name: &str) -> bool {
+    const RESERVED: [&str; 8] = [
+        "annotation-xml",
+        "color-profile",
+        "font-face",
+        "font-face-src",
+        "font-face-uri",
+        "font-face-format",
+        "font-face-name",
+        "missing-glyph",
+    ];
+    name.starts_with(|first: char| first.is_ascii_lowercase())
+        && name.contains('-')
+        && !name.contains(|letter: char| letter.is_ascii_uppercase())
+        && !RESERVED.contains(&name)
 }

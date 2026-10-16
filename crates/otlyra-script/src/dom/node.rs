@@ -149,9 +149,9 @@ impl NodeRef {
 
     #[getter(name = "isConnected")]
     fn js_is_connected(&self) -> Result<bool, JsError> {
-        with_document(self.doc, |document| {
-            tree::root_of(document, self.id) == document.root()
-        })
+        // Through any shadow roots: a node in a shadow tree is connected
+        // when its host is (DOM §4.4).
+        with_document(self.doc, |document| document.is_connected(self.id))
     }
 
     /// The document a node belongs to; `null` for the document itself.

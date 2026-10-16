@@ -9,11 +9,12 @@
 //
 // What is not here: shadow trees, customized built-in elements (`is=`, which
 // Safari does not implement either; their definitions are kept but nothing is
-// upgraded to them), form-associated elements, and the `:defined` selector.
+// upgraded to them) and form-associated elements.
 
 const nativeNodeCount = take(Document, '__nodeCount');
 const nativeCustomElementsDefined = take(Document, '__customElementsDefined');
 const nativeIsCustomElementName = take(Document, '__isCustomElementName');
+const nativeSetCustomized = take(Element.prototype, '__setCustomized');
 
 const rawCreateElement = Document.prototype.createElement;
 const rawGetAttribute = Element.prototype.getAttribute;
@@ -36,6 +37,12 @@ const ALREADY_CONSTRUCTED = Object.freeze({});
 let definedSelector = '';
 // The document's node count when the checkpoint last looked.
 let checkpointNodes = -1;
+
+// An element a definition has run on: 'custom', and `:defined` from now on.
+const markCustom = (element) => {
+  customState.set(element, 'custom');
+  nativeSetCustomized.call(element);
+};
 
 const escapeName = (name) => name.replace(/[^a-zA-Z0-9_-]/g, (character) => '\\' + character);
 
@@ -98,7 +105,7 @@ const upgrade = (element, definition) => {
     report(failure);
     return;
   }
-  customState.set(element, 'custom');
+  markCustom(element);
   for (const attribute of definition.observed) {
     const value = rawGetAttribute.call(element, attribute);
     if (value !== null) {
@@ -108,8 +115,12 @@ const upgrade = (element, definition) => {
   if (element.isConnected) connect(element, definition);
 };
 
+// The elements script attached shadow roots to, so the walks below can go
+// into their shadow trees, which no selector reaches.
+const shadowHosts = new Set();
+
 // The elements in `node`'s inclusive subtree whose names are defined, in
-// tree order.
+// tree order, and those in the shadow trees of hosts inside it.
 const definedInside = (node) => {
   if (!definedSelector || !node) return [];
   const found = [];
@@ -117,6 +128,12 @@ const definedInside = (node) => {
   if (type === 1 && definitions.has(node.localName)) found.push(node);
   if (type === 1 || type === 9 || type === 11) {
     for (const element of Array.from(node.querySelectorAll(definedSelector))) found.push(element);
+  }
+  for (const host of shadowHosts) {
+    if (host === node || node.contains(host)) {
+      const root = nativeShadowRoot.call(host);
+      if (root && root !== node) found.push(...definedInside(root));
+    }
   }
   return found;
 };
@@ -304,7 +321,7 @@ htmlElementConstructor = (newTarget) => {
   if (definition.stack.length === 0) {
     const element = rawCreateElement.call(document, definition.localName);
     Object.setPrototypeOf(element, prototype);
-    customState.set(element, 'custom');
+    markCustom(element);
     return element;
   }
   const element = definition.stack[definition.stack.length - 1];

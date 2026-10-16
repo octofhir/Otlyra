@@ -253,6 +253,32 @@ impl TreeSink for DomSink {
         });
     }
 
+    /// A `<template shadowrootmode>` (HTML §13.2.6.4.7): a shadow root on the
+    /// element it is in, which the parser fills with what the template holds.
+    fn attach_declarative_shadow(
+        &self,
+        location: &NodeId,
+        template: &NodeId,
+        attrs: &[html5ever::Attribute],
+    ) -> bool {
+        let mode = attrs
+            .iter()
+            .find(|attr| &*attr.name.local == "shadowrootmode")
+            .map(|attr| attr.value.as_ref());
+        let mode = match mode {
+            Some(mode) if mode.eq_ignore_ascii_case("open") => crate::ShadowMode::Open,
+            Some(mode) if mode.eq_ignore_ascii_case("closed") => crate::ShadowMode::Closed,
+            _ => return false,
+        };
+        let mut document = self.document.borrow_mut();
+        let mut mutator = DocumentMutator::new(&mut document);
+        let Some(root) = mutator.attach_shadow(*location, mode) else {
+            return false;
+        };
+        mutator.set_template_contents(*template, root);
+        true
+    }
+
     fn get_template_contents(&self, target: &NodeId) -> NodeId {
         self.document
             .borrow()

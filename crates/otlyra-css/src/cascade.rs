@@ -309,6 +309,9 @@ pub struct Styler {
     /// parsed. A page cannot be shown in a font it has not fetched, and nothing
     /// else on the way through knows the rules are there.
     font_faces: Vec<FontFace>,
+    /// Each shadow root's own rules, and the text they were built from, so a
+    /// restyle that changed none of its `<style>` elements parses nothing.
+    shadow_styles: HashMap<NodeId, (u64, Arc<style::stylist::CascadeData>)>,
 }
 
 /// A `@font-face` rule: a face of a family the page brings with it, what the
@@ -454,6 +457,7 @@ impl Styler {
             base: UrlExtraData(Arc::new(sources.base.clone())),
             selectors,
             font_faces,
+            shadow_styles: HashMap::new(),
         }
     }
 
@@ -749,6 +753,7 @@ impl Styler {
             .collect();
         let mut styles = HashMap::new();
         let mut placeholders = HashMap::new();
+        self.build_shadow_styles(document);
         self.resolve_from(
             document,
             &style_data,
@@ -800,6 +805,12 @@ impl Styler {
         before: crate::state::Interaction,
         after: crate::state::Interaction,
     ) -> Option<Vec<(NodeId, Arc<ComputedValues>)>> {
+        // What a restyle in place starts from is found by walking the
+        // document's tree, and a shadow tree is styled through the flat one:
+        // a page with shadow trees is styled whole.
+        if document.has_shadow_trees() {
+            return None;
+        }
         let _span = tracing::info_span!("recalc_style").entered();
 
         let before_states = crate::state::States::new(document, form, before);
@@ -908,6 +919,63 @@ impl Styler {
         Some(previous)
     }
 
+    /// Build each shadow root's own rules from the `<style>` elements in it
+    /// (CSS Scoping §3.1): what applies inside that tree and, through
+    /// `:host`, to its host, and to nothing else. A root whose sheets have
+    /// not changed keeps what was built for it.
+    fn build_shadow_styles(&mut self, document: &Document) {
+        use std::hash::{Hash, Hasher};
+
+        if !document.has_shadow_trees() {
+            self.shadow_styles.clear();
+            return;
+        }
+        let mut kept = HashMap::new();
+        let roots: Vec<NodeId> = document.shadow_roots().map(|(_, root)| root).collect();
+        for root in roots {
+            let texts = shadow_style_texts(document, root);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            texts.hash(&mut hasher);
+            let key = hasher.finish();
+            let data = match self.shadow_styles.remove(&root) {
+                Some((built_from, data)) if built_from == key => data,
+                _ => self.shadow_cascade_data(&texts),
+            };
+            kept.insert(root, (key, data));
+        }
+        self.shadow_styles = kept;
+    }
+
+    /// One shadow root's rules, from the text of its `<style>` elements.
+    fn shadow_cascade_data(&mut self, texts: &[String]) -> Arc<style::stylist::CascadeData> {
+        let imports = HashMap::new();
+        let imported = Cell::new(0);
+        let parse = AuthorParse {
+            lock: &self.lock,
+            quirks_mode: self.quirks_mode,
+            imports: &imports,
+            imported: &imported,
+        };
+        let base = (*self.base.0).clone();
+        let sheets: Vec<Arc<Stylesheet>> = texts
+            .iter()
+            .map(|text| Arc::new(parse.sheet(text, &base, parse.media(""), Vec::new())))
+            .collect();
+        let mut author = style::author_styles::AuthorStyles::<DocumentStyleSheet>::new();
+        let guard = self.lock.read();
+        let custom_media = Default::default();
+        for sheet in sheets {
+            author.stylesheets.append_stylesheet(
+                None,
+                &custom_media,
+                DocumentStyleSheet(sheet),
+                &guard,
+            );
+        }
+        author.flush(&mut self.stylist, &guard);
+        author.data
+    }
+
     /// Resolve every element under each of `starts` — a node, the style it
     /// inherits from, and its depth among elements — into `styles`.
     fn resolve_from(
@@ -934,7 +1002,12 @@ impl Styler {
             registered_speculative_painters: &NoPainters,
         };
 
-        let tree = Tree::styled(document, style_data);
+        let shadow_data: HashMap<NodeId, Arc<style::stylist::CascadeData>> = self
+            .shadow_styles
+            .iter()
+            .map(|(root, (_, data))| (*root, data.clone()))
+            .collect();
+        let tree = Tree::styled(document, style_data).with_shadow_data(&shadow_data);
         let _scope = TreeScope::enter(&tree);
         // The engine's assertions check that a restyle happens on a thread that
         // has declared itself the layout thread — including in the destructors
@@ -975,6 +1048,37 @@ impl Styler {
             }
         }
     }
+}
+
+/// The text of every `<style>` element in the shadow tree under `root`, in
+/// tree order.
+fn shadow_style_texts(document: &Document, root: NodeId) -> Vec<String> {
+    let mut texts = Vec::new();
+    let mut stack: Vec<NodeId> = document.children(root).collect();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        let is_style = document
+            .get(node)
+            .and_then(|data| data.element())
+            .is_some_and(|element| &*element.name.local == "style");
+        if is_style {
+            let text: String = document
+                .children(node)
+                .filter_map(|child| match &document.get(child)?.data {
+                    otlyra_dom::NodeData::Text(text) => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect();
+            texts.push(text);
+            continue;
+        }
+        let mut children: Vec<NodeId> = document.children(node).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    // What it adopts comes after what it holds (CSSOM §6.4.1).
+    texts.extend(document.adopted_styles(root).iter().cloned());
+    texts
 }
 
 /// Whether `node` is a field a placeholder can show in: an `<input>` or a
@@ -1173,7 +1277,9 @@ fn resolve<'a>(
 
     let inherited = own_style.as_ref().or(parent);
     let child_depth = if is_element { depth + 1 } else { depth };
-    for child in document.children(node).collect::<Vec<_>>() {
+    // The flat tree: a host's shadow tree is styled under it, and what a
+    // slot is assigned under the slot.
+    for child in document.flat_children(node) {
         resolve(tree, child, inherited, child_depth, context, styles);
     }
 }

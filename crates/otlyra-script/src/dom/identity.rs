@@ -131,6 +131,7 @@ impl IntoJs for JsNode {
                 Kind::Text => "Text",
                 Kind::Comment => "Comment",
                 Kind::Document => "HTMLDocument",
+                Kind::Fragment if document.shadow_host_of(self.id).is_some() => "ShadowRoot",
                 Kind::Fragment => "DocumentFragment",
                 Kind::Doctype => "DocumentType",
             };

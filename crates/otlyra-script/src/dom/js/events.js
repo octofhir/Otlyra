@@ -62,7 +62,13 @@ const propagationPath = (target) => {
   // A bounded walk: a tree with a cycle in it is a bug elsewhere, and this is
   // not the place to hang because of one.
   for (let step = 0; step < 4096; step++) {
-    const parent = node.parentNode;
+    let parent = node.parentNode;
+    // A shadow root's parent in the event path is its host (DOM §4.8
+    // "get the parent"), which is how an event inside a shadow tree reaches
+    // the document.
+    if (!parent && typeof globalThis.ShadowRoot === 'function' && node instanceof globalThis.ShadowRoot) {
+      parent = node.host;
+    }
     if (!parent || path.includes(parent)) break;
     path.push(parent);
     node = parent;

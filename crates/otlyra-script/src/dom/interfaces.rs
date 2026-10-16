@@ -164,31 +164,7 @@ fn svg_interface(local: &str) -> &'static str {
     }
 }
 
-/// HTML §4.13.3 "valid custom element name", minus the reserved names (which
-/// all have interfaces of their own above or are SVG and MathML names that
-/// never reach here in the HTML namespace as custom elements would).
-///
-/// A lowercase ASCII letter, then anything that is not an uppercase ASCII
-/// letter, with at least one hyphen. The production also admits a long list of
-/// non-ASCII ranges; every one of them is outside `A`–`Z`, which is all the
-/// check below needs to know about them.
-#[must_use]
-pub fn is_valid_custom_element_name(name: &str) -> bool {
-    const RESERVED: [&str; 8] = [
-        "annotation-xml",
-        "color-profile",
-        "font-face",
-        "font-face-src",
-        "font-face-uri",
-        "font-face-format",
-        "font-face-name",
-        "missing-glyph",
-    ];
-    name.starts_with(|first: char| first.is_ascii_lowercase())
-        && name.contains('-')
-        && !name.contains(|letter: char| letter.is_ascii_uppercase())
-        && !RESERVED.contains(&name)
-}
+pub use otlyra_dom::is_valid_custom_element_name;
 
 /// Every interface name [`element_interface`] can answer, for the test that
 /// holds this table to the classes `dom.js` defines.

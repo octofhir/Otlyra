@@ -199,6 +199,10 @@ input, button, select, textarea, meter, progress {
   --otlyra-appearance: auto;
 }
 
+/* A slot generates no box of its own: what is assigned to it is laid out
+   where it is (HTML §15.3.1). */
+slot { display: contents; }
+
 /* The hint a field shows while it holds nothing, in the grey every browser
    draws it in (HTML §15.5.4 leaves the colour to the user agent). */
 ::placeholder {

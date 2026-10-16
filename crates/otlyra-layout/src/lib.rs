@@ -205,6 +205,79 @@ mod tests {
             .join("")
     }
 
+    /// A shadow tree is laid out in place of its host's children, its slots
+    /// take what is assigned to them, and its styles apply inside it and not
+    /// outside — nor do the document's reach into it, except by inheritance.
+    #[test]
+    fn a_shadow_tree_renders_its_slots_with_its_own_styles() {
+        let tree = tree_of(
+            "<style>.inner { color: rgb(200, 0, 0) } #host { color: rgb(1, 2, 3) }</style>\
+             <div id=host><template shadowrootmode=open>\
+               <style>.inner { color: rgb(0, 128, 0) } ::slotted(span) { color: rgb(0, 0, 255) }</style>\
+               <b class=inner>shadow</b><slot></slot><slot name=x>fallback</slot><slot name=y>default</slot>\
+               <em>inherited</em>\
+             </template><span>light</span><i slot=x>named</i></div>\
+             <p class=inner>document</p>",
+        );
+        let texts: Vec<(String, [u8; 4])> = tree
+            .descendants(tree.root())
+            .into_iter()
+            .filter_map(|id| match &tree.node(id).kind {
+                BoxKind::Text(text) if !text.trim().is_empty() => Some((
+                    text.trim().to_owned(),
+                    tree.node(id).style.color.to_rgba8().to_u8_array(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("shadow".to_owned(), [0, 128, 0, 255]),
+                ("light".to_owned(), [0, 0, 255, 255]),
+                ("named".to_owned(), [1, 2, 3, 255]),
+                ("default".to_owned(), [1, 2, 3, 255]),
+                ("inherited".to_owned(), [1, 2, 3, 255]),
+                ("document".to_owned(), [200, 0, 0, 255]),
+            ]
+        );
+    }
+
+    /// The document styles what a shadow tree exposes as a part, and what an
+    /// inner host passes on with `exportparts`; an undefined custom element
+    /// is hidden by `:not(:defined)`.
+    #[test]
+    fn parts_take_outer_styles_and_undefined_elements_hide() {
+        let tree = tree_of(
+            "<style>x-card::part(title) { color: rgb(0, 0, 255) } x-card::part(icon) { color: rgb(0, 128, 0) }\
+               x-late:not(:defined) { display: none }</style>\
+             <x-card><template shadowrootmode=open>\
+               <b part=title>title</b><i>plain</i>\
+               <x-inner exportparts=\"glyph: icon\"><template shadowrootmode=open><u part=glyph>glyph</u></template></x-inner>\
+             </template></x-card><x-late>hidden</x-late><p>shown</p>",
+        );
+        let texts: Vec<(String, [u8; 4])> = tree
+            .descendants(tree.root())
+            .into_iter()
+            .filter_map(|id| match &tree.node(id).kind {
+                BoxKind::Text(text) if !text.trim().is_empty() => Some((
+                    text.trim().to_owned(),
+                    tree.node(id).style.color.to_rgba8().to_u8_array(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("title".to_owned(), [0, 0, 255, 255]),
+                ("plain".to_owned(), [0, 0, 0, 255]),
+                ("glyph".to_owned(), [0, 128, 0, 255]),
+                ("shown".to_owned(), [0, 0, 0, 255]),
+            ]
+        );
+    }
+
     /// A placeholder is drawn in its `::placeholder` colour — the grey of the
     /// browser's own rule unless the page says otherwise, and not at all
     /// where the page made it transparent — and what a field holds is drawn

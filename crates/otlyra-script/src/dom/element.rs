@@ -121,6 +121,74 @@ impl ElementRef {
         Ok(self.get("class")?.unwrap_or_default())
     }
 
+    /// Record that a custom element definition has run on this element, so
+    /// that it matches `:defined`. Not part of the platform: the custom
+    /// element glue calls it once the element's constructor has succeeded.
+    #[method(name = "__setCustomized")]
+    fn js_set_customized(&self) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            otlyra_dom::DocumentMutator::new(document).set_customized(id);
+        })
+    }
+
+    /// Attach a shadow root (DOM §4.9 `attachShadow`). Not part of the
+    /// platform under this name: the glue checks the options and the element.
+    #[method(name = "__attachShadow")]
+    fn js_attach_shadow(&self, open: bool) -> Result<JsNode, JsError> {
+        let (doc, id) = (self.node.doc, self.node.id);
+        let mode = if open {
+            otlyra_dom::ShadowMode::Open
+        } else {
+            otlyra_dom::ShadowMode::Closed
+        };
+        let root = with_document_mut(doc, |document| {
+            otlyra_dom::DocumentMutator::new(document).attach_shadow(id, mode)
+        })?;
+        root.map(|root| JsNode::new(doc, root)).ok_or_else(|| {
+            tree::exception(
+                "NotSupportedError",
+                "this element already has a shadow root",
+            )
+        })
+    }
+
+    /// The shadow root attached here, whatever its mode. Not part of the
+    /// platform: `shadowRoot` answers only an open one.
+    #[method(name = "__shadowRoot")]
+    fn js_shadow_root(&self) -> Result<Option<JsNode>, JsError> {
+        let (doc, id) = (self.node.doc, self.node.id);
+        with_document(doc, |document| {
+            document
+                .shadow_root_of(id)
+                .map(|(root, _)| JsNode::new(doc, root))
+        })
+    }
+
+    /// The slot this element is assigned to. Not part of the platform.
+    #[method(name = "__assignedSlot")]
+    fn js_assigned_slot(&self) -> Result<Option<JsNode>, JsError> {
+        let (doc, id) = (self.node.doc, self.node.id);
+        with_document(doc, |document| {
+            document
+                .assigned_slot(id)
+                .map(|slot| JsNode::new(doc, slot))
+        })
+    }
+
+    /// What this slot is assigned. Not part of the platform.
+    #[method(name = "__assignedNodes")]
+    fn js_assigned_nodes(&self) -> Result<Vec<JsNode>, JsError> {
+        let (doc, id) = (self.node.doc, self.node.id);
+        with_document(doc, |document| {
+            document
+                .assigned_nodes(id)
+                .into_iter()
+                .map(|node| JsNode::new(doc, node))
+                .collect()
+        })
+    }
+
     #[getter(name = "innerHTML")]
     fn js_inner_html(&self) -> Result<String, JsError> {
         with_document(self.node.doc, |document| {

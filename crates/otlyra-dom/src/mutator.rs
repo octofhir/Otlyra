@@ -32,6 +32,47 @@ impl<'a> DocumentMutator<'a> {
         self.document.nodes_mut().insert(Node::new(data))
     }
 
+    /// Attach a shadow root to `host` (DOM §4.2.14 "attach a shadow root"):
+    /// a fragment the document keeps beside it, which the flat tree renders
+    /// in place of its children. `None` when it already has one.
+    pub fn attach_shadow(&mut self, host: NodeId, mode: crate::ShadowMode) -> Option<NodeId> {
+        if self.document.shadow_root_of(host).is_some() {
+            return None;
+        }
+        let root = self.create(NodeData::Document);
+        self.document.shadow.attach(host, root, mode);
+        Some(root)
+    }
+
+    /// Say which constructed style sheets `root` adopts, by their text.
+    pub fn set_adopted_styles(&mut self, root: NodeId, texts: Vec<String>) {
+        if texts.is_empty() {
+            self.document.shadow.adopted.remove(&root);
+        } else {
+            self.document.shadow.adopted.insert(root, texts);
+        }
+    }
+
+    /// Record that a custom element definition has run on `element`: it is
+    /// `:defined` from now on.
+    pub fn set_customized(&mut self, element: NodeId) {
+        self.document.customized.insert(element);
+    }
+
+    /// Point a `<template>` at `contents` as what it holds: a declarative
+    /// shadow root, which the parser then fills as it would a template's
+    /// own contents.
+    pub fn set_template_contents(&mut self, template: NodeId, contents: NodeId) {
+        if let Some(NodeData::Element(element)) = self
+            .document
+            .nodes_mut()
+            .get_mut(template)
+            .map(|node| &mut node.data)
+        {
+            element.template_contents = Some(contents);
+        }
+    }
+
     /// Create a detached element.
     ///
     /// Attributes beyond the limit are dropped rather than truncating the document:

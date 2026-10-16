@@ -59,6 +59,9 @@ pub struct Tree<'a> {
     /// `:lang()` reaches an element nothing above has a language for, and not
     /// before: a restyle that never asks pays nothing for it.
     default_language: std::cell::OnceCell<Option<Box<str>>>,
+    /// Each shadow root's own rules, built from the `<style>` elements in it.
+    shadow_data:
+        Option<&'a std::collections::HashMap<NodeId, servo_arc::Arc<style::stylist::CascadeData>>>,
 }
 
 impl<'a> Tree<'a> {
@@ -69,6 +72,7 @@ impl<'a> Tree<'a> {
             style_data: None,
             states: None,
             default_language: std::cell::OnceCell::new(),
+            shadow_data: None,
         }
     }
 
@@ -79,6 +83,7 @@ impl<'a> Tree<'a> {
             style_data: None,
             states: Some(states),
             default_language: std::cell::OnceCell::new(),
+            shadow_data: None,
         }
     }
 
@@ -89,7 +94,17 @@ impl<'a> Tree<'a> {
             style_data: Some(style_data),
             states: None,
             default_language: std::cell::OnceCell::new(),
+            shadow_data: None,
         }
+    }
+
+    /// The same, with the rules each shadow root carries.
+    pub fn with_shadow_data(
+        mut self,
+        data: &'a std::collections::HashMap<NodeId, servo_arc::Arc<style::stylist::CascadeData>>,
+    ) -> Self {
+        self.shadow_data = Some(data);
+        self
     }
 
     /// The language of an element that neither it nor anything above it gives
@@ -322,11 +337,24 @@ impl SelectorsElement for NodeRef<'_> {
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
-        false
+        let document = self.tree().document;
+        document
+            .get(self.id)
+            .and_then(|node| node.parent)
+            .is_some_and(|parent| document.shadow_host_of(parent).is_some())
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
-        None
+        let document = self.tree().document;
+        let root = document.containing_shadow_root(self.id)?;
+        document.shadow_host_of(root).map(|host| self.at(host))
+    }
+
+    fn assigned_slot(&self) -> Option<Self> {
+        self.tree()
+            .document
+            .assigned_slot(self.id)
+            .map(|slot| self.at(slot))
     }
 
     fn is_pseudo_element(&self) -> bool {
@@ -463,7 +491,9 @@ impl SelectorsElement for NodeRef<'_> {
     }
 
     fn is_html_slot_element(&self) -> bool {
-        false
+        self.element().is_some_and(|element| {
+            &*element.name.local == "slot" && element.name.ns == html5ever::ns!(html)
+        })
     }
 
     fn has_id(&self, id: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
@@ -484,12 +514,16 @@ impl SelectorsElement for NodeRef<'_> {
         false
     }
 
-    fn imported_part(&self, _name: &AtomIdent) -> Option<AtomIdent> {
-        None
+    fn imported_part(&self, name: &AtomIdent) -> Option<AtomIdent> {
+        exported_parts(self.element()?)
+            .find(|(_, outer)| outer.as_bytes() == name.as_bytes())
+            .map(|(inner, _)| AtomIdent::from(inner))
     }
 
-    fn is_part(&self, _name: &AtomIdent) -> bool {
-        false
+    fn is_part(&self, name: &AtomIdent) -> bool {
+        self.element().is_some_and(|element| {
+            part_names(element).any(|part| part.as_bytes() == name.as_bytes())
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -567,6 +601,29 @@ pub fn select_with(
     let list = parse_selector_list(selector)?;
     let states = crate::state::States::new(document, form, interaction);
     Ok(Matcher::new(document, &states, None).select_under(&list, document.root(), false))
+}
+
+/// The names in an element's `part` attribute (CSS Shadow Parts §3.1).
+fn part_names(element: &ElementData) -> impl Iterator<Item = &str> {
+    element
+        .attr("part")
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+}
+
+/// The parts a shadow host passes on from its shadow tree, as `(inner,
+/// outer)` names: its `exportparts` attribute (CSS Shadow Parts §3.2), a comma
+/// list of `name` or `inner: outer`.
+fn exported_parts(element: &ElementData) -> impl Iterator<Item = (&str, &str)> {
+    element
+        .attr("exportparts")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| {
+            let (inner, outer) = entry.split_once(':').unwrap_or((entry, entry));
+            let (inner, outer) = (inner.trim(), outer.trim());
+            (!inner.is_empty() && !outer.is_empty()).then_some((inner, outer))
+        })
 }
 
 /// The elements under `scope` that `selector` matches, in tree order — what
@@ -1322,6 +1379,10 @@ impl StyleData {
         while let Some(id) = stack.pop() {
             every.push(id);
             stack.extend(document.children(id));
+            // A host's shadow tree is styled with it.
+            if let Some((root, _)) = document.shadow_root_of(id) {
+                stack.push(root);
+            }
         }
         self.prepare_nodes(document, &every, form, interaction, base);
     }
@@ -1469,49 +1530,43 @@ impl<'a> style::dom::TDocument for DocumentRef<'a> {
     }
 }
 
-/// A shadow root, which we do not have.
-///
-/// The trait has to be satisfied for the types to line up; every method is
-/// unreachable because no value of this type is ever constructed. Shadow DOM is a
-/// milestone of its own, and a stub that lies would be worse than one that cannot
-/// be called.
+/// A shadow root, as the style engine sees it: the fragment node the
+/// document keeps beside its host.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum NoShadowRoot<'a> {
-    /// Uninhabited, and carrying the tree's lifetime so that the associated types
-    /// line up with the node type it would have belonged to.
-    #[doc(hidden)]
-    Never(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
+pub struct ShadowRef<'a> {
+    node: NodeRef<'a>,
 }
 
-impl<'a> style::dom::TShadowRoot for NoShadowRoot<'a> {
+impl<'a> style::dom::TShadowRoot for ShadowRef<'a> {
     type ConcreteNode = NodeRef<'a>;
 
     fn as_node(&self) -> Self::ConcreteNode {
-        match *self {
-            NoShadowRoot::Never(never, _) => match never {},
-        }
+        self.node
     }
 
     fn host(&self) -> <Self::ConcreteNode as style::dom::TNode>::ConcreteElement {
-        match *self {
-            NoShadowRoot::Never(never, _) => match never {},
-        }
+        let host = self
+            .node
+            .tree()
+            .document
+            .shadow_host_of(self.node.id)
+            .expect("a shadow root has a host");
+        self.node.at(host)
     }
 
     fn style_data<'b>(&self) -> Option<&'b style::stylist::CascadeData>
     where
         Self: 'b,
     {
-        match *self {
-            NoShadowRoot::Never(never, _) => match never {},
-        }
+        let data = self.node.tree().shadow_data?;
+        data.get(&self.node.id).map(|data| &**data)
     }
 }
 
 impl<'a> style::dom::TNode for NodeRef<'a> {
     type ConcreteElement = Self;
     type ConcreteDocument = DocumentRef<'a>;
-    type ConcreteShadowRoot = NoShadowRoot<'a>;
+    type ConcreteShadowRoot = ShadowRef<'a>;
 
     fn parent_node(&self) -> Option<Self> {
         self.tree()
@@ -1561,8 +1616,16 @@ impl<'a> style::dom::TNode for NodeRef<'a> {
         self.tree().document.get(self.id).is_some()
     }
 
+    /// The parent in the flat tree, which is what a style inherits from: a
+    /// shadow tree's top elements inherit from the host, and a slotted
+    /// element from its slot.
     fn traversal_parent(&self) -> Option<Self> {
-        self.parent_element_id().map(|id| self.at(id))
+        let document = self.tree().document;
+        if !document.has_shadow_trees() {
+            return self.parent_element_id().map(|id| self.at(id));
+        }
+        let parent = document.flat_parent(self.id)?;
+        document.get(parent)?.element().map(|_| self.at(parent))
     }
 
     fn opaque(&self) -> style::dom::OpaqueNode {
@@ -1582,7 +1645,10 @@ impl<'a> style::dom::TNode for NodeRef<'a> {
     }
 
     fn as_shadow_root(&self) -> Option<Self::ConcreteShadowRoot> {
-        None
+        self.tree()
+            .document
+            .shadow_host_of(self.id)
+            .map(|_| ShadowRef { node: *self })
     }
 }
 
@@ -1598,7 +1664,8 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
         let children: Vec<Self> = self
             .tree()
             .document
-            .children(self.id)
+            .flat_children(self.id)
+            .into_iter()
             .map(|id| self.at(id))
             .collect();
         style::dom::LayoutIterator(children.into_iter())
@@ -1665,11 +1732,39 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
     }
 
     fn has_part_attr(&self) -> bool {
-        false
+        self.element()
+            .is_some_and(|element| part_names(element).next().is_some())
     }
 
     fn exports_any_part(&self) -> bool {
-        false
+        self.element()
+            .is_some_and(|element| exported_parts(element).next().is_some())
+    }
+
+    fn each_part<F>(&self, mut callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        let Some(element) = self.element() else {
+            return;
+        };
+        for part in part_names(element) {
+            callback(&AtomIdent::from(part));
+        }
+    }
+
+    fn each_exported_part<F>(&self, name: &AtomIdent, mut callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        let Some(element) = self.element() else {
+            return;
+        };
+        for (inner, outer) in exported_parts(element) {
+            if inner.as_bytes() == name.as_bytes() {
+                callback(&AtomIdent::from(outer));
+            }
+        }
     }
 
     fn id(&self) -> Option<&style::Atom> {
@@ -1801,12 +1896,18 @@ impl<'a> style::dom::TElement for NodeRef<'a> {
         false
     }
 
-    fn shadow_root(&self) -> Option<NoShadowRoot<'a>> {
-        None
+    fn shadow_root(&self) -> Option<ShadowRef<'a>> {
+        let (root, _) = self.tree().document.shadow_root_of(self.id)?;
+        Some(ShadowRef {
+            node: self.at(root),
+        })
     }
 
-    fn containing_shadow(&self) -> Option<NoShadowRoot<'a>> {
-        None
+    fn containing_shadow(&self) -> Option<ShadowRef<'a>> {
+        let root = self.tree().document.containing_shadow_root(self.id)?;
+        Some(ShadowRef {
+            node: self.at(root),
+        })
     }
 
     /// The language this element itself declares: `xml:lang`, the one in the

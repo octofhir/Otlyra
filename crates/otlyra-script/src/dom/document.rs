@@ -599,6 +599,66 @@ impl DocumentFragmentRef {
         Err(illegal_constructor("DocumentFragment"))
     }
 
+    /// The host this fragment is the shadow root of, if it is one. Not part
+    /// of the platform: `ShadowRoot.host` reads it.
+    #[method(name = "__shadowHost")]
+    fn js_shadow_host(&self) -> Result<Option<JsNode>, JsError> {
+        let (doc, id) = (self.node.doc, self.node.id);
+        with_document(doc, |document| {
+            document
+                .shadow_host_of(id)
+                .map(|host| JsNode::new(doc, host))
+        })
+    }
+
+    /// `"open"` or `"closed"` for a shadow root. Not part of the platform.
+    #[method(name = "__shadowMode")]
+    fn js_shadow_mode(&self) -> Result<Option<String>, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            let host = document.shadow_host_of(id)?;
+            document.shadow_root_of(host).map(|(_, mode)| {
+                match mode {
+                    otlyra_dom::ShadowMode::Open => "open",
+                    otlyra_dom::ShadowMode::Closed => "closed",
+                }
+                .to_owned()
+            })
+        })
+    }
+
+    /// The text of the constructed style sheets this shadow root adopts. Not
+    /// part of the platform: `adoptedStyleSheets` sets it.
+    #[method(name = "__setAdoptedStyles")]
+    fn js_set_adopted_styles(&self, text: String) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            let texts = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            };
+            DocumentMutator::new(document).set_adopted_styles(id, texts);
+        })
+    }
+
+    /// A shadow root's markup (DOM Parsing §3.1, on `ShadowRoot`).
+    #[method(name = "__innerHTML")]
+    fn js_fragment_inner_html(&self) -> Result<String, JsError> {
+        with_document(self.node.doc, |document| {
+            super::markup::serialize(document, self.node.id, false)
+        })?
+    }
+
+    /// Replace a shadow root's children with what `html` parses to.
+    #[method(name = "__setInnerHTML")]
+    fn js_fragment_set_inner_html(&self, html: String) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            super::markup::set_inner(document, id, &html)
+        })?
+    }
+
     #[method(name = "getElementById", length = 1)]
     fn js_get_element_by_id(&self, id: String) -> Result<Option<JsNode>, JsError> {
         by_id(self.node, &id)

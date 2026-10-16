@@ -118,8 +118,9 @@ impl<'a> States<'a> {
         };
         let mut state = ElementState::empty();
 
-        // Nothing here is a custom element, so everything here is defined.
-        state |= ElementState::DEFINED;
+        if document.is_defined(id) {
+            state |= ElementState::DEFINED;
+        }
 
         if self.hover.contains(&id) {
             state |= ElementState::HOVER;

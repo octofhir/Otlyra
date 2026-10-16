@@ -892,6 +892,130 @@ define(navigator, 'javaEnabled', function javaEnabled() {
   return false;
 });
 
+// NonDocumentTypeChildNode (DOM §4.2.7) on character data: the element
+// siblings of a text node or a comment. Lit's hydration finds the element a
+// `<!--lit-node-->` marker stands for as the comment's next element sibling.
+accessor(CharacterData.prototype, 'nextElementSibling', function () {
+  let node = this.nextSibling;
+  while (node && node.nodeType !== 1) node = node.nextSibling;
+  return node;
+});
+accessor(CharacterData.prototype, 'previousElementSibling', function () {
+  let node = this.previousSibling;
+  while (node && node.nodeType !== 1) node = node.previousSibling;
+  return node;
+});
+
+// ---------------------------------------------------------------- DOMParser
+// DOMParser (HTML §8.5.1) answers with a document of its own; this browser
+// has one document per page, so what it answers is that document's shape —
+// a detached `<html>` with a `<head>` and a `<body>` — built from the markup
+// in this document, where `importNode` and `appendChild` take it as it is.
+// Scripts in it never run, as they do not in a parsed document.
+const XML_TYPES = new Set(['application/xml', 'text/xml', 'image/svg+xml', 'application/xhtml+xml']);
+const parsedDocument = (root, head, body, type) => {
+  const parsed = Object.create(null);
+  Object.assign(parsed, {
+    nodeType: 9,
+    contentType: type,
+    documentElement: root,
+    head,
+    body,
+    get title() {
+      const title = root.querySelector('title');
+      return title ? title.textContent.trim() : '';
+    },
+    get firstChild() {
+      return root;
+    },
+    get childNodes() {
+      return [root];
+    },
+    get children() {
+      return [root];
+    },
+    querySelector: (selector) => root.querySelector(selector),
+    querySelectorAll: (selector) => root.querySelectorAll(selector),
+    getElementById: (id) => root.querySelector('#' + CSS.escape(String(id))),
+    getElementsByTagName: (name) => root.getElementsByTagName(name),
+    getElementsByClassName: (name) => root.getElementsByClassName(name),
+    createElement: (name, options) => document.createElement(name, options),
+    createElementNS: (namespace, name) => document.createElementNS(namespace, name),
+    createTextNode: (text) => document.createTextNode(text),
+    createComment: (text) => document.createComment(text),
+    createDocumentFragment: () => document.createDocumentFragment(),
+    createTreeWalker: (...args) => document.createTreeWalker(...args),
+    createNodeIterator: (...args) => document.createNodeIterator(...args),
+    createRange: () => document.createRange(),
+    importNode: (node, deep) => document.importNode(node, deep),
+    adoptNode: (node) => node,
+    get implementation() {
+      return document.implementation;
+    },
+  });
+  return parsed;
+};
+// The empty document `createHTMLDocument` answers: `<html><head><title>`
+// and an empty `<body>`.
+const emptyHtmlDocument = (title) => {
+  const root = document.createElement('html');
+  const head = document.createElement('head');
+  const body = document.createElement('body');
+  root.appendChild(head);
+  root.appendChild(body);
+  if (title !== undefined) {
+    const element = document.createElement('title');
+    element.textContent = String(title);
+    head.appendChild(element);
+  }
+  return parsedDocument(root, head, body, 'text/html');
+};
+// `document.implementation` (DOM §4.5.1), over the same approximation.
+class DOMImplementation {
+  createHTMLDocument(title) {
+    return emptyHtmlDocument(title);
+  }
+  createDocument(namespace, qualifiedName) {
+    const root = qualifiedName ? document.createElementNS(namespace, qualifiedName) : null;
+    return parsedDocument(root, null, null, 'application/xml');
+  }
+  createDocumentType(name, publicId, systemId) {
+    return { nodeType: 10, name: String(name), publicId: String(publicId), systemId: String(systemId) };
+  }
+  hasFeature() {
+    return true;
+  }
+}
+defineGlobal('DOMImplementation', DOMImplementation);
+const theImplementation = new DOMImplementation();
+accessor(Document.prototype, 'implementation', () => theImplementation);
+class DOMParser {
+  parseFromString(text, type) {
+    const source = String(text);
+    const kind = String(type || 'text/html').toLowerCase();
+    if (XML_TYPES.has(kind)) {
+      const holder = document.createElement('div');
+      holder.innerHTML = source.replace(/^\s*<\?xml[^>]*\?>/, '');
+      const root = holder.firstElementChild || holder;
+      if (root.parentNode === holder) holder.removeChild(root);
+      return parsedDocument(root, null, null, kind);
+    }
+    const root = document.createElement('html');
+    const head = document.createElement('head');
+    const body = document.createElement('body');
+    root.appendChild(head);
+    root.appendChild(body);
+    const headPart = /<head[^>]*>([\s\S]*?)<\/head>/i.exec(source);
+    const bodyPart = /<body[^>]*>([\s\S]*?)(?:<\/body>|$)/i.exec(source);
+    if (headPart) head.innerHTML = headPart[1];
+    let rest = bodyPart ? bodyPart[1] : headPart ? source.replace(headPart[0], '') : source;
+    rest = rest.replace(/^[\s\S]*?<html[^>]*>/i, '').replace(/<\/html>[\s\S]*$/i, '');
+    body.innerHTML = rest;
+    return parsedDocument(root, head, body, 'text/html');
+  }
+}
+defineGlobal('DOMParser', DOMParser);
+
 // ---------------------------------------------------------------- Wrappers
 // The prototype each interface's wrappers are made with, as the glue left
 // it. A page may put something else at `window.HTMLElement` — the custom
@@ -911,6 +1035,7 @@ for (const name of [
   'HTMLDocument',
   'DocumentFragment',
   'DocumentType',
+  'ShadowRoot',
 ]) {
   const Interface = globalThis[name];
   if (Interface && Interface.prototype) interfacePrototypes[name] = Interface.prototype;

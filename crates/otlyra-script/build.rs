@@ -37,6 +37,7 @@ const SOURCES: &[&str] = &[
     "src/dom/js/location.js",
     "src/dom/js/platform.js",
     "src/dom/js/custom_elements.js",
+    "src/dom/js/shadow.js",
     "src/dom/js/compat.js",
     "src/dom/js/network.js",
 ];
@@ -89,6 +90,9 @@ const DEFINES: &[&str] = &[
     "XMLHttpRequestEventTarget",
     "__otlyraCustomElementsCheckpoint",
     "customElements",
+    "ShadowRoot",
+    "CSSStyleSheet",
+    "DOMParser",
     "CustomElementRegistry",
     "CSS",
     "Storage",

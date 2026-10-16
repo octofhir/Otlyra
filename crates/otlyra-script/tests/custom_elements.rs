@@ -244,3 +244,92 @@ fn nodes_keep_their_interface_after_a_page_replaces_the_global() {
          </script>");
     assert_eq!(log, ["function 1 true", "late x-late"]);
 }
+
+#[test]
+fn shadow_roots_are_attached_filled_slotted_and_reached_through() {
+    let log = run(
+        "<div id=host><span id=light>light</span><b slot=x>named</b></div>\
+         <section id=declared><template shadowrootmode=open><p id=inside>declared</p></template></section>\
+         <script>\
+           const host = document.getElementById('host');\
+           const root = host.attachShadow({ mode: 'open' });\
+           root.innerHTML = '<slot></slot><slot name=x></slot><button id=inner>go</button>';\
+           const inner = root.getElementById('inner');\
+           const [main, named] = root.querySelectorAll('slot');\
+           console.log(root instanceof ShadowRoot, root instanceof DocumentFragment, host.shadowRoot === root, root.host === host, root.mode);\
+           console.log(inner.isConnected, inner.getRootNode() === root, inner.getRootNode({ composed: true }) === document);\
+           console.log(main.assignedNodes().map((n) => n.id).join(), named.assignedElements().map((n) => n.textContent).join(),\
+             document.getElementById('light').assignedSlot === main, document.querySelector('#inner'));\
+           document.addEventListener('click', (e) => console.log('document heard', e.composedPath().includes(host)));\
+           inner.click();\
+           let refused;\
+           try { host.attachShadow({ mode: 'open' }); } catch (e) { refused = e.name; }\
+           try { document.createElement('img').attachShadow({ mode: 'open' }); } catch (e) { refused += ' ' + e.name; }\
+           console.log(refused, document.getElementById('declared').shadowRoot.querySelector('#inside').textContent);\
+           customElements.define('x-card', class extends HTMLElement {\
+             constructor() { super(); this.attachShadow({ mode: 'closed' }).innerHTML = '<x-part></x-part>'; }\
+             connectedCallback() { console.log('card connected', this.shadowRoot); }\
+           });\
+           customElements.define('x-part', class extends HTMLElement { connectedCallback() { console.log('part connected', this.isConnected); } });\
+           document.body.appendChild(document.createElement('x-card'));\
+         </script>",
+    );
+    assert_eq!(
+        log,
+        [
+            "true true true true open",
+            "true true true",
+            "light named true null",
+            "document heard true",
+            "NotSupportedError NotSupportedError declared",
+            "card connected null",
+            "part connected true",
+        ]
+    );
+}
+
+#[test]
+fn constructed_sheets_and_parsed_markup() {
+    let log = run("<div id=host></div>\
+         <script>\
+           const sheet = new CSSStyleSheet();\
+           sheet.replaceSync(':host { color: red } p { margin: 0 }');\
+           const root = document.getElementById('host').attachShadow({ mode: 'open' });\
+           root.adoptedStyleSheets = [sheet];\
+           sheet.insertRule('b { font-weight: 700 }', 2);\
+           console.log(root.adoptedStyleSheets.length, sheet.cssRules.length, sheet.cssRules[2].cssText);\
+           const parsed = new DOMParser().parseFromString('<html><head><title> T </title></head><body><p id=a>one</p><script>console.log(\"ran\")<\\/script></body></html>', 'text/html');\
+           console.log(parsed.title, parsed.body.querySelector('#a').textContent, parsed.getElementById('a').id, parsed.documentElement.localName);\
+           const svg = new DOMParser().parseFromString('<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"2\"/></svg>', 'image/svg+xml');\
+           console.log(svg.documentElement.localName, svg.querySelector('circle').getAttribute('r'));\
+           const inert = document.implementation.createHTMLDocument('inert');\
+           inert.body.innerHTML = '<i>x</i>';\
+           console.log(inert.title, inert.body.firstChild.localName, inert.createElement('b').isConnected, document.implementation instanceof DOMImplementation);\
+         </script>");
+    assert_eq!(
+        log,
+        [
+            "1 3 b { font-weight: 700 }",
+            "T one a html",
+            "svg 2",
+            "inert i false true"
+        ]
+    );
+}
+
+#[test]
+fn only_upgraded_custom_elements_are_defined() {
+    let log = run(
+        "<x-later id=later></x-later><x-broken id=broken></x-broken>\
+         <script>\
+           window.onerror = () => true;\
+           const defined = (id) => document.getElementById(id).matches(':defined');\
+           console.log(document.body.matches(':defined'), defined('later'), document.querySelectorAll(':not(:defined)').length);\
+           customElements.define('x-later', class extends HTMLElement {});\
+           customElements.define('x-broken', class extends HTMLElement { constructor() { super(); throw 1; } });\
+           const made = document.createElement('x-later');\
+           console.log(defined('later'), defined('broken'), made.matches(':defined'), document.createElement('x-none').matches(':defined'));\
+         </script>",
+    );
+    assert_eq!(log, ["true false 2", "true false true false"]);
+}

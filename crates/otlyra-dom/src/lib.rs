@@ -34,6 +34,7 @@ pub mod form;
 pub mod limits;
 pub mod mutator;
 pub mod node;
+pub mod shadow;
 pub mod sink;
 pub mod submit;
 pub mod tree;
@@ -43,9 +44,12 @@ pub use form::{Control, FormState, InputKind};
 pub use limits::DomLimits;
 pub use mutator::DocumentMutator;
 pub use node::{ElementData, Node, NodeData, NodeId, node_id_from_u64, node_id_to_u64};
+pub use shadow::ShadowMode;
 pub use sink::DomSink;
 pub use submit::{Encoding, Method, Submission};
-pub use tree::{ComputedStyles, Document, DocumentId, ImageState, StyleResolver};
+pub use tree::{
+    ComputedStyles, Document, DocumentId, ImageState, StyleResolver, is_valid_custom_element_name,
+};
 pub use xpath::{XPathError, select as xpath_select};
 
 #[cfg(test)]

@@ -556,3 +556,17 @@ fn fetch_and_xhr_go_through_the_browser_and_settle_when_it_answers() {
         ]
     );
 }
+
+#[test]
+fn text_and_comments_know_their_element_siblings() {
+    let log = run(
+        "<div id=d><b>one</b><!--marker--> text <i>two</i></div>\
+         <script>\
+           const nodes = document.getElementById('d').childNodes;\
+           console.log(nodes[1].nextElementSibling.localName, nodes[1].previousElementSibling.localName,\
+             nodes[2].nextElementSibling.localName, nodes[3].nextElementSibling);\
+         </script>",
+        &[],
+    );
+    assert_eq!(log, ["i b i null"]);
+}

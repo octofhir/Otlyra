@@ -1167,7 +1167,7 @@ impl Builder<'_> {
                     }
                     let style = Arc::new(style);
                     if has_renderable_children(element) {
-                        for child in self.document.children(node) {
+                        for child in self.document.flat_children(node) {
                             self.walk(child, parent_box, &style);
                         }
                     }
@@ -1317,7 +1317,9 @@ impl Builder<'_> {
                         self.walk(child, popup, &style);
                     }
                 } else if !replaced && has_renderable_children(element) && !closed {
-                    for child in self.document.children(node) {
+                    // The flat tree: a host lays out its shadow tree, and a
+                    // slot what is assigned to it.
+                    for child in self.document.flat_children(node) {
                         self.walk(child, id, &style);
                     }
                 }
