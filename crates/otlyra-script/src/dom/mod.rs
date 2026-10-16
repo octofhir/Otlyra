@@ -575,6 +575,21 @@ pub(crate) fn window_metric(which: u32) -> f64 {
     }
 }
 
+/// Whether `query` matches the window this page is shown in, answered the
+/// way the cascade answers `@media`.
+pub(crate) fn media_matches(query: &str) -> bool {
+    let viewport = with_state(|state| state.viewport);
+    otlyra_css::cascade::media_condition_matches(
+        query,
+        otlyra_css::cascade::Viewport {
+            width: viewport.width as f32,
+            height: viewport.height as f32,
+            scale: viewport.scale as f32,
+            ..otlyra_css::cascade::Viewport::default()
+        },
+    )
+}
+
 /// Say which `<script>` element script is running now, for one it inserted.
 pub(crate) fn set_current_script(element: Option<otlyra_dom::NodeId>) {
     with_state_mut(|state| state.current_script = element);

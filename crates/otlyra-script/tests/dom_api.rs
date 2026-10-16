@@ -880,3 +880,38 @@ fn indexed_db_keeps_records_for_the_document() {
 </script>"#);
     assert_all_ok(&lines, 9);
 }
+
+#[test]
+fn the_interfaces_the_sweep_found_missing() {
+    let lines = run(r#"<div id=d><b>bold</b> &amp; text</div><script>
+  const serialized = new XMLSerializer().serializeToString(document.getElementById('d'));
+  check('XMLSerializer writes markup with the XHTML namespace', serialized, '<div xmlns="http://www.w3.org/1999/xhtml" id="d"><b>bold</b> &amp; text</div>');
+  window.addEventListener('message', (event) => {
+    check('postMessage reaches the window as a clone', [event.data, event.origin, event.source === window], [{ a: [1] }, 'https://example.com', true]);
+  });
+  postMessage({ a: [1] }, '*');
+  postMessage('dropped', 'https://elsewhere.test');
+  const reader = new FileReader();
+  reader.onload = () => {
+    check('FileReader reads a data URL', reader.result, 'data:text/plain;base64,aGk=');
+  };
+  reader.readAsDataURL(new Blob(['hi'], { type: 'text/plain' }));
+  const socket = new WebSocket('wss://example.com/live');
+  const seen = [];
+  socket.onerror = () => seen.push('error');
+  socket.onclose = (event) => {
+    seen.push('close ' + event.code);
+    check('a socket fails like an unreachable server', [seen, socket.readyState, socket.url], [['error', 'close 1006'], 3, 'wss://example.com/live']);
+  };
+  let invalid = '';
+  try { new WebSocket('ftp://x'); } catch (error) { invalid = error.name; }
+  check('a socket to another scheme is refused at once', invalid, 'SyntaxError');
+  check('hit testing outside the window finds nothing', document.elementFromPoint(-1, -1), null);
+  check('StorageEvent and FontFace exist', [new StorageEvent('storage', { key: 'k' }).key, new FontFace('X', 'url(x.woff)').family], ['k', 'X']);
+  const probe = document.createElement('div');
+  probe.setAttribute('onfocusin', 't');
+  probe.setAttribute('length', 'x');
+  check('attributes answer by name', [probe.attributes.onfocusin.value, probe.attributes['onfocusin'].expando, probe.attributes.length], ['t', undefined, 2]);
+</script>"#);
+    assert_all_ok(&lines, 8);
+}

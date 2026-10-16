@@ -1015,6 +1015,364 @@ accessor(CharacterData.prototype, 'previousElementSibling', function () {
   return node;
 });
 
+// ---------------------------------------------------------------- Messaging
+// `window.postMessage` (HTML §9.4.3) to this window: there is no other
+// browsing context here, so the only receiver is the page itself — which is
+// how frameworks schedule work (a `message` they post to themselves) and how
+// libraries test for the API. The message is a structured clone, delivered
+// as a task, and dropped when `targetOrigin` names another origin.
+defineGlobal('postMessage', function postMessage(message, options, transfer) {
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required");
+  let target = options !== null && typeof options === 'object' ? options.targetOrigin : options;
+  target = target === undefined ? '/' : String(target);
+  const own = location.origin;
+  if (target !== '*' && target !== '/') {
+    let parsed;
+    try {
+      parsed = new URL(target).origin;
+    } catch (_) {
+      throw new DOMException("Invalid target origin '" + target + "' in a call to 'postMessage'.", 'SyntaxError');
+    }
+    if (parsed !== own) return;
+  }
+  const data = structuredClone(message);
+  setTimeout(() => {
+    globalThis.dispatchEvent(new MessageEvent('message', { data, origin: own, source: globalThis }));
+  }, 0);
+});
+
+// ---------------------------------------------------------------- Hit testing
+// `elementsFromPoint` (CSSOM View §6.1): the elements whose boxes, as last
+// drawn, contain the point, topmost first. Stacking order is approximated by
+// tree order — a later element, or a descendant, is above — which is what
+// a page with no `z-index` games sees.
+method(Document.prototype, 'elementsFromPoint', function elementsFromPoint(x, y) {
+  x = Number(x);
+  y = Number(y);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > innerWidth || y > innerHeight) return [];
+  const hits = [];
+  for (const element of this.querySelectorAll('*')) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0 && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom) {
+      hits.push(element);
+    }
+  }
+  const root = this.documentElement;
+  if (root && !hits.includes(root)) hits.unshift(root);
+  return hits.reverse();
+});
+method(Document.prototype, 'elementFromPoint', function elementFromPoint(x, y) {
+  return this.elementsFromPoint(x, y)[0] ?? null;
+});
+
+// ---------------------------------------------------------------- XMLSerializer
+// DOM Parsing §3.2: markup for a node. HTML elements serialize as their HTML,
+// with the XHTML namespace on the outermost one, as a browser's does.
+const XHTML_NS = 'http://www.w3.org/1999/xhtml';
+const escapeMarkup = (text) => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+class XMLSerializer {
+  serializeToString(node) {
+    if (!(node instanceof Node)) {
+      throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+    }
+    switch (node.nodeType) {
+      case 1: {
+        const markup = node.outerHTML;
+        if (node.namespaceURI !== XHTML_NS || node.hasAttribute('xmlns')) return markup;
+        return markup.replace(/^<([^\s>/]+)/, `<$1 xmlns="${XHTML_NS}"`);
+      }
+      case 3:
+        return escapeMarkup(node.data);
+      case 4:
+        return '<![CDATA[' + node.data + ']]>';
+      case 7:
+        return '<?' + node.target + ' ' + node.data + '?>';
+      case 8:
+        return '<!--' + node.data + '-->';
+      case 9: {
+        const doctype = node.doctype ? this.serializeToString(node.doctype) : '';
+        return doctype + (node.documentElement ? this.serializeToString(node.documentElement) : '');
+      }
+      case 10:
+        return '<!DOCTYPE ' + node.name + (node.publicId ? ` PUBLIC "${node.publicId}"` : '') + (node.systemId ? ` "${node.systemId}"` : '') + '>';
+      case 11:
+        return Array.from(node.childNodes, (child) => this.serializeToString(child)).join('');
+      default:
+        return '';
+    }
+  }
+}
+defineGlobal('XMLSerializer', XMLSerializer);
+
+// ---------------------------------------------------------------- FileReader
+// File API §6: a Blob read as text, a data: URL, bytes or a binary string,
+// with the reader's events in order.
+class FileReader extends EventTarget {
+  static EMPTY = 0;
+  static LOADING = 1;
+  static DONE = 2;
+  #state = 0;
+  #result = null;
+  #error = null;
+  #generation = 0;
+
+  get readyState() {
+    return this.#state;
+  }
+  get result() {
+    return this.#result;
+  }
+  get error() {
+    return this.#error;
+  }
+  #fire(type) {
+    try {
+      this.dispatchEvent(typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type));
+    } catch (error) {
+      reportError(error);
+    }
+  }
+  #read(blob, convert) {
+    if (!(blob instanceof Blob)) throw new TypeError("Failed to execute on 'FileReader': parameter 1 is not of type 'Blob'.");
+    if (this.#state === 1) throw new DOMException('The object is already busy reading Blobs.', 'InvalidStateError');
+    this.#state = 1;
+    this.#result = null;
+    this.#error = null;
+    const generation = ++this.#generation;
+    setTimeout(() => this.#fire('loadstart'), 0);
+    blob.arrayBuffer().then(
+      (buffer) => {
+        setTimeout(() => {
+          if (generation !== this.#generation) return;
+          this.#state = 2;
+          this.#result = convert(buffer, blob);
+          this.#fire('progress');
+          this.#fire('load');
+          this.#fire('loadend');
+        }, 0);
+      },
+      (error) => {
+        setTimeout(() => {
+          if (generation !== this.#generation) return;
+          this.#state = 2;
+          this.#error = new DOMException(String(error && error.message || error), 'NotReadableError');
+          this.#fire('error');
+          this.#fire('loadend');
+        }, 0);
+      },
+    );
+  }
+  readAsArrayBuffer(blob) {
+    this.#read(blob, (buffer) => buffer);
+  }
+  readAsText(blob, encoding = 'utf-8') {
+    this.#read(blob, (buffer) => new TextDecoder(encoding).decode(buffer));
+  }
+  readAsBinaryString(blob) {
+    this.#read(blob, (buffer) => {
+      let out = '';
+      const bytes = new Uint8Array(buffer);
+      for (let at = 0; at < bytes.length; at += 0x8000) out += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+      return out;
+    });
+  }
+  readAsDataURL(blob) {
+    this.#read(blob, (buffer, source) => {
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+      return 'data:' + (source.type || 'application/octet-stream') + ';base64,' + btoa(binary);
+    });
+  }
+  abort() {
+    if (this.#state !== 1) return;
+    this.#generation++;
+    this.#state = 2;
+    this.#result = null;
+    this.#fire('abort');
+    this.#fire('loadend');
+  }
+}
+Object.assign(FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
+for (const type of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) defineHandler(FileReader.prototype, type);
+defineGlobal('FileReader', FileReader);
+
+// ---------------------------------------------------------------- Sockets
+// WebSocket (HTML §9.3) and EventSource (§9.2) have no network beneath them
+// here yet. A connection fails as one to an unreachable server does —
+// `error` then `close`, a task later — rather than the page failing on the
+// constructor, which no browser does.
+class WebSocket extends EventTarget {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  #url;
+  #state = 0;
+  binaryType = 'blob';
+
+  constructor(url, protocols) {
+    super();
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required");
+    let parsed;
+    try {
+      parsed = new URL(String(url), documentBase());
+    } catch (_) {
+      throw new DOMException("Failed to construct 'WebSocket': The URL '" + url + "' is invalid.", 'SyntaxError');
+    }
+    if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+    if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+      throw new DOMException("Failed to construct 'WebSocket': The URL's scheme must be either 'ws' or 'wss'.", 'SyntaxError');
+    }
+    if (parsed.hash) throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier.", 'SyntaxError');
+    this.#url = parsed.href;
+    setTimeout(() => {
+      if (this.#state === 3) return;
+      this.#state = 3;
+      this.dispatchEvent(new Event('error'));
+      this.dispatchEvent(new CloseEvent('close', { code: 1006, reason: '', wasClean: false }));
+    }, 0);
+  }
+  get url() {
+    return this.#url;
+  }
+  get readyState() {
+    return this.#state;
+  }
+  get bufferedAmount() {
+    return 0;
+  }
+  get extensions() {
+    return '';
+  }
+  get protocol() {
+    return '';
+  }
+  send() {
+    if (this.#state === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+  }
+  close() {
+    if (this.#state === 2 || this.#state === 3) return;
+    this.#state = 2;
+  }
+}
+Object.assign(WebSocket.prototype, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+for (const type of ['open', 'message', 'error', 'close']) defineHandler(WebSocket.prototype, type);
+defineGlobal('WebSocket', WebSocket);
+
+class EventSource extends EventTarget {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 2;
+  #url;
+  #state = 0;
+  #credentials;
+
+  constructor(url, init = {}) {
+    super();
+    try {
+      this.#url = new URL(String(url), documentBase()).href;
+    } catch (_) {
+      throw new DOMException("Failed to construct 'EventSource': Cannot open an EventSource to '" + url + "'. The URL is invalid.", 'SyntaxError');
+    }
+    this.#credentials = Boolean(init && init.withCredentials);
+    setTimeout(() => {
+      if (this.#state === 2) return;
+      this.#state = 2;
+      this.dispatchEvent(new Event('error'));
+    }, 0);
+  }
+  get url() {
+    return this.#url;
+  }
+  get readyState() {
+    return this.#state;
+  }
+  get withCredentials() {
+    return this.#credentials;
+  }
+  close() {
+    this.#state = 2;
+  }
+}
+Object.assign(EventSource.prototype, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+for (const type of ['open', 'message', 'error']) defineHandler(EventSource.prototype, type);
+defineGlobal('EventSource', EventSource);
+
+// ---------------------------------------------------------------- Events
+// HTML §12.2.1: what another document's change to storage tells this one.
+// Nothing fires it yet; pages construct it and test for it.
+class StorageEvent extends Event {
+  #init;
+  constructor(type, init = {}) {
+    super(type, init);
+    this.#init = {
+      key: init.key ?? null,
+      oldValue: init.oldValue ?? null,
+      newValue: init.newValue ?? null,
+      url: String(init.url ?? ''),
+      storageArea: init.storageArea ?? null,
+    };
+  }
+  get key() {
+    return this.#init.key;
+  }
+  get oldValue() {
+    return this.#init.oldValue;
+  }
+  get newValue() {
+    return this.#init.newValue;
+  }
+  get url() {
+    return this.#init.url;
+  }
+  get storageArea() {
+    return this.#init.storageArea;
+  }
+}
+defineGlobal('StorageEvent', StorageEvent);
+
+// CSS Font Loading §2: a face a page builds in script. The faces a page
+// names in its sheets load with the page; one made here is accepted and
+// reports itself loaded, and text falls back to the faces the page has.
+class FontFace {
+  #family;
+  #status = 'unloaded';
+  #loaded;
+  #resolve;
+
+  constructor(family, source, descriptors = {}) {
+    this.#family = String(family);
+    this.#loaded = new Promise((resolve) => {
+      this.#resolve = resolve;
+    });
+    this.style = String(descriptors.style ?? 'normal');
+    this.weight = String(descriptors.weight ?? 'normal');
+    this.stretch = String(descriptors.stretch ?? 'normal');
+    this.unicodeRange = String(descriptors.unicodeRange ?? 'U+0-10FFFF');
+    this.display = String(descriptors.display ?? 'auto');
+    if (typeof source !== 'string') this.load();
+  }
+  get family() {
+    return this.#family;
+  }
+  get status() {
+    return this.#status;
+  }
+  get loaded() {
+    return this.#loaded;
+  }
+  load() {
+    if (this.#status === 'unloaded') {
+      this.#status = 'loaded';
+      this.#resolve(this);
+    }
+    return this.#loaded;
+  }
+}
+defineGlobal('FontFace', FontFace);
+
 // ---------------------------------------------------------------- DOMParser
 // DOMParser (HTML §8.5.1) answers with a document of its own; this browser
 // has one document per page, so what it answers is that document's shape —

@@ -109,16 +109,24 @@ impl PageScripts {
             return;
         }
         self.state.set_viewport(viewport);
-        if self.seen == 0 || previous.width == viewport.width && previous.height == viewport.height
-        {
+        if self.seen == 0 {
             return;
         }
+        // HTML §8.1.7.3 "update the rendering": the resize steps, then the
+        // media query lists that stopped or started matching — which a change
+        // of scale alone can do (`resolution`).
+        let resized = previous.width != viewport.width || previous.height != viewport.height;
+        let source = if resized {
+            "window.dispatchEvent(new Event('resize')); __otlyraMediaChanged();"
+        } else {
+            "__otlyraMediaChanged();"
+        };
         let Self { host, state, .. } = self;
         let Some(host) = host.as_mut() else {
             return;
         };
         let outcome = crate::dom::loan(document, state, || {
-            host.run_classic_script("window.dispatchEvent(new Event('resize'))", "<resize>")
+            host.run_classic_script(source, "<resize>")
         });
         self.absorb_turn();
         if let Err(error) = outcome {

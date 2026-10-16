@@ -136,6 +136,14 @@ impl DocumentRef {
         super::set_document_url(href, kind);
     }
 
+    /// Whether the media query list `query` matches the window as it is now
+    /// (CSSOM View §4.2): the `matches` of a `MediaQueryList`. Not part of
+    /// the platform.
+    #[static_method(name = "__matchMedia")]
+    fn js_match_media(query: String) -> bool {
+        super::media_matches(&query)
+    }
+
     /// How many items `localStorage` (0) or `sessionStorage` (1) keeps. Not
     /// part of the platform: the `Storage` glue calls these.
     #[static_method(name = "__storageLength")]

@@ -284,6 +284,14 @@ Object.defineProperties(NamedNodeMap.prototype, Object.getOwnPropertyDescriptors
 accessor(Element.prototype, 'attributes', function () {
   const map = asNamedNodeMap(nativeAttributeRecords.call(this).map((record) => makeAttr(this, record)));
   Object.defineProperty(map, kAttrOwner, { value: this });
+  // Each attribute is also a property by its qualified name (DOM §4.9.1's
+  // supported property names), unless the map already answers to that
+  // name: `element.attributes.class`, `attributes['onclick']`.
+  for (const attr of map) {
+    const name = attr.name;
+    if (name in map || /^\d+$/.test(name)) continue;
+    Object.defineProperty(map, name, { value: attr, configurable: true });
+  }
   return map;
 });
 

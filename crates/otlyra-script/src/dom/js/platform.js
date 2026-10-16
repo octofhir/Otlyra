@@ -2,19 +2,93 @@
 // one window with no preference declared; the listener half exists so that a
 // page that subscribes does not throw on a browser that never changes its
 // answer.
+// `matchMedia` (CSSOM View §4.2): a list whose `matches` is asked of the
+// cascade's own media query evaluator against the window as it is now, so a
+// page's script and its `@media` rules agree. Lists are held weakly; when
+// the window changes, each one still alive whose answer changed hears
+// `change`.
+const nativeMatchMedia = take(Document, '__matchMedia');
+const kMediaQueryList = Symbol('mediaQueryList');
+const mediaQueryLists = new Set();
+class MediaQueryList extends EventTarget {
+  #media;
+  #matches;
+
+  constructor(token, media) {
+    if (token !== kMediaQueryList) throw new TypeError('Illegal constructor');
+    super();
+    this.#media = media;
+    this.#matches = nativeMatchMedia(media);
+  }
+
+  get media() {
+    return this.#media;
+  }
+
+  get matches() {
+    return nativeMatchMedia(this.#media);
+  }
+
+  addListener(callback) {
+    if (typeof callback === 'function') this.addEventListener('change', callback);
+  }
+
+  removeListener(callback) {
+    if (typeof callback === 'function') this.removeEventListener('change', callback);
+  }
+
+  // Whether the answer changed since this was last asked.
+  [kMediaQueryList]() {
+    const now = nativeMatchMedia(this.#media);
+    if (now === this.#matches) return false;
+    this.#matches = now;
+    return true;
+  }
+}
+defineHandler(MediaQueryList.prototype, 'change');
+defineGlobal('MediaQueryList', MediaQueryList);
+
+class MediaQueryListEvent extends Event {
+  #media;
+  #matches;
+
+  constructor(type, init = {}) {
+    super(type, init);
+    this.#media = String(init.media ?? '');
+    this.#matches = Boolean(init.matches);
+  }
+
+  get media() {
+    return this.#media;
+  }
+
+  get matches() {
+    return this.#matches;
+  }
+}
+defineGlobal('MediaQueryListEvent', MediaQueryListEvent);
+
 defineGlobal('matchMedia', function matchMedia(query) {
-  return {
-    media: String(query),
-    matches: false,
-    onchange: null,
-    addListener() {},
-    removeListener() {},
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {
-      return false;
-    },
-  };
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required");
+  const list = new MediaQueryList(kMediaQueryList, String(query));
+  mediaQueryLists.add(new WeakRef(list));
+  return list;
+});
+
+defineGlobal('__otlyraMediaChanged', function __otlyraMediaChanged() {
+  for (const reference of [...mediaQueryLists]) {
+    const list = reference.deref();
+    if (!list) {
+      mediaQueryLists.delete(reference);
+      continue;
+    }
+    if (!list[kMediaQueryList]()) continue;
+    try {
+      list.dispatchEvent(new MediaQueryListEvent('change', { media: list.media, matches: list.matches }));
+    } catch (error) {
+      reportError(error);
+    }
+  }
 });
 
 // Animation callbacks stay in the isolate until the host supplies a visible

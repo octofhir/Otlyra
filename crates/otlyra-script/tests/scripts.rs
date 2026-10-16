@@ -789,6 +789,43 @@ fn paused_parsers_update_viewport_and_replaceable_window_properties_stay_overrid
     );
 }
 
+/// `matchMedia` answers from the window as it is, and a list whose answer
+/// changes with the window hears `change`, after `resize`.
+#[test]
+fn media_query_lists_follow_the_window() {
+    let sink = Arc::new(Captured::default());
+    let mut scripts = Box::new(PageScripts::with_console(
+        "https://viewport.test/",
+        sink.clone(),
+    ));
+    scripts.set_initial_viewport(800.0, 600.0, 1.0);
+    let mut parser = HtmlParser::new().with_script_runner(scripts);
+    let mut document = otlyra_dom::Document::new();
+    parser.feed(&mut document, r#"<script>
+        const wide = matchMedia('(min-width: 900px)');
+        const narrow = matchMedia('(max-width: 899px)');
+        const sharp = matchMedia('(min-resolution: 2dppx)');
+        console.log('initial', wide.matches, narrow.matches, sharp.matches, wide instanceof MediaQueryList, wide.media);
+        window.addEventListener('resize', () => console.log('resize'));
+        wide.addEventListener('change', (event) => console.log('wide', event.matches, event.media, event instanceof MediaQueryListEvent));
+        narrow.onchange = (event) => console.log('narrow', event.matches);
+        sharp.addListener((event) => console.log('sharp', event.matches));
+    </script>"#.into());
+    let mut runner = parser.finish(&mut document).unwrap();
+    runner.set_viewport(&mut document, 1000.0, 600.0, 1.0);
+    runner.set_viewport(&mut document, 1000.0, 600.0, 2.0);
+    assert_eq!(
+        lines(&sink),
+        [
+            "Log: initial false true false true (min-width: 900px)",
+            "Log: resize",
+            "Log: wide true (min-width: 900px) true",
+            "Log: narrow false",
+            "Log: sharp true",
+        ]
+    );
+}
+
 #[test]
 fn an_external_script_whose_source_is_in_hand_runs_where_the_document_names_it() {
     let sink = Arc::new(Captured::default());
