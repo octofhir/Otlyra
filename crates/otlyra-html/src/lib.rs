@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(parser.scripts_run(), 0, "no fallback runs");
         let mut runner = parser.finish(&mut document).expect("runner");
         let counts = runner.take_module_fetches();
-        assert_eq!(counts, ["import maps: 1", "modules: 2"]);
+        assert_eq!(counts, ["import maps: 1", "modules: 2", "ran: 0"]);
         assert!(dump::serialize(&document).contains("\"after\""));
     }
 
@@ -602,6 +602,44 @@ mod tests {
         parser.skip_script(&mut document);
         parser.finish(&mut document);
         assert!(dump::serialize(&document).contains("\"after\""));
+    }
+
+    /// `defer` and `async` scripts neither stop the parse nor run where they
+    /// stand, even with their bytes in hand: they are left for after it, in
+    /// order. A plain one beside them still runs in place.
+    #[test]
+    fn deferred_and_async_scripts_wait_for_the_end_of_the_parse() {
+        use otlyra_dom::Document;
+
+        let sources: ExternalSources = [
+            ("late.js".to_owned(), "1".to_owned()),
+            ("soon.js".to_owned(), "2".to_owned()),
+            ("now.js".to_owned(), "3".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let mut parser = HtmlParser::new()
+            .with_external_sources(sources)
+            .with_script_runner(Box::new(CountingRunner::default()));
+        let mut document = Document::new();
+        parser.feed(
+            &mut document,
+            "<head><script defer src=late.js></script><script async src=soon.js></script>\
+             <script src=now.js></script></head><body><p id=data>after</p>"
+                .into(),
+        );
+        assert!(parser.blocked_on().is_none(), "nothing stops the parse");
+        let deferred: Vec<_> = parser
+            .deferred_scripts()
+            .iter()
+            .map(|node| document.attr(*node, "src").unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(deferred, ["late.js", "soon.js"]);
+        let mut runner = parser.finish(&mut document).expect("the runner");
+        assert!(
+            runner.take_module_fetches().contains(&"ran: 1".to_owned()),
+            "only the plain script ran during the parse"
+        );
     }
 
     /// A runner that does nothing, so a parse can be driven without an engine.
@@ -626,6 +664,7 @@ mod tests {
             vec![
                 format!("import maps: {}", self.import_maps),
                 format!("modules: {}", self.modules),
+                format!("ran: {}", self.ran),
             ]
         }
 

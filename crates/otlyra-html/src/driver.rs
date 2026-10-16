@@ -337,6 +337,10 @@ pub struct PageRequest {
     pub headers: Vec<(String, String)>,
     /// The body, for a method that has one.
     pub body: Option<Vec<u8>>,
+    /// Whether a `<script>` element asked for it: fetched as a script
+    /// (no-cors), and given to the page whatever its origin, since the page
+    /// runs it rather than reads it.
+    pub script: bool,
 }
 
 /// What came back for a [`PageRequest`].
@@ -695,6 +699,12 @@ impl HtmlParser {
 
     /// Run the script the tokenizer stopped at, if it is one we run.
     fn execute(&mut self, element: NodeId) {
+        // Whatever becomes of it here, a script the parser met is started: a
+        // page that moves it later does not run it a second time.
+        {
+            let mut document = self.tokenizer.sink.sink.document_mut();
+            otlyra_dom::DocumentMutator::new(&mut document).mark_script_started(element);
+        }
         if self.script_runner.is_none() {
             return;
         }
@@ -758,6 +768,20 @@ impl HtmlParser {
             // for browsers that do not.
             if data.attr("nomodule").is_some() {
                 tracing::debug!(target: "page.script", "a nomodule script is not run");
+                return;
+            }
+
+            // `defer` and `async` take an external script out of the parse
+            // (HTML §4.12.1.1): it neither stops the tokenizer nor runs where
+            // it stands, even when its bytes are already here. A Next.js page
+            // reads `#__NEXT_DATA__`, written at the end of the body, from a
+            // deferred script in the head. Both run after the parse, in
+            // document order — `defer`'s order; `async` may run in any.
+            if data.attr("src").is_some()
+                && (data.attr("defer").is_some() || data.attr("async").is_some())
+            {
+                self.external_scripts.push(element);
+                self.deferred_scripts.push(element);
                 return;
             }
 
