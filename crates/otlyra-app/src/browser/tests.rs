@@ -4431,6 +4431,8 @@ fn pictures_report_load_and_error_to_their_elements() {
                 content_type: Some("text/html".to_owned()),
                 bytes: b"<body><img id=first src=/first.png onload=\"note('first-load', this)\">\
                          <img id=broken src=/broken.png onerror=\"note('broken-error', this)\">\
+                         <picture><source srcset=/chosen.png media=\"(min-width: 1px)\"><img id=picked src=/fallback.png></picture>\
+                         <img id=sets srcset=\"/set.png 1x\">\
                          <script>\
                            const seen = [];\
                            function note(what, image) {\
@@ -4439,6 +4441,10 @@ fn pictures_report_load_and_error_to_their_elements() {
                            }\
                            window.addEventListener('load', () => {\
                              note('window-load', document.getElementById('first'));\
+                             for (const id of ['picked', 'sets']) {\
+                               const image = document.getElementById(id);\
+                               seen.push(id + ':' + image.complete + ':' + image.naturalWidth + ':' + image.currentSrc.split('/').pop());\
+                             }\
                              const late = document.createElement('img');\
                              late.onload = () => note('late-load', late);\
                              late.src = '/late.png';\
@@ -4469,6 +4475,8 @@ fn pictures_report_load_and_error_to_their_elements() {
             "window-load:1x1:true",
             "late-pending:0x0:false",
             "late-load:1x1:true",
+            "picked:true:1:chosen.png",
+            "sets:true:1:set.png",
         ] {
             assert!(log.contains(expected), "{expected} missing from {log}");
         }

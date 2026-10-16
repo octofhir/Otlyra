@@ -504,8 +504,17 @@ accessor(HTMLImageElement.prototype, 'naturalHeight', function () {
 accessor(HTMLImageElement.prototype, 'complete', function () {
   return this.__otlyraImageState()[2] === 1;
 });
+const nativeImageSource = take(Element.prototype, '__otlyraImageSource');
+// The file the browser picked and has an answer for, resolved; before
+// that, `src`.
 accessor(HTMLImageElement.prototype, 'currentSrc', function () {
-  return this.src;
+  const chosen = nativeImageSource.call(this);
+  if (chosen === null || chosen === undefined) return this.src;
+  try {
+    return new URL(chosen, document.baseURI).href;
+  } catch (_) {
+    return chosen;
+  }
 });
 method(HTMLImageElement.prototype, 'decode', function decode() {
   return Promise.resolve();

@@ -229,6 +229,21 @@ impl ElementRef {
         self.set("class", &value)
     }
 
+    /// The address of the picture this element shows, as it spelled it, if
+    /// one has arrived or failed: what `currentSrc` resolves. Not part of
+    /// the platform.
+    #[method(name = "__otlyraImageSource")]
+    fn js_image_source(&self) -> Result<Option<String>, JsError> {
+        let id = self.node.id;
+        with_document(self.node.doc, |document| {
+            let src = document.attr(id, "src").unwrap_or_default();
+            document
+                .image_state(id)
+                .filter(|state| selects_its_source(document, id) || state.src == src)
+                .map(|state| state.src.clone())
+        })
+    }
+
     /// What became of this element's picture for the `src` it has now:
     /// `[width, height, complete]`, with zero sizes for a picture that has
     /// not arrived or failed. Read by the glue's image accessors.
@@ -237,11 +252,15 @@ impl ElementRef {
         let id = self.node.id;
         with_document(self.node.doc, |document| {
             let src = document.attr(id, "src").unwrap_or_default();
-            if src.trim().is_empty() {
+            // With a `srcset`, or a `<picture>` around it, the browser picks
+            // the file (HTML §4.8.4.3), and the picture that arrived is for
+            // whichever it picked, not for `src`.
+            let selects = selects_its_source(document, id);
+            if src.trim().is_empty() && !selects {
                 return vec![0.0, 0.0, 1.0];
             }
             match document.image_state(id) {
-                Some(state) if state.src == src => {
+                Some(state) if selects || state.src == src => {
                     let (width, height) = state.size.unwrap_or((0, 0));
                     vec![f64::from(width), f64::from(height), 1.0]
                 }
@@ -824,4 +843,16 @@ pub(crate) fn by_name(root: NodeRef, name: &str) -> Result<Vec<JsNode>, JsError>
         .map(|id| JsNode::new(root.doc, id))
         .collect()
     })
+}
+
+/// Whether the browser picks `img`'s file from candidates rather than taking
+/// its `src`: it has a `srcset`, or its parent is a `<picture>`.
+fn selects_its_source(document: &otlyra_dom::Document, img: otlyra_dom::NodeId) -> bool {
+    document.attr(img, "srcset").is_some()
+        || document
+            .get(img)
+            .and_then(|node| node.parent)
+            .and_then(|parent| document.get(parent))
+            .and_then(otlyra_dom::Node::element)
+            .is_some_and(|parent| &*parent.name.local == "picture")
 }
