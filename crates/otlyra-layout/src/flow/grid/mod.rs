@@ -364,13 +364,14 @@ impl<'a> Flow<'a> {
         for (item, &(item_width, offset)) in setup.items.iter().zip(&widths) {
             let (column_x, area_width) = columns.span(&item.area.columns);
             let (row_y, area_height) = rows.span(&item.area.rows);
-            let fragment = self.place_item(
+            let mut fragment = self.place_item(
                 item,
                 &style,
                 (x + column_x + offset, y + row_y),
                 item_width,
                 (area_width, area_height),
             );
+            super::lift_item(&mut fragment, &self.tree.node(item.id).style, area_width);
             out.push(fragment);
         }
         self.floats = outer_floats;

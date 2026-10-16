@@ -174,7 +174,7 @@ impl<'a> Flow<'a> {
             if style.position == otlyra_css::Position::Relative {
                 let (dx, dy) = relative_offset(&style, width);
                 offset(&mut fragment, dx, dy);
-                mark_layer(&mut fragment, style.z_index.unwrap_or(0));
+                mark_layer(&mut fragment, style.z_index);
             }
 
             let bottom = if index == last && !bottom_edge.keeps_margin() {
@@ -259,7 +259,22 @@ impl<'a> Flow<'a> {
         self.table_width = None;
         // What the box's own contents resolve a percentage height against — its
         // height, when it has one to give — and the limits it is held between.
-        let space = self.content_space(&style, width, content_width);
+        // Stretched between two insets: a height of its own, settled before its
+        // contents, which is what a percentage inside it resolves against.
+        let stretched = self
+            .inset_height
+            .take()
+            .filter(|(box_id, _)| *box_id == id)
+            .map(|(_, height)| {
+                let inner =
+                    (height - padding.top - padding.bottom - border.top - border.bottom).max(0.0);
+                self.block_sizes_of(&style, width, content_width, Some(inner))
+                    .used(inner)
+            });
+        let mut space = self.content_space(&style, width, content_width);
+        if let Some(height) = stretched {
+            space.height = Some(height);
+        }
         let content_height = self.layout_inside(
             id,
             content_width,
@@ -274,9 +289,10 @@ impl<'a> Flow<'a> {
         self.table_width = None;
         let laid_out = content_height;
         let content_height = self.content_height(id, content_height);
-        let content_height = self
-            .block_sizes_of(&style, width, content_width, Some(content_height))
-            .used(content_height);
+        let content_height = stretched.unwrap_or_else(|| {
+            self.block_sizes_of(&style, width, content_width, Some(content_height))
+                .used(content_height)
+        });
 
         // Before the clip, because what a field slides out of the box is
         // exactly what the clip is for.

@@ -166,7 +166,22 @@ impl<'a> Flow<'a> {
         // A float outside does not reach into a positioned box, and one inside does
         // not reach out.
         let outer_floats = std::mem::take(&mut self.floats);
+        // An `auto` height with both vertical insets is what they leave of the
+        // containing block, less the box's own margins (CSS 2.2 §10.6.4).
+        if style.height == otlyra_css::Size::Auto
+            && let (Some(top), Some(bottom), Some(_)) = (top, bottom, block.height)
+            && !picture
+        {
+            let margin = |value: &LengthOrAuto| value.resolve(area.width).unwrap_or(0.0);
+            let between = area.height
+                - top
+                - bottom
+                - margin(&style.margin.top)
+                - margin(&style.margin.bottom);
+            self.inset_height = Some((id, between.max(0.0)));
+        }
         let mut fragment = self.layout_sized(id, area.x, area.y, width);
+        self.inset_height = None;
         self.containing_height = outer_height;
         self.floats = outer_floats;
 
@@ -187,7 +202,7 @@ impl<'a> Flow<'a> {
         if style.position == otlyra_css::Position::Fixed {
             mark_fixed(&mut fragment);
         }
-        mark_layer(&mut fragment, style.z_index.unwrap_or(0));
+        mark_layer(&mut fragment, style.z_index);
         fragment
     }
 }

@@ -279,6 +279,9 @@ pub struct Layer {
     /// Whether it floats, which lifts it off the flow's level too — above every
     /// in-flow block and below anything positioned.
     pub floated: bool,
+    /// Whether its `z-index` is a number rather than `auto`: what makes a
+    /// positioned box a stacking context of its own (CSS 2.2 §9.9.1).
+    pub stacking: bool,
     /// One step per level, outermost first.
     ///
     /// Filled in once the tree is built, because a box's place in the order is its
@@ -344,17 +347,20 @@ impl Layer {
             index: 0,
             positioned: false,
             floated: false,
+            stacking: false,
             order: std::sync::Arc::from(Vec::new()),
             enter: 0,
             exit: 0,
         }
     }
 
-    /// The level of a positioned box, before the tree knows where it sits.
-    pub fn positioned(index: i32) -> Self {
+    /// The level of a positioned box with a `z-index` of `index` (`None` for
+    /// `auto`), before the tree knows where it sits.
+    pub fn positioned(index: Option<i32>) -> Self {
         Self {
-            index,
+            index: index.unwrap_or(0),
             positioned: true,
+            stacking: index.is_some(),
             ..Self::flow()
         }
     }
@@ -390,45 +396,56 @@ impl Layer {
 pub(crate) fn assign_paint_order(fragment: &mut Fragment) {
     let root = Layer::flow();
     let mut next = 0;
-    assign(fragment, &root, &mut next);
+    assign(fragment, (&root, &root), &mut next);
 }
 
-fn assign(fragment: &mut Fragment, context: &Layer, next: &mut u32) {
+/// `context` is where a fragment that is not positioned is ordered: the
+/// nearest box painted as a unit. `stacking` is the nearest real stacking
+/// context, where a positioned fragment is ordered (CSS 2.2 Appendix E).
+fn assign(fragment: &mut Fragment, (context, stacking): (&Layer, &Layer), next: &mut u32) {
     let enter = *next;
     *next += 1;
 
     let positioned = fragment.layer.positioned;
     let floated = fragment.layer.floated;
     let index = fragment.layer.index;
+    let explicit = fragment.layer.stacking;
+    // A box that is not painted as part of its parent's flow is ordered in the
+    // stacking context it belongs to, not in whatever its parent is painted
+    // with: a positioned box with `z-index: 2` inside a `position: relative`
+    // one with `z-index: auto` is above that one's later siblings.
+    let parent = if positioned { stacking } else { context };
     let own = Layer {
         index,
         positioned,
         floated,
-        order: context.descend(Layer::level(index, positioned, floated), enter),
+        stacking: explicit,
+        order: parent.descend(Layer::level(index, positioned, floated), enter),
         enter,
         exit: enter,
     };
 
-    // A positioned box makes a context of its own. So does a half-transparent one —
-    // it is composited once, contents and all, and something inside it that painted
-    // somewhere else could not be part of that — and so does a transformed one, for
-    // the same reason: what is inside it is drawn in its space. Only a box; a line
-    // and a run of glyphs carry the style of the block they are in, and a context
-    // per line of a faded paragraph would be a context per line of it.
+    // A positioned box with a `z-index`, a half-transparent box and a
+    // transformed one each make a stacking context: everything inside is
+    // ordered within it — a faded box is composited once, contents and all,
+    // and a transformed one draws its contents in its own space. Only a box;
+    // a line and a run of glyphs carry the style of the block they are in.
     let grouped = matches!(fragment.kind, FragmentKind::Box)
         && (fragment.style.opacity < 1.0 || !fragment.style.transform.is_empty());
-    // A float takes its contents with it for the same reason: CSS paints a
-    // float's background and everything in it together, at the float's own place
-    // in the order, and contents left behind on the flow's level would be
-    // painted under the very blocks the float is drawn over.
-    let context = if positioned || grouped || floated {
-        &own
+    let makes_context = (positioned && explicit) || grouped;
+    // A positioned box with `z-index: auto`, and a float, are painted as if
+    // they made one — their own contents go with them — but what is
+    // positioned inside them belongs to the stacking context outside.
+    let children = if makes_context {
+        (&own, &own)
+    } else if positioned || floated {
+        (&own, stacking)
     } else {
-        context
+        (context, stacking)
     };
 
     for child in &mut fragment.children {
-        assign(child, context, next);
+        assign(child, children, next);
     }
 
     fragment.layer = Layer { exit: *next, ..own };

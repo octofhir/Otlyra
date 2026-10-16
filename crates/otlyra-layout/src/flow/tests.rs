@@ -1066,6 +1066,36 @@ fn absolute_leaves_the_flow_and_measures_from_its_ancestor() {
     assert_eq!(paragraph.y, 0.0, "the flow did not notice it");
 }
 
+/// `top` and `bottom` with an `auto` height is a height too: the box
+/// stretches between them, less its margins, and a percentage inside it is
+/// of that height.
+#[test]
+fn two_vertical_insets_stretch_an_absolute_box_between_them() {
+    let (tree, boxes) = laid_out(
+        "<style>body { margin: 0 } \
+         .frame { position: relative; height: 200px } \
+         .tall { position: absolute; top: 20px; bottom: 30px; left: 0; width: 50px; margin: 5px 0 } \
+         .half { height: 50% }</style>\
+         <div class=frame><div class=tall><div class=half></div></div></div>",
+        400.0,
+    );
+    let divs = boxes_of(&tree, &boxes, "div");
+    let tall = divs
+        .iter()
+        .find(|fragment| fragment.rect.width == 50.0 && fragment.rect.height > 100.0)
+        .expect("the stretched box");
+    assert_eq!(tall.rect.y, 25.0, "twenty down, plus its margin");
+    assert_eq!(
+        tall.rect.height, 140.0,
+        "200 less 20, 30 and two margins of 5"
+    );
+    assert!(
+        divs.iter()
+            .any(|fragment| fragment.rect.width == 50.0 && fragment.rect.height == 70.0),
+        "half of what it stretched to: {divs:?}"
+    );
+}
+
 /// Both insets given is a width: the box stretches between them.
 #[test]
 fn two_insets_stretch_an_absolute_box_between_them() {

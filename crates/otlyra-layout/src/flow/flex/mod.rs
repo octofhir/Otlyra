@@ -390,11 +390,16 @@ impl<'a> Flow<'a> {
                 )
             };
 
-            let fragment = self.layout_item(
+            let mut fragment = self.layout_item(
                 &item.boxed(),
                 (item_x, item_y),
                 item_width,
                 item_height,
+                container.width,
+            );
+            super::lift_item(
+                &mut fragment,
+                &self.tree.node(item.id).style,
                 container.width,
             );
             out.push(fragment);

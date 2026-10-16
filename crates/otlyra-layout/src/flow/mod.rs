@@ -100,6 +100,7 @@ pub fn layout(tree: &mut BoxTree, text: &mut TextEngine, viewport: Viewport) -> 
         // with — is a hundred percent of something rather than of nothing.
         containing_height: Some(viewport.height),
         container_limits: Limits::NONE,
+        inset_height: None,
     };
     let root = tree.root();
     let mut children = Vec::new();
@@ -171,6 +172,7 @@ pub fn relayout_contained(
         measured_heights: std::collections::HashMap::new(),
         containing_height: None,
         container_limits: Limits::NONE,
+        inset_height: None,
     };
     let mut children = Vec::new();
     engine.layout_children(id, content.width, content.x, content.y, &mut children);
@@ -295,6 +297,10 @@ struct Flow<'a> {
     /// knows what they come to (CSS Flexbox §9.3 step 4, §9.4 step 15); a
     /// grid container could do the same.
     container_limits: Limits,
+    /// The border-box height an absolutely positioned box with an `auto`
+    /// height is stretched to between its `top` and `bottom` (CSS 2.2
+    /// §10.6.4), for the one box `layout_positioned` is about to lay out.
+    inset_height: Option<(BoxId, f32)>,
     /// The lines of each collapsed table's grid, for the table to draw.
     ///
     /// A collapsed border belongs to the edge rather than to a cell, so it is
@@ -399,7 +405,21 @@ fn set_container(fragment: &mut Fragment, container: Rect) {
 ///
 /// The box alone: where it lands in the painting order is a question about its
 /// ancestors as well as itself, and that is settled once the tree is built.
-fn mark_layer(fragment: &mut Fragment, index: i32) {
+/// What being a flex or grid item does to its painting: a relatively
+/// positioned item is nudged and lifted like any relative box, and an item
+/// with a `z-index` is ordered by it even when it is not positioned (CSS
+/// Flexbox §4.3, CSS Grid §9.5).
+fn lift_item(fragment: &mut Fragment, style: &otlyra_css::ComputedStyle, containing_width: f32) {
+    if style.position == otlyra_css::Position::Relative {
+        let (dx, dy) = positioned::relative_offset(style, containing_width);
+        offset(fragment, dx, dy);
+        mark_layer(fragment, style.z_index);
+    } else if style.z_index.is_some() {
+        mark_layer(fragment, style.z_index);
+    }
+}
+
+fn mark_layer(fragment: &mut Fragment, index: Option<i32>) {
     fragment.layer = Layer::positioned(index);
 }
 

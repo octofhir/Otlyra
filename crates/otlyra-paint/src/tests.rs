@@ -278,6 +278,58 @@ fn a_transform_moves_the_drawing_and_what_is_tested_against_it() {
     );
 }
 
+/// What an ancestor cuts a transformed box off at stays where the ancestor
+/// is. Apple's hero centres a wide picture with `left: 50%` and
+/// `translate(-50%)` inside a box that clips: moving the clip with the
+/// picture cut the picture in half.
+#[test]
+fn an_ancestor_clip_does_not_move_with_a_transformed_box() {
+    let list = page(
+        "<style>body { margin: 0 } .frame { position: relative; width: 400px; height: 100px; \
+         overflow: clip } .wide { position: absolute; left: 50%; width: 600px; height: 100px; \
+         transform: translate(-50%); background: rgb(255, 0, 0) }</style>\
+         <div class=frame><div class=wide></div></div>",
+        0.0,
+    );
+    // Every clip layer pushed, as drawn: none may end before the frame does.
+    let clips: Vec<_> = list
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::PushLayer {
+                clip, transform, ..
+            } => Some(transform.transform_rect_bbox(clip.bounding_box())),
+            _ => None,
+        })
+        .collect();
+    assert!(!clips.is_empty(), "the frame clips");
+    for clip in &clips {
+        assert!(
+            clip.x0.abs() < 0.01 && (clip.x1 - 400.0).abs() < 0.01,
+            "the frame's edge is where the frame is: {clips:?}"
+        );
+    }
+    let red = list
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::Fill {
+                brush: Brush::Solid(colour),
+                transform,
+                shape,
+                ..
+            } if *colour == Color::from_rgb8(255, 0, 0) => {
+                Some(transform.transform_rect_bbox(shape.bounding_box()))
+            }
+            _ => None,
+        })
+        .expect("the wide box");
+    assert!(
+        (red.x0 + 100.0).abs() < 0.01 && (red.x1 - 500.0).abs() < 0.01,
+        "centred on the frame: {red:?}"
+    );
+}
+
 /// A percentage in a `translate()` is of the box's own size, and a `calc()`
 /// that mixes one with a length keeps both halves: `translate(calc(50% - 10px))`
 /// on a box a hundred wide moves it forty, where folding the percentage away
@@ -416,31 +468,73 @@ fn opacity_composites_a_box_and_its_contents_as_one_group() {
     );
 }
 
-/// A negative index inside a positioned box paints over that box's background
-/// and under its content, rather than dropping below the page's flow.
+/// A negative index inside a positioned box with a `z-index` of its own
+/// paints over that box's background and under its content. Inside one with
+/// `z-index: auto`, which makes no stacking context, it belongs to the page's
+/// and paints under the parent too (CSS 2.2 §9.9.1, Appendix E).
 #[test]
-fn a_negative_index_inside_a_positioned_box_stays_inside_it() {
-    let order = fill_order(&page(
-        "<style>body { margin: 0 } .flow { height: 80px; background: rgb(0, 255, 0) } \
-         .parent { position: absolute; left: 0; top: 0; width: 200px; height: 120px; \
-         background: rgb(255, 0, 0) } \
-         .under { position: absolute; left: 20px; top: 20px; width: 100px; height: 60px; \
-         background: rgb(0, 0, 255); z-index: -1 }</style> \
-         <div class=flow></div><div class=parent><div class=under></div></div>",
-        0.0,
-    ));
+fn a_negative_index_stays_inside_only_a_stacking_context() {
+    let order_of = |parent_index: &str| {
+        let order = fill_order(&page(
+            &format!(
+                "<style>body {{ margin: 0 }} .flow {{ height: 80px; background: rgb(0, 255, 0) }} \
+                 .parent {{ position: absolute; left: 0; top: 0; width: 200px; height: 120px; \
+                 background: rgb(255, 0, 0); z-index: {parent_index} }} \
+                 .under {{ position: absolute; left: 20px; top: 20px; width: 100px; height: 60px; \
+                 background: rgb(0, 0, 255); z-index: -1 }}</style> \
+                 <div class=flow></div><div class=parent><div class=under></div></div>"
+            ),
+            0.0,
+        ));
+        let at = |colour: Color| order.iter().position(|painted| *painted == colour);
+        (
+            at(Color::from_rgb8(0, 255, 0)),
+            at(Color::from_rgb8(255, 0, 0)),
+            at(Color::from_rgb8(0, 0, 255)),
+        )
+    };
 
-    let at = |colour: Color| order.iter().position(|painted| *painted == colour);
-    let (flow, parent, under) = (
-        at(Color::from_rgb8(0, 255, 0)),
-        at(Color::from_rgb8(255, 0, 0)),
-        at(Color::from_rgb8(0, 0, 255)),
-    );
+    let (flow, parent, under) = order_of("0");
     assert!(
         flow < parent && parent < under,
-        "a negative index inside a positioned box paints over that box, \
-         not under the page: {order:?}"
+        "inside a stacking context it paints over that box: {flow:?} {parent:?} {under:?}"
     );
+    let (flow, parent, under) = order_of("auto");
+    assert!(
+        under < flow && flow < parent,
+        "inside a box with z-index auto it is the page's: {flow:?} {parent:?} {under:?}"
+    );
+}
+
+/// Positioned boxes with a `z-index` inside a positioned box with `auto` are
+/// ordered against that box's siblings: Apple's hero copy (`z-index: 2`,
+/// inside a `position: relative` block) paints over the picture positioned
+/// after it.
+#[test]
+fn a_z_index_inside_an_auto_positioned_box_escapes_it() {
+    for display in ["block", "flex", "grid"] {
+        let order = fill_order(&page(
+            &format!(
+                "<style>body {{ margin: 0 }} .tile {{ position: relative; height: 100px; display: {display} }} \
+         .content {{ position: relative; display: {display} }} \
+         .copy {{ position: relative; z-index: 2; height: 40px; width: 40px; background: rgb(255, 0, 0) }} \
+         .picture {{ position: absolute; left: 0; top: 0; right: 0; bottom: 0; \
+         background: rgb(0, 0, 255) }}</style>\
+         <div class=tile><div class=content><div class=copy></div></div><div class=picture></div></div>"
+            ),
+            0.0,
+        ));
+        let red = order.iter().position(|c| *c == Color::from_rgb8(255, 0, 0));
+        let blue = order.iter().position(|c| *c == Color::from_rgb8(0, 0, 255));
+        assert!(
+            red.is_some() && blue.is_some(),
+            "{display}: both painted: {order:?}"
+        );
+        assert!(
+            blue < red,
+            "{display}: the copy is over the picture: {order:?}"
+        );
+    }
 }
 
 /// The same for an absolutely positioned box, which takes a different path
