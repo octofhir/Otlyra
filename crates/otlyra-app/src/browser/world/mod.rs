@@ -26,6 +26,7 @@ use super::TabId;
 mod fonts;
 mod load;
 mod modules;
+mod page_fetch;
 mod subresources;
 
 #[cfg(test)]
@@ -192,6 +193,8 @@ pub(super) struct PageWorld {
     picture_fetches: HashMap<u64, PictureFetch>,
     /// Module fetches for a document whose load is over, by request number.
     module_fetches: HashMap<u64, modules::ModuleFetch>,
+    /// Requests pages' scripts made, by request number.
+    page_fetches: HashMap<u64, page_fetch::PageFetch>,
     /// The last document generation handed to a slot.
     generations: u64,
     /// The window the pictures on screen were last chosen against.
@@ -229,6 +232,7 @@ impl PageWorld {
             background_fetches: HashMap::new(),
             picture_fetches: HashMap::new(),
             module_fetches: HashMap::new(),
+            page_fetches: HashMap::new(),
             generations: 0,
             picture_window: None,
             requested_faces: Vec::new(),
@@ -414,6 +418,13 @@ impl PageWorld {
             }
             keep
         });
+        self.page_fetches.retain(|id, fetch| {
+            let keep = !fetch.of(tab);
+            if !keep {
+                ids.push(*id);
+            }
+            keep
+        });
         for id in ids {
             self.fetcher.cancel(id);
         }
@@ -487,6 +498,7 @@ impl PageWorld {
         changed |= self.run_frame_callbacks();
         self.fetch_detached_pictures();
         self.fetch_module_imports();
+        self.fetch_page_requests();
         changed
     }
 
@@ -793,6 +805,9 @@ impl PageWorld {
         if let Some(fetch) = self.module_fetches.remove(&fetched.id) {
             return self.module_arrived(fetch, fetched);
         }
+        if let Some(fetch) = self.page_fetches.remove(&fetched.id) {
+            return self.page_response_arrived(fetch, fetched);
+        }
 
         let owner = self.slots.iter().find_map(|(tab, slot)| {
             slot.pending
@@ -816,6 +831,9 @@ impl PageWorld {
                 self.receive_subresource(tab, fetched);
                 true
             }
+            // A page's own request is answered above, by its own table, or
+            // not at all once its page has gone.
+            crate::fetcher::ResourceKind::Fetch => false,
         }
     }
 }

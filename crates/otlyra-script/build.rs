@@ -38,6 +38,7 @@ const SOURCES: &[&str] = &[
     "src/dom/js/platform.js",
     "src/dom/js/custom_elements.js",
     "src/dom/js/compat.js",
+    "src/dom/js/network.js",
 ];
 
 /// The globals the glue defines besides the interface tree, which is added to
@@ -82,6 +83,10 @@ const DEFINES: &[&str] = &[
     "cancelIdleCallback",
     "IdleDeadline",
     "__otlyraFlushDeferred",
+    "__otlyraFetchSettle",
+    "fetch",
+    "XMLHttpRequest",
+    "XMLHttpRequestEventTarget",
     "__otlyraCustomElementsCheckpoint",
     "customElements",
     "CustomElementRegistry",

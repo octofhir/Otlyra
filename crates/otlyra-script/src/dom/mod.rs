@@ -136,6 +136,12 @@ pub struct PageState {
     /// Where `history.pushState` or `replaceState` moved the document, for
     /// the browser to show; the document itself was not fetched again.
     url_change: Option<String>,
+    /// Requests `fetch` and `XMLHttpRequest` made that the browser has not
+    /// taken yet, and the number the next one gets.
+    page_requests: Vec<otlyra_html::PageRequest>,
+    next_request: u64,
+    /// Answers the browser delivered that script has not taken yet.
+    page_responses: std::collections::HashMap<u64, Result<otlyra_html::PageResponse, String>>,
 }
 
 /// The browser's cookie jar, as `document.cookie` reaches it.
@@ -263,6 +269,20 @@ impl PageState {
         self.clock = clock;
     }
 
+    /// The requests script made since the browser last asked.
+    pub fn take_page_requests(&mut self) -> Vec<otlyra_html::PageRequest> {
+        std::mem::take(&mut self.page_requests)
+    }
+
+    /// Keep an answer for script to take.
+    pub fn stage_page_response(
+        &mut self,
+        id: u64,
+        response: Result<otlyra_html::PageResponse, String>,
+    ) {
+        self.page_responses.insert(id, response);
+    }
+
     /// Where the session history moved the document without a load, if it
     /// moved since the browser last asked.
     pub fn take_url_change(&mut self) -> Option<String> {
@@ -354,6 +374,37 @@ pub(crate) fn set_document_url(url: String) {
         state.document_url.clone_from(&url);
         state.url_change = Some(url);
     });
+}
+
+/// Script asked the browser to send a request; the number its answer will
+/// carry.
+pub(crate) fn request_page_fetch(
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+) -> u64 {
+    let mut id = 0;
+    with_state_mut(|state| {
+        state.next_request += 1;
+        id = state.next_request;
+        state.page_requests.push(otlyra_html::PageRequest {
+            id,
+            method,
+            url,
+            headers,
+            body,
+        });
+    });
+    id
+}
+
+/// The answer to request `id`, if the browser delivered one script has not
+/// taken.
+pub(crate) fn take_page_response(id: u64) -> Option<Result<otlyra_html::PageResponse, String>> {
+    let mut taken = None;
+    with_state_mut(|state| taken = state.page_responses.remove(&id));
+    taken
 }
 
 /// The page defined a custom element.

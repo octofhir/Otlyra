@@ -473,3 +473,86 @@ fn a_matrix_reads_a_computed_transform_and_composes() {
         ["2 10 true 12 22 20 30 true true matrix(1, 0, 0, 1, 3, 4) 9"]
     );
 }
+
+#[test]
+fn fetch_and_xhr_go_through_the_browser_and_settle_when_it_answers() {
+    let mut page = Page::parse(
+        "<script>\
+           fetch('data.json', { method: 'POST', headers: { 'X-Mode': 'test' }, body: 'q=1' })\
+             .then((r) => r.json().then((j) => console.log('fetch', r.status, r.ok, j.v, r.headers.get('content-type'), r.url)));\
+           fetch('missing').catch((e) => console.log('failed', e.name));\
+           const xhr = new XMLHttpRequest();\
+           const states = [];\
+           xhr.onreadystatechange = () => states.push(xhr.readyState);\
+           xhr.onload = () => console.log('xhr', xhr.status, xhr.statusText, xhr.responseText, states.join(''), xhr.getResponseHeader('X-Server'));\
+           xhr.open('GET', '/other.txt');\
+           xhr.send();\
+         </script>",
+        &[],
+    );
+    page.finish();
+    let requests = page.runner().take_page_requests();
+    let summary: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            format!(
+                "{} {} {:?} {:?}",
+                request.method,
+                request.url,
+                request.headers,
+                request.body.as_deref().map(String::from_utf8_lossy)
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            "POST https://example.com/app/data.json [(\"X-Mode\", \"test\"), (\"content-type\", \"text/plain;charset=UTF-8\")] Some(\"q=1\")",
+            "GET https://example.com/app/missing [] None",
+            "GET https://example.com/other.txt [] None",
+        ]
+    );
+    let answer = |status: u16, url: &str, headers: &[(&str, &str)], body: &str| {
+        Ok(otlyra_html::PageResponse {
+            status,
+            url: url.to_owned(),
+            headers: headers
+                .iter()
+                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        })
+    };
+    let mut document = std::mem::take(&mut page.document);
+    let runner = page.runner();
+    runner.deliver_page_response(
+        &mut document,
+        requests[0].id,
+        answer(
+            200,
+            "https://example.com/app/data.json",
+            &[("content-type", "application/json")],
+            "{\"v\":7}",
+        ),
+    );
+    runner.deliver_page_response(&mut document, requests[1].id, Err("refused".to_owned()));
+    runner.deliver_page_response(
+        &mut document,
+        requests[2].id,
+        answer(
+            200,
+            "https://example.com/other.txt",
+            &[("x-server", "fake")],
+            "hello",
+        ),
+    );
+    page.document = document;
+    assert_eq!(
+        page.log(),
+        [
+            "fetch 200 true 7 application/json https://example.com/app/data.json",
+            "failed TypeError",
+            "xhr 200 OK hello 1234 fake",
+        ]
+    );
+}

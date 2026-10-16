@@ -52,6 +52,8 @@ pub enum ResourceKind {
     Module,
     /// A face a page's `@font-face` rule names.
     Font,
+    /// A request the page's script made with `fetch` or `XMLHttpRequest`.
+    Fetch,
 }
 
 /// What one fetch returned.
@@ -129,6 +131,8 @@ pub struct Held {
     cache: CacheMode,
     /// Whose request it is; see [`Fetcher::request_for`].
     owner: u64,
+    /// The headers it was made with.
+    headers: Vec<(String, String)>,
 }
 
 /// What a driver changed about a held request before letting it go.
@@ -568,6 +572,20 @@ impl Fetcher {
         body: Option<Body>,
         cache: CacheMode,
     ) -> u64 {
+        self.fetch_with_headers(owner, url, kind, body, cache, Vec::new())
+    }
+
+    /// The same, with headers the page set on top of the ones the transport
+    /// puts there: a page's own `fetch` or `XMLHttpRequest`.
+    pub fn fetch_with_headers(
+        &mut self,
+        owner: u64,
+        url: &str,
+        kind: ResourceKind,
+        body: Option<Body>,
+        cache: CacheMode,
+        headers: Vec<(String, String)>,
+    ) -> u64 {
         self.next += 1;
         let id = self.next;
         let method = if body.is_some() { "POST" } else { "GET" };
@@ -620,11 +638,12 @@ impl Fetcher {
                 body,
                 cache,
                 owner,
+                headers: headers.clone(),
             });
             return id;
         }
 
-        self.launch(id, owner, kind, url.to_owned(), body, cache, Vec::new());
+        self.launch(id, owner, kind, url.to_owned(), body, cache, headers);
         id
     }
 
@@ -678,7 +697,11 @@ impl Fetcher {
             url,
             body,
             held.cache,
-            change.headers,
+            if change.headers.is_empty() {
+                held.headers
+            } else {
+                change.headers
+            },
         );
         true
     }

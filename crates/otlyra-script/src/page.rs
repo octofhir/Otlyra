@@ -338,6 +338,30 @@ impl PageScripts {
         }
     }
 
+    /// Settle what was waiting on the page's request `id`: a `fetch`
+    /// promise, or an `XMLHttpRequest`'s events.
+    fn page_response_arrived(
+        &mut self,
+        document: &mut Document,
+        id: u64,
+        response: Result<otlyra_html::PageResponse, String>,
+    ) {
+        self.state.stage_page_response(id, response);
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return;
+        };
+        let source = format!("__otlyraFetchSettle({id})");
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script(&source, "<fetch>")
+        });
+        self.absorb_turn();
+        if let Err(error) = outcome {
+            self.failed += 1;
+            tracing::error!(target: "page.script", %error, "settling a fetch failed");
+        }
+    }
+
     /// Whether ordinary module scripts are still to run before
     /// `DOMContentLoaded`. The first call is the end of the parse, which is
     /// when they start running.
@@ -687,6 +711,19 @@ impl ScriptRunner for PageScripts {
 
     fn take_url_change(&mut self) -> Option<String> {
         PageScripts::take_url_change(self)
+    }
+
+    fn take_page_requests(&mut self) -> Vec<otlyra_html::PageRequest> {
+        self.state.take_page_requests()
+    }
+
+    fn deliver_page_response(
+        &mut self,
+        document: &mut Document,
+        id: u64,
+        response: Result<otlyra_html::PageResponse, String>,
+    ) {
+        self.page_response_arrived(document, id, response);
     }
 
     fn run_frame(&mut self, document: &mut Document, timestamp: f64) -> usize {

@@ -303,6 +303,53 @@ pub trait ScriptRunner {
     /// pass's document is discarded, so its scripts' effects must be too — a
     /// browser that reloads a page reloads its script world with it.
     fn reset(&mut self) {}
+
+    /// The requests the page's script made with `fetch` or
+    /// `XMLHttpRequest` since this was last asked. The browser fetches each
+    /// and answers with [`ScriptRunner::deliver_page_response`].
+    fn take_page_requests(&mut self) -> Vec<PageRequest> {
+        Vec::new()
+    }
+
+    /// The request the page numbered `id` was answered: a response, or why
+    /// there is none — a network failure, or a response the page may not
+    /// read. The runner settles whatever was waiting on it.
+    fn deliver_page_response(
+        &mut self,
+        document: &mut Document,
+        id: u64,
+        response: Result<PageResponse, String>,
+    ) {
+        let _ = (document, id, response);
+    }
+}
+
+/// A request a page's script made, as the browser is to send it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageRequest {
+    /// The page's own number for it, which the answer carries back.
+    pub id: u64,
+    /// The method, uppercase.
+    pub method: String,
+    /// The absolute address, resolved against the document.
+    pub url: String,
+    /// The headers script set, in order.
+    pub headers: Vec<(String, String)>,
+    /// The body, for a method that has one.
+    pub body: Option<Vec<u8>>,
+}
+
+/// What came back for a [`PageRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageResponse {
+    /// The HTTP status; 200 for a response that has none, like a file.
+    pub status: u16,
+    /// Where it came from after redirects.
+    pub url: String,
+    /// The response headers, in order, names lowercase.
+    pub headers: Vec<(String, String)>,
+    /// The body.
+    pub body: Vec<u8>,
 }
 
 /// A module source that arrived, as the network delivered it.

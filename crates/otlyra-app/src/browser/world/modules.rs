@@ -60,7 +60,7 @@ impl PageWorld {
     /// Lend `tab`'s script runner and document to `run`: the parser's while
     /// the parse is stopped, the load's after the parse, the page's after the
     /// load.
-    fn with_page_runner<R>(
+    pub(super) fn with_page_runner<R>(
         &mut self,
         tab: TabId,
         run: impl FnOnce(&mut dyn ScriptRunner, &mut Document) -> R,

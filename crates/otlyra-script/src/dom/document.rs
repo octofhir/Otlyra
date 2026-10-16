@@ -69,6 +69,45 @@ impl DocumentRef {
         super::document_url()
     }
 
+    /// Ask the browser to send a request for `fetch` or `XMLHttpRequest`.
+    /// `headers` is one `name: value` per line, which no header value can
+    /// break. Answers the number the response will be delivered under. Not
+    /// part of the platform.
+    #[static_method(name = "__fetch")]
+    fn js_fetch(method: String, url: String, headers: String, body: Option<String>) -> f64 {
+        let headers = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+            .collect();
+        super::request_page_fetch(method, url, headers, body.map(String::into_bytes)) as f64
+    }
+
+    /// Take the answer to request `id`: `["ok", status, url, count, name,
+    /// value…, body]`, or `["error", why]`, or nothing if none has come.
+    /// Not part of the platform.
+    #[static_method(name = "__fetchTake")]
+    fn js_fetch_take(id: f64) -> Option<Vec<String>> {
+        let response = super::take_page_response(id as u64)?;
+        Some(match response {
+            Ok(response) => {
+                let mut out = vec![
+                    "ok".to_owned(),
+                    response.status.to_string(),
+                    response.url,
+                    response.headers.len().to_string(),
+                ];
+                for (name, value) in response.headers {
+                    out.push(name);
+                    out.push(value);
+                }
+                out.push(String::from_utf8_lossy(&response.body).into_owned());
+                out
+            }
+            Err(why) => vec!["error".to_owned(), why],
+        })
+    }
+
     /// Move the document to `href` without loading it: what
     /// `history.pushState` does to the URL. Not part of the platform; the
     /// glue checks the address first.

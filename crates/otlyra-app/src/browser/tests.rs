@@ -4990,6 +4990,55 @@ fn computed_style_follows_the_tree_and_the_sheets_script_has() {
     });
 }
 
+/// A page's `fetch` and `XMLHttpRequest` go through the browser's fetcher,
+/// and an answer from another origin that does not allow this one is a
+/// network error to the page.
+#[test]
+fn page_requests_are_fetched_by_the_browser() {
+    on_content_stack(|| {
+        let (mut browser, requested) = table_browser(
+            &[
+                (
+                    "https://api.example/",
+                    "text/html",
+                    b"<script>\
+                        const log = (x) => { const h = document.documentElement;\
+                          h.setAttribute('data-log', (h.getAttribute('data-log') || '') + x + ';') };\
+                        fetch('/data.json').then((r) => r.json()).then((j) => log('fetch:' + j.v));\
+                        fetch('https://other.example/secret').then(() => log('read'), (e) => log('refused:' + e.name));\
+                        const xhr = new XMLHttpRequest();\
+                        xhr.onload = () => log('xhr:' + xhr.status + ':' + xhr.responseText);\
+                        xhr.open('GET', '/note.txt'); xhr.send();\
+                      </script>",
+                ),
+                ("https://api.example/data.json", "application/json", b"{\"v\": 3}"),
+                ("https://api.example/note.txt", "text/plain", b"hi"),
+                ("https://other.example/secret", "text/plain", b"private"),
+            ],
+            None,
+        );
+        go(&mut browser, "https://api.example/");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page_log(&browser).matches(';').count() < 3 && std::time::Instant::now() < deadline {
+            browser.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut entries: Vec<String> = page_log(&browser)
+            .split(';')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["fetch:3", "refused:TypeError", "xhr:200:hi"]);
+        let asked = asked_for(&requested);
+        assert!(
+            asked
+                .iter()
+                .any(|url| url == "https://other.example/secret")
+        );
+    });
+}
+
 /// An `import()` a page makes after its load is fetched by the same path and
 /// settles when the module arrives.
 #[test]
