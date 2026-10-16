@@ -56,6 +56,7 @@ fn background_tiling(
     style: &otlyra_css::ComputedStyle,
     rect: Rect,
     picture: &otlyra_gfx::peniko::ImageData,
+    scale: f32,
 ) -> Tiling {
     use otlyra_css::Repeat;
     use otlyra_gfx::peniko::Extend;
@@ -68,8 +69,11 @@ fn background_tiling(
         (rect.height - border.top.width - border.bottom.width).max(0.0),
     );
 
+    // Its pixels, which the brush scales, and its own size, which CSS sizes:
+    // not the same for a vector picture drawn for a dense screen.
     let own = (picture.width as f32, picture.height as f32);
-    let (mut width, mut height) = background_extent(layer, area, own);
+    let scale = scale.max(f32::MIN_POSITIVE);
+    let (mut width, mut height) = background_extent(layer, area, (own.0 / scale, own.1 / scale));
 
     // `round` squeezes or stretches the tile so a whole number of them fits, which
     // is the whole of what it does — everything after it is the ordinary tiling.
@@ -179,14 +183,14 @@ pub(super) fn paint_background_layer(
     let Some(url) = layer.image.as_deref() else {
         return;
     };
-    let Some(picture) = background_picture.and_then(|lookup| lookup(url)) else {
+    let Some((picture, scale)) = background_picture.and_then(|lookup| lookup(url)) else {
         return;
     };
     if picture.width == 0 || picture.height == 0 || rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
 
-    let tiling = background_tiling(layer, &fragment.style, rect, &picture);
+    let tiling = background_tiling(layer, &fragment.style, rect, &picture, scale);
     if tiling.covered.width <= 0.0 || tiling.covered.height <= 0.0 {
         return;
     }

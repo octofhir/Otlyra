@@ -49,7 +49,9 @@ pub use recording::{PaintOp, RecordingPainter};
 pub use render::{render, render_scrolled};
 #[cfg(target_os = "macos")]
 pub use skia::GpuContext;
-pub use skia::{SkiaError, SkiaPainter, decode_image, draw_svg, face_from_collection};
+pub use skia::{
+    SkiaError, SkiaPainter, decode_image, decode_image_at, draw_svg, face_from_collection,
+};
 
 /// Re-exported so downstream crates speak exactly the geometry types the seam does.
 pub use kurbo;

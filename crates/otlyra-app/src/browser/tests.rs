@@ -1894,14 +1894,17 @@ fn a_container_that_lays_its_children_into_tracks_gets_the_dashed_overlay() {
 }
 
 /// A picture of `bytes` bytes, with no pixels worth looking at.
-fn picture(bytes: usize) -> otlyra_gfx::peniko::ImageData {
+fn picture(bytes: usize) -> crate::fetcher::Decoded {
     let side = 1u32;
-    otlyra_gfx::peniko::ImageData {
-        data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; bytes])),
-        format: otlyra_gfx::peniko::ImageFormat::Rgba8,
-        alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
-        width: side,
-        height: side,
+    crate::fetcher::Decoded {
+        image: otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(vec![0u8; bytes])),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+            width: side,
+            height: side,
+        },
+        scale: 1.0,
     }
 }
 

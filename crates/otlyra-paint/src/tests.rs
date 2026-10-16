@@ -1020,7 +1020,7 @@ fn background_tile(declarations: &str) -> (Rect, Rect, otlyra_gfx::peniko::Image
             viewport: (800.0, 600.0),
             // Absolute, as every address a sheet names comes out of the cascade.
             background: Some(&|url: &str| {
-                (url == "https://x.test/behind.png").then(|| picture.clone())
+                (url == "https://x.test/behind.png").then(|| (picture.clone(), 1.0))
             }),
             ..Frame::default()
         },
@@ -1485,7 +1485,7 @@ fn a_mask_is_drawn_destination_in_over_the_box() {
         &Frame {
             viewport: (800.0, 600.0),
             background: Some(&|url: &str| {
-                (url == "https://x.test/logo.svg").then(|| picture.clone())
+                (url == "https://x.test/logo.svg").then(|| (picture.clone(), 1.0))
             }),
             ..Frame::default()
         },

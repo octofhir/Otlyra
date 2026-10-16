@@ -624,13 +624,7 @@ impl PageWorld {
                 };
                 match self.images.get(&url) {
                     Some(image) => {
-                        ready.insert(
-                            source.node,
-                            otlyra_layout::Picture {
-                                data: image,
-                                density: source.density,
-                            },
-                        );
+                        ready.insert(source.node, image.for_element(source.density));
                         false
                     }
                     None => true,
@@ -931,18 +925,10 @@ impl PageWorld {
                         }
                         PendingResource::Image(node, src, density) => match decoded.as_ref() {
                             Some(image) => {
-                                pictures.push((
-                                    node,
-                                    src.clone(),
-                                    Some((image.width, image.height)),
-                                ));
-                                pending.images.insert(
-                                    node,
-                                    otlyra_layout::Picture {
-                                        data: image.clone(),
-                                        density,
-                                    },
-                                );
+                                pictures.push((node, src.clone(), Some(image.natural_size())));
+                                pending
+                                    .images
+                                    .insert(node, image.clone().for_element(density));
                                 pending.picture_sources.insert(node, (src, density));
                             }
                             None => {
@@ -1146,13 +1132,7 @@ impl PageWorld {
                 .and_then(|url| self.images.get(&url));
             match cached {
                 Some(data) => {
-                    ready.insert(
-                        source.node,
-                        otlyra_layout::Picture {
-                            data,
-                            density: source.density,
-                        },
-                    );
+                    ready.insert(source.node, data.for_element(source.density));
                 }
                 None => wanted.push((
                     source.src.clone(),

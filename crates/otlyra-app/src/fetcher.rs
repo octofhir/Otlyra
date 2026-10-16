@@ -90,20 +90,54 @@ pub struct Loaded {
     /// it is received was decoding it in the middle of a frame: every picture on
     /// a page arriving was a frame that did not come. `None` where nothing
     /// decoded it yet; [`Loaded::picture`] decodes it then.
-    pub picture: Option<Result<otlyra_gfx::peniko::ImageData, String>>,
+    pub picture: Option<Result<Decoded, String>>,
+}
+
+/// A decoded picture, and how many of its pixels go to one of its own: more
+/// than one for a vector picture drawn for a dense screen.
+#[derive(Clone, Debug)]
+pub struct Decoded {
+    /// The pixels.
+    pub image: otlyra_gfx::peniko::ImageData,
+    /// Its pixels per pixel of its own size. One for a raster file.
+    pub scale: f32,
+}
+
+impl Decoded {
+    /// The picture as an element shows it, chosen for `density`: its pixels,
+    /// and how many go to a CSS pixel — the candidate's density, times what a
+    /// vector picture was drawn at.
+    pub fn for_element(self, density: f32) -> otlyra_layout::Picture {
+        otlyra_layout::Picture {
+            data: self.image,
+            density: density * self.scale,
+        }
+    }
+
+    /// Its size in pixels of its own: what `naturalWidth` reads.
+    pub fn natural_size(&self) -> (u32, u32) {
+        let own = |pixels: u32| (pixels as f32 / self.scale).round() as u32;
+        (own(self.image.width), own(self.image.height))
+    }
 }
 
 impl Loaded {
     /// The picture these bytes are: the one decoded where they were fetched, or
-    /// decoded now for bytes that came by another way.
-    pub fn picture(&mut self) -> Result<otlyra_gfx::peniko::ImageData, String> {
-        self.picture.take().unwrap_or_else(|| decode(&self.bytes))
+    /// decoded now, for a screen of one device pixel per CSS pixel, for bytes
+    /// that came by another way.
+    pub fn picture(&mut self) -> Result<Decoded, String> {
+        self.picture
+            .take()
+            .unwrap_or_else(|| decode(&self.bytes, 1.0))
     }
 }
 
-/// Decode a picture's bytes, with the failure as the words a log line wants.
-fn decode(bytes: &[u8]) -> Result<otlyra_gfx::peniko::ImageData, String> {
-    otlyra_gfx::decode_image(bytes).map_err(|error| error.to_string())
+/// Decode a picture's bytes for a screen of `density`, with the failure as
+/// the words a log line wants.
+fn decode(bytes: &[u8], density: f32) -> Result<Decoded, String> {
+    otlyra_gfx::decode_image_at(bytes, density)
+        .map(|(image, scale)| Decoded { image, scale })
+        .map_err(|error| error.to_string())
 }
 
 /// The question *should this request be held*, asked of an address.
@@ -493,6 +527,9 @@ pub struct Fetcher {
     /// finished load can ask for a frame. `None` in a test, where there is no loop
     /// to wake and nothing to draw.
     waker: Arc<Mutex<Option<Waker>>>,
+    /// The screen's device pixels per CSS pixel, as `f32` bits: what a vector
+    /// picture is drawn for where it is decoded.
+    picture_density: Arc<std::sync::atomic::AtomicU32>,
     /// Which requests to hold rather than send. See [`Fetcher::set_gate`].
     gate: Option<Gate>,
     /// The requests being held, oldest first.
@@ -543,6 +580,7 @@ impl Fetcher {
             finished,
             results,
             waker: Arc::new(Mutex::new(None)),
+            picture_density: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             gate: None,
             held: Vec::new(),
             next: 0,
@@ -854,6 +892,14 @@ impl Fetcher {
         }
     }
 
+    /// The screen pictures are decoded for: its device pixels per CSS pixel.
+    pub fn set_picture_density(&self, density: f32) {
+        if density.is_finite() && density > 0.0 {
+            self.picture_density
+                .store(density.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Put one request on the pool.
     #[allow(clippy::too_many_arguments)]
     fn launch(
@@ -871,6 +917,10 @@ impl Fetcher {
         let lane = self.lanes.lane(owner, kind, &url);
         let finished = self.finished.clone();
         let waker = Arc::clone(&self.waker);
+        let density = f32::from_bits(
+            self.picture_density
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         self.reap_tasks();
         let task = self.tasks.spawn_on(
             async move {
@@ -899,7 +949,7 @@ impl Fetcher {
                     && let Ok(loaded) = result
                 {
                     result = match tokio::task::spawn_blocking(move || {
-                        let picture = decode(&loaded.bytes);
+                        let picture = decode(&loaded.bytes, density);
                         Loaded {
                             picture: Some(picture),
                             ..loaded

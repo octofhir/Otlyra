@@ -222,8 +222,8 @@ fn every_background_layer_is_drawn_in_the_order_it_was_written() {
         &Frame {
             viewport: (800.0, 600.0),
             background: Some(&|url: &str| match url {
-                "https://x.test/top.png" => Some(one.clone()),
-                "https://x.test/bottom.png" => Some(two.clone()),
+                "https://x.test/top.png" => Some((one.clone(), 1.0)),
+                "https://x.test/bottom.png" => Some((two.clone(), 1.0)),
                 _ => None,
             }),
             ..Frame::default()

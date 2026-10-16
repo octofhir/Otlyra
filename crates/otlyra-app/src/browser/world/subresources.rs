@@ -30,13 +30,13 @@ pub(in crate::browser) const IMAGE_CACHE_BUDGET: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 pub(in crate::browser) struct ImageCache {
     /// Oldest use first; the end is the most recently used.
-    entries: Vec<(String, otlyra_gfx::peniko::ImageData)>,
+    entries: Vec<(String, crate::fetcher::Decoded)>,
     pub(in crate::browser) bytes: usize,
 }
 
 impl ImageCache {
     /// The picture at `url`, if it is here, marked as just used.
-    pub(in crate::browser) fn get(&mut self, url: &str) -> Option<otlyra_gfx::peniko::ImageData> {
+    pub(in crate::browser) fn get(&mut self, url: &str) -> Option<crate::fetcher::Decoded> {
         let at = self.entries.iter().position(|(key, _)| key == url)?;
         let entry = self.entries.remove(at);
         let image = entry.1.clone();
@@ -45,8 +45,8 @@ impl ImageCache {
     }
 
     /// Keep `image` under `url`, evicting the least recently used until it fits.
-    pub(in crate::browser) fn insert(&mut self, url: String, image: otlyra_gfx::peniko::ImageData) {
-        let size = image.data.as_ref().len();
+    pub(in crate::browser) fn insert(&mut self, url: String, image: crate::fetcher::Decoded) {
+        let size = image.image.data.as_ref().len();
         if size > IMAGE_CACHE_BUDGET {
             // One picture larger than the whole budget is not worth evicting
             // everything else for.
@@ -54,12 +54,12 @@ impl ImageCache {
         }
         if let Some(at) = self.entries.iter().position(|(key, _)| *key == url) {
             let (_, old) = self.entries.remove(at);
-            self.bytes -= old.data.as_ref().len();
+            self.bytes -= old.image.data.as_ref().len();
         }
 
         while self.bytes + size > IMAGE_CACHE_BUDGET && !self.entries.is_empty() {
             let (_, evicted) = self.entries.remove(0);
-            self.bytes -= evicted.data.as_ref().len();
+            self.bytes -= evicted.image.data.as_ref().len();
         }
         self.bytes += size;
         self.entries.push((url, image));
@@ -125,14 +125,11 @@ impl PageWorld {
                 if let Some(data) = self.images.get(&target)
                     && let Some(page) = self.page_mut(tab)
                 {
-                    let size = (data.width, data.height);
+                    let size = data.natural_size();
                     page.set_image(
                         source.node,
                         source.src.clone(),
-                        otlyra_layout::Picture {
-                            data,
-                            density: source.density,
-                        },
+                        data.for_element(source.density),
                     );
                     self.record_pictures(tab, vec![(source.node, source.src, Some(size))]);
                     continue;
@@ -199,7 +196,7 @@ impl PageWorld {
                     continue;
                 }
                 if let Some(data) = self.images.get(&target) {
-                    self.record_pictures(tab, vec![(node, src, Some((data.width, data.height)))]);
+                    self.record_pictures(tab, vec![(node, src, Some(data.natural_size()))]);
                     continue;
                 }
                 let id = self
@@ -312,14 +309,11 @@ impl PageWorld {
                 if let Some(data) = self.images.get(&target)
                     && let Some(page) = self.page_mut(tab)
                 {
-                    let size = (data.width, data.height);
+                    let size = data.natural_size();
                     page.set_image(
                         source.node,
                         source.src.clone(),
-                        otlyra_layout::Picture {
-                            data,
-                            density: source.density,
-                        },
+                        data.for_element(source.density),
                     );
                     self.record_pictures(tab, vec![(source.node, source.src, Some(size))]);
                     continue;
@@ -433,13 +427,11 @@ impl PageWorld {
         match loaded.picture() {
             Ok(data) => {
                 self.images.insert(fetched.url.clone(), data.clone());
-                let size = (data.width, data.height);
+                let size = data.natural_size();
                 match self.page_mut(tab) {
                     // A detached element shows nothing; it only hears `load`.
                     Some(page) if !page.is_connected(node) => {}
-                    Some(page) => {
-                        page.set_image(node, src.clone(), otlyra_layout::Picture { data, density })
-                    }
+                    Some(page) => page.set_image(node, src.clone(), data.for_element(density)),
                     None => tracing::warn!(%src, "no page to give the picture to"),
                 }
                 self.record_pictures(tab, vec![(node, src, Some(size))]);

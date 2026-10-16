@@ -219,6 +219,7 @@ pub(super) struct PageWorld {
 impl PageWorld {
     /// No pages yet, fetching through `fetcher` and shaping with `text`.
     pub(super) fn new(fetcher: Fetcher, text: TextEngine, environment: Environment) -> Self {
+        fetcher.set_picture_density(environment.viewport.scale * environment.page_zoom.max(1.0));
         Self {
             environment_changed: false,
             timer_cursor: 0,
@@ -250,6 +251,10 @@ impl PageWorld {
             || self.environment.viewport.scale != environment.viewport.scale;
         let previous = self.environment.visible_tab();
         self.environment = environment;
+        // Vector pictures are drawn for the screen they will be shown on, at
+        // the page's zoom too.
+        self.fetcher
+            .set_picture_density(environment.viewport.scale * environment.page_zoom.max(1.0));
         if let Some(tab) = environment.active
             && let Some(slot) = self.slots.get_mut(&tab)
             && slot.viewport_zoom != Some(environment.page_zoom)

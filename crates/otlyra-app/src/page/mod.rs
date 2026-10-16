@@ -127,7 +127,7 @@ pub struct PageScene {
     /// A background is named by a rule rather than by the markup, so what a page
     /// wants is only known once it has been styled — which is after it is first
     /// shown. They arrive late and the page is painted again.
-    background_pictures: std::collections::HashMap<String, otlyra_gfx::peniko::ImageData>,
+    background_pictures: std::collections::HashMap<String, crate::fetcher::Decoded>,
     /// How far each scrollable box inside the page has been scrolled.
     ///
     /// Kept here rather than on the fragment tree, which is rebuilt by every
@@ -891,7 +891,11 @@ impl PageScene {
                 viewport: (width, height),
                 scroll_y: scroll,
                 margin: height,
-                background: Some(&|url: &str| pictures.get(url).cloned()),
+                background: Some(&|url: &str| {
+                    pictures
+                        .get(url)
+                        .map(|picture| (picture.image.clone(), picture.scale))
+                }),
                 scrollbars,
                 highlights: &highlight,
                 caret,
@@ -1325,7 +1329,7 @@ impl PageScene {
     }
 
     /// Hand over a picture the page asked for.
-    pub fn set_picture(&mut self, url: String, picture: otlyra_gfx::peniko::ImageData) {
+    pub fn set_picture(&mut self, url: String, picture: crate::fetcher::Decoded) {
         self.background_pictures.insert(url, picture);
         self.damage.add(Damage::PAINT);
     }

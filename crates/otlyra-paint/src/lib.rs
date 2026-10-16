@@ -127,7 +127,10 @@ pub fn build_display_list(tree: &FragmentTree, viewport: (f32, f32), scroll_y: f
 }
 
 /// Where a background picture is found, by the address a style names.
-pub type BackgroundLookup<'a> = &'a dyn Fn(&str) -> Option<otlyra_gfx::peniko::ImageData>;
+/// A background or mask picture by its address: its pixels, and how many of
+/// them go to one of its own (more than one for a vector picture drawn for a
+/// dense screen).
+pub type BackgroundLookup<'a> = &'a dyn Fn(&str) -> Option<(otlyra_gfx::peniko::ImageData, f32)>;
 
 /// Everything a frame needs beyond the fragments themselves.
 ///

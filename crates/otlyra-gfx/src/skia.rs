@@ -1680,6 +1680,26 @@ pub fn draw_svg(bytes: &[u8], density: f32) -> Result<(peniko::ImageData, (f32, 
     ))
 }
 
+/// Decode an encoded image for a screen with `density` device pixels to each
+/// CSS pixel, and say how many of its pixels go to one of its own.
+///
+/// A raster file is its pixels whatever the screen: one. A vector one is drawn
+/// at the density it will be shown at, so an icon on a 2× screen is drawn with
+/// twice the pixels rather than scaled up and soft — and the second number is
+/// what keeps it the size it says it is.
+pub fn decode_image_at(bytes: &[u8], density: f32) -> Result<(peniko::ImageData, f32), SkiaError> {
+    if looks_like_svg(bytes) {
+        let (image, declared) = draw_svg(bytes, density.max(1.0))?;
+        let scale = if declared.0 > 0.0 {
+            image.width as f32 / declared.0
+        } else {
+            1.0
+        };
+        return Ok((image, scale.max(f32::MIN_POSITIVE)));
+    }
+    decode_image(bytes).map(|image| (image, 1.0))
+}
+
 /// Decode an encoded image (PNG, JPEG, …) into pixels the display list can carry.
 ///
 /// Skia is already a dependency and already contains decoders, so this costs no new
@@ -1730,6 +1750,17 @@ pub fn decode_image(bytes: &[u8]) -> Result<peniko::ImageData, SkiaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vector picture is drawn for the screen's density and says so; the
+    /// size it declares stays its own.
+    #[test]
+    fn a_vector_picture_is_drawn_for_the_screen_density() {
+        let svg = br#"<!--comment first--><svg xmlns="http://www.w3.org/2000/svg" width="10" height="5"><rect width="10" height="5"/></svg>"#;
+        let (image, scale) = decode_image_at(svg, 2.0).expect("an svg");
+        assert_eq!((image.width, image.height, scale), (20, 10, 2.0));
+        let (image, scale) = decode_image_at(svg, 1.0).expect("an svg");
+        assert_eq!((image.width, image.height, scale), (10, 5, 1.0));
+    }
 
     /// A pixel read back from a `read_rgba8` buffer.
     fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
