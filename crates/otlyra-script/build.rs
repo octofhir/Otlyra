@@ -40,6 +40,7 @@ const SOURCES: &[&str] = &[
     "src/dom/js/shadow.js",
     "src/dom/js/compat.js",
     "src/dom/js/network.js",
+    "src/dom/js/indexeddb.js",
 ];
 
 /// The globals the glue defines besides the interface tree, which is added to
@@ -99,6 +100,18 @@ const DEFINES: &[&str] = &[
     "localStorage",
     "sessionStorage",
     "Path2D",
+    "indexedDB",
+    "IDBFactory",
+    "IDBDatabase",
+    "IDBTransaction",
+    "IDBObjectStore",
+    "IDBIndex",
+    "IDBCursor",
+    "IDBCursorWithValue",
+    "IDBKeyRange",
+    "IDBRequest",
+    "IDBOpenDBRequest",
+    "IDBVersionChangeEvent",
     "DOMRectReadOnly",
     "DOMRect",
     "DOMPointReadOnly",

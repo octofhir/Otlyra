@@ -823,3 +823,60 @@ fn an_error_event_carries_the_exception() {
 </script>"#);
     assert_all_ok(&lines, 2);
 }
+
+#[test]
+fn indexed_db_keeps_records_for_the_document() {
+    let lines = run(r#"<script>
+  const promised = (request) => new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const open = indexedDB.open('app', 2);
+  let upgraded = null;
+  open.onupgradeneeded = (event) => {
+    upgraded = [event.oldVersion, event.newVersion];
+    const db = open.result;
+    const notes = db.createObjectStore('notes', { keyPath: 'id', autoIncrement: true });
+    notes.createIndex('byTag', 'tags', { multiEntry: true });
+    db.createObjectStore('kv');
+  };
+  promised(open).then(async (db) => {
+    check('the upgrade ran from nothing to 2', [upgraded, db.version, [...db.objectStoreNames]], [[0, 2], 2, ['kv', 'notes']]);
+    const write = db.transaction(['notes', 'kv'], 'readwrite');
+    const notes = write.objectStore('notes');
+    const first = await promised(notes.add({ text: 'a', tags: ['x', 'y'] }));
+    const second = await promised(notes.put({ text: 'b', tags: ['y'] }));
+    await promised(write.objectStore('kv').put({ nested: [1, 2] }, 'settings'));
+    check('keys come from the generator', [first, second], [1, 2]);
+    await new Promise((resolve) => { write.oncomplete = resolve; });
+    const read = db.transaction('notes');
+    const all = await promised(read.objectStore('notes').getAll());
+    check('records come back in key order with their keys put in', all.map((n) => [n.id, n.text]), [[1, 'a'], [2, 'b']]);
+    const tagged = await promised(read.objectStore('notes').index('byTag').getAll('y'));
+    check('a multi-entry index finds both', tagged.map((n) => n.text), ['a', 'b']);
+    const range = await promised(read.objectStore('notes').getAllKeys(IDBKeyRange.lowerBound(1, true)));
+    check('a key range bounds the keys', range, [2]);
+    const seen = [];
+    await new Promise((resolve) => {
+      const cursor = read.objectStore('notes').openCursor(null, 'prev');
+      cursor.onsuccess = () => {
+        if (!cursor.result) return resolve();
+        seen.push(cursor.result.value.text);
+        cursor.result.continue();
+      };
+    });
+    check('a cursor walks backwards', seen, ['b', 'a']);
+    const kv = await promised(db.transaction('kv').objectStore('kv').get('settings'));
+    check('values are structured clones', kv, { nested: [1, 2] });
+    const failing = db.transaction('notes', 'readwrite');
+    failing.objectStore('notes').put({ id: 1, text: 'changed', tags: [] });
+    const duplicate = failing.objectStore('notes').add({ id: 2, text: 'dup', tags: [] });
+    const errorName = await new Promise((resolve) => { duplicate.onerror = () => resolve(duplicate.error.name); });
+    await new Promise((resolve) => { failing.onabort = resolve; });
+    const after = await promised(db.transaction('notes').objectStore('notes').get(1));
+    check('an unhandled error aborts and the write is undone', [errorName, after.text], ['ConstraintError', 'a']);
+    check('cmp orders keys by type', [indexedDB.cmp(1, 'a'), indexedDB.cmp(['a'], 'a'), indexedDB.cmp(2, 2)], [-1, 1, 0]);
+  }).catch((error) => check('no failure', String(error), ''));
+</script>"#);
+    assert_all_ok(&lines, 9);
+}
