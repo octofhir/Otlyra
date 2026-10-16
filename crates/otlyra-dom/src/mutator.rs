@@ -124,6 +124,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(child),
         }
         self.document.nodes_mut()[parent].last_child = Some(child);
+        self.child_list(parent, &[child], &[], last, None);
         true
     }
 
@@ -134,9 +135,13 @@ impl<'a> DocumentMutator<'a> {
     /// nodes produced by parsing, and every tree-construction test says so.
     pub fn append_text(&mut self, parent: NodeId, text: StrTendril) {
         if let Some(last) = self.document.node(parent).last_child()
-            && let NodeData::Text(existing) = &mut self.document.nodes_mut()[last].data
+            && let NodeData::Text(existing) = &self.document.node(last).data
         {
-            existing.push_tendril(&text);
+            let old = self.document.observed().then(|| existing.to_string());
+            if let NodeData::Text(existing) = &mut self.document.nodes_mut()[last].data {
+                existing.push_tendril(&text);
+            }
+            self.character_data(last, old.as_deref());
             return;
         }
         let node = self.create(NodeData::Text(text));
@@ -165,6 +170,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(new_node),
         }
         self.document.nodes_mut()[sibling].prev_sibling = Some(new_node);
+        self.child_list(parent, &[new_node], &[], previous, Some(sibling));
         true
     }
 
@@ -172,9 +178,13 @@ impl<'a> DocumentMutator<'a> {
     /// there if there is one.
     pub fn insert_text_before(&mut self, sibling: NodeId, text: StrTendril) {
         if let Some(previous) = self.document.node(sibling).prev_sibling()
-            && let NodeData::Text(existing) = &mut self.document.nodes_mut()[previous].data
+            && let NodeData::Text(existing) = &self.document.node(previous).data
         {
-            existing.push_tendril(&text);
+            let old = self.document.observed().then(|| existing.to_string());
+            if let NodeData::Text(existing) = &mut self.document.nodes_mut()[previous].data {
+                existing.push_tendril(&text);
+            }
+            self.character_data(previous, old.as_deref());
             return;
         }
         let node = self.create(NodeData::Text(text));
@@ -201,6 +211,7 @@ impl<'a> DocumentMutator<'a> {
             Some(next) => self.document.nodes_mut()[next].prev_sibling = previous,
             None => self.document.nodes_mut()[parent].last_child = previous,
         }
+        self.child_list(parent, &[], &[target], previous, next);
     }
 
     /// Move every child of `node` to the end of `new_parent`, in order.
@@ -289,7 +300,10 @@ impl<'a> DocumentMutator<'a> {
             .map(|node| &mut node.data)
         {
             Some(NodeData::Text(data) | NodeData::Comment(data)) => {
-                *data = text;
+                let old = std::mem::replace(data, text);
+                if self.document.observed() {
+                    self.character_data(target, Some(&old));
+                }
                 true
             }
             _ => false,
@@ -350,6 +364,7 @@ impl<'a> DocumentMutator<'a> {
     ) -> bool {
         let limit = self.document.limits().max_attrs_per_element;
         let mut refused = false;
+        let mut changed: Option<(QualName, Option<String>)> = None;
         let set = match self
             .document
             .nodes_mut()
@@ -358,7 +373,8 @@ impl<'a> DocumentMutator<'a> {
         {
             Some(NodeData::Element(element)) => match element.attrs.iter().position(&matches) {
                 Some(at) => {
-                    element.attrs[at].value = value.into();
+                    let old = std::mem::replace(&mut element.attrs[at].value, value.into());
+                    changed = Some((element.attrs[at].name.clone(), Some(old.to_string())));
                     true
                 }
                 None if element.attrs.len() >= limit => {
@@ -366,8 +382,10 @@ impl<'a> DocumentMutator<'a> {
                     false
                 }
                 None => {
+                    let name = name();
+                    changed = Some((name.clone(), None));
                     element.attrs.push(Attribute {
-                        name: name(),
+                        name,
                         value: value.into(),
                     });
                     true
@@ -377,6 +395,9 @@ impl<'a> DocumentMutator<'a> {
         };
         if refused {
             self.document.refuse();
+        }
+        if let Some((name, old)) = changed {
+            self.attribute(target, &name, old.as_deref());
         }
         set
     }
@@ -409,7 +430,8 @@ impl<'a> DocumentMutator<'a> {
             .map(|node| &mut node.data)
             && let Some(at) = element.attrs.iter().position(matches)
         {
-            element.attrs.remove(at);
+            let removed = element.attrs.remove(at);
+            self.attribute(target, &removed.name, Some(&removed.value));
             return true;
         }
         false
@@ -419,6 +441,7 @@ impl<'a> DocumentMutator<'a> {
     pub fn add_attrs_if_missing(&mut self, target: NodeId, attrs: Vec<Attribute>) {
         let limit = self.document.limits().max_attrs_per_element;
         let mut refused = false;
+        let mut added = Vec::new();
         if let NodeData::Element(element) = &mut self.document.nodes_mut()[target].data {
             for attr in attrs {
                 if element
@@ -432,12 +455,74 @@ impl<'a> DocumentMutator<'a> {
                     refused = true;
                     break;
                 }
+                added.push(attr.name.clone());
                 element.attrs.push(attr);
             }
         }
         if refused {
             self.document.refuse();
         }
+        for name in added {
+            self.attribute(target, &name, None);
+        }
+    }
+
+    /// Report a change to `parent`'s children to its observers.
+    fn child_list(
+        &mut self,
+        parent: NodeId,
+        added: &[NodeId],
+        removed: &[NodeId],
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    ) {
+        if !self.document.observed() {
+            return;
+        }
+        self.document.queue_mutation(&crate::observe::Change {
+            kind: crate::MutationKind::ChildList,
+            target: parent,
+            added,
+            removed,
+            previous,
+            next,
+            attribute: None,
+            old_value: None,
+        });
+    }
+
+    /// Report a change to one of `target`'s attributes to its observers.
+    fn attribute(&mut self, target: NodeId, name: &QualName, old: Option<&str>) {
+        if !self.document.observed() {
+            return;
+        }
+        self.document.queue_mutation(&crate::observe::Change {
+            kind: crate::MutationKind::Attributes,
+            target,
+            added: &[],
+            removed: &[],
+            previous: None,
+            next: None,
+            attribute: Some((&name.local, &name.ns)),
+            old_value: old,
+        });
+    }
+
+    /// Report a change to `target`'s data to its observers.
+    fn character_data(&mut self, target: NodeId, old: Option<&str>) {
+        if !self.document.observed() {
+            return;
+        }
+        self.document.queue_mutation(&crate::observe::Change {
+            kind: crate::MutationKind::CharacterData,
+            target,
+            added: &[],
+            removed: &[],
+            previous: None,
+            next: None,
+            attribute: None,
+            old_value: old,
+        });
     }
 
     /// Whether a child may be inserted under `parent` without breaching the depth

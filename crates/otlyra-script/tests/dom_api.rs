@@ -579,3 +579,85 @@ fn cloning_a_template_clones_its_contents() {
 </script>"#);
     assert_all_ok(&lines, 5);
 }
+
+#[test]
+fn polymer_template_parsing_steps() {
+    let lines = run(r#"<script>
+  const t = document.createElement('template');
+  t.innerHTML = '<div><template is="dom-if" if="[[show]]"><b>x [[title]]</b></template></div>';
+  const inner = t.content.querySelector('template');
+  const wrapper = document.createElement('dom-if');
+  inner.parentNode.replaceChild(wrapper, inner);
+  wrapper.appendChild(inner);
+  inner.removeAttribute('is');
+  while (inner.attributes.length) { wrapper.setAttribute(inner.attributes[0].name, inner.attributes[0].value); inner.removeAttribute(inner.attributes[0].name); }
+  check('attributes moved', [wrapper.getAttribute('if'), inner.attributes.length], ['[[show]]', 0]);
+  wrapper.removeAttribute('if');
+  const content = inner.content.ownerDocument.createDocumentFragment();
+  content.appendChild(inner.content);
+  check('content moved', [content.childNodes.length, inner.content.childNodes.length], [1, 0]);
+  const stamped = document.importNode(t.content, true);
+  const w2 = stamped.querySelector('dom-if');
+  check('stamped wrapper', [!!w2, w2 && w2.hasAttribute('if'), w2 && w2.firstElementChild && w2.firstElementChild.localName], [true, false, 'template']);
+  const b = content.firstChild;
+  check('text node data', b.firstChild.data, 'x [[title]]');
+  b.firstChild.textContent = '';
+  check('text cleared', b.textContent, '');
+</script>"#);
+    assert_all_ok(&lines, 5);
+}
+
+#[test]
+fn mutation_observers_hear_what_they_asked_for() {
+    let lines = run(r#"<div id=root><p id=a title=t>text</p></div><script>
+  const root = document.getElementById('root');
+  const a = document.getElementById('a');
+  const seen = [];
+  const all = new MutationObserver((records, observer) => {
+    for (const r of records) seen.push(r.type + ':' + (r.attributeName || '') + ':' + r.oldValue + ':' + r.addedNodes.length + '/' + r.removedNodes.length + ':' + (r.target.id || r.target.nodeName));
+    check('the observer is passed itself', observer, all);
+  });
+  all.observe(root, { childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true, characterDataOldValue: true });
+  const childOnly = new MutationObserver((records) => { seen.push('child-only ' + records.length); });
+  childOnly.observe(root, { childList: true });
+  a.title = 'u';
+  a.firstChild.data = 'changed';
+  const b = document.createElement('b');
+  a.appendChild(b);
+  root.appendChild(document.createElement('i'));
+  a.removeChild(b);
+  const filtered = new MutationObserver((records) => { seen.push('filtered ' + records.map((r) => r.attributeName).join()); });
+  filtered.observe(a, { attributeFilter: ['data-x'] });
+  a.setAttribute('data-x', '1');
+  a.setAttribute('data-y', '2');
+  check('nothing is delivered before the checkpoint', seen.length, 0);
+  const taken = new MutationObserver(() => seen.push('never'));
+  taken.observe(a, { attributes: true });
+  a.id = 'a';
+  check('takeRecords empties the queue', taken.takeRecords().length, 1);
+  let threw = '';
+  try { new MutationObserver(() => {}).observe(a, {}); } catch (e) { threw = e.name; }
+  check('options must ask for something', threw, 'TypeError');
+  setTimeout(() => {
+    check('records arrive in order', seen, [
+      'attributes:title:t:0/0:a',
+      'characterData::text:0/0:#text',
+      'childList::null:1/0:a',
+      'childList::null:1/0:root',
+      'childList::null:0/1:a',
+      'attributes:data-x:null:0/0:a',
+      'attributes:data-y:null:0/0:a',
+      'attributes:id:a:0/0:a',
+      'child-only 1',
+      'filtered data-x',
+    ]);
+    // Polymer's microtask: a callback after a change to a watched text node.
+    const node = document.createTextNode('');
+    let flushed = 0;
+    new MutationObserver(() => { flushed++; }).observe(node, { characterData: true });
+    node.textContent = '1';
+    setTimeout(() => check('a text node watched as a microtask flushes', flushed, 1), 0);
+  }, 0);
+</script>"#);
+    assert_all_ok(&lines, 6);
+}

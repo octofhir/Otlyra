@@ -281,17 +281,148 @@ if (typeof performance === 'object' && performance) {
   define(performance, 'navigation', { type: 0, redirectCount: 0 });
 }
 
-// An observer that never observes: what is left of MutationObserver until
-// the tree reports its own changes.
-class NoopObserver {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-  takeRecords() {
-    return [];
+// MutationObserver (DOM §4.3). The tree keeps the registrations and the
+// records (`otlyra-dom/src/observe.rs`), so a change is matched against the
+// observers where it happens; this side numbers the observers, turns the
+// records into `MutationRecord`s and calls the callbacks at the microtask
+// checkpoint, which the host ends by calling
+// `__otlyraNotifyMutationObservers`.
+const nativeObserveMutations = take(Node.prototype, '__observeMutations');
+const nativeDisconnectMutations = take(Document.prototype, '__disconnectMutations');
+const nativeMutationNodes = take(Document.prototype, '__mutationNodes');
+const nativeTakeMutations = take(Document.prototype, '__takeMutations');
+
+const RECORD_KINDS = ['childList', 'attributes', 'characterData'];
+class MutationRecord {
+  constructor() {
+    throw new TypeError('Illegal constructor');
   }
 }
-if (typeof MutationObserver === 'undefined') defineGlobal('MutationObserver', NoopObserver);
+const makeRecord = (fields) => Object.setPrototypeOf(fields, MutationRecord.prototype);
+
+// Turn the tree's records into `MutationRecord`s, by observer number.
+const takeRecordsOf = (observer) => {
+  const nodes = nativeMutationNodes.call(document, observer);
+  const fields = nativeTakeMutations.call(document, observer);
+  const byObserver = new Map();
+  let at = 0;
+  for (let field = 0; field < fields.length; field += 10) {
+    const added = Number(fields[field + 6]);
+    const removed = Number(fields[field + 7]);
+    const target = nodes[at++];
+    const previousSibling = fields[field + 8] === '1' ? nodes[at++] : null;
+    const nextSibling = fields[field + 9] === '1' ? nodes[at++] : null;
+    const addedNodes = nodes.slice(at, at + added);
+    at += added;
+    const removedNodes = nodes.slice(at, at + removed);
+    at += removed;
+    const kind = RECORD_KINDS[Number(fields[field + 1])];
+    const record = makeRecord({
+      type: kind,
+      target,
+      addedNodes,
+      removedNodes,
+      previousSibling,
+      nextSibling,
+      attributeName: kind === 'attributes' ? fields[field + 2] : null,
+      attributeNamespace: kind === 'attributes' && fields[field + 3] ? fields[field + 3] : null,
+      oldValue: fields[field + 4] === '1' ? fields[field + 5] : null,
+    });
+    const id = Number(fields[field]);
+    if (!byObserver.has(id)) byObserver.set(id, []);
+    byObserver.get(id).push(record);
+  }
+  return byObserver;
+};
+
+const mutationObservers = new Map();
+let nextObserverId = 1;
+const observerIds = new WeakMap();
+
+class MutationObserver {
+  constructor(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+    }
+    const id = nextObserverId++;
+    observerIds.set(this, { id, callback, targets: 0 });
+  }
+
+  observe(target, options = {}) {
+    const state = observerIds.get(this);
+    if (!state) throw new TypeError('Illegal invocation');
+    if (!(target instanceof Node)) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+    }
+    const init = options || {};
+    let attributes = init.attributes;
+    let characterData = init.characterData;
+    const filter = init.attributeFilter;
+    if (attributes === undefined && (init.attributeOldValue !== undefined || filter !== undefined)) {
+      attributes = true;
+    }
+    if (characterData === undefined && init.characterDataOldValue !== undefined) characterData = true;
+    if (!init.childList && !attributes && !characterData) {
+      throw new TypeError("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    }
+    if (init.attributeOldValue && !attributes) {
+      throw new TypeError("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    }
+    if (filter !== undefined && !attributes) {
+      throw new TypeError("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    }
+    if (init.characterDataOldValue && !characterData) {
+      throw new TypeError("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    }
+    const flags =
+      (init.childList ? 1 : 0) |
+      (attributes ? 2 : 0) |
+      (characterData ? 4 : 0) |
+      (init.subtree ? 8 : 0) |
+      (init.attributeOldValue ? 16 : 0) |
+      (init.characterDataOldValue ? 32 : 0) |
+      (filter !== undefined ? 64 : 0);
+    const names = filter !== undefined ? Array.from(filter, String).join('\n') : '';
+    nativeObserveMutations.call(target, state.id, flags, names);
+    mutationObservers.set(state.id, this);
+  }
+
+  disconnect() {
+    const state = observerIds.get(this);
+    if (!state) return;
+    nativeDisconnectMutations.call(document, state.id);
+    mutationObservers.delete(state.id);
+  }
+
+  takeRecords() {
+    const state = observerIds.get(this);
+    if (!state) return [];
+    return takeRecordsOf(state.id).get(state.id) || [];
+  }
+}
+defineGlobal('MutationObserver', MutationObserver);
+defineGlobal('MutationRecord', MutationRecord);
+if (typeof WebKitMutationObserver === 'undefined') defineGlobal('WebKitMutationObserver', MutationObserver);
+
+// DOM §4.3 "notify mutation observers": each observer with records, in the
+// order the observers were made, gets them all in one call.
+defineGlobal('__otlyraNotifyMutationObservers', function __otlyraNotifyMutationObservers() {
+  const byObserver = takeRecordsOf(-1);
+  for (const id of Array.from(byObserver.keys()).sort((a, b) => a - b)) {
+    const observer = mutationObservers.get(id);
+    if (!observer) continue;
+    const records = byObserver.get(id);
+    try {
+      observerIds.get(observer).callback.call(observer, records, observer);
+    } catch (error) {
+      const message =
+        error && typeof error === 'object' && 'message' in error
+          ? 'Uncaught ' + (error.name || 'Error') + ': ' + error.message
+          : 'Uncaught ' + String(error);
+      __otlyraReportError(message, String(location.href));
+    }
+  }
+});
 
 // IntersectionObserver and ResizeObserver, answered from the boxes the last
 // frame drew, in the rendering step after the animation-frame callbacks — as

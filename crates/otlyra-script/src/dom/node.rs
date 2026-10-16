@@ -147,6 +147,34 @@ impl NodeRef {
         })
     }
 
+    /// Register a mutation observer on this node. Not part of the platform:
+    /// `MutationObserver.prototype.observe` checks and defaults the options
+    /// and passes them as bits — child list, attributes, character data,
+    /// subtree, attribute old value, character data old value, filter — with
+    /// the filter's names one per line.
+    #[method(name = "__observeMutations")]
+    fn js_observe_mutations(
+        &self,
+        observer: u32,
+        flags: u32,
+        filter: String,
+    ) -> Result<(), JsError> {
+        let options = otlyra_dom::MutationOptions {
+            child_list: flags & 1 != 0,
+            attributes: flags & 2 != 0,
+            character_data: flags & 4 != 0,
+            subtree: flags & 8 != 0,
+            attribute_old_value: flags & 16 != 0,
+            character_data_old_value: flags & 32 != 0,
+            attribute_filter: (flags & 64 != 0)
+                .then(|| filter.split('\n').map(str::to_owned).collect()),
+        };
+        let id = self.id;
+        super::with_document_unmarked(self.doc, |document| {
+            document.observe_mutations(observer, id, options);
+        })
+    }
+
     #[getter(name = "isConnected")]
     fn js_is_connected(&self) -> Result<bool, JsError> {
         // Through any shadow roots: a node in a shadow tree is connected

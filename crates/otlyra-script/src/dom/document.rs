@@ -343,6 +343,75 @@ impl DocumentRef {
         }
     }
 
+    /// Stop a mutation observer observing anything. Not part of the
+    /// platform: `MutationObserver.prototype.disconnect` calls it.
+    #[method(name = "__disconnectMutations")]
+    fn js_disconnect_mutations(&self, observer: u32) -> Result<(), JsError> {
+        super::with_document_unmarked(self.node.doc, |document| {
+            document.disconnect_mutations(observer);
+        })
+    }
+
+    /// The nodes of the waiting mutation records — for each record its
+    /// target, its previous and next sibling when it has them, then the
+    /// added and the removed nodes — for `observer`, or for every observer
+    /// when it is negative. Not part of the platform: read just before
+    /// [`Self::js_take_mutations`] takes the records themselves.
+    #[method(name = "__mutationNodes")]
+    fn js_mutation_nodes(&self, observer: f64) -> Result<Vec<JsNode>, JsError> {
+        let doc = self.node.doc;
+        super::with_document(doc, |document| {
+            let mut nodes = Vec::new();
+            for record in document.peek_mutation_records() {
+                if observer >= 0.0 && f64::from(record.observer) != observer {
+                    continue;
+                }
+                nodes.push(JsNode::new(doc, record.target));
+                nodes.extend(record.previous.map(|node| JsNode::new(doc, node)));
+                nodes.extend(record.next.map(|node| JsNode::new(doc, node)));
+                nodes.extend(record.added.iter().map(|node| JsNode::new(doc, *node)));
+                nodes.extend(record.removed.iter().map(|node| JsNode::new(doc, *node)));
+            }
+            nodes
+        })
+    }
+
+    /// Take the waiting mutation records, for `observer` or for every
+    /// observer when it is negative, as ten strings each: observer, kind
+    /// (0 child list, 1 attributes, 2 character data), attribute local name,
+    /// attribute namespace, whether there is an old value, the old value,
+    /// how many nodes were added, how many removed, whether there is a
+    /// previous sibling, whether there is a next one. Not part of the
+    /// platform.
+    #[method(name = "__takeMutations")]
+    fn js_take_mutations(&self, observer: f64) -> Result<Vec<String>, JsError> {
+        super::with_document_unmarked(self.node.doc, |document| {
+            let which = (observer >= 0.0).then_some(observer as u32);
+            let mut fields = Vec::new();
+            for record in document.take_mutation_records(which) {
+                let (local, namespace) = record.attribute.unwrap_or_default();
+                fields.extend([
+                    record.observer.to_string(),
+                    match record.kind {
+                        otlyra_dom::MutationKind::ChildList => "0",
+                        otlyra_dom::MutationKind::Attributes => "1",
+                        otlyra_dom::MutationKind::CharacterData => "2",
+                    }
+                    .to_owned(),
+                    local,
+                    namespace,
+                    if record.old_value.is_some() { "1" } else { "0" }.to_owned(),
+                    record.old_value.unwrap_or_default(),
+                    record.added.len().to_string(),
+                    record.removed.len().to_string(),
+                    if record.previous.is_some() { "1" } else { "0" }.to_owned(),
+                    if record.next.is_some() { "1" } else { "0" }.to_owned(),
+                ]);
+            }
+            fields
+        })
+    }
+
     /// The `<script>` element whose code is running, or `null` outside one.
     #[getter(name = "currentScript")]
     fn js_current_script(&self) -> Option<JsNode> {

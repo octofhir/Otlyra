@@ -244,7 +244,7 @@ impl ScriptHost {
         let result = self
             .runtime
             .run_module_source(SourceInput::from_javascript(source), url);
-        let drained = self.runtime.run_microtasks();
+        let drained = microtask_checkpoint(&mut self.runtime);
         let interrupted = guard.finish();
         let outcome = result.and_then(|result| {
             drained.map(|()| ScriptOutcome {
@@ -310,7 +310,7 @@ impl ScriptHost {
         let guard = self.watchdog.begin();
         custom_element_checkpoint(&mut self.runtime);
         let fired = self.runtime.fire_timer(token);
-        let drained = self.runtime.run_microtasks();
+        let drained = microtask_checkpoint(&mut self.runtime);
         let interrupted = guard.finish();
 
         let outcome = fired.and_then(|outcome| {
@@ -347,7 +347,7 @@ impl ScriptHost {
         // The checkpoint runs whether or not the script itself succeeded: a
         // script can settle a promise and then throw, and the callbacks that
         // settlement queued are still owed a turn.
-        let drained = self.runtime.run_microtasks();
+        let drained = microtask_checkpoint(&mut self.runtime);
         let interrupted = guard.finish();
 
         let outcome = result.and_then(|result| {
@@ -395,7 +395,7 @@ impl ScriptHost {
     /// Whatever a microtask threw past every handler.
     pub fn run_microtasks(&mut self) -> Result<(), ScriptError> {
         let guard = self.watchdog.begin();
-        let result = self.runtime.run_microtasks();
+        let result = microtask_checkpoint(&mut self.runtime);
         let interrupted = guard.finish();
         result.map_err(|source| ScriptError {
             specifier: "<microtask checkpoint>".to_owned(),
@@ -408,6 +408,29 @@ impl ScriptHost {
     pub fn runtime_mut(&mut self) -> &mut Runtime {
         &mut self.runtime
     }
+}
+
+/// The microtask checkpoint (HTML §8.1.7.3): run the microtasks, then
+/// notify the mutation observers (DOM §4.3 "notify mutation observers") of
+/// what changed, and again while either leaves work for the other.
+///
+/// The observers are called after the promise jobs queued so far rather than
+/// in the same queue as them, which is the one liberty taken. Bounded,
+/// because a callback that changes what it observes would otherwise never let
+/// the task end.
+fn microtask_checkpoint(runtime: &mut Runtime) -> Result<(), OtterError> {
+    const ROUNDS: usize = 64;
+    for _ in 0..ROUNDS {
+        runtime.run_microtasks()?;
+        if !crate::dom::mutation_records_pending() {
+            return Ok(());
+        }
+        runtime.run_script(
+            SourceInput::from_javascript("__otlyraNotifyMutationObservers()"),
+            "<mutation observers>",
+        )?;
+    }
+    runtime.run_microtasks()
 }
 
 /// Upgrade the custom elements the parser made since script last ran, so that

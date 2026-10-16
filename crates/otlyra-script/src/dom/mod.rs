@@ -417,6 +417,15 @@ pub(crate) fn custom_elements_defined() -> bool {
     with_state(|state| state.custom_elements)
 }
 
+/// Whether mutation records are waiting for their observers' callbacks.
+pub(crate) fn mutation_records_pending() -> bool {
+    LOANED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(Document::has_mutation_records)
+    })
+}
+
 /// How many nodes the lent document has ever made. The arena only grows, so
 /// a count that has not moved is a document with no new elements in it.
 pub(crate) fn node_count() -> usize {

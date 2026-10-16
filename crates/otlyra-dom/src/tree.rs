@@ -104,6 +104,8 @@ pub struct Document {
     /// The elements a custom element definition has run on: what makes one
     /// whose name is a custom element name `:defined`.
     pub(crate) customized: std::collections::HashSet<NodeId>,
+    /// Who observes changes to which nodes, and the records waiting for them.
+    pub(crate) observers: crate::observe::MutationObservers,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -144,6 +146,7 @@ impl Document {
             style_resolver: None,
             shadow: crate::shadow::ShadowTrees::default(),
             customized: std::collections::HashSet::new(),
+            observers: crate::observe::MutationObservers::default(),
         }
     }
 
