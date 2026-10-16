@@ -741,3 +741,46 @@ fn user_timing_marks_and_measures() {
 </script>"#);
     assert_all_ok(&lines, 3);
 }
+
+#[test]
+fn a_page_does_not_look_like_node() {
+    let lines = run(r#"<script>
+  check('no process', typeof process, 'undefined');
+  check('no require, module or Buffer', [typeof require, typeof module, typeof Buffer], ['undefined', 'undefined', 'undefined']);
+  const isNode = typeof process === 'object' && !!process.versions && !!process.versions.node;
+  check('the Node test answers no', isNode, false);
+</script>"#);
+    assert_all_ok(&lines, 3);
+}
+
+#[test]
+fn attribute_nodes_are_removed_and_path2d_is_there() {
+    let lines = run(r#"<script>
+  const el = document.createElement('div');
+  el.setAttribute('data-x', '1');
+  const attr = el.getAttributeNode('data-x');
+  check('removeAttributeNode answers the node', el.removeAttributeNode(attr), attr);
+  check('the attribute is gone and the node keeps its value', [el.hasAttribute('data-x'), attr.value, attr.ownerElement], [false, '1', null]);
+  let name = '';
+  try { el.removeAttributeNode(attr); } catch (error) { name = error.name; }
+  check('removing it again is NotFoundError', name, 'NotFoundError');
+  const path = new Path2D();
+  path.moveTo(0, 0);
+  path.roundRect(0, 0, 10, 10, 2);
+  check('Path2D is a path', [path instanceof Path2D, typeof Path2D.prototype.arc, typeof new Path2D(path).addPath], [true, 'function', 'function']);
+</script>"#);
+    assert_all_ok(&lines, 4);
+}
+
+#[test]
+fn script_selectors_take_has() {
+    let lines = run(
+        r#"<ul id=list><li class=a><b>x</b></li><li class=b></li></ul><script>
+  check('querySelector with :has', document.querySelector('li:has(> b)').className, 'a');
+  check('matches with :has', [document.getElementById('list').matches(':has(.b)'), document.querySelector('.b').matches(':has(*)')], [true, false]);
+  check('closest with :has', document.querySelector('b').closest('ul:has(li.b)').id, 'list');
+  check('nested in :is and :not', document.querySelectorAll('li:not(:has(b))').length, 1);
+</script>"#,
+    );
+    assert_all_ok(&lines, 4);
+}

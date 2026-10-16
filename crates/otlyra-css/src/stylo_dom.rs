@@ -707,8 +707,110 @@ fn parse_selector_list(
     // is what `url()` inside it would resolve against. A selector has none, so this
     // is a stand-in that cannot resolve to anything.
     let url = UrlExtraData(servo_arc::Arc::new(crate::cascade::about_blank()));
-    SelectorParser::parse_author_origin_no_namespace(selector, &url)
-        .map_err(|error| format!("{selector:?} is not a valid selector: {error:?}"))
+    let namespaces = style::stylesheets::Namespaces::default();
+    let parser = ScriptSelectorParser(SelectorParser {
+        stylesheet_origin: style::stylesheets::Origin::Author,
+        namespaces: &namespaces,
+        url_data: &url,
+        for_supports_rule: false,
+    });
+    let mut input = cssparser::ParserInput::new(selector);
+    selectors::SelectorList::parse(
+        &parser,
+        &mut cssparser::Parser::new(&mut input),
+        selectors::parser::ParseRelative::No,
+    )
+    .map_err(|error| format!("{selector:?} is not a valid selector: {error:?}"))
+}
+
+/// Stylo's selector parser, with `:has()` for script.
+///
+/// The cascade leaves `:has()` off (see `cascade::enable_features`): a rule
+/// that depends on an element's descendants needs invalidation the engine
+/// does not do. A selector script hands to `querySelector`, `matches` or
+/// `closest` is matched once, against the tree as it is, and needs none —
+/// and pages use `:has()` there, where a browser without it throws.
+struct ScriptSelectorParser<'a>(style::selector_parser::SelectorParser<'a>);
+
+impl<'i> selectors::Parser<'i> for ScriptSelectorParser<'_> {
+    type Impl = StyleSelectorImpl;
+    type Error = style_traits::StyleParseErrorKind<'i>;
+
+    fn parse_has(&self) -> bool {
+        true
+    }
+
+    fn parse_nth_child_of(&self) -> bool {
+        self.0.parse_nth_child_of()
+    }
+
+    fn parse_is_and_where(&self) -> bool {
+        self.0.parse_is_and_where()
+    }
+
+    fn parse_parent_selector(&self) -> bool {
+        self.0.parse_parent_selector()
+    }
+
+    fn parse_part(&self) -> bool {
+        self.0.parse_part()
+    }
+
+    fn parse_host(&self) -> bool {
+        self.0.parse_host()
+    }
+
+    fn parse_slotted(&self) -> bool {
+        self.0.parse_slotted()
+    }
+
+    fn allow_forgiving_selectors(&self) -> bool {
+        self.0.allow_forgiving_selectors()
+    }
+
+    fn parse_non_ts_pseudo_class(
+        &self,
+        location: cssparser::SourceLocation,
+        name: cssparser::CowRcStr<'i>,
+    ) -> Result<style::selector_parser::NonTSPseudoClass, cssparser::ParseError<'i, Self::Error>>
+    {
+        self.0.parse_non_ts_pseudo_class(location, name)
+    }
+
+    fn parse_non_ts_functional_pseudo_class<'t>(
+        &self,
+        name: cssparser::CowRcStr<'i>,
+        parser: &mut cssparser::Parser<'i, 't>,
+        after_part: bool,
+    ) -> Result<style::selector_parser::NonTSPseudoClass, cssparser::ParseError<'i, Self::Error>>
+    {
+        self.0
+            .parse_non_ts_functional_pseudo_class(name, parser, after_part)
+    }
+
+    fn parse_pseudo_element(
+        &self,
+        location: cssparser::SourceLocation,
+        name: cssparser::CowRcStr<'i>,
+    ) -> Result<style::selector_parser::PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        self.0.parse_pseudo_element(location, name)
+    }
+
+    fn parse_functional_pseudo_element<'t>(
+        &self,
+        name: cssparser::CowRcStr<'i>,
+        parser: &mut cssparser::Parser<'i, 't>,
+    ) -> Result<style::selector_parser::PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        self.0.parse_functional_pseudo_element(name, parser)
+    }
+
+    fn default_namespace(&self) -> Option<style::Namespace> {
+        self.0.default_namespace()
+    }
+
+    fn namespace_for_prefix(&self, prefix: &style::Prefix) -> Option<style::Namespace> {
+        self.0.namespace_for_prefix(prefix)
+    }
 }
 
 /// One matching pass over a document: the tree view, its scope, and the

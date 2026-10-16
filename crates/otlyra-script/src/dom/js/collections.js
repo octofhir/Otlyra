@@ -302,6 +302,25 @@ method(Element.prototype, 'setAttributeNode', function setAttributeNode(attr) {
   this.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
   return previous;
 });
+method(Element.prototype, 'setAttributeNodeNS', function setAttributeNodeNS(attr) {
+  return this.setAttributeNode(attr);
+});
+// DOM §4.9 removeAttributeNode: the attribute must be this element's; it
+// leaves the element and keeps its value, as an attribute of no element.
+method(Element.prototype, 'removeAttributeNode', function removeAttributeNode(attr) {
+  if (
+    !(attr instanceof Attr) ||
+    attr[kAttrOwner] !== this ||
+    this.getAttributeNS(attr.namespaceURI, attr.localName) === null
+  ) {
+    throw new DOMException('the attribute is not an attribute of this element', 'NotFoundError');
+  }
+  const value = attr.value;
+  this.removeAttributeNS(attr.namespaceURI, attr.localName);
+  attr[kAttrRecord] = { ...attr[kAttrRecord], value };
+  attr[kAttrOwner] = null;
+  return attr;
+});
 method(Document.prototype, 'createAttribute', function createAttribute(name) {
   const local = String(name).toLowerCase();
   return makeAttr(null, { name: local, localName: local, namespaceURI: null, prefix: null, value: '' });

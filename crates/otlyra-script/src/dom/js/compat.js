@@ -196,6 +196,36 @@ const makeStorage = (area) => {
 defineGlobal('localStorage', makeStorage(0));
 defineGlobal('sessionStorage', makeStorage(1));
 
+// ---------------------------------------------------------------- Path2D
+// A path for a 2D canvas (HTML §4.12.5.1.16). There is no canvas backend
+// yet, so nothing draws one; the interface is here because libraries extend
+// or feature-test it at load (`Path2D.prototype.roundRect ||= …`), and a
+// missing global stops the whole bundle. It keeps the commands it is given,
+// so a later backend has them.
+const kPathCommands = Symbol('pathCommands');
+class Path2D {
+  constructor(path) {
+    this[kPathCommands] = path instanceof Path2D ? [...path[kPathCommands]] : [];
+    if (typeof path === 'string') this[kPathCommands].push(['svg', path]);
+  }
+  addPath(path) {
+    if (!(path instanceof Path2D)) throw new TypeError("Failed to execute 'addPath' on 'Path2D': parameter 1 is not of type 'Path2D'.");
+    this[kPathCommands].push(...path[kPathCommands]);
+  }
+}
+for (const name of ['closePath', 'moveTo', 'lineTo', 'bezierCurveTo', 'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect']) {
+  Object.defineProperty(Path2D.prototype, name, {
+    value: {
+      [name](...args) {
+        this[kPathCommands].push([name, ...args]);
+      },
+    }[name],
+    writable: true,
+    configurable: true,
+  });
+}
+defineGlobal('Path2D', Path2D);
+
 // ---------------------------------------------------------------- Geometry
 class DOMRectReadOnly {
   constructor(x = 0, y = 0, width = 0, height = 0) {

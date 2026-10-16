@@ -98,6 +98,7 @@ const DEFINES: &[&str] = &[
     "Storage",
     "localStorage",
     "sessionStorage",
+    "Path2D",
     "DOMRectReadOnly",
     "DOMRect",
     "DOMPointReadOnly",

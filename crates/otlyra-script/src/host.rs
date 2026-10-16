@@ -198,7 +198,13 @@ impl ScriptHost {
             // `Duration::ZERO` is the engine's own spelling of "do not".
             .timeout(Duration::ZERO)
             .max_heap_bytes(MAX_HEAP_BYTES)
-            .max_stack_depth(MAX_STACK_DEPTH);
+            .max_stack_depth(MAX_STACK_DEPTH)
+            // No Node `process`. Libraries tell Node from a browser by
+            // `typeof process === 'object' && process.versions.node`, and a
+            // page that answers yes is sent down the Node path: `require`,
+            // `Buffer`, `module.exports` — none of which a page has. js-md5,
+            // Airbnb's and Notion's bundles all failed on it.
+            .process_global(false);
         // The web platform Otter already has, then the part of it that knows
         // what a document is, which is ours. Order matters only in that both
         // are registered before the first script runs.
