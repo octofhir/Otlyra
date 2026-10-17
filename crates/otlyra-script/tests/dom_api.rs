@@ -960,3 +960,18 @@ fn the_interfaces_the_sweep_found_missing() {
 </script>"#);
     assert_all_ok(&lines, 8);
 }
+
+#[test]
+fn storage_quota_is_a_profiles_not_a_private_windows() {
+    let lines = run(r#"<script>
+  const descriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webkitTemporaryStorage');
+  check('the old quota interface is a Navigator attribute', typeof descriptor?.get, 'function');
+  navigator.webkitTemporaryStorage.queryUsageAndQuota((usage, quota) => {
+    check('its quota is more than twice a heap limit', [usage, quota > 2 * 2 ** 30], [0, true]);
+  }, () => console.log('FAIL the quota query failed'));
+  navigator.storage.estimate().then(({ quota }) => {
+    check('the estimate gives the same quota', quota > 2 * 2 ** 30, true);
+  });
+</script>"#);
+    assert_all_ok(&lines, 3);
+}

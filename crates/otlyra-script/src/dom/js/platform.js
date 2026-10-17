@@ -377,14 +377,32 @@ if (typeof navigator === 'object' && navigator) {
   // its beacon left is a page that will not try the request another way.
   define(navigator, 'sendBeacon', () => false);
   // StorageManager (Storage §5): an estimate with room to spare, and storage
-  // that is not promised to persist.
+  // that is not promised to persist. The quota is a profile's on disk, not a
+  // private window's: incognito detectors (CNN's among them) compare it with
+  // the heap limit and treat a small one as a private window.
+  const quota = 2 ** 37;
   if (!('storage' in navigator)) {
     const storage = {
-      estimate: () => Promise.resolve({ quota: 2 ** 31, usage: 0 }),
+      estimate: () => Promise.resolve({ quota, usage: 0 }),
       persisted: () => Promise.resolve(false),
       persist: () => Promise.resolve(false),
     };
     Object.defineProperty(prototype, 'storage', { get: () => storage, enumerable: true, configurable: true });
+  }
+  // Chrome's older quota interface, which those detectors ask first:
+  // `queryUsageAndQuota(success, error)` answers through its callback.
+  const deprecatedQuota = {
+    queryUsageAndQuota(success) {
+      if (typeof success === 'function') queueMicrotask(() => success(0, quota));
+    },
+    requestQuota(size, success) {
+      if (typeof success === 'function') queueMicrotask(() => success(Math.min(Number(size) || 0, quota)));
+    },
+  };
+  for (const name of ['webkitTemporaryStorage', 'webkitPersistentStorage']) {
+    if (!(name in navigator)) {
+      Object.defineProperty(prototype, name, { get: () => deprecatedQuota, enumerable: true, configurable: true });
+    }
   }
 }
 
