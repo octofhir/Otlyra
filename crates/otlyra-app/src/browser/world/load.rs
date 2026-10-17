@@ -77,6 +77,22 @@ pub(super) struct PendingLoad {
     /// Module addresses already asked for during this load — by the preload
     /// scan, or for the page's runner — so none is asked for twice.
     pub(super) modules_asked: HashSet<String>,
+    /// When the load passed each of its stages, for the `page.timing` line.
+    timing: LoadTiming,
+}
+
+/// When a load passed each of its stages, and how long the work in the last
+/// of them took: what says whether a slow page waited on the network, on its
+/// parse, or on its scripts.
+#[derive(Debug, Default)]
+struct LoadTiming {
+    /// The document's bytes arrived.
+    arrived: Option<std::time::Instant>,
+    /// The document was parsed as far as it could be and first shown.
+    built: Option<std::time::Instant>,
+    /// Running what the parse ran on the way: the parse itself and the scripts
+    /// it ran in place.
+    build: std::time::Duration,
 }
 
 impl PendingLoad {
@@ -317,6 +333,7 @@ impl PageWorld {
             scripts: HashMap::new(),
             runner: None,
             modules_asked: HashSet::new(),
+            timing: LoadTiming::default(),
         });
         slot.modules_fetched = 0;
     }
@@ -396,7 +413,16 @@ impl PageWorld {
             self.prefetch_scripts(tab, &loaded);
         }
 
-        self.build_document(tab, loaded, otlyra_html::ExternalSources::new())
+        let arrived = std::time::Instant::now();
+        if let Some(pending) = self.pending_mut(tab) {
+            pending.timing.arrived = Some(arrived);
+        }
+        let built = self.build_document(tab, loaded, otlyra_html::ExternalSources::new());
+        if let Some(pending) = self.pending_mut(tab) {
+            pending.timing.built = Some(std::time::Instant::now());
+            pending.timing.build = arrived.elapsed();
+        }
+        built
     }
 
     /// Ask for every script a document's bytes name, before parsing them.
@@ -1256,12 +1282,14 @@ impl PageWorld {
             return;
         };
         let scroll = pending.restore_scroll;
+        let finishing = std::time::Instant::now();
 
         // The scripts the page linked to, in the order it named them, then the
         // load events that were waiting for them. This happens before the scene
         // is rebuilt, so whatever they did to the document is in the first frame
         // the reader sees rather than in a second one after a flash.
         let (mut document, url) = slot.page.take().map(PageScene::into_document).unzip();
+        let mut scripts_ran = std::time::Duration::ZERO;
         let pictures = std::mem::take(&mut slot.picture_events);
         if let (Some(document), Some(runner)) = (document.as_mut(), pending.runner.as_mut()) {
             for node in &pending.script_order {
@@ -1269,6 +1297,7 @@ impl PageWorld {
                     runner.run_external(source, *node, document);
                 }
             }
+            scripts_ran = finishing.elapsed();
             // The pictures that arrived or failed during the load, before the
             // window's load, which waits for them.
             for (node, loaded) in pictures {
@@ -1276,6 +1305,7 @@ impl PageWorld {
             }
             runner.release_load_event(document);
         }
+        let load_event = finishing.elapsed();
         // The page's own deferred work, up to a bounded budget. A page that
         // paints from a `setTimeout(…, 0)` — which is most of what a framework
         // does after hydrating — has done it by the time the first frame is
@@ -1287,10 +1317,12 @@ impl PageWorld {
                 tracing::debug!(target: "page.script", ran, "the page settled");
             }
         }
+        let settled = finishing.elapsed();
         // The isolate stays with the tab: its timers are still coming due and
         // its listeners are still waiting.
         slot.scripts = pending.runner.take();
 
+        let url_shown = url.clone();
         if let (Some(document), Some(url)) = (document, url) {
             let mut page = PageScene::with_resources(
                 document,
@@ -1308,6 +1340,23 @@ impl PageWorld {
             }
             slot.page = Some(shown(page, interface));
         }
+        let since = |at: Option<std::time::Instant>| {
+            at.map_or(0, |at| at.duration_since(pending.started).as_millis())
+        };
+        tracing::info!(
+            target: "page.timing",
+            url = url_shown.as_ref().map_or("", url::Url::as_str),
+            arrived_ms = since(pending.timing.arrived),
+            build_ms = pending.timing.build.as_millis(),
+            built_ms = since(pending.timing.built),
+            everything_ms = since(Some(finishing)),
+            scripts_ms = scripts_ran.as_millis(),
+            load_event_ms = (load_event - scripts_ran).as_millis(),
+            settle_ms = (settled - load_event).as_millis(),
+            scene_ms = (finishing.elapsed() - settled).as_millis(),
+            total_ms = pending.started.elapsed().as_millis(),
+            "a load finished"
+        );
         slot.generation = generation;
         slot.swept_at_build = None;
         // What the load asked for and did not get stays asked: a picture that
