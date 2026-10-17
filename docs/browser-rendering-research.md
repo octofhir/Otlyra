@@ -1915,6 +1915,34 @@ Notion now loads with no console errors, with iframe and object
 `contentWindow`/`contentDocument` back to accessors (still `null`: there are
 no nested browsing contexts).
 
+## Frames
+
+An `<iframe>` used to be a box with nothing in it. Now each one is a slot of
+the page world like a tab's, under an id no tab has
+(`otlyra-app/src/browser/world/frames.rs`), so the whole load pipeline —
+fetch lane, isolate, timers, pictures, fonts, modules — serves it unchanged.
+After each frame the world matches the pages' `<iframe>` elements against
+its frames: new ones open at their element's content box, resized ones get a
+new viewport, gone ones close with everything nested in them. A frame is
+drawn by building its display list at that size, rasterizing it at the
+window's density and giving the pixels to the parent as the element's
+picture, the way a canvas is shown; it redraws when its page changed, at
+most every 200 ms, because a new picture lays the parent out again.
+
+The display list has no item that can hold another list, which is why the
+first cut rasterizes; nesting lists needs spatial ids renumbered per frame
+and a compositor that knows a frame's scroll from its page's.
+
+Security: a frame's document is requested as the page's request (initiator
+the page, not a top-level navigation), so a third-party frame gets the
+cookies its page's rules allow; and a response whose CSP `frame-ancestors`
+or `X-Frame-Options` does not admit every page around the frame is refused
+before it is parsed. On the 25-site sweep frames opened on 8 sites:
+reCAPTCHA anchors (Spotify, The Verge), Stripe's helper frames, Optimizely's
+storage frame, an Amazon tracking pixel, NYTimes' DataDome captcha (which
+used to be a white page and now shows the captcha Chrome shows), and
+YouTube's passive Google sign-in, refused for `X-Frame-Options: DENY`.
+
 ## Page load speed against Chrome
 
 Measured 2026-10-17 on the M-series laptop, warm caches on both sides, the

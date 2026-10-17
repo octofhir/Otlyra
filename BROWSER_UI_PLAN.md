@@ -321,7 +321,8 @@ clicks and wheel events. What is left:
   generated content's `url()`; a hover that changes a `::before` restyles
   the whole page; a TLS handshake that does not mark a browser with a
   normal User-Agent as a bot (Amazon's robot check); nested browsing
-  contexts, which give an iframe's `contentWindow`/`contentDocument` a value.
+  contexts' scripting side, which gives an iframe's `contentWindow`/
+  `contentDocument` a value (see [Frames](#frames)).
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of
@@ -424,6 +425,30 @@ tree for an unrelated visual change.
 
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
+
+## Frames
+
+- [x] `<iframe src>` and `srcdoc` load a document of their own: a slot of
+  the page world under a name no tab has, with its own fetch lane, isolate,
+  timers, subresources and viewport (the element's content box), animation
+  frames and visibility with the tab it is shown in. Drawn into its element
+  as a picture at the window's density, redrawn when its page changed (at
+  most every 200 ms). At most 16 per document, 3 levels. Goes with its
+  element, its document or a new source.
+- [x] A frame's document request is the page's (its cookies under the
+  page's rules, not a top-level navigation's), and a document that refuses
+  to be framed — CSP `frame-ancestors`, `X-Frame-Options` — is never
+  parsed. YouTube's hidden Google sign-in frame is refused as in Chrome.
+- [ ] Input into frames: hit testing through the element into the frame's
+  page, clicks, keys, focus, wheel and the frame's own scrolling.
+- [ ] `contentWindow`/`contentDocument`/`window.frames`/`parent`/`top`, and
+  `postMessage` between a page and its frames (same-origin frames sharing
+  an agent, cross-origin ones a `WindowProxy`).
+- [ ] Drawing without a raster per change: the frame's display list nested
+  in the parent's, and a parent that is not laid out again when only a
+  frame's drawing changed (shared with canvas).
+- [ ] `loading=lazy`, `sandbox`, `allow`, a frame navigating itself, the
+  `load` event on the element, `about:blank` documents script writes into.
 
 ## Page load speed
 
