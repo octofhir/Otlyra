@@ -1226,6 +1226,20 @@ impl PageWorld {
         let viewport = self.environment.viewport;
         self.generations += 1;
         let generation = self.generations;
+        // What the page's script asked for while it loaded — an
+        // `XMLHttpRequest`, a script it inserted, an `import()` — is still
+        // the same document's: its answers are not a stale page's.
+        if let Some(slot) = self.slots.get(&tab)
+            && slot.pending.is_some()
+        {
+            let from = slot.generation;
+            for fetch in self.page_fetches.values_mut() {
+                fetch.rebase(tab, from, generation);
+            }
+            for fetch in self.module_fetches.values_mut() {
+                fetch.rebase(tab, from, generation);
+            }
+        }
         let Some(slot) = self.slots.get_mut(&tab) else {
             return;
         };

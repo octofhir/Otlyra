@@ -5207,6 +5207,53 @@ fn page_requests_are_fetched_by_the_browser() {
     });
 }
 
+/// A request a page makes while it loads is answered after the load
+/// finishes too: the finished load is the same document, not a new one whose
+/// answers would be stale. An `XMLHttpRequest` sent beside an `import()`
+/// stayed in `OPENED` when its answer came after the module.
+#[test]
+fn a_request_made_during_the_load_is_answered_after_it() {
+    on_content_stack(|| {
+        let (mut browser, _requested) = table_browser(
+            &[
+                (
+                    "https://during.example/",
+                    "text/html",
+                    b"<script>\
+                        const log = (x) => { const h = document.documentElement;\
+                          h.setAttribute('data-log', (h.getAttribute('data-log') || '') + x + ';') };\
+                        const xhr = new XMLHttpRequest();\
+                        xhr.onload = () => log('xhr:' + xhr.responseText);\
+                        xhr.open('GET', '/note.txt'); xhr.send();\
+                        import('./lazy.js').then((m) => log('import:' + m.value));\
+                      </script>",
+                ),
+                ("https://during.example/note.txt", "text/plain", b"hi"),
+                (
+                    "https://during.example/lazy.js",
+                    "text/javascript",
+                    b"export const value = 'lazy';",
+                ),
+            ],
+            None,
+        );
+        go(&mut browser, "https://during.example/");
+        settle(&mut browser);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page_log(&browser).matches(';').count() < 2 && std::time::Instant::now() < deadline {
+            browser.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut entries: Vec<String> = page_log(&browser)
+            .split(';')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["import:lazy", "xhr:hi"]);
+    });
+}
+
 /// An `import()` a page makes after its load is fetched by the same path and
 /// settles when the module arrives.
 #[test]

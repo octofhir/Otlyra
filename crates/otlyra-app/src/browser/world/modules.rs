@@ -50,6 +50,14 @@ pub(super) struct ModuleFetch {
 }
 
 impl ModuleFetch {
+    /// Carry a request `tab`'s document made while it loaded over to the
+    /// generation the finished load gives the same document.
+    pub(super) fn rebase(&mut self, tab: TabId, from: u64, to: u64) {
+        if self.tab == tab && self.generation == from {
+            self.generation = to;
+        }
+    }
+
     /// Whether this was asked for by `tab`'s page.
     pub(super) fn of(&self, tab: TabId) -> bool {
         self.tab == tab
