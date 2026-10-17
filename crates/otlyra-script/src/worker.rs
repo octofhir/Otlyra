@@ -457,6 +457,7 @@ impl Thread {
             .web_modules(modules.clone())
             .console_sink(crate::console::tracing_console())
             .timeout(Duration::ZERO)
+            .execution_stats(false)
             .max_heap_bytes(WORKER_HEAP_BYTES)
             .max_stack_depth(1024)
             .process_global(false)

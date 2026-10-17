@@ -197,6 +197,11 @@ impl ScriptHost {
             //
             // `Duration::ZERO` is the engine's own spelling of "do not".
             .timeout(Duration::ZERO)
+            // Nobody here reads a run's statistics, and gathering them walks
+            // every linked function's inline caches after each of the small
+            // scripts an event, a timer or an observer is: about 90 ms of
+            // YouTube's load.
+            .execution_stats(false)
             .max_heap_bytes(MAX_HEAP_BYTES)
             .max_stack_depth(MAX_STACK_DEPTH)
             // No Node `process`. Libraries tell Node from a browser by
