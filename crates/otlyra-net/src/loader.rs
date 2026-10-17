@@ -363,7 +363,7 @@ struct Hop {
 
 /// Identifies us to servers. Deliberately honest rather than imitating a browser
 /// whose behaviour we do not yet have.
-const USER_AGENT: &str = concat!("Otlyra/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("Otlyra/", env!("CARGO_PKG_VERSION"));
 
 /// The process's network stack: one HTTP client.
 ///

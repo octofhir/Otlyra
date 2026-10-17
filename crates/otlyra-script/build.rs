@@ -43,6 +43,7 @@ const SOURCES: &[&str] = &[
     "src/dom/js/network.js",
     "src/dom/js/clone.js",
     "src/dom/js/worker.js",
+    "src/dom/js/sockets.js",
     "src/dom/js/indexeddb.js",
 ];
 
@@ -108,6 +109,7 @@ const DEFINES: &[&str] = &[
     "Path2D",
     "Worker",
     "__otlyraWorkerDeliver",
+    "__otlyraSocketDeliver",
     "CanvasRenderingContext2D",
     "CanvasGradient",
     "CanvasPattern",

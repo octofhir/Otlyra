@@ -3634,13 +3634,16 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "encoding_rs",
+ "httparse",
  "idna",
  "percent-encoding",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tungstenite",
  "url",
 ]
 

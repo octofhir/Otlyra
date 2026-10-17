@@ -156,6 +156,50 @@ impl DocumentRef {
         super::with_state_mut(|state| state.workers.terminate(id as u64));
     }
 
+    /// Open a WebSocket (`kind` 0, offering the `\n`-separated `protocols`)
+    /// or an event stream (`kind` 1) to `url`: its number, or null when there
+    /// is no network to open it on. Not part of the platform: `sockets.js`
+    /// calls these.
+    #[static_method(name = "__socketOpen")]
+    fn js_socket_open(kind: u32, url: String, protocols: String, origin: String) -> Option<f64> {
+        let kind = match kind {
+            0 => crate::sockets::SocketKind::WebSocket {
+                protocols: protocols
+                    .split('\n')
+                    .filter(|protocol| !protocol.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            _ => crate::sockets::SocketKind::EventSource,
+        };
+        super::with_state_value(|state| state.sockets.open(kind, url, origin))
+            .flatten()
+            .map(|id| id as f64)
+    }
+
+    /// Send text, or bytes written as the code units 0–255.
+    #[static_method(name = "__socketSend")]
+    fn js_socket_send(id: f64, data: String, binary: bool) {
+        let command = if binary {
+            crate::sockets::SocketCommand::Binary(data.chars().map(|c| c as u32 as u8).collect())
+        } else {
+            crate::sockets::SocketCommand::Text(data)
+        };
+        super::with_state_mut(|state| state.sockets.command(id as u64, command));
+    }
+
+    #[static_method(name = "__socketClose")]
+    fn js_socket_close(id: f64, code: f64, reason: String) {
+        let command = crate::sockets::SocketCommand::Close(code as u16, reason);
+        super::with_state_mut(|state| state.sockets.command(id as u64, command));
+    }
+
+    /// The next thing a connection reported: `[id, type, …]`, or null.
+    #[static_method(name = "__socketNextEvent")]
+    fn js_socket_next_event() -> Option<Vec<String>> {
+        super::with_state_value(|state| state.sockets.next_event()).flatten()
+    }
+
     /// The next message or error a worker sent: `[id, type, data]`, or null.
     #[static_method(name = "__workerNextEvent")]
     fn js_worker_next_event() -> Option<Vec<String>> {

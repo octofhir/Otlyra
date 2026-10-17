@@ -14,6 +14,7 @@ loopback HTTP and checks the web APIs in `web-apis.html` through
 
 import base64
 import functools
+import hashlib
 import http.server
 import json
 import os
@@ -35,8 +36,61 @@ def serve_fixtures() -> http.server.ThreadingHTTPServer:
     """The fixtures over HTTP on a free loopback port, for the checks of APIs
     a `file:` page does not get the way a web page does."""
     class Quiet(http.server.SimpleHTTPRequestHandler):
+        # A WebSocket handshake is an HTTP/1.1 exchange.
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args) -> None:
             pass
+
+        def do_GET(self) -> None:
+            if self.path == "/ws":
+                return self.echo_websocket()
+            if self.path == "/events":
+                return self.event_stream()
+            return super().do_GET()
+
+        def echo_websocket(self) -> None:
+            """A WebSocket that sends back every text message it is sent,
+            upper-cased, and answers a close with a close."""
+            accept = base64.b64encode(hashlib.sha1(
+                (self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()).decode()
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            if self.headers.get("Sec-WebSocket-Protocol"):
+                self.send_header("Sec-WebSocket-Protocol", self.headers["Sec-WebSocket-Protocol"].split(",")[0].strip())
+            self.end_headers()
+            while True:
+                head = self.rfile.read(2)
+                if len(head) < 2:
+                    return
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", self.rfile.read(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self.rfile.read(8))[0]
+                mask = self.rfile.read(4)
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(length)))
+                if opcode == 8:
+                    self.wfile.write(bytes([0x88, len(payload)]) + payload)
+                    return
+                if opcode == 1:
+                    reply = payload.decode().upper().encode()
+                    self.wfile.write(bytes([0x81, len(reply)]) + reply)
+                    self.wfile.flush()
+
+        def event_stream(self) -> None:
+            """Two events, then the end of the stream."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(b"retry: 10000\n: hello\ndata: one\n\nevent: tick\ndata: two\nid: 5\n\n")
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.close_connection = True
 
     handler = functools.partial(Quiet, directory=str(FIXTURES))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -254,6 +308,12 @@ def main() -> int:
                 "a dedicated worker imports, fetches and answers through structured clone",
                 poll(lambda: evaluate(client, context, "workerAnswer")),
                 {"type": "string", "value": "true,true,1,2,imported,true,undefined"},
+            ))
+            evaluate(client, context, "socketCheck()")
+            checks.append((
+                "a WebSocket opens, echoes and closes; an event stream delivers its events",
+                poll(lambda: evaluate(client, context, "socketAnswer.length >= 6 ? [...socketAnswer].sort().join(' ') : ''")),
+                {"type": "string", "value": "HELLO close:1000:true es-open message:one open:chat tick:two:5"},
             ))
             server.shutdown()
 

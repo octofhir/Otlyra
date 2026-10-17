@@ -303,6 +303,8 @@ fn main() -> ExitCode {
     observability::init();
     let cli = Cli::parse();
     STARTUP_TRACE.mark("cli_parsed");
+    // Pages' WebSockets and event streams open on threads of their own.
+    otlyra_app::sockets::install();
 
     if !cli.mcp
         && cli.bidi.is_none()

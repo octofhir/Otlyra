@@ -721,15 +721,22 @@ impl ScriptRunner for PageScripts {
     }
 
     fn pump_workers(&mut self, document: &mut Document) -> bool {
-        if !self.state.drain_workers() {
+        let workers = self.state.drain_workers();
+        let sockets = self.state.sockets.drain();
+        if !workers && !sockets {
             return false;
         }
+        let source = match (workers, sockets) {
+            (true, true) => "__otlyraWorkerDeliver(); __otlyraSocketDeliver();",
+            (true, false) => "__otlyraWorkerDeliver();",
+            _ => "__otlyraSocketDeliver();",
+        };
         let Self { host, state, .. } = self;
         let Some(host) = host.as_mut() else {
             return false;
         };
         let outcome = crate::dom::loan(document, state, || {
-            host.run_classic_script("__otlyraWorkerDeliver()", "<worker>")
+            host.run_classic_script(source, "<worker>")
         });
         self.absorb_turn();
         if let Err(error) = outcome {

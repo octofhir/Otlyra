@@ -52,7 +52,7 @@ pub fn set_wake(wake: Arc<dyn Fn() + Send + Sync>) {
     let _ = WAKE.set(wake);
 }
 
-fn wake() {
+pub(crate) fn wake() {
     if let Some(wake) = WAKE.get() {
         wake();
     }

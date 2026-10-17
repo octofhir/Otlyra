@@ -32,6 +32,7 @@ pub mod cookie;
 pub mod limits;
 pub mod loader;
 pub mod mime;
+pub mod socket;
 pub mod url;
 
 pub use cookie::{Cookie, Jar, SameSite, SetCookie};

@@ -134,6 +134,8 @@ pub struct PageState {
     dirty_canvases: Vec<otlyra_dom::NodeId>,
     /// The page's dedicated workers.
     pub(crate) workers: crate::worker::Workers,
+    /// The page's WebSockets and event streams.
+    pub(crate) sockets: crate::sockets::Sockets,
     /// Where `document.cookie` reads and writes. `None` is a document with no
     /// cookies at all, which reads as empty and keeps nothing.
     cookies: Option<Cookies>,

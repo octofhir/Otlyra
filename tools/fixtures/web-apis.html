@@ -40,4 +40,19 @@ function workerCheck() {
   }).then((answer) => { workerAnswer = answer; });
   return 'started';
 }
+
+// A WebSocket to the smoke's echo endpoint and an event stream from its
+// events endpoint; what each reported in `socketAnswer` (the two interleave).
+const socketAnswer = [];
+function socketCheck() {
+  const socket = new WebSocket(`ws://${location.host}/ws`, ['chat']);
+  socket.onopen = () => { socketAnswer.push('open:' + socket.protocol); socket.send('hello'); };
+  socket.onmessage = (event) => { socketAnswer.push(event.data); socket.close(1000, 'done'); };
+  socket.onclose = (event) => socketAnswer.push(`close:${event.code}:${event.wasClean}`);
+  const source = new EventSource('/events');
+  source.onopen = () => socketAnswer.push('es-open');
+  source.onmessage = (event) => socketAnswer.push('message:' + event.data);
+  source.addEventListener('tick', (event) => { socketAnswer.push(`tick:${event.data}:${event.lastEventId}`); source.close(); });
+  return 'started';
+}
 </script>

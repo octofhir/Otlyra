@@ -277,6 +277,10 @@ tokio = { version = "=1.53.0", features = [
 # explicitly. With two providers reachable there is no implicit default and
 # `ClientConfig::builder()` panics; being explicit turns that into our decision.
 rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-rs"] }
+# The verifier reqwest already uses, named for the connections held open
+# outside it; and the HTTP head parser tungstenite already uses.
+rustls-platform-verifier = "=0.7.0"
+httparse = "=1.10.1"
 
 # AES-256-GCM and the system generator, for sealing the browser's own files. This
 # is rustls's own provider at rustls's own version, so it costs no package and

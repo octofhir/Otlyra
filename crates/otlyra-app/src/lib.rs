@@ -65,6 +65,7 @@ pub mod preferences;
 pub mod scene;
 pub mod secret;
 pub mod settings;
+pub mod sockets;
 pub mod ui;
 pub mod widget;
 

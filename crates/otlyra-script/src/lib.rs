@@ -43,6 +43,7 @@ pub mod console;
 pub mod dom;
 pub mod host;
 pub mod page;
+pub mod sockets;
 pub mod storage;
 pub mod timers;
 pub mod worker;
