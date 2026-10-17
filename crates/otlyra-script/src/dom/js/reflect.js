@@ -471,12 +471,13 @@ reflectString(HTMLHtmlElement, 'version');
 
 reflectUrl(HTMLImageElement, 'src');
 // A picture outside the document — `new Image()` preloading one — is fetched
-// all the same, and its element hears `load` or `error`.
+// all the same, and its element hears `load` or `error`. One in a document
+// script made is not: that document has no window to show it in.
 {
   const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
   accessor(HTMLImageElement.prototype, 'src', src.get, function (value) {
     src.set.call(this, value);
-    if (!this.isConnected) this.__otlyraRequestImage();
+    if (!inPage(this) && ofPage(this)) this.__otlyraRequestImage();
   });
 }
 reflectString(HTMLImageElement, 'srcset');
@@ -508,7 +509,7 @@ accessor(HTMLImageElement.prototype, 'complete', function () {
 for (const [name, index] of [['width', 0], ['height', 1]]) {
   const { set } = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, name);
   accessor(HTMLImageElement.prototype, name, function () {
-    const rect = this.isConnected ? this.__otlyraClientRect() : null;
+    const rect = inPage(this) ? this.__otlyraClientRect() : null;
     if (rect) return Math.round(index === 0 ? rect[2] - rect[0] : rect[3] - rect[1]);
     const attribute = parseInt(this.getAttribute(name), 10);
     if (attribute >= 0) return attribute;
@@ -546,13 +547,11 @@ tokenList(HTMLIFrameElement, 'sandbox', 'sandbox', [
   'allow-presentation', 'allow-same-origin', 'allow-scripts', 'allow-top-navigation',
   'allow-top-navigation-by-user-activation', 'allow-top-navigation-to-custom-protocols',
 ]);
-// Plain values, not accessors yet, on purpose: a consent manager (Transcend's
-// airgap, on Notion) wraps these two getters to rewrite markup through a
-// document from `document.implementation`, which is not a real Document here
-// (see `parsedDocument`), and its natives throw on it. Without getters to wrap
-// it leaves them alone. Make them accessors once secondary documents are real.
-define(HTMLIFrameElement.prototype, 'contentWindow', null);
-define(HTMLIFrameElement.prototype, 'contentDocument', null);
+// No nested browsing contexts yet, so an iframe has no window or document to
+// answer with; but these are attributes, and a consent manager (Transcend's
+// airgap, on Notion) wraps their getters.
+readonly(HTMLIFrameElement.prototype, 'contentWindow', null);
+readonly(HTMLIFrameElement.prototype, 'contentDocument', null);
 
 reflectUrl(HTMLEmbedElement, 'src');
 reflectString(HTMLEmbedElement, 'type');
@@ -563,8 +562,8 @@ reflectString(HTMLObjectElement, 'type');
 reflectString(HTMLObjectElement, 'name');
 reflectString(HTMLObjectElement, 'width');
 reflectString(HTMLObjectElement, 'height');
-define(HTMLObjectElement.prototype, 'contentDocument', null);
-define(HTMLObjectElement.prototype, 'contentWindow', null);
+readonly(HTMLObjectElement.prototype, 'contentDocument', null);
+readonly(HTMLObjectElement.prototype, 'contentWindow', null);
 
 reflectUrl(HTMLSourceElement, 'src');
 reflectString(HTMLSourceElement, 'type');

@@ -135,6 +135,13 @@ const throwsDomExceptions = (object, name) => {
 // them.
 const nativeDocument = take(Document, '__self');
 const nativeUrl = take(Document, '__url');
+// Documents script makes beside the page's (see compat.js).
+const nativeCreateDocument = take(Document, '__create');
+const nativeSecondaryType = take(Document.prototype, '__contentType');
+const nativeParseInto = take(Document.prototype, '__parse');
+const nativeCreateDoctype = take(Document.prototype, '__createDoctype');
+// Whether `document` is one script made rather than the page's.
+const isMadeDocument = (document) => nativeSecondaryType.call(document) !== null;
 const nativeNavigate = take(Document, '__navigate');
 const nativeReload = take(Document, '__reload');
 const nativeFrameRequested = take(Document, '__frameRequested');
@@ -144,3 +151,15 @@ const nativeGeometryWanted = take(Document, '__geometryWanted');
 const nativeScrollEventsWanted = take(Document, '__scrollEventsWanted');
 const nativeWheelEventsWanted = take(Document, '__wheelEventsWanted');
 const nativeAttributeRecords = take(Element.prototype, '__attributeRecords');
+// Whether a node is in the page's tree: what running a script, connecting a
+// custom element or drawing a picture asks. `isConnected` is also true in a
+// document script made, where none of those happen.
+const nativeInPage = take(Node.prototype, '__inPage');
+const inPage = (node) => nativeInPage.call(node);
+// Whether a node belongs to the page's document rather than one script made,
+// whose pictures are never fetched and whose scripts never run.
+const nativeOwnerDocument = Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument').get;
+const ofPage = (node) => {
+  const page = nativeDocument();
+  return node === page || nativeOwnerDocument.call(node) === page;
+};

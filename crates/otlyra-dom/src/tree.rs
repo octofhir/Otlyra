@@ -143,6 +143,9 @@ pub struct Document {
     /// "already started"): the parser's, the ones markup made, and the ones
     /// script has run. Inserting one again does not run it again.
     pub(crate) started_scripts: std::collections::HashSet<NodeId>,
+    /// The documents script made besides this one, and which detached nodes
+    /// belong to them.
+    pub(crate) documents: crate::documents::Documents,
 }
 
 /// What became of the picture an element asked for, and which address that
@@ -215,6 +218,7 @@ impl Document {
             observers: crate::observe::MutationObservers::default(),
             cssom: std::collections::HashMap::new(),
             started_scripts: std::collections::HashSet::new(),
+            documents: crate::documents::Documents::default(),
         }
     }
 

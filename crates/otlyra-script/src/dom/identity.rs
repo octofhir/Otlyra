@@ -130,7 +130,10 @@ impl IntoJs for JsNode {
                     }),
                 Kind::Text => "Text",
                 Kind::Comment => "Comment",
-                Kind::Document => "HTMLDocument",
+                Kind::Document => match document.secondary_document(self.id) {
+                    Some(kind) if !kind.is_html() => "XMLDocument",
+                    _ => "HTMLDocument",
+                },
                 Kind::Fragment if document.shadow_host_of(self.id).is_some() => "ShadowRoot",
                 Kind::Fragment => "DocumentFragment",
                 Kind::Doctype => "DocumentType",

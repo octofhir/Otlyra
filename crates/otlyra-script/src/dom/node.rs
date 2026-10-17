@@ -139,7 +139,7 @@ impl NodeRef {
                 Some(NodeData::Element(element)) => super::element::tag_name(element),
                 Some(NodeData::Text(_)) => "#text".to_owned(),
                 Some(NodeData::Comment(_)) => "#comment".to_owned(),
-                Some(NodeData::Document) if self.id == document.root() => "#document".to_owned(),
+                Some(NodeData::Document) if document.is_document(self.id) => "#document".to_owned(),
                 Some(NodeData::Document) => "#document-fragment".to_owned(),
                 Some(NodeData::Doctype { name, .. }) => name.to_string(),
                 None => String::new(),
@@ -175,18 +175,28 @@ impl NodeRef {
         })
     }
 
+    /// Whether the node is in the page's own tree, through shadow hosts: what
+    /// decides whether a script runs, a custom element connects or a picture
+    /// is drawn. Not part of the platform; `isConnected` is also true in a
+    /// document script made.
+    #[method(name = "__inPage")]
+    fn js_in_page(&self) -> Result<bool, JsError> {
+        with_document(self.doc, |document| document.is_connected(self.id))
+    }
+
     #[getter(name = "isConnected")]
     fn js_is_connected(&self) -> Result<bool, JsError> {
         // Through any shadow roots: a node in a shadow tree is connected
         // when its host is (DOM §4.4).
-        with_document(self.doc, |document| document.is_connected(self.id))
+        with_document(self.doc, |document| document.is_in_a_document(self.id))
     }
 
     /// The document a node belongs to; `null` for the document itself.
     #[getter(name = "ownerDocument")]
     fn js_owner_document(&self) -> Result<Option<JsNode>, JsError> {
         with_document(self.doc, |document| {
-            (self.id != document.root()).then(|| JsNode::new(self.doc, document.root()))
+            (!document.is_document(self.id))
+                .then(|| JsNode::new(self.doc, document.node_document(self.id)))
         })
     }
 

@@ -864,7 +864,7 @@ method(Element.prototype, 'scrollIntoViewIfNeeded', function scrollIntoViewIfNee
   if (rect.top < 0 || rect.bottom > innerHeight) this.scrollIntoView();
 });
 method(Element.prototype, 'checkVisibility', function checkVisibility() {
-  if (!this.isConnected) return false;
+  if (!inPage(this)) return false;
   const rect = this.getBoundingClientRect();
   return rect.width > 0 || rect.height > 0;
 });
@@ -1306,115 +1306,103 @@ class FontFace {
 }
 defineGlobal('FontFace', FontFace);
 
-// ---------------------------------------------------------------- DOMParser
-// DOMParser (HTML §8.5.1) answers with a document of its own; this browser
-// has one document per page, so what it answers is that document's shape —
-// a detached `<html>` with a `<head>` and a `<body>` — built from the markup
-// in this document, where `importNode` and `appendChild` take it as it is.
-// Scripts in it never run, as they do not in a parsed document.
+// ---------------------------------------------------------------- Documents
+// Documents script makes (DOM §4.5.1, HTML §8.5.1): each one a document of its
+// own beside the page's, with its own nodes, which nothing draws, fetches
+// pictures for or runs scripts in.
 const XML_TYPES = new Set(['application/xml', 'text/xml', 'image/svg+xml', 'application/xhtml+xml']);
-const parsedDocument = (root, head, body, type) => {
-  const parsed = Object.create(null);
-  Object.assign(parsed, {
-    nodeType: 9,
-    contentType: type,
-    documentElement: root,
-    head,
-    body,
-    get title() {
-      const title = root.querySelector('title');
-      return title ? title.textContent.trim() : '';
-    },
-    get firstChild() {
-      return root;
-    },
-    get childNodes() {
-      return [root];
-    },
-    get children() {
-      return [root];
-    },
-    querySelector: (selector) => root.querySelector(selector),
-    querySelectorAll: (selector) => root.querySelectorAll(selector),
-    getElementById: (id) => root.querySelector('#' + CSS.escape(String(id))),
-    getElementsByTagName: (name) => root.getElementsByTagName(name),
-    getElementsByClassName: (name) => root.getElementsByClassName(name),
-    createElement: (name, options) => document.createElement(name, options),
-    createElementNS: (namespace, name) => document.createElementNS(namespace, name),
-    createTextNode: (text) => document.createTextNode(text),
-    createComment: (text) => document.createComment(text),
-    createDocumentFragment: () => document.createDocumentFragment(),
-    createTreeWalker: (...args) => document.createTreeWalker(...args),
-    createNodeIterator: (...args) => document.createNodeIterator(...args),
-    createRange: () => document.createRange(),
-    importNode: (node, deep) => document.importNode(node, deep),
-    adoptNode: (node) => node,
-    get implementation() {
-      return document.implementation;
-    },
-  });
-  return parsed;
-};
-// The empty document `createHTMLDocument` answers: `<html><head><title>`
-// and an empty `<body>`.
-const emptyHtmlDocument = (title) => {
-  const root = document.createElement('html');
-  const head = document.createElement('head');
-  const body = document.createElement('body');
-  callTree('appendChild', root, head);
-  callTree('appendChild', root, body);
-  if (title !== undefined) {
-    const element = document.createElement('title');
-    element.textContent = String(title);
-    callTree('appendChild', head, element);
-  }
-  return parsedDocument(root, head, body, 'text/html');
-};
-// `document.implementation` (DOM §4.5.1), over the same approximation.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const implementations = new WeakMap();
+// `document.implementation` (DOM §4.5.1): what makes documents, and doctypes
+// for the document it belongs to.
 class DOMImplementation {
-  createHTMLDocument(title) {
-    return emptyHtmlDocument(title);
+  #document;
+  constructor(owner) {
+    if (!implementations.has(owner)) throw new TypeError('Illegal constructor');
+    this.#document = owner;
   }
-  createDocument(namespace, qualifiedName) {
-    const root = qualifiedName ? document.createElementNS(namespace, qualifiedName) : null;
-    return parsedDocument(root, null, null, 'application/xml');
+  createHTMLDocument(title) {
+    const made = nativeCreateDocument('text/html');
+    callTree('appendChild', made, nativeCreateDoctype.call(made, 'html', '', ''));
+    const root = made.createElement('html');
+    const head = made.createElement('head');
+    callTree('appendChild', made, root);
+    callTree('appendChild', root, head);
+    if (title !== undefined) {
+      const element = made.createElement('title');
+      callTree('appendChild', element, made.createTextNode(String(title)));
+      callTree('appendChild', head, element);
+    }
+    callTree('appendChild', root, made.createElement('body'));
+    return made;
+  }
+  createDocument(namespace, qualifiedName, doctype = null) {
+    const type =
+      namespace === XHTML_NS ? 'application/xhtml+xml' : namespace === SVG_NS ? 'image/svg+xml' : 'application/xml';
+    const made = nativeCreateDocument(type);
+    const name = qualifiedName === null || qualifiedName === undefined ? '' : String(qualifiedName);
+    const element = name === '' ? null : made.createElementNS(namespace, name);
+    if (doctype) callTree('appendChild', made, doctype);
+    if (element) callTree('appendChild', made, element);
+    return made;
   }
   createDocumentType(name, publicId, systemId) {
-    return { nodeType: 10, name: String(name), publicId: String(publicId), systemId: String(systemId) };
+    return nativeCreateDoctype.call(this.#document, String(name), String(publicId), String(systemId));
   }
   hasFeature() {
     return true;
   }
 }
 defineGlobal('DOMImplementation', DOMImplementation);
-const theImplementation = new DOMImplementation();
-accessor(Document.prototype, 'implementation', () => theImplementation);
+accessor(Document.prototype, 'implementation', function () {
+  let made = implementations.get(this);
+  if (!made) {
+    implementations.set(this, null);
+    made = new DOMImplementation(this);
+    implementations.set(this, made);
+  }
+  return made;
+});
 class DOMParser {
   parseFromString(text, type) {
-    const source = String(text);
-    const kind = String(type || 'text/html').toLowerCase();
-    if (XML_TYPES.has(kind)) {
-      const holder = document.createElement('div');
-      holder.innerHTML = source.replace(/^\s*<\?xml[^>]*\?>/, '');
-      const root = holder.firstElementChild || holder;
-      if (root.parentNode === holder) callTree('removeChild', holder, root);
-      return parsedDocument(root, null, null, kind);
+    const kind = String(type);
+    if (kind !== 'text/html' && !XML_TYPES.has(kind)) {
+      throw new TypeError(
+        `Failed to execute 'parseFromString' on 'DOMParser': The provided value '${kind}' is not a valid enum value of type DOMParserSupportedType.`,
+      );
     }
-    const root = document.createElement('html');
-    const head = document.createElement('head');
-    const body = document.createElement('body');
-    callTree('appendChild', root, head);
-    callTree('appendChild', root, body);
-    const headPart = /<head[^>]*>([\s\S]*?)<\/head>/i.exec(source);
-    const bodyPart = /<body[^>]*>([\s\S]*?)(?:<\/body>|$)/i.exec(source);
-    if (headPart) head.innerHTML = headPart[1];
-    let rest = bodyPart ? bodyPart[1] : headPart ? source.replace(headPart[0], '') : source;
-    rest = rest.replace(/^[\s\S]*?<html[^>]*>/i, '').replace(/<\/html>[\s\S]*$/i, '');
-    body.innerHTML = rest;
-    return parsedDocument(root, head, body, 'text/html');
+    const made = nativeCreateDocument(kind);
+    nativeParseInto.call(made, String(text));
+    return made;
   }
 }
 defineGlobal('DOMParser', DOMParser);
+
+// `open`, `write` and `close` (HTML §8.4) on a document script made: what is
+// written so far is that document's markup, parsed again with each write so
+// it can be read before `close`. The page's own document cannot be written to
+// yet — there is no insertion point in a parse that has finished, nor in one
+// that is running — so there they do nothing rather than throw.
+const written = new WeakMap();
+method(Document.prototype, 'open', function open() {
+  if (isMadeDocument(this)) {
+    written.set(this, '');
+    nativeParseInto.call(this, '');
+  }
+  return this;
+});
+method(Document.prototype, 'write', function write(...text) {
+  if (!isMadeDocument(this)) return;
+  const markup = (written.get(this) ?? '') + text.join('');
+  written.set(this, markup);
+  nativeParseInto.call(this, markup);
+});
+method(Document.prototype, 'writeln', function writeln(...text) {
+  this.write(...text, '\n');
+});
+method(Document.prototype, 'close', function close() {
+  written.delete(this);
+});
 
 // ---------------------------------------------------------------- Wrappers
 // The prototype each interface's wrappers are made with, as the glue left

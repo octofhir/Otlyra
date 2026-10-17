@@ -50,7 +50,7 @@ pub(super) fn set_outer(document: &mut Document, id: NodeId, html: &str) -> Resu
     let Some(parent) = tree::parent(document, id) else {
         return Ok(());
     };
-    if parent == document.root() {
+    if document.is_document(parent) {
         return Err(tree::exception(
             "NoModificationAllowedError",
             "the document element cannot be replaced",
@@ -72,7 +72,7 @@ pub(super) fn insert_adjacent(
     let (parent, before) = match position.as_str() {
         "beforebegin" | "afterend" => {
             let parent = tree::parent(document, id)
-                .filter(|parent| *parent != document.root())
+                .filter(|parent| !document.is_document(*parent))
                 .ok_or_else(|| {
                     tree::exception(
                         "NoModificationAllowedError",
@@ -114,6 +114,146 @@ pub(super) fn insert_adjacent(
     // Unlike innerHTML, insertAdjacentHTML inserts into a template's ordinary
     // children, rather than its separate content fragment (HTML §8.5.6).
     insert(document, parent, before, &parsed)
+}
+
+/// Fill the document `target` — one script made — with what `html` parses to
+/// as a whole document: a doctype if it has one, and an `<html>` with its
+/// `<head>` and `<body>` whether it wrote them or not (HTML §8.5.1
+/// `parseFromString`). Its scripts are already started and never run.
+pub(super) fn parse_document(
+    document: &mut Document,
+    target: NodeId,
+    html: &str,
+) -> Result<(), JsError> {
+    let parsed = otlyra_html::parse_document_string(html, document.limits());
+    let mut mutator = DocumentMutator::new(document);
+    for child in parsed.children(parsed.root()) {
+        import(&mut mutator, &parsed, child, target, None)?;
+    }
+    Ok(())
+}
+
+/// How many nodes an XML document script parses may have: far past any real
+/// one, and short of what a hostile string could make the arena hold.
+const XML_NODES: u32 = 1_000_000;
+
+/// Where a browser puts what went wrong with an XML document: an element of
+/// this name and namespace, which is what pages look for.
+const PARSER_ERROR_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+
+/// Fill the document `target` with what `xml` parses to as XML, names and
+/// namespaces as written. Markup that is not well formed makes a document
+/// whose element is a `<parsererror>` saying why, rather than an exception
+/// (DOM Parsing §3.3 `parseFromString`).
+pub(super) fn parse_xml_document(
+    document: &mut Document,
+    target: NodeId,
+    xml: &str,
+) -> Result<(), JsError> {
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        nodes_limit: XML_NODES,
+        entity_resolver: None,
+    };
+    let parsed = match roxmltree::Document::parse_with_options(xml, options) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let mut mutator = DocumentMutator::new(document);
+            let element = mutator.create_element(
+                QualName::new(
+                    None,
+                    html5ever::Namespace::from(PARSER_ERROR_NAMESPACE),
+                    LocalName::from("parsererror"),
+                ),
+                Vec::new(),
+                None,
+                false,
+            );
+            mutator.append(target, element);
+            mutator.append_text(element, error.to_string().into());
+            return Ok(());
+        }
+    };
+
+    let mut mutator = DocumentMutator::new(document);
+    let mut pending: Vec<(roxmltree::Node<'_, '_>, NodeId)> = parsed
+        .root()
+        .children()
+        .rev()
+        .map(|child| (child, target))
+        .collect();
+    while let Some((node, parent)) = pending.pop() {
+        let made = match node.node_type() {
+            roxmltree::NodeType::Element => xml_element(&mut mutator, node),
+            roxmltree::NodeType::Text => {
+                let Some(text) = node.text() else { continue };
+                // Text outside the element is white space XML ignores.
+                if parent == target {
+                    continue;
+                }
+                mutator.create(NodeData::Text(text.into()))
+            }
+            roxmltree::NodeType::Comment => {
+                mutator.create(NodeData::Comment(node.text().unwrap_or_default().into()))
+            }
+            roxmltree::NodeType::Root | roxmltree::NodeType::PI => continue,
+        };
+        if !mutator.append(parent, made) {
+            return Err(nesting_limit());
+        }
+        pending.extend(node.children().rev().map(|child| (child, made)));
+    }
+    Ok(())
+}
+
+/// An XML element as the DOM has it: its namespace, the prefix it was written
+/// with, its attributes, and the namespace declarations made on it — which
+/// XML keeps as attributes in the `xmlns` namespace.
+fn xml_element(mutator: &mut DocumentMutator<'_>, node: roxmltree::Node<'_, '_>) -> NodeId {
+    let namespace = node.tag_name().namespace().unwrap_or_default();
+    let prefix = (!namespace.is_empty() && node.lookup_namespace_uri(None) != Some(namespace))
+        .then(|| node.lookup_prefix(namespace))
+        .flatten();
+    let name = QualName::new(
+        prefix.map(html5ever::Prefix::from),
+        html5ever::Namespace::from(namespace),
+        LocalName::from(node.tag_name().name()),
+    );
+
+    let inherited: Vec<_> = node
+        .parent_element()
+        .map(|parent| parent.namespaces().collect())
+        .unwrap_or_default();
+    let mut attrs: Vec<html5ever::Attribute> = node
+        .namespaces()
+        .filter(|declared| !inherited.contains(declared))
+        .map(|declared| html5ever::Attribute {
+            name: match declared.name() {
+                Some(prefix) => QualName::new(
+                    Some(html5ever::Prefix::from("xmlns")),
+                    ns!(xmlns),
+                    LocalName::from(prefix),
+                ),
+                None => QualName::new(None, ns!(xmlns), LocalName::from("xmlns")),
+            },
+            value: declared.uri().into(),
+        })
+        .collect();
+    attrs.extend(node.attributes().map(|attribute| {
+        let namespace = attribute.namespace().unwrap_or_default();
+        let prefix = (!namespace.is_empty())
+            .then(|| node.lookup_prefix(namespace))
+            .flatten();
+        html5ever::Attribute {
+            name: QualName::new(
+                prefix.map(html5ever::Prefix::from),
+                html5ever::Namespace::from(namespace),
+                LocalName::from(attribute.name()),
+            ),
+            value: attribute.value().into(),
+        }
+    }));
+    mutator.create_element(name, attrs, None, false)
 }
 
 fn import(

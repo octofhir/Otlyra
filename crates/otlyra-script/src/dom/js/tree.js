@@ -221,14 +221,17 @@ accessor(Node.prototype, 'baseURI', function () {
 });
 
 // The document's facts that are not about any node.
+// A document script made has no address of its own, no window and no
+// domain; its type is the one it was made with.
 const DOCUMENT = {
   get URL() {
-    return nativeUrl();
+    return isMadeDocument(this) ? 'about:blank' : nativeUrl();
   },
   get documentURI() {
-    return nativeUrl();
+    return isMadeDocument(this) ? 'about:blank' : nativeUrl();
   },
   get domain() {
+    if (isMadeDocument(this)) return '';
     try {
       return new URL(nativeUrl()).hostname;
     } catch (_) {
@@ -248,10 +251,10 @@ const DOCUMENT = {
     return 'UTF-8';
   },
   get contentType() {
-    return 'text/html';
+    return nativeSecondaryType.call(this) ?? 'text/html';
   },
   get defaultView() {
-    return globalThis;
+    return isMadeDocument(this) ? null : globalThis;
   },
   get scrollingElement() {
     return this.documentElement;

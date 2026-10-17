@@ -515,7 +515,7 @@ const runClassicScript = (script, source, url) => {
   }
 };
 const prepareInsertedScript = (script) => {
-  if (!script.isConnected || nativeScriptStarted.call(script, false)) return;
+  if (!inPage(script) || nativeScriptStarted.call(script, false)) return;
   const kind = scriptKind(script);
   if (kind === null) return;
   const src = script.getAttribute('src');
@@ -570,7 +570,7 @@ const insertedCandidates = (nodes) => {
 };
 const startInsertedScripts = (candidates) => {
   for (const node of candidates) {
-    if (node.nodeType !== 1 || !node.isConnected) continue;
+    if (node.nodeType !== 1 || !inPage(node)) continue;
     if (node.localName === 'script') {
       prepareInsertedScript(node);
     } else if (node.firstElementChild) {
@@ -612,7 +612,7 @@ for (const property of ['text', 'textContent', 'src']) {
       ...descriptor,
       set(value) {
         descriptor.set.call(this, value);
-        if (this.localName === 'script' && this.isConnected) prepareInsertedScript(this);
+        if (this.localName === 'script' && inPage(this)) prepareInsertedScript(this);
       },
     });
   }

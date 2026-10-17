@@ -205,6 +205,10 @@ slotmap = "=1.1.1"
 # when the cascade lands at M8.
 html5ever = "=0.39.0"
 
+# A read-only XML parser, for the documents `DOMParser` makes from XML. Pinned to
+# the version the SVG rasterizer already brings, so it is one copy.
+roxmltree = "=0.21.1"
+
 # Zero-copy text slices off the parse buffer. `subtendril` is O(1) where `String`
 # is a copy, and the tokenizer produces a great many small slices.
 tendril = { version = "=0.5.1", features = ["encoding_rs"] }

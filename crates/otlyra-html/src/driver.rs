@@ -479,6 +479,30 @@ impl HtmlParser {
         }
     }
 
+    /// A parser writing into `document`, for a whole document that arrives as
+    /// a string rather than as bytes, as `DOMParser` and `document.write` into a document script made
+    /// give one (HTML §8.5.1). A U+FEFF at its start is a character, not a
+    /// byte order mark, and scripting is disabled: `<noscript>` holds markup.
+    pub fn for_string(document: Document) -> Self {
+        let mut parser = Self::new();
+        let sink = DomSink::with_document(document);
+        let tree_builder = TreeBuilder::new(
+            sink,
+            TreeBuilderOpts {
+                scripting_enabled: false,
+                ..TreeBuilderOpts::default()
+            },
+        );
+        parser.tokenizer = Tokenizer::new(
+            tree_builder,
+            TokenizerOpts {
+                discard_bom: false,
+                ..TokenizerOpts::default()
+            },
+        );
+        parser
+    }
+
     /// A parser for a fragment, as `innerHTML` parses one.
     ///
     /// A fragment is parsed *as if* it were inside `context`, and that changes the

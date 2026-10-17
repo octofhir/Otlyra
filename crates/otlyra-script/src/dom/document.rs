@@ -63,6 +63,71 @@ impl DocumentRef {
         with_document(owner, |document| JsNode::new(owner, document.root()))
     }
 
+    /// A new, empty document of `content_type`, beside the page's: what
+    /// `createHTMLDocument`, `createDocument` and `DOMParser` are made from.
+    /// Not part of the platform; the glue takes it.
+    #[static_method(name = "__create")]
+    fn js_create_document(content_type: String) -> Result<JsNode, JsError> {
+        let owner = super::lent_document().ok_or_else(|| {
+            JsError::Type("there is no document for this isolate right now".to_owned())
+        })?;
+        with_document_mut(owner, |document| {
+            let created = DocumentMutator::new(document)
+                .create_document(otlyra_dom::SecondaryDocument { content_type });
+            JsNode::new(owner, created)
+        })
+    }
+
+    /// The `contentType` of a document script made, or `None` for the page's.
+    /// Not part of the platform.
+    #[method(name = "__contentType")]
+    fn js_secondary_content_type(&self) -> Result<Option<String>, JsError> {
+        with_document(self.node.doc, |document| {
+            document
+                .secondary_document(self.node.id)
+                .map(|kind| kind.content_type.clone())
+        })
+    }
+
+    /// Replace what a document script made holds with what `markup` parses
+    /// to, as HTML or as XML by its type. An XML error leaves a
+    /// `<parsererror>` as the document's element, as browsers do. Not part
+    /// of the platform: `DOMParser` and `document.write` use it.
+    #[method(name = "__parse")]
+    fn js_parse(&self, markup: String) -> Result<(), JsError> {
+        let id = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            let Some(kind) = document.secondary_document(id).cloned() else {
+                return Err(tree::exception(
+                    "InvalidStateError",
+                    "only a document script made can be parsed into",
+                ));
+            };
+            DocumentMutator::new(document).remove_children(id);
+            if kind.is_html() {
+                super::markup::parse_document(document, id, &markup)
+            } else {
+                super::markup::parse_xml_document(document, id, &markup)
+            }
+        })?
+    }
+
+    /// A doctype belonging to this document. Not part of the platform:
+    /// `DOMImplementation.createDocumentType` makes one through it.
+    #[method(name = "__createDoctype")]
+    fn js_create_doctype(
+        &self,
+        name: String,
+        public_id: String,
+        system_id: String,
+    ) -> Result<JsNode, JsError> {
+        self.create(NodeData::Doctype {
+            name: name.as_str().into(),
+            public_id: public_id.as_str().into(),
+            system_id: system_id.as_str().into(),
+        })
+    }
+
     /// The document's own address, for the `location` the glue builds.
     #[static_method(name = "__url")]
     fn js_url() -> String {
@@ -390,7 +455,7 @@ impl DocumentRef {
     fn js_head(&self) -> Result<Option<JsNode>, JsError> {
         let doc = self.node.doc;
         with_document(doc, |document| {
-            tree::root_child_named(document, "head").map(|id| JsNode::new(doc, id))
+            tree::root_child_named(document, self.node.id, "head").map(|id| JsNode::new(doc, id))
         })
     }
 
@@ -398,7 +463,7 @@ impl DocumentRef {
     fn js_body(&self) -> Result<Option<JsNode>, JsError> {
         let doc = self.node.doc;
         with_document(doc, |document| {
-            tree::root_child_named(document, "body").map(|id| JsNode::new(doc, id))
+            tree::root_child_named(document, self.node.id, "body").map(|id| JsNode::new(doc, id))
         })
     }
 
@@ -407,7 +472,7 @@ impl DocumentRef {
         let doc = self.node.doc;
         with_document(doc, |document| {
             document
-                .children(document.root())
+                .children(self.node.id)
                 .find(|child| tree::kind(document, *child) == Some(tree::Kind::Doctype))
                 .map(|id| JsNode::new(doc, id))
         })
@@ -418,7 +483,7 @@ impl DocumentRef {
     #[getter(name = "title")]
     fn js_title(&self) -> Result<String, JsError> {
         with_document(self.node.doc, |document| {
-            let title = tree::descendants(document, document.root())
+            let title = tree::descendants(document, self.node.id)
                 .into_iter()
                 .find(|id| {
                     document
@@ -441,7 +506,10 @@ impl DocumentRef {
     #[setter(name = "title")]
     fn js_set_title(&mut self, value: String) -> Result<(), JsError> {
         let doc = self.node.doc;
-        let head = with_document(doc, |document| tree::root_child_named(document, "head"))?;
+        let owner = self.node.id;
+        let head = with_document(doc, |document| {
+            tree::root_child_named(document, owner, "head")
+        })?;
         let Some(head) = head else {
             return Ok(());
         };
@@ -471,15 +539,23 @@ impl DocumentRef {
     }
 
     /// The cookies this document may read (HTML §3.1.4).
+    /// The page's cookies. A document script made has none, and keeps none
+    /// that are written to it (HTML §3.1.4 "cookie-averse").
     #[getter(name = "cookie")]
-    fn js_cookie(&self) -> String {
-        super::read_cookies()
+    fn js_cookie(&self) -> Result<String, JsError> {
+        Ok(if self.is_page()? {
+            super::read_cookies()
+        } else {
+            String::new()
+        })
     }
 
     /// Set one cookie, as a `Set-Cookie` line would (HTML §3.1.4).
     #[setter(name = "cookie")]
     fn js_set_cookie(&mut self, value: String) -> Result<(), JsError> {
-        super::write_cookie(&value);
+        if self.is_page()? {
+            super::write_cookie(&value);
+        }
         Ok(())
     }
 
@@ -504,12 +580,13 @@ impl DocumentRef {
     /// There is no `"interactive"`: the step it names is the one between the
     /// last byte and the subresources, and we do not run script in it yet.
     #[getter(name = "readyState")]
-    fn js_ready_state(&self) -> String {
-        if super::is_ready() {
+    fn js_ready_state(&self) -> Result<String, JsError> {
+        // A document script made is complete as soon as it exists.
+        Ok(if super::is_ready() || !self.is_page()? {
             "complete".to_owned()
         } else {
             "loading".to_owned()
-        }
+        })
     }
 
     /// Stop a mutation observer observing anything. Not part of the
@@ -704,8 +781,23 @@ impl DocumentRef {
         if !is_valid_element_name(&name) {
             return Err(invalid_name(&name));
         }
-        let local = LocalName::from(name.to_ascii_lowercase());
-        self.create_element(QualName::new(None, ns!(html), local))
+        // An XML document keeps the name as written, and gives it the XHTML
+        // namespace only if it is an XHTML document (DOM §4.5).
+        let kind = with_document(self.node.doc, |document| {
+            document.secondary_document(self.node.id).cloned()
+        })?;
+        let name = match kind {
+            Some(kind) if !kind.is_html() => {
+                let namespace = if kind.content_type == "application/xhtml+xml" {
+                    ns!(html)
+                } else {
+                    ns!()
+                };
+                QualName::new(None, namespace, LocalName::from(name))
+            }
+            _ => QualName::new(None, ns!(html), LocalName::from(name.to_ascii_lowercase())),
+        };
+        self.create_element(name)
     }
 
     /// An element in any namespace — SVG, above all, where a framework builds
@@ -770,46 +862,60 @@ impl DocumentRef {
                 mutator.shallow_clone(node.id)
             }
         })?;
-        copy.map(|copy| JsNode::new(self.node.doc, copy))
-            .ok_or_else(tree::gone)
+        let copy = copy.ok_or_else(tree::gone)?;
+        let owner = self.node.id;
+        with_document_mut(self.node.doc, |document| {
+            DocumentMutator::new(document).set_node_document(copy, owner);
+        })?;
+        Ok(JsNode::new(self.node.doc, copy))
     }
 
     /// Take `node` out of wherever it is, to be inserted elsewhere (DOM §4.5).
     #[method(name = "adoptNode", length = 1)]
     fn js_adopt_node(&self, node: NodeRef) -> Result<JsNode, JsError> {
         same_document(self.node.doc, &node)?;
-        if node.id == with_document(self.node.doc, otlyra_dom::Document::root)? {
+        if with_document(self.node.doc, |document| document.is_document(node.id))? {
             return Err(tree::exception(
                 "NotSupportedError",
                 "a document cannot be adopted",
             ));
         }
+        let owner = self.node.id;
         with_document_mut(self.node.doc, |document| {
-            DocumentMutator::new(document).detach(node.id);
+            let mut mutator = DocumentMutator::new(document);
+            mutator.detach(node.id);
+            mutator.set_node_document(node.id, owner);
         })?;
         Ok(JsNode::new(self.node.doc, node.id))
     }
 }
 
 impl DocumentRef {
+    /// Whether this is the page's document, rather than one script made.
+    fn is_page(&self) -> Result<bool, JsError> {
+        with_document(self.node.doc, |document| self.node.id == document.root())
+    }
+
     fn create(&self, data: NodeData) -> Result<JsNode, JsError> {
-        let doc = self.node.doc;
+        let (doc, owner) = (self.node.doc, self.node.id);
         with_document_mut(doc, |document| {
-            JsNode::new(doc, DocumentMutator::new(document).create(data))
+            let mut mutator = DocumentMutator::new(document);
+            let created = mutator.create(data);
+            mutator.set_node_document(created, owner);
+            JsNode::new(doc, created)
         })
     }
 
     fn create_element(&self, name: QualName) -> Result<JsNode, JsError> {
-        let doc = self.node.doc;
+        let (doc, owner) = (self.node.doc, self.node.id);
         // A `<template>` made by script has contents like a parsed one.
         let is_template = name.ns == ns!(html) && &*name.local == "template";
         with_document_mut(doc, |document| {
             let mut mutator = DocumentMutator::new(document);
             let contents = is_template.then(|| mutator.create(NodeData::Document));
-            JsNode::new(
-                doc,
-                mutator.create_element(name, Vec::new(), contents, false),
-            )
+            let created = mutator.create_element(name, Vec::new(), contents, false);
+            mutator.set_node_document(created, owner);
+            JsNode::new(doc, created)
         })
     }
 }

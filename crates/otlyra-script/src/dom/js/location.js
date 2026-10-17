@@ -83,10 +83,10 @@ Object.defineProperty(globalThis, 'location', {
 
 Object.defineProperty(Document.prototype, 'location', {
   get() {
-    return locationObject;
+    return isMadeDocument(this) ? null : locationObject;
   },
   set(next) {
-    nativeNavigate(String(next), false);
+    if (!isMadeDocument(this)) nativeNavigate(String(next), false);
   },
   enumerable: false,
   configurable: true,

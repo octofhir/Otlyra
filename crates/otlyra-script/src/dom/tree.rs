@@ -59,7 +59,7 @@ pub(crate) fn kind(document: &Document, id: NodeId) -> Option<Kind> {
         NodeData::Element(_) => Kind::Element,
         NodeData::Text(_) => Kind::Text,
         NodeData::Comment(_) => Kind::Comment,
-        NodeData::Document if id == document.root() => Kind::Document,
+        NodeData::Document if document.is_document(id) => Kind::Document,
         NodeData::Document => Kind::Fragment,
         NodeData::Doctype { .. } => Kind::Doctype,
     })
@@ -603,11 +603,11 @@ pub(crate) fn normalize(document: &mut Document, root: NodeId) {
     }
 }
 
-/// The document's `<html>` element's child named `name`, which is how `head`
-/// and `body` are found (HTML §3.1.4, ignoring `<frameset>`, which we do not
-/// lay out).
-pub(crate) fn root_child_named(document: &Document, name: &str) -> Option<NodeId> {
-    let root = document.first_element_child(document.root())?;
+/// The child named `name` of the `<html>` element of the document `owner`,
+/// which is how `head` and `body` are found (HTML §3.1.4, ignoring
+/// `<frameset>`, which we do not lay out).
+pub(crate) fn root_child_named(document: &Document, owner: NodeId, name: &str) -> Option<NodeId> {
+    let root = document.first_element_child(owner)?;
     document.children(root).find(|child| {
         document
             .get(*child)

@@ -32,6 +32,30 @@ impl<'a> DocumentMutator<'a> {
         self.document.nodes_mut().insert(Node::new(data))
     }
 
+    /// A new, empty document beside the page's (see [`crate::documents`]).
+    pub fn create_document(&mut self, kind: crate::SecondaryDocument) -> NodeId {
+        let node = self.create(NodeData::Document);
+        self.document.documents.kinds.insert(node, kind);
+        node
+    }
+
+    /// Say that the detached node `node` belongs to `owner`: the document that
+    /// made it, or that it was copied for.
+    pub fn set_node_document(&mut self, node: NodeId, owner: NodeId) {
+        if !self.document.documents.any() {
+            return;
+        }
+        if owner == self.document.root() {
+            self.document.documents.owners.remove(&node);
+        } else if self
+            .document
+            .get(node)
+            .is_some_and(|data| data.parent.is_none())
+        {
+            self.document.documents.owners.insert(node, owner);
+        }
+    }
+
     /// Attach a shadow root to `host` (DOM §4.2.14 "attach a shadow root"):
     /// a fragment the document keeps beside it, which the flat tree renders
     /// in place of its children. `None` when it already has one.
@@ -143,6 +167,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(child),
         }
         self.document.nodes_mut()[parent].last_child = Some(child);
+        self.now_in_a_tree(child);
         self.forget_cssom(parent);
         self.child_list(parent, &[child], &[], last, None);
         true
@@ -190,6 +215,7 @@ impl<'a> DocumentMutator<'a> {
             None => self.document.nodes_mut()[parent].first_child = Some(new_node),
         }
         self.document.nodes_mut()[sibling].prev_sibling = Some(new_node);
+        self.now_in_a_tree(new_node);
         self.forget_cssom(parent);
         self.child_list(parent, &[new_node], &[], previous, Some(sibling));
         true
@@ -212,8 +238,24 @@ impl<'a> DocumentMutator<'a> {
         self.insert_before(sibling, node);
     }
 
+    /// A node just given a parent: its document is its tree's from now on.
+    fn now_in_a_tree(&mut self, node: NodeId) {
+        if self.document.documents.any() {
+            self.document.documents.owners.remove(&node);
+        }
+    }
+
     /// Unlink `target` from its parent and siblings. Its own subtree is untouched.
+    ///
+    /// Taken out of a secondary document, it still belongs to it (DOM §4.2.3:
+    /// removing changes no node document), which is now remembered by it.
     pub fn detach(&mut self, target: NodeId) {
+        let owner = self
+            .document
+            .documents
+            .any()
+            .then(|| self.document.node_document(target))
+            .filter(|owner| *owner != self.document.root());
         let (parent, previous, next) = {
             let node = &mut self.document.nodes_mut()[target];
             (
@@ -223,6 +265,9 @@ impl<'a> DocumentMutator<'a> {
             )
         };
         let Some(parent) = parent else { return };
+        if let Some(owner) = owner {
+            self.document.documents.owners.insert(target, owner);
+        }
 
         match previous {
             Some(previous) => self.document.nodes_mut()[previous].next_sibling = next,
@@ -301,7 +346,21 @@ impl<'a> DocumentMutator<'a> {
         {
             element.template_contents = Some(self.create(NodeData::Document));
         }
-        Some(self.create(data))
+        let copy = self.create(data);
+        // A script's copy is started if it was (HTML §4.12.1.1 cloning steps):
+        // markup that was never to run does not run by being copied.
+        if self.document.started_scripts.contains(&source) {
+            self.document.started_scripts.insert(copy);
+        }
+        // A copy is of the original's document (DOM §4.5 "clone a node"), and
+        // a copy of a document is a document.
+        if let Some(kind) = self.document.secondary_document(source).cloned() {
+            self.document.documents.kinds.insert(copy, kind);
+        } else if self.document.documents.any() {
+            let owner = self.document.node_document(source);
+            self.set_node_document(copy, owner);
+        }
+        Some(copy)
     }
 
     /// A `<template>`'s contents fragment, if `id` is a template.

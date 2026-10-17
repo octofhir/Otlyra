@@ -3698,6 +3698,7 @@ dependencies = [
  "otter-runtime",
  "otter-syntax",
  "otter-web",
+ "roxmltree 0.21.1",
  "thiserror 2.0.19",
  "tracing",
  "url",

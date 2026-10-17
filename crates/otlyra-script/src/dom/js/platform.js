@@ -305,7 +305,7 @@ for (const [name, measure] of [
   });
 }
 accessor(HTMLElement.prototype, 'offsetParent', function () {
-  return this.isConnected && this !== document.body ? document.body : null;
+  return inPage(this) && this !== document.body ? document.body : null;
 });
 for (const [name, axis] of [['clientWidth', 0], ['clientHeight', 1]]) {
   accessor(Element.prototype, name, function () {
@@ -707,7 +707,7 @@ class IntersectionObserverImpl {
       bottom: rootRect.bottom + margin.bottom(height),
     };
     for (const [target, previous] of this.targets) {
-      const drawn = target.isConnected && target.__otlyraClientRect() !== null;
+      const drawn = inPage(target) && target.__otlyraClientRect() !== null;
       const rect = clientRectOf(target);
       const left = Math.max(rect.left, bounds.left);
       const top = Math.max(rect.top, bounds.top);

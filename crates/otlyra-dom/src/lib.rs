@@ -29,6 +29,7 @@
 //! 4. **Depth is bounded.** A document nested past the limit stops growing rather
 //!    than handing a stack overflow to the first recursive walk over it.
 
+pub mod documents;
 pub mod dump;
 pub mod form;
 pub mod limits;
@@ -41,6 +42,7 @@ pub mod submit;
 pub mod tree;
 pub mod xpath;
 
+pub use documents::SecondaryDocument;
 pub use form::{Control, FormState, InputKind};
 pub use limits::DomLimits;
 pub use mutator::DocumentMutator;

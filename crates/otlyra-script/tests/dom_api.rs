@@ -1043,3 +1043,66 @@ fn the_windows_own_attributes_are_accessors() {
 </script>"#);
     assert_all_ok(&lines, 3);
 }
+
+#[test]
+fn documents_script_makes_are_documents_of_their_own() {
+    let lines = run(r#"<title>Page</title><script>
+  const made = document.implementation.createHTMLDocument('Made');
+  check('a document', [made instanceof Document, made instanceof HTMLDocument, made.nodeType, made.nodeName], [true, true, 9, '#document']);
+  check('not the page', [made === document, made.ownerDocument, made.defaultView, made.URL, made.location], [false, null, null, 'about:blank', null]);
+  check('its own shape', [made.doctype.name, made.documentElement.localName, made.head.localName, made.body.localName, made.title], ['html', 'html', 'head', 'body', 'Made']);
+  check('the page keeps its title', document.title, 'Page');
+  check('its nodes are its own', [made.body.ownerDocument === made, made.createElement('p').ownerDocument === made, made.createTextNode('t').ownerDocument === made], [true, true, true]);
+  check('in it is connected to it', made.body.isConnected, true);
+  check('its own implementation', [made.implementation !== document.implementation, made.implementation.createDocumentType('x', '', '').ownerDocument === made], [true, true]);
+  made.cookie = 'stolen=1';
+  check('no cookies of its own, and none written to the page', [made.cookie, document.cookie.includes('stolen')], ['', false]);
+  check('complete as soon as made', made.readyState, 'complete');
+
+  const moved = made.createElement('b');
+  made.body.appendChild(moved);
+  check('found in it', made.querySelector('b') === moved && made.getElementsByTagName('b').length === 1, true);
+  document.body.appendChild(moved);
+  check('moved into the page, it is the page\'s', moved.ownerDocument === document, true);
+  moved.remove();
+  check('and stays the page\'s when taken out', moved.ownerDocument === document, true);
+  const kept = made.body.appendChild(made.createElement('i'));
+  kept.remove();
+  check('taken out of it, it stays its', kept.ownerDocument === made, true);
+  check('importNode copies for the page', document.importNode(kept, true).ownerDocument === document, true);
+  check('adoptNode takes it', document.adoptNode(kept).ownerDocument === document, true);
+
+  const script = made.createElement('script');
+  script.textContent = 'console.log("ran in a made document")';
+  made.body.appendChild(script);
+
+  const parsed = new DOMParser().parseFromString('<!doctype html><title>P</title><p id=a>one<script>console.log("ran from DOMParser")<\/script>', 'text/html');
+  check('parsed html', [parsed.doctype.name, parsed.title, parsed.getElementById('a').firstChild.data, parsed.body.children.length], ['html', 'P', 'one', 1]);
+  check('parsed into a document of its own', [parsed !== document, parsed.contentType, parsed.querySelector('p').ownerDocument === parsed], [true, 'text/html', true]);
+  document.body.appendChild(document.importNode(parsed.getElementById('a'), true));
+
+  const xml = new DOMParser().parseFromString('<?xml version="1.0"?><Root xmlns:a="urn:a"><Item n="1"/><a:Thing a:k="v">t</a:Thing></Root>', 'application/xml');
+  check('an XML document', [xml instanceof XMLDocument, xml.contentType, xml.documentElement.localName, xml.documentElement.namespaceURI], [true, 'application/xml', 'Root', null]);
+  const thing = xml.documentElement.lastChild;
+  check('names as written, namespaces as declared', [thing.prefix, thing.localName, thing.namespaceURI, thing.getAttributeNS('urn:a', 'k')], ['a', 'Thing', 'urn:a', 'v']);
+  check('case kept', [xml.getElementsByTagName('Item').length, xml.getElementsByTagName('item').length], [1, 0]);
+  const broken = new DOMParser().parseFromString('<a><b></a>', 'text/xml');
+  check('not well formed', broken.getElementsByTagName('parsererror').length, 1);
+  try { new DOMParser().parseFromString('', 'text/plain'); console.log('FAIL a bad type: did not throw'); }
+  catch (error) { check('a bad type', error instanceof TypeError, true); }
+
+  const created = document.implementation.createDocument(null, 'root', null);
+  const element = created.createElement('Mixed');
+  check('createDocument', [created instanceof XMLDocument, created.documentElement.localName, element.localName, element.namespaceURI], [true, 'root', 'Mixed', null]);
+
+  const written = document.implementation.createHTMLDocument('');
+  written.open();
+  written.write('<p id=w>hi');
+  check('readable before close', written.getElementById('w').textContent, 'hi');
+  written.write(' there</p>');
+  written.close();
+  check('written in parts', written.getElementById('w').textContent, 'hi there');
+  check('the page is not written to', [document.write('<i>no</i>'), document.title], [undefined, 'Page']);
+</script>"#);
+    assert_all_ok(&lines, 26);
+}

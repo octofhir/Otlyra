@@ -116,7 +116,7 @@ const upgrade = (element, definition) => {
       invoke(element, definition, 'attributeChangedCallback', [attribute, null, value, null]);
     }
   }
-  if (element.isConnected) connect(element, definition);
+  if (inPage(element)) connect(element, definition);
 };
 
 // The elements script attached shadow roots to, so the walks below can go
@@ -151,13 +151,13 @@ const settleInserted = (roots, wereConnected) => {
     for (const element of definedInside(root)) {
       const state = customState.get(element);
       if (state === undefined) {
-        if (element.isConnected) upgrade(element, definitions.get(element.localName));
+        if (inPage(element)) upgrade(element, definitions.get(element.localName));
         continue;
       }
       const definition = definitionOf(element);
       if (!definition) continue;
       if (wereConnected[index]) disconnect(element, definition);
-      if (element.isConnected) connect(element, definition);
+      if (inPage(element)) connect(element, definition);
     }
   });
 };
@@ -166,7 +166,7 @@ const settleInserted = (roots, wereConnected) => {
 const settleRemoved = (elements) => {
   for (const element of elements) {
     const definition = definitionOf(element);
-    if (definition && !element.isConnected) disconnect(element, definition);
+    if (definition && !inPage(element)) disconnect(element, definition);
   }
 };
 
@@ -193,7 +193,7 @@ const insertedRoots = (node) =>
 for (const name of ['appendChild', 'insertBefore']) {
   wrapNodeMethod(Node.prototype, name, function (native, args) {
     const roots = insertedRoots(args[0]);
-    const were = roots.map((root) => Boolean(root && root.isConnected));
+    const were = roots.map((root) => Boolean(root && inPage(root)));
     const result = native.apply(this, args);
     settleInserted(roots, were);
     return result;
@@ -202,7 +202,7 @@ for (const name of ['appendChild', 'insertBefore']) {
 
 wrapNodeMethod(Node.prototype, 'replaceChild', function (native, args) {
   const roots = insertedRoots(args[0]);
-  const were = roots.map((root) => Boolean(root && root.isConnected));
+  const were = roots.map((root) => Boolean(root && inPage(root)));
   const leaving = customInside(args[1]);
   const result = native.apply(this, args);
   settleRemoved(leaving);
@@ -228,6 +228,8 @@ wrapNodeMethod(Element.prototype, 'remove', function (native, args) {
 // element with the synchronous flag unset comes to when nothing is in the
 // way (DOM §4.5 "clone").
 const upgradeInside = (root) => {
+  // A document script made has no registry: nothing in it is custom.
+  if (!ofPage(root)) return;
   for (const element of definedInside(root)) {
     if (!customState.has(element)) upgrade(element, definitions.get(element.localName));
   }
@@ -302,11 +304,13 @@ const createDefined = (document, definition) => {
   }
 };
 wrapNodeMethod(Document.prototype, 'createElement', function (native, args) {
+  if (isMadeDocument(this)) return native.apply(this, args);
   const definition = definitions.get(String(args[0]).toLowerCase());
   if (!definition || definition.localName !== definition.name) return native.apply(this, args);
   return createDefined(this, definition);
 });
 wrapNodeMethod(Document.prototype, 'createElementNS', function (native, args) {
+  if (isMadeDocument(this)) return native.apply(this, args);
   const definition =
     args[0] === 'http://www.w3.org/1999/xhtml' ? definitions.get(String(args[1])) : undefined;
   if (!definition || definition.localName !== definition.name) return native.apply(this, args);

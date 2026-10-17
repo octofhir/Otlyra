@@ -204,7 +204,7 @@ defineGlobal('StyleSheet', CSSStyleSheet);
 // does not read (its text is the network's, not script's).
 const elementSheets = new WeakMap();
 const sheetOf = (element) => {
-  if (!element.isConnected) return null;
+  if (!inPage(element)) return null;
   const isStyle = element.localName === 'style';
   if (!isStyle) {
     const rel = (element.getAttribute('rel') || '').toLowerCase().split(/\s+/);

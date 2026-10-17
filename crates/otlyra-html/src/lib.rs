@@ -192,6 +192,17 @@ pub fn parse_fragment_for_element(html: &str, owner: &Document, context: NodeId)
     document
 }
 
+/// Parse a string as a whole document, the way `DOMParser` does: no encoding
+/// to find, a leading U+FEFF kept as text, scripting disabled and no scripts
+/// run.
+pub fn parse_document_string(html: &str, limits: otlyra_dom::DomLimits) -> Document {
+    let mut parser = HtmlParser::for_string(Document::with_limits(limits));
+    let mut document = parser.take_document();
+    parser.feed(&mut document, html.into());
+    parser.finish(&mut document);
+    document
+}
+
 /// Parse a complete byte stream into a document.
 ///
 /// `transport_charset` is the `charset` parameter of the response's `Content-Type`,
@@ -329,6 +340,28 @@ mod tests {
 
     fn tree(html: &str) -> String {
         dump::serialize(&parse(html.as_bytes(), Some("utf-8")).document)
+    }
+
+    /// A string is not a byte stream: its U+FEFF is text. And with scripting
+    /// disabled, `<noscript>` holds elements rather than text.
+    #[test]
+    fn a_string_is_parsed_as_a_document_without_a_byte_order_mark_or_scripting() {
+        let parsed = parse_document_string(
+            "\u{feff}<noscript><b>x</b></noscript>",
+            otlyra_dom::DomLimits::default(),
+        );
+        assert_eq!(
+            dump::serialize(&parsed),
+            "\
+| <html>
+|   <head>
+|   <body>
+|     \"\u{feff}\"
+|     <noscript>
+|       <b>
+|         \"x\"
+"
+        );
     }
 
     #[test]
