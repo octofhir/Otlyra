@@ -502,6 +502,13 @@ impl Lanes {
     }
 }
 
+/// The `Accept` of a document load: what every browser's navigation sends.
+const DOCUMENT_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+/// The reader's languages, as `navigator.languages` says them.
+const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+
 /// The handle the browser keeps on the fetch pool.
 pub struct Fetcher {
     /// Dropping the pool cancels its transport futures; native content also
@@ -710,6 +717,23 @@ impl Fetcher {
         headers: Vec<(String, String)>,
         context: RequestContext,
     ) -> u64 {
+        // What a browser says it accepts, unless the page said: a document
+        // load asks for markup the way every browser's navigation does, and
+        // every request names the reader's languages. A server that sees
+        // neither is talking to a script, and some answer one with a
+        // challenge page instead of the page.
+        let mut headers = headers;
+        let has = |headers: &[(String, String)], name: &str| {
+            headers
+                .iter()
+                .any(|(header, _)| header.eq_ignore_ascii_case(name))
+        };
+        if kind == ResourceKind::Document && !has(&headers, "accept") {
+            headers.push(("Accept".to_owned(), DOCUMENT_ACCEPT.to_owned()));
+        }
+        if !has(&headers, "accept-language") {
+            headers.push(("Accept-Language".to_owned(), ACCEPT_LANGUAGE.to_owned()));
+        }
         self.next += 1;
         let id = self.next;
         let method = if body.is_some() { "POST" } else { "GET" };

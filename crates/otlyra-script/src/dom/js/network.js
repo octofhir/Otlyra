@@ -90,12 +90,24 @@ const requestBody = (body, pairs) => {
     return body.toString();
   }
   if (typeof FormData === 'function' && body instanceof FormData) {
-    // Sent URL-encoded: a multipart body needs a boundary the native would
-    // have to write, and files are not sent from here yet.
-    const form = new URLSearchParams();
-    for (const [name, value] of body) form.append(name, typeof value === 'string' ? value : '');
-    if (!hasHeader(pairs, 'content-type')) pairs.push(['content-type', FORM_TYPE]);
-    return form.toString();
+    // multipart/form-data, as every browser sends a FormData (HTML §4.10.21.8);
+    // servers that read it as a form refuse anything else. A file's name and
+    // type go with it, and not yet its bytes, which only an asynchronous read
+    // of the Blob would give.
+    const boundary = '----OtlyraFormBoundary' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const escape = (text) => String(text).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+    let text = '';
+    for (const [name, value] of body) {
+      text += `--${boundary}\r\nContent-Disposition: form-data; name="${escape(name)}"`;
+      if (typeof value === 'string') {
+        text += `\r\n\r\n${value.replace(/\r?\n|\r/g, '\r\n')}\r\n`;
+      } else {
+        text += `; filename="${escape(value.name ?? 'blob')}"\r\nContent-Type: ${value.type || 'application/octet-stream'}\r\n\r\n\r\n`;
+      }
+    }
+    text += `--${boundary}--\r\n`;
+    if (!hasHeader(pairs, 'content-type')) pairs.push(['content-type', `multipart/form-data; boundary=${boundary}`]);
+    return text;
   }
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
     return new TextDecoder().decode(body);
