@@ -286,8 +286,17 @@ clicks and wheel events. What is left:
 - [x] `localStorage` kept in the profile beside the cookie file, under the
   same rule, written back off the thread; the `storage` event in an
   origin's other tabs.
-- [ ] A real `DOMParser` (a second document); IndexedDB that outlives the
-  run; sealing `local-storage.tsv` like the cookie file.
+- [x] Documents script makes are documents: `createHTMLDocument`,
+  `createDocument` and `DOMParser` (HTML from a string, XML through
+  roxmltree with names and namespaces as written, `<parsererror>` when not
+  well formed) answer with a document node of their own in the page's arena,
+  with node documents tracked for detached nodes, `open`/`write`/`close`,
+  no cookies, no window, no scripts and no pictures. Notion's consent
+  manager runs on them with no errors, so iframe and object
+  `contentWindow`/`contentDocument` are accessors again.
+- [ ] IndexedDB that outlives the run; sealing `local-storage.tsv` like the
+  cookie file; `document.write` into the page while it parses (today it does
+  nothing there).
 - [x] [Sixteen more sites](docs/browser-rendering-research.md#a-sweep-of-sixteen-more-sites):
   no Node `process` in pages, `delete`/`in` on every heap kind, linear
   regex name checks, `await` in async arrows in static blocks, hostless
@@ -311,10 +320,8 @@ clicks and wheel events. What is left:
   service workers, `MessageChannel`, transfer lists; cookies on sockets;
   generated content's `url()`; a hover that changes a `::before` restyles
   the whole page; a TLS handshake that does not mark a browser with a
-  normal User-Agent as a bot (Amazon's robot check); real secondary
-  documents from `createHTMLDocument`/`DOMParser`, after which iframe and
-  object `contentWindow`/`contentDocument` become accessors (Notion's
-  consent manager needs both).
+  normal User-Agent as a bot (Amazon's robot check); nested browsing
+  contexts, which give an iframe's `contentWindow`/`contentDocument` a value.
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of

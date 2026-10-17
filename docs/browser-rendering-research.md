@@ -1868,12 +1868,52 @@ The Verge now hydrates with no errors.
   the feed's own requests are the next thing to follow.
 - Notion: airgap stops at `contentWindow`'s data descriptor (above); the
   next step is a real Document from `createHTMLDocument`/`DOMParser`.
+  Done since: see [documents script makes](#documents-script-makes).
 - Otter: an error thrown inside a call through `Function.prototype.call.bind`
   is reported with the outer callee's name (`Wr is not a function` for a
   missing `lookupNamespaceURI`), and the arrow's own frame is missing.
 - Otter: `jit_exception_regions::stack_owned_nested_catch_routes_committed_getter_throw_once`
   fails with or without this run's VM changes (a JIT call-count assertion).
 - Amazon shows its robot check with the normal User-Agent (above).
+
+## Documents script makes
+
+`document.implementation.createHTMLDocument`, `createDocument` and
+`DOMParser` used to answer with an object shaped like a document over a
+detached `<html>` in the page's own tree. Natives refused it (it was not a
+node), so anything that called `Document.prototype` methods on it threw.
+Notion's consent manager does exactly that.
+
+Now each is a document node of its own in the page's arena, beside the
+page's root, the way a `<template>`'s contents already were
+(`otlyra-dom/src/documents.rs`):
+
+- **Which nodes are documents** is a map beside the arena; a node's *node
+  document* is the document at its tree's root, or, for a detached tree,
+  the one recorded on its root. The mutator records it where a tree is cut
+  off (`detach`), forgets it where one is attached, and copies it on clone.
+  A page that never makes a document keeps two empty maps.
+- **What renders, runs and loads** still asks `Document::is_connected`,
+  which is about the page's tree only, so nothing in a made document is
+  drawn, has its scripts run, its pictures fetched or its custom elements
+  constructed. Script's `isConnected` is true inside one, as in browsers;
+  the glue asks `inPage()` for the other question.
+- **Parsing**: HTML from a string through a document parser that keeps a
+  leading U+FEFF and disables scripting (`parse_document_string`); XML
+  through roxmltree (already in the graph through usvg), with prefixes,
+  namespaces and their declarations as written, and a `<parsererror>`
+  element for markup that is not well formed. Scripts in either are
+  already started, and stay so when copied into the page (the started flag
+  now travels with a clone, as HTML's cloning steps say).
+- **What a made document is not**: it has no cookies (reading gives `""`,
+  writing is dropped), no window, no location, its address is
+  `about:blank`, and it is `complete` at once. `open`/`write`/`close`
+  rebuild it from what was written so far. `document.write` on the page
+  does nothing yet.
+
+Notion now loads with no console errors, with iframe and object
+`contentWindow`/`contentDocument` back to accessors (still `null`: there are
+no nested browsing contexts).
 
 ## What the reference browsers do
 
