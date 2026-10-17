@@ -1915,6 +1915,70 @@ Notion now loads with no console errors, with iframe and object
 `contentWindow`/`contentDocument` back to accessors (still `null`: there are
 no nested browsing contexts).
 
+## Page load speed against Chrome
+
+Measured 2026-10-17 on the M-series laptop, warm caches on both sides, the
+machine otherwise quiet but not idle (so the numbers are for comparing, not
+for budgets). Chrome: headless, CDP, a fresh profile then two warm loads,
+Navigation and Paint Timing read from the page. Otlyra: `--screenshot`, the
+`page.timing` line every load now logs (`arrived_ms` document bytes,
+`built_ms` first shown, `everything_ms` every subresource in, then how long
+the deferred scripts, the `load` event and the settle budget took), plus a
+Time Profiler trace split by crate.
+
+| ms, warm | Chrome FCP | Chrome load | Otlyra first shown | Otlyra load done | Otlyra process |
+|---|---|---|---|---|---|
+| github.com | 200–230 | 325–365 | 430–480 | 2050–2300 | 3.0–4.9 s |
+| apple.com | 110 | 250 | 375 | 1120–1560 | 2.8–5.3 s |
+| bbc.com | 180–250 | 1370–1480 | 270–310 | 800–1100 | 2.6–2.9 s |
+| theverge.com | 80–145 | 570–1500 | 260–430 | 2200–2400 | 4.1–5.4 s |
+| youtube.com | 320–480 | 880–1240 | 400–450 | 830–3500 | 1.0–4.0 s |
+
+Where the CPU goes during an Otlyra load (main thread almost all of it):
+
+| share of samples | Otter | stylo | text | layout | paint | net |
+|---|---|---|---|---|---|---|
+| The Verge (5.5 s) | 61% | 5.5% | 7% | 1.5% | 2% | 3% |
+| GitHub (3.2 s) | 49% | 16% | 10% | 2% | 8% | 4% |
+| BBC (2.9 s) | 54% | 3% | 15% | 3% | 8% | 4% |
+| YouTube (3.4 s) | 47% | 20% | 0% | 0% | 1% | 5% |
+| Apple (2.2 s) | 17% | 27% | 23% | 6% | 2% | 4% |
+
+So both, by site: script-heavy pages are mostly Otter, Apple is mostly
+style and text. What was found, in order of size:
+
+- **Otter: a code census on every turn** (fixed, Otter `5d4a17350`). Past
+  16 MiB of live `eval`/`import()` code, each run entry did a full
+  collection and walked the whole heap, freeing nothing: 650 ms of The
+  Verge. A census now waits until the retained code has grown by half.
+- **Otter: compiling is eager and slow.** GitHub spends 830 ms in the
+  parser and compiler (672 ms of it the bytecode compiler: several AST
+  walks, many small allocations, a SipHash map); The Verge 580 ms. Chrome
+  pre-parses inner functions and compiles them on first call, and on a warm
+  load takes bytecode from its code cache. Both are Otter work: lazy
+  function compilation, and a bytecode cache the browser keeps by script.
+- **Otter: per-turn bookkeeping proportional to all code.** Every run
+  gathered execution statistics by walking every function's inline caches
+  (90 ms of YouTube; off for the browser now, Otter `bda926bac`), and every
+  exit from compiled code reconciles feedback over every entry cell
+  (`take_generated_feedback`, 64 ms of The Verge; still open).
+- **Browser: every event, timer and observer is a compiled script.**
+  `run_classic_script("__otlyraX(…)")` parses, compiles and links a new
+  chunk per dispatch. A call API on a held function would remove that.
+- **Browser: style, layout and text are redone whole.** After The Verge
+  loads, script reads geometry about seven times and each read restyles the
+  whole page (25–30 ms) and lays it out again (75–90 ms), shaping every
+  paragraph again; Apple spends half its CPU in stylo and text. Incremental
+  restyle and layout, and keeping shaped text across layouts, are the work.
+- **Browser: GitHub's late modules** are `import()`ed chunks its running
+  code asks for, so they wait for the compile above. `modulepreload` links
+  are now fetched with the module entries (86 on GitHub's home page);
+  that did not move GitHub's numbers, because the graph was not what it
+  waited on.
+
+The page's own network time is small on a warm load: GitHub's 151
+subresources came from the disk cache within 0.2 s.
+
 ## What the reference browsers do
 
 ### Chromium

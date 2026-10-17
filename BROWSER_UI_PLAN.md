@@ -425,6 +425,27 @@ tree for an unrelated visual change.
 **Exit:** every popup uses one event/focus/semantics contract and can leave the
 browser window when required.
 
+## Page load speed
+
+Measured against Chrome on five sites (see [the comparison](docs/browser-rendering-research.md#page-load-speed-against-chrome)):
+a warm load finishes 2–6 times later than Chrome's. Every load logs a
+`page.timing` line with its stages.
+
+- [x] Otter: no code census on every turn past the code high-water mark
+  (Otter `5d4a17350`; The Verge −24% end to end).
+- [x] Otter: execution statistics off for the browser's runtimes (Otter
+  `bda926bac`).
+- [x] `<link rel=modulepreload>` fetched with the module entries.
+- [ ] Otter: lazy function compilation, and a bytecode cache the browser
+  keeps per script (GitHub spends 830 ms parsing and compiling).
+- [ ] Otter: reconcile JIT feedback only for entry cells that ran
+  (`take_generated_feedback` walks all of them per exit).
+- [ ] Dispatch events, timers and observers by calling held functions, not
+  by compiling `__otlyraX(…)` source for each.
+- [ ] Incremental restyle and layout after script changes, and shaped text
+  kept across layouts (The Verge relays out its whole page seven times
+  after load).
+
 ## Next large feature — not chosen yet
 
 The two the last one was picked over, either of which is the obvious next:
