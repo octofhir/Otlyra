@@ -1007,7 +1007,13 @@ impl Builder<'_> {
                 image: self.images.get(&node).map(|picture| picture.data.clone()),
                 intrinsic: Some(canvas_size(element)),
             }),
-            (&ns!(html), "iframe") => Some(Replaced::EMPTY),
+            // What its document drew, once there is a drawing: the frame's own
+            // size is its attributes' or the default object size, never the
+            // drawing's, which was made to fit it.
+            (&ns!(html), "iframe") => Some(Replaced {
+                image: self.images.get(&node).map(|picture| picture.data.clone()),
+                ..Replaced::EMPTY
+            }),
             // A plug-in, or the picture it turned out to be. One with no `src`
             // represents nothing (§4.8.6), and both references give it no box.
             (&ns!(html), "embed") if element.address("src").is_some() => {

@@ -2,7 +2,9 @@
 //! (§15.4) at the size their attributes, their content and the default object
 //! size give them, and the fallback inside them shown only where HTML says.
 
-use super::tests::{boxes_of, image_rect, laid_out, laid_out_with_image, picture, rect_of};
+use super::tests::{
+    boxes_of, image_rect, laid_out, laid_out_with_image, laid_out_with_pictures, picture, rect_of,
+};
 use crate::{FragmentKind, FragmentTree};
 
 /// A border box's width and height.
@@ -48,6 +50,39 @@ fn a_frame_is_the_default_object_size_unless_its_attributes_say_otherwise() {
     assert_eq!(
         size_of("<iframe frameborder=-1></iframe>", "iframe"),
         (304.0, 154.0)
+    );
+}
+
+/// A frame shows what its document drew in its content box, and keeps the
+/// size its attributes give it whatever the drawing's own size is.
+#[test]
+fn a_frame_shows_its_drawing_at_its_own_size() {
+    let (tree, boxes) = laid_out_with_pictures(
+        "<body style='margin: 0'><iframe src=a.html width=200 height=100></iframe>",
+        800.0,
+        picture(400, 200),
+        |document| {
+            let mut frames = Vec::new();
+            let mut stack = vec![document.root()];
+            while let Some(node) = stack.pop() {
+                if document
+                    .get(node)
+                    .and_then(|dom| dom.element())
+                    .is_some_and(|element| &*element.name.local == "iframe")
+                {
+                    frames.push(node);
+                }
+                stack.extend(document.children(node));
+            }
+            frames
+        },
+    );
+    let frame = rect_of(&tree, &boxes, "iframe");
+    assert_eq!((frame.width, frame.height), (204.0, 104.0));
+    let drawing = image_rect(&tree);
+    assert_eq!(
+        (drawing.x, drawing.y, drawing.width, drawing.height),
+        (2.0, 2.0, 200.0, 100.0)
     );
 }
 

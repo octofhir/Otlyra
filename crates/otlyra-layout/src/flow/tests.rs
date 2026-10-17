@@ -497,6 +497,21 @@ pub(super) fn laid_out_with_image(
     width: f32,
     image: otlyra_gfx::peniko::ImageData,
 ) -> (FragmentTree, BoxTree) {
+    laid_out_with_pictures(html, width, image, |document| {
+        crate::image_sources(document, StyleViewport::default())
+            .into_iter()
+            .map(|source| source.node)
+            .collect()
+    })
+}
+
+/// The same, giving `image` to the elements `holders` picks.
+pub(super) fn laid_out_with_pictures(
+    html: &str,
+    width: f32,
+    image: otlyra_gfx::peniko::ImageData,
+    holders: impl FnOnce(&otlyra_dom::Document) -> Vec<otlyra_dom::NodeId>,
+) -> (FragmentTree, BoxTree) {
     let document = otlyra_html::parse(html.as_bytes(), Some("utf-8")).document;
     let styles = style_document(
         &document,
@@ -508,9 +523,9 @@ pub(super) fn laid_out_with_image(
             color_scheme: Default::default(),
         },
     );
-    let images: crate::Images = crate::image_sources(&document, StyleViewport::default())
+    let images: crate::Images = holders(&document)
         .into_iter()
-        .map(|source| (source.node, crate::Picture::new(image.clone())))
+        .map(|node| (node, crate::Picture::new(image.clone())))
         .collect();
     let mut boxes = crate::build_box_tree_with_images(&document, &styles, &images);
     let mut text = otlyra_text::TextEngine::isolated();
