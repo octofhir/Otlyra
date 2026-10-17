@@ -1673,6 +1673,138 @@ Still open from the sweep:
 - Workers have no runtime here, so Twitch's `new Worker` throws.
 - `matchMedia` does not see the browser's dark mode yet.
 
+## Canvas, workers, sockets, and what CNN, Notion and The Verge were missing
+
+A run of 2026-10-17 (Otlyra `e7cfe65`..; Otter `beb5ac2b8`..). It began by
+loading CNN, Notion and The Verge again and looking at the pictures, not
+only the logs.
+
+### What the pictures showed
+
+1. **`::before` and `::after` were not there at all.** Neither the cascade
+   nor the box tree knew about generated content, so every separator,
+   icon, clearfix and aspect-ratio box built with one was missing. CNN's
+   pictures sit in boxes sized by a `::before`, so its home page had none;
+   The Verge's navigation had no `/` between its links. The cascade now
+   resolves the two eager pseudo-elements with their element
+   (`resolve_style` rather than `resolve_primary_style`), and the builder
+   puts their boxes first and last in the element, with text from strings,
+   `attr()` and quotes. `<q>` is quoted by the user-agent sheet. A hover
+   that changes one restyles the whole page.
+2. **An absolutely positioned box split the line it was in.** Stylo
+   blockifies `position: absolute`, and the anonymous-box fixup treated the
+   box as block-level: the line broke around it, an inline parent was made a
+   block, and the box's static position was its containing block's left
+   edge. Out-of-flow boxes now split nothing; in a line they are placed
+   from a zero-width spacer where the shaper put them, and one that was a
+   block before blockification (`ComputedStyle::was_inline`) goes below the
+   run. A box placed by `bottom` in a containing block of `auto` height is
+   moved once that height is known.
+3. **`:has()` was off in the cascade.** Apple's buttons sit side by side
+   only under `.tile-ctas:has(:nth-child(2))`. It is on now; a whole
+   restyle follows every tree change anyway, and a `:has()` that reads
+   hover, focus or form state turns the in-place interaction restyle off.
+
+### New platform
+
+- **Canvas 2D** (`otlyra-gfx/src/canvas2d.rs`, `otlyra-script/src/dom/canvas.rs`,
+  `canvas.js`): a Skia raster bitmap per `<canvas>`, one native call per
+  operation. Paths are kept in device pixels, transformed as each point is
+  added, as the specification defines them. Fill and stroke, colours,
+  linear and radial gradients, dashes, clip, transforms, save/restore,
+  alpha and composite operations, text, `drawImage` from pictures and
+  canvases, image data, PNG data URLs, `isPointInPath`. After a turn the
+  page takes a copy of each changed bitmap and shows it as the canvas's
+  replaced content. Stripe loads with no errors. Shadows, filters, patterns
+  and conic gradients are kept and read back but not drawn.
+- **Dedicated workers** (`otlyra-script/src/worker.rs`): an Otter runtime on
+  a thread of its own per worker, with Otter's web APIs, a timer wheel and
+  no DOM. Messages cross as structured-clone text (`clone.js`, both sides).
+  The worker's script, `importScripts`, module graph and `fetch` are page
+  requests through the browser's `Fetcher`; the worker's thread waits for
+  them and the content thread never does. Twitch loads with no errors.
+- **WebSocket and EventSource** (`otlyra-net/src/socket.rs`): a thread per
+  connection, tungstenite over TCP or rustls with the system trust store,
+  and an HTTP/1.1 event stream with chunked bodies, `retry` and
+  `Last-Event-ID`. What a connection reports wakes the content thread and is
+  fired between turns. No cookies on these connections yet.
+- **`prefers-color-scheme` in `matchMedia`**, with `change` when the system
+  appearance or the preference changes.
+- **`localStorage` in the profile** (`local-storage.tsv`, beside the cookie
+  file, under the same rule), written back at most once a second off the
+  thread, and **`storage` events** in an origin's other tabs from a change
+  log in the area.
+- **A User-Agent servers know**: the Chrome-compatible string with an
+  `Otlyra/` token, the same in the network layer, sockets, `navigator` and
+  workers. It was `Otlyra/0.0.0`, and `navigator.userAgent` was the engine's.
+
+### The Verge's hydration
+
+React logged #418, #423 and #425 on every load; Chrome logs none. The way
+to the cause was to compare the text of the page after hydration with
+Chrome's, then substitute an instrumented copy of React's chunk (a local
+diagnostic build that read one script from disk) that printed both sides
+of each mismatch. Three things in turn:
+
+1. **`JSON.parse` corrupted a string whose first escape came after a
+   non-ASCII character** (Otter `9b72bdb8f`): the slow path seeded its
+   UTF-16 buffer with the prefix bytes cast one to one, so `"— <"` came
+   back as `"â\u0080\u0094 <"`. Next.js props are JSON full of `<`;
+   every paragraph with a dash or a curly quote mismatched.
+2. **`TextDecoder` had no streaming mode** (Otter `2977341e8`): a character
+   split across two `decode(…, {stream: true})` calls became replacement
+   characters, and a byte order mark was stripped from every chunk.
+3. **Markup set from script lost a leading U+FEFF**: html5ever's tokenizer
+   discards a byte order mark by default, and a fragment is a string, not
+   bytes. `innerHTML`/`DOMParser` now keep it, and the server's text and
+   the client's match.
+
+The Verge now hydrates with no errors.
+
+### Also found on the way
+
+- **Requests a page made while it loaded were dropped** if their answers
+  came after the load finished: the finished load gave the tab a new
+  generation and treated the old one's answers as a stale page's. An
+  `XMLHttpRequest` beside an `import()` stayed in `OPENED` most of the time.
+  The same document's requests are now carried over.
+- **A private method heading an optional chain lost its receiver** in Otter
+  (`beb5ac2b8`): `this.#m(x)?.[0]` called `#m` with `this` undefined.
+- `img.width` answers the rendered size, else the attribute, else the
+  natural size; three.js measured a loaded `new Image()` as 0×0.
+- **Notion's consent manager keeps pristine copies of the platform's
+  getters** (`Object.getOwnPropertyDescriptor(X.prototype, name).get`) and
+  stopped on each one that was an own data property or missing:
+  `navigator`'s attributes are now accessors on `Navigator.prototype`
+  (with `vendor` "Google Inc." to match the user agent, and
+  `navigator.storage`), `length` is an accessor on the list prototypes,
+  `XMLHttpRequest.prototype.responseType` is one, User Timing lives on
+  `Performance.prototype`, and `ValidityState`,
+  `SecurityPolicyViolationEvent` and six more event interfaces exist. It
+  still logs one error (a `push` onto a frozen array, with no stack).
+- Otter: the async-module ancestor test now passes (heap exhaustion there
+  leaves the turn, `6921b7c5b`); the Blob heap-cap test expected the
+  `TypeError` the marshal boundary used to flatten out-of-memory into, and
+  now expects the canonical `RangeError` (`ed2d8105f`).
+
+### Still open
+
+- BBC: placeholders stay over some pictures; the pictures themselves now
+  draw (no more `alt` text).
+- YouTube search: `ytd-two-column-search-results-renderer` keeps the
+  `hidden` attribute its framework set; what should clear it is not found.
+- Cookies on WebSocket and EventSource; IndexedDB on disk.
+- Canvas: shadows, filters, patterns, conic gradients, `OffscreenCanvas`,
+  WebGL. A canvas frame rebuilds the box tree (no paint-only path yet).
+- Workers: shared and service workers, `MessageChannel`, transfer lists
+  (buffers are copied).
+- Otter: `wasm_catchable_host_class_and_getter_throw_keep_their_original_causes`
+  still fails: an object thrown by an import object's getter reaches the
+  page as another object (its identity is lost between the native boundary
+  and the rethrow; a moving collection is the suspect). `jit_module_ops`
+  fails at HEAD too, before this run's changes.
+- CNN's detectIncognito still cannot tell the browser apart.
+
 ## What the reference browsers do
 
 ### Chromium

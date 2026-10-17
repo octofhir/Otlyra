@@ -283,8 +283,11 @@ clicks and wheel events. What is left:
 - [x] `localStorage` shared by an origin's documents in every tab and
   `sessionStorage` per tab, with the quota and named-property access;
   cleared with the site's cookies.
-- [ ] A real `DOMParser` (a second document); `localStorage` and IndexedDB
-  that outlive the run (sealed like the cookie file); the `storage` event.
+- [x] `localStorage` kept in the profile beside the cookie file, under the
+  same rule, written back off the thread; the `storage` event in an
+  origin's other tabs.
+- [ ] A real `DOMParser` (a second document); IndexedDB that outlives the
+  run; sealing `local-storage.tsv` like the cookie file.
 - [x] [Sixteen more sites](docs/browser-rendering-research.md#a-sweep-of-sixteen-more-sites):
   no Node `process` in pages, `delete`/`in` on every heap kind, linear
   regex name checks, `await` in async arrows in static blocks, hostless
@@ -294,9 +297,20 @@ clicks and wheel events. What is left:
   `elementFromPoint(s)`, `XMLSerializer`, `FileReader`, `FontFace`,
   `StorageEvent`, failing `WebSocket`/`EventSource`, named
   `attributes[...]`, AES-CBC/CTR (Otter).
-- [ ] Sweep follow-ups: a canvas 2D backend (Stripe), workers (Twitch),
-  The Verge's hydration mismatches, real WebSocket/EventSource, dark mode
-  in `matchMedia`.
+- [x] [Sweep follow-ups](docs/browser-rendering-research.md#canvas-workers-sockets-and-what-cnn-notion-and-the-verge-were-missing):
+  a Skia canvas 2D backend (Stripe), dedicated workers on threads of their
+  own with structured clone and the browser's network (Twitch), real
+  WebSocket and EventSource on threads of their own, `prefers-color-scheme`
+  in `matchMedia` with `change`, a Chrome-compatible User-Agent, and The
+  Verge's hydration (Otter `JSON.parse` and streaming `TextDecoder`, a
+  leading U+FEFF kept by fragment parsing). `::before`/`::after`,
+  positioned boxes that stay in their line, `:has()` in the cascade.
+  Requests made during a load are answered after it.
+- [ ] Their follow-ups: canvas shadows, filters, patterns, conic gradients,
+  `OffscreenCanvas`, WebGL, a paint-only path for canvas frames; shared and
+  service workers, `MessageChannel`, transfer lists; cookies on sockets;
+  generated content's `counter()` and `url()`; a hover that changes a
+  `::before` restyles the whole page.
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of
@@ -321,7 +335,8 @@ clicks and wheel events. What is left:
   makes one, flex and grid items lifted by `position: relative`/`z-index`,
   absolute boxes stretched between `top` and `bottom`, `complete`/
   `currentSrc` for picked pictures.
-- [ ] YouTube follow-ups: search results stay hidden, web fonts in the
+- [ ] YouTube follow-ups: search results stay hidden (the renderer keeps a
+  `hidden` its framework set), web fonts in the
   script layout, SVG pictures rasterized at device density (masks and
   backgrounds blur on HiDPI), gradient masks, and the optimizing tier's
   re-run of a call in a constructing record (Otter).
