@@ -781,7 +781,7 @@ class Range {
     template.innerHTML = String(markup);
     const fragment = document.createDocumentFragment();
     const content = template.content || template;
-    while (content.firstChild) fragment.appendChild(content.firstChild);
+    while (content.firstChild) callTree('appendChild', fragment, content.firstChild);
     return fragment;
   }
   getBoundingClientRect() {
@@ -1361,12 +1361,12 @@ const emptyHtmlDocument = (title) => {
   const root = document.createElement('html');
   const head = document.createElement('head');
   const body = document.createElement('body');
-  root.appendChild(head);
-  root.appendChild(body);
+  callTree('appendChild', root, head);
+  callTree('appendChild', root, body);
   if (title !== undefined) {
     const element = document.createElement('title');
     element.textContent = String(title);
-    head.appendChild(element);
+    callTree('appendChild', head, element);
   }
   return parsedDocument(root, head, body, 'text/html');
 };
@@ -1397,14 +1397,14 @@ class DOMParser {
       const holder = document.createElement('div');
       holder.innerHTML = source.replace(/^\s*<\?xml[^>]*\?>/, '');
       const root = holder.firstElementChild || holder;
-      if (root.parentNode === holder) holder.removeChild(root);
+      if (root.parentNode === holder) callTree('removeChild', holder, root);
       return parsedDocument(root, null, null, kind);
     }
     const root = document.createElement('html');
     const head = document.createElement('head');
     const body = document.createElement('body');
-    root.appendChild(head);
-    root.appendChild(body);
+    callTree('appendChild', root, head);
+    callTree('appendChild', root, body);
     const headPart = /<head[^>]*>([\s\S]*?)<\/head>/i.exec(source);
     const bodyPart = /<body[^>]*>([\s\S]*?)(?:<\/body>|$)/i.exec(source);
     if (headPart) head.innerHTML = headPart[1];

@@ -91,22 +91,22 @@ const convertNodes = (context, nodes) => {
   const asNode = (value) => (value instanceof Node ? value : owner.createTextNode(String(value)));
   if (nodes.length === 1) return asNode(nodes[0]);
   const fragment = owner.createDocumentFragment();
-  for (const node of nodes) fragment.appendChild(asNode(node));
+  for (const node of nodes) callTree('appendChild', fragment, asNode(node));
   return fragment;
 };
 
 // ParentNode (DOM §4.2.6), on the three kinds of node that have children.
 const PARENT_NODE = {
   prepend(...nodes) {
-    this.insertBefore(convertNodes(this, nodes), this.firstChild);
+    callTree('insertBefore', this, convertNodes(this, nodes), this.firstChild);
   },
   append(...nodes) {
-    this.appendChild(convertNodes(this, nodes));
+    callTree('appendChild', this, convertNodes(this, nodes));
   },
   replaceChildren(...nodes) {
     const node = convertNodes(this, nodes);
-    while (this.firstChild) this.removeChild(this.firstChild);
-    this.appendChild(node);
+    while (this.firstChild) callTree('removeChild', this, this.firstChild);
+    callTree('appendChild', this, node);
   },
 };
 
@@ -120,14 +120,14 @@ const CHILD_NODE = {
     let previous = this.previousSibling;
     while (previous && nodes.indexOf(previous) !== -1) previous = previous.previousSibling;
     const node = convertNodes(this, nodes);
-    parent.insertBefore(node, previous ? previous.nextSibling : parent.firstChild);
+    callTree('insertBefore', parent, node, previous ? previous.nextSibling : parent.firstChild);
   },
   after(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
     let next = this.nextSibling;
     while (next && nodes.indexOf(next) !== -1) next = next.nextSibling;
-    parent.insertBefore(convertNodes(this, nodes), next);
+    callTree('insertBefore', parent, convertNodes(this, nodes), next);
   },
   replaceWith(...nodes) {
     const parent = this.parentNode;
@@ -135,12 +135,12 @@ const CHILD_NODE = {
     let next = this.nextSibling;
     while (next && nodes.indexOf(next) !== -1) next = next.nextSibling;
     const node = convertNodes(this, nodes);
-    if (this.parentNode === parent) parent.replaceChild(node, this);
-    else parent.insertBefore(node, next);
+    if (this.parentNode === parent) callTree('replaceChild', parent, node, this);
+    else callTree('insertBefore', parent, node, next);
   },
   remove() {
     const parent = this.parentNode;
-    if (parent) parent.removeChild(this);
+    if (parent) callTree('removeChild', parent, this);
   },
 };
 
@@ -171,17 +171,17 @@ const insertAdjacent = (element, where, node) => {
   switch (String(where).toLowerCase()) {
     case 'beforebegin':
       if (!element.parentNode) return null;
-      element.parentNode.insertBefore(node, element);
+      callTree('insertBefore', element.parentNode, node, element);
       return node;
     case 'afterbegin':
-      element.insertBefore(node, element.firstChild);
+      callTree('insertBefore', element, node, element.firstChild);
       return node;
     case 'beforeend':
-      element.appendChild(node);
+      callTree('appendChild', element, node);
       return node;
     case 'afterend':
       if (!element.parentNode) return null;
-      element.parentNode.insertBefore(node, element.nextSibling);
+      callTree('insertBefore', element.parentNode, node, element.nextSibling);
       return node;
     default:
       throw new DOMException("'" + where + "' is not a place next to an element", 'SyntaxError');
@@ -322,3 +322,57 @@ for (const name of Object.keys(Object.getOwnPropertyDescriptors(DOCUMENT))) {
     Object.assign(Object.getOwnPropertyDescriptor(DOCUMENT, name), { enumerable: true }),
   );
 }
+
+// Namespace lookup (DOM §4.4 "locate a namespace" and "locate a namespace
+// prefix"): an element's own namespace and prefix first, then its `xmlns`
+// declarations, then its parent's.
+const XML_NAMESPACE = 'http://www.w3.org/XML/1998/namespace';
+const XMLNS_NAMESPACE = 'http://www.w3.org/2000/xmlns/';
+const namespaceHolder = (node) => {
+  switch (node.nodeType) {
+    case Node.ELEMENT_NODE:
+      return node;
+    case Node.DOCUMENT_NODE:
+      return node.documentElement;
+    case Node.DOCUMENT_TYPE_NODE:
+    case Node.DOCUMENT_FRAGMENT_NODE:
+      return null;
+    case Node.ATTRIBUTE_NODE:
+      return node.ownerElement;
+    default:
+      return node.parentElement;
+  }
+};
+const locateNamespace = (node, prefix) => {
+  for (let element = namespaceHolder(node); element; element = element.parentElement) {
+    if (prefix === 'xml') return XML_NAMESPACE;
+    if (prefix === 'xmlns') return XMLNS_NAMESPACE;
+    if (element.namespaceURI !== null && (element.prefix || null) === prefix) return element.namespaceURI;
+    for (const attribute of element.attributes) {
+      if (prefix === null ? attribute.name === 'xmlns' : attribute.name === 'xmlns:' + prefix) {
+        return attribute.value || null;
+      }
+    }
+  }
+  return null;
+};
+const locatePrefix = (node, namespace) => {
+  for (let element = namespaceHolder(node); element; element = element.parentElement) {
+    if (element.namespaceURI === namespace && element.prefix) return element.prefix;
+    for (const attribute of element.attributes) {
+      if (attribute.name.startsWith('xmlns:') && attribute.value === namespace) return attribute.name.slice(6);
+    }
+  }
+  return null;
+};
+method(Node.prototype, 'lookupNamespaceURI', function lookupNamespaceURI(prefix) {
+  return locateNamespace(this, prefix === undefined || prefix === null || prefix === '' ? null : String(prefix));
+});
+method(Node.prototype, 'lookupPrefix', function lookupPrefix(namespace) {
+  if (namespace === undefined || namespace === null || namespace === '') return null;
+  return locatePrefix(this, String(namespace));
+});
+method(Node.prototype, 'isDefaultNamespace', function isDefaultNamespace(namespace) {
+  const wanted = namespace === undefined || namespace === null || namespace === '' ? null : String(namespace);
+  return locateNamespace(this, null) === wanted;
+});

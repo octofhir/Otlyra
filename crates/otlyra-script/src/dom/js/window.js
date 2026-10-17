@@ -1,15 +1,27 @@
 // `window` is the global object, and everything a page uses to say "the window
 // I am in" is the same object. A page in no frame is its own top, has no opener
 // and holds no frames.
-defineGlobal('window', globalThis);
-defineGlobal('self', globalThis);
-defineGlobal('top', globalThis);
-defineGlobal('parent', globalThis);
-defineGlobal('frames', globalThis);
-define(globalThis, 'opener', null);
-define(globalThis, 'frameElement', null);
-define(globalThis, 'closed', false);
-define(globalThis, 'name', '');
+// They are the window's own accessors, as WebIDL makes them: code that keeps
+// `Object.getOwnPropertyDescriptor(window, 'closed').get` to call later finds
+// a getter. `self`, `frames` and `parent` are [Replaceable]: assigning one
+// replaces it with a plain value.
+const windowAttribute = (name, get, set) => {
+  Object.defineProperty(globalThis, name, { get, set, enumerable: true, configurable: true });
+};
+const replaceable = (name) => function (value) {
+  Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+};
+windowAttribute('window', function window() { return globalThis; });
+windowAttribute('top', function top() { return globalThis; });
+for (const name of ['self', 'frames', 'parent']) {
+  windowAttribute(name, { [name]() { return globalThis; } }[name], replaceable(name));
+}
+windowAttribute('frameElement', function frameElement() { return null; });
+windowAttribute('closed', function closed() { return false; });
+let windowOpener = null;
+windowAttribute('opener', function opener() { return windowOpener; }, function opener(value) { windowOpener = value; });
+let windowName = '';
+windowAttribute('name', function name() { return windowName; }, function name(value) { windowName = String(value); });
 
 // Page turns use the browser's monotonic clock. Bare ScriptHost embedders
 // without a document loan retain the engine's fallback performance clock.

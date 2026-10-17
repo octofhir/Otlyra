@@ -52,6 +52,34 @@ const accessor = (object, name, get, set) => {
   });
 };
 
+// The tree's mutation methods as the glue leaves them, custom element
+// reactions and script insertion included, captured by `seal.js` once every
+// file has wrapped them. The glue's own DOM methods change the tree through
+// these and never through what a page has since put on `Node.prototype`:
+// `el.after(x)` in a browser does not call a page's `insertBefore`, and a
+// consent manager that patches it would hear its own half-built hook.
+const treeOps = {};
+const callTree = (name, target, ...args) => treeOps[name].apply(target, args);
+
+// An attribute this engine has no state behind: a getter that always answers
+// `value`, as WebIDL makes even a read-only attribute an accessor — code that
+// wraps `Object.getOwnPropertyDescriptor(X.prototype, name).get` finds one.
+const readonly = (object, name, value) => {
+  accessor(object, name, { [name]() { return value; } }[name], undefined);
+};
+
+// A writable attribute with nothing behind it but what was last written:
+// `initial` until then, per object.
+const stored = (object, name, initial) => {
+  const values = new WeakMap();
+  accessor(
+    object,
+    name,
+    { [name]() { return values.has(this) ? values.get(this) : initial; } }[name],
+    { [name](value) { values.set(this, value); } }[name],
+  );
+};
+
 // The object in `object`'s prototype chain that owns `name`. A native member
 // lives on the native class's prototype, which is not always the prototype of
 // the global by that name: `Text`, `Comment` and `DocumentFragment` are

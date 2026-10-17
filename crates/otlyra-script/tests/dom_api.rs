@@ -975,3 +975,71 @@ fn storage_quota_is_a_profiles_not_a_private_windows() {
 </script>"#);
     assert_all_ok(&lines, 3);
 }
+
+#[test]
+fn attributes_without_state_are_still_accessors() {
+    let lines = run(r#"<script>
+  const pairs = [[HTMLMediaElement, 'paused'], [HTMLMediaElement, 'currentTime'], [HTMLVideoElement, 'videoWidth'], [HTMLInputElement, 'selectionStart'], [CSSStyleDeclaration, 'parentRule']];
+  check('each is a getter on its prototype', pairs.map(([C, n]) => typeof Object.getOwnPropertyDescriptor(C.prototype, n).get), pairs.map(() => 'function'));
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
+  check('a wrapper can add a setter to one', Object.keys(Object.defineProperty({}, 'x', { ...descriptor, set() {} })), ['x']);
+  const one = document.createElement('video');
+  const two = document.createElement('video');
+  one.currentTime = 5;
+  check('a settable one keeps what each element was given', [one.currentTime, two.currentTime, one.paused, one.videoWidth], [5, 0, true, 0]);
+</script>"#);
+    assert_all_ok(&lines, 3);
+}
+
+#[test]
+fn the_platforms_own_methods_do_not_call_what_a_page_patched() {
+    let lines = run(r#"<div id="host"><p id="first"></p></div><script>
+  const calls = [];
+  for (const name of ['appendChild', 'insertBefore', 'replaceChild', 'removeChild']) {
+    const original = Node.prototype[name];
+    Node.prototype[name] = function (...args) { calls.push(name); return original.apply(this, args); };
+  }
+  const host = document.getElementById('host');
+  const first = document.getElementById('first');
+  first.after(document.createElement('b'));
+  first.before('text');
+  host.append(document.createElement('i'));
+  host.prepend(document.createElement('u'));
+  first.replaceWith(document.createElement('s'));
+  host.lastChild.insertAdjacentElement('afterend', document.createElement('em'));
+  host.replaceChildren(document.createElement('hr'));
+  check('none of them went through the patched methods', calls, []);
+  host.appendChild(document.createElement('br'));
+  check('the page still hears its own calls', calls, ['appendChild']);
+  check('the tree changed as asked', host.innerHTML, '<hr><br>');
+</script>"#);
+    assert_all_ok(&lines, 3);
+}
+
+#[test]
+fn nodes_look_up_their_namespaces() {
+    let lines = run(
+        r#"<div id="host"><svg xmlns:xl="http://www.w3.org/1999/xlink"><g></g></svg></div><script>
+  const host = document.getElementById('host');
+  const g = host.querySelector('g');
+  check('an HTML element is in the HTML namespace', [document.body.lookupNamespaceURI(null), document.lookupNamespaceURI(''), host.firstChild.lookupNamespaceURI(undefined)], ['http://www.w3.org/1999/xhtml', 'http://www.w3.org/1999/xhtml', 'http://www.w3.org/2000/svg']);
+  check('a declared prefix is found from below it', [g.lookupNamespaceURI('xl'), g.lookupPrefix('http://www.w3.org/1999/xlink'), host.lookupNamespaceURI('xl'), g.lookupNamespaceURI('xml')], ['http://www.w3.org/1999/xlink', 'xl', null, 'http://www.w3.org/XML/1998/namespace']);
+  check('the default namespace is told apart', [document.body.isDefaultNamespace('http://www.w3.org/1999/xhtml'), g.isDefaultNamespace('http://www.w3.org/1999/xhtml'), document.createDocumentFragment().lookupNamespaceURI(null)], [true, false, null]);
+</script>"#,
+    );
+    assert_all_ok(&lines, 3);
+}
+
+#[test]
+fn the_windows_own_attributes_are_accessors() {
+    let lines = run(r#"<script>
+  const names = ['window', 'self', 'top', 'parent', 'frames', 'opener', 'frameElement', 'closed', 'name'];
+  check('each has a getter on the window', names.map((n) => typeof Object.getOwnPropertyDescriptor(window, n).get), names.map(() => 'function'));
+  const closed = Object.getOwnPropertyDescriptor(window, 'closed').get;
+  check('they answer as a window in no frame', [window === self, top === window, parent === window, closed.call(window), frameElement, opener], [true, true, true, false, null, null]);
+  name = 'tab';
+  self = 1;
+  check('name is kept and self is replaceable', [window.name, self, window.self], ['tab', 1, 1]);
+</script>"#);
+    assert_all_ok(&lines, 3);
+}

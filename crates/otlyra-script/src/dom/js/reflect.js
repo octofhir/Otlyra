@@ -546,6 +546,11 @@ tokenList(HTMLIFrameElement, 'sandbox', 'sandbox', [
   'allow-presentation', 'allow-same-origin', 'allow-scripts', 'allow-top-navigation',
   'allow-top-navigation-by-user-activation', 'allow-top-navigation-to-custom-protocols',
 ]);
+// Plain values, not accessors yet, on purpose: a consent manager (Transcend's
+// airgap, on Notion) wraps these two getters to rewrite markup through a
+// document from `document.implementation`, which is not a real Document here
+// (see `parsedDocument`), and its natives throw on it. Without getters to wrap
+// it leaves them alone. Make them accessors once secondary documents are real.
 define(HTMLIFrameElement.prototype, 'contentWindow', null);
 define(HTMLIFrameElement.prototype, 'contentDocument', null);
 
@@ -610,13 +615,9 @@ const MEDIA_STATE = {
   seekable: null,
   textTracks: null,
 };
+const MEDIA_SETTABLE = new Set(['currentTime', 'volume', 'playbackRate', 'defaultPlaybackRate']);
 for (const name of Object.keys(MEDIA_STATE)) {
-  Object.defineProperty(HTMLMediaElement.prototype, name, {
-    value: MEDIA_STATE[name],
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
+  (MEDIA_SETTABLE.has(name) ? stored : readonly)(HTMLMediaElement.prototype, name, MEDIA_STATE[name]);
 }
 accessor(
   HTMLMediaElement.prototype,
@@ -640,8 +641,8 @@ reflectUnsigned(HTMLVideoElement, 'width', 'width', 0);
 reflectUnsigned(HTMLVideoElement, 'height', 'height', 0);
 reflectUrl(HTMLVideoElement, 'poster');
 reflectBoolean(HTMLVideoElement, 'playsInline', 'playsinline');
-define(HTMLVideoElement.prototype, 'videoWidth', 0);
-define(HTMLVideoElement.prototype, 'videoHeight', 0);
+readonly(HTMLVideoElement.prototype, 'videoWidth', 0);
+readonly(HTMLVideoElement.prototype, 'videoHeight', 0);
 
 // ---------------------------------------------------------------- forms
 
@@ -851,10 +852,10 @@ accessor(
     this[kIndeterminate] = Boolean(value);
   },
 );
-define(HTMLInputElement.prototype, 'files', null);
-define(HTMLInputElement.prototype, 'selectionStart', null);
-define(HTMLInputElement.prototype, 'selectionEnd', null);
-define(HTMLInputElement.prototype, 'selectionDirection', null);
+stored(HTMLInputElement.prototype, 'files', null);
+stored(HTMLInputElement.prototype, 'selectionStart', null);
+stored(HTMLInputElement.prototype, 'selectionEnd', null);
+stored(HTMLInputElement.prototype, 'selectionDirection', null);
 method(HTMLInputElement.prototype, 'select', function select() {});
 method(HTMLInputElement.prototype, 'setSelectionRange', function setSelectionRange() {});
 method(HTMLInputElement.prototype, 'setRangeText', function setRangeText() {});
@@ -945,8 +946,8 @@ method(HTMLSelectElement.prototype, 'namedItem', function namedItem(name) {
 });
 method(HTMLSelectElement.prototype, 'add', function add(element, before) {
   const reference = typeof before === 'number' ? this.options[before] || null : before || null;
-  if (reference && reference.parentNode) reference.parentNode.insertBefore(element, reference);
-  else this.appendChild(element);
+  if (reference && reference.parentNode) callTree('insertBefore', reference.parentNode, element, reference);
+  else callTree('appendChild', this, element);
 });
 // `select.remove()` is ChildNode's; `select.remove(index)` removes an option.
 const childRemove = Element.prototype.remove;
@@ -1176,8 +1177,8 @@ accessor(HTMLTableRowElement.prototype, 'sectionRowIndex', function () {
 method(HTMLTableRowElement.prototype, 'insertCell', function insertCell(index = -1) {
   const cell = (this.ownerDocument || document).createElement('td');
   const cells = this.cells;
-  if (index === -1 || index === cells.length) this.appendChild(cell);
-  else if (index >= 0 && index < cells.length) this.insertBefore(cell, cells[index]);
+  if (index === -1 || index === cells.length) callTree('appendChild', this, cell);
+  else if (index >= 0 && index < cells.length) callTree('insertBefore', this, cell, cells[index]);
   else throw new DOMException('no cell at ' + index, 'IndexSizeError');
   return cell;
 });
@@ -1193,8 +1194,8 @@ accessor(HTMLTableSectionElement.prototype, 'rows', function () {
 const insertRowInto = (container, index) => {
   const row = (container.ownerDocument || document).createElement('tr');
   const rows = rowsOf(container);
-  if (index === -1 || index === rows.length) container.appendChild(row);
-  else if (index >= 0 && index < rows.length) container.insertBefore(row, rows[index]);
+  if (index === -1 || index === rows.length) callTree('appendChild', container, row);
+  else if (index >= 0 && index < rows.length) callTree('insertBefore', container, row, rows[index]);
   else throw new DOMException('no row at ' + index, 'IndexSizeError');
   return row;
 };
@@ -1233,7 +1234,7 @@ method(HTMLTableElement.prototype, 'insertRow', function insertRow(index = -1) {
   const body = this.tBodies[this.tBodies.length - 1];
   if (body) return insertRowInto(body, index === -1 ? -1 : Math.min(index, rowsOf(body).length));
   const created = (this.ownerDocument || document).createElement('tbody');
-  this.appendChild(created);
+  callTree('appendChild', this, created);
   return insertRowInto(created, -1);
 });
 method(HTMLTableElement.prototype, 'deleteRow', function deleteRow(index) {
@@ -1246,8 +1247,8 @@ for (const [name, tag] of [['createTHead', 'thead'], ['createTFoot', 'tfoot'], [
     const existing = tag === 'tbody' ? null : childNamed(this, tag);
     if (existing) return existing;
     const created = (this.ownerDocument || document).createElement(tag);
-    if (tag === 'caption' || tag === 'thead') this.insertBefore(created, this.firstChild);
-    else this.appendChild(created);
+    if (tag === 'caption' || tag === 'thead') callTree('insertBefore', this, created, this.firstChild);
+    else callTree('appendChild', this, created);
     return created;
   });
 }
@@ -1293,7 +1294,7 @@ factory('Audio', HTMLAudioElement, (src) => {
 });
 factory('Option', HTMLOptionElement, (text = '', value, defaultSelected = false, selected = false) => {
   const option = document.createElement('option');
-  if (text !== '') option.appendChild(document.createTextNode(String(text)));
+  if (text !== '') callTree('appendChild', option, document.createTextNode(String(text)));
   if (value !== undefined) option.value = value;
   if (defaultSelected || selected) option.setAttribute('selected', '');
   return option;

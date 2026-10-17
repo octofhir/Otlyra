@@ -175,7 +175,7 @@ Object.defineProperty(CSSStyleDeclaration.prototype, 'cssFloat', {
 method(CSSStyleDeclaration.prototype, 'getPropertyPriority', function getPropertyPriority() {
   return '';
 });
-define(CSSStyleDeclaration.prototype, 'parentRule', null);
+readonly(CSSStyleDeclaration.prototype, 'parentRule', null);
 defineGlobal('CSSStyleDeclaration', CSSStyleDeclaration);
 
 // One declaration object per element, so `el.style === el.style`.

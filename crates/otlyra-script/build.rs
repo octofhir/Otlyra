@@ -45,6 +45,7 @@ const SOURCES: &[&str] = &[
     "src/dom/js/worker.js",
     "src/dom/js/sockets.js",
     "src/dom/js/indexeddb.js",
+    "src/dom/js/seal.js",
 ];
 
 /// The globals the glue defines besides the interface tree, which is added to
