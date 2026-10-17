@@ -1469,15 +1469,55 @@ fn aspect_ratio(value: &style::values::computed::position::AspectRatio) -> Aspec
     }
 }
 
+/// What an element (or a `::before`/`::after`) does to the CSS counters, in
+/// the order CSS Lists 3 §4.4 applies them: `counter-reset`, then
+/// `counter-set`, then `counter-increment`. Each is the counter's name and the
+/// value given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CounterOps {
+    /// `counter-reset`: a new counter, at this value.
+    pub reset: Vec<(String, i32)>,
+    /// `counter-set`: the innermost counter, set to this value.
+    pub set: Vec<(String, i32)>,
+    /// `counter-increment`: the innermost counter, moved by this much.
+    pub increment: Vec<(String, i32)>,
+}
+
+impl CounterOps {
+    /// Whether it changes no counter at all, which is nearly every element.
+    pub fn is_empty(&self) -> bool {
+        self.reset.is_empty() && self.set.is_empty() && self.increment.is_empty()
+    }
+}
+
+/// The counter operations `values` names.
+pub fn counter_ops(values: &ComputedValues) -> CounterOps {
+    let counters = values.get_counters();
+    let pairs = |list: &[style::values::generics::counters::CounterPair<i32>]| {
+        list.iter()
+            .map(|pair| (pair.name.0.to_string(), pair.value))
+            .collect()
+    };
+    CounterOps {
+        reset: pairs(&counters.counter_reset),
+        // `counter-set` is parsed only by the engine's Gecko build.
+        set: Vec::new(),
+        increment: pairs(&counters.counter_increment),
+    }
+}
+
 /// The text a `::before` or `::after` generates, from its `content`, with
-/// `attr()` answered by `attribute` (CSS Content 3 §2).
+/// `attr()` answered by `attribute` and `counter()` and `counters()` by
+/// `counter` — given the counter's name, the separator for `counters()`, and
+/// the counter style's name (CSS Content 3 §2, CSS Lists 3 §4.5).
 ///
 /// `None` when it generates no box at all: `normal` and `none`. A picture
-/// (`url()`) and a counter generate nothing yet; their place is kept, so a
-/// string beside them still shows.
+/// (`url()`) generates nothing yet; its place is kept, so a string beside it
+/// still shows.
 pub fn generated_text(
     values: &ComputedValues,
     attribute: &dyn Fn(&str) -> Option<String>,
+    counter: &dyn Fn(&str, Option<&str>, &str) -> String,
 ) -> Option<String> {
     use style::values::generics::counters::{Content, ContentItem};
 
@@ -1496,10 +1536,29 @@ pub fn generated_text(
             },
             ContentItem::OpenQuote => text.push('\u{201C}'),
             ContentItem::CloseQuote => text.push('\u{201D}'),
+            ContentItem::Counter(name, style) => {
+                text.push_str(&counter(&name.0, None, &counter_style_name(style)));
+            }
+            ContentItem::Counters(name, separator, style) => {
+                text.push_str(&counter(
+                    &name.0,
+                    Some(separator),
+                    &counter_style_name(style),
+                ));
+            }
             _ => {}
         }
     }
     Some(text)
+}
+
+/// A counter style's name: `decimal` for anything that is not named.
+fn counter_style_name(style: &style::counter_style::CounterStyle) -> String {
+    match style {
+        style::counter_style::CounterStyle::Name(name) => name.0.to_string(),
+        style::counter_style::CounterStyle::None => "none".to_owned(),
+        _ => "decimal".to_owned(),
+    }
 }
 
 #[cfg(test)]

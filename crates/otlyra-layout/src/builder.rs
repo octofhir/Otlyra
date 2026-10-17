@@ -166,6 +166,7 @@ fn build(
         tree,
         root_overflow: None,
         body_overflow_taken: false,
+        counters: vec![Vec::new()],
     };
     for child in document.children(document.root()) {
         builder.walk(child, root, &root_style);
@@ -194,6 +195,10 @@ struct Builder<'a> {
     root_overflow: Option<otlyra_css::Overflow>,
     /// Whether a `<body>` already has, which only the first one does.
     body_overflow_taken: bool,
+    /// The CSS counters in scope, one list per level of the tree being
+    /// walked: a counter an element resets belongs to its level, so its later
+    /// siblings and everything inside them see it (CSS Lists 3 §4.4.1).
+    counters: Vec<Vec<(String, i32)>>,
 }
 
 /// Remove the whitespace-only boxes that sit between block-level boxes.
@@ -1199,7 +1204,17 @@ impl Builder<'_> {
         };
         let document = self.document;
         let attribute = |name: &str| document.attr(node, name).map(str::to_owned);
-        let Some(text) = otlyra_css::computed::generated_text(values, &attribute) else {
+        if otlyra_css::computed::generated_text(values, &attribute, &|_, _, _| String::new())
+            .is_none()
+        {
+            return;
+        }
+        self.apply_counters(&otlyra_css::computed::counter_ops(values));
+        let counters = &self.counters;
+        let counter = |name: &str, separator: Option<&str>, style: &str| {
+            format_counters(counters, name, separator, style)
+        };
+        let Some(text) = otlyra_css::computed::generated_text(values, &attribute, &counter) else {
             return;
         };
         let mut style = otlyra_css::computed::to_layout_style(values);
@@ -1249,6 +1264,49 @@ impl Builder<'_> {
         }
     }
 
+    /// Apply what an element or a pseudo-element does to the counters, at the
+    /// level being walked.
+    fn apply_counters(&mut self, ops: &otlyra_css::computed::CounterOps) {
+        if ops.is_empty() {
+            return;
+        }
+        let level = self.counters.len() - 1;
+        for (name, value) in &ops.reset {
+            let frame = &mut self.counters[level];
+            match frame.iter_mut().find(|(held, _)| held == name) {
+                Some(counter) => counter.1 = *value,
+                None => frame.push((name.clone(), *value)),
+            }
+        }
+        for (name, value) in &ops.set {
+            self.innermost_counter(name).1 = *value;
+        }
+        for (name, value) in &ops.increment {
+            let counter = self.innermost_counter(name);
+            counter.1 = counter.1.saturating_add(*value);
+        }
+    }
+
+    /// The innermost counter called `name`, made at the current level at zero
+    /// when none is in scope.
+    fn innermost_counter(&mut self, name: &str) -> &mut (String, i32) {
+        let level = (0..self.counters.len())
+            .rev()
+            .find(|level| self.counters[*level].iter().any(|(held, _)| held == name));
+        let level = match level {
+            Some(level) => level,
+            None => {
+                let level = self.counters.len() - 1;
+                self.counters[level].push((name.to_owned(), 0));
+                level
+            }
+        };
+        self.counters[level]
+            .iter_mut()
+            .find(|(held, _)| held == name)
+            .expect("found or just made")
+    }
+
     fn walk(&mut self, node: NodeId, parent_box: BoxId, parent_style: &Arc<ComputedStyle>) {
         let Some(dom) = self.document.get(node) else {
             return;
@@ -1263,9 +1321,12 @@ impl Builder<'_> {
 
                 // `display: none` generates no box, and neither do its descendants.
                 // That is the whole of it: the subtree is not laid out, not painted,
-                // and not hit-testable.
+                // and not hit-testable — and it touches no counter.
                 if style.display == Display::None {
                     return;
+                }
+                if let Some(values) = self.styles.style_of(node) {
+                    self.apply_counters(&otlyra_css::computed::counter_ops(values));
                 }
 
                 // `display: contents` generates no box, and its children are
@@ -1435,6 +1496,9 @@ impl Builder<'_> {
                     }
                 } else if !replaced && has_renderable_children(element) && !closed {
                     let generates = generates_pseudo_boxes(name);
+                    // The element's children, and its pseudo-elements, are a
+                    // level of counters of their own.
+                    self.counters.push(Vec::new());
                     if generates {
                         self.push_generated(node, id, &style, Generated::Before);
                     }
@@ -1446,6 +1510,7 @@ impl Builder<'_> {
                     if generates {
                         self.push_generated(node, id, &style, Generated::After);
                     }
+                    self.counters.pop();
                 }
             }
 
@@ -1477,6 +1542,54 @@ impl Builder<'_> {
                 }
             }
         }
+    }
+}
+
+/// `counter(name, style)`, or with a separator `counters(name, separator,
+/// style)`: the innermost counter's value, or every one in scope from the
+/// outermost in, in the style named. A counter nothing made is zero.
+fn format_counters(
+    counters: &[Vec<(String, i32)>],
+    name: &str,
+    separator: Option<&str>,
+    style: &str,
+) -> String {
+    let values: Vec<i32> = counters
+        .iter()
+        .filter_map(|frame| {
+            frame
+                .iter()
+                .find(|(held, _)| held == name)
+                .map(|(_, value)| *value)
+        })
+        .collect();
+    let format = |value: i32| -> String {
+        let index = usize::try_from(value)
+            .ok()
+            .and_then(|value| value.checked_sub(1));
+        match (style, index) {
+            ("none", _) => String::new(),
+            ("disc", _) => "\u{2022}".to_owned(),
+            ("circle", _) => "\u{25e6}".to_owned(),
+            ("square", _) => "\u{25aa}".to_owned(),
+            ("decimal-leading-zero", _) if (0..10).contains(&value) => format!("0{value}"),
+            ("lower-alpha" | "lower-latin", Some(index)) => alphabetic(index, false),
+            ("upper-alpha" | "upper-latin", Some(index)) => alphabetic(index, true),
+            ("lower-roman", Some(_)) => roman(value as usize).to_lowercase(),
+            ("upper-roman", Some(_)) => roman(value as usize),
+            _ => value.to_string(),
+        }
+    };
+    match separator {
+        Some(separator) => {
+            let all: Vec<String> = if values.is_empty() {
+                vec![format(0)]
+            } else {
+                values.iter().copied().map(format).collect()
+            };
+            all.join(separator)
+        }
+        None => format(values.last().copied().unwrap_or(0)),
     }
 }
 
@@ -1697,6 +1810,23 @@ mod tests {
             [255, 0, 0],
             "the pseudo-element's own style"
         );
+    }
+
+    #[test]
+    fn counters_number_what_their_rules_say() {
+        let html = "<style>ol { counter-reset: item 0 } li { display: block; counter-increment: item } \
+                    li::before { content: counters(item, '.') ' ' } \
+                    h2 { counter-increment: section 2 } h2::before { content: counter(section, upper-roman) '. ' } \
+                    p::after { content: counter(nothing) }</style>\
+                    <h2>A</h2><h2>B</h2><ol><li>one<ol><li>inner</li></ol></li><li>two</li></ol><p>x";
+        assert_eq!(text_of(html), "II. AIV. B1 one1.1 inner2 twox0");
+    }
+
+    #[test]
+    fn an_element_with_no_box_touches_no_counter() {
+        let html = "<style>p { counter-increment: n } p::before { content: counter(n) ' ' } \
+                    .gone { display: none }</style><p>a</p><p class=gone>b</p><p>c";
+        assert_eq!(text_of(html), "1 a2 c");
     }
 
     #[test]
