@@ -309,8 +309,12 @@ clicks and wheel events. What is left:
 - [ ] Their follow-ups: canvas shadows, filters, patterns, conic gradients,
   `OffscreenCanvas`, WebGL, a paint-only path for canvas frames; shared and
   service workers, `MessageChannel`, transfer lists; cookies on sockets;
-  generated content's `counter()` and `url()`; a hover that changes a
-  `::before` restyles the whole page.
+  generated content's `url()`; a hover that changes a `::before` restyles
+  the whole page; a TLS handshake that does not mark a browser with a
+  normal User-Agent as a bot (Amazon's robot check); real secondary
+  documents from `createHTMLDocument`/`DOMParser`, after which iframe and
+  object `contentWindow`/`contentDocument` become accessors (Notion's
+  consent manager needs both).
 - [x] Script loading as HTML has it (see [BBC](docs/browser-rendering-research.md#bbc)):
   `defer`/`async` after the parse, scripts inserted by script (inline,
   external, module) with `load`/`error`, nothing run twice; the CSSOM of

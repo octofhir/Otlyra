@@ -1787,10 +1787,66 @@ The Verge now hydrates with no errors.
   `TypeError` the marshal boundary used to flatten out-of-memory into, and
   now expects the canonical `RangeError` (`ed2d8105f`).
 
+- **Masks erased the page beneath them.** The Skia backend draws a group at
+  full opacity straight onto the canvas, so a mask composited
+  destination-in against a masked box's group cut away what was under the
+  box too, and every icon drawn as a masked `::after` was a white square on
+  MDN. A masked group now asks for an opacity one ulp below one, which makes
+  it a surface of its own.
+- **CSS counters**: `counter-reset`, `counter-increment`, `counter()` and
+  `counters()` with the decimal, alphabetic, roman and bullet styles, scoped
+  by tree level. `counter-set` is parsed only by Stylo's Gecko build.
+- **A FormData body is multipart/form-data**, and a document load sends the
+  navigation `Accept` and every request `Accept-Language`. Amazon's AWS WAF
+  challenge now solves (its verify call wanted multipart). With a browser's
+  User-Agent and a TLS handshake that is not Chrome's, Amazon then answers
+  with its robot check ("Click the button below to continue shopping"),
+  where with `Otlyra/0.0.0` it served the page: that is the price of the
+  normal User-Agent, until the handshake looks like a browser's.
+- **Engine detection**: Number formatting `RangeError`s now say what V8
+  says (Otter `361b58dea`), so detectIncognito places the engine; and
+  `navigator.webkitTemporaryStorage` answers `queryUsageAndQuota` with a
+  profile's quota, so it does not take the browser for a private window.
+  CNN loads with no console errors.
+- **Notion's consent manager** (Transcend's airgap) was the one error left on
+  Notion, and following it found five things in turn:
+  1. **An error a builtin threw had no stack frames** (Otter `e4e7124c1`):
+     `error.stack` of a `TypeError` from `Array.prototype.push` was the message
+     alone. It now records the calling script's frames, which is what found
+     the rest.
+  2. **An array under a frozen prototype could not take elements** (Otter
+     `b8657a82e`): airgap freezes the prototype of its `class extends Array`,
+     and `push` threw "Cannot assign to read only property '0'". [[Set]] asked
+     the prototype whether it was extensible instead of the receiver.
+  3. **Attributes with no state behind them were data properties**: media
+     state, `videoWidth`, `selectionStart`, `files`, `parentRule`, and the
+     window's own `self`/`top`/`parent`/`frames`/`opener`/`frameElement`/
+     `closed`/`name`. Code that keeps `Object.getOwnPropertyDescriptor(…).get`
+     found none. They are accessors now.
+  4. **`el.after()`, `append()`, `replaceWith()` and the other platform
+     methods called the page's `insertBefore`**: airgap patches it, and its
+     hook ran inside the platform's own calls. The glue's methods now go
+     through the tree methods it captured last (`treeOps`, `seal.js`).
+  5. **`lookupNamespaceURI`, `lookupPrefix`, `isDefaultNamespace`** did not
+     exist.
+  Past those, airgap installs getter hooks on `contentWindow`/`contentDocument`
+  that rewrite markup through `document.implementation.createHTMLDocument()`
+  and call `Document.prototype.open/write/close` on it. Ours is not a real
+  Document, the natives throw, and Notion fell to its error page. Those two
+  stay plain values until secondary documents are real (a comment in
+  `reflect.js` says why); Notion renders, with airgap stopping at its first
+  hook ("descriptor mixes accessor + data fields") as before.
+- **A binding's property read runs getters** (Otter `5f583b600`): a WebIDL
+  read of a dictionary member or an import object's module (`MarshalCx::get`)
+  read data properties only, so `WebAssembly.instantiate` with an `env`
+  getter that throws reported a `LinkError` instead of the thrown object.
+
 ### Still open
 
-- BBC: placeholders stay over some pictures; the pictures themselves now
-  draw (no more `alt` text).
+- BBC: placeholders stay over some pictures, beside them rather than over
+  them; the pictures themselves now draw (no more `alt` text). Its
+  styled-components rules are not visible through `cssRules` here, which
+  is where the next look should start.
 - YouTube search: `ytd-two-column-search-results-renderer` keeps the
   `hidden` attribute its framework set; what should clear it is not found.
 - Cookies on WebSocket and EventSource; IndexedDB on disk.
@@ -1798,12 +1854,26 @@ The Verge now hydrates with no errors.
   WebGL. A canvas frame rebuilds the box tree (no paint-only path yet).
 - Workers: shared and service workers, `MessageChannel`, transfer lists
   (buffers are copied).
-- Otter: `wasm_catchable_host_class_and_getter_throw_keep_their_original_causes`
-  still fails: an object thrown by an import object's getter reaches the
-  page as another object (its identity is lost between the native boundary
-  and the rethrow; a moving collection is the suspect). `jit_module_ops`
-  fails at HEAD too, before this run's changes.
-- CNN's detectIncognito still cannot tell the browser apart.
+- Otter: `jit_module_ops` fails at HEAD too, before this run's changes;
+  `shared_runtime_host::per_page_isolates_share_one_host_but_not_globals_or_heaps`
+  fails as well: every `Eval` command on a `RuntimeHandle` finishes as a
+  Node process does (`'exit'`), and a host task that arrives afterwards is
+  cancelled. A page isolate has no process to exit; which isolates finish
+  that way is a decision for the embedding API.
+- The Verge logs React #418/#425 again at 07:52 (11 console errors). The
+  binary that loaded it with none at 06:30 now logs the same 11, so the
+  page changed, not the browser; the method above (text diff against
+  Chrome, then the instrumented chunk) is where to start.
+- YouTube's home page is still skeleton cards when the screenshot is taken;
+  the feed's own requests are the next thing to follow.
+- Notion: airgap stops at `contentWindow`'s data descriptor (above); the
+  next step is a real Document from `createHTMLDocument`/`DOMParser`.
+- Otter: an error thrown inside a call through `Function.prototype.call.bind`
+  is reported with the outer callee's name (`Wr is not a function` for a
+  missing `lookupNamespaceURI`), and the arrow's own frame is missing.
+- Otter: `jit_exception_regions::stack_owned_nested_catch_routes_committed_getter_throw_once`
+  fails with or without this run's VM changes (a JIT call-count assertion).
+- Amazon shows its robot check with the normal User-Agent (above).
 
 ## What the reference browsers do
 
