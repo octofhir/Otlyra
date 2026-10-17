@@ -733,7 +733,8 @@ fn user_timing_marks_and_measures() {
   const a = performance.mark('a');
   performance.mark('b', { startTime: a.startTime + 5 });
   const m = performance.measure('a-b', 'a', 'b');
-  check('a measure spans its marks', [m.entryType, m.duration], ['measure', 5]);
+  // (t + 5) - t is 5 to within a rounding of t, not exactly.
+  check('a measure spans its marks', [m.entryType, Math.round(m.duration * 1e6) / 1e6], ['measure', 5]);
   check('entries are listed', [performance.getEntriesByType('mark').length, performance.getEntriesByName('a-b').length], [2, 1]);
   performance.clearMarks('a');
   performance.clearMeasures();

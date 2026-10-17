@@ -339,23 +339,53 @@ if (typeof navigator === 'object' && navigator) {
   // The string the network sends as `User-Agent`; the engine's own default
   // names the engine, not the browser.
   const userAgent = take(Document, '__userAgent')();
-  for (const [name, value] of [['userAgent', userAgent], ['appVersion', userAgent.slice('Mozilla/'.length)]]) {
-    Object.defineProperty(navigator, name, { value, writable: false, enumerable: true, configurable: true });
+  // What a browser says about itself, as accessors on `Navigator.prototype`
+  // the way WebIDL makes attributes: consent managers read them through the
+  // prototype's descriptors (`Object.getOwnPropertyDescriptor(Navigator.
+  // prototype, 'languages').get`), and an own data property on the object
+  // answers that with `undefined`. Strings, as every browser has them,
+  // because sniffing code calls `navigator.platform.indexOf(…)` without
+  // asking first; the platform and vendor are the ones the user agent names.
+  const languages = Object.freeze(['en-US', 'en']);
+  const answers = {
+    userAgent,
+    appVersion: userAgent.slice('Mozilla/'.length),
+    appName: 'Netscape',
+    appCodeName: 'Mozilla',
+    product: 'Gecko',
+    productSub: '20030107',
+    vendor: 'Google Inc.',
+    vendorSub: '',
+    platform: 'MacIntel',
+    language: 'en-US',
+    languages,
+    onLine: true,
+    cookieEnabled: true,
+    maxTouchPoints: 0,
+    hardwareConcurrency: 8,
+    deviceMemory: 8,
+    webdriver: false,
+    pdfViewerEnabled: false,
+    doNotTrack: null,
+  };
+  const prototype = typeof Navigator === 'function' ? Navigator.prototype : Object.getPrototypeOf(navigator);
+  for (const [name, value] of Object.entries(answers)) {
+    if (Object.getOwnPropertyDescriptor(navigator, name)?.configurable) delete navigator[name];
+    Object.defineProperty(prototype, name, { get: { [name]() { return value; } }[name], enumerable: true, configurable: true });
   }
   // It cannot send, and says so rather than pretending: a page that believes
   // its beacon left is a page that will not try the request another way.
   define(navigator, 'sendBeacon', () => false);
-  define(navigator, 'language', 'en-US');
-  define(navigator, 'languages', ['en-US']);
-  define(navigator, 'onLine', true);
-  define(navigator, 'cookieEnabled', true);
-  // Strings, as every browser has them, because sniffing code calls
-  // `navigator.platform.indexOf(…)` without asking first. The platform is the
-  // one the user agent names; an empty `vendor` is what the standard allows
-  // a browser that does not say, and what Firefox's is.
-  define(navigator, 'platform', 'MacIntel');
-  define(navigator, 'vendor', '');
-  define(navigator, 'maxTouchPoints', 0);
+  // StorageManager (Storage §5): an estimate with room to spare, and storage
+  // that is not promised to persist.
+  if (!('storage' in navigator)) {
+    const storage = {
+      estimate: () => Promise.resolve({ quota: 2 ** 31, usage: 0 }),
+      persisted: () => Promise.resolve(false),
+      persist: () => Promise.resolve(false),
+    };
+    Object.defineProperty(prototype, 'storage', { get: () => storage, enumerable: true, configurable: true });
+  }
 }
 
 if (typeof performance === 'object' && performance) {
@@ -407,13 +437,17 @@ if (typeof performance === 'object' && performance) {
       }
     }
   };
-  define(performance, 'mark', function mark(name, options = {}) {
+  // On `Performance.prototype`, as WebIDL puts them: a page that keeps the
+  // platform's methods (`Performance.prototype.getEntries`) calls them on
+  // `performance` later, and finds nothing on the object itself.
+  const performanceInterface = Object.getPrototypeOf(performance);
+  define(performanceInterface, 'mark', function mark(name, options = {}) {
     const startTime = options && options.startTime !== undefined ? Number(options.startTime) : performance.now();
     const entry = new PerformanceMark(String(name), 'mark', startTime, 0, options && options.detail);
     timingEntries.push(entry);
     return entry;
   });
-  define(performance, 'measure', function measure(name, start, end) {
+  define(performanceInterface, 'measure', function measure(name, start, end) {
     let startTime = 0;
     let endTime = performance.now();
     let detail = null;
@@ -430,18 +464,20 @@ if (typeof performance === 'object' && performance) {
     timingEntries.push(entry);
     return entry;
   });
-  define(performance, 'clearMarks', (name) => clearEntries('mark', name));
-  define(performance, 'clearMeasures', (name) => clearEntries('measure', name));
-  define(performance, 'clearResourceTimings', () => undefined);
-  define(performance, 'setResourceTimingBufferSize', () => undefined);
-  define(performance, 'getEntries', () => timingEntries.slice());
-  define(performance, 'getEntriesByType', (type) => timingEntries.filter((entry) => entry.entryType === String(type)));
-  define(performance, 'getEntriesByName', (name, type) =>
+  define(performanceInterface, 'clearMarks', (name) => clearEntries('mark', name));
+  define(performanceInterface, 'clearMeasures', (name) => clearEntries('measure', name));
+  define(performanceInterface, 'clearResourceTimings', () => undefined);
+  define(performanceInterface, 'setResourceTimingBufferSize', () => undefined);
+  define(performanceInterface, 'getEntries', () => timingEntries.slice());
+  define(performanceInterface, 'getEntriesByType', (type) => timingEntries.filter((entry) => entry.entryType === String(type)));
+  define(performanceInterface, 'getEntriesByName', (name, type) =>
     timingEntries.filter((entry) => entry.name === String(name) && (type === undefined || entry.entryType === String(type))),
   );
   const origin = typeof performance.timeOrigin === 'number' ? performance.timeOrigin : Date.now() - performance.now();
-  define(performance, 'timing', Object.fromEntries(TIMING_NAMES.map((name) => [name, Math.round(origin)])));
-  define(performance, 'navigation', { type: 0, redirectCount: 0 });
+  const timing = Object.fromEntries(TIMING_NAMES.map((name) => [name, Math.round(origin)]));
+  const navigation = { type: 0, redirectCount: 0 };
+  if (!('timing' in performance)) accessor(performanceInterface, 'timing', () => timing);
+  if (!('navigation' in performance)) accessor(performanceInterface, 'navigation', () => navigation);
 }
 
 // MutationObserver (DOM §4.3). The tree keeps the registrations and the

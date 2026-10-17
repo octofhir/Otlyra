@@ -8,6 +8,19 @@
 // building lists by query almost always means, and the live lists of the
 // specification are a cost to come back to when a page shows they matter.
 
+// `length` as WebIDL has it, an accessor on the interface's prototype, for
+// code that reads it through the descriptor (`Object.getOwnPropertyDescriptor(
+// HTMLCollection.prototype, 'length').get.call(list)`, as consent managers
+// keep pristine copies of the platform's getters). A list's own array
+// `length` still answers a plain read.
+const lengthAccessor = (prototype) => {
+  Object.defineProperty(prototype, 'length', {
+    get: { length() { return Array.isArray(this) ? this.length : 0; } }.length,
+    enumerable: true,
+    configurable: true,
+  });
+};
+
 const listInterface = (name) => {
   const List = makeInterface(name, Object);
   Object.setPrototypeOf(List.prototype, Object.prototype);
@@ -16,6 +29,7 @@ const listInterface = (name) => {
     return at < this.length ? this[at] : null;
   });
   method(List.prototype, Symbol.iterator, Array.prototype.values);
+  lengthAccessor(List.prototype);
   return List;
 };
 
@@ -280,6 +294,7 @@ const NAMED_NODE_MAP = {
   },
 };
 Object.defineProperties(NamedNodeMap.prototype, Object.getOwnPropertyDescriptors(NAMED_NODE_MAP));
+lengthAccessor(NamedNodeMap.prototype);
 
 accessor(Element.prototype, 'attributes', function () {
   const map = asNamedNodeMap(nativeAttributeRecords.call(this).map((record) => makeAttr(this, record)));

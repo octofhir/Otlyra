@@ -581,6 +581,7 @@ accessor(HTMLMapElement.prototype, 'areas', function () {
 reflectUnsigned(HTMLCanvasElement, 'width', 'width', 300);
 reflectUnsigned(HTMLCanvasElement, 'height', 'height', 150);
 // Its context and bitmap are in `canvas.js`.
+reflectBoolean(HTMLIFrameElement, 'credentialless');
 
 // Media that cannot play: the members a page reads before it decides what to
 // do, answering as an element with nothing loaded does (HTML §4.8.11).
@@ -698,9 +699,23 @@ const VALIDITY = {
   customError: false,
   valid: true,
 };
+// The flags as the interface's own accessors, which is where a page that
+// keeps the platform's getters (`Object.getOwnPropertyDescriptor(
+// ValidityState.prototype, 'valid').get`) looks for them.
+const kValidity = Symbol('validity');
+class ValidityState {
+  constructor(key, flags) {
+    if (key !== kValidity) throw new TypeError('Illegal constructor');
+    this[kValidity] = { ...flags };
+  }
+}
+for (const name of Object.keys(VALIDITY)) {
+  accessor(ValidityState.prototype, name, { [name]() { return this[kValidity][name]; } }[name]);
+}
+defineGlobal('ValidityState', ValidityState);
 for (const Interface of [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement, HTMLObjectElement, HTMLOutputElement, HTMLSelectElement, HTMLTextAreaElement]) {
   accessor(Interface.prototype, 'validity', function () {
-    return Object.assign({}, VALIDITY);
+    return new ValidityState(kValidity, VALIDITY);
   });
   accessor(Interface.prototype, 'validationMessage', function () {
     return '';

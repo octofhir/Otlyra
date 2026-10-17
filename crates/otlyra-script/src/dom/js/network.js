@@ -245,7 +245,24 @@ const fireXhr = (target, event) => {
   target.dispatchEvent(event);
 };
 
+const kResponseType = Symbol('responseType');
+const RESPONSE_TYPES = ['', 'arraybuffer', 'blob', 'document', 'json', 'text'];
+
 class XMLHttpRequest extends XMLHttpRequestEventTarget {
+  // An accessor on the prototype, as WebIDL makes it; a value outside the
+  // enumeration is ignored, and one set after the response arrived throws.
+  get responseType() {
+    return this[kResponseType] ?? '';
+  }
+  set responseType(value) {
+    const type = String(value);
+    if (!RESPONSE_TYPES.includes(type)) return;
+    if (this.readyState === 3 || this.readyState === 4) {
+      throw new DOMException("Failed to set the 'responseType' property on 'XMLHttpRequest': The response type cannot be set if the object's state is LOADING or DONE.", 'InvalidStateError');
+    }
+    this[kResponseType] = type;
+  }
+
   constructor() {
     super();
     this[kXhr] = {
@@ -261,7 +278,6 @@ class XMLHttpRequest extends XMLHttpRequestEventTarget {
       timer: undefined,
     };
     this.onreadystatechange = null;
-    this.responseType = '';
     this.timeout = 0;
     this.withCredentials = false;
     this.upload = new XMLHttpRequestEventTarget();

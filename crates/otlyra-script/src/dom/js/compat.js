@@ -1197,6 +1197,26 @@ defineGlobal('FileReader', FileReader);
 
 // WebSocket and EventSource are in `sockets.js`.
 
+// ---------------------------------------------------------------- More event interfaces
+// Event types a page constructs, or keeps the platform's `isTrusted` getter
+// from (`new SecurityPolicyViolationEvent('…')`), with their init members
+// read back as the interface's own accessors (`eventInterface`, in
+// `uievents.js`). Nothing fires most of them yet.
+eventInterface('DragEvent', MouseEvent, { dataTransfer: null });
+eventInterface('ClipboardEvent', Event, { clipboardData: null });
+eventInterface('FormDataEvent', Event, { formData: null });
+eventInterface('BeforeUnloadEvent', Event, { returnValue: '' });
+eventInterface('ToggleEvent', Event, { oldState: '', newState: '' });
+eventInterface('TrackEvent', Event, { track: null });
+eventInterface('GamepadEvent', Event, { gamepad: null });
+eventInterface('DeviceOrientationEvent', Event, { alpha: null, beta: null, gamma: null, absolute: false });
+eventInterface('SecurityPolicyViolationEvent', Event, {
+  documentURI: '', referrer: '', blockedURI: '', violatedDirective: '', effectiveDirective: '',
+  originalPolicy: '', sourceFile: '', sample: '', disposition: 'enforce', statusCode: 0,
+  lineNumber: 0, columnNumber: 0,
+});
+
+
 // ---------------------------------------------------------------- Events
 // HTML §12.2.1: what another document's change to storage tells this one.
 // Fired at the window by `__otlyraStorageDeliver`, for every change another
