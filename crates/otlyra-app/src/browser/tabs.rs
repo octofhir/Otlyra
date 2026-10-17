@@ -79,7 +79,7 @@ const CLOSED_TAB_LIMIT: usize = 25;
 /// A process-wide counter rather than one per browser: two browsers in one test
 /// binary handing out the same names would be two tabs a driver cannot tell
 /// apart, and the numbers are cheap.
-fn next_tab_id() -> TabId {
+pub(super) fn next_tab_id() -> TabId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     TabId(NEXT.fetch_add(1, Ordering::Relaxed))

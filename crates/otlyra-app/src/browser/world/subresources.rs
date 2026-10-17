@@ -376,6 +376,9 @@ impl PageWorld {
         // Last, because it is a question about the window this frame was drawn
         // for: the answer is for the next one. It has a guard of its own.
         self.rechoose_pictures();
+        // The pages' `<iframe>` elements were laid out on the way to this
+        // frame: their frames take those sizes, and are drawn into them.
+        self.sync_frames();
     }
 
     /// A background picture a page asked for arrived. It belongs to a page

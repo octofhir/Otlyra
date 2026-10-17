@@ -672,6 +672,16 @@ fn screenshot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     browser.wait_for_load(LOAD_TIMEOUT);
     browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
+    // A page's frames start loading from the frame that lays their elements
+    // out, and are drawn into them on the frame after they arrive: one more
+    // round for each level of frames.
+    for _ in 0..FRAME_ROUNDS {
+        if !browser.loading() {
+            break;
+        }
+        browser.wait_for_load(LOAD_TIMEOUT);
+        browser.prepare_frame(cli.viewport(), LOAD_TIMEOUT);
+    }
     open_inspector(browser, cli);
     if let Some((x, y)) = cli.inspect_at {
         write_screenshot(browser, cli.viewport(), path)?;
@@ -694,6 +704,10 @@ fn point(text: &str) -> Result<(f64, f64), String> {
     };
     Ok((parse(x)?, parse(y)?))
 }
+
+/// How many times `--screenshot` waits again for frames that started loading
+/// from the frame it drew: one for each level a page may nest them.
+const FRAME_ROUNDS: usize = 3;
 
 /// How long `--screenshot` waits for the page it was given.
 const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

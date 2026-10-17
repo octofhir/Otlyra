@@ -645,6 +645,26 @@ impl Fetcher {
         )
     }
 
+    /// Ask for the document a frame shows, on the authority of the page at
+    /// `parent` that holds it. A document, but not a top-level navigation:
+    /// cookies go with it under the rules for a request that page made, so a
+    /// third-party frame does not get the `Lax` cookies a link would.
+    pub fn load_frame(&mut self, owner: u64, url: &str, cache: CacheMode, parent: String) -> u64 {
+        let context = RequestContext {
+            initiator: Some(parent),
+            navigation: false,
+        };
+        self.fetch_in_context(
+            owner,
+            url,
+            ResourceKind::Document,
+            None,
+            cache,
+            Vec::new(),
+            context,
+        )
+    }
+
     /// Ask for `url` on `owner`'s behalf: a tab, whose requests wait in lanes of
     /// their own so that another tab's never hold them up.
     pub fn request_for(&mut self, owner: u64, url: &str, kind: ResourceKind) -> u64 {

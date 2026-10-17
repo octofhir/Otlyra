@@ -24,6 +24,7 @@ use crate::page::PageScene;
 use super::TabId;
 
 mod fonts;
+mod frames;
 mod load;
 mod modules;
 mod page_fetch;
@@ -200,6 +201,8 @@ pub(super) struct PageWorld {
     picture_fetches: HashMap<u64, PictureFetch>,
     /// Module fetches for a document whose load is over, by request number.
     module_fetches: HashMap<u64, modules::ModuleFetch>,
+    /// The frames the pages' `<iframe>` elements show, by the slot each is.
+    frames: frames::Frames,
     /// Requests pages' scripts made, by request number.
     page_fetches: HashMap<u64, page_fetch::PageFetch>,
     /// The last document generation handed to a slot.
@@ -244,6 +247,7 @@ impl PageWorld {
             background_fetches: HashMap::new(),
             picture_fetches: HashMap::new(),
             module_fetches: HashMap::new(),
+            frames: HashMap::new(),
             page_fetches: HashMap::new(),
             generations: 0,
             picture_window: None,
@@ -296,14 +300,22 @@ impl PageWorld {
             // Hide the old page before exposing the new one. This runs between
             // turns on content's owner, including when input is batched.
             if let Some(tab) = previous {
-                self.set_hidden(tab, true);
+                for shown in std::iter::once(tab).chain(self.frames_in(tab)) {
+                    self.set_hidden(shown, true);
+                }
             }
             if let Some(tab) = visible {
-                self.set_hidden(tab, false);
+                for shown in std::iter::once(tab).chain(self.frames_in(tab)) {
+                    self.set_hidden(shown, false);
+                }
             }
         }
         if viewport_changed {
-            for slot in self.slots.values_mut() {
+            for (tab, slot) in &mut self.slots {
+                // A frame's viewport is its element's box, not the window.
+                if self.frames.contains_key(tab) {
+                    continue;
+                }
                 let Some(page) = slot.page.as_mut() else {
                     continue;
                 };
@@ -449,6 +461,15 @@ impl PageWorld {
 
     /// Forget `tab`: its document, its scripts and whatever it was waiting for.
     pub(super) fn close(&mut self, tab: TabId) {
+        let inner: Vec<TabId> = self
+            .frames
+            .iter()
+            .filter(|(_, frame)| frame.parent() == tab)
+            .map(|(id, _)| *id)
+            .collect();
+        for frame in inner {
+            self.close_frame(frame);
+        }
         self.cancel_fetches(tab);
         self.fetcher.set_initiator(tab.0, None);
         self.slots.remove(&tab);
@@ -537,12 +558,16 @@ impl PageWorld {
     /// Whether `tab`'s page has asked for an animation frame.
     pub(super) fn frames_pending(&self, tab: TabId) -> bool {
         self.environment.visible_tab() == Some(tab)
-            && self.slots.get(&tab).is_some_and(|slot| {
-                slot.scripts
-                    .as_ref()
-                    .is_some_and(|scripts| scripts.frames_pending())
-                    || slot.observers_owed()
-            })
+            && std::iter::once(tab)
+                .chain(self.frames_in(tab))
+                .any(|shown| {
+                    self.slots.get(&shown).is_some_and(|slot| {
+                        slot.scripts
+                            .as_ref()
+                            .is_some_and(|scripts| scripts.frames_pending())
+                            || slot.observers_owed()
+                    })
+                })
     }
 
     /// When a page's timer next comes due, if one is waiting.
@@ -806,12 +831,20 @@ impl PageWorld {
     /// answered from a counter the bindings keep, not by entering the isolate.
     fn run_frame_callbacks(&mut self) -> bool {
         let at = std::time::Instant::now();
+        let Some(visible) = self.environment.visible_tab() else {
+            return false;
+        };
+        let mut ran = false;
+        for shown in std::iter::once(visible).chain(self.frames_in(visible)) {
+            ran |= self.run_frame_callbacks_in(shown, at);
+        }
+        ran
+    }
+
+    /// The animation frame callbacks of one shown document.
+    fn run_frame_callbacks_in(&mut self, tab: TabId, at: std::time::Instant) -> bool {
         let timestamp = at.saturating_duration_since(self.started).as_secs_f64() * 1000.0;
-        let Some(slot) = self
-            .environment
-            .visible_tab()
-            .and_then(|tab| self.slots.get_mut(&tab))
-        else {
+        let Some(slot) = self.slots.get_mut(&tab) else {
             return false;
         };
         let observers = slot.observers_owed();

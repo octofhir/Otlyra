@@ -309,7 +309,11 @@ impl PageWorld {
             .is_some()
             .then(|| previous_url.clone())
             .filter(|page| !page.is_empty());
-        let id = self.fetcher.navigate(tab.0, url, body, cache, initiator);
+        // A frame's document is a request its page made, under its page's rules.
+        let id = match self.frame_parent_url(tab) {
+            Some(parent) => self.fetcher.load_frame(tab.0, url, cache, parent),
+            None => self.fetcher.navigate(tab.0, url, body, cache, initiator),
+        };
         let slot = self.slots.entry(tab).or_default();
         slot.viewport_zoom = Some(self.environment.page_zoom);
         slot.pending = Some(PendingLoad {
@@ -350,6 +354,9 @@ impl PageWorld {
 
     /// The CSS viewport `tab`'s script sees: the window, at the tab's zoom.
     fn script_viewport(&self, tab: TabId) -> otlyra_css::cascade::Viewport {
+        if let Some(viewport) = self.frame_viewport(tab) {
+            return viewport;
+        }
         let mut viewport = self.environment.viewport;
         let zoom = self
             .slots
@@ -377,6 +384,14 @@ impl PageWorld {
                 return true;
             }
         };
+
+        // A document that refuses to be shown in this frame is never parsed:
+        // its scripts do not run, and its element shows nothing.
+        if let Some(why) = self.frame_refused(tab, &loaded) {
+            tracing::info!(target: "page.frames", url = %loaded.final_url, %why, "a frame was refused its document");
+            self.set_page(tab, None);
+            return true;
+        }
 
         // An attachment is a completed download, not a document with unusual
         // bytes. The payload goes to the window, which keeps the downloads, and
@@ -545,16 +560,9 @@ impl PageWorld {
                 if let Some(pending) = self.pending(tab) {
                     scripts.set_initial_time_origin(pending.started);
                 }
-                scripts.set_initial_hidden(self.environment.visible_tab() != Some(tab));
-                let mut viewport = self.environment.viewport;
-                let zoom = self
-                    .slots
-                    .get(&tab)
-                    .and_then(|slot| slot.viewport_zoom)
-                    .unwrap_or(1.0);
-                viewport.width /= zoom;
-                viewport.height /= zoom;
-                viewport.scale *= zoom;
+                scripts
+                    .set_initial_hidden(self.environment.visible_tab() != Some(self.top_of(tab)));
+                let viewport = self.script_viewport(tab);
                 scripts.set_initial_viewport(
                     f64::from(viewport.width),
                     f64::from(viewport.height),

@@ -1287,6 +1287,45 @@ impl PageScene {
             .and_then(|fragment| fragment.used)
     }
 
+    /// The content box layout gave an element, in logical pixels: the box a
+    /// frame shows its document in. `None` before the element is laid out.
+    pub fn content_size_of(&self, node: NodeId) -> Option<(f32, f32)> {
+        let id = self.boxes.box_for(node)?;
+        let fragment = self
+            .layout
+            .as_ref()?
+            .1
+            .iter()
+            .find(|fragment| fragment.box_id == Some(id))?;
+        // A replaced box keeps no used edges; its border and padding are its
+        // style's, percentages taken against nothing, which is what a frame's
+        // padding almost never is.
+        let (border, padding) = match fragment.used {
+            Some(used) => (used.border, used.padding),
+            None => {
+                let style = &fragment.style;
+                (
+                    otlyra_css::Sides {
+                        top: style.border.top.width,
+                        right: style.border.right.width,
+                        bottom: style.border.bottom.width,
+                        left: style.border.left.width,
+                    },
+                    otlyra_css::Sides {
+                        top: style.padding.top.resolve(0.0),
+                        right: style.padding.right.resolve(0.0),
+                        bottom: style.padding.bottom.resolve(0.0),
+                        left: style.padding.left.resolve(0.0),
+                    },
+                )
+            }
+        };
+        let width = fragment.rect.width - border.left - border.right - padding.left - padding.right;
+        let height =
+            fragment.rect.height - border.top - border.bottom - padding.top - padding.bottom;
+        Some((width.max(0.0), height.max(0.0)))
+    }
+
     /// The background and mask pictures this page names and has not been
     /// given.
     ///
@@ -1354,6 +1393,18 @@ impl PageScene {
         self.damage.add(Damage::of(
             otlyra_layout::InvalidationReason::DocumentLoaded,
         ));
+    }
+
+    /// Take an element's picture away: a frame that closed shows nothing.
+    pub fn forget_image(&mut self, node: NodeId) {
+        self.picture_sources.remove(&node);
+        if self.images.borrow_mut().remove(&node).is_some() {
+            self.boxes_stale = true;
+            self.layout_stale = true;
+            self.damage.add(Damage::of(
+                otlyra_layout::InvalidationReason::DocumentLoaded,
+            ));
+        }
     }
 
     /// Show what script last drew into a `<canvas>`.
