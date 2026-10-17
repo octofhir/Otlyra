@@ -245,24 +245,44 @@ impl DocumentRef {
     #[static_method(name = "__storageSet")]
     fn js_storage_set(which: u32, key: String, value: String) -> Result<(), JsError> {
         let (area, origin) = super::storage_area(which);
+        let old = area.get(&origin, &key);
         area.set(&origin, &key, &value).map_err(|_| {
             tree::exception(
                 "QuotaExceededError",
                 format!("setting {key:?} would go over the storage quota"),
             )
-        })
+        })?;
+        if which == 0 && old.as_deref() != Some(value.as_str()) {
+            super::record_storage_change(&area, &origin, Some(key), old, Some(value));
+        }
+        Ok(())
     }
 
     #[static_method(name = "__storageRemove")]
     fn js_storage_remove(which: u32, key: String) {
         let (area, origin) = super::storage_area(which);
+        let old = area.get(&origin, &key);
         area.remove(&origin, &key);
+        if which == 0 && old.is_some() {
+            super::record_storage_change(&area, &origin, Some(key), old, None);
+        }
     }
 
     #[static_method(name = "__storageClear")]
     fn js_storage_clear(which: u32) {
         let (area, origin) = super::storage_area(which);
+        let had = area.length(&origin) > 0;
         area.clear(&origin);
+        if which == 0 && had {
+            super::record_storage_change(&area, &origin, None, None, None);
+        }
+    }
+
+    /// The next `storage` event: whether the key, old and new values are
+    /// present and what they are, then the changing document's address.
+    #[static_method(name = "__storageNextEvent")]
+    fn js_storage_next_event() -> Option<Vec<String>> {
+        super::with_state_value(|state| state.next_storage_event()).flatten()
     }
 
     /// How many nodes the document has made, for the custom element

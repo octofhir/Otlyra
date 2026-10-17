@@ -750,20 +750,26 @@ impl ScriptRunner for PageScripts {
     fn pump_workers(&mut self, document: &mut Document) -> bool {
         let workers = self.state.drain_workers();
         let sockets = self.state.sockets.drain();
-        if !workers && !sockets {
+        let storage = self.state.drain_storage();
+        if !workers && !sockets && !storage {
             return false;
         }
-        let source = match (workers, sockets) {
-            (true, true) => "__otlyraWorkerDeliver(); __otlyraSocketDeliver();",
-            (true, false) => "__otlyraWorkerDeliver();",
-            _ => "__otlyraSocketDeliver();",
-        };
+        let mut source = String::new();
+        if workers {
+            source.push_str("__otlyraWorkerDeliver();");
+        }
+        if sockets {
+            source.push_str("__otlyraSocketDeliver();");
+        }
+        if storage {
+            source.push_str("__otlyraStorageDeliver();");
+        }
         let Self { host, state, .. } = self;
         let Some(host) = host.as_mut() else {
             return false;
         };
         let outcome = crate::dom::loan(document, state, || {
-            host.run_classic_script(source, "<worker>")
+            host.run_classic_script(&source, "<worker>")
         });
         self.absorb_turn();
         if let Err(error) = outcome {

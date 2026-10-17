@@ -110,6 +110,7 @@ const DEFINES: &[&str] = &[
     "Worker",
     "__otlyraWorkerDeliver",
     "__otlyraSocketDeliver",
+    "__otlyraStorageDeliver",
     "CanvasRenderingContext2D",
     "CanvasGradient",
     "CanvasPattern",

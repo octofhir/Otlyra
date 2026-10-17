@@ -145,6 +145,12 @@ pub struct PageState {
     /// with the origin's other documents. `None` keeps them in
     /// [`PageState::own_storage`].
     storage: Option<[std::sync::Arc<crate::storage::StorageArea>; 2]>,
+    /// Which document this is to the storage log, and the last change in
+    /// the log it has heard.
+    storage_source: u64,
+    storage_seen: u64,
+    /// `storage` events waiting for the glue.
+    storage_events: std::collections::VecDeque<Vec<String>>,
     /// Storage that is this document's alone: for a document the browser
     /// gave none, and for one with no origin to share it under.
     own_storage: [std::sync::Arc<crate::storage::StorageArea>; 2],
@@ -247,7 +253,45 @@ impl PageState {
         local: std::sync::Arc<crate::storage::StorageArea>,
         session: std::sync::Arc<crate::storage::StorageArea>,
     ) {
+        static SOURCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.storage_source = SOURCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.storage_seen = local.latest();
         self.storage = Some([local, session]);
+    }
+
+    /// Take the changes other documents of this origin made to
+    /// `localStorage`, as `storage` events for the glue. Whether any wait.
+    pub fn drain_storage(&mut self) -> bool {
+        let Some([local, _]) = &self.storage else {
+            return false;
+        };
+        let Some(origin) = url::Url::parse(&self.document_url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .map(|url| url.origin().ascii_serialization())
+        else {
+            return false;
+        };
+        for change in local.changes_since(self.storage_seen, &origin, self.storage_source) {
+            self.storage_seen = self.storage_seen.max(change.seq);
+            // Present or absent, then the value, for each of the three.
+            let field = |value: &Option<String>| match value {
+                Some(value) => ["1".to_owned(), value.clone()],
+                None => ["0".to_owned(), String::new()],
+            };
+            let mut event = Vec::with_capacity(7);
+            event.extend(field(&change.key));
+            event.extend(field(&change.old));
+            event.extend(field(&change.new));
+            event.push(change.url);
+            self.storage_events.push_back(event);
+        }
+        !self.storage_events.is_empty()
+    }
+
+    /// The next `storage` event for the glue.
+    pub(crate) fn next_storage_event(&mut self) -> Option<Vec<String>> {
+        self.storage_events.pop_front()
     }
 
     /// Whether script changed the document, clearing the answer.
@@ -555,6 +599,28 @@ pub(crate) fn storage_area(which: u32) -> (std::sync::Arc<crate::storage::Storag
             ),
         }
     })
+}
+
+/// Log a change to `localStorage` for the other documents of the origin,
+/// and wake the browser to tell them.
+pub(crate) fn record_storage_change(
+    area: &crate::storage::StorageArea,
+    origin: &str,
+    key: Option<String>,
+    old: Option<String>,
+    new: Option<String>,
+) {
+    let (url, source) = with_state(|state| (state.document_url.clone(), state.storage_source));
+    area.record(crate::storage::StorageChange {
+        seq: 0,
+        origin: origin.to_owned(),
+        key,
+        old,
+        new,
+        url,
+        source,
+    });
+    crate::worker::wake();
 }
 
 /// One write to `document.cookie`.

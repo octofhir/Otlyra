@@ -55,4 +55,19 @@ function socketCheck() {
   source.addEventListener('tick', (event) => { socketAnswer.push(`tick:${event.data}:${event.lastEventId}`); source.close(); });
   return 'started';
 }
+
+// One tab listens for `storage` and the other writes: the listener hears the
+// other document's change, and the writer never hears its own.
+let storageAnswer = '';
+function storageListen() {
+  addEventListener('storage', (event) => {
+    storageAnswer = [event.key, event.oldValue, event.newValue, event.url.endsWith('/web-apis.html'), event.storageArea === localStorage].join(',');
+  });
+  return 'listening';
+}
+function storageWrite() {
+  localStorage.setItem('smoke', 'first');
+  localStorage.setItem('smoke', 'second');
+  return localStorage.getItem('smoke') + ':' + storageAnswer;
+}
 </script>

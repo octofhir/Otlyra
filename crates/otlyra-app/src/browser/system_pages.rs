@@ -154,6 +154,9 @@ impl Browser {
     /// where it is written are.
     pub fn persist_cookies(&mut self) {
         self.cookies.persist();
+        // What sites keep in `localStorage` goes with their cookies: the
+        // same person's, kept for the same reason, under the same rule.
+        self.world.persist_local_storage();
     }
 
     /// The jar, to hand to a loader before the browser is built.

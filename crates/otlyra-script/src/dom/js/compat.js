@@ -1199,7 +1199,8 @@ defineGlobal('FileReader', FileReader);
 
 // ---------------------------------------------------------------- Events
 // HTML §12.2.1: what another document's change to storage tells this one.
-// Nothing fires it yet; pages construct it and test for it.
+// Fired at the window by `__otlyraStorageDeliver`, for every change another
+// document of this origin made to `localStorage`.
 class StorageEvent extends Event {
   #init;
   constructor(type, init = {}) {
@@ -1229,6 +1230,21 @@ class StorageEvent extends Event {
   }
 }
 defineGlobal('StorageEvent', StorageEvent);
+
+const nativeStorageNextEvent = take(Document, '__storageNextEvent');
+defineGlobal('__otlyraStorageDeliver', () => {
+  let item;
+  while ((item = nativeStorageNextEvent()) !== null && item !== undefined) {
+    const [hasKey, key, hasOld, oldValue, hasNew, newValue, url] = item;
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: hasKey === '1' ? key : null,
+      oldValue: hasOld === '1' ? oldValue : null,
+      newValue: hasNew === '1' ? newValue : null,
+      url,
+      storageArea: localStorage,
+    }));
+  }
+});
 
 // CSS Font Loading §2: a face a page builds in script. The faces a page
 // names in its sheets load with the page; one made here is accepted and

@@ -315,6 +315,22 @@ def main() -> int:
                 poll(lambda: evaluate(client, context, "socketAnswer.length >= 6 ? [...socketAnswer].sort().join(' ') : ''")),
                 {"type": "string", "value": "HELLO close:1000:true es-open message:one open:chat tick:two:5"},
             ))
+            other = client.call("browsingContext.create", {"type": "tab"})["context"]
+            client.call(
+                "browsingContext.navigate",
+                {"context": other, "url": f"{origin}/web-apis.html", "wait": "complete"},
+            )
+            evaluate(client, other, "storageListen()")
+            checks.append((
+                "localStorage is shared and a change is a storage event in the other tab",
+                evaluate(client, context, "storageWrite()"),
+                {"type": "string", "value": "second:"},
+            ))
+            checks.append((
+                "the other tab heard the change",
+                poll(lambda: evaluate(client, other, "storageAnswer")),
+                {"type": "string", "value": "smoke,first,second,true,true"},
+            ))
             server.shutdown()
 
             failed = 0

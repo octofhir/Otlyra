@@ -219,6 +219,8 @@ pub(super) struct PageWorld {
     cookie_jar: Option<otlyra_net::SharedJar>,
     /// What `localStorage` keeps, for every origin, shared by every tab.
     local_storage: std::sync::Arc<otlyra_script::storage::StorageArea>,
+    /// When `localStorage` was last written back.
+    storage_flushed: Option<std::time::Instant>,
     /// Legacy elapsed clock for runners without their own document origin.
     started: std::time::Instant,
     /// What has happened that the window has not been told.
@@ -249,6 +251,7 @@ impl PageWorld {
             font_fetches: HashMap::new(),
             cookie_jar: None,
             local_storage: std::sync::Arc::default(),
+            storage_flushed: None,
             started: std::time::Instant::now(),
             events: Vec::new(),
         }
@@ -390,6 +393,29 @@ impl PageWorld {
         self.local_storage.forget(&wanted);
         for slot in self.slots.values() {
             slot.session_storage.forget(&wanted);
+        }
+    }
+
+    /// Keep `localStorage` in the profile from now on: what the last run left,
+    /// and every change written back a moment after it is made. Called before
+    /// any page loads, so every page shares the one area.
+    pub(super) fn persist_local_storage(&mut self) {
+        if let Some(directory) = crate::preferences::directory() {
+            self.local_storage = std::sync::Arc::new(
+                otlyra_script::storage::StorageArea::persisted(directory.join("local-storage.tsv")),
+            );
+        }
+    }
+
+    /// Write `localStorage` back if it changed, at most once a second.
+    fn flush_local_storage(&mut self) {
+        if self.local_storage.is_dirty()
+            && self
+                .storage_flushed
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.local_storage.flush();
+            self.storage_flushed = Some(std::time::Instant::now());
         }
     }
 
@@ -543,6 +569,7 @@ impl PageWorld {
         }
         changed |= self.run_due_timers();
         changed |= self.pump_workers();
+        self.flush_local_storage();
         changed |= self.run_frame_callbacks();
         self.fetch_detached_pictures();
         self.fetch_module_imports();
