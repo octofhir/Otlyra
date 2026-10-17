@@ -66,8 +66,8 @@ pub fn prescan_scripts(bytes: &[u8]) -> Vec<String> {
     scanner.scripts().0
 }
 
-/// Every address a `<script type="module" src>` names, in document order,
-/// without repeats.
+/// Every address a `<script type="module" src>` or a
+/// `<link rel=modulepreload href>` names, in document order, without repeats.
 ///
 /// A module never blocks the parse, but its graph is fetched before it runs,
 /// and the entry is the first link in that chain: asking for it now saves the
@@ -228,6 +228,23 @@ impl<'a> Scanner<'a> {
                     && !list.contains(&src)
                 {
                     list.push(src);
+                }
+            } else if self.tag_named(b"link") {
+                self.at += 1 + b"link".len();
+                // A module the page says it will need: fetched with the entries,
+                // rather than a wave later when the module importing it has
+                // arrived and been read (HTML §4.6.7.17 `modulepreload`).
+                let [rel, href] = self.tag_attributes([b"rel".as_slice(), b"href"]);
+                let preload = rel.as_deref().is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("modulepreload"))
+                });
+                if preload
+                    && let Some(href) = href
+                    && !href.is_empty()
+                    && !modules.contains(&href)
+                {
+                    modules.push(href);
                 }
             } else if let Some(name) = RAW_TEXT.iter().find(|name| self.tag_named(name)) {
                 self.at += 1 + name.len();
@@ -497,6 +514,18 @@ mod tests {
                     <script type=MODULE src=n.js async></script><script type=module src=m.js></script>";
         assert_eq!(scripts(html), ["c.js"]);
         assert_eq!(prescan_module_scripts(html.as_bytes()), ["m.js", "n.js"]);
+    }
+
+    #[test]
+    fn a_module_preload_is_fetched_with_the_entries() {
+        let html = "<link rel=modulepreload href=dep.js><script type=module src=m.js></script>\
+                    <link rel='preload modulePreload' href=/Other.js><link rel=preload href=img.png>\
+                    <link rel=modulepreload href=m.js><link rel=modulepreload>";
+        assert_eq!(
+            prescan_module_scripts(html.as_bytes()),
+            ["dep.js", "m.js", "/Other.js"]
+        );
+        assert!(scripts(html).is_empty());
     }
 
     #[test]
