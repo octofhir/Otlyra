@@ -805,6 +805,18 @@ fn a_2d_canvas_draws_into_pixels_script_can_read() {
 }
 
 #[test]
+fn markup_set_from_script_keeps_a_leading_zero_width_no_break_space() {
+    let lines = run(r#"<script>
+  const div = document.createElement('div');
+  div.innerHTML = '\ufeffIssues';
+  const parsed = new DOMParser().parseFromString('\ufeffIssues', 'text/html');
+  check('innerHTML keeps it', div.textContent, '\ufeffIssues');
+  check('DOMParser keeps it', parsed.body.textContent, '\ufeffIssues');
+</script>"#);
+    assert_all_ok(&lines, 2);
+}
+
+#[test]
 fn script_selectors_take_has() {
     let lines = run(
         r#"<ul id=list><li class=a><b>x</b></li><li class=b></li></ul><script>

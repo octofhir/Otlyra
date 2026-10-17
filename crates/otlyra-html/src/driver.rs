@@ -530,6 +530,11 @@ impl HtmlParser {
         );
         let tokenizer_opts = TokenizerOpts {
             initial_state: Some(tree_builder.tokenizer_state_for_context_elem(true)),
+            // A fragment is a string, never a byte stream: a U+FEFF at its
+            // start is a character of it, not a byte order mark. Dropped, the
+            // `innerHTML` a page sets no longer matches the text the server
+            // sent for the same element, and React's hydration fails on it.
+            discard_bom: false,
             ..TokenizerOpts::default()
         };
 
