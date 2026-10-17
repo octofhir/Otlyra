@@ -358,9 +358,19 @@ pub fn build_display_list_with(tree: &FragmentTree, frame: &Frame<'_>) -> PageLi
                     // The group's bound is the screen, and the screen does not
                     // scroll.
                     list.set_spatial(SpatialId::VIEWPORT);
+                    // A masked group has to be a surface of its own: its mask is
+                    // composited destination-in against it, and drawn straight
+                    // onto the page the mask would cut the page beneath away too.
+                    // A backend draws a group at full opacity straight on, so a
+                    // masked one asks for the largest opacity below one, which no
+                    // eight-bit pixel can tell from one.
+                    let alpha = match masked && fragment.style.opacity >= 1.0 {
+                        true => f32::from_bits(1.0_f32.to_bits() - 1),
+                        false => fragment.style.opacity,
+                    };
                     list.push(DisplayItem::PushLayer {
                         blend: BlendMode::default(),
-                        alpha: fragment.style.opacity,
+                        alpha,
                         transform: Affine::IDENTITY,
                         // The whole viewport: a group is a compositing step, not a
                         // clip, and a box whose contents reach outside it still

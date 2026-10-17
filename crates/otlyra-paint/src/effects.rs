@@ -55,12 +55,16 @@ pub(super) fn close(
             ),
             alpha: 1.0,
             transform: Affine::IDENTITY,
+            // A little past the border box: what the box drew outside it is
+            // masked away too (the mask's clip is the border box), and the
+            // smoothed edge of a box at a fractional position is outside it.
             clip: otlyra_gfx::kurbo::Rect::new(
                 f64::from(rect.x),
                 f64::from(rect.y),
                 f64::from(rect.right()),
                 f64::from(rect.bottom()),
             )
+            .inflate(2.0, 2.0)
             .to_path(crate::PATH_TOLERANCE),
         });
         for layer in fragment.style.masks.iter().rev() {

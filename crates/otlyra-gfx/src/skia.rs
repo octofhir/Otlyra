@@ -1288,7 +1288,11 @@ impl PaintTarget for SkiaPainter {
         // pushed with the identity, and doubles a scrolling panel the moment the
         // whole list is scaled for a HiDPI screen.
         canvas.concat(&matrix);
-        canvas.clip_path(&path, sk::ClipOp::Intersect, true);
+        // A layer composited destination-in (a mask) keeps of what is beneath
+        // it as much as it covers; a smoothed edge covers part of a pixel and
+        // would keep the rest of it, outlining the mask in what it removed.
+        let smooth = blend.compose != peniko::Compose::DestIn;
+        canvas.clip_path(&path, sk::ClipOp::Intersect, smooth);
         canvas.reset_matrix();
         if isolated {
             let mut paint = sk::Paint::default();

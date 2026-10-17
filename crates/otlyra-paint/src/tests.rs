@@ -1529,6 +1529,17 @@ fn a_mask_is_drawn_destination_in_over_the_box() {
         ],
         "{kinds:?}"
     );
+    // The group the mask cuts is a surface of its own, however opaque: drawn
+    // straight onto the page, the mask would cut away the page beneath too.
+    let group_alpha = list.items().iter().find_map(|item| match item {
+        DisplayItem::PushLayer { blend, alpha, .. }
+            if blend.compose != otlyra_gfx::peniko::Compose::DestIn =>
+        {
+            Some(*alpha)
+        }
+        _ => None,
+    });
+    assert!(group_alpha.is_some_and(|alpha| alpha < 1.0 && alpha > 0.999));
 }
 
 /// `visibility: hidden` draws nothing of the box, and nothing is hit there,
