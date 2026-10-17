@@ -2382,6 +2382,23 @@ mod tests {
         }
     }
 
+    /// Thai is written without spaces between words, and breaks between them
+    /// all the same: where they are is found in a dictionary, which is what a
+    /// browser carries for the scripts that need one.
+    #[test]
+    fn thai_breaks_between_words_it_does_not_space() {
+        let mut engine = engine();
+        let text = "สวัสดีครับยินดีต้อนรับสู่ประเทศไทย";
+        let whole = engine.shape(text, &test_stack(), 16.0, None);
+        let narrow = engine.shape(text, &test_stack(), 16.0, Some(whole.metrics.width / 2.0));
+        assert!(
+            narrow.metrics.line_count > 1,
+            "one line {} wide in {}",
+            narrow.metrics.width,
+            whole.metrics.width / 2.0
+        );
+    }
+
     fn span(text: &str, size: f32, brush: Brush) -> TextSpan<'_> {
         TextSpan {
             brush,

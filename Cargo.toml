@@ -104,8 +104,11 @@ resvg = { version = "=0.48.1", default-features = false, features = [
     "raster-images",
 ] }
 
-# Font enumeration, CSS family matching, shaping and line breaking.
-parley = "=0.11.1"
+# Font enumeration, CSS family matching, shaping and line breaking. With the
+# dictionaries for the scripts written without spaces between words — Thai, Lao,
+# Khmer, Burmese for lines, Chinese and Japanese for words — which is a few
+# megabytes of binary, and what every browser carries.
+parley = { version = "=0.11.1", features = ["complex-scripts"] }
 
 # Reading a font's own tables. Already in the tree as parley's own dependency and
 # pinned to the same version, so this costs no package and cannot pull a second
