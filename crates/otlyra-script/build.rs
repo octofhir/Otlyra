@@ -41,6 +41,8 @@ const SOURCES: &[&str] = &[
     "src/dom/js/compat.js",
     "src/dom/js/canvas.js",
     "src/dom/js/network.js",
+    "src/dom/js/clone.js",
+    "src/dom/js/worker.js",
     "src/dom/js/indexeddb.js",
 ];
 
@@ -104,6 +106,8 @@ const DEFINES: &[&str] = &[
     "localStorage",
     "sessionStorage",
     "Path2D",
+    "Worker",
+    "__otlyraWorkerDeliver",
     "CanvasRenderingContext2D",
     "CanvasGradient",
     "CanvasPattern",

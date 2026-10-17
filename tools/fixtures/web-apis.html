@@ -23,4 +23,21 @@ function canvasCheck() {
   const at = (x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data).join(',');
   return [at(4, 4), at(20, 4), at(36, 4), at(60, 30), ctx.measureText('Wide').width > 10].join(' ');
 }
+
+// Starts a worker, posts it a value with a cycle in it, and keeps what the
+// worker said back in `workerAnswer`: through structured clone both ways,
+// `importScripts` and `fetch` through the page. The answer comes turns later,
+// so the driver polls for it.
+let workerAnswer = '';
+function workerCheck() {
+  new Promise((resolve) => {
+    const worker = new Worker('web-apis-worker.js');
+    worker.onmessage = (event) => { resolve(event.data); worker.terminate(); };
+    worker.onerror = (event) => resolve('error: ' + event.message);
+    const message = { when: new Date(0), bytes: new Uint8Array([1, 2]) };
+    message.self = message;
+    worker.postMessage(message);
+  }).then((answer) => { workerAnswer = answer; });
+  return 'started';
+}
 </script>

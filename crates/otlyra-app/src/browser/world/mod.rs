@@ -526,10 +526,28 @@ impl PageWorld {
             changed |= self.receive(fetched);
         }
         changed |= self.run_due_timers();
+        changed |= self.pump_workers();
         changed |= self.run_frame_callbacks();
         self.fetch_detached_pictures();
         self.fetch_module_imports();
         self.fetch_page_requests();
+        changed
+    }
+
+    /// Hand each page what its workers sent, and send on what they asked
+    /// for: the next `fetch_page_requests` takes their requests with the
+    /// page's own.
+    fn pump_workers(&mut self) -> bool {
+        let mut changed = false;
+        for slot in self.slots.values_mut() {
+            let (Some(scripts), Some(page)) = (slot.scripts.as_mut(), slot.page.as_mut()) else {
+                continue;
+            };
+            if page.with_document(|document| scripts.pump_workers(document)) {
+                after_script_turn(page, scripts.as_mut());
+                changed = true;
+            }
+        }
         changed
     }
 

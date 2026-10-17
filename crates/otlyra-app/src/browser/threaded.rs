@@ -454,6 +454,12 @@ impl WindowBrowser {
                         let _ = wake_sender.send(Command::Wake);
                     }
                 });
+                // A worker's message wakes the content thread as a response
+                // does: it may be asleep with no timer due.
+                let worker_waker = waker.clone();
+                otlyra_script::worker::set_wake(std::sync::Arc::new(move || {
+                    worker_waker.wake();
+                }));
                 let (viewport, queued) = if native_surface {
                     // Painter::set_waker also pumps ready loads. Attach the
                     // services without that pump until the OS viewport arrives.

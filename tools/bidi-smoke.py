@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
@@ -125,6 +126,18 @@ def evaluate(client: Client, context: str, expression: str) -> dict:
         "script.evaluate",
         {"expression": expression, "target": {"context": context}, "awaitPromise": True},
     )["result"]
+
+
+def poll(read, seconds: float = 10.0) -> dict:
+    """What `read` answers once it is a non-empty string, or its last answer
+    when that takes longer than `seconds`: for what a page learns turns
+    after it asked."""
+    deadline = time.monotonic() + seconds
+    while True:
+        answer = read()
+        if answer.get("value") or time.monotonic() >= deadline:
+            return answer
+        time.sleep(0.05)
 
 
 def main() -> int:
@@ -235,6 +248,12 @@ def main() -> int:
                 "a 2D canvas draws shapes, transforms, pictures and text",
                 evaluate(client, context, "canvasCheck()"),
                 {"type": "string", "value": "255,0,0,255 0,0,255,255 0,255,0,255 0,0,0,0 true"},
+            ))
+            evaluate(client, context, "workerCheck()")
+            checks.append((
+                "a dedicated worker imports, fetches and answers through structured clone",
+                poll(lambda: evaluate(client, context, "workerAnswer")),
+                {"type": "string", "value": "true,true,1,2,imported,true,undefined"},
             ))
             server.shutdown()
 

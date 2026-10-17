@@ -136,6 +136,34 @@ impl DocumentRef {
         super::set_document_url(href, kind);
     }
 
+    /// Start a dedicated worker on the script at `url`, or on `source` when
+    /// the page read it from an object URL: its number, or null when the page
+    /// may have no more. Not part of the platform: `worker.js` calls these.
+    #[static_method(name = "__workerStart")]
+    fn js_worker_start(url: String, module: bool, source: Option<String>) -> Option<f64> {
+        super::with_state_value(|state| state.workers.start(url, module, source))
+            .flatten()
+            .map(|id| id as f64)
+    }
+
+    #[static_method(name = "__workerPost")]
+    fn js_worker_post(id: f64, data: String) {
+        super::with_state_mut(|state| state.workers.post(id as u64, data));
+    }
+
+    #[static_method(name = "__workerTerminate")]
+    fn js_worker_terminate(id: f64) {
+        super::with_state_mut(|state| state.workers.terminate(id as u64));
+    }
+
+    /// The next message or error a worker sent: `[id, type, data]`, or null.
+    #[static_method(name = "__workerNextEvent")]
+    fn js_worker_next_event() -> Option<Vec<String>> {
+        super::with_state_value(|state| state.workers.next_event())
+            .flatten()
+            .map(|(id, kind, data)| vec![id.to_string(), kind.to_owned(), data])
+    }
+
     /// Whether the media query list `query` matches the window as it is now
     /// (CSSOM View §4.2): the `matches` of a `MediaQueryList`. Not part of
     /// the platform.

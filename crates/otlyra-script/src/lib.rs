@@ -45,6 +45,7 @@ pub mod host;
 pub mod page;
 pub mod storage;
 pub mod timers;
+pub mod worker;
 
 pub use dom::DocumentCookies;
 pub use host::{ScriptError, ScriptHost, ScriptOutcome};

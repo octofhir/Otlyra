@@ -132,6 +132,8 @@ pub struct PageState {
     canvases: std::collections::HashMap<otlyra_dom::NodeId, otlyra_gfx::canvas2d::Canvas2D>,
     /// The canvases drawn into since the browser last took their pixels.
     dirty_canvases: Vec<otlyra_dom::NodeId>,
+    /// The page's dedicated workers.
+    pub(crate) workers: crate::worker::Workers,
     /// Where `document.cookie` reads and writes. `None` is a document with no
     /// cookies at all, which reads as empty and keeps nothing.
     cookies: Option<Cookies>,
@@ -330,6 +332,29 @@ impl PageState {
     /// Take the pictures detached elements asked for.
     pub fn take_image_requests(&mut self) -> Vec<otlyra_dom::NodeId> {
         std::mem::take(&mut self.image_requests)
+    }
+
+    /// Take what the page's workers sent: their requests become page
+    /// requests, and whether messages or errors wait for the glue.
+    pub fn drain_workers(&mut self) -> bool {
+        let Self {
+            workers,
+            page_requests,
+            next_request,
+            ..
+        } = self;
+        workers.drain(|url, script| {
+            *next_request += 1;
+            page_requests.push(otlyra_html::PageRequest {
+                id: *next_request,
+                method: "GET".to_owned(),
+                url,
+                headers: Vec::new(),
+                body: None,
+                script,
+            });
+            *next_request
+        }) || workers.has_events()
     }
 
     /// Take a copy of each canvas bitmap drawn into since this was last

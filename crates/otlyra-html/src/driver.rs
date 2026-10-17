@@ -326,6 +326,13 @@ pub trait ScriptRunner {
         Vec::new()
     }
 
+    /// Take in what the page's workers sent since this was last asked:
+    /// their messages and errors as events for the page's script, their
+    /// requests as page requests. Whether any script ran.
+    fn pump_workers(&mut self, _document: &mut Document) -> bool {
+        false
+    }
+
     /// The request the page numbered `id` was answered: a response, or why
     /// there is none — a network failure, or a response the page may not
     /// read. The runner settles whatever was waiting on it.

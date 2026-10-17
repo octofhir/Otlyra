@@ -204,7 +204,10 @@ impl ScriptHost {
             // page that answers yes is sent down the Node path: `require`,
             // `Buffer`, `module.exports` — none of which a page has. js-md5,
             // Airbnb's and Notion's bundles all failed on it.
-            .process_global(false);
+            .process_global(false)
+            // The page's `Worker` is ours (`worker.rs`): a thread and an
+            // isolate per worker, with its network through the browser's.
+            .worker_global(false);
         // The web platform Otter already has, then the part of it that knows
         // what a document is, which is ours. Order matters only in that both
         // are registered before the first script runs.
@@ -424,7 +427,7 @@ impl ScriptHost {
 /// in the same queue as them, which is the one liberty taken. Bounded,
 /// because a callback that changes what it observes would otherwise never let
 /// the task end.
-fn microtask_checkpoint(runtime: &mut Runtime) -> Result<(), OtterError> {
+pub(crate) fn microtask_checkpoint(runtime: &mut Runtime) -> Result<(), OtterError> {
     const ROUNDS: usize = 64;
     for _ in 0..ROUNDS {
         runtime.run_microtasks()?;

@@ -364,6 +364,11 @@ impl PageScripts {
         id: u64,
         response: Result<otlyra_html::PageResponse, String>,
     ) {
+        // A worker's request: the worker waits for it, the page's script
+        // never sees it.
+        if self.state.workers.answer(id, &response) {
+            return;
+        }
         self.state.stage_page_response(id, response);
         let Self { host, state, .. } = self;
         let Some(host) = host.as_mut() else {
@@ -713,6 +718,25 @@ impl ScriptRunner for PageScripts {
 
     fn take_canvas_frames(&mut self) -> Vec<(NodeId, otlyra_dom::Bitmap)> {
         self.state.take_canvas_frames()
+    }
+
+    fn pump_workers(&mut self, document: &mut Document) -> bool {
+        if !self.state.drain_workers() {
+            return false;
+        }
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return false;
+        };
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script("__otlyraWorkerDeliver()", "<worker>")
+        });
+        self.absorb_turn();
+        if let Err(error) = outcome {
+            self.failed += 1;
+            tracing::error!(target: "page.script", %error, "a worker's message failed");
+        }
+        true
     }
 
     fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
