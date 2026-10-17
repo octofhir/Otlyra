@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>web APIs</title>
+<!-- Served over HTTP by tools/bidi-smoke.py, which calls these functions
+     through script.evaluate and compares what they answer. -->
+<img id="picture" src="pixel.png" width="2" height="2">
+<canvas id="canvas" width="64" height="32"></canvas>
+<script>
+// Draws, then reads back: a rectangle, a path through a transform, text, and
+// the picture above drawn into the bitmap.
+function canvasCheck() {
+  const ctx = document.getElementById('canvas').getContext('2d');
+  ctx.fillStyle = '#ff0000';
+  ctx.fillRect(0, 0, 8, 8);
+  ctx.save();
+  ctx.translate(16, 0);
+  ctx.beginPath();
+  ctx.arc(4, 4, 4, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgb(0, 0, 255)';
+  ctx.fill();
+  ctx.restore();
+  ctx.drawImage(document.getElementById('picture'), 32, 0, 8, 8);
+  const at = (x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data).join(',');
+  return [at(4, 4), at(20, 4), at(36, 4), at(60, 30), ctx.measureText('Wide').width > 10].join(' ');
+}
+</script>

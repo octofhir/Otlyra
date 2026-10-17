@@ -7,10 +7,14 @@ Starts the browser with `--bidi 0` (the port it binds is printed on stdout),
 connects with a minimal standard-library WebSocket client, loads the
 `tools/fixtures/bidi-input.html` fixture, clicks its button and types into its
 field through `input.performActions`, and reads what the page heard through
-`script.evaluate` and `script.callFunction`. Exits non-zero on any mismatch.
+`script.evaluate` and `script.callFunction`. Then it serves the fixtures over
+loopback HTTP and checks the web APIs in `web-apis.html` through
+`script.evaluate`. Exits non-zero on any mismatch.
 """
 
 import base64
+import functools
+import http.server
 import json
 import os
 import pathlib
@@ -19,9 +23,24 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 
-FIXTURE = pathlib.Path(__file__).resolve().parent / "fixtures" / "bidi-input.html"
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+FIXTURE = FIXTURES / "bidi-input.html"
+
+
+def serve_fixtures() -> http.server.ThreadingHTTPServer:
+    """The fixtures over HTTP on a free loopback port, for the checks of APIs
+    a `file:` page does not get the way a web page does."""
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args) -> None:
+            pass
+
+    handler = functools.partial(Quiet, directory=str(FIXTURES))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 class Client:
@@ -205,6 +224,19 @@ def main() -> int:
                 },
             )["result"]
             checks.append(("callFunction answers by value", called, {"type": "number", "value": 42}))
+
+            server = serve_fixtures()
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            client.call(
+                "browsingContext.navigate",
+                {"context": context, "url": f"{origin}/web-apis.html", "wait": "complete"},
+            )
+            checks.append((
+                "a 2D canvas draws shapes, transforms, pictures and text",
+                evaluate(client, context, "canvasCheck()"),
+                {"type": "string", "value": "255,0,0,255 0,0,255,255 0,255,0,255 0,0,0,0 true"},
+            ))
+            server.shutdown()
 
             failed = 0
             for name, actual, expected in checks:

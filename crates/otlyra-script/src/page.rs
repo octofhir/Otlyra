@@ -711,6 +711,10 @@ impl ScriptRunner for PageScripts {
         self.state.take_image_requests()
     }
 
+    fn take_canvas_frames(&mut self) -> Vec<(NodeId, otlyra_dom::Bitmap)> {
+        self.state.take_canvas_frames()
+    }
+
     fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
         self.state.take_scroll_request()
     }

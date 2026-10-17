@@ -996,10 +996,10 @@ impl Builder<'_> {
             // has been decoded, which none is; and before it, or without one,
             // nothing, at the default object size (§15.4.1, §4.8.9).
             (&ns!(html), "video") => Some(self.picture(node).unwrap_or(Replaced::EMPTY)),
-            // A bitmap as big as the element's attributes say (§4.12.5.1), and
-            // transparent: nothing draws into it without the scripting API.
+            // A bitmap as big as the element's attributes say (§4.12.5.1):
+            // what script last drew into it, or transparent.
             (&ns!(html), "canvas") => Some(Replaced {
-                image: None,
+                image: self.images.get(&node).map(|picture| picture.data.clone()),
                 intrinsic: Some(canvas_size(element)),
             }),
             (&ns!(html), "iframe") => Some(Replaced::EMPTY),

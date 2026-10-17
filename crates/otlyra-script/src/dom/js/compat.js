@@ -197,11 +197,9 @@ defineGlobal('localStorage', makeStorage(0));
 defineGlobal('sessionStorage', makeStorage(1));
 
 // ---------------------------------------------------------------- Path2D
-// A path for a 2D canvas (HTML §4.12.5.1.16). There is no canvas backend
-// yet, so nothing draws one; the interface is here because libraries extend
-// or feature-test it at load (`Path2D.prototype.roundRect ||= …`), and a
-// missing global stops the whole bundle. It keeps the commands it is given,
-// so a later backend has them.
+// A path for a 2D canvas (HTML §4.12.5.1.16). It keeps the commands it is
+// given, and `canvas.js` replays them into the bitmap's own path when one is
+// filled, stroked or clipped to.
 const kPathCommands = Symbol('pathCommands');
 class Path2D {
   constructor(path) {

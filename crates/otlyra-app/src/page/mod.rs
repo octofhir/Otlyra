@@ -382,11 +382,12 @@ impl PageScene {
         images: Images,
         picture_sources: std::collections::HashMap<NodeId, (String, f32)>,
     ) -> Self {
+        let images = std::rc::Rc::new(std::cell::RefCell::new(images));
         Self {
             base: document_base_url(&document, &url),
             url,
             sources,
-            images: std::rc::Rc::new(std::cell::RefCell::new(images)),
+            images,
             script_styler: None,
             script_size: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0))),
             picture_sources,
@@ -1355,10 +1356,55 @@ impl PageScene {
         ));
     }
 
+    /// Show what script last drew into a `<canvas>`.
+    ///
+    /// A canvas is a replaced element whose content is its bitmap, so this is
+    /// [`PageScene::set_image`] without a file: the box tree is built again
+    /// with the new pixels in it.
+    pub fn set_canvas(&mut self, node: NodeId, bitmap: otlyra_dom::Bitmap) {
+        let data = otlyra_gfx::peniko::ImageData {
+            data: otlyra_gfx::peniko::Blob::new(std::sync::Arc::new(BitmapBytes(bitmap.pixels))),
+            format: otlyra_gfx::peniko::ImageFormat::Rgba8,
+            alpha_type: if bitmap.premultiplied {
+                otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied
+            } else {
+                otlyra_gfx::peniko::ImageAlphaType::Alpha
+            },
+            width: bitmap.width,
+            height: bitmap.height,
+        };
+        self.images
+            .borrow_mut()
+            .insert(node, otlyra_layout::Picture::new(data));
+        self.boxes_stale = true;
+        self.layout_stale = true;
+        self.damage.add(Damage::of(
+            otlyra_layout::InvalidationReason::DocumentLoaded,
+        ));
+    }
+
     /// Hand over a picture the page asked for.
     pub fn set_picture(&mut self, url: String, picture: crate::fetcher::Decoded) {
         self.background_pictures.insert(url, picture);
         self.damage.add(Damage::PAINT);
+    }
+}
+
+/// A picture's bytes, lent to script as a [`otlyra_dom::Bitmap`].
+pub(crate) struct SharedPixels(pub(crate) otlyra_gfx::peniko::Blob<u8>);
+
+impl AsRef<[u8]> for SharedPixels {
+    fn as_ref(&self) -> &[u8] {
+        self.0.data()
+    }
+}
+
+/// A canvas bitmap's bytes, drawn as a picture.
+struct BitmapBytes(std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
+
+impl AsRef<[u8]> for BitmapBytes {
+    fn as_ref(&self) -> &[u8] {
+        (*self.0).as_ref()
     }
 }
 

@@ -773,6 +773,38 @@ fn attribute_nodes_are_removed_and_path2d_is_there() {
 }
 
 #[test]
+fn a_2d_canvas_draws_into_pixels_script_can_read() {
+    let lines = run(r#"<canvas id=c width=40 height=20></canvas><script>
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  check('the same context each time', [ctx === canvas.getContext('2d'), canvas.getContext('webgl')], [true, null]);
+  ctx.fillStyle = 'rgb(255, 0, 0)';
+  ctx.fillRect(0, 0, 10, 10);
+  check('a filled rectangle is in the pixels', Array.from(ctx.getImageData(5, 5, 1, 1).data), [255, 0, 0, 255]);
+  check('outside it is transparent', Array.from(ctx.getImageData(30, 15, 1, 1).data), [0, 0, 0, 0]);
+  ctx.fillStyle = 'nonsense';
+  check('a colour that does not parse is ignored', ctx.fillStyle, '#ff0000');
+  ctx.translate(20, 0);
+  const path = new Path2D();
+  path.rect(0, 0, 5, 5);
+  ctx.fillStyle = '#00f';
+  ctx.fill(path);
+  check('a Path2D is drawn through the transform', Array.from(ctx.getImageData(22, 2, 1, 1).data), [0, 0, 255, 255]);
+  check('isPointInPath reads the transformed path', ctx.isPointInPath(path, 22, 2), true);
+  const image = ctx.createImageData(1, 1);
+  image.data.set([1, 2, 3, 255]);
+  ctx.putImageData(image, 39, 19);
+  check('putImageData writes straight pixels', Array.from(ctx.getImageData(39, 19, 1, 1).data), [1, 2, 3, 255]);
+  ctx.font = 'bold 12px sans-serif';
+  check('font reads back and text measures', [ctx.font, ctx.measureText('abc').width > 10], ['bold 12px sans-serif', true]);
+  check('toDataURL is a PNG', canvas.toDataURL().startsWith('data:image/png;base64,iVBOR'), true);
+  canvas.width = 40;
+  check('setting the width clears it', Array.from(ctx.getImageData(5, 5, 1, 1).data), [0, 0, 0, 0]);
+</script>"#);
+    assert_all_ok(&lines, 10);
+}
+
+#[test]
 fn script_selectors_take_has() {
     let lines = run(
         r#"<ul id=list><li class=a><b>x</b></li><li class=b></li></ul><script>

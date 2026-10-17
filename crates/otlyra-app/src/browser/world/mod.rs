@@ -617,6 +617,33 @@ impl PageWorld {
         if pictures.is_empty() {
             return;
         }
+        // The pixels each element now shows, lent to its script for
+        // `drawImage`: the decoded file, the same bytes the page draws.
+        let Some((here, base)) = self
+            .slots
+            .get(&tab)
+            .and_then(|slot| slot.page.as_ref())
+            .map(|page| (page.url().to_string(), page.base_url().clone()))
+        else {
+            return;
+        };
+        let bitmaps: Vec<Option<otlyra_dom::Bitmap>> = pictures
+            .iter()
+            .map(|(_, src, size)| {
+                size.as_ref()?;
+                let url = Self::subresource_url(&here, &base, src)?;
+                let image = self.images.get(&url)?.image;
+                (image.format == otlyra_gfx::peniko::ImageFormat::Rgba8).then(|| {
+                    otlyra_dom::Bitmap {
+                        width: image.width,
+                        height: image.height,
+                        premultiplied: image.alpha_type
+                            == otlyra_gfx::peniko::ImageAlphaType::AlphaPremultiplied,
+                        pixels: std::sync::Arc::new(crate::page::SharedPixels(image.data)),
+                    }
+                })
+            })
+            .collect();
         let Some(slot) = self.slots.get_mut(&tab) else {
             return;
         };
@@ -626,7 +653,8 @@ impl PageWorld {
         };
         let mut events = Vec::with_capacity(pictures.len());
         page.with_document(|document| {
-            for (node, src, size) in pictures {
+            for ((node, src, size), bitmap) in pictures.into_iter().zip(bitmaps) {
+                document.set_bitmap(node, bitmap);
                 let state = otlyra_dom::ImageState { src, size };
                 // The same answer again — a preloaded picture put in the
                 // document, a window choosing the same file — is not news.
@@ -879,6 +907,9 @@ fn after_script_turn(page: &mut PageScene, scripts: &mut dyn otlyra_html::Script
     let detached = scripts.take_image_requests();
     if !detached.is_empty() {
         page.note_detached_pictures(detached);
+    }
+    for (node, bitmap) in scripts.take_canvas_frames() {
+        page.set_canvas(node, bitmap);
     }
     if let Some((_, y)) = scripts.take_scroll_request() {
         page.set_scroll(y as f32);

@@ -41,6 +41,7 @@
 //! of that is needed — a binding that guessed at damage levels would be a
 //! second, quieter invalidation system beside the real one.
 
+mod canvas;
 mod character_data;
 mod document;
 mod element;
@@ -127,6 +128,10 @@ pub struct PageState {
     /// Pictures asked for by `<img>` elements outside the document — a
     /// `new Image()` preloading — which nothing else would fetch.
     image_requests: Vec<otlyra_dom::NodeId>,
+    /// Each `<canvas>` element's 2D bitmap, made when script first draws.
+    canvases: std::collections::HashMap<otlyra_dom::NodeId, otlyra_gfx::canvas2d::Canvas2D>,
+    /// The canvases drawn into since the browser last took their pixels.
+    dirty_canvases: Vec<otlyra_dom::NodeId>,
     /// Where `document.cookie` reads and writes. `None` is a document with no
     /// cookies at all, which reads as empty and keeps nothing.
     cookies: Option<Cookies>,
@@ -327,6 +332,30 @@ impl PageState {
         std::mem::take(&mut self.image_requests)
     }
 
+    /// Take a copy of each canvas bitmap drawn into since this was last
+    /// asked: what the page shows for those elements now.
+    pub fn take_canvas_frames(&mut self) -> Vec<(otlyra_dom::NodeId, otlyra_dom::Bitmap)> {
+        let dirty = std::mem::take(&mut self.dirty_canvases);
+        dirty
+            .into_iter()
+            .filter_map(|node| {
+                let canvas = self.canvases.get_mut(&node)?;
+                let (width, height) = canvas.size();
+                let pixels: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+                    std::sync::Arc::new(canvas.pixels());
+                Some((
+                    node,
+                    otlyra_dom::Bitmap {
+                        width: width.max(1),
+                        height: height.max(1),
+                        premultiplied: true,
+                        pixels,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// Whether the page listens for wheel events.
     #[must_use]
     pub fn wants_wheel_events(&self) -> bool {
@@ -372,6 +401,12 @@ pub(crate) fn with_state<R>(read: impl FnOnce(&PageState) -> R) -> R {
 }
 
 /// Change the lent page state, if there is one.
+/// Change the page's state and answer something from it; `None` while no
+/// page's state is loaned.
+pub(crate) fn with_state_value<R>(change: impl FnOnce(&mut PageState) -> R) -> Option<R> {
+    STATE.with(|slot| slot.borrow_mut().as_mut().map(change))
+}
+
 pub(crate) fn with_state_mut(change: impl FnOnce(&mut PageState)) {
     STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {

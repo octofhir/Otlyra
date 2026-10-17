@@ -105,6 +105,8 @@ pub struct Document {
     form: crate::form::FormState,
     /// What became of each element's picture, by element.
     images: std::collections::HashMap<NodeId, ImageState>,
+    /// The pixels of each element's decoded picture, for script to draw.
+    bitmaps: std::collections::HashMap<NodeId, Bitmap>,
     /// The element that has the focus, as the browser last settled it or
     /// script last asked.
     focused: Option<NodeId>,
@@ -154,6 +156,32 @@ pub struct ImageState {
     pub size: Option<(u32, u32)>,
 }
 
+/// A decoded picture's pixels, lent to script: what `drawImage` draws from
+/// an `<img>`, and what a `<canvas>` hands the page each time script draws.
+///
+/// RGBA, four bytes a pixel, row after row. Shared, never copied on the way:
+/// a picture is the same bytes the page draws.
+#[derive(Clone)]
+pub struct Bitmap {
+    /// Its width in pixels.
+    pub width: u32,
+    /// Its height in pixels.
+    pub height: u32,
+    /// Whether each colour is already multiplied by its alpha.
+    pub premultiplied: bool,
+    /// The pixels.
+    pub pixels: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+}
+
+impl std::fmt::Debug for Bitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bitmap")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Document {
     /// An empty document: a root node and nothing else.
     pub fn new() -> Self {
@@ -173,6 +201,7 @@ impl Document {
             refused: 0,
             form: crate::form::FormState::new(),
             images: std::collections::HashMap::new(),
+            bitmaps: std::collections::HashMap::new(),
             focused: None,
             scroll: (0.0, 0.0),
             geometry: std::sync::Arc::default(),
@@ -511,6 +540,20 @@ impl Document {
     /// Record what became of `node`'s picture.
     pub fn set_image_state(&mut self, node: NodeId, state: ImageState) {
         self.images.insert(node, state);
+    }
+
+    /// The pixels of `node`'s decoded picture, if it has one.
+    pub fn bitmap(&self, node: NodeId) -> Option<Bitmap> {
+        self.bitmaps.get(&node).cloned()
+    }
+
+    /// Lend script the pixels of `node`'s decoded picture, or take them
+    /// back.
+    pub fn set_bitmap(&mut self, node: NodeId, bitmap: Option<Bitmap>) {
+        match bitmap {
+            Some(bitmap) => self.bitmaps.insert(node, bitmap),
+            None => self.bitmaps.remove(&node),
+        };
     }
 
     /// The state of the document's controls.

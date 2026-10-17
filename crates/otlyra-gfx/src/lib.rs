@@ -32,6 +32,7 @@
 //! 4. **Adding a required method is a four-backend cost.** New capability goes in as
 //!    a provided method over the seven, or it does not go in.
 
+pub mod canvas2d;
 mod display_list;
 mod hit_test;
 mod paint_target;

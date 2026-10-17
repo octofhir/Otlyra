@@ -502,6 +502,19 @@ accessor(HTMLImageElement.prototype, 'naturalHeight', function () {
 accessor(HTMLImageElement.prototype, 'complete', function () {
   return this.__otlyraImageState()[2] === 1;
 });
+// `width` and `height` answer with what is drawn: the rendered size, else
+// the attribute, else the picture's own size (HTML §4.8.4.3.8) — which is
+// what a `new Image()` that has loaded tells a script measuring it.
+for (const [name, index] of [['width', 0], ['height', 1]]) {
+  const { set } = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, name);
+  accessor(HTMLImageElement.prototype, name, function () {
+    const rect = this.isConnected ? this.__otlyraClientRect() : null;
+    if (rect) return Math.round(index === 0 ? rect[2] - rect[0] : rect[3] - rect[1]);
+    const attribute = parseInt(this.getAttribute(name), 10);
+    if (attribute >= 0) return attribute;
+    return this.__otlyraImageState()[index];
+  }, set);
+}
 const nativeImageSource = take(Element.prototype, '__otlyraImageSource');
 // The file the browser picked and has an answer for, resolved; before
 // that, `src`.
@@ -567,17 +580,7 @@ accessor(HTMLMapElement.prototype, 'areas', function () {
 
 reflectUnsigned(HTMLCanvasElement, 'width', 'width', 300);
 reflectUnsigned(HTMLCanvasElement, 'height', 'height', 150);
-// No canvas backend yet: `getContext` answers as a browser that does not offer
-// the context asked for does, and a page falls back to what it draws without.
-method(HTMLCanvasElement.prototype, 'getContext', function getContext() {
-  return null;
-});
-method(HTMLCanvasElement.prototype, 'toDataURL', function toDataURL() {
-  return 'data:,';
-});
-method(HTMLCanvasElement.prototype, 'toBlob', function toBlob(callback) {
-  if (typeof callback === 'function') Promise.resolve().then(() => callback(null));
-});
+// Its context and bitmap are in `canvas.js`.
 
 // Media that cannot play: the members a page reads before it decides what to
 // do, answering as an element with nothing loaded does (HTML §4.8.11).

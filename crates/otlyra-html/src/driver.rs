@@ -163,6 +163,12 @@ pub trait ScriptRunner {
         Vec::new()
     }
 
+    /// The `<canvas>` bitmaps script drew into since this was last asked,
+    /// each as it now is.
+    fn take_canvas_frames(&mut self) -> Vec<(NodeId, otlyra_dom::Bitmap)> {
+        Vec::new()
+    }
+
     /// Where script asked the window to scroll to since this was last asked.
     fn take_scroll_request(&mut self) -> Option<(f64, f64)> {
         None

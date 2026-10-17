@@ -3682,9 +3682,11 @@ dependencies = [
 name = "otlyra-script"
 version = "0.0.0"
 dependencies = [
+ "cssparser",
  "html5ever",
  "otlyra-css",
  "otlyra-dom",
+ "otlyra-gfx",
  "otlyra-html",
  "otter-bytecode",
  "otter-compiler",

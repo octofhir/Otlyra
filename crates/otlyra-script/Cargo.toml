@@ -43,6 +43,10 @@ otlyra-html.workspace = true
 # Selector matching, for `querySelector`. The engine is written once, in the
 # crate the cascade already uses it from.
 otlyra-css.workspace = true
+# The 2D canvas's bitmaps are drawn with the painter's Skia, on the CPU; and
+# its colours are read with the parser's own colour tables.
+otlyra-gfx.workspace = true
+cssparser.workspace = true
 
 html5ever.workspace = true
 thiserror.workspace = true

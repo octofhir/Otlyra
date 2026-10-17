@@ -50,7 +50,7 @@ pub use shadow::ShadowMode;
 pub use sink::DomSink;
 pub use submit::{Encoding, Method, Submission};
 pub use tree::{
-    ComputedStyles, Document, DocumentId, GeometryResolver, ImageState, StyleResolver,
+    Bitmap, ComputedStyles, Document, DocumentId, GeometryResolver, ImageState, StyleResolver,
     is_valid_custom_element_name,
 };
 pub use xpath::{XPathError, select as xpath_select};

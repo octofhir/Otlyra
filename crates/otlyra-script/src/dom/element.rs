@@ -327,6 +327,44 @@ impl ElementRef {
         })
     }
 
+    /// One 2D context operation on this `<canvas>` element's bitmap: what
+    /// `canvas.js` calls for every method and setting. `numbers` are its
+    /// arguments, as a `Float64Array`, `text` its string one, `source` the element `drawImage`
+    /// draws from; the answer, when there is one, is numbers. Not part of
+    /// the platform.
+    #[method(name = "__otlyraCanvas", length = 4)]
+    fn js_canvas(
+        &self,
+        op: String,
+        numbers: otter_runtime::marshal::BufferSource,
+        text: Option<String>,
+        source: Option<NodeRef>,
+    ) -> Result<Option<Vec<f64>>, JsError> {
+        let id = self.node.id;
+        // A `Float64Array`'s bytes, in the platform's order.
+        let numbers: Vec<f64> = numbers
+            .as_ref()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| f64::from_ne_bytes(*bytes))
+            .collect();
+        let source = source
+            .filter(|node| node.doc == self.node.doc)
+            .map(|node| node.id);
+        super::with_document_unmarked(self.node.doc, |document| {
+            super::canvas::run(document, id, &op, &numbers, text.as_deref(), source)
+        })
+    }
+
+    /// This `<canvas>` element's bitmap as a PNG, base64: what `toDataURL`
+    /// puts in its URL. Not part of the platform.
+    #[method(name = "__otlyraCanvasPng")]
+    fn js_canvas_png(&self) -> Result<Option<String>, JsError> {
+        let id = self.node.id;
+        super::with_document_unmarked(self.node.doc, |document| super::canvas::png(document, id))
+    }
+
     /// A detached `<img>` was given a `src`: ask the browser for its picture.
     #[method(name = "__otlyraRequestImage")]
     fn js_request_image(&self) {
