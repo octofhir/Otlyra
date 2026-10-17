@@ -1766,6 +1766,16 @@ mod tests {
         assert_eq!((image.width, image.height, scale), (10, 5, 1.0));
     }
 
+    /// The transparent pixel counters answer with: a GIF of one pixel, with
+    /// one colour in its table.
+    #[test]
+    fn a_one_pixel_gif_decodes() {
+        const PIXEL: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\
+            \x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        let image = decode_image(PIXEL).expect("a gif");
+        assert_eq!((image.width, image.height), (1, 1));
+    }
+
     /// A pixel read back from a `read_rgba8` buffer.
     fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * width + x) * 4) as usize;

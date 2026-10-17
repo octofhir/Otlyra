@@ -881,11 +881,20 @@ impl PageWorld {
                     .iter()
                     .any(|resource| matches!(resource, PendingResource::Image(..)))
                     .then(|| {
+                        let (status, bytes) = (loaded.status, loaded.bytes.len());
+                        let content_type = loaded.content_type.clone();
                         loaded
                             .picture()
-                            .inspect_err(
-                                |error| tracing::warn!(url = %fetched.url, %error, "image failed to decode"),
-                            )
+                            .inspect_err(|error| {
+                                tracing::warn!(
+                                    url = %fetched.url,
+                                    %error,
+                                    ?status,
+                                    ?content_type,
+                                    bytes,
+                                    "image failed to decode"
+                                )
+                            })
                             .ok()
                     })
                     .flatten();
@@ -937,8 +946,8 @@ impl PageWorld {
                                     .insert(node, image.clone().for_element(density));
                                 pending.picture_sources.insert(node, (src, density));
                             }
+                            // Said once already, where it was decoded.
                             None => {
-                                tracing::warn!(url = %fetched.url, "image failed to decode");
                                 pictures.push((node, src, None));
                             }
                         },

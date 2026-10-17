@@ -395,7 +395,14 @@ impl PageWorld {
                 true
             }
             Err(error) => {
-                tracing::warn!(%url, %error, "background picture failed to decode");
+                tracing::warn!(
+                    %url,
+                    %error,
+                    status = ?loaded.status,
+                    content_type = ?loaded.content_type,
+                    bytes = loaded.bytes.len(),
+                    "background picture failed to decode"
+                );
                 false
             }
         }
@@ -441,7 +448,17 @@ impl PageWorld {
                 true
             }
             Err(error) => {
-                tracing::warn!(%src, %error, "picture failed to decode");
+                // What came instead of a picture says why: a counter's pixel
+                // answered with an empty body or a page is not a broken decoder.
+                tracing::warn!(
+                    %src,
+                    %error,
+                    status = ?loaded.status,
+                    content_type = ?loaded.content_type,
+                    bytes = loaded.bytes.len(),
+                    final_url = %loaded.final_url,
+                    "picture failed to decode"
+                );
                 self.record_pictures(tab, vec![(node, src, None)]);
                 false
             }
