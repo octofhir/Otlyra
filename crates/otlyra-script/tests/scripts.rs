@@ -826,6 +826,38 @@ fn media_query_lists_follow_the_window() {
     );
 }
 
+/// `prefers-color-scheme` answers the reader's palette, and a list it flips
+/// hears `change` when the palette does.
+#[test]
+fn media_query_lists_follow_the_palette() {
+    let sink = Arc::new(Captured::default());
+    let mut scripts = Box::new(PageScripts::with_console(
+        "https://palette.test/",
+        sink.clone(),
+    ));
+    scripts.set_initial_viewport(800.0, 600.0, 1.0);
+    scripts.set_initial_color_scheme(false);
+    let mut parser = HtmlParser::new().with_script_runner(scripts);
+    let mut document = otlyra_dom::Document::new();
+    parser.feed(
+        &mut document,
+        r#"<script>
+        const dark = matchMedia('(prefers-color-scheme: dark)');
+        console.log('initial', dark.matches);
+        dark.addEventListener('change', (event) => console.log('dark', event.matches));
+    </script>"#
+            .into(),
+    );
+    let mut runner = parser.finish(&mut document).unwrap();
+    runner.set_color_scheme(&mut document, true);
+    runner.set_color_scheme(&mut document, true);
+    runner.set_color_scheme(&mut document, false);
+    assert_eq!(
+        lines(&sink),
+        ["Log: initial false", "Log: dark true", "Log: dark false"]
+    );
+}
+
 #[test]
 fn an_external_script_whose_source_is_in_hand_runs_where_the_document_names_it() {
     let sink = Arc::new(Captured::default());

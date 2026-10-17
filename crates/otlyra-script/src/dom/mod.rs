@@ -98,6 +98,8 @@ pub struct PageState {
     hidden: bool,
     /// CSS viewport and device scale supplied by the embedder.
     viewport: WindowViewport,
+    /// Whether the reader asks pages for the dark palette.
+    dark: bool,
     // None in the cheap default placeholder used while a state is loaned.
     clock: Option<crate::clock::PageClock>,
     /// Where the page's script thinks it is. `location` is built from it.
@@ -282,6 +284,16 @@ impl PageState {
 
     pub(crate) fn viewport(&self) -> WindowViewport {
         self.viewport
+    }
+
+    /// Whether the reader asks for the dark palette.
+    pub(crate) fn dark(&self) -> bool {
+        self.dark
+    }
+
+    /// Say which palette the reader asks for.
+    pub(crate) fn set_dark(&mut self, dark: bool) {
+        self.dark = dark;
     }
 
     pub(crate) fn set_viewport(&mut self, viewport: WindowViewport) {
@@ -640,13 +652,18 @@ pub(crate) fn window_metric(which: u32) -> f64 {
 /// Whether `query` matches the window this page is shown in, answered the
 /// way the cascade answers `@media`.
 pub(crate) fn media_matches(query: &str) -> bool {
-    let viewport = with_state(|state| state.viewport);
+    let (viewport, dark) = with_state(|state| (state.viewport, state.dark));
     otlyra_css::cascade::media_condition_matches(
         query,
         otlyra_css::cascade::Viewport {
             width: viewport.width as f32,
             height: viewport.height as f32,
             scale: viewport.scale as f32,
+            color_scheme: if dark {
+                otlyra_css::cascade::ColorScheme::Dark
+            } else {
+                otlyra_css::cascade::ColorScheme::Light
+            },
             ..otlyra_css::cascade::Viewport::default()
         },
     )

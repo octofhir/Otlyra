@@ -336,6 +336,12 @@ if (typeof CustomEvent === 'undefined' && typeof Event !== 'undefined') {
 }
 
 if (typeof navigator === 'object' && navigator) {
+  // The string the network sends as `User-Agent`; the engine's own default
+  // names the engine, not the browser.
+  const userAgent = take(Document, '__userAgent')();
+  for (const [name, value] of [['userAgent', userAgent], ['appVersion', userAgent.slice('Mozilla/'.length)]]) {
+    Object.defineProperty(navigator, name, { value, writable: false, enumerable: true, configurable: true });
+  }
   // It cannot send, and says so rather than pretending: a page that believes
   // its beacon left is a page that will not try the request another way.
   define(navigator, 'sendBeacon', () => false);
@@ -344,10 +350,10 @@ if (typeof navigator === 'object' && navigator) {
   define(navigator, 'onLine', true);
   define(navigator, 'cookieEnabled', true);
   // Strings, as every browser has them, because sniffing code calls
-  // `navigator.platform.indexOf(…)` without asking first. Empty is what the
-  // standard allows a browser that does not say, and what Firefox's
-  // `vendor` is.
-  define(navigator, 'platform', '');
+  // `navigator.platform.indexOf(…)` without asking first. The platform is the
+  // one the user agent names; an empty `vendor` is what the standard allows
+  // a browser that does not say, and what Firefox's is.
+  define(navigator, 'platform', 'MacIntel');
   define(navigator, 'vendor', '');
   define(navigator, 'maxTouchPoints', 0);
 }

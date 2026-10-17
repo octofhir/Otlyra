@@ -95,6 +95,11 @@ impl PageScripts {
         self.state.set_clock(Some(crate::clock::PageClock::at(at)));
     }
 
+    /// The palette the page starts with, before its first script runs.
+    pub fn set_initial_color_scheme(&mut self, dark: bool) {
+        self.state.set_dark(dark);
+    }
+
     /// Set dimensions before the first page script, without a resize event.
     pub fn set_initial_viewport(&mut self, width: f64, height: f64, scale: f64) {
         self.state
@@ -714,6 +719,28 @@ impl ScriptRunner for PageScripts {
 
     fn take_image_requests(&mut self) -> Vec<NodeId> {
         self.state.take_image_requests()
+    }
+
+    fn set_color_scheme(&mut self, document: &mut Document, dark: bool) {
+        if self.state.dark() == dark {
+            return;
+        }
+        self.state.set_dark(dark);
+        if self.seen == 0 {
+            return;
+        }
+        let Self { host, state, .. } = self;
+        let Some(host) = host.as_mut() else {
+            return;
+        };
+        let outcome = crate::dom::loan(document, state, || {
+            host.run_classic_script("__otlyraMediaChanged();", "<appearance>")
+        });
+        self.absorb_turn();
+        if let Err(error) = outcome {
+            self.failed += 1;
+            tracing::error!(target: "page.script", %error, "a media query listener failed");
+        }
     }
 
     fn take_canvas_frames(&mut self) -> Vec<(NodeId, otlyra_dom::Bitmap)> {

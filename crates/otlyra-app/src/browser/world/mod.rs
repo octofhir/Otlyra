@@ -256,6 +256,8 @@ impl PageWorld {
 
     /// Take the window's preferences and size as they stand now.
     pub(super) fn set_environment(&mut self, environment: Environment) {
+        let scheme_changed =
+            self.environment.viewport.color_scheme != environment.viewport.color_scheme;
         let mut viewport_changed = self.environment.viewport.width != environment.viewport.width
             || self.environment.viewport.height != environment.viewport.height
             || self.environment.viewport.scale != environment.viewport.scale;
@@ -271,6 +273,20 @@ impl PageWorld {
         {
             slot.viewport_zoom = Some(environment.page_zoom);
             viewport_changed = true;
+        }
+        if scheme_changed {
+            let dark = environment.viewport.color_scheme == otlyra_css::cascade::ColorScheme::Dark;
+            for slot in self.slots.values_mut() {
+                let (Some(page), Some(scripts)) = (slot.page.as_mut(), slot.scripts.as_mut())
+                else {
+                    continue;
+                };
+                page.with_document(|document| scripts.set_color_scheme(document, dark));
+                if scripts.take_mutated() {
+                    page.document_changed();
+                    self.environment_changed = true;
+                }
+            }
         }
         let visible = environment.visible_tab();
         if previous != visible {

@@ -534,6 +534,9 @@ impl PageWorld {
                     f64::from(viewport.height),
                     f64::from(viewport.scale),
                 );
+                scripts.set_initial_color_scheme(
+                    viewport.color_scheme == otlyra_css::cascade::ColorScheme::Dark,
+                );
                 let started = otlyra_html::start_parse(
                     &loaded.bytes,
                     loaded.charset.as_deref(),

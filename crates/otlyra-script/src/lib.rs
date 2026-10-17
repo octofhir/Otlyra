@@ -51,3 +51,11 @@ pub mod worker;
 pub use dom::DocumentCookies;
 pub use host::{ScriptError, ScriptHost, ScriptOutcome};
 pub use page::PageScripts;
+
+/// What `navigator.userAgent` says, in pages and in workers: the string the
+/// network layer sends as `User-Agent`, built the same way.
+pub const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ",
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Otlyra/",
+    env!("CARGO_PKG_VERSION")
+);

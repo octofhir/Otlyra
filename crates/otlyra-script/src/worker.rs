@@ -471,8 +471,9 @@ impl Thread {
             *interrupt = Some(runtime.interrupt_handle());
         }
         let setup = format!(
-            "{WORKER_GLOBAL}\n__otlyraWorkerSetup({});",
-            js_string(&self.url)
+            "{WORKER_GLOBAL}\n__otlyraWorkerSetup({}, {});",
+            js_string(&self.url),
+            js_string(crate::USER_AGENT)
         );
         run(&mut runtime, &setup, "<worker>")?;
 

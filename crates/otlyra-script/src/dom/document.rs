@@ -208,6 +208,12 @@ impl DocumentRef {
             .map(|(id, kind, data)| vec![id.to_string(), kind.to_owned(), data])
     }
 
+    /// What `navigator.userAgent` says. Not part of the platform.
+    #[static_method(name = "__userAgent")]
+    fn js_user_agent() -> String {
+        crate::USER_AGENT.to_owned()
+    }
+
     /// Whether the media query list `query` matches the window as it is now
     /// (CSSOM View §4.2): the `matches` of a `MediaQueryList`. Not part of
     /// the platform.

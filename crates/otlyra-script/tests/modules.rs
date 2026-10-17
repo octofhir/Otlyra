@@ -345,6 +345,19 @@ fn navigator_answers_the_strings_sniffing_code_reads() {
 }
 
 #[test]
+fn navigator_says_what_the_network_sends() {
+    let log = run(
+        "<script>console.log(navigator.userAgent, navigator.appVersion === navigator.userAgent.slice(8))</script>",
+        &[],
+    );
+    assert_eq!(log, [format!("{} true", otlyra_script::USER_AGENT)]);
+    assert!(
+        otlyra_script::USER_AGENT.contains("Chrome/")
+            && otlyra_script::USER_AGENT.contains("Otlyra/")
+    );
+}
+
+#[test]
 fn screen_reports_the_window_size() {
     let log = run(
         "<script>console.log(screen.width === Math.round(innerWidth), \

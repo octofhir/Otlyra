@@ -201,6 +201,13 @@ pub trait ScriptRunner {
         false
     }
 
+    /// The palette the reader asks pages for changed: what
+    /// `prefers-color-scheme` answers in `matchMedia`, and a `change` event
+    /// for each list that it flips.
+    fn set_color_scheme(&mut self, document: &mut Document, dark: bool) {
+        let _ = (document, dark);
+    }
+
     /// The CSS viewport changed between script turns or while parsing is paused.
     fn set_viewport(&mut self, document: &mut Document, width: f64, height: f64, scale: f64) {
         let _ = (document, width, height, scale);

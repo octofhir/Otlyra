@@ -442,6 +442,9 @@ impl Browser {
             PlatformEvent::AppearanceChanged(scheme) => {
                 self.scheme = scheme;
                 self.apply_theme();
+                // The pages hear it too: `prefers-color-scheme` in their
+                // `matchMedia` lists, and a `change` for the ones it flips.
+                self.sync_world();
             }
 
             // A context menu hangs off a point in a window that has just

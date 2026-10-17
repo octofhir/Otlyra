@@ -361,9 +361,18 @@ struct Hop {
     keeps_the_body: bool,
 }
 
-/// Identifies us to servers. Deliberately honest rather than imitating a browser
-/// whose behaviour we do not yet have.
-pub(crate) const USER_AGENT: &str = concat!("Otlyra/", env!("CARGO_PKG_VERSION"));
+/// Identifies us to servers: as the engine family whose pages we are built to
+/// show, and then as ourselves.
+///
+/// `Otlyra/0.0.0` alone was a browser no server had heard of, and they sent
+/// it their oldest page — or none. Every browser's string has carried another
+/// one's since 1996, for the same reason. The page's `navigator.userAgent`
+/// (`otlyra_script::USER_AGENT`) is the same string, built the same way.
+pub const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ",
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Otlyra/",
+    env!("CARGO_PKG_VERSION")
+);
 
 /// The process's network stack: one HTTP client.
 ///

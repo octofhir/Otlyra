@@ -97,9 +97,8 @@ hidden('fetch', function fetch(input, init = {}) {
   }
 });
 
-hidden('__otlyraWorkerSetup', (href) => {
+hidden('__otlyraWorkerSetup', (href, userAgent) => {
   hidden('location', new WorkerLocation(href));
-  const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Otlyra/0.1';
   hidden('navigator', {
     userAgent,
     appVersion: userAgent.slice('Mozilla/'.length),
