@@ -13,6 +13,15 @@ use otlyra_app::scene::DemoScene;
 use otlyra_app::{observability, run_window, write_screenshot};
 use otlyra_platform::{RendererBackend, StartupTrace, Viewport, WindowConfig};
 
+/// The page's work allocates small and often from one thread at a time: the
+/// script compiler's instruction and span buffers, style and layout records,
+/// shaped runs. mimalloc's thread-local free lists serve those in a few
+/// instructions where the system allocator takes a zone lock and a size
+/// lookup on every free, which on a script-heavy page was the largest single
+/// cost of compiling.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Evaluated by the first statement in `main` and carried to the platform loop,
 /// so startup milestones share one process-level origin.
 static PROCESS_STARTED: std::sync::LazyLock<std::time::Instant> =

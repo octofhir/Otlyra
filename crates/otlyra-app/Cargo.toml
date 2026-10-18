@@ -22,6 +22,8 @@ path = "src/lib.rs"
 fault-injection = ["otlyra-platform/fault-injection"]
 
 [dependencies]
+# The binary's global allocator; see `main.rs`.
+mimalloc.workspace = true
 otlyra-css.workspace = true
 otlyra-dom.workspace = true
 otlyra-gfx.workspace = true

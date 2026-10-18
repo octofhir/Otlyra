@@ -194,6 +194,8 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 # Data structures.
 smallvec = { version = "=1.15.2", features = ["union"] }
 rustc-hash = "=2.1.3"
+# The allocator the `otlyra` binary installs.
+mimalloc = { version = "=0.1.52", default-features = false }
 slotmap = "=1.1.1"
 
 # HTML tokenizer and tree construction. Hand-writing one to html5lib-green is
