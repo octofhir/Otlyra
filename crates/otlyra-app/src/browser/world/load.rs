@@ -1327,6 +1327,7 @@ impl PageWorld {
             if ran > 0 {
                 tracing::debug!(target: "page.script", ran, "the page settled");
             }
+            runner.keep_code_caches();
         }
         let settled = finishing.elapsed();
         // The isolate stays with the tab: its timers are still coming due and

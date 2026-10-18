@@ -52,6 +52,9 @@ pub struct PageScripts {
     /// Where the compiled form of fetched scripts and modules is kept between
     /// runs, when the browser keeps it.
     code_cache: Option<std::sync::Arc<crate::code_cache::CodeCache>>,
+    /// Each script run through the code cache, by specifier, with the key
+    /// its compiled form is kept under.
+    cached_scripts: Vec<(String, String)>,
 }
 
 impl PageScripts {
@@ -288,6 +291,7 @@ impl PageScripts {
             mutated: false,
             hold_load: false,
             code_cache: None,
+            cached_scripts: Vec::new(),
         }
     }
 
@@ -298,6 +302,23 @@ impl PageScripts {
             host.modules().produce_code_caches();
         }
         self.code_cache = Some(cache);
+    }
+
+    /// Keep each cached script's compiled form again, with the function
+    /// bodies it compiled since it ran, for the next load.
+    pub(crate) fn keep_script_caches(&mut self) {
+        let (Some(cache), Some(host)) = (&self.code_cache, self.host.as_mut()) else {
+            return;
+        };
+        let warm: Vec<(String, Vec<u8>)> = self
+            .cached_scripts
+            .iter()
+            .filter_map(|(specifier, key)| {
+                host.script_code_cache(specifier)
+                    .map(|bytes| (key.clone(), bytes))
+            })
+            .collect();
+        cache.store(warm);
     }
 
     /// Keep the compiled modules the page's module map produced since this
@@ -613,6 +634,7 @@ impl PageScripts {
             host,
             state,
             code_cache,
+            cached_scripts,
             ..
         } = self;
         // A fetched script's compiled form is kept by its text. One too
@@ -622,7 +644,12 @@ impl PageScripts {
             .filter(|_| source.len() >= crate::code_cache::MIN_SCRIPT_BYTES);
         state.set_current_script(Some(element));
         let outcome = crate::dom::loan(document, state, || match cache {
-            Some(cache) => Self::execute_cached(host, source, &specifier, cache),
+            Some(cache) => {
+                let key = crate::code_cache::CodeCache::script_key(source);
+                let outcome = Self::execute_cached(host, source, &specifier, &key, cache);
+                cached_scripts.push((specifier.clone(), key));
+                outcome
+            }
             None => Self::execute(host, source, &specifier),
         });
         state.set_current_script(None);
@@ -650,11 +677,11 @@ impl PageScripts {
         host: &mut Option<ScriptHost>,
         source: &str,
         specifier: &str,
+        key: &str,
         cache: &crate::code_cache::CodeCache,
     ) -> Option<Result<(), ScriptError>> {
         let host = host.as_mut()?;
-        let key = crate::code_cache::CodeCache::script_key(source);
-        let kept = cache.load(&key);
+        let kept = cache.load(key);
         Some(
             host.run_classic_script_cached(source, specifier, kept.as_deref())
                 .map(|(outcome, fresh)| {
@@ -666,7 +693,7 @@ impl PageScripts {
                         "script ran",
                     );
                     if let Some(fresh) = fresh {
-                        cache.store(vec![(key, fresh)]);
+                        cache.store(vec![(key.to_owned(), fresh)]);
                     }
                 }),
         )
@@ -733,6 +760,10 @@ impl ScriptRunner for PageScripts {
     fn release_load_event(&mut self, document: &mut Document) {
         self.hold_load = false;
         PageScripts::document_finished(self, document, true);
+    }
+
+    fn keep_code_caches(&mut self) {
+        self.keep_script_caches();
     }
 
     fn document_finished(&mut self, document: &mut Document, more_scripts_coming: bool) {

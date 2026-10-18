@@ -375,6 +375,14 @@ impl ScriptHost {
         })
     }
 
+    /// The bytes to keep for `specifier` in place of the ones
+    /// [`Self::run_classic_script_cached`] ran it from or returned, now that
+    /// its functions have run and compiled; `None` while those are still
+    /// the whole answer.
+    pub fn script_code_cache(&mut self, specifier: &str) -> Option<Vec<u8>> {
+        self.runtime.script_code_cache(specifier)
+    }
+
     /// Run one classic script, then take the microtask checkpoint.
     ///
     /// `specifier` names the script for diagnostics; for an inline one the

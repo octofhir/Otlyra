@@ -83,6 +83,10 @@ pub trait ScriptRunner {
         self.document_finished(document, false);
     }
 
+    /// The load is over: keep what the page's scripts compiled while it
+    /// ran, for the next load of the same scripts.
+    fn keep_code_caches(&mut self) {}
+
     /// Run an external script whose bytes have arrived.
     fn run_external(&mut self, source: &str, element: NodeId, document: &mut Document) {
         let _ = (source, element, document);
