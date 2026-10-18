@@ -337,6 +337,44 @@ impl ScriptHost {
         })
     }
 
+    /// [`Self::run_classic_script`] for a fetched script, compiled from
+    /// `cache` when it holds this script's compiled form; returns, beside the
+    /// outcome, fresh bytes to keep when it did not.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_classic_script`].
+    pub fn run_classic_script_cached(
+        &mut self,
+        source: &str,
+        specifier: &str,
+        cache: Option<&[u8]>,
+    ) -> Result<(ScriptOutcome, Option<Vec<u8>>), ScriptError> {
+        let guard = self.watchdog.begin();
+        custom_element_checkpoint(&mut self.runtime);
+        let result =
+            self.runtime
+                .run_script_cached(SourceInput::from_javascript(source), specifier, cache);
+        let drained = microtask_checkpoint(&mut self.runtime);
+        let interrupted = guard.finish();
+        let outcome = result.and_then(|(result, fresh)| {
+            drained.map(|()| {
+                (
+                    ScriptOutcome {
+                        completion: result.completion_string().to_owned(),
+                        duration: result.duration,
+                    },
+                    fresh,
+                )
+            })
+        });
+        outcome.map_err(|source| ScriptError {
+            specifier: specifier.to_owned(),
+            interrupted,
+            source,
+        })
+    }
+
     /// Run one classic script, then take the microtask checkpoint.
     ///
     /// `specifier` names the script for diagnostics; for an inline one the

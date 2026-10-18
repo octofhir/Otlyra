@@ -177,6 +177,14 @@ impl Browser {
         self.cache = Some(cache);
     }
 
+    /// Keep the compiled form of fetched scripts in `directory`, beside the
+    /// HTTP cache that fetched them and cleared with it.
+    pub fn set_code_cache(&mut self, directory: std::path::PathBuf) {
+        self.world.set_code_cache(std::sync::Arc::new(
+            otlyra_script::code_cache::CodeCache::new(directory),
+        ));
+    }
+
     /// What has already been fetched, for a surface that lists it or empties it.
     pub fn cache(&self) -> Option<&otlyra_net::SharedCache> {
         self.cache.as_ref()
@@ -234,10 +242,17 @@ impl Browser {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match action {
+            // A compiled script is filed by its address alone, and is only
+            // ever a faster way to the same answer: clearing a site clears
+            // them all.
             crate::cache::Action::ClearSite(site) => {
                 held.clear_site(&site);
+                self.world.clear_code_cache();
             }
-            crate::cache::Action::Clear => held.clear(),
+            crate::cache::Action::Clear => {
+                held.clear();
+                self.world.clear_code_cache();
+            }
             crate::cache::Action::Close | crate::cache::Action::None => {}
         }
     }

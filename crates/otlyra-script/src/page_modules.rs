@@ -105,13 +105,15 @@ impl PageScripts {
             let text = element_text(document, element);
             let key = WebModuleMap::inline_url(&self.document_url, self.modules.inline_count);
             self.modules.inline_count += 1;
-            map.deliver(
+            let kept = self.code_cache.as_ref().and_then(|cache| cache.load(&key));
+            map.deliver_cached(
                 &key,
                 Ok(WebModuleSource {
                     final_url: key.clone(),
                     content_type: Some("text/javascript".to_owned()),
                     text: text.clone(),
                 }),
+                kept,
             );
             ModuleScript {
                 element,
@@ -164,13 +166,15 @@ impl PageScripts {
         let Some(map) = self.module_map() else {
             return;
         };
-        map.deliver(
+        let kept = self.code_cache.as_ref().and_then(|cache| cache.load(url));
+        map.deliver_cached(
             url,
             response.map(|response| WebModuleSource {
                 final_url: response.final_url,
                 content_type: response.content_type,
                 text: response.text,
             }),
+            kept,
         );
         self.advance_modules(document);
     }
@@ -197,6 +201,12 @@ impl PageScripts {
     /// Run every module script whose turn it is, resume the `import()` calls
     /// whose modules arrived, and collect what is still to fetch.
     fn advance_modules(&mut self, document: &mut Document) {
+        self.advance_module_graphs(document);
+        // The walks just compiled whatever arrived; keep it for next time.
+        self.keep_module_caches();
+    }
+
+    fn advance_module_graphs(&mut self, document: &mut Document) {
         let Some(map) = self.module_map() else {
             return;
         };

@@ -52,6 +52,8 @@ html5ever.workspace = true
 # XML for `DOMParser` and `createDocument`'s documents: already in the graph
 # through the SVG rasterizer, so this costs no package.
 roxmltree.workspace = true
+# Naming a compiled script by its text, for the code cache.
+rustc-hash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # Resolving a module script's `src` against its document.

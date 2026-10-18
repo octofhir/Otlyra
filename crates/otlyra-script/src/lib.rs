@@ -13,6 +13,8 @@
 //!
 //! - [`capabilities`] — what page script is allowed to ask the host for, which
 //!   is nothing.
+//! - [`code_cache`] — the compiled form of a page's scripts, kept between
+//!   runs beside the HTTP cache.
 //! - [`console`] — `console.log` from a page, arriving in `tracing`.
 //! - [`host`] — the isolate itself, its lifetime, and running one script in it.
 //!
@@ -37,6 +39,7 @@
 extern crate otter_runtime as otter_vm;
 
 mod clock;
+pub mod code_cache;
 
 pub mod capabilities;
 pub mod console;

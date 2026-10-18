@@ -49,6 +49,9 @@ pub struct PageScripts {
     state: crate::dom::PageState,
     /// The document's module scripts that have not run yet.
     modules: modules::ModuleScripts,
+    /// Where the compiled form of fetched scripts and modules is kept between
+    /// runs, when the browser keeps it.
+    code_cache: Option<std::sync::Arc<crate::code_cache::CodeCache>>,
 }
 
 impl PageScripts {
@@ -284,7 +287,32 @@ impl PageScripts {
             failed: 0,
             mutated: false,
             hold_load: false,
+            code_cache: None,
         }
+    }
+
+    /// Run fetched scripts and modules from the compiled form an earlier run
+    /// kept in `cache`, and keep what this run compiles there.
+    pub fn set_code_cache(&mut self, cache: std::sync::Arc<crate::code_cache::CodeCache>) {
+        if let Some(host) = &self.host {
+            host.modules().produce_code_caches();
+        }
+        self.code_cache = Some(cache);
+    }
+
+    /// Keep the compiled modules the page's module map produced since this
+    /// was last called.
+    pub(crate) fn keep_module_caches(&self) {
+        let (Some(cache), Some(host)) = (&self.code_cache, &self.host) else {
+            return;
+        };
+        let fresh = host.modules().take_code_caches();
+        cache.store(
+            fresh
+                .into_iter()
+                .map(|fresh| (fresh.request_url, fresh.bytes))
+                .collect(),
+        );
     }
 
     /// Take back what the turn that just ended wrote into the page's state.
@@ -581,9 +609,22 @@ impl PageScripts {
             || format!("{} (external script {})", self.document_url, self.seen),
             str::to_owned,
         );
-        let Self { host, state, .. } = self;
+        let Self {
+            host,
+            state,
+            code_cache,
+            ..
+        } = self;
+        // A fetched script's compiled form is kept by its text. One too
+        // short to be worth a file compiles faster than the file reads.
+        let cache = code_cache
+            .as_deref()
+            .filter(|_| source.len() >= crate::code_cache::MIN_SCRIPT_BYTES);
         state.set_current_script(Some(element));
-        let outcome = crate::dom::loan(document, state, || Self::execute(host, source, &specifier));
+        let outcome = crate::dom::loan(document, state, || match cache {
+            Some(cache) => Self::execute_cached(host, source, &specifier, cache),
+            None => Self::execute(host, source, &specifier),
+        });
         state.set_current_script(None);
         self.absorb_turn();
         match outcome {
@@ -601,6 +642,34 @@ impl PageScripts {
                 );
             }
         }
+    }
+
+    /// [`Self::execute`] from the compiled form `cache` keeps for
+    /// `specifier`, keeping a fresh one when there was none to use.
+    fn execute_cached(
+        host: &mut Option<ScriptHost>,
+        source: &str,
+        specifier: &str,
+        cache: &crate::code_cache::CodeCache,
+    ) -> Option<Result<(), ScriptError>> {
+        let host = host.as_mut()?;
+        let key = crate::code_cache::CodeCache::script_key(source);
+        let kept = cache.load(&key);
+        Some(
+            host.run_classic_script_cached(source, specifier, kept.as_deref())
+                .map(|(outcome, fresh)| {
+                    tracing::debug!(
+                        target: "page.script",
+                        specifier,
+                        micros = outcome.duration.as_micros(),
+                        cached = fresh.is_none(),
+                        "script ran",
+                    );
+                    if let Some(fresh) = fresh {
+                        cache.store(vec![(key, fresh)]);
+                    }
+                }),
+        )
     }
 
     /// Run one script and report the outcome. The name is what diagnostics
@@ -889,10 +958,14 @@ impl ScriptRunner for PageScripts {
         let hidden = self.state.hidden();
         let viewport = self.state.viewport();
         let clock = self.state.clock();
+        let code_cache = self.code_cache.take();
         *self = Self::build(self.document_url.clone(), self.console.clone());
         self.state.set_hidden(hidden);
         self.state.set_viewport(viewport);
         self.state.set_clock(clock);
+        if let Some(code_cache) = code_cache {
+            self.set_code_cache(code_cache);
+        }
     }
 }
 

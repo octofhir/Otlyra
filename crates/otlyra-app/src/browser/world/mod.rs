@@ -224,6 +224,9 @@ pub(super) struct PageWorld {
     local_storage: std::sync::Arc<otlyra_script::storage::StorageArea>,
     /// When `localStorage` was last written back.
     storage_flushed: Option<std::time::Instant>,
+    /// Where pages keep the compiled form of their fetched scripts, once the
+    /// browser has a place for it.
+    code_cache: Option<std::sync::Arc<otlyra_script::code_cache::CodeCache>>,
     /// Legacy elapsed clock for runners without their own document origin.
     started: std::time::Instant,
     /// What has happened that the window has not been told.
@@ -256,6 +259,7 @@ impl PageWorld {
             cookie_jar: None,
             local_storage: std::sync::Arc::default(),
             storage_flushed: None,
+            code_cache: None,
             started: std::time::Instant::now(),
             events: Vec::new(),
         }
@@ -416,6 +420,22 @@ impl PageWorld {
             self.local_storage = std::sync::Arc::new(
                 otlyra_script::storage::StorageArea::persisted(directory.join("local-storage.tsv")),
             );
+        }
+    }
+
+    /// Keep the compiled form of every page's fetched scripts in `cache`.
+    pub(super) fn set_code_cache(
+        &mut self,
+        cache: std::sync::Arc<otlyra_script::code_cache::CodeCache>,
+    ) {
+        self.code_cache = Some(cache);
+    }
+
+    /// Forget every compiled script, with the HTTP cache they were fetched
+    /// through.
+    pub(super) fn clear_code_cache(&self) {
+        if let Some(cache) = &self.code_cache {
+            cache.clear();
         }
     }
 

@@ -836,6 +836,9 @@ fn browser_with_text(
     };
     browser.set_cookie_store(cookies);
     browser.set_cache(cache);
+    if let Some(directory) = otlyra_app::preferences::directory() {
+        browser.set_code_cache(directory.join(CODE_CACHE_FOLDER));
+    }
     browser
 }
 
@@ -897,6 +900,9 @@ fn browser_cache() -> otlyra_net::SharedCache {
 
 /// What the cache directory is called inside the browser's own directory.
 const CACHE_FOLDER: &str = "cache";
+
+/// And where the compiled form of fetched scripts is kept.
+const CODE_CACHE_FOLDER: &str = "code-cache";
 
 /// How much of somebody's disk this may take.
 ///
