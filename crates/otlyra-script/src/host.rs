@@ -383,6 +383,15 @@ impl ScriptHost {
         self.runtime.script_code_cache(specifier)
     }
 
+    /// The code caches to keep for the page's modules: each one compiled
+    /// since the last call, and each one whose functions compiled since,
+    /// with their bodies.
+    pub fn web_module_code_caches(
+        &mut self,
+    ) -> Vec<otter_runtime::web_modules::WebModuleCodeCache> {
+        self.runtime.web_module_code_caches()
+    }
+
     /// Run one classic script, then take the microtask checkpoint.
     ///
     /// `specifier` names the script for diagnostics; for an inline one the

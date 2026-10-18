@@ -322,12 +322,13 @@ impl PageScripts {
     }
 
     /// Keep the compiled modules the page's module map produced since this
-    /// was last called.
-    pub(crate) fn keep_module_caches(&self) {
-        let (Some(cache), Some(host)) = (&self.code_cache, &self.host) else {
+    /// was last called, and every module again whose functions compiled
+    /// since, with their bodies.
+    pub(crate) fn keep_module_caches(&mut self) {
+        let (Some(cache), Some(host)) = (&self.code_cache, self.host.as_mut()) else {
             return;
         };
-        let fresh = host.modules().take_code_caches();
+        let fresh = host.web_module_code_caches();
         cache.store(
             fresh
                 .into_iter()
@@ -764,6 +765,7 @@ impl ScriptRunner for PageScripts {
 
     fn keep_code_caches(&mut self) {
         self.keep_script_caches();
+        self.keep_module_caches();
     }
 
     fn document_finished(&mut self, document: &mut Document, more_scripts_coming: bool) {
