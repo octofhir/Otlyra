@@ -300,6 +300,7 @@ impl PageScripts {
     pub fn set_code_cache(&mut self, cache: std::sync::Arc<crate::code_cache::CodeCache>) {
         if let Some(host) = &self.host {
             host.modules().produce_code_caches();
+            host.set_engine_code_cache(std::sync::Arc::clone(&cache));
         }
         self.code_cache = Some(cache);
     }
@@ -766,6 +767,11 @@ impl ScriptRunner for PageScripts {
     fn keep_code_caches(&mut self) {
         self.keep_script_caches();
         self.keep_module_caches();
+        if self.code_cache.is_some()
+            && let Some(host) = self.host.as_mut()
+        {
+            host.keep_eval_code_caches();
+        }
     }
 
     fn document_finished(&mut self, document: &mut Document, more_scripts_coming: bool) {

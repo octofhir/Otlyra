@@ -383,6 +383,20 @@ impl ScriptHost {
         self.runtime.script_code_cache(specifier)
     }
 
+    /// Keep the compiled form of the large `eval` text pages run in
+    /// `cache`, and read it back from there.
+    pub fn set_engine_code_cache(&self, cache: std::sync::Arc<crate::code_cache::CodeCache>) {
+        self.runtime.set_code_cache_hook(Some(std::sync::Arc::new(
+            crate::code_cache::EngineCodeCache(cache),
+        )));
+    }
+
+    /// Store again each cached `eval` whose functions compiled since it ran,
+    /// with their bodies.
+    pub fn keep_eval_code_caches(&mut self) {
+        self.runtime.keep_eval_code_caches();
+    }
+
     /// The code caches to keep for the page's modules: each one compiled
     /// since the last call, and each one whose functions compiled since,
     /// with their bodies.

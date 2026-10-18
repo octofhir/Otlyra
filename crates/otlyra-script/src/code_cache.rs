@@ -10,6 +10,8 @@
 //!
 //! - [`CodeCache`] — one directory, one file per key: a module's URL, or a
 //!   classic script's text ([`CodeCache::script_key`]).
+//! - [`EngineCodeCache`] — the same directory as the engine's own hook, for
+//!   the `eval` text it keeps by keys of its own.
 //!
 //! # Invariants
 //!
@@ -38,6 +40,21 @@ const MAGIC: &[u8] = b"otlyra-code-cache\n";
 
 /// Largest file worth keeping or reading back.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The engine's code-cache hook over a [`CodeCache`]: what the engine keeps
+/// itself, which is the text a page hands `eval`, filed beside the scripts.
+#[derive(Debug)]
+pub struct EngineCodeCache(pub std::sync::Arc<CodeCache>);
+
+impl otter_runtime::RuntimeCodeCacheHook for EngineCodeCache {
+    fn load(&self, key: &str) -> Option<Vec<u8>> {
+        self.0.load(&format!("engine:{key}"))
+    }
+
+    fn store(&self, key: &str, bytes: Vec<u8>) {
+        self.0.store(vec![(format!("engine:{key}"), bytes)]);
+    }
+}
 
 /// Shortest script worth a file: below this, compiling it again costs less
 /// than opening and checking what was kept.
