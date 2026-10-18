@@ -375,6 +375,40 @@ impl ScriptHost {
         })
     }
 
+    /// [`Self::run_classic_script_cached`] for a script prepared on another
+    /// thread ([`otter_runtime::PreparedScript::prepare`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_classic_script`].
+    pub fn run_prepared_script(
+        &mut self,
+        prepared: otter_runtime::PreparedScript,
+    ) -> Result<(ScriptOutcome, Option<Vec<u8>>), ScriptError> {
+        let specifier = prepared.specifier().to_owned();
+        let guard = self.watchdog.begin();
+        custom_element_checkpoint(&mut self.runtime);
+        let result = self.runtime.run_prepared_script(prepared);
+        let drained = microtask_checkpoint(&mut self.runtime);
+        let interrupted = guard.finish();
+        let outcome = result.and_then(|(result, fresh)| {
+            drained.map(|()| {
+                (
+                    ScriptOutcome {
+                        completion: result.completion_string().to_owned(),
+                        duration: result.duration,
+                    },
+                    fresh,
+                )
+            })
+        });
+        outcome.map_err(|source| ScriptError {
+            specifier,
+            interrupted,
+            source,
+        })
+    }
+
     /// The bytes to keep for `specifier` in place of the ones
     /// [`Self::run_classic_script_cached`] ran it from or returned, now that
     /// its functions have run and compiled; `None` while those are still

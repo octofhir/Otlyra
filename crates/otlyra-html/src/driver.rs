@@ -87,6 +87,12 @@ pub trait ScriptRunner {
     /// ran, for the next load of the same scripts.
     fn keep_code_caches(&mut self) {}
 
+    /// An external script's bytes arrived from `url`: start compiling it
+    /// where it does not hold up the parse. [`Self::run_external`] runs it.
+    fn prepare_external(&mut self, source: &str, url: &str) {
+        let _ = (source, url);
+    }
+
     /// Run an external script whose bytes have arrived.
     fn run_external(&mut self, source: &str, element: NodeId, document: &mut Document) {
         let _ = (source, element, document);

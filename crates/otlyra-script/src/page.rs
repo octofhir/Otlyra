@@ -55,6 +55,56 @@ pub struct PageScripts {
     /// Each script run through the code cache, by specifier, with the key
     /// its compiled form is kept under.
     cached_scripts: Vec<(String, String)>,
+    /// Fetched scripts being compiled, or read back from the code cache, on
+    /// the preparing threads, by the key their compiled form is kept under.
+    preparing:
+        std::collections::HashMap<String, std::sync::mpsc::Receiver<otter_runtime::PreparedScript>>,
+    /// The threads that prepare them, started with the first.
+    workers: Option<ScriptWorkers>,
+}
+
+/// Threads that compile fetched scripts while the page's own thread parses,
+/// styles and fetches: a script's bytes arrive long before the parse reaches
+/// the point where it runs.
+struct ScriptWorkers {
+    jobs: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for ScriptWorkers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptWorkers").finish_non_exhaustive()
+    }
+}
+
+impl ScriptWorkers {
+    /// One thread fewer than the machine has, at least one and at most four;
+    /// they end when the page drops its end of the queue.
+    fn start() -> Option<Self> {
+        let (jobs, queue) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(queue));
+        let count = std::thread::available_parallelism()
+            .map_or(2, |count| count.get().saturating_sub(1))
+            .clamp(1, 4);
+        for _ in 0..count {
+            let queue = std::sync::Arc::clone(&queue);
+            std::thread::Builder::new()
+                .name("otlyra-script-compile".to_owned())
+                .spawn(move || {
+                    loop {
+                        let job = queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok()?;
+        }
+        Some(Self { jobs })
+    }
 }
 
 impl PageScripts {
@@ -292,6 +342,8 @@ impl PageScripts {
             hold_load: false,
             code_cache: None,
             cached_scripts: Vec::new(),
+            preparing: std::collections::HashMap::new(),
+            workers: None,
         }
     }
 
@@ -616,6 +668,42 @@ impl PageScripts {
         ran
     }
 
+    /// Start compiling an external script whose bytes arrived from `url`,
+    /// or reading its compiled form back, on a preparing thread, for
+    /// [`Self::run_external`] to run when the parse reaches it.
+    pub fn prepare_external(&mut self, source: &str, url: &str) {
+        let Some(cache) = self.code_cache.clone() else {
+            return;
+        };
+        if source.len() < crate::code_cache::MIN_SCRIPT_BYTES {
+            return;
+        }
+        let key = crate::code_cache::CodeCache::script_key(source);
+        if self.preparing.contains_key(&key) {
+            return;
+        }
+        if self.workers.is_none() {
+            self.workers = ScriptWorkers::start();
+        }
+        let Some(workers) = &self.workers else {
+            return;
+        };
+        let (done, prepared) = std::sync::mpsc::channel();
+        let (text, url, job_key) = (source.to_owned(), url.to_owned(), key.clone());
+        let job = Box::new(move || {
+            let kept = cache.load(&job_key);
+            let script = otter_runtime::PreparedScript::prepare(
+                otter_runtime::SourceInput::from_javascript(text),
+                &url,
+                kept.as_deref(),
+            );
+            let _ = done.send(script);
+        });
+        if workers.jobs.send(job).is_ok() {
+            self.preparing.insert(key, prepared);
+        }
+    }
+
     /// Run an external script whose bytes have arrived.
     ///
     /// It runs in the same isolate and sees everything the inline scripts left
@@ -637,6 +725,7 @@ impl PageScripts {
             state,
             code_cache,
             cached_scripts,
+            preparing,
             ..
         } = self;
         // A fetched script's compiled form is kept by its text. One too
@@ -644,15 +733,32 @@ impl PageScripts {
         let cache = code_cache
             .as_deref()
             .filter(|_| source.len() >= crate::code_cache::MIN_SCRIPT_BYTES);
+        let key = cache.map(|_| crate::code_cache::CodeCache::script_key(source));
+        // Prepared on a preparing thread when its bytes arrived; waiting for
+        // one still compiling costs no more than compiling it here.
+        let prepared = key
+            .as_ref()
+            .and_then(|key| preparing.remove(key))
+            .and_then(|prepared| prepared.recv().ok());
         state.set_current_script(Some(element));
-        let outcome = crate::dom::loan(document, state, || match cache {
-            Some(cache) => {
-                let key = crate::code_cache::CodeCache::script_key(source);
-                let outcome = Self::execute_cached(host, source, &specifier, &key, cache);
-                cached_scripts.push((specifier.clone(), key));
+        let outcome = crate::dom::loan(document, state, || match (cache, key) {
+            (Some(cache), Some(key)) => {
+                let outcome = match prepared {
+                    Some(prepared) => {
+                        let specifier = prepared.specifier().to_owned();
+                        let outcome = Self::execute_prepared(host, prepared, &key, cache);
+                        cached_scripts.push((specifier, key));
+                        outcome
+                    }
+                    None => {
+                        let outcome = Self::execute_cached(host, source, &specifier, &key, cache);
+                        cached_scripts.push((specifier.clone(), key));
+                        outcome
+                    }
+                };
                 outcome
             }
-            None => Self::execute(host, source, &specifier),
+            _ => Self::execute(host, source, &specifier),
         });
         state.set_current_script(None);
         self.absorb_turn();
@@ -699,6 +805,29 @@ impl PageScripts {
                     }
                 }),
         )
+    }
+
+    /// [`Self::execute_cached`] of a script a preparing thread compiled or
+    /// read back.
+    fn execute_prepared(
+        host: &mut Option<ScriptHost>,
+        prepared: otter_runtime::PreparedScript,
+        key: &str,
+        cache: &crate::code_cache::CodeCache,
+    ) -> Option<Result<(), ScriptError>> {
+        let host = host.as_mut()?;
+        Some(host.run_prepared_script(prepared).map(|(outcome, fresh)| {
+            tracing::debug!(
+                target: "page.script",
+                micros = outcome.duration.as_micros(),
+                cached = fresh.is_none(),
+                prepared = true,
+                "script ran",
+            );
+            if let Some(fresh) = fresh {
+                cache.store(vec![(key.to_owned(), fresh)]);
+            }
+        }))
     }
 
     /// Run one script and report the outcome. The name is what diagnostics
@@ -762,6 +891,10 @@ impl ScriptRunner for PageScripts {
     fn release_load_event(&mut self, document: &mut Document) {
         self.hold_load = false;
         PageScripts::document_finished(self, document, true);
+    }
+
+    fn prepare_external(&mut self, source: &str, url: &str) {
+        PageScripts::prepare_external(self, source, url);
     }
 
     fn keep_code_caches(&mut self) {

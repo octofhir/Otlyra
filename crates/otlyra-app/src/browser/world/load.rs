@@ -960,6 +960,9 @@ impl PageWorld {
                         }
                         PendingResource::Script(node) => {
                             let source = decode_text(&loaded.bytes, loaded.charset.as_deref());
+                            if let Some(runner) = pending.runner.as_mut() {
+                                runner.prepare_external(&source, &fetched.url);
+                            }
                             pending.scripts.insert(node, source);
                             resumed = true;
                         }
